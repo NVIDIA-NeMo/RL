@@ -349,7 +349,7 @@ class TestWandbLogger:
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
         step = 10
-        logger.log_metrics(metrics, step)
+        logger.log_metrics(metrics, step, step_finished=True)
 
         # W&B's internal row step is implicit; the caller step is a custom axis.
         mock_run = mock_wandb.init.return_value
@@ -364,7 +364,7 @@ class TestWandbLogger:
         metrics = {"loss": 0.5, "accuracy": 0.8}
         step = 10
         prefix = "train"
-        logger.log_metrics(metrics, step, prefix)
+        logger.log_metrics(metrics, step, prefix, step_finished=True)
 
         # Check that prefixed metrics retain the caller step as a custom axis.
         mock_run = mock_wandb.init.return_value
@@ -390,10 +390,12 @@ class TestWandbLogger:
 
         logger.log_metrics(metrics, step, step_metric=step_metric)
 
-        # The requested custom metric supplies the series x-axis, while the
-        # caller step remains available to all other metrics in the row.
+        # The requested custom metric supplies the series x-axis. Independent
+        # event streams must not also carry the trainer-step axis.
         mock_run = mock_wandb.init.return_value
-        mock_run.log.assert_called_once_with({**metrics, "nemo_rl/step": step})
+        mock_run.log.assert_called_once_with(metrics)
+        mock_run.define_metric.assert_any_call("loss", step_metric="iteration")
+        mock_run.define_metric.assert_any_call("accuracy", step_metric="iteration")
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix_and_step_metric(self, mock_wandb):
@@ -417,9 +419,11 @@ class TestWandbLogger:
             "train/loss": 0.5,
             "train/accuracy": 0.8,
             "train/iteration": 15,
-            "nemo_rl/step": step,
         }
         mock_run.log.assert_called_once_with(expected_metrics)
+        mock_run.define_metric.assert_any_call(
+            "train/loss", step_metric="train/iteration"
+        )
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_independent_events_do_not_reuse_wandb_internal_step(self, mock_wandb):
@@ -427,21 +431,34 @@ class TestWandbLogger:
         logger = WandbLogger({})
 
         logger.log_metrics({"loss": 1.0}, step=1, prefix="train")
+        logger.log_metrics({"seconds": 5.0}, step=1, prefix="timing/train")
         logger.log_metrics(
             {"telemetry/wall_time_seconds": 30.0, "tokens_per_second": 10.0},
             step=1,
             prefix="rollout/throughput",
             step_metric="telemetry/wall_time_seconds",
         )
-        logger.log_metrics({"loss": 0.5}, step=2, prefix="train")
+        logger.log_metrics(
+            {"tokens_per_second": 20.0},
+            step=1,
+            prefix="performance",
+            step_finished=True,
+        )
+        logger.log_metrics({"loss": 0.5}, step=2, prefix="train", step_finished=True)
 
         mock_run = mock_wandb.init.return_value
         assert mock_run.log.call_args_list == [
-            call({"train/loss": 1.0, "nemo_rl/step": 1}),
             call(
                 {
                     "telemetry/wall_time_seconds": 30.0,
                     "rollout/throughput/tokens_per_second": 10.0,
+                }
+            ),
+            call(
+                {
+                    "train/loss": 1.0,
+                    "timing/train/seconds": 5.0,
+                    "performance/tokens_per_second": 20.0,
                     "nemo_rl/step": 1,
                 }
             ),
@@ -458,10 +475,57 @@ class TestWandbLogger:
         # Define metric pattern and step metric
         logger.define_metric("ray/*", step_metric="ray/ray_step")
 
-        # Check that the caller's custom series definition is preserved in
-        # addition to the logger-wide logical-step axis.
+        logger.log_metrics(
+            {"ray/ray_step": 15.0, "gpu_utilization": 80.0},
+            step=10,
+            prefix="ray",
+            step_metric="ray/ray_step",
+        )
+        logger.log_metrics(
+            {"ray/ray_step": 16.0, "gpu_utilization": 81.0},
+            step=11,
+            prefix="ray",
+            step_metric="ray/ray_step",
+        )
+
+        # Patterns stay local; W&B receives deterministic exact-name rules.
         mock_run = mock_wandb.init.return_value
-        mock_run.define_metric.assert_any_call("ray/*", step_metric="ray/ray_step")
+        assert call("ray/*", step_metric="ray/ray_step") not in (
+            mock_run.define_metric.call_args_list
+        )
+        mock_run.define_metric.assert_any_call("ray/ray_step", hidden=True)
+        mock_run.define_metric.assert_any_call(
+            "ray/gpu_utilization", step_metric="ray/ray_step"
+        )
+        assert (
+            mock_run.define_metric.call_args_list.count(
+                call("ray/gpu_utilization", step_metric="ray/ray_step")
+            )
+            == 1
+        )
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_does_not_define_catch_all_metric(self, mock_wandb):
+        """Overlapping W&B globs must not choose axes nondeterministically."""
+        WandbLogger({})
+
+        mock_run = mock_wandb.init.return_value
+        assert call("*", step_metric="nemo_rl/step") not in (
+            mock_run.define_metric.call_args_list
+        )
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_finish_flushes_pending_trainer_row(self, mock_wandb):
+        """A final incomplete step is not lost during logger teardown."""
+        logger = WandbLogger({})
+        logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
+
+        mock_run = mock_wandb.init.return_value
+        mock_run.log.assert_not_called()
+        logger.finish()
+
+        mock_run.log.assert_called_once_with({"train/loss": 0.5, "nemo_rl/step": 7})
+        mock_run.finish.assert_called_once_with()
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_hyperparams(self, mock_wandb):

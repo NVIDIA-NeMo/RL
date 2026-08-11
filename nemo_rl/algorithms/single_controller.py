@@ -2057,7 +2057,10 @@ class SingleControllerActor:
                 step_metrics, step=self._train_steps, prefix="train"
             )
             self._logger.log_metrics(
-                timing_metrics, step=self._train_steps, prefix="timing/train"
+                timing_metrics,
+                step=self._train_steps,
+                prefix="timing/train",
+                step_finished=not self._master_config.token_capture.enabled,
             )
             if self._master_config.token_capture.enabled:
                 await self._log_gate_metrics()
@@ -2255,7 +2258,12 @@ class SingleControllerActor:
         gate_metrics: dict[str, float] = {k: float(v) for k, v in counters.items()}
         if calls:
             gate_metrics["token_in_rate"] = counters["token_in"] / calls
-        self._logger.log_metrics(gate_metrics, step=self._train_steps, prefix="gate")
+        self._logger.log_metrics(
+            gate_metrics,
+            step=self._train_steps,
+            prefix="gate",
+            step_finished=True,
+        )
         print(f"gate_metrics={gate_metrics}", flush=True)
 
     async def _log_rollout_throughput_metrics(self, *, emit: bool = True) -> None:
@@ -2351,11 +2359,8 @@ class SingleControllerActor:
                 list(mutation_waits), 0.95
             )
             metrics["checkpoint_mutation_wait_seconds_max"] = max(mutation_waits)
-        try:
+        if self._buffer is not None:
             metrics["buffer_occupancy_groups"] = float(len(self._buffer))
-        except TypeError:
-            # Some test or backend adapters do not expose local occupancy.
-            pass
 
         running = _latest_vllm_values(generation_metrics, "inflight_batch_sizes")
         waiting = _latest_vllm_values(generation_metrics, "num_pending_samples")
