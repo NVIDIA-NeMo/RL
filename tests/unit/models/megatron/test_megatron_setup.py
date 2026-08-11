@@ -3616,6 +3616,7 @@ def test_zero_train_gen_mismatch_forces_te_generation_spec():
     from nemo_rl.models.megatron.setup import _apply_zero_train_gen_mismatch
 
     config = {
+        "model_name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16",
         "megatron_cfg": {"zero_train_gen_mismatch": True},
         "generation": {
             "mcore_generation_config": {
@@ -3644,5 +3645,34 @@ def test_zero_train_gen_mismatch_forces_te_generation_spec():
         config["generation"]["mcore_generation_config"]["transformer_impl"]
         == "transformer_engine"
     )
-    apply_mamba_patch.assert_called_once_with()
+    assert config["megatron_cfg"]["flash_attention_version"] == 4
+    apply_mamba_patch.assert_called_once_with(required=True)
     apply_moe_patches.assert_called_once_with()
+
+
+def test_zero_train_gen_mismatch_skips_mamba_patch_for_non_mamba_models():
+    """Pure MoE/transformer models must not require the Mamba runtime patch."""
+    from nemo_rl.models.megatron.setup import _apply_zero_train_gen_mismatch
+
+    config = {
+        "model_name": "Qwen/Qwen3-30B-A3B",
+        "megatron_cfg": {"zero_train_gen_mismatch": True},
+        "generation": {"mcore_generation_config": {}},
+    }
+
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.mamba_determinism_patches."
+            "apply_mamba_determinism_patch"
+        ) as apply_mamba_patch,
+        patch(
+            "nemo_rl.models.policy.workers.moe_determinism_patches."
+            "apply_moe_determinism_patches"
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.patches.apply_te_gemm_cublas_pinned_patch"
+        ),
+    ):
+        _apply_zero_train_gen_mismatch(config)
+
+    apply_mamba_patch.assert_called_once_with(required=False)

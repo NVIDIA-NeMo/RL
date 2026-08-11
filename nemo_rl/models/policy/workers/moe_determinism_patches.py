@@ -91,6 +91,95 @@ def _unpermute_fixed_order_combine(
     return contrib.sum(dim=1)
 
 
+def _segment_sum(vals: torch.Tensor, group_sizes: torch.Tensor) -> torch.Tensor:
+    """Deterministic per-segment sum of contiguous row groups (fp32 accumulate)."""
+    vf = vals.float()
+    seg_fn = getattr(torch, "segment_reduce", None)
+    if seg_fn is not None:
+        try:
+            return seg_fn(vf, "sum", lengths=group_sizes, axis=0, unsafe=True).to(vals.dtype)
+        except Exception:
+            pass
+    n, h = vals.shape
+    csum = torch.zeros(n + 1, h, dtype=torch.float32, device=vals.device)
+    torch.cumsum(vf, dim=0, out=csum[1:])
+    ends = group_sizes.cumsum(0)
+    starts = ends - group_sizes
+    return (csum[ends] - csum[starts]).to(vals.dtype)
+
+
+def _unpermute_segmented_combine(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    restore_shape: torch.Size,
+) -> torch.Tensor:
+    """Deterministic combine via segmented sum (no dense [T, max_slots, H] buffer)."""
+    num_tokens, hidden = restore_shape
+    num_permuted = permuted_tokens.size(0)
+    out = torch.zeros(num_tokens, hidden, dtype=permuted_tokens.dtype, device=permuted_tokens.device)
+    if num_permuted == 0:
+        return out
+    sort_perm = torch.argsort(sorted_indices, stable=True)
+    dest = sorted_indices[sort_perm]
+    vals = permuted_tokens[sort_perm]
+    if num_permuted > 1:
+        change = dest.new_ones(num_permuted, dtype=torch.bool)
+        change[1:] = dest[1:] != dest[:-1]
+    else:
+        change = dest.new_ones(1, dtype=torch.bool)
+    group_id = change.long().cumsum(0) - 1
+    num_groups = int(group_id[-1].item()) + 1
+    group_sizes = torch.bincount(group_id, minlength=num_groups)
+    unique_dest = dest[change]
+    seg = _segment_sum(vals, group_sizes)
+    out[unique_dest] = seg.to(out.dtype)
+    return out
+
+
+def _unpermute_gather_combine_droppad(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    restore_shape: torch.Size,
+    routing_map: torch.Tensor,
+) -> torch.Tensor:
+    """``drop_and_pad`` combine for CUDA-graphed decode (capture-safe, no ``nonzero()``).
+
+    Used when ``moe_pad_experts_for_cuda_graph_inference`` fixes per-expert token counts.
+    The padded fixed-order path can diverge from training; this gather path matches the
+    portoptim golden bed and stays graph-capturable.
+    """
+    num_tokens, hidden = restore_shape
+    rmap = routing_map.bool()
+    num_experts = rmap.size(1)
+    total_slots = permuted_tokens.size(0)
+    if num_experts == 0 or total_slots % num_experts != 0:
+        return _unpermute_segmented_combine(permuted_tokens, sorted_indices, restore_shape)
+    capacity = total_slots // num_experts
+    rank = rmap.long().cumsum(dim=0) - 1
+    expert_base = torch.arange(num_experts, device=rmap.device) * capacity
+    pos = expert_base.unsqueeze(0) + rank
+    # Static-shape per-row sort instead of boolean-mask nonzero() (host sync under capture).
+    sel_key = torch.where(
+        rmap,
+        torch.arange(num_experts, device=rmap.device).unsqueeze(0).expand_as(rmap),
+        num_experts + torch.arange(num_experts, device=rmap.device).unsqueeze(0).expand_as(rmap),
+    )
+    expert_idx_sorted = sel_key.sort(dim=1).values
+    _tk = getattr(_unpermute_gather_combine_droppad, "_nrl_static_topk", None)
+    if _tk is None:
+        _tk = int(rmap[0].sum().item()) if num_tokens > 0 else 0
+        _unpermute_gather_combine_droppad._nrl_static_topk = _tk
+    if _tk == 0:
+        return _unpermute_segmented_combine(permuted_tokens, sorted_indices, restore_shape)
+    expert_idx = expert_idx_sorted[:, :_tk]
+    pos_sel = torch.gather(pos, 1, expert_idx)
+    keep_sel = torch.gather(rank, 1, expert_idx) < capacity
+    pos_safe = torch.where(keep_sel, pos_sel, torch.zeros_like(pos_sel))
+    gathered = permuted_tokens.index_select(0, pos_safe.reshape(-1))
+    gathered = gathered * keep_sel.reshape(-1).unsqueeze(-1).to(gathered.dtype)
+    return gathered.view(num_tokens, -1, hidden).sum(dim=1)
+
+
 def _patched_unpermute(
     permuted_tokens: torch.Tensor,
     sorted_indices: torch.Tensor,
@@ -138,10 +227,16 @@ def _patched_unpermute(
             permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
-    _nrl_log_unpermute_path("fixed_order_combine")
-    output_tokens = _unpermute_fixed_order_combine(
-        permuted_tokens, sorted_indices, restore_shape
-    )
+    if drop_and_pad and routing_map is not None:
+        _nrl_log_unpermute_path("gather_combine_droppad")
+        output_tokens = _unpermute_gather_combine_droppad(
+            permuted_tokens, sorted_indices, restore_shape, routing_map
+        )
+    else:
+        _nrl_log_unpermute_path("fixed_order_combine")
+        output_tokens = _unpermute_fixed_order_combine(
+            permuted_tokens, sorted_indices, restore_shape
+        )
     return output_tokens.to(dtype=input_dtype)
 
 
@@ -299,7 +394,8 @@ def apply_moe_unpermute_determinism_patch() -> None:
     _MOE_UNPERMUTE_PATCHED = True
     print(
         "[moe_determinism_patches] patched moe_utils.unpermute and "
-        "token_dispatcher.unpermute with fixed-order combine."
+        "token_dispatcher.unpermute with fixed-order combine "
+        "(gather+droppad for CUDA-graph moe_pad decode)."
     )
 
 
@@ -380,3 +476,5 @@ def restore_moe_determinism_patches() -> None:
         _LOG_SOFTMAX_PATCHED = False
 
     _NRL_UNPERMUTE_PATH_SEEN.clear()
+    if hasattr(_unpermute_gather_combine_droppad, "_nrl_static_topk"):
+        del _unpermute_gather_combine_droppad._nrl_static_topk
