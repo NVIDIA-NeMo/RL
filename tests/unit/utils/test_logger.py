@@ -587,6 +587,21 @@ class TestWandbLogger:
             mock_run.define_metric.call_args_list
         )
 
+    @patch("nemo_rl.utils.logger.atexit.register")
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_registers_teardown_flush(self, mock_wandb, mock_atexit_register):
+        """Driver entrypoints flush the final pending row at process exit."""
+        logger = WandbLogger({})
+        logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
+
+        mock_atexit_register.assert_called_once_with(logger.finish)
+        callback = mock_atexit_register.call_args.args[0]
+        callback()
+
+        mock_run = mock_wandb.init.return_value
+        mock_run.log.assert_called_once_with({"train/loss": 0.5, "nemo_rl/step": 7})
+        mock_run.finish.assert_called_once_with()
+
     @patch("nemo_rl.utils.logger.wandb")
     def test_finish_flushes_pending_trainer_row(self, mock_wandb):
         """A final incomplete step is not lost during logger teardown."""
