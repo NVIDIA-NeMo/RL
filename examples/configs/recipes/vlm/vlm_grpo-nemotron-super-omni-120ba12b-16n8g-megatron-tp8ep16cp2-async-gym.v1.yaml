@@ -18,6 +18,15 @@ loss_fn:
 checkpointing:
   checkpoint_dir: results/nemotron-super-omni-async-gym
   checkpoint_must_save_by: 00:03:45:00
+  # This recipe disables validation (grpo.val_period: 0 above), so no val
+  # metric is ever collected. The parent sets metric_name to
+  # val:total_reward/mean, which is coherent there because it validates every
+  # 5 steps; inherited here it makes every checkpoint tie at -inf, warns on
+  # each save, and degrades best-checkpoint selection to "latest anyway".
+  # null selects the same behaviour deliberately: keep_top_k then ranks
+  # periodic checkpoints by step. Set a val metric here only alongside a
+  # non-zero val_period (or val_at_end).
+  metric_name: null
 policy:
   is_vlm: true
   model_name: /path/to/nemotron-super-omni-hf-checkpoint
