@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossType
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
@@ -382,18 +383,18 @@ class TestProcessMicrobatch:
         assert result.vlm_kwargs == {}
 
     def test_with_multimodal_inputs(self, mock_tokenizer):
-        # Create test microbatch with multimodal data
+        image = torch.randn(1, 3, 224, 224)
+        pixel_row = PackedTensor(image, dim_to_pack=0).enable_deduplication()
+        pixel_values = PackedTensor.concat([pixel_row] * 2)
         mb = BatchedDataDict(
             {
                 "input_ids": torch.randint(0, 1000, (2, 64)),
                 "sample_mask": torch.ones(2, dtype=torch.bool),
-                "pixel_values": torch.randn(2, 3, 224, 224),  # Simulated image data
+                "pixel_values": pixel_values,
             }
         )
-
-        # Mock get_multimodal_dict
-        mock_multimodal_dict = {"pixel_values": torch.randn(2, 3, 224, 224)}
-        mb.get_multimodal_dict = MagicMock(return_value=mock_multimodal_dict)
+        assert len(pixel_values.tensors) == 1
+        assert len(pixel_values) == 2
 
         cfg = {
             "dtensor_cfg": {"sequence_parallel": False},
@@ -412,6 +413,13 @@ class TestProcessMicrobatch:
         # Verify multimodal kwargs were extracted
         assert isinstance(result, ProcessedInputs)
         assert "pixel_values" in result.vlm_kwargs
+        assert result.vlm_kwargs["pixel_values"].shape == (2, 3, 224, 224)
+        torch.testing.assert_close(
+            result.vlm_kwargs["pixel_values"][0],
+            result.vlm_kwargs["pixel_values"][1],
+            rtol=0,
+            atol=0,
+        )
         # When multimodal inputs are present, position_ids should be None
         assert result.position_ids is None
 

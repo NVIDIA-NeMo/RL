@@ -14,8 +14,8 @@ policy:
   model_name: zai-org/GLM-5.1
   train_global_batch_size: 64
   megatron_cfg:
-    # Set dsa_kernel_backend: tilelang to use TileLang kernels; the inherited
-    # cuDNN kernels are faster.
+    # Set model_overrides.dsa_kernel_backend: tilelang to use TileLang kernels;
+    # the inherited cuDNN kernels are faster.
     # GLM-5.1 has 78 layers: 9 on each edge stage and 10 on each middle
     # stage. TP1/PP8/CP32/EP32 spans all 256 colocated GB200 GPUs.
     tensor_model_parallel_size: 1

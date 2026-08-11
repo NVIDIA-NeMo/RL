@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import hashlib
 import json
 import os
 import threading
 import time
 import warnings
+from collections.abc import Mapping
+from dataclasses import fields, is_dataclass, replace
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -232,7 +235,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
     validate_router_replay_config,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_megatron_checkpoint_dir,
@@ -240,37 +243,6 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.models.value.config import ValueConfig
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
-
-_MCORE_CONFIG_OVERRIDE_FIELDS: tuple[str, ...] = (
-    "dsa_indexer_rope_interleaved",
-    "dsa_indexer_rotate_activation",
-    "dsa_indexer_k_norm_epsilon",
-    "dsa_kernel_backend",
-    "dsa_indexer_loss_coeff",
-    "dsa_indexer_use_sparse_loss",
-    "deallocate_pipeline_outputs",
-    "persist_layer_norm",
-    "bias_dropout_fusion",
-)
-
-_MCORE_EFFECTIVE_LOG_FIELDS: tuple[str, ...] = (
-    "dsa_indexer_rope_interleaved",
-    "dsa_indexer_rotate_activation",
-    "dsa_indexer_k_norm_epsilon",
-    "dsa_kernel_backend",
-    "dsa_indexer_loss_coeff",
-    "dsa_indexer_use_sparse_loss",
-    "moe_router_dtype",
-    "moe_shared_expert_overlap",
-    "gradient_accumulation_fusion",
-    "moe_permute_fusion",
-    "moe_grouped_gemm",
-    "bias_activation_fusion",
-    "cp_comm_type",
-    "deallocate_pipeline_outputs",
-    "persist_layer_norm",
-    "bias_dropout_fusion",
-)
 
 
 def destroy_parallel_state():
@@ -656,6 +628,19 @@ def setup_model_config(
             )
             raise
 
+    # Construct the final provider with model-only overrides before applying
+    # NeMo-RL's first-class Megatron settings. Conflicts are rejected so the
+    # provider and the user-facing config cannot disagree about the same field.
+    model_overrides = config["megatron_cfg"].get("model_overrides")
+    if model_overrides:
+        _validate_model_override_conflicts(config["megatron_cfg"], model_overrides)
+        if not is_dataclass(model_cfg):
+            raise TypeError(
+                "model_overrides requires a dataclass-backed Megatron Bridge "
+                f"model config, got {type(model_cfg).__name__}."
+            )
+        model_cfg = _merge_model_overrides(model_cfg, model_overrides)
+
     # Apply parallelism settings
     _apply_parallelism_config(model_cfg, config)
 
@@ -671,15 +656,6 @@ def setup_model_config(
     # Apply performance settings
     _apply_performance_config(model_cfg, config)
 
-    # Apply explicit MCore TransformerConfig overrides.
-    mcore_overrides_applied = _apply_mcore_config_overrides(
-        model_cfg, config, rank=rank
-    )
-    if mcore_overrides_applied:
-        finalize = getattr(model_cfg, "finalize", None)
-        if callable(finalize):
-            finalize()
-
     # Validate optimizer configuration
     _validate_optimizer_config(config)
 
@@ -690,10 +666,10 @@ def setup_model_config(
     # Validate chunking configuration
     _validate_chunking_config(config)
 
-    # For megatron_lm, finalize the model config after all settings have been applied.
-    # (For megatron_bridge/hf, the provider was already finalized before the checkpoint
-    # was saved to run_config.yaml, so finalize() is not called here for those paths.)
-    if fmt == "megatron_lm":
+    # Reconstructed providers must be finalized so derived fields reflect the
+    # merged config. Without overrides, preserve the existing checkpoint-load
+    # behavior: only megatron_lm providers need finalization here.
+    if fmt == "megatron_lm" or model_overrides:
         model_cfg.finalize()
 
     model_cfg.__post_init__()
@@ -735,6 +711,108 @@ def setup_model_config(
     _validate_dtype_config(dtype, megatron_cfg.model, megatron_cfg.optimizer)
 
     return megatron_cfg, model_cfg
+
+
+def _validate_model_override_conflicts(
+    megatron_cfg: Mapping[str, Any], overrides: dict[str, Any]
+) -> None:
+    """Reject overrides that duplicate first-class NeMo-RL Megatron settings."""
+    first_class_fields = (set(MegatronConfig.__annotations__) | set(megatron_cfg)) - {
+        "model_overrides"
+    }
+    conflicts = sorted(set(overrides) & first_class_fields)
+    if not conflicts:
+        return
+
+    conflict_paths = ", ".join(
+        f"policy.megatron_cfg.model_overrides.{name} conflicts with "
+        f"policy.megatron_cfg.{name}"
+        for name in conflicts
+    )
+    raise ValueError(
+        "model_overrides is only for Megatron Bridge model fields without a "
+        f"first-class NeMo-RL setting; {conflict_paths}. Set the first-class "
+        "field directly instead."
+    )
+
+
+def _merge_model_overrides(
+    target: Any,
+    overrides: dict[str, Any],
+    path: str = "policy.megatron_cfg.model_overrides",
+) -> Any:
+    """Construct a model config with recursively merged user overrides.
+
+    Dataclass-backed config objects are reconstructed with ``dataclasses.replace``
+    so the returned provider is the canonical object later stored and serialized
+    by Megatron Bridge's ``ConfigContainer``. Nested mappings and config objects
+    are copied before updates; the input provider is never mutated.
+
+    Args:
+        target: Model provider, nested config object, or mapping to merge.
+        overrides: YAML-derived override hierarchy.
+        path: User-facing config path used in error messages.
+
+    Returns:
+        A new config object or mapping containing the merged values.
+
+    Raises:
+        AttributeError: If an override does not match an object attribute.
+    """
+    if isinstance(target, Mapping):
+        merged_mapping = dict(target)
+        for name, value in overrides.items():
+            override_path = f"{path}.{name}"
+            current_value = target.get(name)
+            merged_mapping[name] = _merge_model_override_value(
+                current_value, value, override_path
+            )
+        return merged_mapping
+
+    # Explicitly collect the allowed fields so we can trace a potential
+    # error back to the config / override path that triggered it.
+    dataclass_init_fields = None
+    if is_dataclass(target):
+        dataclass_init_fields = {field.name for field in fields(target) if field.init}
+
+    updates = {}
+    for name, value in overrides.items():
+        override_path = f"{path}.{name}"
+        if dataclass_init_fields is not None:
+            attribute_exists = name in dataclass_init_fields
+        else:
+            attribute_exists = hasattr(target, name)
+        if not attribute_exists:
+            raise AttributeError(
+                f"{override_path} does not match a configurable field on "
+                f"Megatron Bridge config {type(target).__name__}."
+            )
+
+        current_value = getattr(target, name)
+        updates[name] = _merge_model_override_value(current_value, value, override_path)
+
+    if dataclass_init_fields is not None:
+        return replace(target, **updates)
+
+    merged_object = copy.copy(target)
+    for name, value in updates.items():
+        setattr(merged_object, name, value)
+    return merged_object
+
+
+def _merge_model_override_value(
+    current_value: Any, override_value: Any, path: str
+) -> Any:
+    """Merge one override value, descending into config hierarchies as needed."""
+    if not isinstance(override_value, dict):
+        return override_value
+    if (
+        isinstance(current_value, Mapping)
+        or is_dataclass(current_value)
+        or hasattr(current_value, "__dict__")
+    ):
+        return _merge_model_overrides(current_value, override_value, path)
+    return override_value
 
 
 def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -1026,43 +1104,6 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             model_cfg.fp8_param = fp8_cfg["fp8_param"]
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
-
-
-def _apply_mcore_config_overrides(
-    model_cfg: Any, config: PolicyConfig, rank: int | None = None
-) -> bool:
-    """Apply explicit MCore TransformerConfig overrides from policy.megatron_cfg."""
-    megatron_cfg = config["megatron_cfg"]
-    applied: dict[str, Any] = {}
-    missing_fields: list[str] = []
-
-    for field in _MCORE_CONFIG_OVERRIDE_FIELDS:
-        if field not in megatron_cfg:
-            continue
-        if not hasattr(model_cfg, field):
-            missing_fields.append(field)
-            continue
-        value = megatron_cfg[field]
-        setattr(model_cfg, field, value)
-        applied[field] = value
-
-    if missing_fields:
-        raise ValueError(
-            "policy.megatron_cfg includes MCore override(s) that are not present "
-            f"on this model config: {missing_fields}"
-        )
-
-    if applied and (rank is None or rank == 0):
-        effective_values = {
-            field: getattr(model_cfg, field, "<missing>")
-            for field in _MCORE_EFFECTIVE_LOG_FIELDS
-        }
-        formatted_values = ", ".join(
-            f"{field}={value!r}" for field, value in effective_values.items()
-        )
-        print(f"Effective MCore config overrides at rank 0: {formatted_values}")
-
-    return bool(applied)
 
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:

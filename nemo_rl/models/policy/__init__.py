@@ -328,6 +328,10 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
+    # Arbitrary model-provider attributes applied recursively to the Megatron
+    # Bridge model config before model instantiation. Keys must match configurable
+    # provider fields and must not duplicate first-class megatron_cfg fields.
+    model_overrides: NotRequired[dict[str, Any]]
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
@@ -362,17 +366,6 @@ class MegatronConfig(TypedDict):
     apply_rope_fusion: bool
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: bool
-    # DSA indexer and sparse DSA kernel overrides. These mirror MCore
-    # TransformerConfig fields and are copied through when explicitly set.
-    dsa_indexer_rope_interleaved: NotRequired[bool]
-    dsa_indexer_rotate_activation: NotRequired[bool]
-    dsa_indexer_k_norm_epsilon: NotRequired[float | None]
-    dsa_kernel_backend: NotRequired[Literal["none", "tilelang", "cudnn"]]
-    dsa_indexer_loss_coeff: NotRequired[float | None]
-    dsa_indexer_use_sparse_loss: NotRequired[bool]
-    deallocate_pipeline_outputs: NotRequired[bool]
-    persist_layer_norm: NotRequired[bool]
-    bias_dropout_fusion: NotRequired[bool]
     # Force reconvert from HF even if the checkpoint already exists (default: False)
     force_reconvert_from_hf: NotRequired[bool]
     # Attention backend available values:
