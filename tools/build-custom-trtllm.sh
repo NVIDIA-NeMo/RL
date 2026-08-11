@@ -95,7 +95,9 @@ WHEEL_OUTPUT_DIR=${WHEEL_OUTPUT_DIR:-/opt/trtllm_wheels}
 mkdir -p "$WHEEL_OUTPUT_DIR"
 
 echo "Building TensorRT-LLM from:"
-echo "  TRT-LLM Git URL: $GIT_URL"
+# Redact any embedded credentials: the tekit url carries a clone token and this
+# output ends up in build logs / CI artifacts.
+echo "  TRT-LLM Git URL: $(sed -E 's#://[^/@]*@#://<redacted>@#' <<<"$GIT_URL")"
 echo "  TRT-LLM Git ref: $GIT_REF"
 
 # git-lfs is required because TRT-LLM ships its `internal_cutlass_kernels`
@@ -138,10 +140,19 @@ git submodule update --init --recursive --depth=1
 #   - remove `setuptools<80` ceiling. Modern setuptools (>=80) is required by
 #     several of our other dependencies (e.g. transformer-engine build deps);
 #     downgrading creates an unresolvable conflict in the venv.
-# (The old nvidia-modelopt~=0.37.0 pin bump is gone: the TensorRT-LLM ref no
-#  longer lists nvidia-modelopt in requirements.txt.)
 assert_patch_target requirements.txt 'setuptools<80'
 sed -i 's|^setuptools<80$|setuptools|' requirements.txt
+
+#   - drop nvidia-modelopt (preventive). build_wheel.py installs
+#     requirements-dev.txt into the already-populated nemo-rl venv, so pip can
+#     mutate the runtime environment uv built. The rubin ref pins
+#     `nvidia-modelopt[torch]~=0.39.0` (i.e. <0.40) while the root pyproject
+#     installs modelopt from a git rev reporting 0.46.0.dev*, so pip would
+#     either fail to resolve or silently downgrade a package uv owns. modelopt
+#     is a runtime dependency the wheel build does not need pinned. Not
+#     asserted: refs after rc23 dropped the line, so it may legitimately not
+#     match.
+sed -i '/^nvidia-modelopt/d' requirements.txt
 
 # cutlass_kernels/CMakeLists.txt invokes `setup_library.py develop --user`,
 # which (a) requires a setup.py shim and (b) the `--user` flag is invalid
@@ -189,6 +200,18 @@ echo "Building TensorRT-LLM wheel (arch=${ARCH}, jobs=${JOBS})..."
 # `--zero-stats` keeps cached objects.
 show_ccache_status "before TRT-LLM build"
 ccache --zero-stats
+
+# NGC-style base images (the Rubin TRT-LLM image among them) ship
+# PIP_CONSTRAINT=/etc/pip/constraint.txt, pinning the exact versions baked into
+# the image's own Python. build_wheel.py's setup_venv() shells out to real pip
+# (`python3 -m pip install -r requirements-dev.txt`), which honours that file --
+# and those versions are vendored into the image rather than published, so they
+# are unreachable from any index. Concretely: the image pins
+# `cuda-python==13.4.0`, which does not exist on PyPI at all (latest 13.x is
+# 13.3.1, already installed here), so `cuda-python>=13` -- otherwise satisfied
+# -- becomes unresolvable. This venv is uv-managed and owes the base image's
+# site-packages nothing, so drop the constraint for the build.
+unset PIP_CONSTRAINT
 
 # Keep full output for failure diagnostics, but stream only 5% Ninja milestones.
 TRTLLM_BUILD_LOG=$(mktemp /tmp/trtllm-build.XXXXXX.log)

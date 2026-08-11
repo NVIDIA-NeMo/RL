@@ -253,12 +253,20 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         env["WHEEL_OUTPUT_DIR"] = str(cache_dir)
         venv_bin = str(Path(sys.executable).parent)
         env["PATH"] = f"{venv_bin}:{env.get('PATH', os.defpath)}"
-        subprocess.run(
+        # check=False + explicit raise: CalledProcessError stringifies the full
+        # argv, which would print the expanded url -- clone token and all --
+        # into the build log on any failure.
+        result = subprocess.run(
             ["bash", str(script), _expanded_trtllm_url(env), git_ref],
-            check=True,
+            check=False,
             env=env,
             cwd=str(repo_root),
         )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"build-custom-trtllm.sh failed with exit code {result.returncode} "
+                f"for ref {git_ref} (url redacted). See the build output above."
+            )
         wheel = max(cache_dir.glob("tensorrt_llm-*.whl"), default=None)
         if wheel is None:
             raise RuntimeError(
