@@ -16,8 +16,10 @@ exit_if_max_steps_reached
 # MTP + speculative decoding variant: mtp_loss_scaling_factor 0.1 trains the MTP
 # head, and the recipe drives vLLM with speculative_config.method=mtp plus
 # mamba_cache_mode=align so the recurrent SSM state rolls back on rejected drafts.
-# Watch train/grad_norm: the pinned Megatron-LM clips MTP gradients jointly with
-# the backbone, which is the known cause of exploding grad_norm here.
+# Watch train/grad_norm. MTP gradients are clipped separately from the backbone
+# (mtp_detach_heads tags them grad_norm_group='mtp', and clip_grad_norm excludes
+# tagged parameters from the main norm), so a grad_norm excursion here is not
+# explained by MTP clipping and needs a different cause.
 #
 # Requires patches/mtp-sp-scatter.patch applied to the pinned Megatron-LM. See
 # patches/README.md.
