@@ -88,14 +88,14 @@ apt-get install -y --no-install-recommends \
     ccache
 
 # Nsight
-apt-get install -y --no-install-recommends gnupg
+apt install -y --no-install-recommends gnupg
 echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list
 apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(uname -m | sed 's/aarch64/sbsa/')/7fa2af80.pub
-apt-get update
-apt-get install -y --no-install-recommends nsight-systems-cli
+apt update
+apt install -y --no-install-recommends nsight-systems-cli
 
 # To fix CVE-2025-68973
-apt-get install -y --only-upgrade gnupg
+apt install -y --only-upgrade gnupg
 
 # Upgrade rsync to address security vulnerabilities
 apt-get install -y --only-upgrade rsync
