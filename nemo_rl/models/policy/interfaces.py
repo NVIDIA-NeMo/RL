@@ -48,6 +48,14 @@ class TopkLogitsOutputSpec(TypedDict):
     topk_indices: torch.Tensor
 
 
+class TopkLogprobsOutputSpec(TypedDict):
+    """Teacher target logprobs plus selected support indices and logprobs."""
+
+    reference_logprobs: torch.Tensor
+    topk_indices: torch.Tensor
+    topk_logprobs: torch.Tensor
+
+
 class PolicyInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 

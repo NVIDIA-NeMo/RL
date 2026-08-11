@@ -382,11 +382,15 @@ def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
             "grpo.deduplicate_multimodal_data=true is currently supported "
             "only when data_plane.enabled=false."
         )
-def _validate_student_topk_config(
-    master_config: MasterConfig, student_topk: Optional[int]
+
+
+def _validate_topk_opd_config(
+    master_config: MasterConfig,
+    opd_topk: Optional[int],
+    topk_source: Optional[opd_module.TopkSource],
 ) -> None:
-    """Reject settings that the student-top-k OPD loss cannot honor."""
-    if student_topk is None:
+    """Reject settings that the top-k OPD loss cannot honor."""
+    if opd_topk is None:
         return
 
     grpo_config = master_config.grpo
@@ -396,24 +400,20 @@ def _validate_student_topk_config(
 
     if not opd_module.is_opd_enabled(master_config):
         raise ValueError(
-            "on_policy_distillation.student_topk requires "
+            f"on_policy_distillation.{topk_source}_topk requires "
             "on_policy_distillation.enabled=true."
         )
     if not grpo_config.async_grpo.enabled:
         raise NotImplementedError(
-            "Student-top-k OPD currently supports only grpo.async_grpo.enabled=true."
+            "Top-k OPD currently supports only grpo.async_grpo.enabled=true."
         )
     if policy_config["sequence_packing"]["enabled"]:
-        raise NotImplementedError(
-            "Student-top-k OPD does not yet support sequence packing."
-        )
+        raise NotImplementedError("Top-k OPD does not yet support sequence packing.")
     if megatron_cfg.get("context_parallel_size", 1) != 1:
-        raise NotImplementedError(
-            "Student-top-k OPD does not yet support context parallelism."
-        )
+        raise NotImplementedError("Top-k OPD does not yet support context parallelism.")
     if not megatron_cfg.get("enabled", False):
         raise NotImplementedError(
-            "Student-top-k OPD currently requires the Megatron policy backend."
+            "Top-k OPD currently requires the Megatron policy backend."
         )
     if need_top_k_or_top_p_filtering(
         TrainingSamplingParams(
@@ -422,15 +422,17 @@ def _validate_student_topk_config(
         )
     ):
         raise NotImplementedError(
-            "Student-top-k OPD currently requires unfiltered training distributions "
+            "Top-k OPD currently requires unfiltered training distributions "
             "(policy.generation.top_k=null and top_p=1.0)."
         )
-    if master_config.loss_fn.reference_policy_kl_penalty != 0:
-        raise ValueError(
-            "Student-top-k OPD requires loss_fn.reference_policy_kl_penalty=0."
+    if float(generation_config.get("temperature", 1.0)) != 1.0:
+        raise NotImplementedError(
+            "Top-k OPD currently requires policy.generation.temperature=1.0."
         )
+    if master_config.loss_fn.reference_policy_kl_penalty != 0:
+        raise ValueError("Top-k OPD requires loss_fn.reference_policy_kl_penalty=0.")
     if grpo_config.adv_estimator.name != "opd":
-        raise ValueError("Student-top-k OPD requires grpo.adv_estimator.name='opd'.")
+        raise ValueError("Top-k OPD requires grpo.adv_estimator.name='opd'.")
 
 
 def setup(
@@ -653,8 +655,8 @@ def setup(
     use_fused_linear_logprobs = bool(
         megatron_cfg.get("enabled") and megatron_cfg.get("use_fused_linear_logprobs")
     )
-    student_topk = opd_module.get_student_topk(master_config)
-    _validate_student_topk_config(master_config, student_topk)
+    opd_topk, topk_source = opd_module.get_topk_support_config(master_config)
+    _validate_topk_opd_config(master_config, opd_topk, topk_source)
     if use_fused_linear_logprobs:
         # Sequence packing is not yet validated with the fused path: the fused
         # forward rolls labels over the whole (packed) sequence and would mix
@@ -685,7 +687,7 @@ def setup(
     loss_fn = ClippedPGLossFn(
         loss_config,
         use_fused_linear_logprobs=use_fused_linear_logprobs,
-        opd_student_topk=student_topk,
+        opd_topk=opd_topk,
     )
 
     # Validate force_on_policy_ratio
@@ -2250,12 +2252,11 @@ def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConf
 
 
 def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch.Tensor:
-    """Right-zero-pad teacher logprobs ``[B, teacher_S]`` to ``train_S``.
+    """Right-zero-pad a teacher tensor's sequence dimension to ``train_S``.
 
-    ``from_batches`` pads teacher logprobs to ``max(S_i)``; ``train_data`` may be
-    longer due to ``make_sequence_length_divisible_by``. Zero-pad is safe because
-    the mask zeros padding in advantage computation. ``teacher_S > train_S`` is
-    unexpected (teacher pads to a finer grid than the student) and raises.
+    Supports ``[B, teacher_S]`` target logprobs and ``[B, teacher_S, K]``
+    support tensors. ``from_batches`` pads to ``max(S_i)``; ``train_data`` may
+    be longer due to ``make_sequence_length_divisible_by``. Padding is masked.
     """
     teacher_S = teacher_logprobs.shape[1]
     if teacher_S > train_S:
@@ -2265,8 +2266,12 @@ def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch
             "and train_data is padded to roundup(max(S_i), make_sequence_length_divisible_by)."
         )
     if teacher_S < train_S:
+        pad_width = (0, 0) * (teacher_logprobs.ndim - 2) + (
+            0,
+            train_S - teacher_S,
+        )
         teacher_logprobs = torch.nn.functional.pad(
-            teacher_logprobs, (0, train_S - teacher_S), value=0.0
+            teacher_logprobs, pad_width, value=0.0
         )
     return teacher_logprobs
 
@@ -4167,7 +4172,7 @@ def async_grpo_train(
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
     max_generation_failures = master_config.grpo.async_grpo.max_generation_failures
-    student_topk = opd_module.get_student_topk(master_config)
+    opd_topk, topk_source = opd_module.get_topk_support_config(master_config)
 
     if router_replay_enabled(master_config.policy) and (
         master_config.data_plane or {}
@@ -4680,11 +4685,21 @@ def async_grpo_train(
                     # Teacher logprobs are stored in batch dict by collection-time
                     # computation and padded by from_batches. Extract here.
                     trajectory_teacher_logprobs = None
+                    trajectory_teacher_topk_indices = None
+                    trajectory_teacher_topk_logprobs = None
                     teacher_agent_refs = None
                     if opd_module.is_opd_enabled(master_config):
                         if "teacher_reference_logprobs" in repeated_batch:
                             trajectory_teacher_logprobs = repeated_batch[
                                 "teacher_reference_logprobs"
+                            ]
+                        if "teacher_topk_indices" in repeated_batch:
+                            trajectory_teacher_topk_indices = repeated_batch[
+                                "teacher_topk_indices"
+                            ]
+                        if "teacher_topk_logprobs" in repeated_batch:
+                            trajectory_teacher_topk_logprobs = repeated_batch[
+                                "teacher_topk_logprobs"
                             ]
                         teacher_agent_refs = repeated_batch.get("agent_ref")
 
@@ -4825,38 +4840,59 @@ def async_grpo_train(
                             train_data["generation_logprobs"]
                         )
 
-                    if student_topk is not None:
+                    if opd_topk is not None:
                         if trajectory_teacher_logprobs is None:
                             raise ValueError(
-                                "Student-top-k OPD requires collection-time teacher "
+                                "Top-k OPD requires collection-time teacher "
                                 "target logprobs in the replay batch."
                             )
-                        if not isinstance(teacher_agent_refs, list):
-                            raise ValueError(
-                                "Student-top-k OPD requires one agent_ref per training sample."
+                        if topk_source == "student":
+                            if not isinstance(teacher_agent_refs, list):
+                                raise ValueError(
+                                    "Student-top-k OPD requires one agent_ref per "
+                                    "training sample."
+                                )
+                            topk_output = policy.get_topk_logits(
+                                train_data,
+                                k=opd_topk,
+                                timer=timer,
                             )
-                        topk_output = policy.get_topk_logits(
-                            train_data,
-                            k=student_topk,
-                            timer=timer,
-                        )
-                        train_data["prev_topk_indices"] = topk_output["topk_indices"]
-                        (
-                            teacher_support_logprobs,
-                            teacher_support_time,
-                        ) = ray.get(
-                            trajectory_collector.compute_teacher_support_logprobs.remote(
-                                train_data["input_ids"],
-                                train_data["prev_topk_indices"],
-                                teacher_agent_refs,
-                                input_lengths=train_data["input_lengths"],
+                            support_indices = topk_output["topk_indices"]
+                            (
+                                teacher_support_logprobs,
+                                teacher_support_time,
+                            ) = ray.get(
+                                trajectory_collector.compute_teacher_support_logprobs.remote(
+                                    train_data["input_ids"],
+                                    support_indices,
+                                    teacher_agent_refs,
+                                    input_lengths=train_data["input_lengths"],
+                                )
                             )
-                        )
+                            rollout_metrics["teacher_support_logprob_time"] = (
+                                teacher_support_time
+                            )
+                        else:
+                            assert topk_source == "teacher"
+                            if (
+                                trajectory_teacher_topk_indices is None
+                                or trajectory_teacher_topk_logprobs is None
+                            ):
+                                raise ValueError(
+                                    "Teacher-top-k OPD requires collection-time "
+                                    "teacher support in the replay batch."
+                                )
+                            support_indices = _pad_teacher_logprobs(
+                                trajectory_teacher_topk_indices,
+                                train_data["input_ids"].shape[1],
+                            )
+                            teacher_support_logprobs = _pad_teacher_logprobs(
+                                trajectory_teacher_topk_logprobs,
+                                train_data["input_ids"].shape[1],
+                            )
+                        train_data["opd_support_indices"] = support_indices
                         train_data["teacher_support_logprobs"] = (
                             teacher_support_logprobs
-                        )
-                        rollout_metrics["teacher_support_logprob_time"] = (
-                            teacher_support_time
                         )
 
                     if not skip_reference_logprobs:
@@ -4896,7 +4932,7 @@ def async_grpo_train(
                     trajectory_teacher_logprobs = _pad_teacher_logprobs(
                         trajectory_teacher_logprobs, train_data["input_ids"].shape[1]
                     )
-                    if student_topk is not None:
+                    if opd_topk is not None:
                         train_data["teacher_reference_logprobs"] = (
                             trajectory_teacher_logprobs
                         )

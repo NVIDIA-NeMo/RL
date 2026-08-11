@@ -917,6 +917,105 @@ class AsyncTrajectoryCollector:
             input_lengths,
         )
 
+    def _compute_teacher_topk_logprobs(
+        self,
+        input_ids: torch.Tensor,
+        topk: int,
+        agent_refs: list[dict[str, Any]],
+        input_lengths: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        """Route one-pass teacher target/top-k inference and restore batch order."""
+        if topk < 1:
+            raise ValueError(f"topk must be at least 1, got {topk}.")
+        opd_cfg = self.on_policy_distillation_cfg
+        reference_aliases = resolve_reference_aliases(
+            agent_refs,
+            opd_cfg.get("teacher_model_by_agent_name", {}),
+            default_teacher_alias=opd_cfg.get("default_teacher_alias"),
+            strict_agent_name_match=opd_cfg.get("strict_agent_name_match", False),
+        )
+        group_to_indices: dict[str, list[int]] = defaultdict(list)
+        for sample_index, alias in enumerate(reference_aliases):
+            group_key = self.alias_to_group_alias.get(alias, alias)
+            group_to_indices[group_key].append(sample_index)
+
+        batch_size, seq_len = input_ids.shape
+        target_logprobs = torch.zeros(batch_size, seq_len, dtype=torch.float32)
+        support_indices = torch.zeros(batch_size, seq_len, topk, dtype=torch.long)
+        support_logprobs = torch.zeros(batch_size, seq_len, topk, dtype=torch.float32)
+        if not group_to_indices:
+            return target_logprobs, support_indices, support_logprobs, 0.0
+
+        def _evaluate_group(group_key: str, indices: list[int]):
+            teacher = self.teacher_worker_groups[group_key]
+            sub_input_ids = input_ids[indices]
+            sub_lengths = (
+                input_lengths[indices]
+                if input_lengths is not None
+                else torch.full(
+                    (sub_input_ids.shape[0],),
+                    seq_len,
+                    dtype=torch.long,
+                    device=sub_input_ids.device,
+                )
+            )
+            actual_batch_size = sub_input_ids.shape[0]
+            dp_size = teacher.sharding_annotations.get_axis_size("data_parallel")
+            remainder = actual_batch_size % dp_size
+            if remainder:
+                pad_count = dp_size - remainder
+                sub_input_ids = torch.cat(
+                    [sub_input_ids, sub_input_ids[-1:].expand(pad_count, -1)], dim=0
+                )
+                sub_lengths = torch.cat(
+                    [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
+                )
+
+            sub_data = BatchedDataDict(
+                {"input_ids": sub_input_ids, "input_lengths": sub_lengths}
+            )
+            lock_started = time.time()
+            with self._teacher_locks[group_key]:
+                inference_started = time.time()
+                topk_output = teacher.get_topk_logprobs(sub_data, k=topk)
+            finished = time.time()
+            print(
+                f"[teacher_topk] group={group_key} samples={actual_batch_size} "
+                f"lock_wait={inference_started - lock_started:.2f}s "
+                f"inference={finished - inference_started:.2f}s"
+            )
+            return (
+                indices,
+                topk_output["reference_logprobs"][:actual_batch_size],
+                topk_output["topk_indices"][:actual_batch_size],
+                topk_output["topk_logprobs"][:actual_batch_size],
+            )
+
+        started = time.time()
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(group_to_indices)
+        ) as executor:
+            futures = [
+                executor.submit(_evaluate_group, group_key, indices)
+                for group_key, indices in group_to_indices.items()
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                (
+                    indices,
+                    group_target_logprobs,
+                    group_support_indices,
+                    group_support_logprobs,
+                ) = future.result()
+                target_logprobs[indices] = group_target_logprobs
+                support_indices[indices] = group_support_indices
+                support_logprobs[indices] = group_support_logprobs
+        return (
+            target_logprobs,
+            support_indices,
+            support_logprobs,
+            time.time() - started,
+        )
+
     async def _iter_rollout_groups(
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
@@ -1123,12 +1222,29 @@ class AsyncTrajectoryCollector:
                         make_sequence_length_divisible_by=self._teacher_seq_pad_multiple,
                     )
                 )
-                teacher_logprobs, teacher_logprob_time = await asyncio.to_thread(
-                    self._compute_teacher_logprobs,
-                    flat_for_teacher["token_ids"],
-                    agent_refs,
-                    input_lengths=teacher_input_lengths,
-                )
+                teacher_topk = self.on_policy_distillation_cfg.get("teacher_topk")
+                if teacher_topk is None:
+                    teacher_logprobs, teacher_logprob_time = await asyncio.to_thread(
+                        self._compute_teacher_logprobs,
+                        flat_for_teacher["token_ids"],
+                        agent_refs,
+                        input_lengths=teacher_input_lengths,
+                    )
+                else:
+                    (
+                        teacher_logprobs,
+                        teacher_topk_indices,
+                        teacher_topk_logprobs,
+                        teacher_logprob_time,
+                    ) = await asyncio.to_thread(
+                        self._compute_teacher_topk_logprobs,
+                        flat_for_teacher["token_ids"],
+                        int(teacher_topk),
+                        agent_refs,
+                        input_lengths=teacher_input_lengths,
+                    )
+                    final_batch_cpu["teacher_topk_indices"] = teacher_topk_indices
+                    final_batch_cpu["teacher_topk_logprobs"] = teacher_topk_logprobs
                 # Keep the tensor inside the batch so replay-buffer collation can
                 # pad variable-length prompt groups correctly.
                 final_batch_cpu["teacher_reference_logprobs"] = teacher_logprobs

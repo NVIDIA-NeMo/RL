@@ -21,16 +21,18 @@ IS truncation lives in loss_functions.ClippedPGLoss (ICE-POP mode).
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import ray
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
 )
+
+TopkSource = Literal["student", "teacher"]
 
 # ---------------------------------------------------------------------------
 # Config schemas
@@ -70,11 +72,19 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
 
     enabled: bool = False
     student_topk: Optional[int] = Field(default=None, ge=1)
+    teacher_topk: Optional[int] = Field(default=None, ge=1)
     teacher_model_by_agent_name: dict[str, str] = Field(default_factory=dict)
     default_teacher_alias: Optional[str] = None
     strict_agent_name_match: bool = False
     deduplicate_shared_teacher_checkpoints: bool = True
     non_colocated_teachers: Optional[NonColocatedTeachersConfig] = None
+
+    @model_validator(mode="after")
+    def validate_topk_selector(self) -> "OnPolicyDistillationConfig":
+        """Require at most one model to select the OPD support."""
+        if self.student_topk is not None and self.teacher_topk is not None:
+            raise ValueError("student_topk and teacher_topk are mutually exclusive")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +137,37 @@ def get_student_topk(master_config: Any) -> Optional[int]:
     return topk
 
 
-def student_topk_reverse_kl_loss(
+def get_teacher_topk(master_config: Any) -> Optional[int]:
+    """Return the configured teacher-selected OPD support size, if any."""
+    topk = _opd_cfg(master_config).get("teacher_topk")
+    if topk is None:
+        return None
+    topk = int(topk)
+    if topk < 1:
+        raise ValueError(
+            f"on_policy_distillation.teacher_topk must be at least 1, got {topk}."
+        )
+    return topk
+
+
+def get_topk_support_config(
+    master_config: Any,
+) -> tuple[Optional[int], Optional[TopkSource]]:
+    """Return the OPD support size and selector (``student`` or ``teacher``)."""
+    student_topk = get_student_topk(master_config)
+    teacher_topk = get_teacher_topk(master_config)
+    if student_topk is not None and teacher_topk is not None:
+        raise ValueError(
+            "on_policy_distillation.student_topk and teacher_topk are mutually exclusive."
+        )
+    if student_topk is not None:
+        return student_topk, "student"
+    if teacher_topk is not None:
+        return teacher_topk, "teacher"
+    return None, None
+
+
+def topk_reverse_kl_loss(
     *,
     student_support_logprobs: torch.Tensor,
     teacher_support_logprobs: torch.Tensor,
@@ -135,10 +175,10 @@ def student_topk_reverse_kl_loss(
     teacher_target_logprobs: torch.Tensor,
     target_in_support: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute the per-token student-top-k reverse-KL estimator.
+    """Compute the per-token top-k-support reverse-KL estimator.
 
-    The exact reverse-KL contribution is used for the student-selected top-k
-    support. When the sampled target is outside that support, its score-function
+    The exact reverse-KL contribution is used for a selected top-k support.
+    When the sampled target is outside that support, its score-function
     contribution estimates the remaining vocabulary tail without transferring
     full-vocabulary teacher logits.
 

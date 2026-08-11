@@ -173,7 +173,7 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
-    prev_topk_indices: NotRequired[torch.Tensor]
+    opd_support_indices: NotRequired[torch.Tensor]
     teacher_support_logprobs: NotRequired[torch.Tensor]
     teacher_reference_logprobs: NotRequired[torch.Tensor]
     __extra__: Any
@@ -231,41 +231,33 @@ class ClippedPGLossFn(LossFunction):
         self,
         cfg: ClippedPGLossConfig,
         use_fused_linear_logprobs: bool = False,
-        opd_student_topk: Optional[int] = None,
+        opd_topk: Optional[int] = None,
     ):
         # When True, the model forward is patched to return precomputed next-token
         # logprobs (via chunked linear CE fusion) instead of full logits. This is
         # consumed by prepare_loss_input, which short-circuits the logits->logprobs
         # conversion. See nemo_rl/distributed/model_utils.py for the fused forward.
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
-        self.opd_student_topk = opd_student_topk
+        self.opd_topk = opd_topk
         self.input_type = (
-            LossInputType.OPD_STUDENT_TOPK
-            if opd_student_topk is not None
-            else LossInputType.LOGPROB
+            LossInputType.OPD_TOPK if opd_topk is not None else LossInputType.LOGPROB
         )
-        if opd_student_topk is not None:
-            if opd_student_topk < 1:
-                raise ValueError(
-                    f"opd_student_topk must be at least 1, got {opd_student_topk}."
-                )
+        if opd_topk is not None:
+            if opd_topk < 1:
+                raise ValueError(f"opd_topk must be at least 1, got {opd_topk}.")
             if use_fused_linear_logprobs:
                 raise ValueError(
-                    "Student-top-k OPD is incompatible with fused linear logprobs."
+                    "Top-k OPD is incompatible with fused linear logprobs."
                 )
             if not cfg.disable_ppo_ratio:
-                raise ValueError(
-                    "Student-top-k OPD requires loss_fn.disable_ppo_ratio=true."
-                )
+                raise ValueError("Top-k OPD requires loss_fn.disable_ppo_ratio=true.")
             if cfg.use_cispo:
-                raise ValueError("Student-top-k OPD is incompatible with CISPO.")
+                raise ValueError("Top-k OPD is incompatible with CISPO.")
             if cfg.ratio_clip_c is not None:
-                raise ValueError(
-                    "Student-top-k OPD is incompatible with dual PPO clipping."
-                )
+                raise ValueError("Top-k OPD is incompatible with dual PPO clipping.")
             if cfg.sequence_level_importance_ratios or not cfg.token_level_loss:
                 raise ValueError(
-                    "Student-top-k OPD requires token-level loss and importance ratios."
+                    "Top-k OPD requires token-level loss and importance ratios."
                 )
         self.disable_ppo_ratio = cfg.disable_ppo_ratio
         self.ratio_clip_min = cfg.ratio_clip_min
@@ -404,7 +396,7 @@ class ClippedPGLossFn(LossFunction):
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
                 else MetricNormalizer.TOKENS
             )
-        if self.opd_student_topk is not None:
+        if self.opd_topk is not None:
             self.metric_normalizations.update(
                 {
                     "opd_topk_head_loss": MetricNormalizer.TOKENS,
@@ -596,23 +588,23 @@ class ClippedPGLossFn(LossFunction):
             clip_loss = torch.max(loss1, loss2)
 
         opd_topk_metrics: dict[str, float] = {}
-        if self.opd_student_topk is not None:
-            from nemo_rl.algorithms.opd import student_topk_reverse_kl_loss
+        if self.opd_topk is not None:
+            from nemo_rl.algorithms.opd import topk_reverse_kl_loss
 
             if current_support_logprobs is None:
-                raise ValueError("Student-top-k OPD requires current_support_logprobs.")
+                raise ValueError("Top-k OPD requires current_support_logprobs.")
             required_fields = (
-                "prev_topk_indices",
+                "opd_support_indices",
                 "teacher_support_logprobs",
                 "teacher_reference_logprobs",
             )
             missing = [field for field in required_fields if field not in data]
             if missing:
                 raise ValueError(
-                    "Student-top-k OPD training data is missing: " + ", ".join(missing)
+                    "Top-k OPD training data is missing: " + ", ".join(missing)
                 )
 
-            support_indices = data["prev_topk_indices"][:, :-1]
+            support_indices = data["opd_support_indices"][:, :-1]
             teacher_support_logprobs = data["teacher_support_logprobs"][:, :-1]
             expected_support_shape = support_indices.shape
             for name, value in (
@@ -628,10 +620,10 @@ class ClippedPGLossFn(LossFunction):
                 device=current_support_logprobs.device,
                 dtype=current_support_logprobs.dtype,
             )
-            if expected_support_shape[-1] != self.opd_student_topk:
+            if expected_support_shape[-1] != self.opd_topk:
                 raise ValueError(
-                    "Student top-k data does not match configured support size: "
-                    f"expected {self.opd_student_topk}, got "
+                    "Top-k OPD data does not match configured support size: "
+                    f"expected {self.opd_topk}, got "
                     f"{expected_support_shape[-1]}."
                 )
 
@@ -646,7 +638,7 @@ class ClippedPGLossFn(LossFunction):
                 device=curr_logprobs.device,
                 dtype=curr_logprobs.dtype,
             )
-            clip_loss = student_topk_reverse_kl_loss(
+            clip_loss = topk_reverse_kl_loss(
                 student_support_logprobs=current_support_logprobs,
                 teacher_support_logprobs=teacher_support_logprobs,
                 student_target_logprobs=curr_logprobs,

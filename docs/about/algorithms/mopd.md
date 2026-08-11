@@ -35,13 +35,14 @@ tool / environment tokens contribute zero. Because the advantage subtracts a
 real `prev_logprobs`, MOPD requires the student log-probabilities to actually be
 computed — see [Configuration](#configuration).
 
-### Student top-k reverse KL
+### Top-k reverse KL
 
-Setting `on_policy_distillation.student_topk` replaces the sampled-token MOPD
-loss with a lower-variance reverse-KL estimator. For every token, the student
-selects its highest-probability `k` vocabulary entries. NeMo RL evaluates the
-student and teacher exactly on that support and uses the sampled rollout token
-to estimate the contribution from the remaining vocabulary.
+Setting either `on_policy_distillation.student_topk` or `teacher_topk` replaces
+the sampled-token MOPD loss with a lower-variance reverse-KL estimator. For
+every token, the selected model supplies its highest-probability `k` vocabulary
+entries. NeMo RL evaluates both models exactly on that support and uses the
+sampled rollout token to estimate the contribution from the remaining
+vocabulary. The two selectors are mutually exclusive.
 
 The sampled tail uses the score-function coefficient
 `1 + log π_student − log π_teacher`. The `1` is required because the derivative
@@ -80,6 +81,9 @@ on_policy_distillation:
   # Optional: use the student's top-k vocabulary entries for an exact KL head
   # and the sampled rollout token for the remaining tail.
   # student_topk: 64
+  # Alternatively, let the teacher select the support. This is mutually
+  # exclusive with student_topk.
+  # teacher_topk: 64
   # Map each NeMo Gym agent name to a teacher checkpoint.
   teacher_model_by_agent_name:
     default_teacher: Qwen/Qwen3-1.7B
@@ -117,13 +121,14 @@ on_policy_distillation:
 > degrade to `teacher_logprobs − 0`.
 
 > [!NOTE]
-> Student top-k mode currently requires async GRPO, a Megatron policy backend,
+> Top-k mode currently requires async GRPO, a Megatron policy backend,
 > token-level loss, `loss_fn.disable_ppo_ratio: true`, sequence packing disabled,
 > context parallel size 1, fused linear log-probabilities disabled, and an
-> unfiltered training distribution (`generation.top_k: null`, `top_p: 1.0`).
+> unfiltered training distribution (`generation.top_k: null`, `top_p: 1.0`,
+> `temperature: 1.0`).
 > CISPO, dual PPO clipping, and sequence-level importance ratios are unsupported.
 
-Student top-k training reports four additional metrics:
+Top-k training reports four additional metrics:
 
 - `opd_topk_head_loss`: exact reverse-KL contribution on the selected support.
 - `opd_topk_tail_loss`: sampled score-function surrogate for the tail gradient.
@@ -183,6 +188,12 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
   data.train.data_path=/path/to/train.jsonl \
   data.validation.data_path=/path/to/val.jsonl
 ```
+
+Use `on_policy_distillation.teacher_topk=64` instead of `student_topk=64` to
+run the teacher-selected variant. Teacher selection is performed inside each
+teacher worker in the same forward that computes sampled-token probabilities;
+the selected indices and normalized log-probabilities are stored with the
+trajectory and reused by the trainer.
 
 This remains a smoke-test configuration. Measure throughput, peak memory, and
 loss/reward convergence against full-vocabulary MOPD before using it as a

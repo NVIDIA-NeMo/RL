@@ -628,9 +628,10 @@ class LogprobsPostProcessor:
 
 
 class TopkLogitsPostProcessor:
-    def __init__(self, cfg: PolicyConfig, k: int):
+    def __init__(self, cfg: PolicyConfig, k: int, return_logprobs: bool = False):
         self.cfg = cfg
         self.k = k
+        self.return_logprobs = return_logprobs
 
     def __call__(
         self,
@@ -653,6 +654,11 @@ class TopkLogitsPostProcessor:
         """
         pack = self.cfg["sequence_packing"]["enabled"]
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
+        if self.return_logprobs and (pack or cp_size != 1):
+            raise NotImplementedError(
+                "Teacher top-k logprobs do not yet support sequence packing or "
+                "context parallelism."
+            )
         unpacked_seqlen = data_dict["input_ids"].shape[1]
         seq_lengths = data_dict["input_lengths"]
 
@@ -762,10 +768,37 @@ class TopkLogitsPostProcessor:
                     "topk_indices": out_idx,
                 }
             else:
-                return output_tensor.new_zeros(()), {
+                result = {
                     "topk_logits": topk_vals_full,
                     "topk_indices": topk_idx_full,
                 }
+                if self.return_logprobs:
+                    local_logprobs = vocab_parallel_log_softmax(
+                        output_tensor,
+                        temperature=1.0,
+                        tp_group=tp_grp,
+                    )
+                    result["topk_logprobs"] = gather_logits_at_global_indices(
+                        local_logprobs,
+                        topk_idx_full,
+                        tp_group=tp_grp,
+                        vocab_start_index=vocab_start_index,
+                        vocab_end_index=vocab_start_index + vocab_shard_size,
+                    )
+                    target_logprobs = gather_logits_at_global_indices(
+                        local_logprobs[:, :-1],
+                        data_dict["input_ids"][:, 1:]
+                        .to(device=output_tensor.device, dtype=torch.long)
+                        .unsqueeze(-1),
+                        tp_group=tp_grp,
+                        vocab_start_index=vocab_start_index,
+                        vocab_end_index=vocab_start_index + vocab_shard_size,
+                    ).squeeze(-1)
+                    result["logprobs"] = torch.cat(
+                        [torch.zeros_like(target_logprobs[:, :1]), target_logprobs],
+                        dim=1,
+                    )
+                return output_tensor.new_zeros(()), result
 
         return processor_fn_inner
 

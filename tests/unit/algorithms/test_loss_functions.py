@@ -69,7 +69,7 @@ def _student_topk_opd_loss_data():
             "prev_logprobs": torch.tensor([[0.0, -1.1, -1.2]]),
             "generation_logprobs": torch.tensor([[0.0, -1.1, -1.2]]),
             "reference_policy_logprobs": torch.zeros(1, 3),
-            "prev_topk_indices": torch.tensor([[[1, 0], [0, 1], [0, 0]]]),
+            "opd_support_indices": torch.tensor([[[1, 0], [0, 1], [0, 0]]]),
             "teacher_support_logprobs": torch.tensor(
                 [[[-0.7, -1.2], [-0.8, -1.0], [0.0, 0.0]]]
             ),
@@ -80,16 +80,16 @@ def _student_topk_opd_loss_data():
 
 def test_student_topk_opd_loss_configuration_guards():
     with pytest.raises(ValueError, match="disable_ppo_ratio"):
-        ClippedPGLossFn(ClippedPGLossConfig(), opd_student_topk=2)
+        ClippedPGLossFn(ClippedPGLossConfig(), opd_topk=2)
 
     loss_fn = ClippedPGLossFn(
         ClippedPGLossConfig(
             disable_ppo_ratio=True,
             reference_policy_kl_penalty=0.0,
         ),
-        opd_student_topk=2,
+        opd_topk=2,
     )
-    assert loss_fn.input_type.value == "opd_student_topk"
+    assert loss_fn.input_type.value == "opd_topk"
 
 
 @pytest.mark.parametrize(
@@ -123,19 +123,19 @@ def test_student_topk_opd_loss_rejects_incompatible_options(
         ClippedPGLossFn(
             cfg,
             use_fused_linear_logprobs=use_fused_linear_logprobs,
-            opd_student_topk=2,
+            opd_topk=2,
         )
 
 
 def test_student_topk_opd_loss_uses_head_and_sampled_tail():
-    from nemo_rl.algorithms.opd import student_topk_reverse_kl_loss
+    from nemo_rl.algorithms.opd import topk_reverse_kl_loss
 
     loss_fn = ClippedPGLossFn(
         ClippedPGLossConfig(
             disable_ppo_ratio=True,
             reference_policy_kl_penalty=0.0,
         ),
-        opd_student_topk=2,
+        opd_topk=2,
     )
     data = _student_topk_opd_loss_data()
     # Only the second target contributes. This makes the assertion sensitive to
@@ -152,7 +152,7 @@ def test_student_topk_opd_loss_uses_head_and_sampled_tail():
         global_valid_toks=torch.tensor(1.0),
     )
 
-    expected = student_topk_reverse_kl_loss(
+    expected = topk_reverse_kl_loss(
         student_support_logprobs=current_support,
         teacher_support_logprobs=data["teacher_support_logprobs"][:, :-1],
         student_target_logprobs=current_target,
@@ -175,7 +175,7 @@ def test_prepare_student_topk_opd_loss_input_uses_full_vocab_normalization():
             disable_ppo_ratio=True,
             reference_policy_kl_penalty=0.0,
         ),
-        opd_student_topk=2,
+        opd_topk=2,
     )
     data = _student_topk_opd_loss_data().to("cuda")
     logits = torch.tensor(
@@ -186,7 +186,7 @@ def test_prepare_student_topk_opd_loss_input_uses_full_vocab_normalization():
     loss_input, _ = prepare_loss_input(logits, data, loss_fn)
 
     full_logprobs = logits.log_softmax(dim=-1)
-    expected_support = full_logprobs.gather(-1, data["prev_topk_indices"])[:, :-1]
+    expected_support = full_logprobs.gather(-1, data["opd_support_indices"])[:, :-1]
     torch.testing.assert_close(loss_input["current_support_logprobs"], expected_support)
     assert loss_input["next_token_logprobs"].shape == (1, 2)
 

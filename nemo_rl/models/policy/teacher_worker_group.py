@@ -37,7 +37,10 @@ from nemo_rl.distributed.batched_data_dict import (
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
-from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
+from nemo_rl.models.policy.interfaces import (
+    ReferenceLogprobOutputSpec,
+    TopkLogprobsOutputSpec,
+)
 
 
 @dataclass
@@ -115,7 +118,7 @@ class TeacherWorkerGroup:
     - Never initializes an optimizer
     - Never initializes a reference model
     - Loads the checkpoint once at startup
-    - Exposes sampled-token and caller-selected-support logprob inference
+    - Exposes sampled-token, caller-selected, and teacher-selected support inference
     """
 
     def __init__(
@@ -300,7 +303,7 @@ class TeacherWorkerGroup:
         data: BatchedDataDict[GenerationDatumSpec],
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[Any]:
-        """Evaluate teacher logprobs on student-selected vocabulary indices.
+        """Evaluate teacher logprobs on caller-selected vocabulary indices.
 
         ``data['topk_indices']`` must have shape ``[B, S, K]`` and align with
         ``input_ids``. This first implementation intentionally excludes packing
@@ -309,11 +312,11 @@ class TeacherWorkerGroup:
         """
         if self.use_sequence_packing:
             raise NotImplementedError(
-                "Student-top-k teacher evaluation does not yet support sequence packing."
+                "Top-k teacher evaluation does not yet support sequence packing."
             )
         if self.cfg["megatron_cfg"]["context_parallel_size"] != 1:
             raise NotImplementedError(
-                "Student-top-k teacher evaluation does not yet support context parallelism."
+                "Top-k teacher evaluation does not yet support context parallelism."
             )
         if "topk_indices" not in data:
             raise ValueError("get_logprobs_on_support requires data['topk_indices'].")
@@ -343,6 +346,60 @@ class TeacherWorkerGroup:
                 "support_logprobs": torch.cat(
                     [batch["support_logprobs"] for batch in worker_batches], dim=0
                 ).cpu()
+            }
+        )
+
+    def get_topk_logprobs(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[TopkLogprobsOutputSpec]:
+        """Return target logprobs and teacher-selected support in one forward."""
+        if self.use_sequence_packing:
+            raise NotImplementedError(
+                "Teacher-selected top-k does not yet support sequence packing."
+            )
+        if self.cfg["megatron_cfg"]["context_parallel_size"] != 1:
+            raise NotImplementedError(
+                "Teacher-selected top-k does not yet support context parallelism."
+            )
+
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        mbs = micro_batch_size or self._micro_batch_size
+        sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "get_topk_logits",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={
+                "k": k,
+                "micro_batch_size": mbs,
+                "return_logprobs": True,
+            },
+        )
+        worker_batches = self.worker_group.get_all_worker_results(futures)
+        return BatchedDataDict[TopkLogprobsOutputSpec](
+            {
+                "reference_logprobs": torch.cat(
+                    [batch["logprobs"] for batch in worker_batches], dim=0
+                ).cpu(),
+                "topk_indices": torch.cat(
+                    [batch["topk_indices"] for batch in worker_batches], dim=0
+                ).cpu(),
+                "topk_logprobs": torch.cat(
+                    [batch["topk_logprobs"] for batch in worker_batches], dim=0
+                ).cpu(),
             }
         )
 

@@ -119,3 +119,56 @@ def test_get_logprobs_on_support_routes_shards_and_preserves_worker_order():
     assert call.args == ("get_logprobs_on_support",)
     assert len(call.kwargs["data"]) == 2
     assert call.kwargs["common_kwargs"] == {"micro_batch_size": 3}
+
+
+def test_get_topk_logprobs_routes_shards_and_preserves_worker_order():
+    from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
+
+    teacher = object.__new__(TeacherWorkerGroup)
+    teacher.use_sequence_packing = False
+    teacher.cfg = {"megatron_cfg": {"context_parallel_size": 1}}
+    teacher._micro_batch_size = 3
+    teacher.sharding_annotations = MagicMock()
+    teacher.sharding_annotations.get_axis_size.return_value = 2
+    teacher.worker_group = MagicMock()
+    teacher.worker_group.run_all_workers_sharded_data.return_value = ["f0", "f1"]
+    first_indices = torch.tensor([[[1, 2]], [[3, 4]]])
+    second_indices = torch.tensor([[[5, 6]], [[7, 8]]])
+    first_logprobs = torch.tensor([[[-1.0, -2.0]], [[-3.0, -4.0]]])
+    second_logprobs = torch.tensor([[[-5.0, -6.0]], [[-7.0, -8.0]]])
+    first_targets = torch.tensor([[0.0], [-1.0]])
+    second_targets = torch.tensor([[-2.0], [-3.0]])
+    teacher.worker_group.get_all_worker_results.return_value = [
+        {
+            "logprobs": first_targets,
+            "topk_indices": first_indices,
+            "topk_logprobs": first_logprobs,
+        },
+        {
+            "logprobs": second_targets,
+            "topk_indices": second_indices,
+            "topk_logprobs": second_logprobs,
+        },
+    ]
+    data = BatchedDataDict({"input_ids": torch.arange(4).unsqueeze(1)})
+
+    result = teacher.get_topk_logprobs(data, k=2)
+
+    torch.testing.assert_close(
+        result["topk_indices"], torch.cat((first_indices, second_indices), dim=0)
+    )
+    torch.testing.assert_close(
+        result["topk_logprobs"], torch.cat((first_logprobs, second_logprobs), dim=0)
+    )
+    torch.testing.assert_close(
+        result["reference_logprobs"],
+        torch.cat((first_targets, second_targets), dim=0),
+    )
+    call = teacher.worker_group.run_all_workers_sharded_data.call_args
+    assert call.args == ("get_topk_logits",)
+    assert len(call.kwargs["data"]) == 2
+    assert call.kwargs["common_kwargs"] == {
+        "k": 2,
+        "micro_batch_size": 3,
+        "return_logprobs": True,
+    }

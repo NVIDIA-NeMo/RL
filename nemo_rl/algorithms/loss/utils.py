@@ -121,22 +121,22 @@ def prepare_loss_input(
 
         loss_input = {"next_token_logprobs": logprobs}
 
-    elif loss_fn.input_type == LossInputType.OPD_STUDENT_TOPK:
+    elif loss_fn.input_type == LossInputType.OPD_TOPK:
         if (
             context_parallel_group is not None
             and torch.distributed.get_world_size(context_parallel_group) > 1
         ):
             raise NotImplementedError(
-                "Student-top-k OPD loss preparation does not yet support context parallelism."
+                "Top-k OPD loss preparation does not yet support context parallelism."
             )
-        if "prev_topk_indices" not in data:
-            raise ValueError("Student-top-k OPD requires data['prev_topk_indices'].")
-        support_indices = data["prev_topk_indices"].to(
+        if "opd_support_indices" not in data:
+            raise ValueError("Top-k OPD requires data['opd_support_indices'].")
+        support_indices = data["opd_support_indices"].to(
             device=logits.device, dtype=torch.long
         )
         if support_indices.shape[:2] != logits.shape[:2]:
             raise ValueError(
-                "prev_topk_indices must match logits batch and sequence dimensions, "
+                "opd_support_indices must match logits batch and sequence dimensions, "
                 f"got {support_indices.shape[:2]} and {logits.shape[:2]}."
             )
 

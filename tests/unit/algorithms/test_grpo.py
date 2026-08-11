@@ -45,7 +45,7 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _should_use_async_rollouts,
     _validate_multimodal_dedup_capability,
-    _validate_student_topk_config,
+    _validate_topk_opd_config,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
@@ -186,9 +186,10 @@ def test_initial_policy_generation_stale() -> None:
     assert _initial_policy_generation_stale(generation, completed_steps=0)
 
 
-def _enable_valid_student_topk(master_config: MasterConfig) -> None:
+def _enable_valid_topk(master_config: MasterConfig, source: str = "student") -> None:
+    topk_kwargs = {f"{source}_topk": 8}
     master_config.on_policy_distillation = OnPolicyDistillationConfig(
-        enabled=True, student_topk=8
+        enabled=True, **topk_kwargs
     )
     master_config.grpo.async_grpo.enabled = True
     master_config.grpo.adv_estimator.name = "opd"
@@ -200,15 +201,17 @@ def _enable_valid_student_topk(master_config: MasterConfig) -> None:
     }
     master_config.policy["generation"]["top_k"] = None
     master_config.policy["generation"]["top_p"] = 1.0
+    master_config.policy["generation"]["temperature"] = 1.0
 
 
-def test_validate_student_topk_config_accepts_supported_settings(
-    mock_grpo_components,
+@pytest.mark.parametrize("source", ["student", "teacher"])
+def test_validate_topk_opd_config_accepts_supported_settings(
+    mock_grpo_components, source
 ):
     master_config = mock_grpo_components["master_config"]
-    _enable_valid_student_topk(master_config)
+    _enable_valid_topk(master_config, source)
 
-    _validate_student_topk_config(master_config, student_topk=8)
+    _validate_topk_opd_config(master_config, opd_topk=8, topk_source=source)
 
 
 @pytest.mark.parametrize(
@@ -220,15 +223,16 @@ def test_validate_student_topk_config_accepts_supported_settings(
         ("context_parallel", NotImplementedError, "context parallelism"),
         ("non_megatron", NotImplementedError, "Megatron policy backend"),
         ("filtered_sampling", NotImplementedError, "unfiltered training distributions"),
+        ("temperature", NotImplementedError, "generation.temperature=1.0"),
         ("reference_kl", ValueError, "reference_policy_kl_penalty=0"),
         ("adv_estimator", ValueError, "adv_estimator.name='opd'"),
     ],
 )
-def test_validate_student_topk_config_rejects_unsupported_settings(
+def test_validate_topk_opd_config_rejects_unsupported_settings(
     mock_grpo_components, invalid_setting, error_type, message
 ):
     master_config = mock_grpo_components["master_config"]
-    _enable_valid_student_topk(master_config)
+    _enable_valid_topk(master_config)
 
     if invalid_setting == "opd_disabled":
         master_config.on_policy_distillation.enabled = False
@@ -242,13 +246,15 @@ def test_validate_student_topk_config_rejects_unsupported_settings(
         master_config.policy["megatron_cfg"]["enabled"] = False
     elif invalid_setting == "filtered_sampling":
         master_config.policy["generation"]["top_k"] = 16
+    elif invalid_setting == "temperature":
+        master_config.policy["generation"]["temperature"] = 0.7
     elif invalid_setting == "reference_kl":
         master_config.loss_fn.reference_policy_kl_penalty = 0.01
     elif invalid_setting == "adv_estimator":
         master_config.grpo.adv_estimator.name = "grpo"
 
     with pytest.raises(error_type, match=message):
-        _validate_student_topk_config(master_config, student_topk=8)
+        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="student")
 
 
 @pytest.fixture

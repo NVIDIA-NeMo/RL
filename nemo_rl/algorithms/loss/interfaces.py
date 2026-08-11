@@ -52,7 +52,7 @@ class MetricNormalizer(enum.Enum):
 class LossInputType(enum.Enum):
     LOGIT = "logit"
     LOGPROB = "logprob"
-    OPD_STUDENT_TOPK = "opd_student_topk"
+    OPD_TOPK = "opd_topk"
     DISTILLATION = "distillation"
     DISTILLATION_CROSS_TOKENIZER = "distillation_cross_tokenizer"
     DRAFT = "draft"
@@ -98,7 +98,7 @@ class LossFunction(Protocol):
             **kwargs: Loss function input, which varies by input_type:
                 - For LossInputType.LOGPROB: next_token_logprobs (torch.Tensor)
                 - For LossInputType.LOGIT: logits (torch.Tensor)
-                - For LossInputType.OPD_STUDENT_TOPK: next-token and selected-support logprobs
+                - For LossInputType.OPD_TOPK: next-token and selected-support logprobs
                 - For LossInputType.DISTILLATION: student_topk_logprobs, teacher_topk_logprobs, H_all (torch.Tensor)
                 - For LossInputType.DISTILLATION_CROSS_TOKENIZER: logits (torch.Tensor), teacher_full_logits_by_idx (dict[int, torch.Tensor])
                 - For LossInputType.DRAFT: teacher_logits, student_logits, mask (torch.Tensor)
