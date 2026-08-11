@@ -13,32 +13,33 @@
 # limitations under the License.
 """Shared helpers for the OpenAI-compatible HTTP generation servers.
 
-These utilities are backend-agnostic: they operate on token-ID lists plus a
-tokenizer, with no engine calls. They are shared by the vLLM async worker
-(``vllm_worker_async.py``) and the TRT-LLM HTTP server (``trtllm_http_server.py``),
-which both put a message-based ``/v1/chat/completions`` layer in front of a token
-engine for the agentic NeMo-Gym path. SGLang does not use these — it is driven
-token-in/token-out via ``generate(input_ids)`` and never re-templates messages,
-so it has no retokenization drift to correct.
+These backend-agnostic utilities operate on token-ID lists, parsed chat messages,
+and caller-supplied tokenizers or render functions. They make no engine calls.
+They are shared by the vLLM async worker (``vllm_worker_async.py``) and the
+TRT-LLM HTTP server (``trtllm_http_server.py``), which both put a message-based
+``/v1/chat/completions`` layer in front of a token engine for the agentic
+NeMo-Gym path. SGLang does not use these — it is driven token-in/token-out via
+``generate(input_ids)`` and never re-templates messages, so it has no
+retokenization drift to correct.
 """
 
-import json
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any
-
 
 _COMPLETE_TOKEN_BOUNDARY_MARKER = "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E"
 
 
 class CompleteTokenInjectionError(ValueError):
-    """Raised when complete prompt tokens cannot be derived safely."""
+    """Signal that complete-token injection must use native preprocessing."""
 
 
-def find_latest_tokenized_assistant_ordinal(messages: list[Any]) -> int | None:
-    """Return the assistant ordinal carrying the latest Gym token metadata."""
+def find_latest_tokenized_assistant(
+    messages: list[Any],
+) -> tuple[int, Mapping[str, Any]] | None:
+    """Return the latest fully tokenized assistant and its assistant ordinal."""
     assistant_ordinal = -1
-    latest_tokenized_ordinal = None
+    latest_tokenized_assistant = None
     for message in messages:
         if not isinstance(message, Mapping) or message.get("role") != "assistant":
             continue
@@ -47,8 +48,8 @@ def find_latest_tokenized_assistant_ordinal(messages: list[Any]) -> int | None:
             message.get("prompt_token_ids") is not None
             and message.get("generation_token_ids") is not None
         ):
-            latest_tokenized_ordinal = assistant_ordinal
-    return latest_tokenized_ordinal
+            latest_tokenized_assistant = (assistant_ordinal, message)
+    return latest_tokenized_assistant
 
 
 def _assistant_index_from_ordinal(
@@ -64,33 +65,6 @@ def _assistant_index_from_ordinal(
     raise CompleteTokenInjectionError(
         "The tokenized assistant message was not present after chat parsing."
     )
-
-
-def _normalize_tool_arguments_for_template(
-    messages: list[Any], *, before_index: int
-) -> None:
-    for message in messages[:before_index]:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            function = tool_call.get("function", tool_call)
-            if not isinstance(function, dict):
-                continue
-            arguments = function.get("arguments")
-            if not isinstance(arguments, str):
-                continue
-            try:
-                parsed_arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                parsed_arguments = {}
-            function["arguments"] = (
-                parsed_arguments if isinstance(parsed_arguments, dict) else {}
-            )
 
 
 def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
@@ -114,6 +88,10 @@ def build_complete_prompt_token_ids(
 ) -> list[int]:
     """Join exact model-prefix tokens with a verified contextual suffix.
 
+    ``assistant_ordinal`` must identify the assistant turn covered by
+    ``model_prefix_token_ids``. A mismatch can produce a valid but incorrect
+    prompt, so callers must derive both values from the same message.
+
     The complete conversation is rendered with the tokenized assistant replaced
     by a marker. This preserves context-sensitive template behavior after that
     assistant while making its closing EOS the exact splice boundary.
@@ -129,9 +107,6 @@ def build_complete_prompt_token_ids(
 
     assistant_index = _assistant_index_from_ordinal(
         marked_conversation, assistant_ordinal
-    )
-    _normalize_tool_arguments_for_template(
-        marked_conversation, before_index=assistant_index
     )
 
     marked_assistant = marked_conversation[assistant_index]
@@ -175,6 +150,12 @@ def build_complete_prompt_token_ids(
     if suffix_pos < 0:
         raise CompleteTokenInjectionError(
             "The chat template did not close the tokenized assistant with EOS."
+        )
+    marker_end = marker_pos + len(_COMPLETE_TOKEN_BOUNDARY_MARKER)
+    if marked_text[marker_end:suffix_pos].strip():
+        raise CompleteTokenInjectionError(
+            "The chat template did not close the tokenized assistant immediately; "
+            "the EOS boundary would skip intervening messages."
         )
 
     try:

@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 import warnings
+from collections import Counter
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -43,7 +44,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.openai_server_utils import (
     CompleteTokenInjectionError,
     build_complete_prompt_token_ids,
-    find_latest_tokenized_assistant_ordinal,
+    find_latest_tokenized_assistant,
     replace_prefix_tokens,
 )
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
@@ -59,6 +60,51 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _complete_token_injection_eligibility(
+    request: Any,
+    messages: list[Any],
+    *,
+    has_multimodal_config: bool,
+    prompt_embeds_enabled: bool,
+    renderer_supported: bool,
+) -> tuple[int | None, str | None]:
+    """Return an assistant ordinal or a reason to use native preprocessing."""
+    if getattr(request, "stream", False):
+        return None, "streaming request"
+    if getattr(request, "n", 1) not in (None, 1):
+        return None, "multiple response choices"
+    if getattr(request, "continue_final_message", False):
+        return None, "continue_final_message request"
+    if getattr(request, "echo", False):
+        return None, "echo request"
+    if getattr(request, "return_assistant_tokens_mask", False):
+        return None, "assistant token mask request"
+    if getattr(request, "add_special_tokens", False):
+        return None, "add_special_tokens request"
+    if getattr(request, "return_prompt_text", False):
+        return None, "return_prompt_text request"
+    if has_multimodal_config:
+        return None, "multimodal model"
+    if prompt_embeds_enabled:
+        return None, "prompt embeddings enabled"
+    if not renderer_supported:
+        return None, "unsupported renderer"
+    for message in messages:
+        if not isinstance(message, dict):
+            return None, "non-object message"
+        if message.get("role") not in {"system", "user", "assistant", "tool"}:
+            return None, "unsupported message role"
+        content = message.get("content")
+        if content is not None and not isinstance(content, str):
+            return None, "non-text message content"
+
+    tokenized_assistant = find_latest_tokenized_assistant(messages)
+    if tokenized_assistant is None:
+        return None, "no fully tokenized assistant"
+    assistant_ordinal, _ = tokenized_assistant
+    return assistant_ordinal, None
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -422,13 +468,13 @@ class VllmAsyncGenerationWorkerImpl(
             def model_post_init(self, context):
                 # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
                 if self.required_prefix_token_ids is None:
-                    for message in reversed(self.messages):
-                        if "prompt_token_ids" in message:
-                            self.required_prefix_token_ids = (
-                                message["prompt_token_ids"]
-                                + message["generation_token_ids"]
-                            )
-                            break
+                    tokenized_assistant = find_latest_tokenized_assistant(self.messages)
+                    if tokenized_assistant is not None:
+                        _, message = tokenized_assistant
+                        self.required_prefix_token_ids = (
+                            message["prompt_token_ids"]
+                            + message["generation_token_ids"]
+                        )
 
                 return super().model_post_init(context)
 
@@ -459,44 +505,15 @@ class VllmAsyncGenerationWorkerImpl(
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)
 
-            def _complete_token_injection_assistant_ordinal(
-                self, request, messages
-            ) -> Optional[int]:
-                """Return the assistant ordinal when the guarded path is supported."""
-                if not isinstance(request, NeMoRLChatCompletionRequest):
-                    return None
-                if request.required_prefix_token_ids is None:
-                    return None
-                if getattr(request, "stream", False):
-                    return None
-                if getattr(request, "n", 1) not in (None, 1):
-                    return None
-                if getattr(request, "continue_final_message", False):
-                    return None
-                if getattr(request, "echo", False):
-                    return None
-                if getattr(request, "return_assistant_tokens_mask", False):
-                    return None
-                if self.model_config.multimodal_config is not None:
-                    return None
-                if self.model_config.enable_prompt_embeds:
-                    return None
-                if not isinstance(self.renderer, HfRenderer):
-                    return None
-                for message in messages:
-                    if not isinstance(message, dict):
-                        return None
-                    if message.get("role") not in {
-                        "system",
-                        "user",
-                        "assistant",
-                        "tool",
-                    }:
-                        return None
-                    content = message.get("content")
-                    if content is not None and not isinstance(content, str):
-                        return None
-                return find_latest_tokenized_assistant_ordinal(request.messages)
+            def _record_complete_token_injection_fallback(self, reason: str) -> None:
+                self._complete_token_injection_fallbacks[reason] += 1
+                if reason in self._logged_complete_token_injection_fallbacks:
+                    return
+                self._logged_complete_token_injection_fallbacks.add(reason)
+                LOGGER.warning(
+                    "Complete-token injection fell back to native preprocessing: %s",
+                    reason,
+                )
 
             async def _preprocess_chat_with_complete_token_ids(
                 self,
@@ -640,8 +657,6 @@ class VllmAsyncGenerationWorkerImpl(
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
-                messages_for_replace_prefix_tokens = deepcopy(messages)
-
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
                 # the actual value will be set through _clamp_max_tokens later.
                 actual_request_max_tokens = None
@@ -656,38 +671,53 @@ class VllmAsyncGenerationWorkerImpl(
                     if actual_request_max_tokens is not None:
                         self._set_max_tokens(request, 1)
 
-                assistant_ordinal = self._complete_token_injection_assistant_ordinal(
-                    request, messages
-                )
-                if assistant_ordinal is not None:
-                    try:
-                        res = await self._preprocess_chat_with_complete_token_ids(
-                            request=request,
-                            messages=messages,
-                            default_template=default_template,
-                            default_template_content_format=(
-                                default_template_content_format
+                if (
+                    isinstance(request, NeMoRLChatCompletionRequest)
+                    and request.required_prefix_token_ids is not None
+                ):
+                    self._complete_token_injection_attempts += 1
+                    assistant_ordinal, fallback_reason = (
+                        _complete_token_injection_eligibility(
+                            request,
+                            messages,
+                            has_multimodal_config=(
+                                self.model_config.multimodal_config is not None
                             ),
-                            default_template_kwargs=default_template_kwargs,
-                            tool_dicts=tool_dicts,
-                            parser=parser,
-                            assistant_ordinal=assistant_ordinal,
-                            skip_mm_cache=skip_mm_cache,
+                            prompt_embeds_enabled=self.model_config.enable_prompt_embeds,
+                            renderer_supported=isinstance(self.renderer, HfRenderer),
                         )
-                    except CompleteTokenInjectionError as e:
-                        LOGGER.warning(
-                            "Complete-token injection fell back to native "
-                            "preprocessing: %s",
-                            e,
-                        )
+                    )
+                    if fallback_reason is not None:
+                        self._record_complete_token_injection_fallback(fallback_reason)
                     else:
-                        if actual_request_max_tokens is not None:
-                            self._clamp_max_tokens(
-                                request,
-                                actual_request_max_tokens,
-                                res[1][0]["prompt_token_ids"],
+                        assert assistant_ordinal is not None
+                        try:
+                            res = await self._preprocess_chat_with_complete_token_ids(
+                                request=request,
+                                messages=messages,
+                                default_template=default_template,
+                                default_template_content_format=(
+                                    default_template_content_format
+                                ),
+                                default_template_kwargs=default_template_kwargs,
+                                tool_dicts=tool_dicts,
+                                parser=parser,
+                                assistant_ordinal=assistant_ordinal,
+                                skip_mm_cache=skip_mm_cache,
                             )
-                        return res
+                        except CompleteTokenInjectionError as e:
+                            self._record_complete_token_injection_fallback(str(e))
+                        else:
+                            self._complete_token_injection_successes += 1
+                            if actual_request_max_tokens is not None:
+                                self._clamp_max_tokens(
+                                    request,
+                                    actual_request_max_tokens,
+                                    res[1][0]["prompt_token_ids"],
+                                )
+                            return res
+
+                messages_for_replace_prefix_tokens = deepcopy(messages)
 
                 try:
                     res = await super().preprocess_chat(
@@ -858,7 +888,12 @@ class VllmAsyncGenerationWorkerImpl(
             pass
 
         class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
-            pass
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._complete_token_injection_attempts = 0
+                self._complete_token_injection_successes = 0
+                self._complete_token_injection_fallbacks: Counter[str] = Counter()
+                self._logged_complete_token_injection_fallbacks: set[str] = set()
 
         serving_chat_default_kwargs = dict(
             response_role="assistant",

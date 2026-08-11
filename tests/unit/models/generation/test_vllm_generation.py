@@ -44,6 +44,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _complete_token_injection_eligibility,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -141,6 +142,181 @@ basic_dtensor_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
+
+
+def _complete_token_request(**updates):
+    values = {
+        "stream": False,
+        "n": 1,
+        "continue_final_message": False,
+        "echo": False,
+        "return_assistant_tokens_mask": False,
+        "add_special_tokens": False,
+        "return_prompt_text": False,
+    }
+    values.update(updates)
+    return types.SimpleNamespace(**values)
+
+
+def _tokenized_assistant_messages():
+    return [
+        {"role": "user", "content": "question one"},
+        {
+            "role": "assistant",
+            "content": "answer one",
+            "prompt_token_ids": [1],
+            "generation_token_ids": [2],
+        },
+        {"role": "user", "content": "question two"},
+        {
+            "role": "assistant",
+            "content": "answer two",
+            "prompt_token_ids": [3],
+            "generation_token_ids": [4],
+        },
+    ]
+
+
+def test_complete_token_injection_eligibility_returns_latest_assistant() -> None:
+    ordinal, reason = _complete_token_injection_eligibility(
+        _complete_token_request(),
+        _tokenized_assistant_messages(),
+        has_multimodal_config=False,
+        prompt_embeds_enabled=False,
+        renderer_supported=True,
+    )
+
+    assert ordinal == 1
+    assert reason is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_reason"),
+    [
+        pytest.param("stream", True, "streaming request", id="stream"),
+        pytest.param("n", 2, "multiple response choices", id="multiple_choices"),
+        pytest.param(
+            "continue_final_message",
+            True,
+            "continue_final_message request",
+            id="continue_final_message",
+        ),
+        pytest.param("echo", True, "echo request", id="echo"),
+        pytest.param(
+            "return_assistant_tokens_mask",
+            True,
+            "assistant token mask request",
+            id="assistant_token_mask",
+        ),
+        pytest.param(
+            "add_special_tokens",
+            True,
+            "add_special_tokens request",
+            id="add_special_tokens",
+        ),
+        pytest.param(
+            "return_prompt_text",
+            True,
+            "return_prompt_text request",
+            id="return_prompt_text",
+        ),
+    ],
+)
+def test_complete_token_injection_eligibility_rejects_request_options(
+    field, value, expected_reason
+) -> None:
+    ordinal, reason = _complete_token_injection_eligibility(
+        _complete_token_request(**{field: value}),
+        _tokenized_assistant_messages(),
+        has_multimodal_config=False,
+        prompt_embeds_enabled=False,
+        renderer_supported=True,
+    )
+
+    assert ordinal is None
+    assert reason == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("helper_updates", "expected_reason"),
+    [
+        pytest.param(
+            {"has_multimodal_config": True},
+            "multimodal model",
+            id="multimodal",
+        ),
+        pytest.param(
+            {"prompt_embeds_enabled": True},
+            "prompt embeddings enabled",
+            id="prompt_embeds",
+        ),
+        pytest.param(
+            {"renderer_supported": False},
+            "unsupported renderer",
+            id="renderer",
+        ),
+    ],
+)
+def test_complete_token_injection_eligibility_rejects_model_options(
+    helper_updates, expected_reason
+) -> None:
+    helper_args = {
+        "has_multimodal_config": False,
+        "prompt_embeds_enabled": False,
+        "renderer_supported": True,
+    }
+    helper_args.update(helper_updates)
+
+    ordinal, reason = _complete_token_injection_eligibility(
+        _complete_token_request(),
+        _tokenized_assistant_messages(),
+        **helper_args,
+    )
+
+    assert ordinal is None
+    assert reason == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_reason"),
+    [
+        pytest.param(["invalid"], "non-object message", id="non_object"),
+        pytest.param(
+            [{"role": "developer", "content": "text"}],
+            "unsupported message role",
+            id="unsupported_role",
+        ),
+        pytest.param(
+            [{"role": "user", "content": ["text"]}],
+            "non-text message content",
+            id="non_text_content",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": "partial",
+                    "prompt_token_ids": [1],
+                }
+            ],
+            "no fully tokenized assistant",
+            id="partial_metadata",
+        ),
+    ],
+)
+def test_complete_token_injection_eligibility_rejects_messages(
+    messages, expected_reason
+) -> None:
+    ordinal, reason = _complete_token_injection_eligibility(
+        _complete_token_request(),
+        messages,
+        has_multimodal_config=False,
+        prompt_embeds_enabled=False,
+        renderer_supported=True,
+    )
+
+    assert ordinal is None
+    assert reason == expected_reason
 
 
 def test_context_capped_max_new_tokens():
@@ -2166,12 +2342,23 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
             "generation_token_ids": first_message["generation_token_ids"],
             "generation_log_probs": first_message["generation_log_probs"],
         },
-        {"role": "user", "content": " next"},
+        {
+            "role": "user",
+            "content": " next",
+            # Non-assistant metadata must not replace the assistant prefix.
+            "prompt_token_ids": [12345],
+            "generation_token_ids": [67890],
+        },
     ]
     continuation_body = body | {"messages": continuation_messages}
-    native_response = requests.post(
-        url=f"{base_urls[0]}/../tokenize", json=continuation_body
-    )
+    expected_required_prefix_token_ids = [
+        *first_message["prompt_token_ids"],
+        *first_message["generation_token_ids"],
+    ]
+    native_body = continuation_body | {
+        "required_prefix_token_ids": expected_required_prefix_token_ids
+    }
+    native_response = requests.post(url=f"{base_urls[0]}/../tokenize", json=native_body)
     native_response.raise_for_status()
     injected_response = requests.post(
         url=f"{base_urls[0]}/chat/completions", json=continuation_body

@@ -15,11 +15,11 @@
 
 import pytest
 
-from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.openai_server_utils import (
     CompleteTokenInjectionError,
     build_complete_prompt_token_ids,
-    find_latest_tokenized_assistant_ordinal,
+    find_latest_tokenized_assistant,
+    replace_prefix_tokens,
 )
 
 
@@ -45,8 +45,7 @@ class _CompleteTokenTokenizer:
         return token_ids
 
 
-def _render_marked_conversation(conversation, *, tokenize):
-    token_ids = []
+def _render_marked_conversation(conversation):
     rendered = ""
     for message in conversation:
         for tool_call in message.get("tool_calls", []):
@@ -56,20 +55,15 @@ def _render_marked_conversation(conversation, *, tokenize):
         role = message["role"]
         content = message.get("content")
         if role == "user" and content == "hello":
-            token_ids.append(10)
             rendered += "hello"
         elif role == "user" and content == "next":
-            token_ids.append(40)
             rendered += "next"
         elif role == "assistant":
-            token_ids.extend([777, 2])
             rendered += f"{content}<eos>"
         else:
-            token_ids.append(900)
             rendered += "other"
-    token_ids.append(99)
     rendered += "GEN"
-    return token_ids if tokenize else rendered
+    return rendered
 
 
 def test_build_complete_prompt_token_ids_preserves_prefix_and_suffix() -> None:
@@ -84,7 +78,7 @@ def test_build_complete_prompt_token_ids_preserves_prefix_and_suffix() -> None:
                     "type": "function",
                     "function": {
                         "name": "shell",
-                        "arguments": '{"command":"pwd"}',
+                        "arguments": {"command": "pwd"},
                     },
                 }
             ],
@@ -99,30 +93,124 @@ def test_build_complete_prompt_token_ids_preserves_prefix_and_suffix() -> None:
         conversation=conversation,
         assistant_ordinal=1,
         model_prefix_token_ids=[10, 777, 2, 40, 31, 32, 2],
-        render_prompt_text=lambda messages: _render_marked_conversation(
-            messages, tokenize=False
-        ),
+        render_prompt_text=_render_marked_conversation,
     )
 
     assert result == [10, 777, 2, 40, 31, 32, 2, 40, 99]
-    assert conversation[1]["tool_calls"][0]["function"]["arguments"] == (
-        '{"command":"pwd"}'
+    assert conversation[1]["tool_calls"][0]["function"]["arguments"] == {
+        "command": "pwd"
+    }
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_ordinal", "expected_index"),
+    [
+        pytest.param([], None, None, id="empty"),
+        pytest.param(
+            [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer"},
+            ],
+            None,
+            None,
+            id="no_token_metadata",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": "question one",
+                    "prompt_token_ids": [90],
+                    "generation_token_ids": [91],
+                },
+                {
+                    "role": "assistant",
+                    "content": "answer one",
+                    "prompt_token_ids": [1],
+                    "generation_token_ids": [2],
+                },
+                {
+                    "role": "tool",
+                    "content": "result",
+                    "prompt_token_ids": [92],
+                    "generation_token_ids": [93],
+                },
+                {"role": "user", "content": "question two"},
+                {
+                    "role": "assistant",
+                    "content": "answer two",
+                    "prompt_token_ids": [3],
+                    "generation_token_ids": [4],
+                },
+                {"role": "user", "content": "question three"},
+            ],
+            1,
+            4,
+            id="latest_assistant_ignores_other_roles",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": "partial",
+                    "prompt_token_ids": [1],
+                }
+            ],
+            None,
+            None,
+            id="partial_metadata",
+        ),
+    ],
+)
+def test_complete_token_injection_finds_latest_tokenized_assistant(
+    messages, expected_ordinal, expected_index
+) -> None:
+    """The selector counts assistant messages and returns the latest full record."""
+    result = find_latest_tokenized_assistant(messages)
+    if expected_ordinal is None:
+        assert result is None
+    else:
+        assert result is not None
+        assistant_ordinal, message = result
+        assert assistant_ordinal == expected_ordinal
+        assert message is messages[expected_index]
+
+
+@pytest.mark.parametrize("gap", ["", " \n\t"])
+def test_complete_token_injection_requires_adjacent_assistant_eos(gap) -> None:
+    tokenizer = _CompleteTokenTokenizer()
+    marker = "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E"
+
+    result = build_complete_prompt_token_ids(
+        tokenizer=tokenizer,
+        conversation=[
+            {"role": "assistant", "content": "first"},
+            {"role": "user", "content": "next"},
+        ],
+        assistant_ordinal=0,
+        model_prefix_token_ids=[31, 32, 2],
+        render_prompt_text=lambda messages: f"{marker}{gap}<eos>nextGEN",
     )
 
+    assert result == [31, 32, 2, 40, 99]
 
-def test_complete_token_injection_finds_latest_tokenized_assistant() -> None:
-    messages = [
-        {"role": "assistant", "content": "first"},
-        {
-            "role": "assistant",
-            "content": "second",
-            "prompt_token_ids": [1],
-            "generation_token_ids": [2],
-        },
-        {"role": "assistant", "content": "third"},
-    ]
 
-    assert find_latest_tokenized_assistant_ordinal(messages) == 1
+def test_complete_token_injection_rejects_intervening_content_before_eos() -> None:
+    tokenizer = _CompleteTokenTokenizer()
+
+    with pytest.raises(CompleteTokenInjectionError, match="did not close.*immediately"):
+        build_complete_prompt_token_ids(
+            tokenizer=tokenizer,
+            conversation=[
+                {"role": "assistant", "content": "first"},
+                {"role": "user", "content": "next"},
+            ],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=lambda messages: (
+                "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1Eintervening<eos>nextGEN"
+            ),
+        )
 
 
 def test_complete_token_injection_requires_assistant_eos() -> None:
