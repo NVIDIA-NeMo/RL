@@ -1272,6 +1272,10 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
 
+    flash_attention_version = config["megatron_cfg"].get("flash_attention_version")
+    if flash_attention_version is not None:
+        model_cfg.flash_attention_version = flash_attention_version
+
     # These overrides need to be applied before the workers spawn.
     if "transformer_impl" in config["megatron_cfg"]:
         model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
@@ -1695,6 +1699,7 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
 
     from nemo_rl.models.policy.workers.mamba_determinism_patches import (
         apply_mamba_determinism_patch,
+        policy_uses_mamba_layers,
     )
     from nemo_rl.models.policy.workers.moe_determinism_patches import (
         apply_moe_determinism_patches,
@@ -1704,6 +1709,7 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     mc = config["megatron_cfg"]
     mc["batch_invariant_mode"] = True
     mc.setdefault("attention_backend", "flash")
+    mc.setdefault("flash_attention_version", 4)
     mc.setdefault(
         "use_mamba_mem_eff_path", False
     )  # Disable Mamba's memory-efficient path
@@ -1712,7 +1718,7 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
         generation["mcore_generation_config"]["transformer_impl"] = "transformer_engine"
     apply_te_gemm_cublas_pinned_patch()
     apply_moe_determinism_patches()
-    apply_mamba_determinism_patch()
+    apply_mamba_determinism_patch(required=policy_uses_mamba_layers(config))
     # Starve PyTorch's own cuBLAS workspace so non-TE aten::mm/addmm paths also
     # pick workspace-free (splitK=1, reduction=NONE) algorithms.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
