@@ -378,10 +378,10 @@ class WandbLogger(LoggerInterface):
                 for k, v in metrics.items()
             }
 
-        # If step_metric is provided, use the corresponding value from metrics as step
+        # A defined custom axis selects the plotted x-value; each call still
+        # needs to commit its own W&B history row.
         if step_metric and step_metric in metrics:
-            # commit=False so the step does not get incremented
-            self.run.log(metrics, commit=False)
+            self.run.log(metrics)
         elif step_finished:
             # Commit param defaults to None. By default if step is set, then commit defaults to False
             # Here, we have an explicit fork for commit in case W&B ever decides to change their default logic.

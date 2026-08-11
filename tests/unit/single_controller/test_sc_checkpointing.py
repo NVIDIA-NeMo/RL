@@ -459,6 +459,9 @@ class _FakeGeneration:
     def get_logger_metrics(self) -> dict[str, Any]:
         return {}
 
+    def get_latest_logger_metrics(self) -> dict[str, Any]:
+        return {}
+
 
 # ── builders ─────────────────────────────────────────────────────────────────
 
@@ -1006,9 +1009,7 @@ class TestPeriodicRolloutCheckpoint:
     def test_logs_rollout_checkpoint_load_duration(self, tmp_path):
         actor = _ACTOR_CLS(
             _actor_master_config(tmp_path, max_num_steps=0),
-            _make_actor_args(
-                rollout_checkpoint_load_metrics={"tq_load_seconds": 1.5}
-            ),
+            _make_actor_args(rollout_checkpoint_load_metrics={"tq_load_seconds": 1.5}),
         )
         actor._logger = MagicMock()
         actor._telemetry_started_at = 0.0
@@ -1088,7 +1089,7 @@ class TestPeriodicRolloutCheckpoint:
         )
 
         class _Generation:
-            def get_logger_metrics(self):
+            def get_latest_logger_metrics(self):
                 return next(generation_snapshots)
 
         actor._gen = _Generation()
@@ -1109,6 +1110,7 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["vllm_output_tokens_per_second"] == pytest.approx(20.0)
         assert logged["canonical_output_tokens_per_second"] == pytest.approx(4.0)
         assert logged["canonical_groups_per_second"] == pytest.approx(0.2)
+        assert logged["sample_elapsed_seconds"] == pytest.approx(10.0)
         assert logged["vllm_requests_running"] == 3
         assert logged["vllm_requests_waiting"] == 4
         assert logged["vllm_kv_cache_usage_mean"] == pytest.approx(0.6)
@@ -1118,6 +1120,8 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["group_completion_seconds_p95"] == pytest.approx(4.0)
         assert logged["group_queue_wait_seconds_mean"] == pytest.approx(2.0)
         assert logged["group_queue_wait_seconds_p95"] == pytest.approx(3.0)
+        assert logged["controller_inflight_rollouts"] == 0
+        assert logged["checkpoint_blocked_mutations"] == 0
         assert actor._logger.log_metrics.call_args.kwargs == {
             "step": 1,
             "prefix": "rollout/throughput",

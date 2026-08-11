@@ -1182,7 +1182,7 @@ class RolloutManager:
             # The worker staged every key in the receipt before the gate
             # returned it. Joining the mutation side here prevents a ledger
             # snapshot from naming rows omitted by the matching TQ snapshot.
-            async with self._data_plane_checkpoint_barrier.mutation():
+            async with self._data_plane_checkpoint_barrier.mutation("sibling_seals"):
                 self._recovery_ledger.mark_sibling_sealed(
                     group_id,
                     generation_index=generation_index,
@@ -1292,7 +1292,7 @@ class RolloutManager:
         # retry attempts and making them dispatchable must therefore be one
         # ledger mutation; a snapshot sees either the saved attempts or the
         # complete replacement set, never a half-retried group.
-        async with self._data_plane_checkpoint_barrier.mutation():
+        async with self._data_plane_checkpoint_barrier.mutation("recovery_retries"):
             group = self._recovery_ledger.get_group(group_id)
             generation_indices = self._recovery_ledger.retryable_generation_indices(
                 group_id
@@ -1339,7 +1339,7 @@ class RolloutManager:
                     "token-capture recovery requires the SC data-plane "
                     "checkpoint barrier"
                 )
-            async with self._data_plane_checkpoint_barrier.mutation():
+            async with self._data_plane_checkpoint_barrier.mutation("sibling_seals"):
                 self._recovery_ledger.mark_sibling_sealed(
                     group_id,
                     generation_index=generation_index,

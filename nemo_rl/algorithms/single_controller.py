@@ -56,6 +56,7 @@ import torch
 import yaml
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    CHECKPOINT_MUTATION_KINDS,
     DATA_PLANE_CHECKPOINT_DIR,
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
     DataPlaneCheckpointBarrier,
@@ -342,6 +343,9 @@ class SingleControllerActor:
 
         # Count of work items currently executing generation/finalization.
         self._inflight_rollouts: int = 0
+        self._rollout_slot_waiters: int = 0
+        self._rollout_permitted_waiters: int = 0
+        self._buffer_capacity_waiters: int = 0
 
         # Cancellation handles for in-flight rollout dispatches.
         self._dispatched_rollouts: set[asyncio.Task[bool]] = set()
@@ -645,7 +649,7 @@ class SingleControllerActor:
         # above if the saved group count exceeds current capacity.
         assert restored <= self._async_cfg.max_buffered_rollouts
         for _ in range(restored):
-            await self._buffer_capacity.acquire()
+            await self._acquire_buffer_permit()
         recovery_ledger = self._rollout_manager.recovery_ledger
         if recovery_ledger is not None:
             canonical_group_ids = {
@@ -827,7 +831,7 @@ class SingleControllerActor:
         acquired = 0
         try:
             for _ in groups:
-                await self._buffer_capacity.acquire()
+                await self._acquire_buffer_permit()
                 acquired += 1
         except BaseException:
             for _ in range(acquired):
@@ -889,6 +893,14 @@ class SingleControllerActor:
         if dispatch_admitted_event is not None:
             dispatch_admitted_event.set()
 
+    async def _acquire_buffer_permit(self) -> None:
+        """Acquire one rollout-buffer permit while exposing backpressure."""
+        self._buffer_capacity_waiters += 1
+        try:
+            await self._buffer_capacity.acquire()
+        finally:
+            self._buffer_capacity_waiters -= 1
+
     async def _execute_rollout_work_item(
         self,
         work_item: _RolloutWorkItem,
@@ -912,9 +924,17 @@ class SingleControllerActor:
         rollout_slot_owned = False
         counted_inflight = False
         try:
-            await self._rollout_slots.acquire()
+            self._rollout_slot_waiters += 1
+            try:
+                await self._rollout_slots.acquire()
+            finally:
+                self._rollout_slot_waiters -= 1
             rollout_slot_owned = True
-            await self._rollout_permitted.wait()
+            self._rollout_permitted_waiters += 1
+            try:
+                await self._rollout_permitted.wait()
+            finally:
+                self._rollout_permitted_waiters -= 1
             if dispatch_admitted_event is not None:
                 dispatch_admitted_event.set()
 
@@ -1031,11 +1051,8 @@ class SingleControllerActor:
                         "groups_per_second": len(work_items) / recovery_seconds,
                         "siblings_reused": float(reused),
                         "siblings_redispatched": float(redispatched),
-                        "siblings_per_second": recovered_siblings
-                        / recovery_seconds,
-                        "max_concurrency": float(
-                            self._async_cfg.max_inflight_prompts
-                        ),
+                        "siblings_per_second": recovered_siblings / recovery_seconds,
+                        "max_concurrency": float(self._async_cfg.max_inflight_prompts),
                         "failed": 0.0,
                     },
                     step=self._train_steps,
@@ -1082,7 +1099,7 @@ class SingleControllerActor:
 
     async def _clear_data_plane_samples(self, sample_ids: list[str]) -> None:
         """Clear consumed rows without overlapping a data-plane checkpoint."""
-        async with self._data_plane_checkpoint_barrier.mutation():
+        async with self._data_plane_checkpoint_barrier.mutation("sample_clears"):
             await call_data_plane(
                 self._dp_client,
                 "clear_samples",
@@ -1606,7 +1623,7 @@ class SingleControllerActor:
             acquired = 0
             try:
                 for _ in range(permits):
-                    await self._buffer_capacity.acquire()
+                    await self._acquire_buffer_permit()
                     acquired += 1
             except BaseException:
                 _release_buffer_capacity(acquired)
@@ -1651,7 +1668,9 @@ class SingleControllerActor:
                             # in that batch is one checkpoint mutation. A snapshot
                             # therefore sees either neither operation or both,
                             # preventing skipped/duplicated prompts after restart.
-                            async with self._data_plane_checkpoint_barrier.mutation():
+                            async with self._data_plane_checkpoint_barrier.mutation(
+                                "prompt_reservations"
+                            ):
                                 try:
                                     prompt_batch = next(dataloader_iterator)
                                 except StopIteration:
@@ -1732,7 +1751,7 @@ class SingleControllerActor:
                             if not token_capture_enabled:
                                 # Token-capture groups already own capacity from
                                 # their durable batch reservation above.
-                                await self._buffer_capacity.acquire()
+                                await self._acquire_buffer_permit()
                                 capacity_acquired_here = True
                             task_started_event = asyncio.Event()
                             dispatch_admitted_event = asyncio.Event()
@@ -2240,10 +2259,11 @@ class SingleControllerActor:
         """
         now = time.monotonic()
         counters = self._rollout_manager.telemetry_snapshot()
+        barrier_telemetry = await self._data_plane_checkpoint_barrier.drain_telemetry()
         generation_metrics: dict[str, Any] = {}
         try:
             generation_metrics = await asyncio.to_thread(
-                self._gen.get_logger_metrics
+                self._gen.get_latest_logger_metrics
             )
         except Exception as error:
             warnings.warn(
@@ -2261,6 +2281,48 @@ class SingleControllerActor:
         metrics: dict[str, float] = {
             key: float(value) for key, value in counters.items()
         }
+        blocked_mutations = sum(barrier_telemetry.blocked_by_kind.values())
+        metrics.update(
+            {
+                "controller_dispatched_tasks": float(len(self._dispatched_rollouts)),
+                "controller_inflight_rollouts": float(self._inflight_rollouts),
+                "controller_rollout_capacity": float(
+                    self._async_cfg.max_inflight_prompts
+                ),
+                "controller_rollout_slot_waiters": float(self._rollout_slot_waiters),
+                "controller_rollout_permitted_waiters": float(
+                    self._rollout_permitted_waiters
+                ),
+                "controller_buffer_capacity_waiters": float(
+                    self._buffer_capacity_waiters
+                ),
+                "checkpoint_barrier_active": float(barrier_telemetry.checkpoint_active),
+                "checkpoint_active_mutations": float(
+                    barrier_telemetry.active_mutations
+                ),
+                "checkpoint_waiting_mutations": float(
+                    barrier_telemetry.waiting_mutations
+                ),
+                "checkpoint_max_simultaneous_waiters": float(
+                    barrier_telemetry.max_waiting_mutations
+                ),
+                "checkpoint_blocked_mutations": float(blocked_mutations),
+            }
+        )
+        for kind in CHECKPOINT_MUTATION_KINDS:
+            metrics[f"checkpoint_blocked_{kind}"] = float(
+                barrier_telemetry.blocked_by_kind[kind]
+            )
+        mutation_waits = barrier_telemetry.wait_durations_s
+        if mutation_waits:
+            metrics["checkpoint_mutation_wait_seconds_total"] = sum(mutation_waits)
+            metrics["checkpoint_mutation_wait_seconds_mean"] = sum(
+                mutation_waits
+            ) / len(mutation_waits)
+            metrics["checkpoint_mutation_wait_seconds_p95"] = _percentile(
+                list(mutation_waits), 0.95
+            )
+            metrics["checkpoint_mutation_wait_seconds_max"] = max(mutation_waits)
         try:
             metrics["buffer_occupancy_groups"] = float(len(self._buffer))
         except TypeError:
@@ -2285,9 +2347,9 @@ class SingleControllerActor:
         self._rollout_queue_wait_durations_s.clear()
         if completion_durations:
             metrics["group_completion_samples"] = float(len(completion_durations))
-            metrics["group_completion_seconds_mean"] = sum(
+            metrics["group_completion_seconds_mean"] = sum(completion_durations) / len(
                 completion_durations
-            ) / len(completion_durations)
+            )
             metrics["group_completion_seconds_p50"] = _percentile(
                 completion_durations, 0.50
             )
@@ -2295,9 +2357,9 @@ class SingleControllerActor:
                 completion_durations, 0.95
             )
         if queue_wait_durations:
-            metrics["group_queue_wait_seconds_mean"] = sum(
+            metrics["group_queue_wait_seconds_mean"] = sum(queue_wait_durations) / len(
                 queue_wait_durations
-            ) / len(queue_wait_durations)
+            )
             metrics["group_queue_wait_seconds_p95"] = _percentile(
                 queue_wait_durations, 0.95
             )
@@ -2308,6 +2370,7 @@ class SingleControllerActor:
         if previous_time is not None and previous_counters is not None:
             elapsed = now - previous_time
             if elapsed > 0:
+                metrics["sample_elapsed_seconds"] = elapsed
                 finalized_delta = (
                     counters["canonical_groups_finalized"]
                     - (previous_counters["canonical_groups_finalized"])
