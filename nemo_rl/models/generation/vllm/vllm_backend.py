@@ -922,6 +922,35 @@ class VllmInternalWorkerExtension:
             process_weights_after_loading,
         )
 
+        model = self.model_runner.model
+        use_layerwise_reload = fp8.is_fp8_model(
+            self.model_runner.vllm_config
+        ) and fp8.is_deepseek_v4_model(model)
+        if use_layerwise_reload:
+            from vllm.model_executor.model_loader.reload import (
+                finalize_layerwise_reload,
+                initialize_layerwise_reload,
+            )
+            from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
+
+            # DeepSeek V4 loads attn_sink with a direct copy_ instead of its
+            # Parameter weight_loader. Keep its kernel storage materialized so
+            # that copy is not lost by layerwise reload's load-count fallback.
+            SKIP_TENSORS.add("attn_sink")
+
+            def finalize() -> None:
+                finalize_layerwise_reload(model, self.model_config)
+                fp8.finalize_deepseek_v4_routed_experts_refit(model)
+                self._maybe_process_mtp_drafter_after_loading()
+
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                with torch.device(self.device):
+                    fp8.prepare_deepseek_v4_routed_experts_for_refit(model)
+                    initialize_layerwise_reload(model)
+                    yield finalize
+            self._maybe_process_fp8_kv_cache()
+            return
+
         if fp8.is_fp8_model(self.model_runner.vllm_config):
             # E8M0 DeepGEMM runtime scales use a packed layout. Restore their
             # raw block-scale shape once per complete streamed update so each
@@ -931,7 +960,7 @@ class VllmInternalWorkerExtension:
         def finalize() -> None:
             with set_current_vllm_config(self.model_runner.vllm_config):
                 process_weights_after_loading(
-                    self.model_runner.model, self.model_config, self.device
+                    model, self.model_config, self.device
                 )
             self._maybe_process_mtp_drafter_after_loading()
 
