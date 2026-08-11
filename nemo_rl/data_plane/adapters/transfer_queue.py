@@ -130,15 +130,8 @@ def _connect_existing() -> None:
     tq.init()
 
 
-def _init_tq(cfg: DataPlaneConfig, gpus_per_node: int) -> None:
-    """Driver-process path: bootstrap the TQ controller for the chosen backend.
-
-    Args:
-        cfg: Data-plane config.
-        gpus_per_node: GPUs on each host, from ``cluster.gpus_per_node``. One
-            TQ client process is created per GPU, so this is the multiplier
-            that turns the per-process mooncake sizes into a per-machine cost.
-    """
+def _init_tq(cfg: DataPlaneConfig) -> None:
+    """Driver-process path: bootstrap the TQ controller for the chosen backend."""
     from omegaconf import OmegaConf
 
     base = OmegaConf.load(str(resources.files("transfer_queue") / "config.yaml"))
@@ -199,52 +192,26 @@ def _init_tq(cfg: DataPlaneConfig, gpus_per_node: int) -> None:
                 "Mooncake backend requires a local node IP; "
                 "_get_local_node_ip() returned empty."
             )
-        # Mooncake virtual segment / local buffer sizing. Configured values are
-        # upper bounds: under-sized values cause ``batch_get_tensor returned
-        # None`` once mooncake exhausts its allocator headroom, so recipes size
-        # them generously via ``data_plane.global_segment_size`` /
-        # ``data_plane.local_buffer_size`` (bytes).
-        #
-        # Both are registered per *process* — MooncakeStoreClient.setup() runs
-        # in every process that opens a TQ client, i.e. one per GPU — so the
-        # per-machine cost is gpus_per_node x (segment + buffer), not a single
-        # node-wide allocation.
+        # Mooncake segment / local buffer sizing, both **per client process**.
+        # MooncakeStoreClient.setup() runs in every process that opens a TQ
+        # client — one per GPU — so a node pays gpus_per_node x (segment +
+        # buffer), not a single node-wide allocation.
         #
         # Under ``protocol="rdma"`` (the default, see _mooncake_transport_config)
         # that cost is *resident*, not virtual: mooncake registers the segment
         # with the NIC via ibv_reg_mr, which pins the pages so they can be
-        # DMA'd. The whole segment is therefore charged to RSS at setup, before
-        # any traffic. Sizing it as a generous upper bound — which is safe when
-        # the mapping is lazy, as it is over TCP — OOMs the host under a large
-        # model, whose own resident footprint leaves far less headroom. Scale
-        # both down proportionally (preserving their ratio) so the per-machine
-        # total stays within ``data_plane.host_memory_fraction`` of host RAM.
-        segment_size = int(cfg["global_segment_size"])
-        buffer_size = int(cfg["local_buffer_size"])
-        host_budget = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        per_proc_budget = (
-            int(host_budget * cfg["host_memory_fraction"]) // gpus_per_node
-        )
-        if segment_size + buffer_size > per_proc_budget:
-            scale = per_proc_budget / (segment_size + buffer_size)
-            warnings.warn(
-                f"data_plane mooncake sizing {segment_size + buffer_size} B/process "
-                f"x {gpus_per_node} processes exceeds host_memory_fraction="
-                f"{cfg['host_memory_fraction']} of {host_budget} B; scaling by "
-                f"{scale:.3f}. Lower data_plane.global_segment_size to silence, or "
-                "raise data_plane.host_memory_fraction if the host can afford it.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            segment_size = int(segment_size * scale)
-            buffer_size = int(buffer_size * scale)
+        # DMA'd, charging the whole segment to RSS at setup before any traffic.
+        # Over TCP the mapping is lazy and only touched pages count — so sizing
+        # these as generous upper bounds is safe there and is not safe here.
+        # Keep the per-node product in mind when raising them; under-sizing
+        # surfaces as ``batch_get_tensor returned None``.
         overlay = {
             **controller_overlay,
             "backend": {
                 "storage_backend": "MooncakeStore",
                 "MooncakeStore": {
-                    "global_segment_size": segment_size,
-                    "local_buffer_size": buffer_size,
+                    "global_segment_size": int(cfg["global_segment_size"]),
+                    "local_buffer_size": int(cfg["local_buffer_size"]),
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that
                     # mooncake_master + the metadata server bind to.
@@ -385,13 +352,7 @@ def _from_wire(td: TensorDict) -> TensorDict:
 class TQDataPlaneClient(DataPlaneClient):
     """Adapter façade — maps NeMo-RL calls onto TransferQueue's public API."""
 
-    def __init__(
-        self,
-        cfg: DataPlaneConfig,
-        *,
-        bootstrap: bool = True,
-        gpus_per_node: int | None = None,
-    ) -> None:
+    def __init__(self, cfg: DataPlaneConfig, *, bootstrap: bool = True) -> None:
         """Construct a TQ-backed client.
 
         Args:
@@ -401,10 +362,6 @@ class TQDataPlaneClient(DataPlaneClient):
                 already-running named controller actor in the Ray
                 cluster — ``cfg`` is then only consulted for client-side
                 knobs (poll interval).
-            gpus_per_node: GPUs on each host, from ``cluster.gpus_per_node``.
-                Required when ``bootstrap`` is True — it is the per-machine
-                multiplier for the mooncake sizing bound. Ignored on workers,
-                which do not bootstrap the controller.
         """
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
@@ -441,13 +398,7 @@ class TQDataPlaneClient(DataPlaneClient):
         self._promote_1d = cfg["backend"] == "mooncake_cpu"
 
         if bootstrap:
-            if gpus_per_node is None:
-                raise ValueError(
-                    "TQDataPlaneClient(bootstrap=True) requires gpus_per_node "
-                    "(from cluster.gpus_per_node) to bound the per-machine "
-                    "mooncake sizing."
-                )
-            _init_tq(cfg, gpus_per_node)
+            _init_tq(cfg)
         else:
             _connect_existing()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]

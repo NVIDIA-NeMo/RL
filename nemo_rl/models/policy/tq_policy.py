@@ -116,11 +116,7 @@ class TQPolicy(Policy):
                 f"TP/PP/CP/EP sizes."
             )
         self.dp_cfg = dp_cfg
-        self.dp_client = build_data_plane_client(
-            dp_cfg,
-            bootstrap=True,
-            gpus_per_node=self.worker_group.cluster.num_gpus_per_node,
-        )
+        self.dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
         self.tq_partition_id = tq_partition_id
         self._router_replay_enabled = bool(
             (self.cfg.get("router_replay") or {}).get("enabled", False)
