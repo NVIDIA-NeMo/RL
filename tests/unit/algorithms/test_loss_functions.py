@@ -153,10 +153,10 @@ def test_student_topk_opd_loss_uses_head_and_sampled_tail():
     )
 
     expected = student_topk_reverse_kl_loss(
-        current_support,
-        data["teacher_support_logprobs"][:, :-1],
-        current_target,
-        data["teacher_reference_logprobs"][:, 1:],
+        student_support_logprobs=current_support,
+        teacher_support_logprobs=data["teacher_support_logprobs"][:, :-1],
+        student_target_logprobs=current_target,
+        teacher_target_logprobs=data["teacher_reference_logprobs"][:, 1:],
         target_in_support=torch.tensor([[True, False]]),
     )[:, 1].mean()
     torch.testing.assert_close(loss, expected)
