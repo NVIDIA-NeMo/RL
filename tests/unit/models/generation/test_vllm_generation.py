@@ -239,6 +239,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     for module_name in (
         "vllm",
         "vllm.entrypoints",
+        "vllm.entrypoints.chat_utils",
         "vllm.entrypoints.openai",
         "vllm.entrypoints.openai.chat_completion",
         "vllm.entrypoints.openai.engine",
@@ -250,6 +251,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.tool_parsers",
         "vllm.v1",
         "vllm.v1.engine",
+        "vllm.utils",
     ):
         monkeypatch.setitem(sys.modules, module_name, types.ModuleType(module_name))
 
@@ -304,6 +306,10 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         load_chat_template=MagicMock(return_value=None),
     )
     make_module(
+        "vllm.entrypoints.chat_utils",
+        parse_chat_messages_async=MagicMock(),
+    )
+    make_module(
         "vllm.entrypoints.openai.chat_completion.protocol",
         ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
         ChatCompletionResponse=type("ChatCompletionResponse", (), {}),
@@ -334,6 +340,13 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.renderers.online_renderer",
         OnlineRenderer=OnlineRenderer,
     )
+    sys.modules["vllm.renderers"].merge_kwargs = MagicMock()
+    make_module(
+        "vllm.renderers.hf",
+        HfRenderer=type("HfRenderer", (), {}),
+        resolve_chat_template_content_format=MagicMock(),
+        safe_apply_chat_template=MagicMock(),
+    )
     make_module(
         "vllm.entrypoints.serve.tokenize.serving",
         ServingTokenization=ServingTokenization,
@@ -346,6 +359,11 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     make_module(
         "vllm.tool_parsers.abstract_tool_parser",
         ToolParserManager=ToolParserManager,
+    )
+    make_module(
+        "vllm.utils.mistral",
+        is_mistral_tokenizer=MagicMock(return_value=False),
+        is_mistral_tool_parser=MagicMock(return_value=False),
     )
     make_module("vllm.v1.engine.async_llm", logger=MagicMock())
     return ToolParserManager, ReasoningParserManager, OpenAIServingChat
@@ -2135,6 +2153,33 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     ]["content"][0]
     vllm_http_server_generated_token_id = int(
         vllm_http_server_generated_token["token"].removeprefix("token_id:")
+    )
+
+    # Compare the injected continuation prompt with the native /tokenize path.
+    first_message = vllm_http_server_result["choices"][0]["message"]
+    continuation_messages = [
+        body["messages"][0],
+        {
+            "role": "assistant",
+            "content": first_message["content"],
+            "prompt_token_ids": first_message["prompt_token_ids"],
+            "generation_token_ids": first_message["generation_token_ids"],
+            "generation_log_probs": first_message["generation_log_probs"],
+        },
+        {"role": "user", "content": " next"},
+    ]
+    continuation_body = body | {"messages": continuation_messages}
+    native_response = requests.post(
+        url=f"{base_urls[0]}/../tokenize", json=continuation_body
+    )
+    native_response.raise_for_status()
+    injected_response = requests.post(
+        url=f"{base_urls[0]}/chat/completions", json=continuation_body
+    )
+    injected_response.raise_for_status()
+    assert (
+        injected_response.json()["choices"][0]["message"]["prompt_token_ids"]
+        == native_response.json()["tokens"]
     )
 
     async for _, generate_result in vllm_generation.generate_async(

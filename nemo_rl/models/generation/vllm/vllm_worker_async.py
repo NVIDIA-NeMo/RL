@@ -40,6 +40,12 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.openai_server_utils import (
+    CompleteTokenInjectionError,
+    build_complete_prompt_token_ids,
+    find_latest_tokenized_assistant_ordinal,
+    replace_prefix_tokens,
+)
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
@@ -51,9 +57,6 @@ from nemo_rl.models.generation.vllm.utils import (
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
-from nemo_rl.models.generation.openai_server_utils import (
-    replace_prefix_tokens,
-)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -365,6 +368,7 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.openai.engine.protocol import ErrorResponse
         from vllm.entrypoints.openai.models.protocol import BaseModelPath
         from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+        from vllm.entrypoints.chat_utils import parse_chat_messages_async
         from vllm.entrypoints.serve.tokenize.protocol import (
             TokenizeChatRequest,
             TokenizeCompletionRequest,
@@ -373,10 +377,17 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.serve.tokenize.serving import (
             ServingTokenization,
         )
+        from vllm.renderers import merge_kwargs
+        from vllm.renderers.hf import (
+            HfRenderer,
+            resolve_chat_template_content_format,
+            safe_apply_chat_template,
+        )
         from vllm.renderers.online_renderer import OnlineRenderer
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
+        from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
@@ -448,6 +459,167 @@ class VllmAsyncGenerationWorkerImpl(
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)
 
+            def _complete_token_injection_assistant_ordinal(
+                self, request, messages
+            ) -> Optional[int]:
+                """Return the assistant ordinal when the guarded path is supported."""
+                if not isinstance(request, NeMoRLChatCompletionRequest):
+                    return None
+                if request.required_prefix_token_ids is None:
+                    return None
+                if getattr(request, "stream", False):
+                    return None
+                if getattr(request, "n", 1) not in (None, 1):
+                    return None
+                if getattr(request, "continue_final_message", False):
+                    return None
+                if getattr(request, "echo", False):
+                    return None
+                if getattr(request, "return_assistant_tokens_mask", False):
+                    return None
+                if self.model_config.multimodal_config is not None:
+                    return None
+                if self.model_config.enable_prompt_embeds:
+                    return None
+                if not isinstance(self.renderer, HfRenderer):
+                    return None
+                for message in messages:
+                    if not isinstance(message, dict):
+                        return None
+                    if message.get("role") not in {
+                        "system",
+                        "user",
+                        "assistant",
+                        "tool",
+                    }:
+                        return None
+                    content = message.get("content")
+                    if content is not None and not isinstance(content, str):
+                        return None
+                return find_latest_tokenized_assistant_ordinal(request.messages)
+
+            async def _preprocess_chat_with_complete_token_ids(
+                self,
+                request,
+                messages,
+                default_template,
+                default_template_content_format,
+                default_template_kwargs,
+                tool_dicts,
+                parser,
+                assistant_ordinal: int,
+                *,
+                skip_mm_cache: bool,
+            ):
+                """Preserve vLLM preprocessing while skipping prompt re-encoding."""
+                renderer = self.renderer
+                arrival_time = time.time()
+                default_template_kwargs = merge_kwargs(
+                    default_template_kwargs,
+                    dict(tools=tool_dicts, tokenize=False),
+                )
+                tok_params = request.build_tok_params(self.model_config)
+                chat_params = request.build_chat_params(
+                    default_template, default_template_content_format
+                ).with_defaults(
+                    default_template_kwargs,
+                    default_media_io_kwargs=None,
+                    default_mm_processor_kwargs=getattr(
+                        request, "mm_processor_kwargs", None
+                    ),
+                )
+                if chat_params.return_assistant_tokens_mask:
+                    raise CompleteTokenInjectionError(
+                        "Assistant token masks require native preprocessing."
+                    )
+
+                tokenizer = renderer.get_tokenizer()
+                conversation, mm_data, mm_uuids = await parse_chat_messages_async(
+                    messages,
+                    self.model_config,
+                    content_format=resolve_chat_template_content_format(
+                        chat_template=chat_params.chat_template,
+                        tools=chat_params.chat_template_kwargs.get("tools"),
+                        given_format=chat_params.chat_template_content_format,
+                        tokenizer=tokenizer,
+                        model_config=self.model_config,
+                    ),
+                    media_io_kwargs=chat_params.media_io_kwargs,
+                    mm_processor_kwargs=chat_params.mm_processor_kwargs,
+                )
+                if mm_data is not None or mm_uuids is not None:
+                    raise CompleteTokenInjectionError(
+                        "Multimodal chat data requires native preprocessing."
+                    )
+                apply_chat_template_kwargs = dict(
+                    chat_params.get_apply_chat_template_kwargs()
+                )
+                apply_chat_template_kwargs.pop("tokenize", None)
+
+                def render_prompt_text(marked_conversation):
+                    rendered = safe_apply_chat_template(
+                        self.model_config,
+                        tokenizer,
+                        marked_conversation,
+                        tokenize=False,
+                        **apply_chat_template_kwargs,
+                    )
+                    if not isinstance(rendered, str):
+                        raise CompleteTokenInjectionError(
+                            "The marked prompt did not render as text."
+                        )
+                    return rendered
+
+                prompt_token_ids = await asyncio.to_thread(
+                    build_complete_prompt_token_ids,
+                    tokenizer=tokenizer,
+                    conversation=conversation,
+                    assistant_ordinal=assistant_ordinal,
+                    model_prefix_token_ids=list(request.required_prefix_token_ids),
+                    render_prompt_text=render_prompt_text,
+                )
+                prompt = {"prompt_token_ids": prompt_token_ids}
+                tokenized_prompt = await renderer.tokenize_prompt_async(
+                    prompt, tok_params
+                )
+                renderer._apply_prompt_extras(
+                    [tokenized_prompt],
+                    {
+                        key: value
+                        for key in ("mm_processor_kwargs", "cache_salt")
+                        if (value := getattr(request, key, None)) is not None
+                    },
+                )
+                engine_prompt = await renderer.process_for_engine_async(
+                    tokenized_prompt,
+                    arrival_time,
+                    skip_mm_cache=skip_mm_cache,
+                )
+
+                if parser is not None:
+                    tool_parser = parser.tool_parser_cls
+                    tool_choice = getattr(request, "tool_choice", "none")
+                    is_mistral_grammar_eligible = (
+                        tool_parser is not None
+                        and is_mistral_tool_parser(tool_parser)
+                        and is_mistral_tokenizer(tokenizer)
+                        and tokenizer.supports_grammar
+                    )
+                    should_adjust_request = (
+                        parser.reasoning_parser_cls is not None
+                        or tool_choice != "none"
+                        or is_mistral_grammar_eligible
+                    )
+                    if should_adjust_request:
+                        request = parser(
+                            tokenizer,
+                            request.tools,
+                            model_config=self.model_config,
+                            chat_template_kwargs=chat_params.chat_template_kwargs,
+                        ).adjust_request(request=request)
+
+                return conversation, [engine_prompt]
+
             # vLLM 0.25 moved chat preprocessing to
             # OnlineRenderer.preprocess_chat (tool_parser/reasoning_parser were
             # folded into a single `parser`), so this override now applies via
@@ -483,6 +655,39 @@ class VllmAsyncGenerationWorkerImpl(
                     # So we don't need to set the request's max output tokens to 1 here.
                     if actual_request_max_tokens is not None:
                         self._set_max_tokens(request, 1)
+
+                assistant_ordinal = self._complete_token_injection_assistant_ordinal(
+                    request, messages
+                )
+                if assistant_ordinal is not None:
+                    try:
+                        res = await self._preprocess_chat_with_complete_token_ids(
+                            request=request,
+                            messages=messages,
+                            default_template=default_template,
+                            default_template_content_format=(
+                                default_template_content_format
+                            ),
+                            default_template_kwargs=default_template_kwargs,
+                            tool_dicts=tool_dicts,
+                            parser=parser,
+                            assistant_ordinal=assistant_ordinal,
+                            skip_mm_cache=skip_mm_cache,
+                        )
+                    except CompleteTokenInjectionError as e:
+                        LOGGER.warning(
+                            "Complete-token injection fell back to native "
+                            "preprocessing: %s",
+                            e,
+                        )
+                    else:
+                        if actual_request_max_tokens is not None:
+                            self._clamp_max_tokens(
+                                request,
+                                actual_request_max_tokens,
+                                res[1][0]["prompt_token_ids"],
+                            )
+                        return res
 
                 try:
                     res = await super().preprocess_chat(

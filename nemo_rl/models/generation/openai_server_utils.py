@@ -22,7 +22,181 @@ token-in/token-out via ``generate(input_ids)`` and never re-templates messages,
 so it has no retokenization drift to correct.
 """
 
+import json
+from collections.abc import Callable, Mapping
+from copy import deepcopy
 from typing import Any
+
+
+_COMPLETE_TOKEN_BOUNDARY_MARKER = "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E"
+
+
+class CompleteTokenInjectionError(ValueError):
+    """Raised when complete prompt tokens cannot be derived safely."""
+
+
+def find_latest_tokenized_assistant_ordinal(messages: list[Any]) -> int | None:
+    """Return the assistant ordinal carrying the latest Gym token metadata."""
+    assistant_ordinal = -1
+    latest_tokenized_ordinal = None
+    for message in messages:
+        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+            continue
+        assistant_ordinal += 1
+        if (
+            message.get("prompt_token_ids") is not None
+            and message.get("generation_token_ids") is not None
+        ):
+            latest_tokenized_ordinal = assistant_ordinal
+    return latest_tokenized_ordinal
+
+
+def _assistant_index_from_ordinal(
+    conversation: list[Any], assistant_ordinal: int
+) -> int:
+    current_ordinal = -1
+    for index, message in enumerate(conversation):
+        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+            continue
+        current_ordinal += 1
+        if current_ordinal == assistant_ordinal:
+            return index
+    raise CompleteTokenInjectionError(
+        "The tokenized assistant message was not present after chat parsing."
+    )
+
+
+def _normalize_tool_arguments_for_template(
+    messages: list[Any], *, before_index: int
+) -> None:
+    for message in messages[:before_index]:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function", tool_call)
+            if not isinstance(function, dict):
+                continue
+            arguments = function.get("arguments")
+            if not isinstance(arguments, str):
+                continue
+            try:
+                parsed_arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                parsed_arguments = {}
+            function["arguments"] = (
+                parsed_arguments if isinstance(parsed_arguments, dict) else {}
+            )
+
+
+def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
+    if not isinstance(value, list):
+        raise CompleteTokenInjectionError(f"{field_name} must be a list.")
+    try:
+        return [int(token_id) for token_id in value]
+    except (TypeError, ValueError) as e:
+        raise CompleteTokenInjectionError(
+            f"{field_name} must contain only integer token IDs."
+        ) from e
+
+
+def build_complete_prompt_token_ids(
+    *,
+    tokenizer: Any,
+    conversation: list[Any],
+    assistant_ordinal: int,
+    model_prefix_token_ids: list[int],
+    render_prompt_text: Callable[[list[Any]], str],
+) -> list[int]:
+    """Join exact model-prefix tokens with a verified contextual suffix.
+
+    The complete conversation is rendered with the tokenized assistant replaced
+    by a marker. This preserves context-sensitive template behavior after that
+    assistant while making its closing EOS the exact splice boundary.
+    """
+    marked_conversation = deepcopy(conversation)
+    if any(
+        _COMPLETE_TOKEN_BOUNDARY_MARKER in str(message)
+        for message in marked_conversation
+    ):
+        raise CompleteTokenInjectionError(
+            "The complete-token boundary marker collided with request data."
+        )
+
+    assistant_index = _assistant_index_from_ordinal(
+        marked_conversation, assistant_ordinal
+    )
+    _normalize_tool_arguments_for_template(
+        marked_conversation, before_index=assistant_index
+    )
+
+    marked_assistant = marked_conversation[assistant_index]
+    if not isinstance(marked_assistant, dict):
+        raise CompleteTokenInjectionError(
+            "The tokenized assistant message was not a message object."
+        )
+    marked_assistant["content"] = _COMPLETE_TOKEN_BOUNDARY_MARKER
+    marked_assistant.pop("reasoning_content", None)
+    marked_assistant.pop("reasoning", None)
+    marked_assistant.pop("tool_calls", None)
+
+    try:
+        marked_text = render_prompt_text(marked_conversation)
+    except CompleteTokenInjectionError:
+        raise
+    except Exception as e:
+        raise CompleteTokenInjectionError(
+            "The marked chat template could not be rendered."
+        ) from e
+
+    if not isinstance(marked_text, str):
+        raise CompleteTokenInjectionError("The marked prompt must render as text.")
+
+    marker_pos = marked_text.find(_COMPLETE_TOKEN_BOUNDARY_MARKER)
+    if marker_pos < 0:
+        raise CompleteTokenInjectionError(
+            "The chat template did not preserve the complete-token boundary marker."
+        )
+
+    eos_token = getattr(tokenizer, "eos_token", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if not isinstance(eos_token, str) or eos_token_id is None:
+        raise CompleteTokenInjectionError(
+            "Complete-token injection requires tokenizer EOS text and ID."
+        )
+
+    suffix_pos = marked_text.find(
+        eos_token, marker_pos + len(_COMPLETE_TOKEN_BOUNDARY_MARKER)
+    )
+    if suffix_pos < 0:
+        raise CompleteTokenInjectionError(
+            "The chat template did not close the tokenized assistant with EOS."
+        )
+
+    try:
+        suffix_token_ids = _coerce_token_id_list(
+            tokenizer.encode(marked_text[suffix_pos:], add_special_tokens=False),
+            "Contextual suffix token IDs",
+        )
+    except CompleteTokenInjectionError:
+        raise
+    except Exception as e:
+        raise CompleteTokenInjectionError(
+            "The contextual suffix could not be tokenized."
+        ) from e
+
+    if not suffix_token_ids or suffix_token_ids[0] != eos_token_id:
+        raise CompleteTokenInjectionError(
+            "The contextual suffix did not begin with EOS."
+        )
+    model_cut_end = len(model_prefix_token_ids)
+    if model_prefix_token_ids and model_prefix_token_ids[-1] == eos_token_id:
+        model_cut_end -= 1
+    return model_prefix_token_ids[:model_cut_end] + suffix_token_ids
 
 
 def replace_prefix_tokens(
