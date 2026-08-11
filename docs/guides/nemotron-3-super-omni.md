@@ -63,11 +63,18 @@ bash examples/nemo_gym/nemotron-3-super-omni/super_omni_launch.sh
 
 ## Launch
 
-The launcher defaults to the checkpoint, blended Gym data, Slurm account, and
-cache settings used by the migration source script. Its default NeMo RL image
-uses the Python 3.13 runtime required by the current main branch; the older
-Python 3.12 handoff image is not compatible with the current lockfile. Every
-value can be overridden with an environment variable:
+The launcher ships placeholders rather than defaults: `MODEL_PATH`,
+`TRAIN_PATH`, `CONTAINER`, `SANDBOX_CONTAINER`, `PERSISTENT_CACHE`, and
+`SLURM_ACCOUNT` all start as `/path/to/...` or `your_slurm_account`
+(`VAL_PATH` follows `TRAIN_PATH` unless set). A preflight check rejects any
+still holding a placeholder, listing them, before it reaches `mkdir` or
+`sbatch`.
+
+The container is one of them — there is no working default image. Build or
+supply one with the Python 3.13 runtime the current main branch requires; the
+older Python 3.12 handoff image is not compatible with the current lockfile.
+
+Export a real value for each:
 
 ```bash
 MODEL_PATH=/path/to/nemotron-super-omni-hf \
