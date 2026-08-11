@@ -131,6 +131,9 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.sglang_refit_value_check import (
+    maybe_verify_distributed_refit_values,
+)
 
 # ===============================================================================
 # Configuration
@@ -4120,6 +4123,24 @@ def async_grpo_train(
             on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
             next_nemo_gym_task_index=next_nemo_gym_task_index,
         )
+
+        # Opt-in value check of the distributed refit. Runs here, before
+        # collection starts, because it randomizes engine weights on purpose
+        # and needs the engines quiescent; it leaves them correctly refit, so
+        # the startup refit below is unaffected.
+        #
+        # ``compare_against_disk`` only holds on a fresh run. On resume the
+        # trainer carries a trained checkpoint while the engines cold-loaded
+        # the base model, so a correct refit *must* change their weights.
+        if isinstance(policy_generation, SGLangGeneration):
+            maybe_verify_distributed_refit_values(
+                policy_generation,
+                refit=lambda: refit_policy_generation(
+                    policy, policy_generation, colocated_inference
+                ),
+                colocated_inference=colocated_inference,
+                compare_against_disk=(step == 0),
+            )
 
         # Start trajectory collection in background
         collection_task = trajectory_collector.start_collection.remote(dataloader)

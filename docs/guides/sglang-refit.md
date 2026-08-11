@@ -441,6 +441,43 @@ post-processing, and generation resume complete. Treat these as fatal:
 There is no disk-refit fallback. Diagnose and repair the failed in-memory path
 before retrying.
 
+## Verifying Refit Values
+
+`NRL_SGLANG_REFIT_SUCCESS` says the transfer completed, and
+`NRL_REFIT_EXPORT_SHAPE_CHECK` says every exported tensor has the shape the
+checkpoint declares. Neither compares a single weight *value*. Set
+`NRL_REFIT_VALUE_CHECK=1` to add that proof:
+
+```bash
+EXTRA_ENV="... NRL_REFIT_VALUE_CHECK=1" ./tools/launch <recipe>.sh
+```
+
+It runs once, in async GRPO, before trajectory collection starts, and drives
+SGLang's `/weights_checker` around two extra refits:
+
+| phase | what it proves |
+| --- | --- |
+| `from_disk_vs_refit` | a refit reproduces the weights SGLang loaded from disk, so the Megatron to HF to NCCL round trip preserves values |
+| `reset_control` | `reset_tensors` randomized every parameter, so the next phase is not vacuous |
+| `refit_vs_refit` | a second refit restores exactly the first refit's values; `unwritten` counts parameters the refit never touched, `corrupted` counts ones it wrote wrongly |
+
+A passing run ends with `NRL_REFIT_VALUE_CHECK result=pass`; any failure emits
+`result=fail error_type=...` before raising. Grep for `result=` rather than
+inferring from the exit status, so an aborted run is distinguishable from a
+failed comparison.
+
+Costs two extra refits plus four checksum sweeps, roughly five minutes at 32
+nodes. Three constraints:
+
+- **It randomizes engine weights on purpose.** If it fails, the engines hold
+  noise and the run must not continue. Health monitoring stays suspended on
+  that path by design.
+- **`from_disk_vs_refit` only runs on a fresh start.** On resume the trainer
+  holds a trained checkpoint while the engines cold-loaded the base model, so
+  that phase is skipped and logged as `skipped=1 reason=resumed_run`.
+- **Colocated inference is skipped:** it transfers over IPC, not the NCCL
+  broadcast this check covers.
+
 ## Troubleshooting
 
 - **Failure before `GROUP_READY`:** inspect the trainer-rank-0 and engine-leader

@@ -38,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DRIVER_REFIT_MODULES = (
     "nemo_rl/weight_sync/megatron_refit_sglang.py",
     "nemo_rl/weight_sync/dtensor_refit_sglang.py",
+    "nemo_rl/weight_sync/sglang_refit_value_check.py",
 )
 
 # Distributions unavailable in the driver environment.
