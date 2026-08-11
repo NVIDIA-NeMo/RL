@@ -16,7 +16,7 @@ set -euo pipefail
 # OccupiedIdleGPUsJobReaper --comment exemption — so we set environment and
 # delegate rather than forking 800+ lines.
 #
-# Usage:
+# Usage (legacy async-1 with an already-running GenRM):
 #   GENRM_BASE_URL=http://<lb-host>:9213/v1 \
 #     bash examples/nemo_gym/nemotron-3.5-nano/nano35_dolphin_launch.sh
 #
@@ -25,18 +25,20 @@ set -euo pipefail
 # Extra Hydra overrides are forwarded verbatim:
 #   GENRM_BASE_URL=... bash .../nano35_dolphin_launch.sh grpo.max_num_steps=2
 #
-# GenRM must already be serving. See the GenRM section below.
+# Set EXTERNAL_JUDGES=1 to let PR 3511 launch GenRM and NL2Bash in a separate
+# Slurm heterogeneous component instead. In that mode GENRM_BASE_URL must be
+# unset; the launcher discovers both load-balancer URLs inside the allocation.
 # =============================================================================
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${REPO_ROOT}"   # ultra_launch.sh derives PROJECT_ROOT from $PWD
 
 # -----------------------------------------------------------------------------
-# GenRM — EXTERNAL, and hard-required.
+# GenRM deployment.
 #
-# We serve GenRM out-of-band rather than in-cluster because partition `batch`
-# caps at 4 h: an in-cluster pool would reload the 470 GB bf16 Qwen3-235B on
-# every restart, whereas an external pool stays warm across all of them.
+# Legacy async-1 consumes an already-running GenRM through GENRM_BASE_URL.
+# SingleController V2 sets EXTERNAL_JUDGES=1 and uses PR 3511's heterogeneous
+# service component for both GenRM and NL2Bash.
 #
 # Stand it up first (copy the dir — it holds .lb_pid_*, logs/ and a flock'd
 # registry, so running geshen's in place would collide with their pool):
@@ -57,9 +59,18 @@ cd "${REPO_ROOT}"   # ultra_launch.sh derives PROJECT_ROOT from $PWD
 # genrm_worker.sh). ultra_launch.sh sets base_url XOR model, never both, so the
 # name is pinned in rlvr_dolphin.yaml instead of passed here.
 # -----------------------------------------------------------------------------
-: "${GENRM_BASE_URL:?GENRM_BASE_URL must point to the external GenRM /v1 endpoint}"
-export GENRM_BASE_URL
-unset GENRM_MODEL
+export EXTERNAL_JUDGES="${EXTERNAL_JUDGES:-0}"
+if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
+  if [[ -n "${GENRM_BASE_URL:-}" ]]; then
+    echo "ERROR: unset GENRM_BASE_URL when EXTERNAL_JUDGES=1; PR 3511 launches a fresh GenRM pool." >&2
+    exit 1
+  fi
+  export GENRM_MODEL="${GENRM_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/models/qwen235b_principle_comparison_genrm_step1230}"
+else
+  : "${GENRM_BASE_URL:?GENRM_BASE_URL must point to the external GenRM /v1 endpoint}"
+  export GENRM_BASE_URL
+  unset GENRM_MODEL
+fi
 
 # -----------------------------------------------------------------------------
 # Experiment identity
@@ -68,6 +79,10 @@ unset GENRM_MODEL
 # -----------------------------------------------------------------------------
 export EXP_NAME="${EXP_NAME:-akamehra-nano35-v1-async1-n64-t8-g40-gym16-tp4_cp4_ep8-gpp16-pps128-gbs2048}"
 export CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-nano/rlvr_dolphin.yaml}"
+
+# Pin the legacy async-1 driver explicitly. The SC V2 wrapper overrides this
+# before delegating to this shared Nano site launcher.
+export TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py}"
 
 # -----------------------------------------------------------------------------
 # Model and data
@@ -84,19 +99,19 @@ export TRAIN_PATH="${TRAIN_PATH:-${_BLEND}}"
 export VAL_PATH="${VAL_PATH:-${_BLEND}}"
 
 # -----------------------------------------------------------------------------
-# Judges served in-cluster from the gym pool (GenRM is the only external one).
+# Judge models. With EXTERNAL_JUDGES=1, PR 3511 serves GenRM and NL2Bash in the
+# external-service hetgroup; Safety remains in the Gym pool.
 # -----------------------------------------------------------------------------
 export NL2BASH_JUDGE_MODEL="${NL2BASH_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/models/Qwen3-235B-A22B-Instruct-2507-FP8}"
 export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/super_v3/model_checkpoints/Nemotron-Content-Safety-Reasoning-4B}"
 
 # -----------------------------------------------------------------------------
 # Containers
-# Built from public main on 2026-07-26 with prebaked venvs + NCCL 2.30.4.
-# Its dependency baseline matches HEAD on ray 2.56.1 / torch 2.11.0+cu130 /
-# vllm 0.20.0 / transformers 5.5.0; the only drift is ~20 additive pure-Python
-# packages from 8b58d05d4, which uv resyncs cheaply at startup.
+# PR 3511 requires the vLLM 0.25.1 environment in this image. Using the older
+# V1 July image with the PR's mounted nemo_rl code fails at import time before
+# either the legacy or SC driver can start.
 # -----------------------------------------------------------------------------
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:main_ultra_recipes_prebaked_venvs_nccl2304_20260726_b.squashfs}"
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-images/gitlab-master.nvidia.com/yifuw/images/nemo-rl:nightly-20260806-sandbox.squashfs}"
 
 # -----------------------------------------------------------------------------
 # Sandbox process DISABLED — this is what killed jobs 5726250 and 5732681.
@@ -117,16 +132,15 @@ export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/yifuw/enroot-
 # boot fine without a sandbox and only contact it if a request routes to them.
 # The dolphin blend routes to neither, so the sandbox is never needed.
 #
-# ray.sub gates everything sandbox-related on SANDBOX_CONTAINER && SANDBOX_COMMAND
-# both being non-empty (ray.sub:559) — the ports dir, the 64-instance ready wait,
-# and the srun itself. The unmodified ultra launcher replaces an empty
-# SANDBOX_COMMAND with its default, so keep SANDBOX_CONTAINER empty instead.
+# PR 3511 exposes NO_COLOCATED_SANDBOX for exactly this case. It clears both
+# SANDBOX_CONTAINER and SANDBOX_COMMAND before ray.sub builds the allocation,
+# skipping the ports directory, readiness gate, and sandbox srun.
 #
 # Side benefit: no 16 GB sandbox image extracted on 64 nodes, so faster startup.
-# To re-enable (e.g. if a future blend uses Lean4), explicitly set
-# SANDBOX_CONTAINER to the sandbox image path.
+# To re-enable (e.g. if a future blend uses Lean4), set
+# NO_COLOCATED_SANDBOX=0 and supply SANDBOX_CONTAINER.
 # -----------------------------------------------------------------------------
-export SANDBOX_CONTAINER="${SANDBOX_CONTAINER-}"
+export NO_COLOCATED_SANDBOX="${NO_COLOCATED_SANDBOX:-1}"
 
 # -----------------------------------------------------------------------------
 # Caches
@@ -255,7 +269,11 @@ echo "  Blend      : ${TRAIN_PATH}"
 echo "  Container  : ${CONTAINER}"
 echo "  Cache      : ${PERSISTENT_CACHE}"
 echo "  HF_HOME    : ${HF_HOME}"
-echo "  GenRM      : ${GENRM_BASE_URL} (external; served model name: model)"
+if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
+echo "  Judges     : GenRM + NL2Bash in PR 3511 external-service hetgroup"
+else
+echo "  GenRM      : ${GENRM_BASE_URL} (existing external service; model: model)"
+fi
 echo "  SLURM      : ${SLURM_ACCOUNT} / ${SLURM_PARTITION} / ${WALLTIME}"
 echo "  Reaper     : ${JOB_REAPER_EXEMPT_IDLE_MINS} min idle exemption"
 echo "  Nodes      : ${NUM_TRAIN_NODES} train + ${NUM_GEN_NODES} gen + ${NUM_GYM_NODES} gym"
