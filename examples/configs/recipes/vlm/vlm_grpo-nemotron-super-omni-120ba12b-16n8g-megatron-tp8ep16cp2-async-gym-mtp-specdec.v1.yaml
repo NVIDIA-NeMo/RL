@@ -89,7 +89,12 @@ checkpointing:
   # metric only alongside a non-zero val_period (or val_at_end).
   metric_name: null
   higher_is_better: true
-  keep_top_k: 1000000
+  # A Super Omni checkpoint is ~1.4 TB with optimizer state, so never pruning
+  # costs ~14 TB across a 50-step run at save_period: 5. Keep the 5 most
+  # recent instead. Safe to prune by step only because metric_name is null
+  # above: with a val metric named but never collected, every checkpoint ties
+  # at -inf and pruning is arbitrary.
+  keep_top_k: 5
   save_period: 5
   checkpoint_must_save_by: 00:03:45:00
   save_optimizer: true
