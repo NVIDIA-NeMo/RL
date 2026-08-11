@@ -913,6 +913,12 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.moe_router_group_topk = config["megatron_cfg"][
             "moe_router_group_topk"
         ]
+    if (
+        config["megatron_cfg"].get("transformer_impl") == "inference_optimized"
+        and getattr(model_cfg, "moe_router_num_groups", None) == 1
+    ):
+        model_cfg.moe_router_num_groups = None
+        model_cfg.moe_router_group_topk = None
     if "moe_pad_experts_for_cuda_graph_inference" in config["megatron_cfg"]:
         model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
             "moe_pad_experts_for_cuda_graph_inference"
