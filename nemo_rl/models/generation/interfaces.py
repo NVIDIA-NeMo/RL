@@ -417,3 +417,7 @@ class GenerationInterface(ABC):
             Dictionary of metrics. Format may vary by backend.
         """
         return {}
+
+    def get_latest_logger_metrics(self) -> dict[str, Any]:
+        """Get a bounded latest-value snapshot for frequent telemetry polls."""
+        return self.get_logger_metrics()
