@@ -192,21 +192,47 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                 "Mooncake backend requires a local node IP; "
                 "_get_local_node_ip() returned empty."
             )
-        # Mooncake virtual segment / local buffer sizing. Defaults sized
-        # for production-scale rollouts (multi-iter DAPO, large
-        # message_log object payloads); under-sized values cause
-        # ``batch_get_tensor returned None`` once mooncake exhausts its
-        # internal allocator headroom. Lazy-mmap'd, so RSS is bounded
-        # by actual traffic. Override per-recipe via
-        # ``data_plane.global_segment_size`` /
+        # Mooncake virtual segment / local buffer sizing. Configured values are
+        # upper bounds: under-sized values cause ``batch_get_tensor returned
+        # None`` once mooncake exhausts its allocator headroom, so recipes size
+        # them generously via ``data_plane.global_segment_size`` /
         # ``data_plane.local_buffer_size`` (bytes).
+        #
+        # Both are registered per *process* — MooncakeStoreClient.setup() runs
+        # in every process that opens a TQ client, i.e. one per GPU — so the
+        # per-machine cost is gpus_per_node x (segment + buffer), not a single
+        # node-wide allocation. Left unbounded, a pairing tuned for a small
+        # model OOMs the host under a large one, whose own resident footprint
+        # leaves far less headroom. Scale both down proportionally (preserving
+        # their ratio) so the per-machine total stays within
+        # ``data_plane.host_memory_fraction`` of host RAM.
+        segment_size = int(cfg["global_segment_size"])
+        buffer_size = int(cfg["local_buffer_size"])
+        procs_per_host = max(torch.cuda.device_count(), 1)
+        host_budget = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        per_proc_budget = (
+            int(host_budget * cfg["host_memory_fraction"]) // procs_per_host
+        )
+        if segment_size + buffer_size > per_proc_budget:
+            scale = per_proc_budget / (segment_size + buffer_size)
+            warnings.warn(
+                f"data_plane mooncake sizing {segment_size + buffer_size} B/process "
+                f"x {procs_per_host} processes exceeds host_memory_fraction="
+                f"{cfg['host_memory_fraction']} of {host_budget} B; scaling by "
+                f"{scale:.3f}. Lower data_plane.global_segment_size to silence, or "
+                "raise data_plane.host_memory_fraction if the host can afford it.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            segment_size = int(segment_size * scale)
+            buffer_size = int(buffer_size * scale)
         overlay = {
             **controller_overlay,
             "backend": {
                 "storage_backend": "MooncakeStore",
                 "MooncakeStore": {
-                    "global_segment_size": int(cfg["global_segment_size"]),
-                    "local_buffer_size": int(cfg["local_buffer_size"]),
+                    "global_segment_size": segment_size,
+                    "local_buffer_size": buffer_size,
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that
                     # mooncake_master + the metadata server bind to.
