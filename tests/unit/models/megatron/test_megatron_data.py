@@ -446,17 +446,32 @@ class TestProcessMicrobatch:
         """
         from nemo_rl.models.megatron.data import process_microbatch
 
-        # Distinct lengths at index 0 and 1 so the assertion catches the wrong
-        # read: index 0 is the full THD row, index 1 the CP-local shard.
-        packed_idx0 = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
-        packed_idx1 = torch.tensor([[1, 1, 1, 0]])
-        mock_pack.return_value = (
-            packed_idx0,
-            packed_idx1,
-            MagicMock(),
-            torch.tensor([0, 5, 8], dtype=torch.int32),
-            torch.tensor([0, 5, 8], dtype=torch.int32),
-        )
+        # A distinct return per call, so the assertions below discriminate both
+        # which tuple index was read (0 is the full THD row, 1 the CP-local
+        # shard, and they differ in width) and which call it came from. A
+        # shared return_value would let a regression that re-packs input_ids in
+        # place of mtp_loss_mask pass unnoticed, since both sides would then be
+        # the same object.
+        tokens_full = torch.tensor([[1, 2, 3, 4, 5, 6, 0, 0]])
+        tokens_cp = torch.tensor([[1, 2, 3, 4]])
+        mask_full = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
+        mask_cp = torch.tensor([[1, 1, 1, 0]])
+
+        def _pack_returns(tensor, *args, **kwargs):
+            full, cp = (
+                (mask_full, mask_cp)
+                if tensor is data_dict["mtp_loss_mask"]
+                else (tokens_full, tokens_cp)
+            )
+            return (
+                full,
+                cp,
+                MagicMock(),
+                torch.tensor([0, 5, 8], dtype=torch.int32),
+                torch.tensor([0, 5, 8], dtype=torch.int32),
+            )
+
+        mock_pack.side_effect = _pack_returns
 
         data_dict = {
             "input_ids": torch.tensor(
@@ -476,11 +491,21 @@ class TestProcessMicrobatch:
             straggler_timer=MagicMock(),
         )
 
+        # The mask was packed, not re-derived from input_ids: one call per
+        # tensor, and the second is the mask itself.
+        assert mock_pack.call_count == 2
+        assert torch.equal(
+            mock_pack.call_args_list[1].args[0], data_dict["mtp_loss_mask"]
+        )
+
         assert result.mtp_loss_mask is not None
         # The full row, not the CP-sharded one.
-        assert torch.equal(result.mtp_loss_mask, packed_idx0)
-        # And it lines up with the tokens the model will slice.
+        assert torch.equal(result.mtp_loss_mask, mask_full)
+        # And it lines up with the tokens the model will slice. Because the two
+        # pack calls return distinct tensors, this compares across calls rather
+        # than a tensor with itself.
         assert result.input_ids_cp_sharded is result.input_ids
+        assert torch.equal(result.input_ids_cp_sharded, tokens_full)
         assert result.mtp_loss_mask.shape[1] == result.input_ids_cp_sharded.shape[1]
 
     def test_caller_packing_matches_mbridge_thd_contract(self):
