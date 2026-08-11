@@ -2,17 +2,20 @@
 defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.yaml
 
 logger:
-  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-sc
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync
   wandb:
-    name: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-sc
+    name: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync
 
 # SC does not support validation and checkpointing yet.
 grpo:
+  # Null out the legacy async_grpo block inherited from grpo_math_1B.yaml:
+  # SC reads async_rl instead, and the entrypoint raises if this block is set.
+  async_grpo: null
   val_period: 0
 
 checkpointing:
   enabled: false
-  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-sc
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync
 
 # TransferQueue data plane is mandatory for the SingleController path.
 data_plane:
