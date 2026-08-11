@@ -4670,13 +4670,7 @@ def async_grpo_train(
                             k=student_topk,
                             timer=timer,
                         )
-                        if "topk_logprobs" not in topk_output:
-                            raise RuntimeError(
-                                "The selected policy backend does not return globally "
-                                "normalized topk_logprobs required by student-top-k OPD."
-                            )
                         train_data["prev_topk_indices"] = topk_output["topk_indices"]
-                        train_data["prev_topk_logprobs"] = topk_output["topk_logprobs"]
                         (
                             teacher_support_logprobs,
                             teacher_support_time,

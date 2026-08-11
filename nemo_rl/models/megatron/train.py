@@ -637,7 +637,7 @@ class TopkLogitsPostProcessor:
         data_dict: BatchedDataDict[Any],
         cu_seqlens_padded: torch.Tensor,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
-        """Create a post-processing function for top-k logits, logprobs, and indices.
+        """Create a post-processing function that computes top-k logits and indices.
 
         This function returns a processor that extracts the top-k highest logits
         and their corresponding vocabulary indices from model outputs. It handles
@@ -648,8 +648,8 @@ class TopkLogitsPostProcessor:
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
 
         Returns:
-            Callable: Function that returns top-k logits, globally normalized
-                top-k logprobs, and global vocabulary indices.
+            Callable: Function that takes output tensor and returns
+                ``(dummy_loss, {"topk_logits": values, "topk_indices": indices})``.
         """
         pack = self.cfg["sequence_packing"]["enabled"]
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
@@ -674,19 +674,6 @@ class TopkLogitsPostProcessor:
                 vocab_end_index=vocab_start_index + vocab_shard_size,
                 chunk_size=chunk_size,
             )
-            local_logprobs = vocab_parallel_log_softmax(
-                output_tensor,
-                temperature=1.0,
-                tp_group=tp_grp if torch.distributed.is_initialized() else None,
-            )
-            topk_logprobs_local = gather_logits_at_global_indices(
-                local_logprobs,
-                topk_idx_local,
-                tp_group=tp_grp if torch.distributed.is_initialized() else None,
-                vocab_start_index=vocab_start_index,
-                vocab_end_index=vocab_start_index + vocab_shard_size,
-            )
-
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()
                 if pack:
@@ -704,12 +691,6 @@ class TopkLogitsPostProcessor:
                         dtype=topk_idx_local.dtype,
                         device=topk_idx_local.device,
                     )
-                    topk_logprobs_full = torch.zeros(
-                        (1, total_packed_len, self.k),
-                        dtype=topk_logprobs_local.dtype,
-                        device=topk_logprobs_local.device,
-                    )
-
                     for i in range(batch_size):
                         start_idx = int(cu_seqlens_padded[i].item())
                         end_idx = int(cu_seqlens_padded[i + 1].item())
@@ -725,13 +706,6 @@ class TopkLogitsPostProcessor:
                             )
                             gathered_idx = allgather_cp_sharded_tensor(
                                 local_idx_slice, cp_grp, seq_dim=1
-                            )
-                            gathered_logprobs = allgather_cp_sharded_tensor(
-                                topk_logprobs_local[
-                                    :, start_idx // cp_size : end_idx // cp_size, :
-                                ],
-                                cp_grp,
-                                seq_dim=1,
                             )
                             # Some kernels may return [X, Y, k] where X*Y = (end_idx - start_idx).
                             # Flatten leading dims and reshape to [1, expected_len, k] to match target.
@@ -752,9 +726,6 @@ class TopkLogitsPostProcessor:
                                 )
                             topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
                             topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
-                            topk_logprobs_full[:, start_idx:end_idx, :] = (
-                                gathered_logprobs.reshape(1, expected_len, self.k)
-                            )
                 else:
                     # Sequence packing must be enabled when CP > 1
                     raise RuntimeError(
@@ -763,7 +734,6 @@ class TopkLogitsPostProcessor:
             else:
                 topk_vals_full = topk_vals_local
                 topk_idx_full = topk_idx_local
-                topk_logprobs_full = topk_logprobs_local
 
             if pack:
                 batch_size = data_dict["input_ids"].shape[0]
@@ -777,11 +747,6 @@ class TopkLogitsPostProcessor:
                     dtype=topk_idx_full.dtype,
                     device=topk_idx_full.device,
                 )
-                out_logprobs = torch.zeros(
-                    (batch_size, unpacked_seqlen, self.k),
-                    dtype=topk_logprobs_full.dtype,
-                    device=topk_logprobs_full.device,
-                )
                 for i in range(batch_size):
                     seq_len = int(seq_lengths[i].item())
                     start_idx = int(cu_seqlens_padded[i].item())
@@ -792,18 +757,13 @@ class TopkLogitsPostProcessor:
                         out_idx[i, :seq_len, :] = topk_idx_full[
                             0, start_idx : start_idx + seq_len, :
                         ]
-                        out_logprobs[i, :seq_len, :] = topk_logprobs_full[
-                            0, start_idx : start_idx + seq_len, :
-                        ]
                 return output_tensor.new_zeros(()), {
                     "topk_logits": out_vals,
-                    "topk_logprobs": out_logprobs,
                     "topk_indices": out_idx,
                 }
             else:
                 return output_tensor.new_zeros(()), {
                     "topk_logits": topk_vals_full,
-                    "topk_logprobs": topk_logprobs_full,
                     "topk_indices": topk_idx_full,
                 }
 
@@ -820,6 +780,15 @@ class SupportLogprobsPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        """Create a function that gathers normalized log-probabilities.
+
+        Args:
+            data_dict: Model inputs containing ``topk_indices`` with shape
+                ``[batch, sequence, k]``.
+
+        Returns:
+            Function returning ``support_logprobs`` at the requested indices.
+        """
         if self.cfg["sequence_packing"]["enabled"]:
             raise NotImplementedError(
                 "Support logprob gathering does not yet support sequence packing."

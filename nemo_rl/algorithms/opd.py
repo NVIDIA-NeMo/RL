@@ -178,7 +178,9 @@ def student_topk_reverse_kl_loss(
         * (student_support_logprobs - teacher_support_logprobs)
     ).sum(dim=-1)
     tail_advantage = (teacher_target_logprobs - student_target_logprobs).detach()
-    tail_loss = -tail_advantage * student_target_logprobs
+    # The score-function coefficient includes +1 from differentiating the
+    # student-probability prefactor in p_s * (log p_s - log p_t).
+    tail_loss = (1.0 - tail_advantage) * student_target_logprobs
     return support_loss + tail_loss * (~target_in_support.bool()).to(tail_loss.dtype)
 
 

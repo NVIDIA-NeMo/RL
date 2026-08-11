@@ -29,9 +29,9 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
     from_parallel_logits_to_logprobs_packed_sequences,
+    gather_logits_at_global_indices,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
-    gather_logits_at_global_indices,
     vocab_parallel_log_softmax,
 )
 

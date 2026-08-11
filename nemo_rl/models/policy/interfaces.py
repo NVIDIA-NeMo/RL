@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, Optional, TypedDict
+from typing import Any, Optional, TypedDict
 
 import ray
 import torch
@@ -42,14 +42,9 @@ class ScoreOutputSpec(TypedDict):
 
 
 class TopkLogitsOutputSpec(TypedDict):
-    """Per-position top-k values and corresponding global token indices.
-
-    ``topk_logprobs`` is normalized against the complete vocabulary; it is
-    optional for backend compatibility while implementations migrate.
-    """
+    """Per-position top-k values and corresponding global token indices."""
 
     topk_logits: torch.Tensor
-    topk_logprobs: NotRequired[torch.Tensor]
     topk_indices: torch.Tensor
 
 
