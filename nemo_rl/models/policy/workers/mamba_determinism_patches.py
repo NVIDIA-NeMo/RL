@@ -22,7 +22,7 @@ kept in NeMo-RL so zero-KL runs do not require a custom Megatron-LM fork.
 import importlib
 import inspect
 from types import ModuleType
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 import torch
 import torch.nn.functional as F
@@ -707,6 +707,38 @@ def _nrl_patched_ssm_decode(
     return y
 
 
+_MAMBA_MODEL_NAME_MARKERS = (
+    "nemotron-nano",
+    "nemotron_nano",
+    "nemotron-3-nano",
+    "nemotron_3_nano",
+    "nemotron-3-super",
+    "nemotron_3_super",
+    "falconh1",
+    "falcon-h1",
+    "falcon_h1",
+)
+
+
+def policy_uses_mamba_layers(config: Mapping[str, Any]) -> bool:
+    """Return True when the policy model includes MambaMixer layers."""
+    model_name = str(config.get("model_name", "")).lower()
+    if any(marker in model_name for marker in _MAMBA_MODEL_NAME_MARKERS):
+        return True
+    if "mamba" in model_name and "qwen" not in model_name:
+        return True
+
+    megatron_cfg = config.get("megatron_cfg") or {}
+    if megatron_cfg.get("is_hybrid_model"):
+        return True
+
+    hybrid_layer_pattern = megatron_cfg.get("hybrid_layer_pattern")
+    if hybrid_layer_pattern is not None and "M" in str(hybrid_layer_pattern).upper():
+        return True
+
+    return False
+
+
 def _validate_method_signature(
     method: Callable[..., torch.Tensor],
     expected_parameters: tuple[str, ...],
@@ -722,8 +754,12 @@ def _validate_method_signature(
         )
 
 
-def apply_mamba_determinism_patch() -> None:
-    """Install the zero-KL Mamba prefill and decode paths once per process."""
+def apply_mamba_determinism_patch(*, required: bool = True) -> None:
+    """Install the zero-KL Mamba prefill and decode paths once per process.
+
+    When ``required`` is False (non-Mamba models), signature mismatches are
+    logged and the patch is skipped instead of failing worker initialization.
+    """
     global _MAMBA_MIXER_MODULE, _ORIGINAL_SSM_DECODE, _ORIGINAL_SSM_PREFILL
     if _ORIGINAL_SSM_PREFILL is not None:
         return
@@ -732,12 +768,22 @@ def apply_mamba_determinism_patch() -> None:
     mixer_class = module.MambaMixer
     original_prefill = mixer_class._ssm_prefill
     original_decode = mixer_class._ssm_decode
-    _validate_method_signature(
-        original_prefill, _EXPECTED_PREFILL_PARAMETERS, "_ssm_prefill"
-    )
-    _validate_method_signature(
-        original_decode, _EXPECTED_DECODE_PARAMETERS, "_ssm_decode"
-    )
+    try:
+        _validate_method_signature(
+            original_prefill, _EXPECTED_PREFILL_PARAMETERS, "_ssm_prefill"
+        )
+        _validate_method_signature(
+            original_decode, _EXPECTED_DECODE_PARAMETERS, "_ssm_decode"
+        )
+    except RuntimeError as exc:
+        if not required:
+            print(
+                "[zero_train_gen_mismatch] skipping Mamba determinism patch "
+                f"(model has no Mamba layers): {exc}",
+                flush=True,
+            )
+            return
+        raise
     for method_name in _HELPER_METHODS:
         if hasattr(mixer_class, method_name):
             raise RuntimeError(

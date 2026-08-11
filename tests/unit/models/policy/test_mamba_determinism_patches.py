@@ -172,6 +172,58 @@ def test_bik_decode_rejects_speculative_rollback_buffers(fake_mamba_module):
         )
 
 
+class FakeMambaMixerNewApi(FakeMambaMixer):
+    def _ssm_prefill(
+        self,
+        zxBCdt,
+        conv_state,
+        ssm_state,
+        seq_idx=None,
+        cu_seqlens=None,
+        batch_indices=None,
+        intermediate_chunk_indices=None,
+        intermediate_abs_positions=None,
+        intermediate_real_count=None,
+        intermediate_ssm_out=None,
+        intermediate_conv_out=None,
+        cu_chunk_seqlens=None,
+        last_chunk_indices=None,
+        seq_idx_for_varlen=None,
+        cu_seqlens_list=None,
+        real_token_count=None,
+        conv_seq_idx=None,
+        conv_seq_start=None,
+    ):
+        return "new-api-prefill"
+
+
+def test_policy_uses_mamba_layers():
+    assert patches.policy_uses_mamba_layers(
+        {"model_name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16"}
+    )
+    assert not patches.policy_uses_mamba_layers({"model_name": "Qwen/Qwen3-30B-A3B"})
+    assert patches.policy_uses_mamba_layers(
+        {
+            "model_name": "some/custom-model",
+            "megatron_cfg": {"hybrid_layer_pattern": "MEME*ME"},
+        }
+    )
+
+
+def test_patch_skips_when_not_required_and_signature_mismatch(
+    fake_mamba_module, monkeypatch, capsys
+):
+    module, import_module = fake_mamba_module
+    module.MambaMixer = FakeMambaMixerNewApi
+    original_prefill = module.MambaMixer._ssm_prefill
+
+    patches.apply_mamba_determinism_patch(required=False)
+
+    assert module.MambaMixer._ssm_prefill is original_prefill
+    assert "skipping Mamba determinism patch" in capsys.readouterr().out
+    import_module.assert_called_once_with("megatron.core.ssm.mamba_mixer")
+
+
 def test_reference_prefill_rejects_prefix_cache(fake_mamba_module):
     patches.apply_mamba_determinism_patch()
     mixer = FakeMambaMixer()

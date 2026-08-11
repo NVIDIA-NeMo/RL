@@ -22,6 +22,7 @@ from nemo_rl.models.policy.workers.moe_determinism_patches import (
     _nrl_dynamic_step_context_bookkeeping,
     _patched_unpermute,
     _unpermute_fixed_order_combine,
+    _unpermute_gather_combine_droppad,
     apply_log_softmax_determinism_patch,
     apply_moe_unpermute_determinism_patch,
     apply_router_replay_inference_patches,
@@ -36,6 +37,37 @@ class TestUnpermuteFixedOrderCombine:
         out = _unpermute_fixed_order_combine(permuted, sorted_indices, torch.Size([2, 2]))
         assert torch.allclose(out, torch.tensor([[3.0, 0.0], [3.0, 0.0]]))
 
+
+class TestGatherCombineDroppad:
+    def setup_method(self):
+        restore_moe_determinism_patches()
+
+    def teardown_method(self):
+        restore_moe_determinism_patches()
+
+    def test_routes_one_token_per_expert(self):
+        routing_map = torch.tensor([[True, False], [False, True]])
+        permuted = torch.tensor([[10.0], [20.0]])
+        sorted_indices = torch.tensor([0, 1])
+        out = _unpermute_gather_combine_droppad(
+            permuted, sorted_indices, torch.Size([2, 1]), routing_map
+        )
+        assert torch.allclose(out, torch.tensor([[10.0], [20.0]]))
+
+    def test_patched_unpermute_uses_droppad_when_flag_set(self):
+        routing_map = torch.tensor([[True, False], [False, True]])
+        probs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        permuted = torch.tensor([[3.0], [4.0]])
+        sorted_indices = torch.tensor([0, 1])
+        out = _patched_unpermute(
+            permuted,
+            sorted_indices,
+            torch.Size([2, 1]),
+            probs=probs,
+            routing_map=routing_map,
+            drop_and_pad=True,
+        )
+        assert torch.allclose(out, torch.tensor([[3.0], [4.0]]))
 class TestApplyMoeDeterminismPatches:
     def setup_method(self):
         restore_moe_determinism_patches()
