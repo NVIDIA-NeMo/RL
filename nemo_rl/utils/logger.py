@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import atexit
 import glob
 import json
 import logging
@@ -238,6 +239,11 @@ class WandbLogger(LoggerInterface):
         self._pending_step: Optional[int] = None
         self._pending_metrics: dict[str, Any] = {}
         self.run.define_metric(_WANDB_CALLER_STEP_METRIC, hidden=True)
+        # Most training entrypoints run W&B in the driver process and do not
+        # own an explicit logger teardown today. Register after wandb.init so
+        # our Python-side row buffer drains before W&B's own atexit handlers.
+        # finish() is idempotent for actors that already close explicitly.
+        atexit.register(self.finish)
 
         if os.environ.get("RAY_BACKEND_LOG_LEVEL", "").lower() == "debug":
             print(
