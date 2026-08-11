@@ -151,6 +151,7 @@ class ManagedDynamoRuntime:
             "DYN_EVENT_PLANE": "nats",
             "DYN_HEALTH_CHECK_ENABLED": "false",
             "DYN_SDK_DISABLE_ANSI_LOGGING": "1",
+            "DYN_RL_INIT_WEIGHTS_TIMEOUT_S": str(self._dynamo_cfg.control_timeout_s),
         }
         print(
             f"  [Dynamo] managed environment={redact_environment(self._manager_env)!r}",

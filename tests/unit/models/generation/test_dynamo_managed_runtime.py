@@ -219,10 +219,12 @@ def test_node_local_port_bands_are_deterministic() -> None:
 def test_startup_failure_cleans_up_partial_worker_pool(monkeypatch, tmp_path) -> None:
     calls = []
     exit_hooks = []
+    pool_init_kwargs = {}
 
     class FailingPool:
         def __init__(self, **kwargs):
             calls.append("pool-init")
+            pool_init_kwargs.update(kwargs)
 
         def start(self):
             calls.append("pool-start")
@@ -290,6 +292,7 @@ def test_startup_failure_cleans_up_partial_worker_pool(monkeypatch, tmp_path) ->
     assert runtime._pool is None
     assert runtime._started is False
     assert exit_hooks == []
+    assert pool_init_kwargs["manager_env"]["DYN_RL_INIT_WEIGHTS_TIMEOUT_S"] == "10.0"
     assert not etcd_dir.exists()
     assert not nats_dir.exists()
 
