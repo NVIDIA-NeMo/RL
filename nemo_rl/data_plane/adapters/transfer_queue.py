@@ -22,13 +22,14 @@ business logic. Backend init is lifted from
 
 from __future__ import annotations
 
+import glob
 import ipaddress
 import os
 import socket
-import subprocess
 import time
 import warnings
 from importlib import resources
+from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -72,43 +73,46 @@ def _get_local_node_ip() -> str:
         return ""
 
 
-def _mooncake_transport_config() -> dict:
-    # mooncake_cpu exists for the zero-copy RDMA MooncakeStore path (TQ v0.1.8);
-    # TCP is an explicit dev/CI opt-in, never a silent fallback.
-    #
-    # The probe below deliberately selects a RoCE (Ethernet link-layer) NIC and
-    # takes one of them. It does not pick the InfiniBand rails that the NIXL
-    # checkpoint path uses (see docs/design-docs/checkpoint-engines.md) — RoCE
-    # is what has been validated end-to-end here. Name a device explicitly with
-    # MC_MOONCAKE_DEVICE to override. Runs on the driver only, so it assumes
-    # homogeneous nodes: the device it finds is broadcast to every client.
-    if os.environ.get("MC_MOONCAKE_PROTOCOL") == "tcp":
-        return {"protocol": "tcp"}
+def roce_device() -> str:
+    """Return this host's RoCE-capable mlx5 device, or ``""`` if none.
+
+    ``MC_MOONCAKE_DEVICE`` names one explicitly and wins. Otherwise the first
+    mlx5 device whose port-1 link layer is Ethernet is selected — InfiniBand
+    devices are deliberately not auto-selected, since RoCE is the fabric this
+    path has been validated on (the NIXL checkpoint path uses the IB rails
+    instead; see docs/design-docs/checkpoint-engines.md).
+
+    Also the skip predicate for the mooncake tests, which cannot run without a
+    device now that ``mooncake_cpu`` is RDMA-only.
+    """
     device = os.environ.get("MC_MOONCAKE_DEVICE", "")
-    if not device:
+    if device:
+        return device
+    for link_layer in sorted(
+        glob.glob("/sys/class/infiniband/mlx5_*/ports/1/link_layer")
+    ):
         try:
-            device = subprocess.run(
-                [
-                    "sh",
-                    "-c",
-                    "for d in /sys/class/infiniband/mlx5_*/ports/1/link_layer; do "
-                    "  test -f $d && grep -q Ethernet $d && basename $(dirname $(dirname $(dirname $d))); "
-                    "done | head -1",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-        except Exception:
-            pass
+            if Path(link_layer).read_text().strip() == "Ethernet":
+                return Path(link_layer).parents[2].name
+        except OSError:
+            continue
+    return ""
+
+
+def _mooncake_transport_config() -> dict:
+    # mooncake_cpu exists for the zero-copy RDMA MooncakeStore path (TQ v0.1.8),
+    # so RDMA is the only transport it runs: there is no TCP fallback, and a
+    # host without a RoCE device fails here rather than quietly degrading.
+    # Runs on the driver only, so it assumes homogeneous nodes — the device it
+    # finds is broadcast to every client.
+    device = roce_device()
     if not device:
         raise RuntimeError(
-            "data_plane.backend='mooncake_cpu' uses RDMA, but no mlx5 device "
-            "with an Ethernet link layer was found under /sys/class/infiniband. "
-            "InfiniBand devices are present on some clusters but are not "
-            "auto-selected — name one with MC_MOONCAKE_DEVICE=<dev>. Otherwise "
-            "set MC_MOONCAKE_PROTOCOL=tcp to opt into the TCP transport "
-            "(dev/test only), or use data_plane.backend='simple'."
+            "data_plane.backend='mooncake_cpu' requires RDMA, but no mlx5 "
+            "device with an Ethernet link layer was found under "
+            "/sys/class/infiniband. InfiniBand devices are present on some "
+            "clusters but are not auto-selected — name one with "
+            "MC_MOONCAKE_DEVICE=<dev>, or use data_plane.backend='simple'."
         )
     os.environ.setdefault("MC_GID_INDEX", "3")
     return {"protocol": "rdma", "device_name": device}

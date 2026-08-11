@@ -32,6 +32,7 @@ from __future__ import annotations
 import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
+from nemo_rl.data_plane.adapters.transfer_queue import roce_device
 
 from ._rollout_shapes import mooncake_available
 
@@ -67,15 +68,16 @@ def _session_tq_client_mooncake_cpu():
             "mooncake not installed — skipping mooncake_cpu "
             "(set NEMO_RL_REQUIRE_MOONCAKE=1 to fail loud)"
         )
-    # These tests exercise the mooncake code path, not the transport. Opt into
-    # TCP so they run on hosts with no RoCE NIC — without it the adapter raises,
-    # since it will not silently downgrade a run that asked for RDMA. Scoped so
-    # it cannot leak into other tests in the same worker.
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("MC_MOONCAKE_PROTOCOL", "tcp")
-        client = build_data_plane_client(_make_tq_cfg("mooncake_cpu"))
-        yield client
-        client.close()
+    # mooncake_cpu is RDMA-only, so it cannot run without a RoCE-capable
+    # device (InfiniBand is not auto-selected).
+    if not roce_device():
+        pytest.skip(
+            "no RoCE-capable mlx5 device — mooncake_cpu requires RDMA "
+            "(set MC_MOONCAKE_DEVICE=<dev> to override)"
+        )
+    client = build_data_plane_client(_make_tq_cfg("mooncake_cpu"))
+    yield client
+    client.close()
 
 
 @pytest.fixture
