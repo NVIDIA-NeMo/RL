@@ -2,6 +2,9 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 
 # ===== BEGIN CONFIG =====
+SUITE=disabled
+SKU=h100
+DISABLED_REASON="Transfer-queue wrappers"
 # Mirrors grpo-gemma3-1b-it-1n8g-fsdp2tp1.sh (delegated base).
 NUM_NODES=1
 STEPS_PER_RUN=400

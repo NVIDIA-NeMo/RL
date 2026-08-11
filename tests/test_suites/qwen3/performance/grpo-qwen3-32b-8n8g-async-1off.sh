@@ -5,6 +5,8 @@ source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 export NRL_IGNORE_TP_ACCURACY_CHECK=1
 
 # ===== BEGIN CONFIG =====
+SUITE=performance
+SKU=h100
 NUM_NODES=8
 STEPS_PER_RUN=10
 MAX_STEPS=10

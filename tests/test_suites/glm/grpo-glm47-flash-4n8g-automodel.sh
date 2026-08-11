@@ -2,6 +2,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 # ===== BEGIN CONFIG =====
+SUITE=release
+SKU=h100
 NUM_NODES=4
 # enforce_eager WAR (vLLM 0.20.0) makes generation ~9 min/step, so 30 steps can't fit one
 # 4h Slurm job. Chain 2 resumable runs (NUM_RUNS=ceil(30/15)=2). Revert to 30 after vLLM 0.21 bump.

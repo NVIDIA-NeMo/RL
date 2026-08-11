@@ -2,6 +2,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 
 # ===== BEGIN CONFIG =====
+SUITE=nightly
+SKU=h100
 # Mirrors prorlv2-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v2.sh (delegated base).
 NUM_NODES=1
 STEPS_PER_RUN=450

@@ -11,6 +11,8 @@ if [[ -z "$NRL_DEEPSEEK_V3_BF16_CKPT" ]]; then
 fi
 
 # ===== BEGIN CONFIG =====
+SUITE=performance
+SKU=h100
 NUM_NODES=32
 STEPS_PER_RUN=10
 MAX_STEPS=10

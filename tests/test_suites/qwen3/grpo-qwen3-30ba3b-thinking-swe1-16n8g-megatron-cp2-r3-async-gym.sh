@@ -4,6 +4,8 @@ source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 export NRL_ROUTER_REPLAY_VALIDATE=1
 
 # ===== BEGIN CONFIG =====
+SUITE=nightly
+SKU=h100
 NUM_NODES=16
 GPUS_PER_NODE=8
 STEPS_PER_RUN=3

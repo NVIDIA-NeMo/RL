@@ -2,6 +2,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 
 # ===== BEGIN CONFIG =====
+SUITE=nightly
+SKU=h100
 # Mirrors grpo-qwen3-1.7b-1n8g-megatron-eagle3.sh (delegated base).
 NUM_NODES=1
 GPUS_PER_NODE=8

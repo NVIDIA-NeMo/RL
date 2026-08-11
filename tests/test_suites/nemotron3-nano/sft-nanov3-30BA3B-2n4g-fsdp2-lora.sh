@@ -2,6 +2,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 # ===== BEGIN CONFIG =====
+SUITE=nightly
+SKU=gb200
 NUM_NODES=2
 GPUS_PER_NODE=4
 STEPS_PER_RUN=20  # step_time ~ 10sec

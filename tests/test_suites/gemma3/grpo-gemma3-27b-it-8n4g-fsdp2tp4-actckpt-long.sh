@@ -5,6 +5,9 @@ source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 export NRL_IGNORE_TP_ACCURACY_CHECK=1
 
 # ===== BEGIN CONFIG =====
+SUITE=disabled
+SKU=gb200
+DISABLED_REASON="GB200 mirrors of a retired H100 recipe"
 NUM_NODES=8
 GPUS_PER_NODE=4
 SEGMENT_SIZE=8     # nodes per NVLink-domain segment; tools/launch passes it as sbatch --segment. Matches cluster.segment_size in the yaml.

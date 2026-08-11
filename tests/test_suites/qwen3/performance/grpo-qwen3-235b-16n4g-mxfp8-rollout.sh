@@ -6,6 +6,8 @@ export NCCL_NVLS_ENABLE=0
 export RAY_CGRAPH_get_timeout=2400
 
 # ===== BEGIN CONFIG =====
+SUITE=performance
+SKU=gb200
 NUM_NODES=16
 GPUS_PER_NODE=4
 STEPS_PER_RUN=10

@@ -2,6 +2,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 # ===== BEGIN CONFIG =====
+SUITE=performance
+SKU=gb200
 NUM_NODES=4
 GPUS_PER_NODE=4
 SEGMENT_SIZE=4     # nodes per NVLink-domain segment; tools/launch passes it as sbatch --segment (keeps MoE EP intra-rack, #2937). Matches cluster.segment_size in the yaml.

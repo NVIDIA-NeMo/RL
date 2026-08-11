@@ -206,26 +206,6 @@ def test_no_overlap_across_test_suites(all_test_suites):
     )
 
 
-def test_nightly_suites_match_gpus_per_node(
-    nightly_test_suite, nightly_gb200_test_suite
-):
-    for test_suite, expected_gpus_per_node in (
-        (nightly_test_suite, 8),
-        (nightly_gb200_test_suite, 4),
-    ):
-        for test_script in test_suite:
-            gpus_per_node = 8
-            with open(os.path.join(project_root, test_script)) as f:
-                for line in f:
-                    if line.startswith("GPUS_PER_NODE="):
-                        gpus_per_node = int(line.split("=", 1)[1].split()[0])
-                        break
-            assert gpus_per_node == expected_gpus_per_node, (
-                f"{test_script} requests {gpus_per_node} GPUs per node, but its "
-                f"nightly suite requires {expected_gpus_per_node}"
-            )
-
-
 def test_all_test_scripts_accounted_for_in_test_suites(all_test_suites):
     all_test_scripts_in_test_suites = set(all_test_suites)
 
@@ -268,6 +248,115 @@ def test_all_recipe_yamls_accounted_for_in_test_suites(
 
     assert all_test_script_paths_in_test_suites == set(all_recipe_yaml_rel_paths), (
         "All recipe YAMLs are not accounted for in the test suites"
+    )
+
+
+ALL_SUITE_NAMES = [
+    "nightly",
+    "nightly_gb200",
+    "nightly_mcore",
+    "nightly_mcore_gb200",
+    "release",
+    "release_gb200",
+    "performance",
+    "performance_gb200",
+    "disabled",
+]
+VALID_SUITE_VALUES = {"nightly", "release", "performance", "disabled"}
+VALID_SKU_VALUES = {"h100", "gb200"}
+
+
+def _config_value(script_path, key):
+    """Read one variable out of a driver's CONFIG block."""
+    in_block = False
+    with open(os.path.join(project_root, script_path)) as f:
+        for line in f:
+            if re.match(r"^# =+ BEGIN CONFIG =+", line):
+                in_block = True
+                continue
+            if re.match(r"^# =+ END CONFIG =+", line):
+                break
+            if in_block and line.startswith(f"{key}="):
+                value = line[len(key) + 1 :].split("#")[0].strip()
+                return value.strip("\"'")
+    return None
+
+
+def test_every_driver_declares_a_valid_suite_and_sku():
+    """Every driver must say which suite it belongs to and which SKU it targets."""
+    problems = []
+    for script_path in glob.glob(
+        os.path.join(test_suites_dir, "**", "*.sh"), recursive=True
+    ):
+        rel = script_path[len(project_root) + 1 :]
+        suite = _config_value(rel, "SUITE")
+        sku = _config_value(rel, "SKU")
+        if suite not in VALID_SUITE_VALUES:
+            problems.append(
+                f"{rel}: SUITE={suite!r}, expected one of {sorted(VALID_SUITE_VALUES)}"
+            )
+        if sku not in VALID_SKU_VALUES:
+            problems.append(
+                f"{rel}: SKU={sku!r}, expected one of {sorted(VALID_SKU_VALUES)}"
+            )
+        if suite == "disabled" and not _config_value(rel, "DISABLED_REASON"):
+            problems.append(
+                f"{rel}: SUITE=disabled requires a non-empty DISABLED_REASON"
+            )
+    assert not problems, "\n".join(problems)
+
+
+def test_declared_sku_matches_gpus_per_node():
+    """SKU is what the author declares; GPUS_PER_NODE is what Slurm is asked for.
+
+    They must agree, or a test lands in a lane whose hardware it was not written
+    for. This replaces the old nightly-only check with one that covers every
+    suite.
+    """
+    expected_gpus = {"h100": 8, "gb200": 4}
+    problems = []
+    for script_path in glob.glob(
+        os.path.join(test_suites_dir, "**", "*.sh"), recursive=True
+    ):
+        rel = script_path[len(project_root) + 1 :]
+        sku = _config_value(rel, "SKU")
+        gpus_per_node = int(_config_value(rel, "GPUS_PER_NODE") or 8)
+        if expected_gpus.get(sku) != gpus_per_node:
+            problems.append(
+                f"{rel}: SKU={sku} implies {expected_gpus.get(sku)} GPUs per node, "
+                f"but GPUS_PER_NODE={gpus_per_node}"
+            )
+    assert not problems, "\n".join(problems)
+
+
+@pytest.mark.parametrize("suite", ALL_SUITE_NAMES)
+def test_declarations_reproduce_the_manifest(suite):
+    """`tools/list-suites <suite>` must return exactly what the manifest lists.
+
+    The manifests are still authoritative; the declarations are a parallel
+    source of truth until nemo-ci reads them instead. This test is what stops
+    the two from drifting apart in the meantime, and it retires along with the
+    manifests.
+    """
+    result = subprocess.run(
+        [os.path.join(project_root, "tools", "list-suites"), suite],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"tools/list-suites {suite} failed:\n{result.stdout}\n{result.stderr}"
+    )
+
+    declared = set(result.stdout.split())
+    listed = set(_read_test_suite(os.path.join(test_suites_dir, f"{suite}.txt")))
+
+    only_declared = sorted(declared - listed)
+    only_listed = sorted(listed - declared)
+    assert not only_declared and not only_listed, (
+        f"{suite}: declarations and manifest disagree.\n"
+        f"  declared but not in {suite}.txt: {only_declared}\n"
+        f"  in {suite}.txt but not declared: {only_listed}"
     )
 
 

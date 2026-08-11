@@ -2,6 +2,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 
 # ===== BEGIN CONFIG =====
+SUITE=nightly
+SKU=h100
 # Mirrors grpo-nanov3-30BA3B-2n8g-megatron-pack-cp.sh (delegated base).
 NUM_NODES=2
 GPUS_PER_NODE=8

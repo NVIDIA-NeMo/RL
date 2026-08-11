@@ -5,6 +5,9 @@ source "${SCRIPT_DIR%%/tests/test_suites/*}/tests/test_suites/common.env"
 export NRL_IGNORE_TP_ACCURACY_CHECK=1
 
 # ===== BEGIN CONFIG =====
+SUITE=disabled
+SKU=h100
+DISABLED_REASON="Retained as proof of model support, not run"
 NUM_NODES=8
 STEPS_PER_RUN=20
 MAX_STEPS=20
