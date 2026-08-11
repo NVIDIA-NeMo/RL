@@ -22,9 +22,10 @@ import os
 import shutil
 from pathlib import Path
 
-
 DEFAULT_FMHA_ARTIFACT_PATH = "e3a8eba02eb19f4485652f84f5095524350246b5/fmha/trtllm-gen/"
-DEFAULT_FMHA_MANIFEST_SHA256 = "03e0f29f970de40b0fd3c6025a16a39fb6c9af2a6549a63da73cf3da8494e658"
+DEFAULT_FMHA_MANIFEST_SHA256 = (
+    "03e0f29f970de40b0fd3c6025a16a39fb6c9af2a6549a63da73cf3da8494e658"
+)
 DEFAULT_FMHA_MANIFEST_ENTRIES = 19227
 OLD_FMHA_ARTIFACT_PATH = "158f6fa11ef139a098cfddcdddce73ca99d164ad/fmha/trtllm-gen/"
 
@@ -54,7 +55,9 @@ def _require(condition: bool, message: str) -> None:
 
 
 def main() -> None:
-    source_dir = Path(os.environ.get("FLASHINFER_SOURCE_DIR", "3rdparty/flashinfer")).resolve()
+    source_dir = Path(
+        os.environ.get("FLASHINFER_SOURCE_DIR", "3rdparty/flashinfer")
+    ).resolve()
     artifact_path = _env(
         "FLASHINFER_FMHA_ARTIFACT_PATH",
         "FMHA_ARTIFACT_PATH",
@@ -72,9 +75,13 @@ def main() -> None:
             str(DEFAULT_FMHA_MANIFEST_ENTRIES),
         )
     )
-    old_artifact_path = os.environ.get("FLASHINFER_OLD_FMHA_ARTIFACT_PATH", OLD_FMHA_ARTIFACT_PATH)
+    old_artifact_path = os.environ.get(
+        "FLASHINFER_OLD_FMHA_ARTIFACT_PATH", OLD_FMHA_ARTIFACT_PATH
+    )
 
-    _require(source_dir.is_dir(), f"FlashInfer source directory does not exist: {source_dir}")
+    _require(
+        source_dir.is_dir(), f"FlashInfer source directory does not exist: {source_dir}"
+    )
 
     import flashinfer_cubin
     import flashinfer_jit_cache
@@ -85,7 +92,9 @@ def main() -> None:
 
     cubin_root = Path(flashinfer_cubin.get_cubin_dir())
     manifest = cubin_root / artifact_path / "checksums.txt"
-    _require(manifest.is_file(), f"FlashInfer cubin manifest does not exist: {manifest}")
+    _require(
+        manifest.is_file(), f"FlashInfer cubin manifest does not exist: {manifest}"
+    )
     _require(
         _sha256(manifest) == manifest_sha256,
         f"FlashInfer cubin manifest sha256 mismatch: {manifest}",
@@ -122,8 +131,12 @@ def main() -> None:
     build_jit_specs([spec], verbose=False, skip_prebuilt=False)
 
     compiled = build_dir / f"{spec.name}.so"
-    _require(compiled.is_file(), f"FlashInfer dispatcher build did not produce {compiled}")
-    destination = Path(flashinfer_jit_cache.get_jit_cache_dir()) / spec.name / compiled.name
+    _require(
+        compiled.is_file(), f"FlashInfer dispatcher build did not produce {compiled}"
+    )
+    destination = (
+        Path(flashinfer_jit_cache.get_jit_cache_dir()) / spec.name / compiled.name
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(compiled, destination)
 
