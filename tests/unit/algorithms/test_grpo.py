@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from contextlib import ExitStack, contextmanager
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -39,6 +40,7 @@ from nemo_rl.algorithms.grpo import (
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
+    _maybe_restore_async_replay_buffer_checkpoint,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
@@ -100,6 +102,54 @@ def test_save_async_replay_buffer_checkpoint(tmp_path):
     replay_buffer.save_to_path.remote.assert_called_once_with(
         str(tmp_path / "replay_buffer.pt")
     )
+
+
+@pytest.mark.parametrize("load_replay_buffer", [True, None])
+def test_restore_async_replay_buffer_checkpoint_by_default(
+    tmp_path: Path, load_replay_buffer: bool | None
+) -> None:
+    replay_buffer_path = tmp_path / "replay_buffer.pt"
+    replay_buffer_path.touch()
+    replay_buffer = MagicMock()
+    replay_buffer.load_from_path.remote.return_value = {"restored": 7}
+
+    with patch("nemo_rl.algorithms.grpo.ray.get", side_effect=lambda value: value):
+        metadata = _maybe_restore_async_replay_buffer_checkpoint(
+            replay_buffer,
+            str(tmp_path),
+            load_replay_buffer=load_replay_buffer,
+            num_prompts_per_step=32,
+            current_training_step=4,
+            max_age_steps=1,
+        )
+
+    assert metadata == {"restored": 7}
+    replay_buffer.load_from_path.remote.assert_called_once_with(
+        str(replay_buffer_path),
+        num_prompts_per_step=32,
+        current_training_step=4,
+        max_age_steps=1,
+    )
+
+
+def test_restore_async_replay_buffer_checkpoint_can_be_disabled(
+    tmp_path: Path,
+) -> None:
+    replay_buffer_path = tmp_path / "replay_buffer.pt"
+    replay_buffer_path.touch()
+    replay_buffer = MagicMock()
+
+    metadata = _maybe_restore_async_replay_buffer_checkpoint(
+        replay_buffer,
+        str(tmp_path),
+        load_replay_buffer=False,
+        num_prompts_per_step=32,
+        current_training_step=4,
+        max_age_steps=1,
+    )
+
+    assert metadata is None
+    replay_buffer.load_from_path.remote.assert_not_called()
 
 
 @patch("nemo_rl.algorithms.grpo.ray")
