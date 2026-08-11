@@ -1395,9 +1395,9 @@ class VllmGeneration(GenerationInterface):
         """Collect vLLM metric histories for step-level performance reports."""
         return self._collect_vllm_logger_metrics("get_vllm_logger_metrics")
 
-    def get_latest_vllm_logger_metrics(self) -> dict[str, Any]:
-        """Collect bounded latest-value snapshots for frequent telemetry polls."""
-        return self._collect_vllm_logger_metrics("get_latest_vllm_logger_metrics")
+    def drain_latest_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Consume bounded latest-value snapshots for frequent telemetry polls."""
+        return self._collect_vllm_logger_metrics("drain_latest_vllm_logger_metrics")
 
     def clear_vllm_logger_metrics(self) -> None:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
@@ -1418,9 +1418,9 @@ class VllmGeneration(GenerationInterface):
         """Get logger metrics for performance reporting."""
         return self.get_vllm_logger_metrics()
 
-    def get_latest_logger_metrics(self) -> dict[str, Any]:
-        """Get latest logger values without transferring full worker histories."""
-        return self.get_latest_vllm_logger_metrics()
+    def drain_latest_logger_metrics(self) -> dict[str, Any]:
+        """Consume latest values without transferring full worker histories."""
+        return self.drain_latest_vllm_logger_metrics()
 
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.

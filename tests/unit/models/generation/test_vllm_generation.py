@@ -255,7 +255,7 @@ def test_sampling_params_preserve_bad_words():
     assert sampling_params["bad_words"] == ["<image>", "<img>"]
 
 
-def test_vllm_latest_metric_snapshot_prunes_worker_histories():
+def test_vllm_latest_metric_drain_prunes_worker_histories():
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker.cfg = {"vllm_cfg": {"enable_vllm_metrics_logger": True}}
     worker._vllm_metrics_lock = threading.Lock()
@@ -264,7 +264,7 @@ def test_vllm_latest_metric_snapshot_prunes_worker_histories():
     worker.kv_cache_usage_perc = [0.2, 0.6]
     worker.generation_tokens = [10, 30]
 
-    latest = worker.get_latest_vllm_logger_metrics()
+    latest = worker.drain_latest_vllm_logger_metrics()
 
     assert latest == {
         "inflight_batch_sizes": [2],
@@ -276,6 +276,7 @@ def test_vllm_latest_metric_snapshot_prunes_worker_histories():
     assert worker.num_pending_samples == [4]
     assert worker.kv_cache_usage_perc == [0.6]
     assert worker.generation_tokens == [30]
+    assert latest["generation_tokens"] is not worker.generation_tokens
 
 
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
