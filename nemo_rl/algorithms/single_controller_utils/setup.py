@@ -25,6 +25,7 @@ import hashlib
 import io
 import os
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -717,6 +718,19 @@ def setup_single_controller(
     assert generation_config is not None, (
         "single_controller_utils.setup requires policy.generation in master_config"
     )
+
+    telemetry_interval_s = master_config.rollout_checkpointing.telemetry_interval_s
+    vllm_cfg = generation_config.get("vllm_cfg", {})
+    if telemetry_interval_s is not None and not vllm_cfg.get(
+        "enable_vllm_metrics_logger", False
+    ):
+        warnings.warn(
+            "rollout_checkpointing.telemetry_interval_s is enabled, but "
+            "policy.generation.vllm_cfg.enable_vllm_metrics_logger is false. "
+            "Canonical rollout telemetry will be recorded, but vLLM token, "
+            "request, and KV-cache signals will be absent.",
+            stacklevel=2,
+        )
 
     if data_config["use_multiple_dataloader"]:
         raise NotImplementedError(
