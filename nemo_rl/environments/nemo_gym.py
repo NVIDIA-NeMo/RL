@@ -447,19 +447,8 @@ class NemoGym(EnvironmentInterface):
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
-        initial_global_config_dict = cfg.get("initial_global_config_dict") or {}
-        self._pad_dynamic_image_shapes = bool(
-            cfg.get(
-                "pad_dynamic_image_shapes",
-                initial_global_config_dict.get("pad_dynamic_image_shapes", False),
-            )
-        )
-        self._sanitize_image_placeholders = bool(
-            cfg.get(
-                "sanitize_image_placeholders",
-                initial_global_config_dict.get("sanitize_image_placeholders", False),
-            )
-        )
+        self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
+        self._sanitize_image_placeholders = bool(cfg.get("sanitize_image_placeholders"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
@@ -1069,6 +1058,14 @@ def spinup_nemo_gym_actor(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    # Same treatment for the multimodal knobs: NemoGymConfig declares them as
+    # top-level fields, so populate them here instead of leaving the actor to
+    # read them back out of Gym's global config dict.
+    multimodal_flags: dict[str, bool] = {}
+    for _flag in ("pad_dynamic_image_shapes", "sanitize_image_placeholders"):
+        _value = nemo_gym_dict.pop(_flag, None)
+        if _value is not None:
+            multimodal_flags[_flag] = bool(_value)
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
     # image-baked venvs instead of rebuilding them.
@@ -1089,6 +1086,7 @@ def spinup_nemo_gym_actor(
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
+        **multimodal_flags,
     )
 
     nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
