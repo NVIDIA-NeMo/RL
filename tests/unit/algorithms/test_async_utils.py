@@ -52,6 +52,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.experience.interfaces import PENDING_PROMPTS_KEY
 
 
 @ray.remote(num_cpus=0)
@@ -1157,6 +1158,7 @@ class TestAsyncTrajectoryCollector:
         replay_buffer=None,
         next_nemo_gym_task_index: int = 0,
         max_generation_failures: int = 0,
+        pending_batch=None,
     ):
         """Create a non-Ray collector instance for unit-testing local state."""
         collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
@@ -1176,6 +1178,7 @@ class TestAsyncTrajectoryCollector:
             replay_buffer=replay_buffer,
             start_step=0,
             next_nemo_gym_task_index=next_nemo_gym_task_index,
+            pending_batch=pending_batch,
         )
 
     def _prime_collection_loop(self, collector):
@@ -1269,6 +1272,121 @@ class TestAsyncTrajectoryCollector:
 
         assert collector.data_exhausted is False
         assert collector.collection_failed is False
+
+    def test_collection_loop_consumes_carryover_before_next_pull(self):
+        """A gap-fill remainder is processed ahead of the next dataloader batch."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        first, second, tail = {"b": 0}, {"b": 1}, {"tail": True}
+        processed = []
+
+        def _process(batch):
+            processed.append(batch)
+            return tail if batch is first else None
+
+        collector._process_batch = _process
+        collector.dataloader = [first, second]
+
+        collector._collection_loop()
+
+        assert processed == [first, tail, second]
+        assert collector._pending_batch is None
+        assert collector.data_exhausted is True
+
+    def test_collection_loop_retries_unconsumed_batch(self):
+        """A batch nothing consumed (no target free) is retried, not discarded."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        batch = {"b": 0}
+        processed = []
+
+        def _process(current):
+            processed.append(current)
+            # First attempt: nothing consumed. Second attempt: consumed.
+            return current if len(processed) == 1 else None
+
+        collector._process_batch = _process
+        collector.dataloader = [batch]
+
+        collector._collection_loop()
+
+        assert processed == [batch, batch]
+        assert collector.data_exhausted is True
+
+    def test_collection_loop_starts_from_restored_pending_batch(self):
+        """A pending remainder restored from a checkpoint is processed first."""
+        restored = {"restored": True}
+        collector = self.create_local_collector(pending_batch=restored)
+        self._prime_collection_loop(collector)
+        processed = []
+        collector._process_batch = lambda batch: processed.append(batch)
+        collector.dataloader = [{"b": 0}]
+
+        collector._collection_loop()
+
+        assert processed == [restored, {"b": 0}]
+
+    def test_process_batch_carries_over_gap_fill_tail(self, monkeypatch):
+        """When the target needs fewer prompts than the batch, the tail survives."""
+        replay_buffer = mock.MagicMock()
+        replay_buffer.get_trajectories_needed.remote.return_value = 2
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector._refit_pause_cleared.set()
+        collector._get_next_target_for_generation = lambda version: 1
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector.ray",
+            mock.MagicMock(get=lambda ref: ref),
+        )
+        worker_calls = []
+
+        async def _fake_worker(**kwargs):
+            worker_calls.append(kwargs)
+
+        collector._run_rollout_batch_worker = _fake_worker
+
+        batch = self.create_mock_batch(size=4)
+        leftover = collector._process_batch(batch)
+        collector.wait_for_pending_generations()
+
+        assert leftover is not None
+        assert leftover.size == 2
+        assert [log[0]["content"] for log in leftover["message_log"]] == [
+            "Test prompt 2",
+            "Test prompt 3",
+        ]
+        assert len(worker_calls) == 1
+        # 2 prompts x 3 generations reached the rollout worker.
+        assert worker_calls[0]["repeated_batch"].size == 6
+
+    def test_process_batch_returns_whole_batch_when_no_target_free(self):
+        """No reservable target: the untouched batch comes back for retry."""
+        collector = self.create_local_collector()
+        collector._get_next_target_for_generation = lambda version: None
+
+        batch = self.create_mock_batch(size=2)
+        assert collector._process_batch(batch) is batch
+
+    def test_rollouts_state_roundtrips_pending_batch(self, tmp_path):
+        """The pending remainder survives torch.save/load and collector restore."""
+        collector = self.create_local_collector()
+        assert PENDING_PROMPTS_KEY not in collector.get_rollouts_state()
+
+        pending = self.create_mock_batch(size=2)
+        collector._pending_batch = pending
+        state = collector.get_rollouts_state()
+        assert state[PENDING_PROMPTS_KEY] is pending
+
+        path = tmp_path / "rollouts.pt"
+        torch.save(state, path)
+        loaded = torch.load(path, weights_only=False)
+
+        restored = self.create_local_collector(
+            pending_batch=loaded[PENDING_PROMPTS_KEY]
+        )
+        assert restored._pending_batch.size == 2
+        assert [
+            log[0]["content"] for log in restored._pending_batch["message_log"]
+        ] == ["Test prompt 0", "Test prompt 1"]
         status = collector.get_status()
         assert status["data_exhausted"] is False
         assert status["errored"] is False

@@ -35,6 +35,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
+    PENDING_PROMPTS_KEY,
 )
 from nemo_rl.experience.rollouts import (
     RolloutGroupResult,
@@ -73,6 +74,7 @@ class AsyncTrajectoryCollector:
         on_policy_distillation_cfg: Optional[dict[str, Any]] = None,
         next_nemo_gym_task_index: int = 0,
         processor: Any = None,
+        pending_batch: Optional[BatchedDataDict[DatumSpec]] = None,
     ):
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
@@ -130,6 +132,14 @@ class AsyncTrajectoryCollector:
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
         self._next_nemo_gym_task_index = next_nemo_gym_task_index
+
+        # Unconsumed suffix of the last gap-fill batch. Prompts land here
+        # instead of being discarded, are consumed before the next dataloader
+        # pull, and ride get_rollouts_state() so a checkpoint cannot strand
+        # them. Written by the collection thread, read at checkpoint time from
+        # the actor thread, hence the lock.
+        self._pending_lock: _threading.Lock = _threading.Lock()
+        self._pending_batch: Optional[BatchedDataDict[DatumSpec]] = pending_batch
 
         # Timer for efficiency metrics
         self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
@@ -283,18 +293,21 @@ class AsyncTrajectoryCollector:
         }
 
     def _collection_loop(self):
-        """Run the collection loop in background thread."""
+        """Run the collection loop in background thread.
+
+        Prompts left over from a gap-fill slice (``_pending_batch``) are
+        consumed before the next dataloader pull, so a partially used batch is
+        never discarded. The dataloader counts as exhausted only when the
+        iterator drains with no pending prompts remaining.
+        """
         dataloader_exhausted = False
         if self.dataloader is None:
             raise RuntimeError(
                 "start_collection must set a dataloader before collection"
             )
-        dataloader = self.dataloader
+        dataloader_iter = iter(self.dataloader)
         try:
-            for batch in dataloader:
-                if not self.running:
-                    break
-
+            while self.running:
                 # Check if manually paused and wait
                 if not self._manual_pause_cleared.is_set() and self.running:
                     self._manual_pause_cleared.wait()
@@ -337,10 +350,27 @@ class AsyncTrajectoryCollector:
                 if not self.running:
                     break
 
-                self._process_batch(batch)
-            else:
-                # for-loop completed without break → dataloader iterator exhausted
-                dataloader_exhausted = True
+                # Carried-over prompts take priority over a fresh pull so the
+                # dataloader stream stays strictly ordered and lossless.
+                with self._pending_lock:
+                    batch = self._pending_batch
+                    self._pending_batch = None
+                if batch is None:
+                    try:
+                        batch = next(dataloader_iter)
+                    except StopIteration:
+                        dataloader_exhausted = True
+                        break
+
+                leftover = self._process_batch(batch)
+                if leftover is not None:
+                    with self._pending_lock:
+                        self._pending_batch = leftover
+                    if leftover is batch:
+                        # Nothing was consumed (e.g. no target needed
+                        # generation). Yield briefly so the retry does not
+                        # busy-spin against the replay buffer.
+                        time.sleep(0.05)
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
@@ -377,10 +407,25 @@ class AsyncTrajectoryCollector:
         batch["extra_env_info"] = stamped_rows
         self._next_nemo_gym_task_index += len(stamped_rows)
 
-    def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
-        """Process a single batch and generate for one target weight."""
+    def _process_batch(
+        self, batch: BatchedDataDict[DatumSpec]
+    ) -> Optional[BatchedDataDict[DatumSpec]]:
+        """Process a batch, generating for one target weight.
+
+        Args:
+            batch: Prompt batch pulled from the dataloader (or carried over
+                from a previous gap-fill remainder).
+
+        Returns:
+            The unconsumed remainder of ``batch`` — the whole batch when no
+            target currently needs generation, the sliced-off suffix when this
+            target needed fewer prompts than the batch holds, or ``None`` when
+            every prompt was consumed. The caller re-queues it so no yielded
+            prompt is ever discarded.
+        """
         target_weight: Optional[int] = None
         worker_started = False
+        leftover: Optional[BatchedDataDict[DatumSpec]] = None
         try:
             generation_weight_version = self.current_weight_version
             num_generations = self.master_config.grpo.num_generations_per_prompt
@@ -399,7 +444,7 @@ class AsyncTrajectoryCollector:
                 print(
                     f"🔄 No targets need generation for weight {generation_weight_version}"
                 )
-                return
+                return batch
             reserved_target = target_weight
 
             print(
@@ -417,13 +462,18 @@ class AsyncTrajectoryCollector:
                     f"🔄 Target {reserved_target} already has enough trajectories, skipping"
                 )
                 self._release_target(reserved_target)
-                return
+                return batch
 
             if num_prompts_to_generate < num_prompts_in_batch:
+                # Keep the unused suffix instead of discarding it: the caller
+                # re-queues it ahead of the next dataloader pull.
+                leftover = batch.slice(num_prompts_to_generate, num_prompts_in_batch)
                 print(
                     f"🎯 Gap-filling for target weight {reserved_target}: "
                     f"generating {num_prompts_to_generate}/{num_prompts_in_batch} "
-                    f"prompts (need {trajectories_needed} more trajectories)"
+                    f"prompts (need {trajectories_needed} more trajectories); "
+                    f"carrying over the remaining "
+                    f"{num_prompts_in_batch - num_prompts_to_generate}"
                 )
 
             # Generate all prompt groups needed for this target in one batched worker.
@@ -493,6 +543,7 @@ class AsyncTrajectoryCollector:
             )
 
             self._cleanup_finished_threads()
+            return leftover
 
         except Exception as e:
             if target_weight is not None and not worker_started:
@@ -501,6 +552,7 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
+            return leftover
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
@@ -662,9 +714,25 @@ class AsyncTrajectoryCollector:
         """
         return drain_multimodal_payload_metrics()
 
-    def get_rollouts_state(self) -> dict[str, int]:
-        """Get collector-side rollout state for checkpointing."""
-        return {NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index}
+    def get_rollouts_state(self) -> dict[str, Any]:
+        """Get collector-side rollout state for checkpointing.
+
+        Returns:
+            Mapping with the next NeMo-Gym task index and, when a gap-fill
+            remainder is waiting, the pending prompt batch under
+            ``PENDING_PROMPTS_KEY``. Serializing the remainder keeps yielded
+            prompts recoverable: the dataloader cursor has already advanced
+            past them, so a checkpoint that dropped them would skip those
+            prompts for the rest of the run.
+        """
+        state: dict[str, Any] = {
+            NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index
+        }
+        with self._pending_lock:
+            pending = self._pending_batch
+        if pending is not None:
+            state[PENDING_PROMPTS_KEY] = pending
+        return state
 
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:

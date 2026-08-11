@@ -88,6 +88,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
+    PENDING_PROMPTS_KEY,
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
@@ -4293,6 +4294,7 @@ def async_grpo_train(
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
         next_nemo_gym_task_index=next_nemo_gym_task_index,
         processor=processor,
+        pending_batch=(rollouts_state or {}).get(PENDING_PROMPTS_KEY),
     )
 
     # Start trajectory collection in background

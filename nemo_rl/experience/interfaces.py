@@ -19,6 +19,9 @@ from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
+# Unconsumed suffix of a gap-fill dataloader batch, carried in the async
+# collector's rollouts state so a checkpoint cannot strand yielded prompts.
+PENDING_PROMPTS_KEY = "pending_prompt_batch"
 
 
 @dataclass
