@@ -358,6 +358,57 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 
 
+def _validate_student_topk_config(
+    master_config: MasterConfig, student_topk: Optional[int]
+) -> None:
+    """Reject settings that the student-top-k OPD loss cannot honor."""
+    if student_topk is None:
+        return
+
+    grpo_config = master_config.grpo
+    policy_config = master_config.policy
+    generation_config = policy_config["generation"]
+    megatron_cfg = policy_config.get("megatron_cfg", {})
+
+    if not opd_module.is_opd_enabled(master_config):
+        raise ValueError(
+            "on_policy_distillation.student_topk requires "
+            "on_policy_distillation.enabled=true."
+        )
+    if not grpo_config.async_grpo.enabled:
+        raise NotImplementedError(
+            "Student-top-k OPD currently supports only grpo.async_grpo.enabled=true."
+        )
+    if policy_config["sequence_packing"]["enabled"]:
+        raise NotImplementedError(
+            "Student-top-k OPD does not yet support sequence packing."
+        )
+    if megatron_cfg.get("context_parallel_size", 1) != 1:
+        raise NotImplementedError(
+            "Student-top-k OPD does not yet support context parallelism."
+        )
+    if not megatron_cfg.get("enabled", False):
+        raise NotImplementedError(
+            "Student-top-k OPD currently requires the Megatron policy backend."
+        )
+    if need_top_k_or_top_p_filtering(
+        TrainingSamplingParams(
+            top_k=generation_config["top_k"],
+            top_p=generation_config["top_p"],
+        )
+    ):
+        raise NotImplementedError(
+            "Student-top-k OPD currently requires unfiltered training distributions "
+            "(policy.generation.top_k=null and top_p=1.0)."
+        )
+    if master_config.loss_fn.reference_policy_kl_penalty != 0:
+        raise ValueError(
+            "Student-top-k OPD requires loss_fn.reference_policy_kl_penalty=0."
+        )
+    if grpo_config.adv_estimator.name != "opd":
+        raise ValueError("Student-top-k OPD requires grpo.adv_estimator.name='opd'.")
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -578,38 +629,7 @@ def setup(
         megatron_cfg.get("enabled") and megatron_cfg.get("use_fused_linear_logprobs")
     )
     student_topk = opd_module.get_student_topk(master_config)
-    if student_topk is not None:
-        if not opd_module.is_opd_enabled(master_config):
-            raise ValueError(
-                "on_policy_distillation.student_topk requires "
-                "on_policy_distillation.enabled=true."
-            )
-        if not grpo_config.async_grpo.enabled:
-            raise NotImplementedError(
-                "Student-top-k OPD currently supports only grpo.async_grpo.enabled=true."
-            )
-        if policy_config["sequence_packing"]["enabled"]:
-            raise NotImplementedError(
-                "Student-top-k OPD does not yet support sequence packing."
-            )
-        if megatron_cfg.get("context_parallel_size", 1) != 1:
-            raise NotImplementedError(
-                "Student-top-k OPD does not yet support context parallelism."
-            )
-        if not megatron_cfg.get("enabled", False):
-            raise NotImplementedError(
-                "Student-top-k OPD currently requires the Megatron policy backend."
-            )
-        if need_top_k_or_top_p_filtering(
-            TrainingSamplingParams(
-                top_k=generation_config["top_k"],
-                top_p=generation_config["top_p"],
-            )
-        ):
-            raise NotImplementedError(
-                "Student-top-k OPD currently requires unfiltered training distributions "
-                "(policy.generation.top_k=null and top_p=1.0)."
-            )
+    _validate_student_topk_config(master_config, student_topk)
     if use_fused_linear_logprobs:
         # Sequence packing is not yet validated with the fused path: the fused
         # forward rolls labels over the whole (packed) sequence and would mix
