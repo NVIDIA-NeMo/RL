@@ -30,7 +30,11 @@ from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-from nemo_rl.data.multimodal_utils import PackedTensor, image_to_data_url
+from nemo_rl.data.multimodal_utils import (
+    PackedTensor,
+    attach_image_model_inputs_to_message,
+    image_to_data_url,
+)
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -134,6 +138,73 @@ def test_attach_initial_nemo_gym_image_payloads_requires_processor():
         match="requires the multimodal processor",
     ):
         rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, None)
+
+
+def test_attach_initial_nemo_gym_image_payloads_requires_a_user_message():
+    """An image-bearing prompt with no user turn must fail loudly, not silently."""
+    batch = _initial_gym_image_batch()
+    batch["message_log"] = [[{"role": "assistant", "content": "no user turn"}]]
+
+    class _Processor:
+        image_processor = object()
+
+    with pytest.raises(
+        ValueError,
+        match="no user message to attach to",
+    ):
+        rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, _Processor())
+
+
+def test_attach_image_model_inputs_keeps_rollout_tokens_and_packs_media():
+    """Media arrives as PackedTensor; rollout token_ids stay authoritative."""
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class _TextTokenizer:
+        model_input_names = ["input_ids"]
+
+    class _Processor:
+        image_token = "<image>"
+        image_processor = _ImageProcessor()
+        tokenizer = _TextTokenizer()
+        model_input_names = ["input_ids", "pixel_values"]
+
+        def __call__(self, *, text, images, return_tensors):
+            assert text == "<image>" * len(images)
+            assert return_tensors == "pt"
+            red_values = [image.getpixel((0, 0))[0] for image in images]
+            return {
+                "input_ids": torch.tensor([[101, 102]]),
+                "pixel_values": torch.tensor(red_values, dtype=torch.float32).view(
+                    -1, 1
+                ),
+            }
+
+    rollout_tokens = torch.tensor([7, 8, 9])
+    message = {"role": "user", "content": "", "token_ids": rollout_tokens}
+    images = [Image.new("RGB", (2, 3), color="red")]
+
+    attach_image_model_inputs_to_message(message, images=images, processor=_Processor())
+
+    packed = message["pixel_values"]
+    assert isinstance(packed, PackedTensor)
+    torch.testing.assert_close(packed.as_tensor(), torch.tensor([[255.0]]))
+    # The processor's own input_ids are deliberately dropped so the rollout's
+    # token_ids remain authoritative.
+    assert message["token_ids"] is rollout_tokens
+    assert "input_ids" not in message
+
+
+def test_attach_image_model_inputs_is_a_noop_without_images_or_processor():
+    message = {"role": "user", "content": "", "token_ids": torch.tensor([1])}
+
+    attach_image_model_inputs_to_message(message, images=[], processor=object())
+    attach_image_model_inputs_to_message(
+        message, images=[Image.new("RGB", (2, 3))], processor=None
+    )
+
+    assert set(message) == {"role", "content", "token_ids"}
 
 
 def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():

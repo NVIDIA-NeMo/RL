@@ -111,6 +111,26 @@ class PackedTensor:
 
     Prompt identity is deliberately absent: belonging to the same prompt group
     makes media a candidate for sharing, but never proves media equality.
+
+    Worked example. Prompt A has one image and prompt B has two, each already
+    merged by :meth:`merge_segments` into a single logical row::
+
+        A: tensors = [tA]        _row_offsets = [0, 1]  _segment_indices = [0]
+        B: tensors = [tB0, tB1]  _row_offsets = [0, 2]  _segment_indices = [0, 1]
+
+    GRPO then expands each prompt into G generations. The rows are deep-copied
+    while ``_prepare_multimodal_sharing`` aliases the media leaves, so
+    :meth:`concat` re-interns them by provenance. For G=3::
+
+        tensors          = [tA, tB0, tB1]            # 3 physical segments
+        _row_offsets     = [0, 1, 2, 3, 5, 7, 9]     # 6 logical rows
+        _segment_indices = [0, 0, 0, 1, 2, 1, 2, 1, 2]
+        len()            = 6
+
+    Six logical rows over nine segment references and three physical tensors,
+    so physical memory is flat in G. Row 4 reads as
+    ``_segment_indices[_row_offsets[4]:_row_offsets[5]] == [1, 2]``, i.e. both
+    of prompt B's images, without copying either.
     """
 
     def __init__(
@@ -332,6 +352,23 @@ class PackedTensor:
         return len(self.tensors)
 
     def to(self, device: str | torch.device) -> "PackedTensor":
+        """Move physical segments in place, retaining provenance.
+
+        A device move is value-preserving, so provenance stays valid and two
+        copies of the same segment still re-intern. This is the opposite of
+        :meth:`to_dtype`, which changes values and therefore mints fresh
+        provenance. The asymmetry is deliberate: :meth:`concat` re-interns on
+        provenance alone, so a value-changing operation must not keep it.
+
+        The corollary is that two values sharing provenance on different
+        devices would merge to whichever appears first in ``concat``. That is
+        currently unreachable -- ``BatchedDataDict.to`` and
+        ``get_multimodal_dict`` only touch top-level values, while message-level
+        segments are nested inside ``message_log`` and worker-side device moves
+        happen post-serialization on independent copies -- and it would surface
+        as a loud mixed-device ``torch.cat`` error rather than silent
+        corruption. Keep it that way: do not move a subset of segments.
+        """
         self.tensors = [
             item.to(device) if item is not None else None for item in self.tensors
         ]
