@@ -99,9 +99,7 @@ def _mooncake_transport_config() -> dict:
         except Exception:
             device = ""
     if not device:
-        detail = (
-            "no RoCE-capable mlx5 device detected under /sys/class/infiniband"
-        )
+        detail = "no RoCE-capable mlx5 device detected under /sys/class/infiniband"
         if "MC_MOONCAKE_PROTOCOL" in os.environ:
             # Explicitly asked for RDMA. Falling back to TCP here would let a
             # verification run pass without ever touching RDMA, so refuse.
@@ -119,7 +117,7 @@ def _mooncake_transport_config() -> dict:
             stacklevel=2,
         )
         return {"protocol": "tcp"}
-    os.environ.setdefault("MC_GID_INDEX", os.environ.get("MC_GID_INDEX", "3"))
+    os.environ.setdefault("MC_GID_INDEX", "3")
     return {"protocol": "rdma", "device_name": device}
 
 
@@ -611,8 +609,6 @@ class TQDataPlaneClient(DataPlaneClient):
             sample_ids = list(listing.get(partition_id, {}).keys())
         if not sample_ids:
             if cleared_via_none:
-                import warnings
-
                 warnings.warn(
                     f"clear_samples(sample_ids=None, partition_id={partition_id!r}) "
                     "found nothing to clear — TQ's kv_list returned no keys for "
