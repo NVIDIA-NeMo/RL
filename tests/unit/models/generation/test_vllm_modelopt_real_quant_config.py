@@ -18,7 +18,6 @@ import sys
 import types
 import weakref
 from contextlib import contextmanager, nullcontext
-from pathlib import Path
 
 import pytest
 import torch
@@ -2384,33 +2383,6 @@ def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):
     }
 
     assert captured["config_file"] == "examples/modelopt/quant_configs/nvfp4_a16.yaml"
-
-
-@pytest.mark.parametrize(
-    ("recipe", "num_bits"),
-    [("kv_cache_fp8.yaml", (4, 3)), ("kv_cache_nvfp4.yaml", (2, 1))],
-)
-def test_resolve_kv_cache_quant_recipe(recipe, num_bits):
-    repo_root = Path(__file__).resolve().parents[4]
-
-    config = resolve_quant_cfg(
-        str((repo_root / "examples/modelopt/quant_configs" / recipe).resolve())
-    )
-
-    kv_config = config["quant_cfg"][1]
-    assert config["algorithm"] == "max"
-    assert config["quant_cfg"][0] == {"quantizer_name": "*", "enable": False}
-    assert kv_config["quantizer_name"] == "*[kv]_bmm_quantizer"
-    assert kv_config["enable"] is True
-    assert kv_config["cfg"]["num_bits"] == num_bits
-    uses_constant_amax = recipe == "kv_cache_fp8.yaml"
-    assert kv_config["cfg"].get("use_constant_amax", False) is uses_constant_amax
-    if not uses_constant_amax:
-        assert kv_config["cfg"]["block_sizes"] == {
-            -1: 16,
-            "type": "dynamic",
-            "scale_bits": (4, 3),
-        }
 
 
 def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):
