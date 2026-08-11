@@ -30,7 +30,7 @@ exit_if_max_steps_reached
 VAL_PATH="${VAL_PATH:-$TRAIN_PATH}"
 
 cd $PROJECT_ROOT
-uv run examples/nemo_gym/run_multimodal_grpo_nemo_gym.py \
+uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
     policy.model_name=$MODEL_PATH \
