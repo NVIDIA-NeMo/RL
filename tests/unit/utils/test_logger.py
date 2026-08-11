@@ -424,9 +424,9 @@ class TestWandbLogger:
         step = 10
         logger.log_metrics(metrics, step)
 
-        # Check that log was called with metrics and step
+        # W&B's internal row step is implicit; the caller step is a custom axis.
         mock_run = mock_wandb.init.return_value
-        mock_run.log.assert_called_once_with(metrics, step=step)
+        mock_run.log.assert_called_once_with({**metrics, "nemo_rl/step": step})
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix(self, mock_wandb):
@@ -439,10 +439,14 @@ class TestWandbLogger:
         prefix = "train"
         logger.log_metrics(metrics, step, prefix)
 
-        # Check that log was called with prefixed metrics and step
+        # Check that prefixed metrics retain the caller step as a custom axis.
         mock_run = mock_wandb.init.return_value
-        expected_metrics = {"train/loss": 0.5, "train/accuracy": 0.8}
-        mock_run.log.assert_called_once_with(expected_metrics, step=step)
+        expected_metrics = {
+            "train/loss": 0.5,
+            "train/accuracy": 0.8,
+            "nemo_rl/step": step,
+        }
+        mock_run.log.assert_called_once_with(expected_metrics)
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_step_metric(self, mock_wandb):
@@ -459,9 +463,10 @@ class TestWandbLogger:
 
         logger.log_metrics(metrics, step, step_metric=step_metric)
 
-        # The custom metric supplies the x-axis, while each event commits a row.
+        # The requested custom metric supplies the series x-axis, while the
+        # caller step remains available to all other metrics in the row.
         mock_run = mock_wandb.init.return_value
-        mock_run.log.assert_called_once_with(metrics)
+        mock_run.log.assert_called_once_with({**metrics, "nemo_rl/step": step})
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix_and_step_metric(self, mock_wandb):
@@ -485,8 +490,37 @@ class TestWandbLogger:
             "train/loss": 0.5,
             "train/accuracy": 0.8,
             "train/iteration": 15,
+            "nemo_rl/step": step,
         }
         mock_run.log.assert_called_once_with(expected_metrics)
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_independent_events_do_not_reuse_wandb_internal_step(self, mock_wandb):
+        """Telemetry commits must not make a later trainer step stale."""
+        logger = WandbLogger({})
+
+        logger.log_metrics({"loss": 1.0}, step=1, prefix="train")
+        logger.log_metrics(
+            {"telemetry/wall_time_seconds": 30.0, "tokens_per_second": 10.0},
+            step=1,
+            prefix="rollout/throughput",
+            step_metric="telemetry/wall_time_seconds",
+        )
+        logger.log_metrics({"loss": 0.5}, step=2, prefix="train")
+
+        mock_run = mock_wandb.init.return_value
+        assert mock_run.log.call_args_list == [
+            call({"train/loss": 1.0, "nemo_rl/step": 1}),
+            call(
+                {
+                    "telemetry/wall_time_seconds": 30.0,
+                    "rollout/throughput/tokens_per_second": 10.0,
+                    "nemo_rl/step": 1,
+                }
+            ),
+            call({"train/loss": 0.5, "nemo_rl/step": 2}),
+        ]
+        assert all("step" not in kwargs for _, kwargs in mock_run.log.call_args_list)
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric(self, mock_wandb):
@@ -497,11 +531,10 @@ class TestWandbLogger:
         # Define metric pattern and step metric
         logger.define_metric("ray/*", step_metric="ray/ray_step")
 
-        # Check that define_metric was called
+        # Check that the caller's custom series definition is preserved in
+        # addition to the logger-wide logical-step axis.
         mock_run = mock_wandb.init.return_value
-        mock_run.define_metric.assert_called_once_with(
-            "ray/*", step_metric="ray/ray_step"
-        )
+        mock_run.define_metric.assert_any_call("ray/*", step_metric="ray/ray_step")
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_hyperparams(self, mock_wandb):

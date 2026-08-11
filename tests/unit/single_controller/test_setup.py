@@ -432,6 +432,14 @@ class TestSetup:
         with pytest.raises(ValueError, match="data_plane.enabled=True"):
             setup_single_controller(mc, MagicMock())
 
+    def test_warns_when_rollout_telemetry_lacks_vllm_metrics(self, patched_factories):
+        mc = _make_master_config()
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+        mc.policy["generation"]["vllm_cfg"] = {}
+
+        with pytest.warns(UserWarning, match="vLLM token, request, and KV-cache"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
     def test_rejects_mooncake_data_plane_checkpointing(self):
         mc = _make_master_config()
         mc.data_plane["backend"] = "mooncake_cpu"
