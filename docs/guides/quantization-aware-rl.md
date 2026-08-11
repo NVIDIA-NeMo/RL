@@ -32,10 +32,13 @@ The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dy
 
 ## Simulated KV-Cache Quantization
 
-QARL can apply ModelOpt fake quantization to the attention K/V tensors in the
-Megatron policy, the vLLM rollout model, or both. Configure each worker's
-`quant_cfg` independently. Calibrated K/V amax values available on the policy
-are transferred to compatible rollout quantizers during refit.
+QARL can apply ModelOpt fake quantization to the attention K/V tensors in both
+the Megatron policy and the vLLM rollout model. Use the same quantization recipe
+for both workers so calibrated K/V amax values from the policy can be
+transferred to matching rollout quantizers during refit. The only supported
+exception is rollout-only FP8 K/V fake quantization with
+`use_constant_amax: true`; vLLM computes the constant amax locally, so no
+policy-side K/V quantization or amax transfer is required.
 
 ```yaml
 policy:
@@ -48,21 +51,23 @@ policy:
 
 The KV-only examples are:
 
-- `kv_cache_fp8.yaml`: calibrated FP8 E4M3 K/V fake quantization.
+- `kv_cache_fp8.yaml`: FP8 E4M3 K/V fake quantization with constant amax.
 - `kv_cache_nvfp4.yaml`: calibrated NVFP4 K/V fake quantization with dynamic
   per-block scales and a calibrated global amax.
 
-These recipes intentionally disable weight, input, Q, and P quantizers so a
-test can isolate simulated K/V behavior. They can also serve as the K/V portion
-of a complete user-authored recipe. Constant-amax K/V recipes need no amax
-transfer. Policy and rollout may use different recipes or enable K/V
-quantization on only one side.
+NVFP4 K/V quantization has shown training-quality degradation in current
+experiments. It is intended for studying QARL-based recovery of PTQ accuracy
+and alternative recipes, including mixed formats and quantizing K/V in only
+selected layers.
+
+These recipes enable only the attention K/V quantizers, isolating K/V fake
+quantization from weight and other activation quantization. To combine K/V
+quantization with other formats, define all required quantizers in a single
+recipe.
 
 This path does not enable vLLM's native FP8 KV-cache storage. Set neither
 `policy.generation.real_quant` nor a native vLLM KV-cache dtype for these
-simulated recipes. Affine/rotate recipes, MLA cache quantization, Mamba state
-cache quantization, speculative draft/MTP layers, and models whose HF format
-omits or shares K/V projection tensors are not supported here.
+simulated recipes.
 
 ## ModelOpt Layer Spec Toggle
 

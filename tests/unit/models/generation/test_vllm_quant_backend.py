@@ -214,9 +214,12 @@ def test_vllm_quant_refit(cluster, async_engine):
 
 
 @requires_quant
-@pytest.mark.parametrize("recipe", ["kv_cache_fp8.yaml", "kv_cache_nvfp4.yaml"])
-def test_vllm_kv_quant_refit(cluster, recipe, monkeypatch):
-    """Calibrated simulated K/V state must match after Megatron-to-vLLM refit."""
+@pytest.mark.parametrize(
+    ("recipe", "uses_constant_amax"),
+    [("kv_cache_fp8.yaml", True), ("kv_cache_nvfp4.yaml", False)],
+)
+def test_vllm_kv_quant_refit(cluster, recipe, uses_constant_amax, monkeypatch):
+    """Simulated K/V state must remain valid across Megatron-to-vLLM refit."""
     monkeypatch.setenv("ENABLE_BRIDGE_QUANT_MAPPING", "1")
     quant_cfg = str((_QUANT_CFG_DIR / recipe).resolve())
     tokenizer = get_tokenizer({"name": _MODEL_NAME})
@@ -249,7 +252,9 @@ def test_vllm_kv_quant_refit(cluster, recipe, monkeypatch):
         )
         policy_stats = ray.get(futures)
         for rank, stats in enumerate(policy_stats):
-            assert stats["kv_amax"], f"Megatron rank {rank}: no K/V amax state"
+            assert bool(stats["kv_amax"]) == (not uses_constant_amax), (
+                f"Megatron rank {rank}: unexpected K/V amax state"
+            )
             assert stats["positive_amax"] == stats["with_amax"], (
                 f"Megatron rank {rank}: "
                 f"{stats['with_amax'] - stats['positive_amax']} quantizers "
@@ -267,7 +272,9 @@ def test_vllm_kv_quant_refit(cluster, recipe, monkeypatch):
         )
         rollout_stats = ray.get(futures)
         for rank, stats in enumerate(rollout_stats):
-            assert stats["kv_amax"], f"vLLM rank {rank}: no K/V amax state"
+            assert bool(stats["kv_amax"]) == (not uses_constant_amax), (
+                f"vLLM rank {rank}: unexpected K/V amax state"
+            )
 
         policy_kv_amax = _kv_amax_by_layer(policy_stats[0])
         rollout_kv_amax = _kv_amax_by_layer(rollout_stats[0])

@@ -2403,7 +2403,9 @@ def test_resolve_kv_cache_quant_recipe(recipe, num_bits):
     assert kv_config["quantizer_name"] == "*[kv]_bmm_quantizer"
     assert kv_config["enable"] is True
     assert kv_config["cfg"]["num_bits"] == num_bits
-    if recipe == "kv_cache_nvfp4.yaml":
+    uses_constant_amax = recipe == "kv_cache_fp8.yaml"
+    assert kv_config["cfg"].get("use_constant_amax", False) is uses_constant_amax
+    if not uses_constant_amax:
         assert kv_config["cfg"]["block_sizes"] == {
             -1: 16,
             "type": "dynamic",
