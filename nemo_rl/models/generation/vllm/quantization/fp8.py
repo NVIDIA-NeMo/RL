@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import re
 import warnings
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
@@ -453,7 +454,7 @@ def _get_params_in_layers(param_names, layers):
 
 def _get_packed_modules_mapping(model: torch.nn.Module) -> dict[str, list[str]]:
     packed_modules_mapping = dict(getattr(model, "packed_modules_mapping", {}) or {})
-    if _is_deepseek_v4_model(model):
+    if is_deepseek_v4_model(model):
         # vLLM's DeepSeek V4 loader fuses these checkpoint modules without
         # exposing a packed_modules_mapping for refit's FP8 module lookup.
         packed_modules_mapping.update(
@@ -592,7 +593,7 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return value, scale
 
 
-def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
+def is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     if type(model).__name__.lower() == "deepseekv4forcausallm":
         return True
     config = getattr(model, "config", None)
@@ -603,270 +604,25 @@ def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     )
 
 
-def _get_param_module_name(param_name: str) -> str | None:
-    for suffix in (".weight_scale_inv", ".weight_scale", ".weight"):
-        if param_name.endswith(suffix):
-            return param_name[: -len(suffix)]
-    return None
+_DEEPSEEK_V4_EXPERT_WEIGHT_RE = re.compile(
+    r"(?:^|\.)ffn\.experts\.(?P<expert_id>\d+)\.w[123]\.weight$"
+)
 
 
-def _get_deepseek_v4_bmm_tp_rank(*objects: object) -> int:
-    for obj in objects:
-        tp_rank = getattr(obj, "tp_rank", None)
-        if tp_rank is not None:
-            return int(tp_rank)
-    # Import lazily because distributed state is unavailable in CPU-only tests.
-    try:
-        from vllm.distributed import get_tensor_model_parallel_rank
-
-        return int(get_tensor_model_parallel_rank())
-    except Exception:
-        return 0
-
-
-def _copy_deepseek_v4_bmm_weight(
-    layer: torch.nn.Module,
-    param: torch.nn.Parameter,
-    loaded_weight: torch.Tensor,
+def _is_nonlocal_deepseek_v4_expert_weight(
+    name: str, model: torch.nn.Module
 ) -> bool:
-    if param.data.ndim != 3 or loaded_weight.ndim != 2:
+    """Return whether an exported expert weight is not owned by this EP rank."""
+    match = _DEEPSEEK_V4_EXPERT_WEIGHT_RE.search(name)
+    if match is None or not is_deepseek_v4_model(model):
         return False
 
-    num_groups, rows_per_group, hidden_size = param.data.shape
-    local_rows = num_groups * rows_per_group
-    tp_rank = _get_deepseek_v4_bmm_tp_rank(param, layer.weight, layer)
-    start = tp_rank * local_rows
-    if loaded_weight.shape[0] < start + local_rows:
-        return False
-    if loaded_weight.shape[1] != hidden_size:
+    module = _get_module_from_param_name(model, name)
+    if not isinstance(module, RoutedExperts):
         return False
 
-    local_weight = loaded_weight.narrow(0, start, local_rows)
-    param.data.copy_(local_weight.view(num_groups, rows_per_group, hidden_size))
-    return True
-
-
-def _copy_deepseek_v4_bmm_scale(
-    layer: torch.nn.Module,
-    param: torch.nn.Parameter,
-    loaded_weight: torch.Tensor,
-) -> bool:
-    if loaded_weight.ndim != 2:
-        return False
-    weight = getattr(layer, "weight", None)
-    if weight is None or weight.data.ndim != 3:
-        return False
-
-    num_groups, rows_per_group, hidden_size = weight.data.shape
-    block_m, block_n = tuple(layer.weight_block_size)
-    local_scale_rows = (num_groups * rows_per_group + block_m - 1) // block_m
-    tp_rank = _get_deepseek_v4_bmm_tp_rank(param, weight, layer)
-    start = tp_rank * local_scale_rows
-    if loaded_weight.shape[0] < start + local_scale_rows:
-        return False
-
-    local_scale = loaded_weight.narrow(0, start, local_scale_rows)
-    if local_scale.shape == param.data.shape:
-        param.data.copy_(local_scale)
-        return True
-    if hidden_size % block_n != 0 or rows_per_group % block_m != 0:
-        return False
-
-    scale_groups = local_scale.view(
-        num_groups,
-        rows_per_group // block_m,
-        hidden_size // block_n,
-    )
-    # Import lazily because DeepGEMM is an optional vLLM runtime dependency.
-    from vllm.utils.deep_gemm import transform_sf_into_required_layout
-
-    scale_groups = transform_sf_into_required_layout(
-        sf=scale_groups,
-        mn=rows_per_group,
-        k=hidden_size,
-        recipe=(1, block_m, block_n),
-        num_groups=num_groups,
-        is_sfa=False,
-    )
-    if scale_groups.shape != param.data.shape:
-        return False
-    param.data.copy_(scale_groups)
-    return True
-
-
-def _try_load_deepseek_v4_bmm_param(
-    module_map: dict[str, torch.nn.Module],
-    param_name: str,
-    param: torch.nn.Parameter,
-    loaded_weight: object,
-) -> bool:
-    if not isinstance(loaded_weight, torch.Tensor):
-        return False
-    module_name = _get_param_module_name(param_name)
-    if module_name is None:
-        return False
-    layer = module_map.get(module_name)
-    if not getattr(layer, "is_bmm", False):
-        return False
-    if param_name.endswith(".weight"):
-        return _copy_deepseek_v4_bmm_weight(layer, param, loaded_weight)
-    if param_name.endswith((".weight_scale", ".weight_scale_inv")):
-        return _copy_deepseek_v4_bmm_scale(layer, param, loaded_weight)
-    return False
-
-
-def _get_moe_module_name(param_name: str) -> str | None:
-    for suffix in (
-        ".w13_weight_scale_inv",
-        ".w2_weight_scale_inv",
-        ".w13_weight_scale",
-        ".w2_weight_scale",
-    ):
-        if param_name.endswith(suffix):
-            return param_name[: -len(suffix)]
-    return None
-
-
-def _get_routed_experts_module(
-    module_map: dict[str, torch.nn.Module], module_name: str
-) -> RoutedExperts | None:
-    layer = module_map.get(module_name)
-    if isinstance(layer, MoERunner):
-        layer = layer.routed_experts
-    return layer if isinstance(layer, RoutedExperts) else None
-
-
-def _get_moe_tp_size_and_rank(layer: RoutedExperts) -> tuple[int, int]:
-    return int(layer.moe_config.tp_size), int(layer.moe_config.tp_rank)
-
-
-def _try_load_deepseek_v4_moe_block_scale(
-    module_map: dict[str, torch.nn.Module],
-    param_name: str,
-    param: torch.nn.Parameter,
-    loaded_weight: object,
-    weight_name: str | None,
-    shard_id: str | None,
-    expert_id: int | None,
-) -> bool | None:
-    if not isinstance(loaded_weight, torch.Tensor):
-        return None
-    if loaded_weight.ndim != 2 or param.data.ndim != 3:
-        return None
-    if weight_name is None or shard_id is None or expert_id is None:
-        return None
-
-    module_name = _get_moe_module_name(param_name)
-    if module_name is None:
-        return None
-    layer = _get_routed_experts_module(module_map, module_name)
-    if layer is None:
-        return None
-
-    local_expert_id = layer._map_global_expert_id_to_local_expert_id(expert_id)
-    if local_expert_id == -1:
-        return False
-
-    expert_data = param.data[local_expert_id]
-    loaded_weight = loaded_weight.to(device=expert_data.device)
-    tp_size, tp_rank = _get_moe_tp_size_and_rank(layer)
-
-    def tp_shard(scale: torch.Tensor, dim: int) -> torch.Tensor:
-        if tp_size <= 1:
-            return scale
-        full_size = scale.shape[dim]
-        if full_size % tp_size != 0:
-            raise ValueError(
-                "DeepSeek V4 MoE scale refit cannot TP-shard "
-                f"dim={dim} size={full_size} across tp_size={tp_size} "
-                f"for {param_name}"
-            )
-        shard_size = full_size // tp_size
-        return scale.narrow(dim, tp_rank * shard_size, shard_size)
-
-    if "w13_weight_scale" in param_name:
-        if shard_id not in ("w1", "w3"):
-            return None
-        per_projection_rows = expert_data.shape[0] // 2
-        if loaded_weight.shape[0] != per_projection_rows:
-            loaded_weight = tp_shard(loaded_weight, dim=0)
-        if loaded_weight.shape != (per_projection_rows, expert_data.shape[1]):
-            raise ValueError(
-                "DeepSeek V4 MoE w13 scale refit shape mismatch: "
-                f"param={tuple(expert_data.shape)}, "
-                f"loaded={tuple(loaded_weight.shape)}, shard_id={shard_id}"
-            )
-        row_offset = 0 if shard_id == "w1" else per_projection_rows
-        expert_data.narrow(0, row_offset, per_projection_rows).copy_(loaded_weight)
-        return True
-
-    if "w2_weight_scale" in param_name:
-        if shard_id != "w2":
-            return None
-        if loaded_weight.shape != expert_data.shape:
-            loaded_weight = tp_shard(loaded_weight, dim=1)
-        if loaded_weight.shape != expert_data.shape:
-            raise ValueError(
-                "DeepSeek V4 MoE w2 scale refit shape mismatch: "
-                f"param={tuple(expert_data.shape)}, "
-                f"loaded={tuple(loaded_weight.shape)}"
-            )
-        expert_data.copy_(loaded_weight)
-        return True
-    return None
-
-
-def _wrap_deepseek_v4_weight_loaders_for_refit(
-    model: torch.nn.Module,
-) -> list[tuple[torch.nn.Parameter, Any]]:
-    original_weight_loaders: list[tuple[torch.nn.Parameter, Any]] = []
-    module_map = dict(model.named_modules())
-    for param_name, param in model.named_parameters():
-        weight_loader = getattr(param, "weight_loader", None)
-        if weight_loader is None:
-            continue
-
-        def refit_weight_loader(
-            *args: Any,
-            _param_name: str = param_name,
-            _param: torch.nn.Parameter = param,
-            _weight_loader: Any = weight_loader,
-            **kwargs: Any,
-        ) -> Any:
-            loaded_weight = args[1] if len(args) > 1 else kwargs.get("loaded_weight")
-            weight_name = args[2] if len(args) > 2 else kwargs.get("weight_name")
-            shard_id = args[3] if len(args) > 3 else kwargs.get("shard_id")
-            expert_id = args[4] if len(args) > 4 else kwargs.get("expert_id")
-            return_success = (
-                args[5] if len(args) > 5 else kwargs.get("return_success", False)
-            )
-            moe_scale_result = _try_load_deepseek_v4_moe_block_scale(
-                module_map=module_map,
-                param_name=_param_name,
-                param=_param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
-            if moe_scale_result is not None:
-                return moe_scale_result if return_success else None
-            if _try_load_deepseek_v4_bmm_param(
-                module_map, _param_name, _param, loaded_weight
-            ):
-                return True if return_success else None
-            return _weight_loader(*args, **kwargs)
-
-        original_weight_loaders.append((param, weight_loader))
-        setattr(param, "weight_loader", refit_weight_loader)
-    return original_weight_loaders
-
-
-def _restore_weight_loaders(
-    original_weight_loaders: list[tuple[torch.nn.Parameter, Any]],
-) -> None:
-    for param, weight_loader in original_weight_loaders:
-        setattr(param, "weight_loader", weight_loader)
+    expert_id = int(match.group("expert_id"))
+    return module._map_global_expert_id_to_local_expert_id(expert_id) == -1
 
 
 def load_weights(weights, model_runner):
@@ -874,6 +630,15 @@ def load_weights(weights, model_runner):
     weights_quantized = []
     model = model_runner.model
     for k, v in weights:
+        # vLLM's layerwise loader retains every source tensor until the whole
+        # RoutedExperts module is ready. Under EP, buffering experts owned by
+        # other ranks can consume several GiB per layer before they are rejected
+        # by the destination loader. Filter them before FP8 quantization and
+        # layerwise buffering; the IPC manifest still accounts for the original
+        # received keys outside this function.
+        if _is_nonlocal_deepseek_v4_expert_weight(k, model):
+            continue
+
         # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix
         # (so `_is_fp8_weight` would skip them) and vLLM's grouped loader cannot
         # load their per-block scales. Expand them into the per-expert FP8 (w13, w2 -> w1, w2, and w3)
@@ -921,15 +686,7 @@ def load_weights(weights, model_runner):
         else:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_inv", param_scale])
-    if not _is_deepseek_v4_model(model):
-        model.load_weights(weights_quantized)
-        return
-
-    original_weight_loaders = _wrap_deepseek_v4_weight_loaders_for_refit(model)
-    try:
-        model.load_weights(weights_quantized)
-    finally:
-        _restore_weight_loaders(original_weight_loaders)
+    model.load_weights(weights_quantized)
 
 
 def cast_tensor_to_fp8_blockwise(
@@ -1161,8 +918,8 @@ def _reset_e8m0_fp8_linear_scales_for_refit(model: torch.nn.Module) -> None:
             )
 
 
-def _reset_fp8_moe_params_for_refit(model: torch.nn.Module) -> None:
-    """Restore RoutedExperts weights and scales to their pre-kernel layout."""
+def _reset_fp8_routed_experts_for_refit(model: torch.nn.Module) -> None:
+    """Restore FP8 expert tensors to the checkpoint-loadable layout."""
     for layer in model.modules():
         if not isinstance(layer, RoutedExperts):
             continue
@@ -1170,63 +927,91 @@ def _reset_fp8_moe_params_for_refit(model: torch.nn.Module) -> None:
         if weight_block_size is None:
             continue
 
-        num_experts = layer.num_experts
-        hidden_size = layer.hidden_size
-        intermediate_size = layer.intermediate_size_per_partition
         raw_weight_shapes = {
-            "w13": (num_experts, 2 * intermediate_size, hidden_size),
-            "w2": (num_experts, hidden_size, intermediate_size),
+            "w13": (
+                int(layer.num_experts),
+                2 * int(layer.intermediate_size_per_partition),
+                int(layer.hidden_size),
+            ),
+            "w2": (
+                int(layer.num_experts),
+                int(layer.hidden_size),
+                int(layer.intermediate_size_per_partition),
+            ),
         }
         for prefix, raw_shape in raw_weight_shapes.items():
             weight = getattr(layer, f"{prefix}_weight", None)
-            if weight is None:
-                continue
-            if weight.data.shape != raw_shape or weight.data.dtype != torch.float8_e4m3fn:
+            if weight is not None and (
+                weight.shape != raw_shape or weight.dtype != torch.float8_e4m3fn
+            ):
                 weight.data = torch.empty(
                     raw_shape,
                     dtype=torch.float8_e4m3fn,
-                    device=weight.data.device,
+                    device=weight.device,
                 )
 
         block_m, block_n = (int(size) for size in weight_block_size)
-        for prefix, weight in (
-            ("w13", getattr(layer, "w13_weight", None)),
-            ("w2", getattr(layer, "w2_weight", None)),
-        ):
-            if weight is None or weight.data.ndim != 3:
+        for prefix in ("w13", "w2"):
+            weight = getattr(layer, f"{prefix}_weight", None)
+            if weight is None:
                 continue
-            num_experts, output_dim, input_dim = weight.data.shape
-            raw_shape = (
-                num_experts,
-                (output_dim + block_m - 1) // block_m,
-                (input_dim + block_n - 1) // block_n,
+            raw_scale_shape = (
+                weight.shape[0],
+                (weight.shape[1] + block_m - 1) // block_m,
+                (weight.shape[2] + block_n - 1) // block_n,
             )
             for scale_suffix in ("weight_scale_inv", "weight_scale"):
                 scale = getattr(layer, f"{prefix}_{scale_suffix}", None)
-                if scale is None:
-                    continue
-                if scale.data.shape == raw_shape and scale.data.dtype == torch.float32:
-                    continue
-                scale.data = torch.empty(
-                    raw_shape,
-                    dtype=torch.float32,
-                    device=scale.data.device,
-                )
+                if scale is not None and (
+                    scale.shape != raw_scale_shape or scale.dtype != torch.float32
+                ):
+                    scale.data = torch.empty(
+                        raw_scale_shape,
+                        dtype=torch.float32,
+                        device=scale.device,
+                    )
+
+
+def prepare_deepseek_v4_routed_experts_for_refit(model: torch.nn.Module) -> None:
+    """Keep RoutedExperts out of layerwise buffering and load them in place."""
+    from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
+
+    for layer in model.modules():
+        if not isinstance(layer, RoutedExperts):
+            continue
+        if getattr(layer, "weight_block_size", None) is None:
+            continue
+        # Layerwise reload keeps every source expert until the complete fused
+        # MoE parameter is ready. These tensors instead remain materialized so
+        # RoutedExperts.weight_loader can copy each local expert immediately.
+        SKIP_TENSORS.update(layer._parameters)
+        SKIP_TENSORS.update(layer._buffers)
+        layer._nrl_immediate_refit = True
+
+    _reset_fp8_routed_experts_for_refit(model)
+
+
+@torch.no_grad()
+def finalize_deepseek_v4_routed_experts_refit(model: torch.nn.Module) -> None:
+    """Convert immediately loaded expert tensors back to their kernel layout."""
+    for layer in model.modules():
+        if not isinstance(layer, RoutedExperts) or not getattr(
+            layer, "_nrl_immediate_refit", False
+        ):
+            continue
+        layer.quant_method.process_weights_after_loading(layer)
+        if layer.w13_weight.is_cuda:
+            # Requantization uses sizeable per-expert float32 temporaries.
+            torch.cuda.empty_cache()
 
 
 def prepare_fp8_model_for_refit(model_runner: Any) -> None:
-    """Restore refit-loadable parameters before a streamed FP8 weight update."""
+    """Restore E8M0 linear scales before a streamed FP8 weight update."""
     # Import lazily because DeepGEMM is an optional vLLM runtime dependency.
     from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 
-    model = model_runner.model
-    is_deepseek_v4 = _is_deepseek_v4_model(model)
     if is_deep_gemm_e8m0_used():
-        _reset_e8m0_fp8_linear_scales_for_refit(model)
-    if is_deepseek_v4:
-        # MoE backends may pack expert weights even when the dense-linear E8M0
-        # scale path is disabled, so this restoration must not share its gate.
-        _reset_fp8_moe_params_for_refit(model)
+        _reset_e8m0_fp8_linear_scales_for_refit(model_runner.model)
 
 
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
@@ -1244,10 +1029,6 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     )
 
     is_bmm = getattr(layer, "is_bmm", False)
-    if is_bmm and layer.weight.data.ndim == 3:
-        # The DSv4 refit loader writes BMM weights and scales directly into
-        # DeepGEMM's runtime layout.
-        return
 
     # On Blackwell or Hopper, if E8M0 for DeepGemm is used, we need to
     # requantize the weight and input to the specific scale
