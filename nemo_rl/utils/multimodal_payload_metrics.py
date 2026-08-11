@@ -27,7 +27,6 @@ from nemo_rl.data.multimodal_utils import (
     PackedTensor,
 )
 
-
 _PENDING_PAYLOAD_METRICS: dict[str, int | float] = {}
 _PENDING_PAYLOAD_METRICS_LOCK = Lock()
 

@@ -4252,9 +4252,7 @@ def async_grpo_train(
     next_nemo_gym_task_index = max(
         int((rollouts_state or {}).get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0)),
         int(
-            (replay_buffer_restore_metadata or {}).get(
-                NEXT_NEMO_GYM_TASK_INDEX_KEY, 0
-            )
+            (replay_buffer_restore_metadata or {}).get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0)
         ),
     )
 

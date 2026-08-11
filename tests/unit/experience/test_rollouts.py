@@ -38,13 +38,13 @@ from nemo_rl.data.multimodal_utils import (
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleConfig,
     SlidingPuzzleEnv,
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
+from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 from nemo_rl.experience.rollouts import (

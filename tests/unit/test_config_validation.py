@@ -26,10 +26,10 @@ from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterCo
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
-    MasterConfig as GRPOMasterConfig,
+    RewardPenaltyConfig,
 )
 from nemo_rl.algorithms.grpo import (
-    RewardPenaltyConfig,
+    MasterConfig as GRPOMasterConfig,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig

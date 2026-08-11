@@ -831,9 +831,7 @@ def test_batched_message_log_rejects_mixed_multiturn_media() -> None:
         AssertionError,
         match="flattened_concat requires one logical row per input",
     ):
-        batched_message_log_to_flat_message(
-            batch_logs, pad_value_dict={"token_ids": 0}
-        )
+        batched_message_log_to_flat_message(batch_logs, pad_value_dict={"token_ids": 0})
 
 
 @pytest.mark.parametrize("image_first", [True, False])
