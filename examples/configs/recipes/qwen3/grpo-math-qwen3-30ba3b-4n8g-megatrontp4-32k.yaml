@@ -1,6 +1,6 @@
 defaults: ../../grpo_math_1B.yaml
 checkpointing:
-  checkpoint_dir: results/grpo-math-qwen3-30ba3b-megatron-tp4-32k
+  checkpoint_dir: results/grpo-math-qwen3-30ba3b-4n8g-megatrontp4-32k
   save_period: 3
   keep_top_k: 1
 grpo:
@@ -43,13 +43,13 @@ policy:
       # change to triton to keep same behavior as vLLM 0.17.
       moe_backend: triton
 logger:
-  log_dir: logs/grpo-math-qwen3-30ba3b-megatron-tp4-32k
+  log_dir: logs/grpo-math-qwen3-30ba3b-4n8g-megatrontp4-32k
   wandb_enabled: true
   tensorboard_enabled: true
   monitor_gpus: false
   wandb:
     project: nemo-rl
-    name: grpo-math-qwen3-30ba3b-megatron-tp4-32k
+    name: grpo-math-qwen3-30ba3b-4n8g-megatrontp4-32k
 cluster:
   gpus_per_node: 8
   num_nodes: 4

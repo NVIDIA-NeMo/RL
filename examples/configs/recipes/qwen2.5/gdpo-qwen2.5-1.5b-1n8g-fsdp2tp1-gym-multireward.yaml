@@ -25,8 +25,8 @@ policy:
       http_server_serving_chat_kwargs:
         tool_parser: hermes
 checkpointing:
-  checkpoint_dir: results/gdpo-qwen2.5-1.5b-1n8g-gym-multireward
+  checkpoint_dir: results/gdpo-qwen2.5-1.5b-1n8g-fsdp2tp1-gym-multireward
 logger:
   wandb:
     project: nemo-rl
-    name: gdpo-qwen2.5-1.5b-1n8g-gym-multireward
+    name: gdpo-qwen2.5-1.5b-1n8g-fsdp2tp1-gym-multireward

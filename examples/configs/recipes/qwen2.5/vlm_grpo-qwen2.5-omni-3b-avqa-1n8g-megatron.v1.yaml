@@ -6,3 +6,5 @@ checkpointing:
 logger:
   wandb:
     name: vlm_grpo-qwen2.5-omni-3b-avqa-1n8g-megatron
+cluster:
+  gpus_per_node: 8
