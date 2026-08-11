@@ -19,8 +19,7 @@ ARG NEMO_RL_REPO=https://github.com/NVIDIA-NeMo/RL.git
 ARG NEMO_RL_REVISION=opt/dev-rubin
 ARG HYBRID_EP_REPO=https://github.com/deepseek-ai/DeepEP.git
 ARG HYBRID_EP_REVISION=e0a5b1d9848ab3e7b4a67842bf06f067bfac67f8
-# 10.7 = Rubin (sm_107), matching [tool.trtllm]'s Rubin-targeted ref.
-ARG HYBRID_EP_CUDA_ARCH_LIST="10.0;10.3;10.7"
+ARG HYBRID_EP_CUDA_ARCH_LIST="10.0;10.3"
 ARG HYBRID_EP_MAX_JOBS=16
 
 ## Stage: base (vendored from nemo-rl docker/Dockerfile)
@@ -256,9 +255,10 @@ ARG UV_VERSION
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
-# 10.7 = Rubin (sm_107); torch extensions built during `uv sync` (mamba-ssm,
-# causal-conv1d, transformer-engine) need it to emit native Rubin kernels.
-ENV TORCH_CUDA_ARCH_LIST="9.0 10.0 10.3 10.7"
+# Blackwell only. Rubin (10.7) is deliberately absent: the torch extensions
+# built during `uv sync` (mamba-ssm, causal-conv1d, transformer-engine) fail to
+# compile for sm_107 with this toolchain.
+ENV TORCH_CUDA_ARCH_LIST="10.0 10.3"
 ENV CUDA_HOME=/usr/local/cuda
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 
