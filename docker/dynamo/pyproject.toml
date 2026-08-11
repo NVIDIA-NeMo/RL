@@ -6,3 +6,4 @@ dependencies = ["ai-dynamo[vllm]==1.3.0.post1"]
 
 [tool.uv]
 package = false
+override-dependencies = ["nvidia-nccl-cu13==2.30.7; sys_platform == 'linux'"]

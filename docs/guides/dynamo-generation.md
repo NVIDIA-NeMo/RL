@@ -30,22 +30,27 @@ The opt-in layer installs `ai-dynamo[vllm]==1.3.0.post1` in isolated Python
 3.12 under `/opt/dynamo_venv`, along with etcd v3.5.21 and NATS Server v2.11.6.
 It does not replace NeMo RL's normal Ray or vLLM dependencies: the standard
 NeMo RL vLLM environment currently uses vLLM 0.25.1, while this isolated
-Dynamo environment uses Dynamo's vLLM 0.23.0 pin. For a local source checkout,
-the same environment can be installed under `venvs/dynamo`:
+Dynamo environment uses Dynamo's vLLM 0.23.0 pin. Both environments pin
+`nvidia-nccl-cu13==2.30.7` so their NCCL communicators use the same release.
+For a local source checkout, the same environment can be installed under
+`venvs/dynamo`:
 
 ```bash
 bash docker/dynamo/install.sh
 ```
 
 Set `NEMO_RL_DYNAMO_VENV_DIR` to choose another location. The installer checks
-that Dynamo resolved vLLM 0.23.0, applies the vLLM PR #44814 backport only after
-`git apply --check`, and writes the upstream marker to `VLLM_BACKPORTS`.
+that Dynamo resolved vLLM 0.23.0 and NCCL 2.30.7, applies the vLLM PR #44814
+backport only after `git apply --check`, and writes the upstream marker to
+`VLLM_BACKPORTS`.
 
 Treat the isolated dependency pin and backport as one update. A Dynamo upgrade
 must update and reverify these coupled locations:
 
 - `docker/dynamo/pyproject.toml` and `docker/dynamo/uv.lock`: the Dynamo pin
   and resolved dependency set
+- root `pyproject.toml` and `uv.lock`, plus the isolated Dynamo project and
+  lockfile: the `nvidia-nccl-cu13` pins must remain identical
 - `docker/dynamo/install.sh` and `tests/functional/grpo_dynamo.sh`: the vLLM
   version, backport marker, and runtime assertions
 - `docker/dynamo/patches/vllm-0.23.0-layerwise-reload-composed-loader.patch`:
