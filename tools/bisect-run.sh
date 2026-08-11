@@ -69,7 +69,7 @@ Examples:
 Example nightly bisect:
 
 rsync -ahP --delete tools/ tools.bisect/  # This copies bisect utilities outside of VCS so we always run the latest copy
-TEST_CASE=tests/test_suites/llm/sft-llama3.2-1b-1n8g-fsdp2tp1.v3.sh
+TEST_CASE=tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
 
 HF_HOME=... \
 HF_DATASETS_CACHE=... \
@@ -79,7 +79,7 @@ ACCOUNT=... \
 PARTITION=... \
 \
 SED_CLAUSES=$(cat <<'SED'
-s#mean(data\["timing/train/total_step_time"\], -6, -1) < 0\.6#mean(data["timing/train/total_step_time"], -6, -1) < 0.63#
+s#mean(data\["timing/train/total_step_time"\], 2) < 32#mean(data["timing/train/total_step_time"], 2) < 34#
 /ray\/node\.0\.gpu\.0\.mem_gb/d
 SED
 ) \

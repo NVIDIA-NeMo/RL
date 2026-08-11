@@ -56,13 +56,13 @@ Directory placement and naming parity:
 Each recipe can be run on the head node:
 
 ```sh
-uv run ./llm/sft-llama3.2-1b-1n8g-fsdp2tp1.sh
+uv run ./llm/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
 ```
 
 and the result directory can be found at the same level of the script (w/o `.sh` prefix):
 
 ```sh
-ls -lh llm/sft-llama3.2-1b-1n8g-fsdp2tp1/
+ls -lh llm/sft-llama3.1-8b-1n8g-fsdp2tp2/
 # drwxr-xr-x 2 terryk dip 4.0K Apr 23 18:07 ckpts
 # drwxr-xr-x 3 terryk dip 4.0K Apr 23 18:07 logs
 # -rw-r--r-- 1 terryk dip 142K Apr 23 18:23 metrics.json
@@ -97,23 +97,23 @@ the snapshot of the code at the time the experiment was initially launched.
 
 ```sh
 # Launch
-CONTAINER=... ACCOUNT=... PARTITION=... ../tools/launch ./llm/sft-llama3.2-1b-1n8g-fsdp2tp1.sh
+CONTAINER=... ACCOUNT=... PARTITION=... ../tools/launch ./llm/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
 
 # Prints Estimated GPUhrs and then exits
-DRYRUN=1 CONTAINER=... ACCOUNT=... PARTITION=... ../tools/launch ./llm/sft-llama3.2-1b-1n8g-fsdp2tp1.sh
+DRYRUN=1 CONTAINER=... ACCOUNT=... PARTITION=... ../tools/launch ./llm/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
 
 # Prints Estimated GPUhrs, creates code snapshot, then exits
-DRYRUN=2 CONTAINER=... ACCOUNT=... PARTITION=... ../tools/launch ./llm/sft-llama3.2-1b-1n8g-fsdp2tp1.sh
+DRYRUN=2 CONTAINER=... ACCOUNT=... PARTITION=... ../tools/launch ./llm/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
 
 # Launch but set extra env vars
 EXTRA_ENV="NRL_FORCE_REBUILD_VENVS=true NRL_DEEPSCALER_8K_CKPT=/8k-ckpt NRL_DEEPSCALER_16K_CKPT=/16k-ckpt" \
-CONTAINER=... ACCOUNT=... PARTITION=... ../tools/launch ./llm/sft-llama3.2-1b-1n8g-fsdp2tp1.sh
+CONTAINER=... ACCOUNT=... PARTITION=... ../tools/launch ./llm/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
 ```
 
 After this completes, you can find the result under
 
 ```sh
-ls -lh ../code_snapshots/sft-llama3.2-1b-1n8g-fsdp2tp1/recipes/llm/sft-llama3.2-1b-1n8g-fsdp2tp1/
+ls -lh ../code_snapshots/sft-llama3.1-8b-1n8g-fsdp2tp2/recipes/llm/sft-llama3.1-8b-1n8g-fsdp2tp2/
 # drwxr-xr-x 2 terryk dip 4.0K Apr 23 18:07 ckpts
 # drwxr-xr-x 3 terryk dip 4.0K Apr 23 18:07 logs
 # -rw-r--r-- 1 terryk dip 142K Apr 23 18:23 metrics.json
@@ -126,5 +126,5 @@ unexpectedly cancelled or you want to run it for a little longer.
 
 ```sh
 # This launches one more run of the same experiment
-../code_snapshots/sft-llama3.2-1b-1n8g-fsdp2tp1/continue.sh
+../code_snapshots/sft-llama3.1-8b-1n8g-fsdp2tp2/continue.sh
 ```

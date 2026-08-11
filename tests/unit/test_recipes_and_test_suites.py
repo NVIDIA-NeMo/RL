@@ -13,6 +13,7 @@
 # limitations under the License.
 import glob
 import os
+import re
 import subprocess
 
 import pytest
@@ -56,76 +57,90 @@ ALGO_MAPPING_TO_BASE_YAML = {
 # manually add them to avoid merge conflicts during config validation
 ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.draft", "policy.generation.vllm_kwargs"]
 
+# Weekly GPU-hour budget per (suite, SKU).
+#
+# A lane's real cost is (GPU-hours per run) x (runs per week). Suites run at very
+# different cadences, so comparing per-run numbers across lanes is misleading:
+# nightly is the largest consumer of the fleet by a wide margin even though a
+# single release run is far more expensive than a single nightly run.
+#
+# `runs_per_week` mirrors the nemo-ci pipeline schedules. Keep these in sync if
+# a schedule changes:
+#   "NeMo RL Nightly tests"          0 2 * * *  -> nightly, nightly_gb200
+#   "NeMo RL Weekly Release Tests"   0 4 * * 6  -> release(_gb200)
+#   "NeMo RL Weekly Perf Tests"      0 4 * * 6  -> performance(_gb200)
+#
+# The nightly_mcore lanes are deliberately absent. They are subsets of the
+# nightly lanes, so bounding nightly bounds them transitively; giving them their
+# own ceiling would mean two numbers to retune every time a nightly test lands.
+#
+# Budgets are per SKU because H100 and GB200 capacity are separate pools and
+# cannot be traded against one another. Ceilings sit roughly 15% above current
+# usage so that a legitimate new test has somewhere to land; if a lane is at its
+# ceiling the right response is to retire a test, not to raise the number.
+#
+# The nightly, release and release_gb200 ceilings currently carry five recipes
+# that exist to back user guides (the DAPO guide, the audio and audio-visual
+# guides, and the README model table) rather than to catch regressions. Once
+# those can be marked as documentation-only and stop running, roughly 1,300
+# GPU-hours/week leaves these three lanes and their ceilings should come down.
+SUITE_BUDGETS = {
+    ("nightly", "h100"): {"runs_per_week": 7, "max_gpu_hours_per_week": 26_500},
+    ("nightly", "gb200"): {"runs_per_week": 7, "max_gpu_hours_per_week": 2_600},
+    ("release", "h100"): {"runs_per_week": 1, "max_gpu_hours_per_week": 7_400},
+    ("release", "gb200"): {"runs_per_week": 1, "max_gpu_hours_per_week": 3_100},
+    ("performance", "h100"): {"runs_per_week": 1, "max_gpu_hours_per_week": 13_800},
+    ("performance", "gb200"): {"runs_per_week": 1, "max_gpu_hours_per_week": 4_800},
+}
 
-@pytest.fixture
-def nightly_test_suite():
-    nightly_suite = []
-    with open(nightly_test_suite_path, "r") as f:
+
+def _read_test_suite(path):
+    """Return the test script paths listed in a test suite manifest."""
+    entries = []
+    with open(path, "r") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):
-                nightly_suite.append(line)
-    return nightly_suite
+                entries.append(line)
+    return entries
+
+
+def _suite_manifest_path(suite, sku):
+    """Map a (suite, SKU) pair to its manifest. GB200 lanes use the _gb200 suffix."""
+    name = suite if sku == "h100" else f"{suite}_gb200"
+    return os.path.join(test_suites_dir, f"{name}.txt")
+
+
+@pytest.fixture
+def nightly_test_suite():
+    return _read_test_suite(nightly_test_suite_path)
 
 
 @pytest.fixture
 def release_test_suite():
-    release_suite = []
-    with open(release_test_suite_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                release_suite.append(line)
-    return release_suite
+    return _read_test_suite(release_test_suite_path)
 
 
 @pytest.fixture
 def nightly_gb200_test_suite():
-    nightly_gb200_suite = []
-    with open(nightly_gb200_test_suite_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                nightly_gb200_suite.append(line)
-    return nightly_gb200_suite
+    return _read_test_suite(nightly_gb200_test_suite_path)
 
 
 @pytest.fixture
 def release_gb200_test_suite():
-    release_gb200_suite = []
-    with open(release_gb200_test_suite_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                release_gb200_suite.append(line)
-    return release_gb200_suite
+    return _read_test_suite(release_gb200_test_suite_path)
 
 
 @pytest.fixture
 def performance_test_suite():
-    performance_suite = []
-    with open(h100_performance_test_suite_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                performance_suite.append(line)
-    with open(gb200_performance_test_suite_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                performance_suite.append(line)
-    return performance_suite
+    return _read_test_suite(h100_performance_test_suite_path) + _read_test_suite(
+        gb200_performance_test_suite_path
+    )
 
 
 @pytest.fixture
 def disabled_test_suite():
-    disabled_suite = []
-    with open(disabled_test_suite_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                disabled_suite.append(line)
-    return disabled_suite
+    return _read_test_suite(disabled_test_suite_path)
 
 
 @pytest.fixture
@@ -256,42 +271,63 @@ def test_all_recipe_yamls_accounted_for_in_test_suites(
     )
 
 
-def test_nightly_compute_stays_below_3800_hours(nightly_test_suite, tracker):
-    command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(nightly_test_suite)}"
+@pytest.mark.parametrize(
+    ("suite", "sku"),
+    list(SUITE_BUDGETS),
+    ids=[f"{suite}-{sku}" for suite, sku in SUITE_BUDGETS],
+)
+def test_suite_weekly_gpu_hours_within_budget(suite, sku, tracker):
+    budget = SUITE_BUDGETS[(suite, sku)]
+    scripts = _read_test_suite(_suite_manifest_path(suite, sku))
+    assert scripts, f"Test suite {suite} ({sku}) is empty"
 
-    print(f"Running command: {command}")
-
-    # Run the command from the project root directory
+    command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(scripts)}"
     result = subprocess.run(
         command,
         shell=True,
         cwd=project_root,
         capture_output=True,
         text=True,
-        check=False,  # Don't raise exception on non-zero exit code
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"Command failed with exit code {result.returncode}\n"
+        f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     )
 
-    # Print stdout and stderr for debugging if the test fails
-    print("STDOUT:")
-    print(result.stdout)
-    print("STDERR:")
-    print(result.stderr)
-
-    # Assert that the command exited successfully
-    assert result.returncode == 0, f"Command failed with exit code {result.returncode}"
-
-    # Assert that the last line of stdout contains the expected prefix
     stdout_lines = result.stdout.strip().splitlines()
-    assert len(stdout_lines) > 0, "Command produced no output"
+    assert stdout_lines, "Command produced no output"
     last_line = stdout_lines[-1]
     assert last_line.startswith("[INFO]: Total GPU hours:"), (
         f"Last line of output was not as expected: '{last_line}'"
     )
-    total_gpu_hours = float(last_line.split(":")[-1].strip())
-    assert total_gpu_hours <= 3800, (
-        f"Total GPU hours exceeded 3800: {last_line}. We should revisit the test suites to reduce the total GPU hours."
-    )
-    tracker.track("total_nightly_gpu_hours", total_gpu_hours)
+
+    per_run = float(last_line.split(":")[-1].strip())
+    per_week = per_run * budget["runs_per_week"]
+    tracker.track(f"gpu_hours_per_week_{suite}_{sku}", per_week)
+
+    if per_week > budget["max_gpu_hours_per_week"]:
+        # Surface the most expensive tests so the author can see what to trade
+        # away, rather than only being told the lane is full.
+        costs = sorted(
+            (
+                (int(hours), script)
+                for hours, script in re.findall(
+                    r"^\[INFO\]: (\d+) GPUhrs to run (\S+)$", result.stdout, re.M
+                )
+            ),
+            reverse=True,
+        )
+        worst = "\n".join(
+            f"  {hours:>6} GPU-h/run  {script}" for hours, script in costs[:10]
+        )
+        raise AssertionError(
+            f"{suite} ({sku}) needs {per_week:.0f} GPU-hours/week "
+            f"({per_run:.0f} per run x {budget['runs_per_week']} runs/week), over its "
+            f"{budget['max_gpu_hours_per_week']} budget.\n"
+            f"Retire or shrink a test rather than raising the budget. "
+            f"Most expensive tests in this lane:\n{worst}"
+        )
 
 
 def test_dry_run_does_not_fail_and_prints_total_gpu_hours():
