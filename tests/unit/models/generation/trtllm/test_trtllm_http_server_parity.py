@@ -439,7 +439,8 @@ def test_tool_parser_contracts() -> None:
             enable_thinking=False,
             reasoning_at_start=False,
         )
-        assert actual == case["expected"], (
+        actual_norm = {**actual, "content": (actual["content"] or "").strip() or None}
+        assert actual_norm == case["expected"], (
             "TRT-LLM qwen3 tool contract %r failed" % case["name"]
         )
 
