@@ -74,6 +74,11 @@ class VllmSpecificArgs(TypedDict):
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
+    # Collect vLLM request, cache, and cumulative token counters in a model-owner
+    # background thread for performance diagnostics.
+    enable_vllm_metrics_logger: NotRequired[bool]
+    # Sampling cadence for the optional vLLM metrics logger.
+    vllm_metrics_logger_interval: NotRequired[float]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
     use_tqdm: NotRequired[bool]
     # By default, NeMo RL only has a Python handle to the vllm.LLM generation engine. The expose_http_server flag here will expose that generation engine as an HTTP server.
