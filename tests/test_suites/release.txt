@@ -42,6 +42,8 @@ tests/test_suites/llm/dapo-mistral-medium-3.5-128b-16n8g-fsdp2-automodel.sh
 
 # Deepseek-V3 on DAPO dataset
 tests/test_suites/llm/grpo-dapomath17k-dsv3-megatron.sh
+# Same recipe over the transfer-queue data plane (backend=mooncake_cpu, RDMA).
+tests/test_suites/llm/grpo-dapomath17k-dsv3-megatron-tq_mooncake.sh
 
 # Functional MiniMax M2.7 run (text-only task)
 tests/test_suites/llm/grpo-minimax-m27-dapo-8n8g-automodel.sh

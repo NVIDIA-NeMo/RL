@@ -536,15 +536,9 @@ data_plane:
   storage_capacity: 1000000          # max samples retained per partition
   num_storage_units: 2               # storage shards
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
-  # Both sizes below are **per client process** — one TQ client runs per GPU,
-  # so a node pays gpus_per_node x (segment + buffer). Over RDMA (the default
-  # transport) that memory is pinned via ibv_reg_mr and therefore resident from
-  # setup, not lazily faulted in, so these are real allocations rather than
-  # reservations. On an 8-GPU host, 64+4 GiB works out to 544 GiB/node.
-  # Upstream TransferQueue defaults to 4 GiB / 1 GiB per client; these are
-  # larger because NeMo-RL rollout payloads are, but raise them only with the
-  # per-node multiplier in mind. Under-sizing surfaces as
-  # ``batch_get_tensor returned None``.
+  # Both sizes are per client process (one per GPU) and RDMA-pinned, so an
+  # 8-GPU node pays 8 x (64 + 4) GiB = 544 GiB resident. See DataPlaneConfig
+  # in nemo_rl/data_plane/interfaces.py before raising them.
   global_segment_size: 68719476736   # 64 GiB/process — used when backend == "mooncake_cpu"
   local_buffer_size:    4294967296   # 4 GiB/process  — used when backend == "mooncake_cpu"
   # observability:                    # NotRequired
