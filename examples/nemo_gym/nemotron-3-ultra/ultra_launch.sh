@@ -27,7 +27,8 @@ set -euo pipefail
 #   SLURM_PARTITION=batch \
 #   SLURM_ACCOUNT=your_account \
 #   GENRM_MODEL=<HF repo id or local path>      # Or set GENRM_BASE_URL to use a remote service
-#   NL2BASH_JUDGE_MODEL=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
+#   NL2BASH_JUDGE_MODEL=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \   # Or NL2BASH_BASE_URL
+#   EXTERNAL_JUDGES=1                           # Serve GenRM and NL2Bash outside the training Ray cluster
 #   SAFETY_JUDGE_MODEL=/path/to/safety_checkpoint \
 #   bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 #
@@ -42,6 +43,19 @@ set -euo pipefail
 #   NUM_TRAIN_NODES=64                     Training (Megatron) nodes
 #   NUM_GEN_NODES=172                      vLLM generation nodes
 #   NUM_GYM_NODES=20                       NeMo Gym (judge) nodes
+#   EXTERNAL_JUDGES=0                      1 to serve GenRM and NL2Bash as
+#                                          external vLLM pools in a second
+#                                          Slurm hetgroup instead of inside Gym
+#   GENRM_REPLICAS=4                       External GenRM servers (DP=1 each)
+#   GENRM_TENSOR_PARALLEL_SIZE=4           TP per external GenRM server
+#   GENRM_REASONING_PARSER=                Reasoning-parser plugin .py; only
+#                                          needed for a parser vLLM lacks
+#   GENRM_REASONING_PARSER_NAME=nemotron_v3
+#   NL2BASH_REPLICAS=4                     External NL2Bash servers (DP=1 each)
+#   NL2BASH_TENSOR_PARALLEL_SIZE=4         TP per external NL2Bash server
+#   EXTERNAL_VLLM_SEGMENT_SIZE=4           Segment size for the external hetgroup
+#   BATCH_SCRIPT=ray.sub                   Slurm entrypoint; external services
+#                                          wrap ray.sub
 #   ENABLE_MTP_INFERENCE=0                 1 to enable MTP speculative decoding
 #   NUM_SPECULATIVE_TOKENS=5               MTP speculative tokens
 #   MAX_NUM_BATCHED_TOKENS=8480            vLLM max batched tokens (MTP)
@@ -84,15 +98,12 @@ set -euo pipefail
 # code-execution rewards and needs none of them. Set per recipe; unset vars
 # skip the corresponding override.
 NL2BASH_JUDGE_MODEL="${NL2BASH_JUDGE_MODEL:-}"
+NL2BASH_BASE_URL="${NL2BASH_BASE_URL:-}"
+NL2BASH_API_MODEL_NAME="${NL2BASH_API_MODEL_NAME:-}"
 SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-}"
 GENRM_BASE_URL="${GENRM_BASE_URL:-}"
 GENRM_MODEL="${GENRM_MODEL:-}"
-GENRM_OVERRIDE=""
-if [[ -n "${GENRM_BASE_URL}" ]]; then
-  GENRM_OVERRIDE="env.nemo_gym.genrm_model.responses_api_models.genrm_model.base_url=${GENRM_BASE_URL}"
-elif [[ -n "${GENRM_MODEL}" ]]; then
-  GENRM_OVERRIDE="env.nemo_gym.genrm_model.responses_api_models.genrm_model.model=${GENRM_MODEL}"
-fi
+GENRM_API_MODEL_NAME="${GENRM_API_MODEL_NAME:-}"
 
 # SIF_DIR: for the SWE teacher recipe — directory containing apptainer .sif
 # images for SWE-Bench / SWE-Gym / R2E-Gym instances. The yaml's
@@ -118,6 +129,196 @@ PROJECT_ROOT=$(realpath "$PWD")
 cd "${PROJECT_ROOT}"
 
 # =============================================================================
+# External judge services (EXTERNAL_JUDGES=1)
+#
+# GenRM and NL2Bash are served as fixed-model vLLM pools in a second Slurm
+# heterogeneous component, outside the training Ray cluster. The wrapper starts
+# every replica plus one load balancer per pool, then substitutes each pool's
+# URL placeholder in COMMAND before starting ray.sub on hetgroup 0.
+#
+# Replica defaults mirror the in-Gym deployment in student_rlvr1.yaml
+# (TP=4, DP=4 per judge). Phase 2 typically runs a larger GenRM pool
+# (GENRM_REPLICAS=16), matching student_rlvr2.yaml.
+# =============================================================================
+EXTERNAL_JUDGES="${EXTERNAL_JUDGES:-0}"
+NUM_EXTERNAL_SERVICE_NODES=0
+# Pool sizing divides replica GPUs by GPUS_PER_NODE, so resolve it before
+# registration (re-exported with the other container settings below).
+export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
+  # Stages declare only the judges they use: rlhf_teacher has no NL2Bash block,
+  # reasoning_teacher has no GenRM block, swe_teacher has neither. Each pool is
+  # registered only when its model is set, so a stage never receives an override
+  # for a judge its config does not declare.
+  if [[ -z "${GENRM_MODEL}" && -z "${NL2BASH_JUDGE_MODEL}" ]]; then
+    echo "ERROR: EXTERNAL_JUDGES=1 requires GENRM_MODEL, NL2BASH_JUDGE_MODEL, or both." >&2
+    exit 1
+  fi
+  if [[ -n "${GENRM_BASE_URL}" ]]; then
+    echo "ERROR: GENRM_BASE_URL and EXTERNAL_JUDGES=1 are mutually exclusive." >&2
+    exit 1
+  fi
+  if [[ -n "${NL2BASH_BASE_URL}" ]]; then
+    echo "ERROR: NL2BASH_BASE_URL and EXTERNAL_JUDGES=1 are mutually exclusive." >&2
+    exit 1
+  fi
+
+  # Deployment-specific service definitions stay in this launcher; the
+  # allocation wrapper consumes only pools registered through this interface.
+  source "${PROJECT_ROOT}/tools/external_gym_vllm/pool_config.sh"
+  EXTERNAL_VLLM_POOLS=""
+  EXTERNAL_VLLM_TOOLS_DIR_HOST="${EXTERNAL_VLLM_TOOLS_DIR_HOST:-${PROJECT_ROOT}/tools/external_gym_vllm}"
+  EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
+fi
+
+if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" ]]; then
+  GENRM_BASE_URL="__GENRM_BASE_URL__"
+  GENRM_REPLICAS="${GENRM_REPLICAS:-4}"
+  GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-4}"
+  GENRM_SERVED_MODEL_NAME="${GENRM_SERVED_MODEL_NAME:-model}"
+  GENRM_API_MODEL_NAME="${GENRM_API_MODEL_NAME:-${GENRM_SERVED_MODEL_NAME}}"
+  GENRM_VLLM_PORT="${GENRM_VLLM_PORT:-8000}"
+  GENRM_LB_PORT="${GENRM_LB_PORT:-9213}"
+  GENRM_STARTUP_TIMEOUT="${GENRM_STARTUP_TIMEOUT:-3600}"
+  GENRM_CONTAINER="${GENRM_CONTAINER:-${CONTAINER}}"
+  GENRM_VLLM_PYTHON="${GENRM_VLLM_PYTHON:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python}"
+  # nemotron_v3 is built into vLLM and parses the <think>/</think> format the
+  # GenRM emits. Set GENRM_REASONING_PARSER only for a checkpoint that needs a
+  # parser vLLM does not ship.
+  GENRM_REASONING_PARSER="${GENRM_REASONING_PARSER:-}"
+  GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-nemotron_v3}"
+  GENRM_TOOL_CALL_PARSER="${GENRM_TOOL_CALL_PARSER:-qwen3_coder}"
+  GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-1}"
+  GENRM_COMPILATION_CONFIG="${GENRM_COMPILATION_CONFIG:-{\"pass_config\":{\"fuse_allreduce_rms\":false}}}"
+  GENRM_MODEL_LOADER_EXTRA_CONFIG="${GENRM_MODEL_LOADER_EXTRA_CONFIG:-{\"enable_multithread_load\":true,\"num_threads\":96}}"
+
+fi
+
+if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${NL2BASH_JUDGE_MODEL}" ]]; then
+  NL2BASH_BASE_URL="__NL2BASH_BASE_URL__"
+  NL2BASH_REPLICAS="${NL2BASH_REPLICAS:-4}"
+  NL2BASH_TENSOR_PARALLEL_SIZE="${NL2BASH_TENSOR_PARALLEL_SIZE:-4}"
+  NL2BASH_SERVED_MODEL_NAME="${NL2BASH_SERVED_MODEL_NAME:-model}"
+  NL2BASH_API_MODEL_NAME="${NL2BASH_API_MODEL_NAME:-${NL2BASH_SERVED_MODEL_NAME}}"
+  NL2BASH_VLLM_PORT="${NL2BASH_VLLM_PORT:-8000}"
+  NL2BASH_LB_PORT="${NL2BASH_LB_PORT:-9214}"
+  NL2BASH_STARTUP_TIMEOUT="${NL2BASH_STARTUP_TIMEOUT:-3600}"
+  # GenRM's values when that pool is also registered, else the shared defaults.
+  NL2BASH_CONTAINER="${NL2BASH_CONTAINER:-${GENRM_CONTAINER:-${CONTAINER}}}"
+  NL2BASH_VLLM_PYTHON="${NL2BASH_VLLM_PYTHON:-${GENRM_VLLM_PYTHON:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python}}"
+  NL2BASH_TOOL_CALL_PARSER="${NL2BASH_TOOL_CALL_PARSER:-hermes}"
+  NL2BASH_ENABLE_EXPERT_PARALLEL="${NL2BASH_ENABLE_EXPERT_PARALLEL:-1}"
+  NL2BASH_ATTENTION_BACKEND="${NL2BASH_ATTENTION_BACKEND:-TRITON_ATTN}"
+  NL2BASH_MAX_MODEL_LEN="${NL2BASH_MAX_MODEL_LEN:-131072}"
+  NL2BASH_COMPILATION_CONFIG="${NL2BASH_COMPILATION_CONFIG:-{\"cudagraph_capture_sizes\":[1,2,4,8,16,32,64,128,256]}}"
+  NL2BASH_MODEL_LOADER_EXTRA_CONFIG="${NL2BASH_MODEL_LOADER_EXTRA_CONFIG:-{\"enable_multithread_load\":true,\"num_threads\":112}}"
+fi
+
+if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" ]]; then
+  register_external_vllm_pool GENRM \
+    --display-name GenRM \
+    --model "${GENRM_MODEL}" \
+    --container "${GENRM_CONTAINER}" \
+    --python "${GENRM_VLLM_PYTHON}" \
+    --replicas "${GENRM_REPLICAS}" \
+    --tensor-parallel-size "${GENRM_TENSOR_PARALLEL_SIZE}" \
+    --served-model-name "${GENRM_SERVED_MODEL_NAME}" \
+    --vllm-port "${GENRM_VLLM_PORT}" \
+    --lb-port "${GENRM_LB_PORT}" \
+    --startup-timeout "${GENRM_STARTUP_TIMEOUT}" \
+    --url-placeholder "${GENRM_BASE_URL}" \
+    ${GENRM_REASONING_PARSER:+--shared-path "${GENRM_REASONING_PARSER}"}
+  external_vllm_pool_env GENRM \
+    "FLASHINFER_WORKSPACE_BASE=/tmp" \
+    "VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm" \
+    "VLLM_ALLREDUCE_USE_SYMM_MEM=0"
+  genrm_vllm_args=(
+    --trust-remote-code
+    --dtype bfloat16
+    --kv-cache-dtype fp8
+    --max-num-seqs 256
+    --gpu-memory-utilization 0.95
+    --enable-prefix-caching
+    --reasoning-parser "${GENRM_REASONING_PARSER_NAME}"
+    --enable-auto-tool-choice
+    --tool-call-parser "${GENRM_TOOL_CALL_PARSER}"
+    --compilation-config "${GENRM_COMPILATION_CONFIG}"
+    --model-loader-extra-config "${GENRM_MODEL_LOADER_EXTRA_CONFIG}"
+  )
+  [[ -n "${GENRM_REASONING_PARSER}" ]] && genrm_vllm_args+=(--reasoning-parser-plugin "${GENRM_REASONING_PARSER}")
+  [[ "${GENRM_ENABLE_EXPERT_PARALLEL}" == "1" ]] && genrm_vllm_args+=(--enable-expert-parallel)
+  external_vllm_pool_args GENRM "${genrm_vllm_args[@]}"
+fi
+
+if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${NL2BASH_JUDGE_MODEL}" ]]; then
+  register_external_vllm_pool NL2BASH \
+    --display-name NL2Bash \
+    --model "${NL2BASH_JUDGE_MODEL}" \
+    --container "${NL2BASH_CONTAINER}" \
+    --python "${NL2BASH_VLLM_PYTHON}" \
+    --replicas "${NL2BASH_REPLICAS}" \
+    --tensor-parallel-size "${NL2BASH_TENSOR_PARALLEL_SIZE}" \
+    --served-model-name "${NL2BASH_SERVED_MODEL_NAME}" \
+    --vllm-port "${NL2BASH_VLLM_PORT}" \
+    --lb-port "${NL2BASH_LB_PORT}" \
+    --startup-timeout "${NL2BASH_STARTUP_TIMEOUT}" \
+    --url-placeholder "${NL2BASH_BASE_URL}"
+  external_vllm_pool_env NL2BASH \
+    "FLASHINFER_WORKSPACE_BASE=/tmp" \
+    "VLLM_USE_FLASHINFER_MOE_FP16=0" \
+    "VLLM_USE_FLASHINFER_MOE_FP8=0" \
+    "VLLM_USE_DEEP_GEMM=0" \
+    "VLLM_MOE_USE_DEEP_GEMM=0" \
+    "NCCL_MNNVL_ENABLE=1"
+  nl2bash_vllm_args=(
+    --dtype bfloat16
+    --pipeline-parallel-size 1
+    --max-model-len "${NL2BASH_MAX_MODEL_LEN}"
+    --max-num-seqs 256
+    --gpu-memory-utilization 0.85
+    --enable-prefix-caching
+    --enable-chunked-prefill
+    --enable-auto-tool-choice
+    --tool-call-parser "${NL2BASH_TOOL_CALL_PARSER}"
+    --attention-backend "${NL2BASH_ATTENTION_BACKEND}"
+    --compilation-config "${NL2BASH_COMPILATION_CONFIG}"
+    --model-loader-extra-config "${NL2BASH_MODEL_LOADER_EXTRA_CONFIG}"
+  )
+  [[ "${NL2BASH_ENABLE_EXPERT_PARALLEL}" == "1" ]] && nl2bash_vllm_args+=(--enable-expert-parallel)
+  external_vllm_pool_args NL2BASH "${nl2bash_vllm_args[@]}"
+fi
+
+if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
+  NUM_EXTERNAL_SERVICE_NODES="${EXTERNAL_VLLM_NUM_NODES}"
+  export EXTERNAL_VLLM_LB_PYTHON EXTERNAL_VLLM_POOLS EXTERNAL_VLLM_TOOLS_DIR_HOST
+fi
+
+# Judge endpoints: a base_url routes the Gym server at a remote service and
+# skips the local deployment; otherwise Gym serves the model itself.
+GENRM_OVERRIDE=""
+if [[ -n "${GENRM_BASE_URL}" ]]; then
+  # Gym requires a model name even when it only proxies to base_url, so fall
+  # back to the checkpoint when the served name was not given explicitly.
+  GENRM_API_MODEL_NAME="${GENRM_API_MODEL_NAME:-${GENRM_MODEL}}"
+  GENRM_OVERRIDE="++env.nemo_gym.genrm_model.responses_api_models.genrm_model.base_url=${GENRM_BASE_URL}"
+  if [[ -n "${GENRM_API_MODEL_NAME}" ]]; then
+    GENRM_OVERRIDE="${GENRM_OVERRIDE} env.nemo_gym.genrm_model.responses_api_models.genrm_model.model=${GENRM_API_MODEL_NAME}"
+  fi
+elif [[ -n "${GENRM_MODEL}" ]]; then
+  GENRM_OVERRIDE="env.nemo_gym.genrm_model.responses_api_models.genrm_model.model=${GENRM_MODEL}"
+fi
+NL2BASH_OVERRIDE=""
+if [[ -n "${NL2BASH_BASE_URL}" ]]; then
+  NL2BASH_API_MODEL_NAME="${NL2BASH_API_MODEL_NAME:-${NL2BASH_JUDGE_MODEL}}"
+  NL2BASH_OVERRIDE="++env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.base_url=${NL2BASH_BASE_URL}"
+  if [[ -n "${NL2BASH_API_MODEL_NAME}" ]]; then
+    NL2BASH_OVERRIDE="${NL2BASH_OVERRIDE} env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.model=${NL2BASH_API_MODEL_NAME}"
+  fi
+elif [[ -n "${NL2BASH_JUDGE_MODEL}" ]]; then
+  NL2BASH_OVERRIDE="env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.model=${NL2BASH_JUDGE_MODEL}"
+fi
+
+# =============================================================================
 # Job identity — fixed name for singleton.
 # Slurm --dependency=singleton serialises queued submissions with the same name
 # so a resubmission after preemption resumes from the latest checkpoint instead
@@ -128,20 +329,40 @@ JOB_NAME="${EXP_NAME}"
 # =============================================================================
 # Output directories
 # =============================================================================
-RESULTS_DIR="${RESULTS_DIR:-results/${EXP_NAME}}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RESULTS_DIR}/checkpoints}"
+# Resolved to absolute paths: the driver runs from ${CODE_ROOT} inside the
+# container, and the external-service wrapper rejects relative paths.
+RESULTS_DIR="$(realpath -m -s "${RESULTS_DIR:-results/${EXP_NAME}}")"
+CHECKPOINT_DIR="$(realpath -m -s "${CHECKPOINT_DIR:-${RESULTS_DIR}/checkpoints}")"
 
 # Per-submission dirs for logs and Slurm output (timestamped for history).
 RUN_DIR="${RESULTS_DIR}/runs/$(date +%Y%m%d-%H%M)"
 LOG_DIR="${RUN_DIR}/logs"
 SLURM_LOG_DIR="${RUN_DIR}/slurm"
+BASE_LOG_DIR="$(realpath -m -s "${BASE_LOG_DIR:-${RESULTS_DIR}/ray_logs}")"
+
+# The wrapper bind-mounts EXTERNAL_VLLM_SHARED_ROOT into the service containers,
+# so both paths must resolve under it. Check before creating any directories.
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+  _shared_root="${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}"
+  for _var in BASE_LOG_DIR EXTERNAL_VLLM_TOOLS_DIR_HOST; do
+    _path="$(realpath -m -s "${!_var}")"
+    if [[ "${_path}" != "${_shared_root}" && "${_path}" != "${_shared_root}"/* ]]; then
+      echo "ERROR: ${_var}=${_path} must be under EXTERNAL_VLLM_SHARED_ROOT=${_shared_root} when EXTERNAL_JUDGES=1." >&2
+      echo "  Set ${_var} (or RESULTS_DIR) to a path on the shared filesystem, or set EXTERNAL_VLLM_SHARED_ROOT." >&2
+      exit 1
+    fi
+    printf -v "${_var}" '%s' "${_path}"
+  done
+  export EXTERNAL_VLLM_TOOLS_DIR_HOST
+fi
+
 mkdir -p "${CHECKPOINT_DIR}" "${LOG_DIR}" "${SLURM_LOG_DIR}"
-ln -sfn "$(realpath "${RUN_DIR}")" "${RESULTS_DIR}/runs/latest"
+ln -sfn "${RUN_DIR}" "${RESULTS_DIR}/runs/latest"
 
 # ray.sub reads BASE_LOG_DIR and creates $BASE_LOG_DIR/$SLURM_JOB_ID-logs/ for
 # ray infrastructure logs (ray-head.log, ray-driver.log, ray-worker-*.log,
 # topology probes, attach scripts, etc.).
-export BASE_LOG_DIR="${BASE_LOG_DIR:-${RESULTS_DIR}/ray_logs}"
+export BASE_LOG_DIR
 
 # =============================================================================
 # SLURM configuration
@@ -322,7 +543,8 @@ on_policy_distillation.non_colocated_teachers.default_teacher_cfg.num_nodes=${NU
 fi
 
 NUM_ACTOR_NODES=$((NUM_TRAIN_NODES + NUM_GEN_NODES + NUM_TEACHER_NODES))
-NUM_TOTAL_NODES=$((NUM_ACTOR_NODES + NUM_GYM_NODES))
+NUM_RAY_NODES=$((NUM_ACTOR_NODES + NUM_GYM_NODES))
+NUM_TOTAL_NODES=$((NUM_RAY_NODES + NUM_EXTERNAL_SERVICE_NODES))
 
 if (( NUM_TRAIN_NODES <= 0 )); then
   echo "ERROR: NUM_TRAIN_NODES must be > 0 (got ${NUM_TRAIN_NODES})" >&2; exit 1
@@ -335,16 +557,30 @@ if (( NUM_GYM_NODES < 0 )); then
 fi
 
 # GB200 NVL72 topology: 18 nodes per NVLink domain, allocate in groups of 16.
+# With external judges, Slurm schedules two heterogeneous components, so the
+# NeMo RL nodes and the external-service nodes are validated separately.
 SEGMENT_SIZE="${SEGMENT_SIZE:-16}"
-if (( NUM_TOTAL_NODES < SEGMENT_SIZE )); then
-  echo "ERROR: NUM_TOTAL_NODES=${NUM_TOTAL_NODES} < SEGMENT_SIZE=${SEGMENT_SIZE}" >&2
+EXTERNAL_VLLM_SEGMENT_SIZE="${EXTERNAL_VLLM_SEGMENT_SIZE:-4}"
+if (( NUM_RAY_NODES < SEGMENT_SIZE )); then
+  echo "ERROR: NUM_RAY_NODES=${NUM_RAY_NODES} < SEGMENT_SIZE=${SEGMENT_SIZE}" >&2
   exit 1
 fi
-if (( NUM_TOTAL_NODES % SEGMENT_SIZE != 0 )); then
-  echo "ERROR: NUM_TOTAL_NODES=${NUM_TOTAL_NODES} is not divisible by SEGMENT_SIZE=${SEGMENT_SIZE}." >&2
-  echo "  Training=${NUM_TRAIN_NODES} + Generation=${NUM_GEN_NODES} + Gym=${NUM_GYM_NODES} + Teachers=${NUM_TEACHER_NODES} = ${NUM_TOTAL_NODES}" >&2
+if (( NUM_RAY_NODES % SEGMENT_SIZE != 0 )); then
+  echo "ERROR: NeMo RL nodes=${NUM_RAY_NODES} is not divisible by SEGMENT_SIZE=${SEGMENT_SIZE}." >&2
+  echo "  Training=${NUM_TRAIN_NODES} + Generation=${NUM_GEN_NODES} + Gym=${NUM_GYM_NODES} + Teachers=${NUM_TEACHER_NODES} = ${NUM_RAY_NODES}" >&2
   echo "  Adjust node counts so the total is a multiple of ${SEGMENT_SIZE}." >&2
   exit 1
+fi
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+  if (( EXTERNAL_VLLM_SEGMENT_SIZE <= 0 )); then
+    echo "ERROR: EXTERNAL_VLLM_SEGMENT_SIZE must be > 0." >&2
+    exit 1
+  fi
+  if (( NUM_EXTERNAL_SERVICE_NODES % EXTERNAL_VLLM_SEGMENT_SIZE != 0 )); then
+    echo "ERROR: External service nodes=${NUM_EXTERNAL_SERVICE_NODES} is not divisible by EXTERNAL_VLLM_SEGMENT_SIZE=${EXTERNAL_VLLM_SEGMENT_SIZE}." >&2
+    echo "  Registered pools: ${EXTERNAL_VLLM_POOLS}" >&2
+    exit 1
+  fi
 fi
 
 # =============================================================================
@@ -545,6 +781,17 @@ if [[ ! -f "${RAY_SUB}" ]]; then
   echo "ERROR: ray.sub not found at ${RAY_SUB}" >&2
   exit 1
 fi
+export RAY_SUB
+# External judges wrap ray.sub so the services come up before training starts.
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+  BATCH_SCRIPT="${BATCH_SCRIPT:-${PROJECT_ROOT}/tools/external_gym_vllm/run_in_allocation.sh}"
+else
+  BATCH_SCRIPT="${BATCH_SCRIPT:-${RAY_SUB}}"
+fi
+if [[ ! -f "${BATCH_SCRIPT}" ]]; then
+  echo "ERROR: batch script not found at ${BATCH_SCRIPT}" >&2
+  exit 1
+fi
 
 # =============================================================================
 # Per-node cache seeding (SETUP_COMMAND)
@@ -639,7 +886,7 @@ ${CHECKPOINTING_SAVE_BY:+checkpointing.checkpoint_must_save_by=${CHECKPOINTING_S
 data.train.data_path=${TRAIN_PATH} \
 data.validation.data_path=${VAL_PATH} \
 ${GENRM_OVERRIDE:+${GENRM_OVERRIDE}} \
-${NL2BASH_JUDGE_MODEL:+env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.model=${NL2BASH_JUDGE_MODEL}} \
+${NL2BASH_OVERRIDE:+${NL2BASH_OVERRIDE}} \
 ${SAFETY_JUDGE_MODEL:+env.nemo_gym.safety_judge_model.responses_api_models.local_vllm_model.model=${SAFETY_JUDGE_MODEL}} \
 ${SIF_DIR:+sif_dir=${SIF_DIR}} \
 env.nemo_gym.nemo_gym_log_dir=${LOG_DIR}/nemo_gym \
@@ -653,6 +900,9 @@ ${MOPD_OVERRIDES} \
 ${*}"
 
 export COMMAND="${TRAIN_CMD}"
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+  validate_external_vllm_submission "${COMMAND}" "${NUM_EXTERNAL_SERVICE_NODES}"
+fi
 
 # =============================================================================
 # Summary
@@ -663,14 +913,26 @@ echo "  Nemotron 3 Ultra — ${EXP_NAME} (${NUM_TOTAL_NODES}-node)"
 echo "================================================================"
 echo "  Job name:    ${JOB_NAME}  (singleton — only one runs at a time)"
 echo "  Config:      ${CONFIG_PATH}"
-echo "  Nodes:       ${NUM_TOTAL_NODES} total  (segment=${SEGMENT_SIZE})"
+echo "  Nodes:       ${NUM_TOTAL_NODES} total"
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+echo "    Hetgroup 0: ${NUM_RAY_NODES} NeMo RL nodes  (segment=${SEGMENT_SIZE})"
+fi
 echo "    Training:  ${NUM_TRAIN_NODES}  ($((NUM_TRAIN_NODES * GPUS_PER_NODE)) GPUs)"
 echo "    vLLM gen:  ${NUM_GEN_NODES}  ($((NUM_GEN_NODES * GPUS_PER_NODE)) GPUs)"
 echo "    Gym:       ${NUM_GYM_NODES}  ($((NUM_GYM_NODES * GPUS_PER_NODE)) GPUs)"
 if (( NUM_TEACHER_NODES > 0 )); then
 echo "    Teachers:  ${NUM_TEACHER_NODES}  ($((NUM_TEACHER_NODES * GPUS_PER_NODE)) GPUs)"
 fi
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+echo "    Hetgroup 1: ${NUM_EXTERNAL_SERVICE_NODES} external-service nodes  (segment=${EXTERNAL_VLLM_SEGMENT_SIZE})"
+for _pool in ${EXTERNAL_VLLM_POOLS}; do
+  _replicas="${_pool}_REPLICAS"; _tp="${_pool}_TENSOR_PARALLEL_SIZE"; _lb="${_pool}_LB_PORT"
+  _label="${_pool}_DISPLAY_NAME"
+  echo "      ${!_label}: ${!_replicas} independent TP=${!_tp}, DP=1 servers; LB port=${!_lb}"
+done
+fi
 echo "  Walltime:    ${WALLTIME}"
+echo "  Batch script: ${BATCH_SCRIPT}"
 echo ""
 echo "  Checkpoints: ${CHECKPOINT_DIR}  (stable — auto-resumes across jobs)"
 echo "  Run dir:     ${RUN_DIR}"
@@ -731,6 +993,11 @@ fi
 # then idles. We save the driver command to <jobid>-run-cmd.sh so you can attach
 # and run it by hand, edit it, and re-run without requeueing.
 if [[ "${INTERACTIVE}" == "1" ]]; then
+  if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+    echo "ERROR: INTERACTIVE=1 is not supported with external judge services." >&2
+    echo "  Use DRY_RUN=1 to inspect the command or submit the batch job normally." >&2
+    exit 1
+  fi
   unset COMMAND 2>/dev/null || true   # empty COMMAND -> ray.sub idle/interactive mode
   WALLTIME="${INTERACTIVE_WALLTIME:-${WALLTIME}}"
 
@@ -802,24 +1069,58 @@ SLURM_DEPENDENCY="${SLURM_DEPENDENCY:-}"
 DEPENDENCY="singleton"
 [[ -n "${SLURM_DEPENDENCY}" ]] && DEPENDENCY="singleton,${SLURM_DEPENDENCY}"
 
-SBATCH_OUTPUT=$(sbatch \
-  --nodes="${NUM_TOTAL_NODES}" \
-  --account="${SLURM_ACCOUNT}" \
-  --job-name="${JOB_NAME}" \
-  --partition="${SLURM_PARTITION}" \
-  --time="${WALLTIME}" \
-  --gres=gpu:${GPUS_PER_NODE} \
-  --exclusive \
-  --mem=0 \
-  --dependency="${DEPENDENCY}" \
-  --segment="${SEGMENT_SIZE}" \
-  --output="${SLURM_LOG_DIR}/%j.out" \
-  --error="${SLURM_LOG_DIR}/%j.err" \
-  ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
-  ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
-  ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-  --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"batch training run"}}' \
-  "${RAY_SUB}")
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+  SBATCH_OUTPUT=$(sbatch \
+    --nodes="${NUM_RAY_NODES}" \
+    --account="${SLURM_ACCOUNT}" \
+    --job-name="${JOB_NAME}" \
+    --partition="${SLURM_PARTITION}" \
+    --time="${WALLTIME}" \
+    --gres=gpu:${GPUS_PER_NODE} \
+    --exclusive \
+    --mem=0 \
+    --dependency="${DEPENDENCY}" \
+    --segment="${SEGMENT_SIZE}" \
+    --output="${SLURM_LOG_DIR}/%j.out" \
+    --error="${SLURM_LOG_DIR}/%j.err" \
+    ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
+    ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
+    ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+    --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"batch training run"}}' \
+    : \
+    --nodes="${NUM_EXTERNAL_SERVICE_NODES}" \
+    --account="${SLURM_ACCOUNT}" \
+    --job-name="${JOB_NAME}-services" \
+    --partition="${SLURM_PARTITION}" \
+    --time="${WALLTIME}" \
+    --gres=gpu:${GPUS_PER_NODE} \
+    --exclusive \
+    --mem=0 \
+    --segment="${EXTERNAL_VLLM_SEGMENT_SIZE}" \
+    ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
+    ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
+    ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+    "${BATCH_SCRIPT}")
+else
+  SBATCH_OUTPUT=$(sbatch \
+    --nodes="${NUM_TOTAL_NODES}" \
+    --account="${SLURM_ACCOUNT}" \
+    --job-name="${JOB_NAME}" \
+    --partition="${SLURM_PARTITION}" \
+    --time="${WALLTIME}" \
+    --gres=gpu:${GPUS_PER_NODE} \
+    --exclusive \
+    --mem=0 \
+    --dependency="${DEPENDENCY}" \
+    --segment="${SEGMENT_SIZE}" \
+    --output="${SLURM_LOG_DIR}/%j.out" \
+    --error="${SLURM_LOG_DIR}/%j.err" \
+    ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
+    ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
+    ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+    --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"batch training run"}}' \
+    "${BATCH_SCRIPT}")
+fi
 
 echo "${SBATCH_OUTPUT}"
 JOB_ID=$(echo "${SBATCH_OUTPUT}" | grep -oP '\d+$')
