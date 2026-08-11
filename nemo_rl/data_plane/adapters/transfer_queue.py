@@ -132,102 +132,6 @@ def _connect_existing() -> None:
     tq.init()
 
 
-_TQ_RUNTIME_ENV_PATCHED = False
-
-
-def _resolve_tq_pin() -> str:
-    """Return the ``TransferQueue`` requirement string from nemo-rl metadata.
-
-    Single source of truth is ``pyproject.toml`` — we read it back via
-    ``importlib.metadata.requires`` so the runtime_env injection cannot
-    drift from the dependency declaration.
-    """
-    from importlib.metadata import requires
-
-    for req in requires("nemo-rl") or []:
-        spec = req.split(";")[0].strip()
-        if spec.lower().startswith("transferqueue"):
-            return spec
-    raise RuntimeError(
-        "Could not resolve TransferQueue dependency from nemo-rl metadata. "
-        "Check pyproject.toml under [project.dependencies]."
-    )
-
-
-def _patch_tq_actor_runtime_env() -> None:
-    """Inject a per-actor ``runtime_env`` pin into TQ's actor ``.options()``.
-
-    TQ spawns ``SimpleStorageUnit`` and ``TransferQueueController`` via
-    ``Cls.options(...).remote(...)`` without a runtime_env, so they
-    inherit the job-level env. In a multi-node container deployment
-    where each node has its own ``/opt/nemo_rl_venv``, the driver's
-    ``uv sync`` only updates ray-head's venv and a worker-node actor
-    fails with ``ModuleNotFoundError``. This monkey-patch makes Ray
-    pip-install TQ into a per-actor runtime_env on first spawn (cached
-    per-node by Ray afterwards). Idempotent. Couples us to TQ's internal
-    class layout — if TQ restructures, this becomes a no-op with a
-    logged warning and we fall back to per-node ``uv sync``.
-
-    The pin is sourced from nemo-rl's installed metadata via
-    :func:`_resolve_tq_pin` so it cannot drift from ``pyproject.toml``.
-
-    TODO(zhiyul): remove this patch once the nightly container image
-    is published with ``TransferQueue`` baked in via ``pyproject.toml``.
-    When every node starts from that image, the base env already has TQ
-    and Ray actors inherit it — this injection then becomes pure
-    overhead (Ray builds a redundant per-actor pip env on top of the
-    container's existing TQ install). Drop the call from
-    ``TQDataPlaneClient.__init__`` and delete this function.
-    """
-    global _TQ_RUNTIME_ENV_PATCHED
-    if _TQ_RUNTIME_ENV_PATCHED:
-        return
-
-    runtime_env = {"pip": [_resolve_tq_pin()]}
-
-    def _install(cls) -> bool:
-        if not hasattr(cls, "options"):
-            return False
-        original = cls.options
-
-        def patched(*args, **kwargs):
-            kwargs.setdefault("runtime_env", runtime_env)
-            return original(*args, **kwargs)
-
-        cls.options = patched  # type: ignore[method-assign]
-        return True
-
-    unpatched_classes: list[str] = []
-    try:
-        from transfer_queue.storage.simple_storage import SimpleStorageUnit
-
-        if not _install(SimpleStorageUnit):
-            unpatched_classes.append("SimpleStorageUnit")
-    except ImportError:
-        unpatched_classes.append("SimpleStorageUnit")
-    try:
-        from transfer_queue.controller import TransferQueueController
-
-        if not _install(TransferQueueController):
-            unpatched_classes.append("TransferQueueController")
-    except ImportError:
-        unpatched_classes.append("TransferQueueController")
-
-    if unpatched_classes:
-        # Soft-fail: TQ may have moved its actor classes. The driver will
-        # still work; multi-node TQ may need the per-node `uv sync` workaround.
-        warnings.warn(
-            "Could not patch every TQ actor class for runtime_env injection: "
-            f"unpatched={unpatched_classes}. "
-            "Multi-node TQ may fail with ModuleNotFoundError: 'transfer_queue' "
-            "on worker nodes. Workaround: run `uv sync` inside each node's "
-            "container before the driver runs.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    _TQ_RUNTIME_ENV_PATCHED = True
-
-
 def _init_tq(cfg: DataPlaneConfig) -> None:
     """Driver-process path: bootstrap the TQ controller for the chosen backend."""
     from omegaconf import OmegaConf
@@ -318,11 +222,6 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
     conf = OmegaConf.merge(base, overlay)
-
-    # Inject runtime_env into TQ's actor spawn so SimpleStorageUnit /
-    # TransferQueueController land on workers with transfer_queue available
-    # — see _patch_tq_actor_runtime_env() docstring for the why.
-    _patch_tq_actor_runtime_env()
 
     # pyrefly: ignore  # bad-argument-type
     tq.init(conf=conf)
