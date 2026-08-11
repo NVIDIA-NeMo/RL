@@ -54,16 +54,58 @@ Both arms go through `nano35_dolphin_launch_sc.sh`. The launcher derives
 `MAX_LOOKAHEAD_VERSIONS` emit `+async_rl.sampler.max_staleness_versions`, which
 is the key the windowed sampler actually reads.
 
-Set `GENRM_BASE_URL` to a warm GenRM pool that is already serving, or use
-`EXTERNAL_JUDGES=1` instead to host GenRM and the NL2Bash judge in-job. Both
-shapes total 68 nodes. **Use whichever mode job 5995584 used, and use the same
-one for both arms** — the two differ in judge latency and in Gym node count
-(16 vs 8), which would confound the comparison.
+### Judge hosting: `EXTERNAL_JUDGES=1`, and no `GENRM_BASE_URL`
+
+Both arms host GenRM and the NL2Bash judge in-job, in a second Slurm hetgroup.
+This is settled, not a preference.
+
+Job 5995584 ran as a **heterogeneous** job. All four arms of that sweep appear
+in Slurm as `5995580+0`, `5995582+0`, `5995584+0` and `5995586+0`; the `+N`
+suffix is a hetjob component index and exists only for heterogeneous jobs. The
+three v1 arms pending as of this writing (6032239, 6032458, 6032460) show the
+same `+0` / `+1` pattern at 56 and 12 nodes. `EXTERNAL_JUDGES=1` is precisely
+what produces that two-component shape.
+
+**Do not set `GENRM_BASE_URL`.** The GenRM URLs in older logs are ephemeral
+compute-node addresses belonging to a pool whose job terminated on August 8;
+passing one would aim the arms at a dead endpoint. It would also fail outright:
+`ultra_launch.sh` treats `GENRM_BASE_URL` and `EXTERNAL_JUDGES=1` as mutually
+exclusive and exits with an error. Leaving it unset is safe — the launcher
+defaults it to empty, then substitutes its own `__GENRM_BASE_URL__` placeholder,
+which the allocation wrapper replaces with the resolved load-balancer URL once
+the pools are healthy.
+
+`GENRM_MODEL` and `NL2BASH_JUDGE_MODEL` are required under `EXTERNAL_JUDGES=1`.
+Both already have defaults in `nano35_dolphin_launch.sh`, so neither needs to be
+passed.
+
+### Node arithmetic
+
+`EXTERNAL_JUDGES=1` drops the Gym pool from 16 nodes to 8, because the NL2Bash
+judge vacates exactly the 8 it was filling and moves to the judge hetgroup.
+
+| Component | Derivation | Nodes |
+|-----------|-----------|-------|
+| Hetgroup 0 — train | `NUM_TRAIN_NODES` | 8 |
+| Hetgroup 0 — generation | `NUM_GEN_NODES` | 40 |
+| Hetgroup 0 — Gym | `_DEFAULT_GYM_NODES` under `EXTERNAL_JUDGES=1` | 8 |
+| **Hetgroup 0 total** | `NUM_RAY_NODES` | **56** |
+| Hetgroup 1 — GenRM | 2 replicas x TP 8 / 4 GPUs per node | 4 |
+| Hetgroup 1 — NL2Bash | 8 replicas x TP 4 / 4 GPUs per node | 8 |
+| **Hetgroup 1 total** | `EXTERNAL_VLLM_NUM_NODES` | **12** |
+| **Job total** | `NUM_TOTAL_NODES` | **68** |
+
+Hetgroup 1 is sized by `pool_config.sh` as the sum over registered pools of
+`REPLICAS * TENSOR_PARALLEL_SIZE / GPUS_PER_NODE`; no extra node is reserved for
+the load balancers, which run inside the pools. This reproduces 5995584's 56+12
+exactly. Both components clear their segment checks at the nano values
+(`SEGMENT_SIZE=2` divides 56, `EXTERNAL_VLLM_SEGMENT_SIZE=2` divides 12), so
+neither arm should be rejected at submission.
 
 ### Arm A — cap below offered load
 
 ```bash
-GENRM_BASE_URL=http://<lb-host>:9213/v1 \
+EXTERNAL_JUDGES=1 \
 EXP_NAME=sauramishra-nano35-sc-conc-probe-armA-cap256 \
 SAMPLER=windowed \
 MAX_LOOKAHEAD_VERSIONS=4 \
@@ -75,7 +117,7 @@ GYM_MAX_CONCURRENCY=256 \
 ### Arm B — control, Ray's default cap
 
 ```bash
-GENRM_BASE_URL=http://<lb-host>:9213/v1 \
+EXTERNAL_JUDGES=1 \
 EXP_NAME=sauramishra-nano35-sc-conc-probe-armB-default \
 SAMPLER=windowed \
 MAX_LOOKAHEAD_VERSIONS=4 \
@@ -84,10 +126,27 @@ NUM_STORAGE_UNITS=8 \
 ```
 
 Arm B passes no `env.nemo_gym.max_concurrency` override at all; the launcher
-omits it when `GYM_MAX_CONCURRENCY` is empty. Check the banner before the job is
-submitted — it prints `Gym concur : 256` for Arm A and
-`Gym concur : unset (Ray default 1000)` for Arm B. Add `DRY_RUN=1` to inspect
-the resolved command without submitting.
+omits it when `GYM_MAX_CONCURRENCY` is empty.
+
+### Pre-submit check
+
+Prepend `DRY_RUN=1` to either command. `ultra_launch.sh` prints the resolved
+`TRAIN_CMD` and exits before submitting, and it is the supported way to inspect
+this shape — `INTERACTIVE=1` is rejected outright when external judge services
+are configured. Three things to read off the output:
+
+- The SC banner prints `Gym concur : 256` for Arm A and
+  `Gym concur : unset (Ray default 1000)` for Arm B. This is the check that the
+  two arms actually differ, and it is unaffected by the judge-mode correction:
+  the SC launcher emits its banner before handing off, so it appears under
+  `DRY_RUN=1` just as it does on a real submission.
+- `TRAIN_CMD` should contain `env.nemo_gym.max_concurrency=256` for Arm A and no
+  `max_concurrency` token at all for Arm B.
+- The ultra banner should report `Hetgroup 1: 12 external-service nodes`
+  alongside a 56-node hetgroup 0, confirming the 68-node total above.
+
+A dry run is cheap and submits nothing; do it for both arms before either goes
+to the queue.
 
 ## Parity warning: storage units
 
@@ -166,7 +225,7 @@ raising the cap rescues it.
 
 ```bash
 # Arm C — over the gate, Ray's default cap (expected to gate)
-GENRM_BASE_URL=http://<lb-host>:9213/v1 \
+EXTERNAL_JUDGES=1 \
 EXP_NAME=sauramishra-nano35-sc-conc-probe-armC-1152-default \
 SAMPLER=windowed \
 MAX_LOOKAHEAD_VERSIONS=8 \
@@ -174,7 +233,7 @@ NUM_STORAGE_UNITS=16 \
   bash examples/nemo_gym/nemotron-3.5-nano/nano35_dolphin_launch_sc.sh
 
 # Arm D — same load, cap raised above it
-GENRM_BASE_URL=http://<lb-host>:9213/v1 \
+EXTERNAL_JUDGES=1 \
 EXP_NAME=sauramishra-nano35-sc-conc-probe-armD-1152-cap2048 \
 SAMPLER=windowed \
 MAX_LOOKAHEAD_VERSIONS=8 \
