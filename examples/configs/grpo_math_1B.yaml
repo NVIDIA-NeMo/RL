@@ -536,8 +536,7 @@ data_plane:
   storage_capacity: 1000000          # max samples retained per partition
   num_storage_units: 2               # storage shards
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
-  # Per client process (one per GPU) and RDMA-pinned, so a node pays
-  # gpus_per_node x (segment + buffer). See DataPlaneConfig before raising.
+  # Per client process — see DataPlaneConfig before raising these.
   global_segment_size: 68719476736   # 64 GiB/process — used when backend == "mooncake_cpu"
   local_buffer_size:    4294967296   # 4 GiB/process  — used when backend == "mooncake_cpu"
   # observability:                    # NotRequired

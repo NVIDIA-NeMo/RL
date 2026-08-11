@@ -10,6 +10,11 @@ git config --global --add safe.directory $PROJECT_ROOT
 
 set -eou pipefail
 
+# Exercises the mooncake code path, not the transport. Opt into TCP so this
+# runs on hosts with no RoCE NIC — without it the adapter raises, since it
+# will not silently downgrade a run that asked for RDMA.
+export MC_MOONCAKE_PROTOCOL=tcp
+
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs

@@ -29,8 +29,6 @@ smoke / smoke-backend / smoke-1d / obj-backend / mix-e2e today).
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
@@ -71,11 +69,13 @@ def _session_tq_client_mooncake_cpu():
         )
     # These tests exercise the mooncake code path, not the transport. Opt into
     # TCP so they run on hosts with no RoCE NIC — without it the adapter raises,
-    # since it will not silently downgrade a run that asked for RDMA.
-    os.environ.setdefault("MC_MOONCAKE_PROTOCOL", "tcp")
-    client = build_data_plane_client(_make_tq_cfg("mooncake_cpu"))
-    yield client
-    client.close()
+    # since it will not silently downgrade a run that asked for RDMA. Scoped so
+    # it cannot leak into other tests in the same worker.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("MC_MOONCAKE_PROTOCOL", "tcp")
+        client = build_data_plane_client(_make_tq_cfg("mooncake_cpu"))
+        yield client
+        client.close()
 
 
 @pytest.fixture
