@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 pytestmark = pytest.mark.mcore
 
@@ -1010,8 +1011,10 @@ class TestTopkLogitsPostProcessor:
         loss, result = wrapped_fn(output_tensor)
 
         assert "topk_logits" in result
+        assert "topk_logprobs" in result
         assert "topk_indices" in result
         assert result["topk_logits"].shape[-1] == k
+        assert result["topk_logprobs"].shape == result["topk_logits"].shape
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
@@ -1058,6 +1061,7 @@ class TestTopkLogitsPostProcessor:
         loss, result = wrapped_fn(output_tensor)
 
         assert "topk_logits" in result
+        assert "topk_logprobs" in result
         assert "topk_indices" in result
         # Output should be unpacked to batch shape
         assert result["topk_logits"].shape[0] == 1
@@ -1149,7 +1153,8 @@ class TestTopkLogitsPostProcessor:
         # allgather returns the full gathered tensor
         gathered_vals = torch.randn(1, seq_len, k)
         gathered_idx = torch.randint(0, 100, (1, seq_len, k))
-        mock_allgather.side_effect = [gathered_vals, gathered_idx]
+        gathered_logprobs = torch.randn(1, seq_len, k)
+        mock_allgather.side_effect = [gathered_vals, gathered_idx, gathered_logprobs]
 
         cu_seqlens_padded = torch.tensor([0, seq_len])
 
@@ -1161,9 +1166,10 @@ class TestTopkLogitsPostProcessor:
         output_tensor = torch.randn(1, local_seq_len, 100)
         loss, result = wrapped_fn(output_tensor)
 
-        # Verify allgather was called for both vals and indices
-        assert mock_allgather.call_count == 2
+        # Verify allgather was called for logits, indices, and logprobs.
+        assert mock_allgather.call_count == 3
         assert "topk_logits" in result
+        assert "topk_logprobs" in result
         assert "topk_indices" in result
         # Output should be unpacked: (batch_size=1, unpacked_seqlen=8, k=3)
         assert result["topk_logits"].shape == (1, 8, k)
@@ -1214,7 +1220,7 @@ class TestTopkLogitsPostProcessor:
         mock_topk_idx = torch.randint(0, 100, (1, local_packed_len, k))
         mock_topk.return_value = (mock_topk_vals, mock_topk_idx)
 
-        # allgather is called once per sequence (2 sequences x 2 tensors = 4 calls)
+        # allgather is called once per sequence for logits, indices, and logprobs.
         def fake_allgather(local_tensor, group, seq_dim):
             # Simulate gathering: double the seq_dim since cp_size=2
             return local_tensor.repeat(1, cp_size, 1)
@@ -1231,13 +1237,66 @@ class TestTopkLogitsPostProcessor:
         output_tensor = torch.randn(1, local_packed_len, 100)
         loss, result = wrapped_fn(output_tensor)
 
-        # allgather called 2x per sequence (vals + idx) x 2 sequences = 4 calls
-        assert mock_allgather.call_count == 4
+        assert mock_allgather.call_count == 6
         assert "topk_logits" in result
+        assert "topk_logprobs" in result
         assert "topk_indices" in result
         # Output should be unpacked: (batch_size=2, unpacked_seqlen=6, k=3)
         assert result["topk_logits"].shape == (2, unpacked_seqlen, k)
         assert result["topk_indices"].shape == (2, unpacked_seqlen, k)
+
+
+class TestSupportLogprobsPostProcessor:
+    """Tests for gathering teacher logprobs on a student-selected support."""
+
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    def test_gathers_full_vocab_normalized_logprobs(self, mock_tp_rank, mock_tp_group):
+        from nemo_rl.models.megatron.train import SupportLogprobsPostProcessor
+
+        mock_tp_group.return_value = None
+        logits = torch.tensor([[[1.0, 3.0, 2.0], [4.0, 0.0, 1.0]]])
+        support_indices = torch.tensor([[[1, 2], [0, 2]]])
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"context_parallel_size": 1},
+        }
+        processor = SupportLogprobsPostProcessor(cfg=cfg)
+
+        _, output = processor(
+            BatchedDataDict(
+                {
+                    "input_ids": torch.zeros(1, 2, dtype=torch.long),
+                    "topk_indices": support_indices,
+                }
+            )
+        )(logits)
+
+        expected = logits.log_softmax(dim=-1).gather(-1, support_indices)
+        torch.testing.assert_close(output["support_logprobs"], expected)
+
+    @pytest.mark.parametrize(
+        "packing,context_parallel_size",
+        [(True, 1), (False, 2)],
+    )
+    def test_rejects_unimplemented_layouts(self, packing, context_parallel_size):
+        from nemo_rl.models.megatron.train import SupportLogprobsPostProcessor
+
+        cfg = {
+            "sequence_packing": {"enabled": packing},
+            "megatron_cfg": {"context_parallel_size": context_parallel_size},
+        }
+        with pytest.raises(NotImplementedError):
+            SupportLogprobsPostProcessor(cfg=cfg)(
+                BatchedDataDict(
+                    {
+                        "input_ids": torch.zeros(1, 2, dtype=torch.long),
+                        "topk_indices": torch.zeros(1, 2, 1, dtype=torch.long),
+                    }
+                )
+            )
 
 
 class TestAggregateTrainingStatistics:
