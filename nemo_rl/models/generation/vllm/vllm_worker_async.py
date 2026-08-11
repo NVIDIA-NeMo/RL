@@ -761,7 +761,6 @@ class VllmAsyncGenerationWorkerImpl(
                 f"val_top_p={generation_config['val_top_p']})"
             )
 
-
             try:
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
