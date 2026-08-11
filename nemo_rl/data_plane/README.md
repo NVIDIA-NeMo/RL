@@ -489,5 +489,6 @@ trainer uses only half of it**. The task-mediated half
 (`claim_meta` / `get_data` / `check_consumption_status`) is reserved
 for the async trainer, which is not yet wired into production.
 
-Design proposal, filtering / staleness strategies, and open questions:
-see [`docs/data-plane-async-proposal.md`](docs/data-plane-async-proposal.md).
+The design proposal covering filtering / staleness strategies and the open
+questions has not been written up yet; the task-mediated methods on
+`DataPlaneClient` are the current source of truth for the intended shape.
