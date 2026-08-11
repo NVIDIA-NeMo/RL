@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import time
 from functools import partial
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import ray
 import torch
@@ -656,7 +656,17 @@ class SingleControllerActor:
         """
         self._rollout_permitted.clear()
 
-        aborted_stale_inflight_groups = await self._abort_stale_inflight()
+        # TODO(#2625): abort unconditionally once gym-path abort is validated;
+        # for now only the native path aborts. Local import dodges the grpo.py
+        # circular dep (as in async_utils/trajectory_collector.py).
+        from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
+        from nemo_rl.algorithms.grpo import _should_use_nemo_gym
+
+        aborted_stale_inflight_groups = (
+            0
+            if _should_use_nemo_gym(cast(GrpoMasterConfig, self._master_config))
+            else await self._abort_stale_inflight()
+        )
 
         # TODO(#2625): Add drain-gate support during refit.
 
