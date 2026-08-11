@@ -149,6 +149,7 @@ def test_config_classifies_managed_logprobs_and_runtime_fields() -> None:
     config["vllm_cfg"].update(
         {
             "logprobs_mode": "processed_logprobs",
+            "cap_max_tokens_to_context": False,
             "use_deep_gemm": False,
             "num_first_layers_in_bf16": 0,
             "num_last_layers_in_bf16": 0,
@@ -164,12 +165,17 @@ def test_config_classifies_managed_logprobs_and_runtime_fields() -> None:
         DynamoConfig.model_validate(config)
 
 
-def test_config_warns_only_for_active_unsupported_fields() -> None:
+@pytest.mark.parametrize("field", ["skip_tokenizer_init", "cap_max_tokens_to_context"])
+def test_config_warns_only_for_active_unsupported_fields(field) -> None:
     config = _config()
-    config["vllm_cfg"]["skip_tokenizer_init"] = True
+    config["vllm_cfg"][field] = True
 
-    with pytest.warns(UserWarning, match="skip_tokenizer_init"):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         DynamoConfig.model_validate(config)
+    assert [str(warning.message) for warning in caught] == [
+        f"policy.generation.vllm_cfg.{field} is ignored by backend='dynamo'"
+    ]
 
 
 @pytest.mark.parametrize(

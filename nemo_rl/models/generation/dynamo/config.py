@@ -50,6 +50,9 @@ _VLLM_CFG_MOVED = {
 }
 
 _VLLM_CFG_UNSUPPORTED = {
+    # Applied inside NeMo RL's in-process vLLM worker; it cannot configure the
+    # managed ``dynamo.vllm`` subprocess.
+    "cap_max_tokens_to_context",
     "is_mx",
     "num_first_layers_in_bf16",
     "num_last_layers_in_bf16",

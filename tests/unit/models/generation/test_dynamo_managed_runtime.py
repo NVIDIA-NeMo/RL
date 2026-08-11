@@ -718,11 +718,23 @@ def test_frontend_waits_for_model_after_endpoint_registration(monkeypatch) -> No
             {"data": [{"id": "model"}]},
         ]
     )
+    urls: list[str] = []
+
+    def fake_urlopen(url, timeout):
+        urls.append(url)
+        return _FakeHttpResponse(next(responses))
+
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.managed_runtime.urllib.request.urlopen",
-        lambda url, timeout: _FakeHttpResponse(next(responses)),
+        fake_urlopen,
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.managed_runtime.time.sleep", lambda _: None
     )
     runtime._wait_for_frontend(expected_workers=1)
+    assert urls == [
+        "http://127.0.0.1:3000/health",
+        "http://127.0.0.1:3000/v1/models",
+        "http://127.0.0.1:3000/health",
+        "http://127.0.0.1:3000/v1/models",
+    ]

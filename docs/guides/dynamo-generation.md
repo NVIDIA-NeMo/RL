@@ -4,6 +4,8 @@ NeMo RL can launch and own Dynamo's control plane, frontend, and a fixed vLLM
 worker fleet inside a Slurm-backed Ray allocation. This mode supports direct
 GRPO and NeMo-Gym rollouts, NCCL weight refits, cache invalidation, and
 `generation_metrics/*` telemetry sent to enabled loggers such as W&B.
+See the [Dynamo integration design](../design-docs/dynamo-integration.md) for
+the service ownership, startup, and weight-refit architecture.
 
 This integration is managed and vLLM-only. It does not connect to an external
 Dynamo deployment and does not support Kubernetes, DGD, SGLang, TensorRT-LLM,
@@ -40,12 +42,26 @@ that Dynamo resolved vLLM 0.23.0, applies the vLLM PR #44814 backport only after
 `git apply --check`, and writes the upstream marker to `VLLM_BACKPORTS`.
 
 Treat the isolated dependency pin and backport as one update. A Dynamo upgrade
-must update `docker/dynamo/pyproject.toml` and `docker/dynamo/uv.lock`, the
-version and marker assertions in `docker/dynamo/install.sh` and
-`tests/functional/grpo_dynamo.sh`, and the version text in this guide and the
-design document. If the new Dynamo vLLM pin contains PR #44814, delete the
-patch file, patch-application block, marker assertion, and explanatory
-backport text. Do not rebase the patch onto the newer vLLM release.
+must update and reverify these coupled locations:
+
+- `docker/dynamo/pyproject.toml` and `docker/dynamo/uv.lock`: the Dynamo pin
+  and resolved dependency set
+- `docker/dynamo/install.sh` and `tests/functional/grpo_dynamo.sh`: the vLLM
+  version, backport marker, and runtime assertions
+- `docker/dynamo/patches/vllm-0.23.0-layerwise-reload-composed-loader.patch`:
+  the version-specific #44814 backport
+- `tests/unit/distributed/test_stateless_process_group.py`: vLLM's
+  `broadcast_from/0/0` weight-transfer wire key
+- `nemo_rl/models/generation/dynamo/token_wrapper.py`: the real Dynamo response
+  keys `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
+  reverify them against real Dynamo output because unit tests validate only the
+  expected local response shape
+- this guide and the Dynamo design document: the stated versions and backport
+  behavior
+
+If the new Dynamo vLLM pin contains PR #44814, delete the patch file,
+patch-application block, marker assertion, and explanatory backport text. Do
+not rebase the patch onto the newer vLLM release.
 
 ## Configure Dynamo
 
