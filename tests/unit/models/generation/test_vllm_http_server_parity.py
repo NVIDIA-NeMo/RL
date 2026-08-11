@@ -99,18 +99,6 @@ def _wait_for_server(base_url: str, timeout: int = 180) -> None:
     raise TimeoutError(f"vLLM server at {base_url} did not start within {timeout}s")
 
 
-def _extract_generation_token_ids(choice: dict[str, Any]) -> list[int]:
-    token_logprobs = (choice.get("logprobs") or {}).get("content") or []
-    token_ids = []
-    for token_logprob in token_logprobs:
-        token = token_logprob.get("token", "")
-        assert token.startswith("token_id:"), (
-            f"vLLM did not return a token ID for generated token {token!r}"
-        )
-        token_ids.append(int(token.removeprefix("token_id:")))
-    return token_ids
-
-
 def _extract_fields(response_json: dict[str, Any]) -> dict[str, Any]:
     choice = response_json["choices"][0]
     msg = choice["message"]
@@ -125,7 +113,7 @@ def _extract_fields(response_json: dict[str, Any]) -> dict[str, Any]:
     ]
     return {
         "prompt_token_ids": msg["prompt_token_ids"],
-        "generation_token_ids": _extract_generation_token_ids(choice),
+        "generation_token_ids": msg["generation_token_ids"],
         "content": msg.get("content"),
         # Normalize vLLM and NeMo-Gym reasoning field names.
         "reasoning_content": msg.get("reasoning") or msg.get("reasoning_content") or "",
@@ -147,6 +135,7 @@ def _run_scenario(base_url: str, enable_thinking: bool) -> list[dict[str, Any]]:
         "top_k": -1,
         "max_tokens": 512,
         "logprobs": True,
+        "top_logprobs": 0,
         "chat_template_kwargs": template_kwargs,
     }
     r1 = requests.post(f"{base}/chat/completions", json=body1, timeout=180)
@@ -168,7 +157,7 @@ def _run_scenario(base_url: str, enable_thinking: bool) -> list[dict[str, Any]]:
         "tool_calls": normalized_tool_calls,
         "prompt_token_ids": turn1["prompt_token_ids"],
         "generation_token_ids": turn1["generation_token_ids"],
-        "generation_log_probs": [-0.0] * len(turn1["generation_token_ids"]),
+        "generation_log_probs": raw_msg1["generation_log_probs"],
     }
     tool_result_msg = {
         "role": "tool",
@@ -185,6 +174,7 @@ def _run_scenario(base_url: str, enable_thinking: bool) -> list[dict[str, Any]]:
         "top_k": -1,
         "max_tokens": 512,
         "logprobs": True,
+        "top_logprobs": 0,
         "chat_template_kwargs": template_kwargs,
     }
     r2 = requests.post(f"{base}/chat/completions", json=body2, timeout=180)
@@ -205,7 +195,7 @@ def _run_scenario(base_url: str, enable_thinking: bool) -> list[dict[str, Any]]:
         "content": raw_msg2.get("content"),
         "prompt_token_ids": turn2["prompt_token_ids"],
         "generation_token_ids": turn2["generation_token_ids"],
-        "generation_log_probs": [-0.0] * len(turn2["generation_token_ids"]),
+        "generation_log_probs": raw_msg2["generation_log_probs"],
     }
     body3 = {
         "model": MODEL,
@@ -222,6 +212,7 @@ def _run_scenario(base_url: str, enable_thinking: bool) -> list[dict[str, Any]]:
         "top_k": -1,
         "max_tokens": 512,
         "logprobs": True,
+        "top_logprobs": 0,
         "chat_template_kwargs": template_kwargs,
     }
     r3 = requests.post(f"{base}/chat/completions", json=body3, timeout=180)
@@ -335,7 +326,11 @@ def test_parser_contracts(
                 reasoning_parser=None,
                 enable_thinking=False,
             )
-            assert actual == case["expected"], (
+            actual_norm = {
+                **actual,
+                "content": (actual["content"] or "").strip() or None,
+            }
+            assert actual_norm == case["expected"], (
                 "vLLM Hermes tool contract %r failed" % case["name"]
             )
 

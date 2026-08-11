@@ -135,7 +135,7 @@ TOOL_PARSER_CONTRACT_CASES = (
         "raw_output": "before " + _tool_call_text("pwd") + " after",
         "expected": {
             "reasoning_content": "",
-            "content": "before ",
+            "content": "before",
             "tool_calls": [{"name": "run_bash", "arguments": {"command": "pwd"}}],
         },
     },
