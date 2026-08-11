@@ -29,12 +29,17 @@
 
 [project]
 name = "tensorrt-llm"
-version = "1.3.0rc24"
+# Must match tensorrt_llm/version.py at [tool.trtllm].ref, and the pin in the
+# root pyproject.toml's `trtllm` extra. feat/rubin-bringup branched before
+# rc24, so this is rc23 -- a step back from the previous ref by design.
+version = "1.3.0rc23"
 requires-python = ">=3.13"
 dependencies = [
   "mpi4py",
   "numpy>=2.0.0,<2.4",
-  "torch>=2.11.0,<=2.13.0a0",
+  # Unpinned to match the ref's requirements.txt; the root pyproject's torch pin
+  # is what actually governs the resolved version.
+  "torch",
   "torchvision",
   # Ceiling raised from upstream's <=2.29.7 (which tracks what NGC rel-26-04 ships,
   # not a tested incompatibility) so it matches the nvidia-nccl-cu13==2.30.7 override.
@@ -45,18 +50,22 @@ dependencies = [
   "cuda-python>=13",
   "flash-attn-4==4.0.0b11",
   "flashinfer-python==0.6.15",
-  "torchao>=0.14.1,<0.16.0",
+  "torchao",
   "apache-tvm-ffi==0.1.6",
   "torch-c-dlpack-ext==0.1.3",
   "xdsl>=0.59.0",
   "cuda-tile>=1.0.1",
   "nvidia-cuda-tileiras>=13.1,<13.2",
+  # NOTE: the ref's requirements.txt adds nvidia-modelopt[torch]~=0.39.0, but it
+  # is intentionally not mirrored here: the root pyproject already pins modelopt
+  # to a git rev via [tool.uv.sources] and forces >=0.44.0a0 via
+  # override-dependencies, so a ~=0.39.0 declaration would be overridden anyway.
   "transformers==5.5.4",
   "accelerate>=1.7.0",
   "sentencepiece>=0.1.99",
   "mistral-common>=1.10.0",
   "tiktoken",
-  "diffusers>=0.39.0",
+  "diffusers>=0.37.1",
   "peft>=0.18.1,<0.19.0",
   "optimum",
   "ftfy",
@@ -89,6 +98,10 @@ dependencies = [
   "einops",
   "aenum",
   "strenum",
+  # Deliberately ahead of the ref's requirements.txt (which pins 0.7.29): vLLM
+  # needs >=1.3.0 and the root pyproject's [tool.uv] override-dependencies
+  # enforces that project-wide, so declaring 0.7.29 here would be inert and
+  # misleading. Do not "re-sync" this one to upstream.
   "llguidance>=1.3.0,<1.4.0",
   "backoff",
   "jsonschema",
@@ -129,5 +142,11 @@ backend-path = ["."]
 # image is scoped by base image and architecture so valid compiler objects can
 # be reused across ref and uv-version changes. When bumping `ref`, also re-sync
 # [project].dependencies against the new requirements.txt.
-url = "https://github.com/shuyixiong/TensorRT-LLM.git"
-ref = "3dbf513f3ed7487044ae64631c68bffde0fe4ad3"   # pragma: allowlist secret
+#
+# tekit is a private GitLab repo, so the url carries a ${GITLAB_CLONE_ACCESS_TOKEN}
+# placeholder that _backend.py expands from the build environment (the token is
+# never committed, and the cache key uses this raw string, not the expanded one).
+# The ref is user/shuyix/rubin-bringup-qwen35-refit-disagg: feat/rubin-bringup
+# (Rubin/sm_107) + qwen3.5 BF16/FP8 refit + the squashed NIXL disagg work.
+url = "https://oauth2:${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/ftp/tekit.git"
+ref = "6076444fcb36d9b91e480a934c553148565da387"   # pragma: allowlist secret
