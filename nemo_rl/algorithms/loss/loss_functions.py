@@ -134,6 +134,19 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # If True, add KL penalty to reward instead of loss (used by Reinforce++)
     use_kl_in_reward: bool = False
 
+    # --- Behaviour-policy KL regularization ---
+    # Penalize KL(π_gen || π_curr) on rollout tokens, anchoring the policy to
+    # the behaviour (generation) policy. Bounds cumulative drift across async
+    # steps: clipping only limits per-update movement (prev_logprobs refreshes
+    # every update) and TIS only reweights the estimator after drift happened.
+    behaviour_kl_penalty: float = 0.0
+    # Can be set to k1, k2, k3 (see reference_policy_kl_type)
+    behaviour_kl_type: str = "k3"
+    # Separate clamps from the reference-policy KL so enabling this term is
+    # safe even in configs that set kl_{input,output}_clamp_value to null.
+    behaviour_kl_input_clamp_value: Optional[float] = 20.0
+    behaviour_kl_output_clamp_value: Optional[float] = 10.0
+
     # --- Importance sampling correction ---
     # Async GRPO requires importance sampling correction enabled
     # Set to true when async_grpo.enabled is true
@@ -243,6 +256,13 @@ class ClippedPGLossFn(LossFunction):
         self.reference_policy_kl_type = cfg.reference_policy_kl_type
         self.kl_input_clamp_value = cfg.kl_input_clamp_value
         self.kl_output_clamp_value = cfg.kl_output_clamp_value
+        self.behaviour_kl_penalty = cfg.behaviour_kl_penalty
+        self.behaviour_kl_type = cfg.behaviour_kl_type
+        self.behaviour_kl_input_clamp_value = cfg.behaviour_kl_input_clamp_value
+        self.behaviour_kl_output_clamp_value = cfg.behaviour_kl_output_clamp_value
+        assert self.behaviour_kl_type in ("k1", "k2", "k3"), (
+            f"behaviour_kl_type must be 'k1', 'k2', or 'k3', got {self.behaviour_kl_type}"
+        )
         self.use_importance_sampling_correction = cfg.use_importance_sampling_correction
         # Type of truncated importance sampling: "tis" | "icepop" | "seq-mask-tis"
         self.truncated_importance_sampling_type = cfg.truncated_importance_sampling_type
@@ -337,6 +357,7 @@ class ClippedPGLossFn(LossFunction):
             # Normalized like the gradient (loss_type-dependent).
             "loss": grad_normalizer,
             "kl_penalty": grad_normalizer,
+            "behaviour_kl": grad_normalizer,
             # Token-normalized diagnostics, independent of loss_type.
             "probs_ratio": MetricNormalizer.TOKENS,
             "probs_ratio_clamped": MetricNormalizer.TOKENS,
@@ -515,6 +536,35 @@ class ClippedPGLossFn(LossFunction):
                 )
         else:
             kl = torch.tensor(0.0)
+
+        # Behaviour-policy KL penalty: KL(π_gen || π_curr) estimated on rollout
+        # tokens. Samples come from π_gen (θ-independent), so unlike the
+        # reference-policy KL above, no importance-sampling weights are needed
+        # and the pathwise gradient through curr_logprobs is unbiased.
+        # curr_logprobs (not curr_logprobs_unfiltered) is used to match the
+        # other π_gen-facing terms (actor IS weights, approx_entropy).
+        if self.behaviour_kl_penalty != 0:
+            behaviour_kl = self.behaviour_kl_penalty * calculate_kl(
+                logprobs=generation_logprobs,
+                logprobs_reference=curr_logprobs,
+                kl_type=self.behaviour_kl_type,
+                input_clamp_value=self.behaviour_kl_input_clamp_value,
+                output_clamp_value=self.behaviour_kl_output_clamp_value,
+            )
+            if self.loss_type == LossType.TOKEN_LEVEL:
+                behaviour_kl = masked_mean(
+                    behaviour_kl,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            else:
+                behaviour_kl = masked_mean(
+                    masked_mean(behaviour_kl, token_mask, dim=-1),
+                    sample_mask,
+                    global_normalization_factor=global_valid_seqs,
+                )
+        else:
+            behaviour_kl = torch.tensor(0.0)
 
         # Calculate clipped loss function if ppo ratio is enabled.
         if self.force_on_policy_ratio:
@@ -732,7 +782,12 @@ class ClippedPGLossFn(LossFunction):
                     global_normalization_factor=correct_valid_toks,
                 )
 
-        loss = actor_loss + kl + self.positive_example_nll_weight * nll_loss
+        loss = (
+            actor_loss
+            + kl
+            + behaviour_kl
+            + self.positive_example_nll_weight * nll_loss
+        )
         with torch.no_grad():
             probs_ratio = masked_mean(
                 ratios.detach(),
@@ -775,6 +830,9 @@ class ClippedPGLossFn(LossFunction):
                 "probs_ratio_clamped_min": probs_ratio_clamped_min,
                 "probs_ratio_clamped_max": probs_ratio_clamped_max,
                 "kl_penalty": kl.item() / self.reference_policy_kl_penalty if kl else 0,
+                "behaviour_kl": behaviour_kl.item() / self.behaviour_kl_penalty
+                if behaviour_kl
+                else 0,
                 "token_mult_prob_error": mult_prob_error,
                 "gen_kl_error": gen_kl_error,
                 "policy_kl_error": policy_kl_error,
