@@ -330,6 +330,10 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def post_init_async(self):
         if self.llm is not None:
+            if self._use_internal_rollout_profiler:
+                await self.llm.collective_rpc(
+                    "end_rollout_profiler_engine_initialization", args=tuple()
+                )
             await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
         if self._mtp_load_from_disk:
@@ -339,6 +343,34 @@ class VllmAsyncGenerationWorkerImpl(
         if self._sparse_refit_receiver is not None:
             hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
             self._sparse_refit_receiver.set_worker_hostnames(hostnames)
+
+    async def begin_rollout_profile_async(self, *, step_id: int | str) -> None:
+        """Open one rollout profile window on every async-engine GPU worker."""
+        if not self._use_internal_rollout_profiler:
+            return
+        if self.llm is None:
+            raise RuntimeError("The vLLM engine is not initialized")
+        await self.llm.collective_rpc(
+            "begin_rollout_profile", args=tuple(), kwargs={"step_id": step_id}
+        )
+
+    async def finish_rollout_profile_async(self) -> None:
+        """Close a successful async-engine rollout profile window."""
+        if not self._use_internal_rollout_profiler:
+            return
+        if self.llm is None:
+            raise RuntimeError("The vLLM engine is not initialized")
+        await self.llm.collective_rpc("finish_rollout_profile", args=tuple())
+
+    async def abort_rollout_profile_async(self, *, reason: str) -> None:
+        """Abort an async-engine rollout profile window after an error."""
+        if not self._use_internal_rollout_profiler:
+            return
+        if self.llm is None:
+            raise RuntimeError("The vLLM engine is not initialized")
+        await self.llm.collective_rpc(
+            "abort_rollout_profile", args=tuple(), kwargs={"reason": reason}
+        )
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -1680,6 +1712,10 @@ class VllmAsyncGenerationWorkerImpl(
                 await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
 
             if self.llm is not None:
+                if self._use_internal_rollout_profiler:
+                    await self.llm.collective_rpc(
+                        "close_rollout_profiler", args=tuple()
+                    )
                 # Clean up extension resources (e.g., ZMQ sockets)
                 await self.llm.collective_rpc("cleanup", args=tuple())
                 try:

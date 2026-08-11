@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import logging
+import os
 import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -22,6 +23,11 @@ from typing import Any, Literal, Optional
 import torch
 import zmq
 
+from nemo_rl.models.generation.profiling import (
+    ROLLOUT_PROFILER_CLASS_ENV,
+    RolloutProfiler,
+    load_rollout_profiler,
+)
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineMixin,
     preinit_nixl_from_vllm_config,
@@ -43,6 +49,15 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+_ROLLOUT_PROFILER_CONFIG_KEY = "nemo_rl_rollout_profiler"
+_ROLLOUT_PROFILING_VLLM_WORKER = (
+    "nemo_rl.models.generation.vllm.vllm_backend.RolloutProfilingVllmWorker"
+)
+_ROLLOUT_PROFILING_NIXL_VLLM_WORKER = (
+    "nemo_rl.models.generation.vllm.vllm_backend.RolloutProfilingNixlVllmWorker"
+)
+_NIXL_VLLM_WORKER = "nemo_rl.models.generation.vllm.vllm_backend.NixlVllmWorker"
 
 try:
     import vllm  # noqa: F401
@@ -182,6 +197,158 @@ class _IPCWeightManifest:
             raise IPCWeightManifestError("; ".join(details))
 
 
+class _RolloutProfilingVllmWorkerBase(VllmWorker):
+    """Run a configured rollout profiler inside one vLLM GPU worker."""
+
+    _nrl_rollout_profiler: RolloutProfiler | None
+    _nrl_rollout_engine_initialization_open: bool
+    _nrl_rollout_engine_initialization_token: Any
+
+    def __init__(
+        self,
+        vllm_config: Any,
+        local_rank: int,
+        rank: int,
+        distributed_init_method: str,
+        is_driver_worker: bool = False,
+    ) -> None:
+        self._nrl_rollout_profiler = None
+        self._nrl_rollout_engine_initialization_open = False
+        self._nrl_rollout_engine_initialization_token = None
+
+        profiler_config = vllm_config.additional_config.get(
+            _ROLLOUT_PROFILER_CONFIG_KEY
+        )
+        if profiler_config is not None:
+            os.environ[ROLLOUT_PROFILER_CLASS_ENV] = profiler_config["class_path"]
+            profiler = load_rollout_profiler(
+                rank=int(profiler_config["rank_prefix"]) + rank
+            )
+            if profiler is None:
+                raise RuntimeError(
+                    "The vLLM rollout profiling worker was selected without a "
+                    "rollout profiler class"
+                )
+            self._nrl_rollout_profiler = profiler
+            try:
+                self._nrl_rollout_engine_initialization_token = (
+                    profiler.begin_engine_initialization()
+                )
+                self._nrl_rollout_engine_initialization_open = True
+            except BaseException as profiler_error:
+                try:
+                    profiler.close()
+                except Exception as close_error:
+                    profiler_error.add_note(
+                        "Rollout profiler cleanup after initialization failure "
+                        f"also failed: {close_error!r}"
+                    )
+                raise
+
+        try:
+            # vLLM is an optional import, so Pyrefly resolves this base
+            # initializer as object.__init__ rather than the runtime worker.
+            super().__init__(
+                vllm_config=vllm_config,  # pyrefly: ignore[unexpected-keyword]
+                local_rank=local_rank,  # pyrefly: ignore[unexpected-keyword]
+                rank=rank,  # pyrefly: ignore[unexpected-keyword]
+                distributed_init_method=distributed_init_method,  # pyrefly: ignore[unexpected-keyword]
+                is_driver_worker=is_driver_worker,  # pyrefly: ignore[unexpected-keyword]
+            )
+        except BaseException as worker_error:
+            try:
+                self.close_rollout_profiler()
+            except Exception as profiler_error:
+                worker_error.add_note(
+                    "Rollout profiler cleanup after vLLM worker initialization "
+                    f"failure also failed: {profiler_error!r}"
+                )
+            raise
+
+    def _require_rollout_profiler(self) -> RolloutProfiler:
+        profiler = self._nrl_rollout_profiler
+        if profiler is None:
+            raise RuntimeError("The vLLM rollout profiler is not active")
+        return profiler
+
+    def end_rollout_profiler_engine_initialization(self) -> None:
+        """Close the one-time vLLM graph-construction capture window."""
+        if not self._nrl_rollout_engine_initialization_open:
+            return
+        profiler = self._require_rollout_profiler()
+        try:
+            profiler.end_engine_initialization(
+                self._nrl_rollout_engine_initialization_token
+            )
+        finally:
+            self._nrl_rollout_engine_initialization_open = False
+            self._nrl_rollout_engine_initialization_token = None
+
+    def begin_rollout_profile(self, *, step_id: int | str) -> None:
+        """Open one complete rollout capture window on this GPU worker."""
+        if self._nrl_rollout_engine_initialization_open:
+            raise RuntimeError(
+                "Cannot begin rollout profiling before vLLM engine "
+                "initialization has completed"
+            )
+        self._require_rollout_profiler().begin_rollout(step_id=step_id)
+
+    def finish_rollout_profile(self) -> None:
+        """Close a successful rollout capture window on this GPU worker."""
+        self._require_rollout_profiler().finish_rollout()
+
+    def abort_rollout_profile(self, *, reason: str) -> None:
+        """Abort a failed rollout capture window on this GPU worker."""
+        self._require_rollout_profiler().abort_rollout(reason=reason)
+
+    def close_rollout_profiler(self) -> None:
+        """Close the profiler, including any open initialization window."""
+        profiler = self._nrl_rollout_profiler
+        if profiler is None:
+            return
+
+        profiler_error: Exception | None = None
+        try:
+            self.end_rollout_profiler_engine_initialization()
+        except Exception as error:
+            profiler_error = error
+
+        try:
+            profiler.close()
+        except Exception as error:
+            if profiler_error is None:
+                profiler_error = error
+            else:
+                profiler_error.add_note(
+                    f"Rollout profiler close also failed: {error!r}"
+                )
+        finally:
+            self._nrl_rollout_profiler = None
+
+        if profiler_error is not None:
+            raise profiler_error
+
+    def shutdown(self) -> None:
+        """Close profiling before releasing the vLLM worker resources."""
+        profiler_error: Exception | None = None
+        try:
+            self.close_rollout_profiler()
+        except Exception as error:
+            profiler_error = error
+
+        try:
+            super().shutdown()
+        except BaseException as shutdown_error:
+            if profiler_error is not None:
+                shutdown_error.add_note(
+                    f"Rollout profiler shutdown also failed: {profiler_error!r}"
+                )
+            raise
+
+        if profiler_error is not None:
+            raise profiler_error
+
+
 class NixlVllmWorker(VllmWorker):
     """vLLM worker that establishes NIXL/UCX before vLLM initialization."""
 
@@ -189,6 +356,48 @@ class NixlVllmWorker(VllmWorker):
         worker = super().__new__(cls)
         worker._nrl_nixl_preinit_agent = preinit_nixl_from_vllm_config(vllm_config)
         return worker
+
+
+class RolloutProfilingVllmWorker(_RolloutProfilingVllmWorkerBase):
+    """vLLM GPU worker with the generic rollout-profiler lifecycle."""
+
+
+class RolloutProfilingNixlVllmWorker(_RolloutProfilingVllmWorkerBase):
+    """NIXL vLLM GPU worker with the rollout-profiler lifecycle."""
+
+    def __new__(
+        cls, vllm_config: Any, *args: Any, **kwargs: Any
+    ) -> "RolloutProfilingNixlVllmWorker":
+        worker = super().__new__(cls)
+        worker._nrl_nixl_preinit_agent = preinit_nixl_from_vllm_config(vllm_config)
+        return worker
+
+
+def configure_rollout_profiler_worker(
+    vllm_kwargs: dict[str, Any], *, class_path: str, rank_prefix: int
+) -> None:
+    """Configure vLLM to construct the profiler in each internal GPU worker."""
+    worker_cls = vllm_kwargs.get("worker_cls")
+    if worker_cls in (None, "auto", _ROLLOUT_PROFILING_VLLM_WORKER):
+        profiling_worker_cls = _ROLLOUT_PROFILING_VLLM_WORKER
+    elif worker_cls in (
+        _NIXL_VLLM_WORKER,
+        _ROLLOUT_PROFILING_NIXL_VLLM_WORKER,
+    ):
+        profiling_worker_cls = _ROLLOUT_PROFILING_NIXL_VLLM_WORKER
+    else:
+        raise ValueError(
+            "Rollout profiling cannot be composed with the configured "
+            f"vllm_kwargs.worker_cls={worker_cls!r}"
+        )
+
+    vllm_kwargs["worker_cls"] = profiling_worker_cls
+    additional_config = dict(vllm_kwargs.get("additional_config") or {})
+    additional_config[_ROLLOUT_PROFILER_CONFIG_KEY] = {
+        "class_path": class_path,
+        "rank_prefix": rank_prefix,
+    }
+    vllm_kwargs["additional_config"] = additional_config
 
 
 def fix_gemma3_vision_weight_name(key: str) -> str:

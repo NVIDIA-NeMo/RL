@@ -218,6 +218,7 @@ def _log_effective_quantization_ignore_patterns(
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
     _rollout_profiler: RolloutProfiler | None = None
+    _use_internal_rollout_profiler: bool = False
 
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -403,23 +404,29 @@ class BaseVllmGenerationWorker:
         )
         self._rollout_profiler = None
         rollout_profiler_class = os.environ.get(ROLLOUT_PROFILER_CLASS_ENV, "")
+        self._rollout_profiler_class = rollout_profiler_class
+        self._use_internal_rollout_profiler = bool(rollout_profiler_class) and (
+            self.tensor_parallel_size > 1 or self.cfg["vllm_cfg"]["async_engine"]
+        )
+        self._rollout_profiler_rank_prefix: int | None = None
         if self.is_model_owner:
             validate_rollout_profiler_topology(
                 class_path=rollout_profiler_class,
                 tensor_parallel_size=self.tensor_parallel_size,
                 pipeline_parallel_size=self.pipeline_parallel_size,
                 expert_parallel_size=self.expert_parallel_size,
-                async_engine=self.cfg["vllm_cfg"]["async_engine"],
             )
         if self.is_model_owner and rollout_profiler_class:
             try:
                 rollout_rank = int(os.environ["RANK"])
             except (KeyError, ValueError) as exc:
                 raise RuntimeError(
-                    "Synchronous rollout profiling requires the generation "
+                    "Rollout profiling requires the generation "
                     "worker RANK environment variable"
                 ) from exc
-            self._rollout_profiler = load_rollout_profiler(rank=rollout_rank)
+            self._rollout_profiler_rank_prefix = rollout_rank
+            if not self._use_internal_rollout_profiler:
+                self._rollout_profiler = load_rollout_profiler(rank=rollout_rank)
         self._sparse_refit_receiver: Any = None
         if (
             self.is_model_owner
@@ -556,6 +563,17 @@ class BaseVllmGenerationWorker:
             self.expert_parallel_size,
         )
         vllm_kwargs["distributed_executor_backend"] = executor_backend
+        if self._use_internal_rollout_profiler:
+            from nemo_rl.models.generation.vllm.vllm_backend import (
+                configure_rollout_profiler_worker,
+            )
+
+            assert self._rollout_profiler_rank_prefix is not None
+            configure_rollout_profiler_worker(
+                vllm_kwargs,
+                class_path=self._rollout_profiler_class,
+                rank_prefix=self._rollout_profiler_rank_prefix,
+            )
 
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -789,19 +807,36 @@ class BaseVllmGenerationWorker:
                 profiler.end_engine_initialization(engine_token)
 
     def begin_rollout_profile(self, *, step_id: int | str) -> None:
-        """Open one complete synchronous rollout profile window."""
+        """Open one complete rollout profile window."""
         if self._rollout_profiler is not None:
             self._rollout_profiler.begin_rollout(step_id=step_id)
+        elif self._use_internal_rollout_profiler:
+            self._run_internal_rollout_profiler_rpc(
+                "begin_rollout_profile", step_id=step_id
+            )
 
     def finish_rollout_profile(self) -> None:
-        """Close a successful synchronous rollout profile window."""
+        """Close a successful rollout profile window."""
         if self._rollout_profiler is not None:
             self._rollout_profiler.finish_rollout()
+        elif self._use_internal_rollout_profiler:
+            self._run_internal_rollout_profiler_rpc("finish_rollout_profile")
 
     def abort_rollout_profile(self, *, reason: str) -> None:
-        """Abort a synchronous rollout profile window after an error."""
+        """Abort a rollout profile window after an error."""
         if self._rollout_profiler is not None:
             self._rollout_profiler.abort_rollout(reason=reason)
+        elif self._use_internal_rollout_profiler:
+            self._run_internal_rollout_profiler_rpc(
+                "abort_rollout_profile", reason=reason
+            )
+
+    def _run_internal_rollout_profiler_rpc(
+        self, method_name: str, **kwargs: Any
+    ) -> None:
+        if self.llm is None:
+            raise RuntimeError("The vLLM engine is not initialized")
+        self.llm.collective_rpc(method_name, args=tuple(), kwargs=kwargs)
 
     def _merge_stop_strings(self, batch_stop_strings):
         stop_set: set[str] = set()
@@ -996,6 +1031,10 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
     def post_init(self):
         if self.llm is not None:
+            if self._use_internal_rollout_profiler:
+                self.llm.collective_rpc(
+                    "end_rollout_profiler_engine_initialization", args=tuple()
+                )
             self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = self.report_device_id()
         if self._mtp_load_from_disk:
@@ -1552,6 +1591,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 self._sparse_refit_receiver.shutdown()
 
             if self.llm is not None:
+                if self._use_internal_rollout_profiler:
+                    self.llm.collective_rpc("close_rollout_profiler", args=tuple())
                 # Clean up extension resources (e.g., ZMQ sockets)
                 self.llm.collective_rpc("cleanup", args=tuple())
 

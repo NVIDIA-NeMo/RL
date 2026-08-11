@@ -175,7 +175,6 @@ class VllmGeneration(GenerationInterface):
             tensor_parallel_size=self.tp_size,
             pipeline_parallel_size=self.pp_size,
             expert_parallel_size=self.ep_size,
-            async_engine=self.cfg["vllm_cfg"]["async_engine"],
         )
         self.rollout_profiler_enabled = bool(rollout_profiler_class)
 
@@ -639,22 +638,27 @@ class VllmGeneration(GenerationInterface):
         self._step_metrics_snapshot = self._get_raw_spec_counters()
 
     def begin_rollout_profile(self, *, step_id: int | str) -> None:
-        """Open one complete synchronous rollout on profiled workers."""
+        """Open one complete rollout on profiled workers."""
         self._run_rollout_profiler_rpc("begin_rollout_profile", step_id=step_id)
 
     def finish_rollout_profile(self) -> None:
-        """Close the current synchronous rollout on profiled workers."""
+        """Close the current rollout on profiled workers."""
         self._run_rollout_profiler_rpc("finish_rollout_profile")
 
     def abort_rollout_profile(self, *, reason: str) -> None:
-        """Abort the current synchronous rollout on profiled workers."""
+        """Abort the current rollout on profiled workers."""
         self._run_rollout_profiler_rpc("abort_rollout_profile", reason=reason)
 
     def _run_rollout_profiler_rpc(self, method_name: str, **kwargs: Any) -> None:
         if not self.rollout_profiler_enabled:
             return
+        worker_method_name = (
+            f"{method_name}_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else method_name
+        )
         futures = self.worker_group.run_all_workers_single_data(
-            method_name,
+            worker_method_name,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             **kwargs,
         )
