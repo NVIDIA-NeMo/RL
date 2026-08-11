@@ -208,11 +208,17 @@ def _init_tq(cfg: DataPlaneConfig, gpus_per_node: int) -> None:
         # Both are registered per *process* — MooncakeStoreClient.setup() runs
         # in every process that opens a TQ client, i.e. one per GPU — so the
         # per-machine cost is gpus_per_node x (segment + buffer), not a single
-        # node-wide allocation. Left unbounded, a pairing tuned for a small
-        # model OOMs the host under a large one, whose own resident footprint
-        # leaves far less headroom. Scale both down proportionally (preserving
-        # their ratio) so the per-machine total stays within
-        # ``data_plane.host_memory_fraction`` of host RAM.
+        # node-wide allocation.
+        #
+        # Under ``protocol="rdma"`` (the default, see _mooncake_transport_config)
+        # that cost is *resident*, not virtual: mooncake registers the segment
+        # with the NIC via ibv_reg_mr, which pins the pages so they can be
+        # DMA'd. The whole segment is therefore charged to RSS at setup, before
+        # any traffic. Sizing it as a generous upper bound — which is safe when
+        # the mapping is lazy, as it is over TCP — OOMs the host under a large
+        # model, whose own resident footprint leaves far less headroom. Scale
+        # both down proportionally (preserving their ratio) so the per-machine
+        # total stays within ``data_plane.host_memory_fraction`` of host RAM.
         segment_size = int(cfg["global_segment_size"])
         buffer_size = int(cfg["local_buffer_size"])
         host_budget = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
