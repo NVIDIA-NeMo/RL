@@ -54,10 +54,15 @@ class DataPlaneConfig(TypedDict):
     ``num_storage_units``, ``claim_meta_poll_interval_s``,
     ``global_segment_size``, ``local_buffer_size``.
 
-    ``global_segment_size`` / ``local_buffer_size`` are only *read* when
-    ``backend == "mooncake_cpu"``; the simple backend ignores them.
-    They are required (not NotRequired) so the YAML carries the full
-    schema and there are no hidden Python defaults.
+    ``global_segment_size`` / ``local_buffer_size`` / ``host_memory_fraction``
+    are only *read* when ``backend == "mooncake_cpu"``; the simple backend
+    ignores them. They are required (not NotRequired) so the YAML carries the
+    full schema and there are no hidden Python defaults.
+
+    ``global_segment_size`` and ``local_buffer_size`` are per *process*, not
+    per node or per storage unit: every process that opens a TQ client (one
+    per GPU) registers both with mooncake. ``host_memory_fraction`` bounds the
+    resulting per-machine total — see :func:`_init_tq`.
     """
 
     enabled: bool
@@ -68,6 +73,7 @@ class DataPlaneConfig(TypedDict):
     claim_meta_poll_interval_s: float
     global_segment_size: int
     local_buffer_size: int
+    host_memory_fraction: float
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
