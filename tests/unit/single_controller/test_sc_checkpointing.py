@@ -452,6 +452,10 @@ class _FakeTQBuffer:
     def target_step_list(self) -> tuple[Optional[int], ...]:
         return tuple(self._target_step_list)
 
+    def __len__(self) -> int:
+        """Match the production TQReplayBuffer occupancy contract."""
+        return len(self.target_step_list)
+
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
     ) -> None:
