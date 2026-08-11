@@ -37,25 +37,54 @@ def test_replace_prefix_tokens_empty_model_prefix_returns_template():
     assert result == template_token_ids
 
 
-def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
-    """A template prefix with no EOS has no valid splice boundary and must raise."""
+def test_replace_prefix_tokens_eos_free_template_appends_separately_tokenized_suffix():
+    """Raw Search-R1 prompts append the observation without retokenizing history."""
 
     class _T:
         eos_token_id = 2
 
-        def decode(self, *args, **kwargs):
-            pass
+        def decode(self, ids, **kwargs):
+            if ids == [10, 11]:
+                return "question<search>query</search>"
+            if ids == [20, 21, 22]:
+                return (
+                    "question<search>query</search>"
+                    "\n\n<information>result</information>\n\n"
+                )
+            raise AssertionError(f"Unexpected token IDs: {ids}")
+
+        def encode(self, text, *, add_special_tokens):
+            assert text == "\n\n<information>result</information>\n\n"
+            assert add_special_tokens is False
+            return [70, 71]
 
     tokenizer = _T()
-    model_prefix_token_ids = [7, 2]
-    template_prefix_token_ids = [9, 9, 9]
-    template_token_ids = [9, 9, 9, 2, 10]
+    result = replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=[90, 91],
+        template_prefix_token_ids=[10, 11],
+        template_token_ids=[20, 21, 22],
+    )
+
+    assert result == [90, 91, 70, 71]
+
+
+def test_replace_prefix_tokens_eos_free_non_prefix_template_raises():
+    """An EOS-free template with no append-only text boundary remains unsafe."""
+
+    class _T:
+        eos_token_id = 2
+
+        def decode(self, ids, **kwargs):
+            return "prefix" if ids == [9, 9, 9] else "different full text"
+
+    tokenizer = _T()
     with pytest.raises(AssertionError):
         replace_prefix_tokens(
             tokenizer=tokenizer,
-            model_prefix_token_ids=model_prefix_token_ids,
-            template_prefix_token_ids=template_prefix_token_ids,
-            template_token_ids=template_token_ids,
+            model_prefix_token_ids=[7],
+            template_prefix_token_ids=[9, 9, 9],
+            template_token_ids=[8, 8, 8],
         )
 
 

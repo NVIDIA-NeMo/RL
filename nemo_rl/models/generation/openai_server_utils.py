@@ -66,13 +66,21 @@ def replace_prefix_tokens(
     and image tokenization is non-unique, then we will need to uppdate this
     function.
 
-    The splice boundary is located by EOS count, not position: count the EOS
-    tokens in template_prefix_token_ids and cut at the N-th EOS in
-    template_token_ids. This is robust to chat templates that strip reasoning
-    (<think>) blocks from history when the last message is a user turn -- that
-    shifts token positions but not the per-message EOS count, so counting still
-    finds the same boundary (and reduces to the last EOS of the prefix when
-    nothing is stripped).
+    For ordinary chat templates, the splice boundary is located by EOS count,
+    not position: count the EOS tokens in template_prefix_token_ids and cut at
+    the N-th EOS in template_token_ids. This is robust to chat templates that
+    strip reasoning (<think>) blocks from history when the last message is a
+    user turn -- that shifts token positions but not the per-message EOS count,
+    so counting still finds the same boundary (and reduces to the last EOS of
+    the prefix when nothing is stripped).
+
+    Passthrough templates, such as Search-R1's raw text prompt, contain no EOS
+    separators. In that case, decode the two template renderings to recover the
+    newly appended text, tokenize only that suffix, and append it to the exact
+    model prefix. Tokenizing the suffix separately is intentional: Search-R1
+    itself concatenates generated token IDs with separately tokenized search
+    observations, and slicing the fully retokenized prompt at a token position
+    would be unsafe because BPE tokens can change across the text boundary.
 
     Example (turn-by-turn, concise; eos_token_id = 2):
         Turn 1:
@@ -95,6 +103,26 @@ def replace_prefix_tokens(
     eos_token_id = tokenizer.eos_token_id
     assert eos_token_id is not None, "Tokenizer must have an EOS token ID"
 
+    count_needed = template_prefix_token_ids.count(eos_token_id)
+    if count_needed == 0:
+        decode_kwargs = {
+            "skip_special_tokens": False,
+            "clean_up_tokenization_spaces": False,
+        }
+        template_prefix_text = tokenizer.decode(
+            template_prefix_token_ids, **decode_kwargs
+        )
+        template_text = tokenizer.decode(template_token_ids, **decode_kwargs)
+        assert template_text.startswith(template_prefix_text), (
+            "An EOS-free template can only preserve the exact model prefix when "
+            "its previous-turn rendering is a text prefix of the full rendering.\n"
+            f"Template prefix repr (detokenized): {repr(template_prefix_text)}\n\n"
+            f"Template repr (detokenized): {repr(template_text)}"
+        )
+        suffix_text = template_text[len(template_prefix_text) :]
+        suffix_token_ids = tokenizer.encode(suffix_text, add_special_tokens=False)
+        return model_prefix_token_ids + list(suffix_token_ids)
+
     # The model isn't guaranteed to end on EOS (e.g. it hit max_tokens); chat
     # templates always add one, so cut the model input to just before its EOS.
     model_cut_end = len(model_prefix_token_ids)
@@ -105,7 +133,6 @@ def replace_prefix_tokens(
     # templates may strip prior reasoning blocks when re-rendering history;
     # EOS counting preserves the original generated reasoning tokens without
     # requiring a customized chat template.
-    count_needed = template_prefix_token_ids.count(eos_token_id)
     count_seen = 0
     template_cut_start = -1
     for pos, tid in enumerate(template_token_ids):
