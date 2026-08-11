@@ -19,7 +19,10 @@ from nemo_rl.data_plane.interfaces import DataPlaneClient, DataPlaneConfig
 
 
 def build_data_plane_client(
-    cfg: DataPlaneConfig | None, *, bootstrap: bool = True
+    cfg: DataPlaneConfig | None,
+    *,
+    bootstrap: bool = True,
+    gpus_per_node: int | None = None,
 ) -> DataPlaneClient:
     """Construct the configured data-plane client.
 
@@ -34,6 +37,10 @@ def build_data_plane_client(
         bootstrap: ``True`` on the driver — bootstraps the TQ
             controller. ``False`` on worker processes — connects to the
             existing controller (avoids creating a second named actor).
+        gpus_per_node: GPUs on each host, from ``cluster.gpus_per_node``.
+            Required when ``bootstrap`` is True; one TQ client process runs
+            per GPU, so it is the multiplier bounding per-machine mooncake
+            memory. Ignored on workers.
 
     Returns:
         A configured ``DataPlaneClient``; wrapped in
@@ -50,7 +57,9 @@ def build_data_plane_client(
     if impl == "transfer_queue":
         from nemo_rl.data_plane.adapters.transfer_queue import TQDataPlaneClient
 
-        client: DataPlaneClient = TQDataPlaneClient(cfg, bootstrap=bootstrap)
+        client: DataPlaneClient = TQDataPlaneClient(
+            cfg, bootstrap=bootstrap, gpus_per_node=gpus_per_node
+        )
     else:
         raise ValueError(f"unknown data_plane impl: {impl!r}")
 
