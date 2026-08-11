@@ -16,6 +16,8 @@ import os
 from contextlib import contextmanager
 from importlib.util import find_spec
 
+USE_TORCH_LOGPROBS_ENV = "NRL_VLLM_USE_TORCH_LOGPROBS"
+
 
 def _get_vllm_file(relative_path: str) -> str:
     """Return absolute path to a vLLM file or raise if it cannot be found.
@@ -566,6 +568,103 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
     logger.info("Successfully patched vLLM RADIO LayerScale loading.")
 
 
+def _patch_vllm_torch_logprobs(logger) -> bool:
+    """Add an opt-in PyTorch fallback for vLLM selected-token logprobs.
+
+    vLLM 0.25.1 computes selected-token logprobs with a custom Triton kernel.
+    Some long-running RL generation workloads can hang in that kernel. The
+    guarded fallback preserves the same float32 log-softmax-and-gather
+    semantics while matching the implementation style used by the older vLLM
+    release family on which Search-R1 was built.
+
+    Returns:
+        Whether the guarded fallback is installed in the vLLM source.
+    """
+    try:
+        file_to_patch = _get_vllm_file("v1/worker/gpu/sample/logprob.py")
+    except RuntimeError as error:
+        logger.warning("Could not locate vLLM logprob.py for patch: %s", error)
+        return False
+
+    old_snippet = '''def compute_token_logprobs(
+    logits: torch.Tensor, token_ids: torch.Tensor
+) -> torch.Tensor:
+    # NOTE(woosuk): To save GPU memory, we do not materialize the full
+    # [batch_size, vocab_size] logprobs tensor. The kernel computes
+    # max + logsumexp per row and only emits logprobs at `token_ids`.
+    batch_size, vocab_size = logits.shape
+    token_ids = token_ids.to(torch.int64)
+    num_logprobs = token_ids.shape[1]
+    logprobs = logits.new_empty((batch_size, num_logprobs), dtype=torch.float32)
+    # Cap the kernel's per-iteration width so very large num_logprobs requests
+    # stream the gather in bounded-size chunks, avoiding excessive mem use.
+    topk_block_size = min(triton.next_power_of_2(num_logprobs), _MAX_TOPK_BLOCK)
+    _topk_log_softmax_kernel[(batch_size,)](
+        logprobs,
+        logits,
+        logits.stride(0),
+        token_ids,
+        num_logprobs,
+        vocab_size,
+        BLOCK_SIZE=1024,  # type: ignore
+        TOPK_BLOCK_SIZE=topk_block_size,
+    )
+    return logprobs
+'''
+    new_snippet = '''def compute_token_logprobs(
+    logits: torch.Tensor, token_ids: torch.Tensor
+) -> torch.Tensor:
+    # NeMo-RL compatibility path for workloads that hang in vLLM's Triton
+    # selected-token logprob kernel. This deliberately materializes the full
+    # float32 log-softmax, matching the older vLLM path used by Search-R1.
+    from os import environ
+
+    if environ.get("NRL_VLLM_USE_TORCH_LOGPROBS") == "1":
+        token_ids = token_ids.to(torch.int64)
+        return torch.log_softmax(logits, dim=-1, dtype=torch.float32).gather(
+            dim=-1, index=token_ids
+        )
+
+    # NOTE(woosuk): To save GPU memory, we do not materialize the full
+    # [batch_size, vocab_size] logprobs tensor. The kernel computes
+    # max + logsumexp per row and only emits logprobs at `token_ids`.
+    batch_size, vocab_size = logits.shape
+    token_ids = token_ids.to(torch.int64)
+    num_logprobs = token_ids.shape[1]
+    logprobs = logits.new_empty((batch_size, num_logprobs), dtype=torch.float32)
+    # Cap the kernel's per-iteration width so very large num_logprobs requests
+    # stream the gather in bounded-size chunks, avoiding excessive mem use.
+    topk_block_size = min(triton.next_power_of_2(num_logprobs), _MAX_TOPK_BLOCK)
+    _topk_log_softmax_kernel[(batch_size,)](
+        logprobs,
+        logits,
+        logits.stride(0),
+        token_ids,
+        num_logprobs,
+        vocab_size,
+        BLOCK_SIZE=1024,  # type: ignore
+        TOPK_BLOCK_SIZE=topk_block_size,
+    )
+    return logprobs
+'''
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if new_snippet in content:
+            logger.info("vLLM PyTorch logprob fallback patch already applied.")
+            return True
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply vLLM PyTorch logprob fallback: expected "
+                "vLLM 0.25.1 source shape was not found in %s.",
+                file_to_patch,
+            )
+            return False
+        write_back(content.replace(old_snippet, new_snippet, 1))
+
+    logger.info("Successfully patched vLLM PyTorch logprob fallback.")
+    return True
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -599,7 +698,11 @@ def _apply_vllm_patches(
     # Reporting the same way in both cases either cries wolf or hides a real
     # break, so branch on it.
     uses_v1_executor = not envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
-    applied = _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
+    forwarded_env_vars = list(extra_env_vars or [])
+    if os.environ.get(USE_TORCH_LOGPROBS_ENV) == "1":
+        forwarded_env_vars.append(USE_TORCH_LOGPROBS_ENV)
+
+    applied = _patch_vllm_init_workers_ray(py_executable, forwarded_env_vars)
 
     if applied and uses_v1_executor:
         patch_logger.info(
@@ -634,3 +737,11 @@ def _apply_vllm_patches(
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    if os.environ.get(USE_TORCH_LOGPROBS_ENV) == "1" and not (
+        _patch_vllm_torch_logprobs(patch_logger)
+    ):
+        raise RuntimeError(
+            "policy.generation.vllm_cfg.use_torch_logprobs=true was requested, "
+            "but the vLLM 0.25.1 logprob compatibility patch could not be "
+            "installed. Refusing to silently use the Triton path."
+        )

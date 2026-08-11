@@ -26,3 +26,4 @@ def test_search_r1_recipe_instantiates_master_config() -> None:
     config = MasterConfig(**resolved_config)
     assert config.policy["tokenizer"]["chat_template"] is None
     assert config.policy["generation"]["vllm_cfg"]["enforce_eager"] is True
+    assert config.policy["generation"]["vllm_cfg"]["use_torch_logprobs"] is True

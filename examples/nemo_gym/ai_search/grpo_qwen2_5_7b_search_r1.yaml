@@ -81,6 +81,10 @@ policy:
       tensor_parallel_size: 1
       max_model_len: 4096
       enforce_eager: true
+      # Search-R1 pinned an older vLLM that used PyTorch log_softmax here.
+      # Avoid the vLLM 0.25.1 Triton selected-token logprob path, which hung in
+      # the strict-protocol preflight on H100.
+      use_torch_logprobs: true
       http_server_serving_chat_kwargs:
         enable_auto_tools: false
         chat_template: "{% for message in messages %}{{ message['content'] }}{% endfor %}"

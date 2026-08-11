@@ -45,6 +45,9 @@ _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
 _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
+_LOGPROB_SOURCE = "v1/worker/gpu/sample/logprob.py"
+_LOGPROB_PATCH_FN = "_patch_vllm_torch_logprobs"
+_LOGPROB_MARKER = "NeMo-RL compatibility path"
 
 
 @pytest.fixture
@@ -62,6 +65,17 @@ def patched_radio_source(tmp_path, monkeypatch):
     copied = write_unpatched_copy(_RADIO_SOURCE, _RADIO_PATCH_FN, tmp_path / "radio.py")
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
     patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
+    return copied
+
+
+@pytest.fixture
+def patched_logprob_source(tmp_path, monkeypatch):
+    """The installed vLLM logprob.py, unpatched then patched in tmp."""
+    copied = write_unpatched_copy(
+        _LOGPROB_SOURCE, _LOGPROB_PATCH_FN, tmp_path / "logprob.py"
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    assert patches._patch_vllm_torch_logprobs(logging.getLogger(__name__))
     return copied
 
 
@@ -156,6 +170,106 @@ def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, c
 
     assert radio_source.read_text() == "class RadioModel:\n    pass\n"
     assert "vLLM 0.25.1 source shape was not found" in caplog.text
+
+
+@pytest.mark.vllm
+def test_torch_logprob_patch_anchor_matches_installed_vllm(patched_logprob_source):
+    content = patched_logprob_source.read_text()
+    assert _LOGPROB_MARKER in content
+    ast.parse(content)
+
+
+@pytest.mark.vllm
+def test_torch_logprob_fallback_matches_float32_reference(
+    patched_logprob_source, monkeypatch
+):
+    """Execute the exact patched function without importing its Triton module."""
+    tree = ast.parse(patched_logprob_source.read_text())
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "compute_token_logprobs"
+    )
+    namespace = {"torch": pytest.importorskip("torch")}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "<logprob>", "exec"),
+        namespace,
+    )
+
+    torch = namespace["torch"]
+    logits = torch.tensor([[1.0, -2.0, 0.5], [0.1, 0.2, 0.3]], dtype=torch.bfloat16)
+    token_ids = torch.tensor([[0, 2], [1, 0]], dtype=torch.int32)
+    monkeypatch.setenv(patches.USE_TORCH_LOGPROBS_ENV, "1")
+
+    actual = namespace["compute_token_logprobs"](logits, token_ids)
+    expected = torch.log_softmax(logits, dim=-1, dtype=torch.float32).gather(
+        -1, token_ids.to(torch.int64)
+    )
+    torch.testing.assert_close(actual, expected)
+    assert actual.dtype == torch.float32
+
+
+@pytest.mark.vllm
+def test_torch_logprob_patch_is_idempotent(patched_logprob_source, monkeypatch):
+    before = patched_logprob_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_logprob_source)
+    )
+    assert patches._patch_vllm_torch_logprobs(logging.getLogger(__name__))
+    assert patched_logprob_source.read_text() == before
+
+
+def test_torch_logprob_patch_rejects_unknown_source(monkeypatch, tmp_path, caplog):
+    logprob_source = tmp_path / "logprob.py"
+    logprob_source.write_text("def compute_token_logprobs():\n    pass\n")
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(logprob_source)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert not patches._patch_vllm_torch_logprobs(logging.getLogger(__name__))
+
+    assert logprob_source.read_text() == "def compute_token_logprobs():\n    pass\n"
+    assert "vLLM 0.25.1 source shape was not found" in caplog.text
+
+
+def test_worker_enables_and_forwards_torch_logprob_fallback(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    captured = {}
+
+    def capture_apply(_py_executable, *, extra_env_vars=None):
+        captured["extra_env_vars"] = extra_env_vars
+
+    monkeypatch.delenv(patches.USE_TORCH_LOGPROBS_ENV, raising=False)
+    monkeypatch.setattr(vllm_worker, "_apply_vllm_patches", capture_apply)
+
+    worker = vllm_worker.BaseVllmGenerationWorker.__new__(
+        vllm_worker.BaseVllmGenerationWorker
+    )
+    worker._init_config(
+        {
+            "model_name": "unused",
+            "vllm_cfg": {
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "expert_parallel_size": 1,
+                "gpu_memory_utilization": 0.5,
+                "precision": "bfloat16",
+                "use_torch_logprobs": True,
+            },
+        },
+        bundle_indices=[0],
+        fraction_of_gpus=1.0,
+        seed=0,
+        extra_env_vars=["EXISTING_VAR"],
+    )
+
+    assert os.environ[patches.USE_TORCH_LOGPROBS_ENV] == "1"
+    assert captured["extra_env_vars"] == [
+        "EXISTING_VAR",
+        patches.USE_TORCH_LOGPROBS_ENV,
+    ]
 
 
 @pytest.mark.parametrize(

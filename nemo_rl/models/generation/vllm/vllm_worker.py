@@ -44,7 +44,10 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
 )
-from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
+from nemo_rl.models.generation.vllm.patches import (
+    USE_TORCH_LOGPROBS_ENV,
+    _apply_vllm_patches,
+)
 from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
@@ -322,12 +325,17 @@ class BaseVllmGenerationWorker:
         self.is_model_owner = bundle_indices is not None
         self._extra_env_vars = extra_env_vars
 
+        patch_extra_env_vars = list(extra_env_vars or [])
+        if self.cfg["vllm_cfg"].get("use_torch_logprobs", False):
+            os.environ[USE_TORCH_LOGPROBS_ENV] = "1"
+            patch_extra_env_vars.append(USE_TORCH_LOGPROBS_ENV)
+
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
         _apply_vllm_patches(
             self.py_executable,
-            extra_env_vars=extra_env_vars,
+            extra_env_vars=patch_extra_env_vars,
         )
 
         # Skip model loading if we're not the model owner

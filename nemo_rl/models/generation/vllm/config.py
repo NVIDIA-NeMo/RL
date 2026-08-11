@@ -39,6 +39,10 @@ class VllmSpecificArgs(TypedDict):
     # with generation-time processors should request ``raw_logprobs`` when
     # comparing generation and policy logprobs.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
+    # Use PyTorch log_softmax for selected-token logprobs instead of vLLM's
+    # Triton kernel. This is an opt-in compatibility path for workloads that
+    # hang while compiling or running the Triton logprob kernel.
+    use_torch_logprobs: NotRequired[bool]
     # Cap each request's generated tokens so the training prompt plus response
     # fits within max_model_len. This is needed when multimodal processing makes
     # the training prompt longer than its text-only representation.
