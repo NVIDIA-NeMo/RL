@@ -33,7 +33,7 @@ while [[ "${MODEL_PATH}" == */ && "${MODEL_PATH}" != "/" ]]; do
 done
 
 CONFIG_PATH="${CONFIG_PATH:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml}"
-ENTRYPOINT="${ENTRYPOINT:-examples/nemo_gym/run_multimodal_grpo_nemo_gym.py}"
+ENTRYPOINT="${ENTRYPOINT:-examples/nemo_gym/run_grpo_nemo_gym.py}"
 SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:0:0}"
 SBATCH_NUM_NODES="${SBATCH_NUM_NODES:-$(awk '/^cluster:/{f=1} f && /num_nodes:/{print $2; exit}' "${CONFIG_PATH}")}"
 EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
