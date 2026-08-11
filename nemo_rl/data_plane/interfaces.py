@@ -59,15 +59,10 @@ class DataPlaneConfig(TypedDict):
     They are required (not NotRequired) so the YAML carries the full
     schema and there are no hidden Python defaults.
 
-    Both are per *process*, not per node or per storage unit: every process
-    that opens a TQ client (one per GPU) registers both with mooncake, so a
-    node pays ``gpus_per_node x (segment + buffer)``. Under the default RDMA
-    transport that memory is pinned via ``ibv_reg_mr`` and therefore resident
-    from setup rather than lazily faulted in, so the pair are real allocations
-    — on an 8-GPU host, 64+4 GiB works out to 544 GiB/node. Over TCP the
-    mapping is lazy and only touched pages count, which is why generous upper
-    bounds are safe there and not here. Under-sizing surfaces as
-    ``batch_get_tensor returned None``.
+    Both are per client *process* (one per GPU), so a node pays
+    ``gpus_per_node x (segment + buffer)``. Under RDMA that memory is pinned
+    and resident from setup, so keep the per-node product in mind when raising
+    them. Under-sizing surfaces as ``batch_get_tensor returned None``.
     """
 
     enabled: bool
