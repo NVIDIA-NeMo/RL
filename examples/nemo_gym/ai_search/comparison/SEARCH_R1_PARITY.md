@@ -61,3 +61,8 @@ Parquet files are converted without changing the supplied prompt text by
 This is protocol parity, not framework identity. Search-R1 uses its veRL fork;
 this target intentionally uses NeMo RL for optimization, Ray orchestration,
 weight synchronization, and checkpointing.
+
+For a multi-node run, start the E5 retrieval server on its dedicated GPU and
+export `AI_SEARCH_RETRIEVER_URL=http://<retriever-host>:8000/retrieve` in the
+training allocation. If the variable is unset, the systems preflight keeps its
+local default of `http://127.0.0.1:8000/retrieve`.

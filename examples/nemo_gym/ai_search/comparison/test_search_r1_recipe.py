@@ -27,3 +27,24 @@ def test_search_r1_recipe_instantiates_master_config() -> None:
     assert config.policy["tokenizer"]["chat_template"] is None
     assert config.policy["generation"]["vllm_cfg"]["enforce_eager"] is True
     assert config.policy["generation"]["vllm_cfg"]["use_torch_logprobs"] is True
+
+
+def test_search_r1_resources_allow_remote_retriever(monkeypatch) -> None:
+    repo_root = Path(__file__).parents[4]
+    resources_config = (
+        repo_root
+        / "examples/nemo_gym/ai_search/resources_servers/ai_search/configs"
+        / "ai_search_search_r1.yaml"
+    )
+    retriever_url = "http://retriever.example:8000/retrieve"
+
+    monkeypatch.setenv("AI_SEARCH_RETRIEVER_URL", retriever_url)
+    raw_config = OmegaConf.load(resources_config)
+    resolved_config = OmegaConf.to_container(raw_config, resolve=True)
+
+    assert isinstance(resolved_config, dict)
+    assert (
+        resolved_config["ai_search"]["resources_servers"]["ai_search"]["search"]
+        ["http_url"]
+        == retriever_url
+    )

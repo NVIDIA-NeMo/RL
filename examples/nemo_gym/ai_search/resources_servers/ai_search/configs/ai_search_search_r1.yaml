@@ -9,7 +9,8 @@ ai_search:
       num_workers: 1
       search:
         provider: http
-        http_url: http://127.0.0.1:8000/retrieve
+        # Override when the E5 retriever runs on a dedicated GPU node.
+        http_url: ${oc.env:AI_SEARCH_RETRIEVER_URL,http://127.0.0.1:8000/retrieve}
         http_timeout_s: 30.0
         # Dense-only fields remain schema-valid but are unused by the HTTP provider.
         corpus_path: data/search_r1/unused.jsonl
