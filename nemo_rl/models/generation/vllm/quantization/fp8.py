@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -96,15 +96,7 @@ def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
         # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
         # a ray remote that patches each worker with the required fp8 vllm patches
-        # vLLM 0.20.0 renamed this module ray_distributed_executor -> ray_executor
-        # (the class RayDistributedExecutor is unchanged). Support both so the FP8
-        # refit path works on vLLM 0.17.x (v0.6.0 container) and >=0.20.0 (main).
-        try:
-            from vllm.v1.executor.ray_executor import RayDistributedExecutor
-        except ImportError:
-            from vllm.v1.executor.ray_distributed_executor import (
-                RayDistributedExecutor,
-            )
+        from vllm.v1.executor.ray_executor import RayDistributedExecutor
 
         original_run_workers = RayDistributedExecutor.collective_rpc
 
@@ -246,6 +238,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     if vllm_cfg.get("use_deep_gemm", False) and not is_mx:
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
         os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+
+    # FP8 patches v1 RayDistributedExecutor.collective_rpc to initialize every
+    # engine worker. RayExecutorV2 bypasses that hook, so select the v1 backend.
+    os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] = "0"
 
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
@@ -471,7 +467,9 @@ def load_weights(weights, model_runner):
         # load their per-block scales. Expand them into the per-expert FP8 (w13, w2 -> w1, w2, and w3)
         # layout, then reshape to 2D [num_experts, out_features, in_features] -> [num_experts*out_features, in_features]
         # so the block scales can be quantized and routed correctly.
-        if k.endswith("mlp.experts.gate_up_proj") or k.endswith("mlp.experts.down_proj"):
+        if k.endswith("mlp.experts.gate_up_proj") or k.endswith(
+            "mlp.experts.down_proj"
+        ):
             expanded_moe_experts = _expand_grouped_moe_expert_to_fp8(k, v)
             weights_quantized.extend(expanded_moe_experts)
             continue

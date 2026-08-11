@@ -56,6 +56,7 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     )
     monkeypatch.delenv("VLLM_USE_DEEP_GEMM", raising=False)
     monkeypatch.delenv("VLLM_USE_DEEP_GEMM_E8M0", raising=False)
+    monkeypatch.delenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", raising=False)
 
     vllm_kwargs = fp8.init_fp8(
         {
@@ -78,6 +79,7 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert fp8.global_fp8_config.is_mx is True
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
+    assert fp8.os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] == "0"
 
 
 @pytest.mark.parametrize(
