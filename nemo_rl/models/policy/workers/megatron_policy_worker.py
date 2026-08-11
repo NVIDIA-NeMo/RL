@@ -82,6 +82,7 @@ from nemo_rl.models.megatron.setup import (
 from nemo_rl.models.megatron.train import (
     LogprobsPostProcessor,
     LossPostProcessor,
+    SupportLogprobsPostProcessor,
     TopkLogitsPostProcessor,
     aggregate_training_statistics,
     megatron_forward_backward,
@@ -1866,39 +1867,129 @@ class MegatronPolicyWorkerImpl(
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             logits_chunks = []
+            logprobs_chunks = []
             indices_chunks = []
             for out in list_of_outputs:
                 tk = out["topk_logits"]
+                tlp = out["topk_logprobs"]
                 ti = out["topk_indices"]
                 pad_len = seq_length - tk.shape[1]
                 if pad_len > 0:
                     tk = torch.nn.functional.pad(tk, (0, 0, 0, pad_len), value=0.0)
+                    tlp = torch.nn.functional.pad(tlp, (0, 0, 0, pad_len), value=0.0)
                     ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
                 logits_chunks.append(tk)
+                logprobs_chunks.append(tlp)
                 indices_chunks.append(ti)
 
             topk_logits = torch.cat(logits_chunks, dim=0)
+            topk_logprobs = torch.cat(logprobs_chunks, dim=0)
             topk_indices = torch.cat(indices_chunks, dim=0)
 
             tensors_to_broadcast = {
                 "topk_logits": topk_logits,
+                "topk_logprobs": topk_logprobs,
                 "topk_indices": topk_indices,
             }
         else:
             tensors_to_broadcast = {
                 "topk_logits": None,
+                "topk_logprobs": None,
                 "topk_indices": None,
             }
 
         # Broadcast tensors from last stage to all stages
         broadcasted = broadcast_tensors_from_last_stage(tensors_to_broadcast)
         topk_logits = broadcasted["topk_logits"]
+        topk_logprobs = broadcasted["topk_logprobs"]
         topk_indices = broadcasted["topk_indices"]
 
         no_grad.__exit__(None, None, None)
         return BatchedDataDict.from_batches(
-            [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
+            [
+                {
+                    "topk_logits": topk_logits.cpu(),
+                    "topk_logprobs": topk_logprobs.cpu(),
+                    "topk_indices": topk_indices.cpu(),
+                }
+            ]
         )
+
+    @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs_on_support")
+    def get_logprobs_on_support(
+        self,
+        *,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Evaluate normalized model logprobs at caller-provided top-k indices."""
+        if self.cfg["sequence_packing"]["enabled"]:
+            raise NotImplementedError(
+                "get_logprobs_on_support does not yet support sequence packing."
+            )
+        if self.cfg["megatron_cfg"]["context_parallel_size"] != 1:
+            raise NotImplementedError(
+                "get_logprobs_on_support does not yet support context parallelism."
+            )
+
+        with torch.no_grad():
+            self.model.eval()
+            logprob_batch_size = (
+                micro_batch_size
+                if micro_batch_size is not None
+                else self.cfg["logprob_batch_size"]
+            )
+            (
+                mb_iterator,
+                num_microbatches,
+                micro_batch_size,
+                seq_length,
+                padded_seq_length,
+            ) = get_microbatch_iterator(
+                data,
+                self.cfg,
+                logprob_batch_size,
+                straggler_timer=self.mcore_state.straggler_timer,
+                delegate_pack_to_model=self.delegate_pack_to_model,
+                delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+                model_slices_context_parallel_inputs=(
+                    self.model_slices_context_parallel_inputs
+                ),
+            )
+
+            list_of_outputs = megatron_forward_backward(
+                model=self.model,
+                data_iterator=mb_iterator,
+                seq_length=padded_seq_length,
+                mbs=micro_batch_size,
+                num_microbatches=num_microbatches,
+                post_processing_fn=SupportLogprobsPostProcessor(cfg=self.cfg),
+                forward_only=True,
+                defer_fp32_logits=self.defer_fp32_logits,
+                sampling_params=self.sampling_params,
+                straggler_timer=self.mcore_state.straggler_timer,
+            )
+
+            if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                chunks = []
+                for out in list_of_outputs:
+                    support_logprobs = out["support_logprobs"]
+                    pad_len = seq_length - support_logprobs.shape[1]
+                    if pad_len > 0:
+                        support_logprobs = torch.nn.functional.pad(
+                            support_logprobs,
+                            (0, 0, 0, pad_len),
+                            value=0.0,
+                        )
+                    chunks.append(support_logprobs)
+                gathered_support_logprobs = torch.cat(chunks, dim=0)
+            else:
+                gathered_support_logprobs = None
+
+            broadcasted = broadcast_tensors_from_last_stage(
+                {"support_logprobs": gathered_support_logprobs}
+            )["support_logprobs"]
+            return BatchedDataDict({"support_logprobs": broadcasted.cpu()})
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")

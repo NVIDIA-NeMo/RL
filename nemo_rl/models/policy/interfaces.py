@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypedDict
+from typing import Any, NotRequired, Optional, TypedDict
 
 import ray
 import torch
@@ -42,9 +42,14 @@ class ScoreOutputSpec(TypedDict):
 
 
 class TopkLogitsOutputSpec(TypedDict):
-    """Per-position top-k logits and corresponding global token indices."""
+    """Per-position top-k values and corresponding global token indices.
+
+    ``topk_logprobs`` is normalized against the complete vocabulary; it is
+    optional for backend compatibility while implementations migrate.
+    """
 
     topk_logits: torch.Tensor
+    topk_logprobs: NotRequired[torch.Tensor]
     topk_indices: torch.Tensor
 
 

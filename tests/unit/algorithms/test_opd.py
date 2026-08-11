@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,71 @@
 import pytest
 import torch
 
+from nemo_rl.algorithms.opd import (
+    OnPolicyDistillationConfig,
+    get_student_topk,
+    student_topk_reverse_kl_loss,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+# ---------------------------------------------------------------------------
+# Student-top-k estimator tests
+# ---------------------------------------------------------------------------
+
+
+def test_student_topk_config_validation():
+    cfg = OnPolicyDistillationConfig(enabled=True, student_topk=32)
+    assert get_student_topk({"on_policy_distillation": cfg}) == 32
+
+    with pytest.raises(ValueError, match="greater than or equal to 1"):
+        OnPolicyDistillationConfig(enabled=True, student_topk=0)
+
+
+def test_student_topk_full_support_matches_exact_reverse_kl():
+    student_logits = torch.tensor([[0.1, 0.7, -0.4]], requires_grad=True)
+    teacher_logits = torch.tensor([[0.5, -0.2, 0.3]])
+    student_logprobs = student_logits.log_softmax(dim=-1)
+    teacher_logprobs = teacher_logits.log_softmax(dim=-1)
+
+    estimated = student_topk_reverse_kl_loss(
+        student_support_logprobs=student_logprobs,
+        teacher_support_logprobs=teacher_logprobs,
+        student_target_logprobs=student_logprobs[:, 0],
+        teacher_target_logprobs=teacher_logprobs[:, 0],
+        target_in_support=torch.ones(1, dtype=torch.bool),
+    )
+    exact = (student_logprobs.exp() * (student_logprobs - teacher_logprobs)).sum(dim=-1)
+
+    torch.testing.assert_close(estimated, exact)
+    estimated.sum().backward()
+    assert student_logits.grad is not None
+    assert torch.isfinite(student_logits.grad).all()
+
+
+def test_student_topk_adds_sampled_tail_only_outside_support():
+    student_support = torch.log(torch.tensor([[0.6]]))
+    teacher_support = torch.log(torch.tensor([[0.5]]))
+    student_target = torch.log(torch.tensor([0.1], requires_grad=True))
+    teacher_target = torch.log(torch.tensor([0.2]))
+
+    outside_loss = student_topk_reverse_kl_loss(
+        student_support,
+        teacher_support,
+        student_target,
+        teacher_target,
+        target_in_support=torch.tensor([False]),
+    )
+    inside_loss = student_topk_reverse_kl_loss(
+        student_support,
+        teacher_support,
+        student_target,
+        teacher_target,
+        target_in_support=torch.tensor([True]),
+    )
+
+    expected_tail = -(teacher_target - student_target).detach() * student_target
+    torch.testing.assert_close(outside_loss - inside_loss, expected_tail)
+
 
 # ---------------------------------------------------------------------------
 # Mock teacher worker group for _compute_teacher_logprobs tests
