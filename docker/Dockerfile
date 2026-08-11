@@ -61,6 +61,20 @@ RUN <<"EOF" bash -exu -o pipefail
 export DEBIAN_FRONTEND=noninteractive
 export TZ=America/Los_Angeles
 
+# Keep apt from replacing the base image's driver-matched NVML with a newer
+# userspace library from Ubuntu/NVIDIA repos.
+BASE_NVML_LINK="$(find /usr/lib -path '*/libnvidia-ml.so.1' -print -quit || true)"
+BASE_NVML_REALPATH=""
+if [[ -n "${BASE_NVML_LINK}" ]]; then
+    BASE_NVML_REALPATH="$(readlink -f "${BASE_NVML_LINK}")"
+    BASE_NVML_DIR="$(dirname "${BASE_NVML_REALPATH}")"
+    BASE_NVML_SO="$(basename "${BASE_NVML_REALPATH}")"
+    NVML_PACKAGES="$({ dpkg-query -S "${BASE_NVML_LINK}" "${BASE_NVML_REALPATH}" /usr/bin/nvidia-smi 2>/dev/null || true; } | cut -d: -f1 | sort -u)"
+    if [[ -n "${NVML_PACKAGES}" ]]; then
+        apt-mark hold ${NVML_PACKAGES}
+    fi
+fi
+
 apt-get update
 apt-get install -y --no-install-recommends \
     jq \
@@ -71,18 +85,17 @@ apt-get install -y --no-install-recommends \
     wget \
     less \
     vim \
-    ccache \
-    nvidia-cuda-dev
+    ccache
 
 # Nsight
-apt install -y --no-install-recommends gnupg
+apt-get install -y --no-install-recommends gnupg
 echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list
 apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(uname -m | sed 's/aarch64/sbsa/')/7fa2af80.pub
-apt update
-apt install -y nsight-systems-cli
+apt-get update
+apt-get install -y --no-install-recommends nsight-systems-cli
 
 # To fix CVE-2025-68973
-apt install -y --only-upgrade gnupg
+apt-get install -y --only-upgrade gnupg
 
 # Upgrade rsync to address security vulnerabilities
 apt-get install -y --only-upgrade rsync
@@ -90,6 +103,17 @@ apt-get install -y --only-upgrade rsync
 # Remove ffmpeg (from base image) to reduce attack surface
 apt-get remove -y --purge ffmpeg || true
 apt-get autoremove -y
+
+if [[ -n "${BASE_NVML_REALPATH}" ]]; then
+    test -e "${BASE_NVML_REALPATH}"
+    ln -sfn "${BASE_NVML_SO}" "${BASE_NVML_DIR}/libnvidia-ml.so.1"
+    ln -sfn "${BASE_NVML_SO}" "${BASE_NVML_DIR}/libnvidia-ml.so"
+    ldconfig
+    RESOLVED_NVML="$(ldconfig -p | awk '/libnvidia-ml\.so\.1 / { print $NF; exit }')"
+    if [[ -n "${RESOLVED_NVML}" ]]; then
+        test "$(readlink -f "${RESOLVED_NVML}")" = "${BASE_NVML_REALPATH}"
+    fi
+fi
 
 apt-get clean
 rm -rf /var/lib/apt/lists/*
