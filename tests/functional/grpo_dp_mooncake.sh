@@ -10,10 +10,14 @@ git config --global --add safe.directory $PROJECT_ROOT
 
 set -eou pipefail
 
-# Exercises the mooncake code path, not the transport. Opt into TCP so this
-# runs on hosts with no RoCE NIC — without it the adapter raises, since it
-# will not silently downgrade a run that asked for RDMA.
-export MC_MOONCAKE_PROTOCOL=tcp
+# mooncake_cpu is RDMA-only, so this needs a RoCE-capable mlx5 device. Skip
+# rather than fail on hosts that have none (InfiniBand-only or no RDMA at all).
+if [[ -z "${MC_MOONCAKE_DEVICE:-}" ]] &&
+   ! grep -q Ethernet /sys/class/infiniband/mlx5_*/ports/1/link_layer 2>/dev/null; then
+    echo "[SKIP] no RoCE-capable mlx5 device under /sys/class/infiniband;" \
+         "mooncake_cpu requires RDMA. Set MC_MOONCAKE_DEVICE=<dev> to override."
+    exit 0
+fi
 
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
