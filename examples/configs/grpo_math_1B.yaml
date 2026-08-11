@@ -541,10 +541,12 @@ data_plane:
   local_buffer_size:   68719476736   # 64 GiB  — used when backend == "mooncake_cpu"
   # Mooncake registers (global_segment_size + local_buffer_size) in *every*
   # process that opens a TQ client — one per GPU — so the per-machine cost is
-  # gpus_per_node x (segment + buffer). The two sizes above are upper bounds;
-  # they are scaled down proportionally so that per-machine total stays under
-  # this fraction of host RAM. Prevents a config tuned for a small model from
-  # OOM-ing the host under a large one.
+  # gpus_per_node x (segment + buffer). Over RDMA (the default transport) that
+  # memory is pinned via ibv_reg_mr and therefore resident from setup, not
+  # lazily faulted in. The two sizes above act as upper bounds: they are scaled
+  # down proportionally so the per-machine total stays under this fraction of
+  # host RAM, which keeps a config tuned for a small model from OOM-ing the
+  # host under a large one. Raise it on hosts with memory to spare.
   host_memory_fraction: 0.40         # used when backend == "mooncake_cpu"
   # observability:                    # NotRequired
   #   enabled: false
