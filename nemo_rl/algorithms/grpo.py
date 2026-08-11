@@ -271,7 +271,8 @@ class GRPOConfig(BaseModel, extra="allow"):
     stop_at_validation_threshold: float | None = None
     skip_reference_policy_logprobs_calculation: bool = False
     seed: int = 42
-    async_grpo: AsyncGRPOConfig = Field(default_factory=AsyncGRPOConfig)
+    # Legacy async config block; SC reads its async knobs from `async_rl` instead.
+    async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
