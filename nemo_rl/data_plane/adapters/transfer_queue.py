@@ -73,12 +73,15 @@ def _get_local_node_ip() -> str:
 
 
 def _mooncake_transport_config() -> dict:
-    # RDMA is the transport for real runs — it is the zero-copy MooncakeStore
-    # path from TQ v0.1.8 and the reason to pick mooncake_cpu over the simple
-    # backend at all. TCP is reachable only by opting in explicitly, for hosts
-    # with no RoCE NIC (dev laptops, CI runners exercising the mooncake code
-    # path). Anything else missing a device raises rather than degrading
-    # quietly, so a run can never report mooncake/RDMA coverage it did not do.
+    # mooncake_cpu exists for the zero-copy RDMA MooncakeStore path (TQ v0.1.8);
+    # TCP is an explicit dev/CI opt-in, never a silent fallback.
+    #
+    # The probe below deliberately selects a RoCE (Ethernet link-layer) NIC and
+    # takes one of them. It does not pick the InfiniBand rails that the NIXL
+    # checkpoint path uses (see docs/design-docs/checkpoint-engines.md) — RoCE
+    # is what has been validated end-to-end here. Name a device explicitly with
+    # MC_MOONCAKE_DEVICE to override. Runs on the driver only, so it assumes
+    # homogeneous nodes: the device it finds is broadcast to every client.
     if os.environ.get("MC_MOONCAKE_PROTOCOL") == "tcp":
         return {"protocol": "tcp"}
     device = os.environ.get("MC_MOONCAKE_DEVICE", "")
@@ -100,11 +103,12 @@ def _mooncake_transport_config() -> dict:
             pass
     if not device:
         raise RuntimeError(
-            "data_plane.backend='mooncake_cpu' uses RDMA, but no RoCE-capable "
-            "mlx5 device was detected under /sys/class/infiniband. Name one "
-            "with MC_MOONCAKE_DEVICE=<dev>, set MC_MOONCAKE_PROTOCOL=tcp to "
-            "opt into the TCP transport (dev/test only), or use "
-            "data_plane.backend='simple'."
+            "data_plane.backend='mooncake_cpu' uses RDMA, but no mlx5 device "
+            "with an Ethernet link layer was found under /sys/class/infiniband. "
+            "InfiniBand devices are present on some clusters but are not "
+            "auto-selected — name one with MC_MOONCAKE_DEVICE=<dev>. Otherwise "
+            "set MC_MOONCAKE_PROTOCOL=tcp to opt into the TCP transport "
+            "(dev/test only), or use data_plane.backend='simple'."
         )
     os.environ.setdefault("MC_GID_INDEX", "3")
     return {"protocol": "rdma", "device_name": device}
