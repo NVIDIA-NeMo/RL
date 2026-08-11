@@ -426,7 +426,7 @@ if [[ -n "${WARMUP_FLASHINFER_KERNELS:-}" && -z "${SKIP_VLLM_BUILD:-}" ]]; then
             "${venv_python}" /opt/nemo-rl/tools/warmup-custom-flashinfer.py
             WARMED=$((WARMED + 1))
         fi
-    done < <(find -L "${NEMO_RL_VENV_DIR}" -mindepth 3 -maxdepth 3 -path '*/bin/python' -type f | sort)
+    done < <(find -L "${NEMO_RL_VENV_DIR}" -mindepth 3 -maxdepth 3 -path '*/nemo_rl.models.generation.vllm.*/bin/python' -type f | sort)
     test "${WARMED}" -gt 0
 fi
 EOF
