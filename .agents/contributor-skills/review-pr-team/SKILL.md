@@ -1,6 +1,6 @@
 ---
 name: review-pr-team
-description: Agent-team-based parallel code review for NVIDIA-NeMo/RL pull requests. Spawns specialized agents (RL expert, submodule experts, bug finder, test agent, devil's advocate, comment reviewer) that coordinate via shared task list and direct messaging. Leader orchestrates, collates ALL findings, and presents to user for approval before posting.
+description: Agent-team-based parallel code review for NVIDIA-NeMo/RL pull requests. Spawns specialized agents (RL expert, submodule experts, bug finder, design reviewer, test agent, devil's advocate, comment reviewer) that coordinate via shared task list and direct messaging. Leader orchestrates, collates ALL findings, and presents to user for approval before posting.
 when_to_use: Deep multi-agent review of a PR; '/review-pr-team <number>'; 'team review PR', 'thorough parallel review'. Requires CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1.
 argument-hint: "<pr-number>"
 allowed-tools:
@@ -218,6 +218,7 @@ Create all tasks upfront using `TaskCreate`, then set dependencies with `TaskUpd
 | `review-existing-comments` | `comment-reviewer` | Review all PR comment threads. Identify responses needed. |
 | `review-and-suggest-tests` | `test-agent` | Review tests in PR. Suggest new tests. Run tests locally via `uv run` if GPUs available. |
 | `scan-for-bugs` | `bug-finder` | Scan diff for bugs independently. Write tests when uncertain. |
+| `review-design` | `design-reviewer` | Review design-level changes (new class/interface/config/worker group/module) for testability, extensibility, and maintainability — flagging drift toward BOTH under- and over-abstraction. Bail fast on PRs with no design surface. Report ALL findings. |
 
 **Wave 2 tasks (blocked by ALL Wave 1 tasks):**
 
@@ -301,6 +302,82 @@ Instructions:
 - **Make every finding actionable.** Lead with the observation, then a bolded **Action:** line naming the exact
   file/function to change and (when known) the concrete snippet/schema. Drop pure editorializing ("looks
   intended", reassurance) that doesn't lead to an action.
+- **Open every comment by declaring its actionability, before any prose.** The author must know what they
+  are expected to DO before they read why. The first line is one of:
+    - `**No action needed** — <one clause>.` for pure FYI/context.
+    - `**1 action item.**` / `**2 action items, 1 follow-up.**` when there is work.
+  Then make the body match that count: label each ask `### AI-1`, `### AI-2` …, label deferred work
+  `### Follow-up` with its tracking reference, and put pure background under a final `**Context — no
+  action.**` heading. If an ask should be done in THIS PR rather than deferred, say so in the opening line
+  ("please fix in this PR") and do not also offer a tracked fallback — an escape hatch beside an ask is
+  read as permission to skip it.
+- **Any comment over ~1500 characters needs a one-line TL;DR**, bolded, immediately after the actionability
+  declaration and before any prose. State the defect and its consequence, not the topic: "**TL;DR — in
+  colocated mode the `mcore_generation_config` model keys are silently discarded, so `policy.megatron_cfg` is
+  the only route left**", never "TL;DR — about how config keys are handled". Reviewers skim; a long comment
+  with no TL;DR gets skipped entirely, which is strictly worse than a short comment that lands.
+  Two corollaries. If you cannot compress the finding into one line, it is usually TWO findings — split them
+  into separate comments anchored at their own lines, rather than one comment with numbered sections; several
+  focused comments are far easier to act on than one that has to be read in full before any of it can be.
+  And if the user ever asks you to "tl;dr" a comment you already posted, treat that as a defect report on the
+  comment itself: shorten it in place and split out whatever forced the length.
+- **Never blend an ask and a "tracked elsewhere" note in one paragraph.** A comment that says both
+  "tracked in <issue>" and "please change X" without separating them is the most common way review
+  feedback gets silently dropped: the author reads "tracked" and closes the thread. When you cite a
+  tracking issue, cite the SPECIFIC item (a stable id and title, not a bare issue link) and state in the
+  same sentence whether it covers the ask or only the part you are NOT asking for.
+- **Be ruthlessly succinct — length is a cost the author pays.** Write the shortest comment that still lands,
+  then cut again. Before each sentence ask "does deleting this change what the author does?" If no, delete it.
+  Cut: restatements of what the code plainly does, hedging preambles, evidence the author needn't act on, and
+  recaps of your own investigation. Reviewers skim — an over-long comment gets skipped entirely, so it is
+  WORSE than a short one even when every sentence is true. The breaking-case walkthrough and the mechanism
+  explanation below are the only licensed exceptions, and both have their own tight budgets.
+- **If the finding turns on a mechanism the reader may not hold in their head, walk them to the punchline.**
+  Your reader is a subject-matter expert — do not explain RL, distributed training, or the codebase to them.
+  What they lack is not knowledge but *paged-in context*: naming a mechanism ("the `prepare_refit_info`
+  handshake") forces them to reconstruct it from the diff before they can judge the finding. Most won't, and
+  the finding dies unread. So reload that context for them, tersely, in this order, stopping as soon as the
+  defect is self-evident:
+  1. **Background** — the one sentence of context the finding sits on ("every step, weights are copied
+     trainer→engine; that's the refit").
+  2. **What problem the mechanism solves** — why it exists at all. Usually "side A doesn't know X, only side B
+     does", which is exactly what makes the design non-obvious.
+  3. **How it works** — numbered steps, one line each, each anchored to its permalink.
+  4. **What breaks** — the defect stated against that scaffolding, ending in the observable symptom.
+  Budget: 4-8 lines before the **Action:**. Needing more usually means it's two findings. Skip steps 1-2 when
+  the mechanism is obvious from the diff — this rule is for handshakes, protocols, caches, lifecycles and
+  cross-process contracts, not for a null check. Terseness is the point: a paragraph that teaches an expert
+  something they already know is as costly as one that omits what they don't.
+- **Show the breaking case, don't just assert it.** Whenever a finding HAS a concrete failing case, walk the
+  reader through it — abstract prose ("this isn't validated", "this could starve the policy") is easy to wave
+  away; a config plus a trace is not. Two acceptable forms:
+  1. **Walk the failure.** Show the triggering input (a YAML block, an argument combination, a call), then the
+     ordered steps from input to symptom, each anchored to the line that fails to stop it, ending in the
+     observable symptom the author would actually see (the exact error text, a silent wrong value, a 180s
+     stall). Include the step where it *succeeds when it shouldn't* — that's usually the crux.
+  2. **Give a repro.** "Run `<recipe/command>` with `<config delta>` and you'll see `<symptom>`", or a short
+     self-contained snippet. Fine when it's genuinely short.
+  Rules: the trace must be TIGHT — a config block plus 3-5 one-line steps, not an essay; every step that
+  claims code behaves a certain way gets a permalink to that line; and quote the real symptom string rather
+  than paraphrasing it. If the premise depends on an external tool's semantics (Ray `PACK` vs `STRICT_PACK`,
+  a SLURM flag), link the upstream source that defines it. If you CAN'T construct a failing case, say so
+  plainly and downgrade the finding — "I could not construct a config where this breaks" is honest and often
+  means it shouldn't be posted at all.
+- **State whether the defect is PR-introduced or pre-existing/adjacent,** in one clause, near the top. Asking
+  an author to fix something they didn't break is legitimate but must be labelled as such ("adjacent footgun
+  rather than something this PR broke — but <what the PR changes about it>"), or the comment reads as a
+  false accusation.
+- **When proposing a guard/assert, show it blocks nothing legitimate.** One line is enough ("`gpus_per_node`
+  exceeding the node's GPU count is never a valid configuration"). If a real user might deliberately want the
+  configuration you're proposing to reject, it's not an assert — it's a design discussion, and a much weaker
+  finding.
+- **Prefer a `suggestion` block whenever a fix is a concrete edit to line(s) in the diff.** A GitHub
+  `suggestion` block is directly committable, so it is far more actionable than prose — reach for it by default
+  for any clear code/docs fix, not just docstrings and tests. Don't force one where it doesn't fit: if the fix
+  spans multiple files, targets a line not in the diff, or is an operational/config/verification ask, give the
+  concrete change in prose. When several valid implementations exist, still show one but label it explicitly as
+  **one way to do it** (e.g. "one option — of several: …") so the author reads it as illustrative, not
+  prescriptive.
 - Report ALL findings — never limit, truncate, cap, or summarize. Every issue you find must be reported.
 - When done, mark your task completed with TaskUpdate and send your findings to the leader via SendMessage.
 ```
@@ -479,6 +556,14 @@ ALSO, two mandatory disqualifiers:
   permalink that proves it. A confidence score is a claim about a factual premise; if the premise is
   unverified, DISPUTE or DOWNGRADE — never let an agent's low-confidence guess get promoted past the
   staging threshold just because it was restated confidently.
+- **Design-finding check (for `[DESIGN]` findings):** these are the easiest to hand-wave, so hold them
+  to a HIGHER bar. DISPUTE any design finding that lacks a NAMED, plausible near-term extension or a
+  CONCRETE maintenance hazard — hypothetical "what if we ever need X" is noise. For a "decouple this"
+  finding, demand the ≥2-variants-or-named-second-impl evidence and check the split actually reduces
+  net complexity (not just moves it). For a "unify these" finding, check it wouldn't create if-else
+  soup or blast-radius coupling — if it would, DISPUTE (over-abstraction is a real failure mode).
+  Prefer findings on code the PR INTRODUCES; downgrade demands to refactor pre-existing shape to
+  "tracking-issue" severity.
 
 Report ALL verdicts — every challenged finding gets one of:
 - CONFIRMED (with justification)
@@ -507,6 +592,109 @@ via `uv run`. If no GPUs, note "not verified — no GPU environment" for finding
 runtime validation.
 ```
 
+### `design-reviewer`
+
+```
+You are the design reviewer. You evaluate the PR's design SHAPE and its cost to the next
+engineer — NOT correctness (bug-finder owns that) or guideline compliance (rl-expert owns
+that). Think one step past this PR: how will this be tested, extended, and maintained?
+
+FIRST: Dynamically discover guidelines:
+1. Glob `.claude/skills/*/SKILL.md` at the repo root — read every match
+2. Read `CLAUDE.md`
+
+SCOPE GATE (do this first): if the diff has no design surface — a one-line fix, a config
+VALUE change, a pure test/doc edit, a mechanical rename — report "no design-level surface —
+LGTM" and STOP. Do NOT manufacture findings. Design review only earns its keep when the PR
+adds or reshapes a class, interface, config schema, worker group, module, or a control-flow
+branch structure.
+
+Your core job is to flag drift in EITHER direction on the abstraction spectrum. A naive
+architecture reviewer only ever says "add more abstraction" — that is actively harmful
+(it produces if-else soup and coupling). Run each test below on the change and report only
+where one genuinely fires:
+
+  TEST A — under-abstraction (should this be DECOUPLED?):
+    - Are there already ≥2 variants expressed as flags/branches in one unit, or a NAMED
+      second implementation coming soon?
+    - Does the current shape force a new variant to edit shared code in multiple places?
+    - Would a seam let each variant's logic live — and be unit-tested — in one place?
+    → If yes, recommend the seam with a concrete interface sketch.
+
+  TEST B — over-abstraction / over-coupling (should this stay SEPARATE?):
+    - Would unifying scatter "which algorithm/mode" conditionals through a shared path
+      (if-else soup)?
+    - Would a change to one variant then force re-testing ALL variants (blast radius —
+      every small change becomes monstrous)?
+    - Are these things actually the same, or coincidentally similar — do they change for
+      DIFFERENT reasons? Prefer duplication over the wrong abstraction.
+    → If yes, recommend AGAINST merging (or a thin shared helper, not a merged path).
+
+  TEST C — extraction (should a cluster inside this class become its OWN OBJECT?):
+    Method count and line count are SYMPTOMS that tell you to run this test; they are never
+    themselves the finding. Compare against sibling classes first — "big" relative to nothing
+    is not a finding.
+    Score the candidate group on three questions, and flag ONLY when all three hold:
+      1. CLOSED STATE — is there a set of instance attributes touched ONLY by this group of
+         methods and by nothing else in the class? COMPUTE this, do not eyeball it: map every
+         method to the `self.<attr>` it reads/writes, then look for a partition.
+      2. INDEPENDENT LIFECYCLE — does the group own a thread / socket / subprocess /
+         connection, or a stateful protocol with real ordering (prepare -> use -> teardown),
+         that the rest of the class does not participate in?
+      3. LOW REACH-BACK — how many host attributes must it borrow? If everything it needs
+         fits through a constructor — with dynamic data arriving as a callable/provider
+         rather than a snapshot — reach-back is zero. If it must call back into the host,
+         do NOT extract.
+    -> 3/3: recommend extraction with signatures + the instantiation site, keep the public
+      methods as one-line delegations so the interface contract is unchanged, and state the
+      payoff as a NUMBER (lines off __init__, attributes off __setstate__, what becomes
+      unit-testable without spinning up the world).
+    -> Anything less: do NOT flag.
+
+    ANTI-PATTERN to name explicitly when you see it: "these methods are private and callers
+    never invoke them" is NOT a reason to extract. A cluster with NO mutable state and no
+    lifecycle wants to be module-level functions, not a class — turning it into one produces
+    an anemic helper whose constructor exists only to memoize its arguments. Reject that
+    proposal out loud rather than silently omitting it.
+
+    Cheap signals worth checking for, each of which is a cost you can quantify: a >100-line
+    __init__; a __getstate__/__setstate__ that must enumerate a dozen-plus attributes (every
+    one a silent bug on the unpickle path if forgotten); being the only class at its layer
+    that owns a thread. If an existing repo abstraction already models the cluster (e.g. a
+    synchronizer, a registry, a worker pool), say so — "extract this" and "adopt the existing
+    abstraction" are often the same refactor seen from two directions.
+
+The one-liners to apply: couple what changes together; decouple what changes for
+different reasons; and give a cluster its own object only when its state is closed and
+its lifecycle is independent.
+
+Judge on three axes, each tied to an OBSERVABLE (no abstract hand-waving):
+  1. TESTABILITY: can the core logic be tested without spinning up the world (GPU / Ray
+     actors / real models)? If a change buries testable logic behind an untestable boundary,
+     flag it and name the seam that would make it unit-testable. This is the strongest,
+     most objective signal.
+  2. EXTENSIBILITY: state the CONCRETE cost of the next PLAUSIBLE variant — "to add a 4th X
+     / a 2nd Y you'd touch N call sites and add an elif in M places." No named/plausible
+     extension → do NOT flag (avoid hypothetical gold-plating).
+  3. MAINTAINABILITY: blast radius + reasons-to-change — how many places must move together
+     for one logical change.
+
+Rules:
+- Compare the new component to its nearest existing analog (a new worker group ↔ lm_policy,
+  a new estimator ↔ the existing estimators): does it match that pattern's extension points
+  (backend dispatch, override hooks, guards), or diverge without reason?
+- Bias to code the PR INTRODUCES — reshaping a seam while it is being written costs nothing.
+  For pre-existing shape the PR merely touches, suggest a tracking issue; do NOT block.
+- Low-severity SUGGESTIONS by default (these are not blockers) unless the shape will actively
+  cause bugs.
+- Every finding needs a NAMED future scenario + a concrete seam/interface sketch. BANNED:
+  "consider making this more extensible" with no scenario and no sketch.
+- Also affirm GOOD design explicitly — a clean seam worth keeping — so the collate step can
+  reinforce it. Category [DESIGN] for both problems and affirmations.
+
+Delegate domain questions to rl-expert / submodule experts via SendMessage. Report ALL findings.
+```
+
 ---
 
 ## Phase 3: Collation (leader)
@@ -516,7 +704,7 @@ runtime validation.
 After each Wave 1 agent reports completion (you will receive an idle notification with their
 findings attached), check `TaskList` to see which Wave 1 tasks are still in flight. When ALL
 Wave 1 tasks (`analyze-rl-code`, any `analyze-{submodule}`, `review-existing-comments`,
-`review-and-suggest-tests`, `scan-for-bugs`) are completed, IMMEDIATELY send a single
+`review-and-suggest-tests`, `scan-for-bugs`, `review-design`) are completed, IMMEDIATELY send a single
 consolidated message to `devil-advocate` via `SendMessage` containing the full set of Wave 1
 findings (grouped by source agent). This is a push notification — it unblocks
 `devil-advocate`, which is otherwise idle waiting for your message. Do NOT expect
@@ -545,20 +733,75 @@ community contributors who are volunteering their time:
 - **Be specific about asks**: "Could you share tokens/sec with and without CUDA graphs on
   a 1B model?" is better than "Please add performance numbers."
 
+### 🚦 HARD GATE — do NOT stage anything until devil-advocate has reported
+
+**Blocking rule: you may not call `AskUserQuestion` to offer staging, and you may not POST a
+review, until `devil-advocate` has delivered its verdicts via SendMessage.** The
+`collate-review` blockedBy `challenge-findings` dependency exists for this; honour it in
+behaviour, not just in the task graph.
+
+This is the single most common way this skill produces churn. The failure mode is seductive:
+the leader has personally verified most findings, devil-advocate is slow, and proceeding
+"feels safe because I checked everything myself." It is not safe — the leader is one of the
+reviewers, and the leader's findings need the adversarial pass **more** than anyone's, because
+nobody else is auditing them.
+
+If devil-advocate has gone idle without reporting, do NOT interpret that as "no objections."
+Send the explicit-tool-call nudge — a resumed agent's final assistant text is not delivered to
+the leader, so a silent agent is usually one that never called the tool, not one with nothing to say:
+
+> Your verdicts never reached me. When you are resumed by a message, your final assistant text
+> is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
+> `SendMessage(to="team-lead", summary="devil-advocate verdicts", message="<full verdict list>")`.
+
+Only after that nudge has ALSO failed may you proceed, and then you MUST say so in the preview
+("devil-advocate did not report; findings below carry only the leader's verification").
+
+**Cost of getting this wrong, observed on PR #3262:** the leader staged 8 comments before
+devil-advocate returned. DA then killed 3 of them — one where the leader's own supporting audit
+used the wrong peer group (comparing PPO recipes against tuned large-model async GRPO recipes to
+claim a config value was anomalous, when it was that family's house value), one where the "no
+test covers this" premise was refuted by an existing deterministic unit test, and one where the
+proposed fix would have defeated a deliberate CI ratchet. The staged review had to be deleted and
+re-POSTed. Had the user hit publish in that window, the author would have received three findings
+that do not survive scrutiny.
+
+**If you catch yourself thinking any of these, stop and wait:**
+- "I've verified these myself, DA is a formality."
+- "DA already weighed in on some items, that's close enough."
+- "I'll stage now and amend if DA objects." ← re-POSTing is what creates duplicate comments.
+
+Note also that DA overturning **itself** is a signal the pass is working, not a reason to
+discount it: on #3262 it reinstated a finding it had previously agreed to kill.
+
 After all Wave 2 agents complete:
 
-1. Gather ALL findings from ALL agents. Categories: `[BUG]`, `[TEST]`, `[GUIDELINE]`, `[DOC]`, `[UPSTREAM]`, `[DOCSTRING]`, `[PERF-EVIDENCE]`, `[DOC-ROADMAP]`
+1. Gather ALL findings from ALL agents. Categories: `[BUG]`, `[TEST]`, `[GUIDELINE]`, `[DOC]`, `[UPSTREAM]`, `[DOCSTRING]`, `[PERF-EVIDENCE]`, `[DOC-ROADMAP]`, `[DESIGN]`
 2. Apply devil-advocate verdicts: remove DISPUTED findings, adjust scores for DOWNGRADED ones
 3. Deduplicate: same file + same line range + same core issue = one finding
 4. Confidence threshold: discard anything scoring below 80
 5. **Show ALL surviving findings** — no caps, no "top N", no summarization
 6. For each finding, construct the review comment:
-   - Concise, straight to the point (2-3 sentences max)
+   - Concise, straight to the point (2-3 sentences max) — the ONLY things that earn extra length are the
+     breaking-case walkthrough and the mechanism context-reload below, each within its own budget. After
+     drafting, re-read and delete every sentence whose removal wouldn't change what the author does.
+   - **Understandable**: if the finding hinges on a mechanism (handshake, protocol, cache, lifecycle,
+     cross-process contract), open with the 4-step context-reload from the preamble — background → what problem
+     the mechanism solves → numbered how-it-works → what breaks — in 4-8 lines. The reader is an expert but has
+     not paged this mechanism in; one who has to reconstruct it from the diff before judging the finding won't.
    - **Actionable**: lead with the issue, then a bolded **Action:** line naming the exact file/function to
      change. Give the concrete fix (snippet / schema / signature) when known, and note placement + DRY
      concerns (e.g. "factor this predicate into one helper so the guard can't drift from the loop"). Cut
      reassurance/editorializing — if the answer to "what should the author DO?" is "nothing," drop the comment
      or move it to the review body.
+   - **Tangible**: if the finding has a concrete failing case, SHOW it (per the preamble rule) — the triggering
+     config/input, 3-5 permalinked steps from input to symptom, and the real symptom string; or a one-line
+     repro ("run `<recipe>` with `<delta>` → `<symptom>`"). This is the single highest-leverage thing that
+     makes a reviewer's ask land: an author can argue with "this isn't validated", but not with a YAML block
+     and a trace ending in the exact error they'd see. Budget it: config block + a few one-line bullets. A
+     finding with no demonstrable failing case is a weaker finding — reflect that in its score rather than
+     dressing it up in prose.
+   - Label each finding **PR-introduced** vs **pre-existing/adjacent** in one clause near the top
    - Start with a permalink to the code being commented on
    - **Evidence permalinks**: When a finding references behavior in upstream code (Megatron-LM,
      Megatron-Bridge, etc.), include permalinks to the specific lines that prove the claim.
@@ -567,7 +810,13 @@ After all Wave 2 agents complete:
      definition that shows a missing member, or the `__post_init__` normalization logic.
      Every claim about external code must have a clickable link — don't just cite file:line.
    - For call-stack reasoning (e.g. "A calls B which asserts C"), link each step in the chain
-   - Include `suggestion` block when the fix is known (docstrings, tests, code fixes):
+   - **Include a `suggestion` block whenever the fix is a concrete edit to line(s) in the diff** — not just for
+     docstrings/tests. It is directly committable from the UI, so it is the most actionable form a finding can
+     take; default to it for any clear code/docs fix. The block must contain the exact replacement for the
+     commented line(s) (they are replaced verbatim), so anchor the comment on the line the edit changes. Skip it
+     only when the change isn't a single-region edit (multi-file, a line not in the diff, or an operational/config
+     ask) — then give the concrete change in prose. When multiple valid fixes exist, show one but label it **one
+     way to do it** so it reads as illustrative:
      ````
      ```suggestion
      corrected code here
@@ -581,6 +830,11 @@ After all Wave 2 agents complete:
 ---
 
 ## Phase 4: Preview & Confirm
+
+> **Precondition check before you write a single line of this preview:** has `devil-advocate`
+> delivered its verdicts via SendMessage? If not, go back to the Phase 3 hard gate. Do not
+> present findings and do not offer staging. A preview built on un-challenged findings is how
+> a review gets staged, deleted, and re-staged.
 
 Display ALL findings to the user using the card layout. Group by severity (Critical, then
 Suggestions, then Informational), with each finding as a blockquote card:
@@ -645,6 +899,14 @@ by @$AUTHOR | <count> files changed | <count> agents
 > ```
 >
 > _test-agent_
+
+> **DESIGN** `path/to/new_component.py:40` [confidence: 82]
+> <shape observation + which axis: testability/extensibility/maintainability>. To add the next
+> <named variant> you'd touch <N> sites; a <interface/seam> would isolate + unit-test each. (Or,
+> for over-coupling: merging <X> and <Y> would scatter mode conditionals — keep them separate.)
+> [view on GitHub](https://github.com/NVIDIA-NeMo/RL/blob/$HEAD_SHA/path/to/new_component.py#L40)
+>
+> _design-reviewer, confirmed by devil-advocate_
 
 ### Threads (<count>)
 
@@ -761,6 +1023,30 @@ URL so the user can click through to preview it:
 https://github.com/NVIDIA-NeMo/RL/pull/$PRNUM#pullrequestreview-$REVIEW_ID
 ```
 
+**Verify the staged comment count with GraphQL, not REST — REST under-reports on a PENDING review.**
+`GET /pulls/<n>/reviews/<id>/comments` can return fewer comments than were actually attached (observed:
+30 returned for a 32-comment pending review). Trusting it leads to "re-adding" comments that are already
+there and silently creating duplicates. Always confirm with GraphQL, which reports the true `totalCount`:
+
+```bash
+cat > /tmp/q.json <<'JSON'
+{"query":"query { repository(owner:\"NVIDIA-NeMo\", name:\"RL\") { pullRequest(number:<PRNUM>) { reviews(last:1, states:PENDING) { nodes { databaseId state comments(first:100) { totalCount nodes { databaseId path line body } } } } } } }"}
+JSON
+gh api graphql --input /tmp/q.json \
+  --jq '.data.repository.pullRequest.reviews.nodes[0] | "state=\(.state) id=\(.databaseId) comments=\(.comments.totalCount)"'
+```
+
+Rules that follow from this:
+- After creating the review, assert `totalCount == len(comments)` in your payload before telling the user
+  it is staged. If it is short, the POST silently dropped some — recreate the review rather than patching.
+- If comments really are missing, prefer **deleting the review and re-POSTing the canonical JSON** over
+  adding the stragglers with `addPullRequestReviewThread`. Re-adding is what creates duplicates, and a
+  pending review has no cheap dedupe.
+- To find duplicates after the fact, list `(path, body[:60])` from the GraphQL `nodes` and look for repeats;
+  each duplicate's `databaseId` is what you would need to delete.
+- The same caution applies when answering "did the author address my comments?" — enumerate threads via
+  GraphQL so you do not miss ones REST omits.
+
 **If the `gh api` POST is blocked by permissions**: Print the exact command for the
 user to run manually (prefixed with `!`). After they run it, parse the returned JSON
 for the `id` field and print the pending review URL.
@@ -875,16 +1161,27 @@ After posting, tell the user:
 
 ### Marking comments fixed in a later commit
 
-When the user asks (often in a follow-up session) to update the review comments after new commits
-land, first **verify each finding against a specific commit** (re-run the linter/test, inspect the
-code at that SHA). Then handle each thread by how much of the finding was addressed:
+**Trigger**: the user asks to update the review comments after new commits land, OR asks a
+question like "did the author address my review?" / "did they fix my comments?" (often in a
+follow-up session). That question is the request to run this workflow — don't just summarize;
+after reporting, post the fixed-in replies below (confirm with the user first if they only asked
+the question).
 
-- **Completely fixed** → reply with exactly `fixed in <full-commit-sha>` (nothing else needed).
+Method: list the author's **new commits since the reviewed head SHA**
+(`gh pr view $PRNUM --json commits` or `git log <reviewed-sha>..<new-head>`), fetch each commit's
+diff (`gh api repos/NVIDIA-NeMo/RL/commits/$SHA`), and **verify each open review thread against
+those diffs** (re-run the linter/test, inspect the code at that SHA). Then handle each thread by
+how much of the finding was addressed:
+
+- **Completely fixed, and it's VERY OBVIOUS** (the commit's diff directly implements the asked-for
+  change) → reply with exactly `fixed in <full-commit-sha>` (nothing else needed). If it is not
+  obvious — the diff only partially overlaps the ask, or you'd have to infer intent — do NOT post
+  a "fixed" reply; treat it as partial or unaddressed instead.
 - **Not fixed at all** → **do not reply**. Leave the thread as-is; a "still not fixed" note adds
   noise. (Only surface unaddressed findings to the user in your summary, not on the PR thread.)
-- **Partially fixed** → reply noting it's partially addressed in `<full-commit-sha>` **and spell out
-  what still remains** (the specific sub-item / file:line not yet handled), so the author knows the
-  thread isn't done. Do not mark it simply "fixed."
+- **Partially fixed** → reply noting it's partially resolved in `<full-commit-sha>` **and spell out
+  how**: what the commit did address and what still remains (the specific sub-item / file:line not
+  yet handled), so the author knows the thread isn't done. Do not mark it simply "fixed."
 
 Rules:
 - Use the **full 40-char commit SHA**, as **plain text with NO backticks / code span**. GitHub's UI
