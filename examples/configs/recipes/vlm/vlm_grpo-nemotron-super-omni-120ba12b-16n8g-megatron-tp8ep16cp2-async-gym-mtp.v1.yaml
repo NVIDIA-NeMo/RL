@@ -14,13 +14,17 @@ policy:
     mtp_num_layers: 1
     mtp_use_repeated_layer: false
     mtp_detach_heads: true
-    # 0.0 keeps the MTP head present and refit into vLLM (so speculative
-    # decoding can use it) without adding its loss to the training objective.
-    # This matches the reference Super Omni CP=2 recipe. Raising it turns MTP
-    # training on -- note that the pinned Megatron-LM has no separate MTP
-    # gradient clipping (nothing in clip_grads.py or optimizer_config.py
-    # references MTP), which is the known cause of exploding grad_norm.
-    mtp_loss_scaling_factor: 0.0
+    # Train the MTP head: its loss is added to the training objective at this
+    # weight. Set 0.0 instead to keep the head present and refit into vLLM (so
+    # speculative decoding can use it) without training it, which is what the
+    # reference Super Omni CP=2 recipe does.
+    #
+    # Note the pinned Megatron-LM has no separate MTP gradient clipping
+    # (nothing in clip_grads.py or optimizer_config.py references MTP), so MTP
+    # gradients are clipped jointly with the backbone -- the known cause of
+    # exploding grad_norm on Super. Watch train/grad_norm. Measured over 24
+    # steps at this weight, grad_norm stayed in 0.03-0.22.
+    mtp_loss_scaling_factor: 0.1
 logger:
   log_dir: logs/nemotron-super-omni-async-gym-mtp
   wandb:
