@@ -16,6 +16,7 @@ import asyncio
 import os
 import tempfile
 import threading
+import time
 import unittest.mock as mock
 from types import SimpleNamespace
 
@@ -1107,7 +1108,10 @@ class TestAsyncTrajectoryCollector:
     """Test cases for AsyncTrajectoryCollector."""
 
     def create_local_collector(
-        self, replay_buffer=None, next_nemo_gym_task_index: int = 0
+        self,
+        replay_buffer=None,
+        next_nemo_gym_task_index: int = 0,
+        max_generation_failures: int = 0,
     ):
         """Create a non-Ray collector instance for unit-testing local state."""
         collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
@@ -1115,6 +1119,7 @@ class TestAsyncTrajectoryCollector:
         mock_tokenizer = mock.MagicMock()
         task_to_env = {}
         master_config = self.create_mock_config()
+        master_config.grpo.async_grpo.max_generation_failures = max_generation_failures
         if replay_buffer is None:
             replay_buffer = mock.MagicMock()
 
@@ -1205,7 +1210,10 @@ class TestAsyncTrajectoryCollector:
                 num_prompts_per_step=2,
                 num_generations_per_prompt=3,
                 max_rollout_turns=1,
-                async_grpo=AsyncGRPOConfig.model_construct(max_trajectory_age_steps=2),
+                async_grpo=AsyncGRPOConfig.model_construct(
+                    max_trajectory_age_steps=2,
+                    max_generation_failures=0,
+                ),
             ),
             policy={
                 "max_total_sequence_length": 512,
@@ -1898,6 +1906,186 @@ class TestAsyncTrajectoryCollector:
         ray.kill(buffer)
         ray.kill(mock_env)
 
+    @pytest.mark.parametrize("max_generation_failures", [0, 2])
+    def test_batch_worker_failure_surfaces_after_threshold(
+        self, monkeypatch, max_generation_failures
+    ):
+        """Consecutive batch-worker failures become sticky past the limit."""
+        collector = self.create_local_collector(
+            max_generation_failures=max_generation_failures
+        )
+        collector.running = True
+        target_weight = 7
+
+        outcomes = []
+        if max_generation_failures > 0:
+            outcomes.append(ValueError("pre-reset failure"))
+        outcomes.append(None)
+        outcomes.extend(
+            ValueError(f"backend failed {failure_index}")
+            for failure_index in range(max_generation_failures + 2)
+        )
+
+        async def collect_rollout_batch(**kwargs):
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", collect_rollout_batch)
+
+        def run_worker(*, expect_generation_wake):
+            collector._generation_limit_cleared.clear()
+            collector._generating_targets.add(target_weight)
+            asyncio.run(
+                collector._run_rollout_batch_worker(
+                    repeated_batch=None,
+                    generation_weight_version=4,
+                    target_weight_version=target_weight,
+                    num_generations=1,
+                    use_nemo_gym=False,
+                )
+            )
+            assert target_weight not in collector._generating_targets
+            assert (
+                collector._generation_limit_cleared.is_set() is expect_generation_wake
+            )
+
+        collector.check_health()
+
+        if max_generation_failures > 0:
+            run_worker(expect_generation_wake=True)
+            assert collector._failure_count == 1
+            collector.check_health()
+
+        run_worker(expect_generation_wake=False)
+        assert collector._failure_count == 0
+        collector.check_health()
+
+        for failure_index in range(max_generation_failures + 1):
+            run_worker(expect_generation_wake=True)
+            if failure_index < max_generation_failures:
+                collector.check_health()
+
+        expected_count = max_generation_failures + 1
+        with pytest.raises(RuntimeError) as exc_info:
+            collector.check_health()
+
+        error_message = str(exc_info.value)
+        assert f"{expected_count} batch-worker failure(s)" in error_message
+        assert f"max_generation_failures={max_generation_failures}" in error_message
+        assert "native batch worker" in error_message
+        assert "generation_weight=4" in error_message
+        assert "target_weight=7" in error_message
+        assert (
+            f"ValueError('backend failed {max_generation_failures}')" in error_message
+        )
+        assert "Worker traceback:" in error_message
+        assert "Traceback (most recent call last):" in error_message
+
+        first_fatal_error = exc_info.value
+        run_worker(expect_generation_wake=True)
+        assert collector._failure_count == expected_count + 1
+
+        with pytest.raises(RuntimeError, match="target_weight=7") as repeated_exc_info:
+            collector.check_health()
+
+        assert repeated_exc_info.value is not first_fatal_error
+        assert str(repeated_exc_info.value) == error_message
+
+    def test_tolerated_worker_failure_wakes_gap_fill_pause(self, monkeypatch):
+        """A failed worker releases and wakes a max-age-one target for gap fill."""
+        collector = self.create_local_collector(max_generation_failures=3)
+        collector.master_config.grpo.async_grpo.max_trajectory_age_steps = 1
+        collector.current_weight_version = 4
+        collector.running = True
+        collector.dataloader = [{"batch": 0}]
+        target_weight = 5
+        collector._generating_targets.add(target_weight)
+        collector._last_limit_warning_version = collector.current_weight_version
+
+        release_target = collector._release_target
+
+        def release_before_wake(target_weight_version):
+            assert not collector._generation_limit_cleared.is_set()
+            release_target(target_weight_version)
+
+        monkeypatch.setattr(collector, "_release_target", release_before_wake)
+
+        monkeypatch.setattr(
+            collector,
+            "_should_pause_for_generation_limits",
+            lambda: target_weight in collector._generating_targets,
+        )
+
+        gap_fill_started = threading.Event()
+
+        def process_gap_fill(batch):
+            assert target_weight not in collector._generating_targets
+            gap_fill_started.set()
+
+        monkeypatch.setattr(collector, "_process_batch", process_gap_fill)
+
+        async def fail_rollout_batch(**kwargs):
+            raise ValueError("worker exhausted retries")
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", fail_rollout_batch)
+
+        collection_thread = threading.Thread(target=collector._collection_loop)
+        collection_thread.start()
+        deadline = time.monotonic() + 1
+        while collector._generation_limit_cleared.is_set():
+            assert time.monotonic() < deadline, "collection loop did not enter pause"
+            time.sleep(0.01)
+        assert not gap_fill_started.is_set()
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=None,
+                generation_weight_version=4,
+                target_weight_version=target_weight,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert gap_fill_started.wait(timeout=1)
+        collection_thread.join(timeout=1)
+        assert not collection_thread.is_alive()
+        assert collector._failure_count == 1
+        collector.check_health()
+
+    def test_worker_shutdown_error_is_not_counted(self, monkeypatch):
+        """An in-flight worker stopping after exhaustion is not a generation failure."""
+        collector = self.create_local_collector(max_generation_failures=0)
+        collector.running = False
+        collector.data_exhausted = True
+        target_weight = 7
+        collector._generating_targets.add(target_weight)
+        collector._inflight_threads.add(threading.current_thread())
+        collector._generation_limit_cleared.clear()
+
+        async def fail_during_shutdown(**kwargs):
+            raise RuntimeError("Trajectory collection stopped before enqueue completed")
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", fail_during_shutdown)
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=None,
+                generation_weight_version=4,
+                target_weight_version=target_weight,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert collector._failure_count == 0
+        assert collector._fatal_error_message is None
+        assert not collector._generation_limit_cleared.is_set()
+        assert target_weight not in collector._generating_targets
+        assert threading.current_thread() not in collector._inflight_threads
+        collector.check_health()
+
 
 class TestAsyncUtilsIntegration:
     """Integration tests for async utilities working together."""
@@ -1909,7 +2097,10 @@ class TestAsyncUtilsIntegration:
                 num_prompts_per_step=2,
                 num_generations_per_prompt=2,
                 max_rollout_turns=1,
-                async_grpo=AsyncGRPOConfig.model_construct(max_trajectory_age_steps=1),
+                async_grpo=AsyncGRPOConfig.model_construct(
+                    max_trajectory_age_steps=1,
+                    max_generation_failures=0,
+                ),
             ),
             policy={
                 "max_total_sequence_length": 512,

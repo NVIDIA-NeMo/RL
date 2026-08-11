@@ -41,6 +41,7 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1  # Maximum age, in training steps, for trajectories
+    max_generation_failures: 0  # Consecutive worker failures to tolerate
     in_flight_weight_updates: false  # Enable for faster weight synchronization
     recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after weight-updates
 ```
@@ -67,6 +68,7 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
+    max_generation_failures: 0  # Consecutive worker failures to tolerate
     in_flight_weight_updates: false  # Enable for faster weight synchronization
     recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after weight-updates
 
