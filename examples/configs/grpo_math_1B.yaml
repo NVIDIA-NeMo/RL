@@ -118,6 +118,10 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  # Async GRPO: restore replay-buffer state on resume. Set false to regenerate
+  # the buffered window fresh instead of reusing completed groups (which skew
+  # toward short rollouts at a save boundary).
+  load_replay_buffer: true
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
