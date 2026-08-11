@@ -61,19 +61,19 @@ container cannot read a `wandb login` credential from `~/.netrc`; only
 ```bash
 export WANDB_API_KEY=<key>       # log live
 export WANDB_MODE=offline        # log locally, `wandb sync <run-dir>` later
-EXTRA_OVERRIDES="logger.wandb_enabled=false"   # skip W&B entirely
+EXTRA_HYDRA_ARGS="logger.wandb_enabled=false"   # skip W&B entirely
 ```
 
 The launcher checks this before submitting and refuses to burn an allocation
 on a run that cannot log.
 
 Set `DRY_RUN=true` to print the complete training command and `sbatch`
-invocation without submitting. Use `EXTRA_OVERRIDES` for Hydra overrides, for
+invocation without submitting. Use `EXTRA_HYDRA_ARGS` for Hydra overrides, for
 example a short validation run:
 
 ```bash
 DRY_RUN=true \
-EXTRA_OVERRIDES="grpo.max_num_steps=1 checkpointing.enabled=false" \
+EXTRA_HYDRA_ARGS="grpo.max_num_steps=1 checkpointing.enabled=false" \
 bash examples/nemo_gym/nemotron-3-super-omni/super_omni_launch.sh
 ```
 
@@ -86,7 +86,7 @@ This smoke keeps the policy topology intact while using 4 generation nodes,
 EXP_NAME=smoke-super-omni-mtp-off-8n \
 SBATCH_NUM_NODES=8 \
 SLURM_TIME_LIMIT=00:30:00 \
-EXTRA_OVERRIDES="cluster.num_nodes=8 \
+EXTRA_HYDRA_ARGS="cluster.num_nodes=8 \
 policy.generation.colocated.resources.num_nodes=4 \
 grpo.max_num_steps=1 \
 grpo.num_prompts_per_step=2 \
