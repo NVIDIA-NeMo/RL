@@ -53,6 +53,11 @@ grpo:
   invalid_tool_call_advantage: null
   # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
   malformed_thinking_advantage: null
+  # Share immutable multimodal payloads across logical GRPO rows. Currently
+  # qualified with the vLLM generation backend and data_plane.enabled=false.
+  deduplicate_multimodal_data: false
+  # Debug-only exact Ray payload telemetry; serialization adds runtime overhead.
+  debug_payload_metrics: false
 
   async_grpo:
     enabled: false # Set to true to enable async training mode
