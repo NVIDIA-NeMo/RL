@@ -667,22 +667,22 @@ class VllmAsyncGenerationWorkerImpl(
         )
         # The embedded server is constructed directly instead of through
         # vLLM's CLI, where chat-template file paths are normally loaded.
-        # OpenAIServingRender expects literal Jinja content; passing a path
-        # makes Transformers render the path itself and drops multimodal
+        # OnlineRenderer expects literal Jinja content; passing a path makes
+        # Transformers render the path itself and drops multimodal
         # placeholders such as <image>.
         configured_chat_template = serving_chat_kwargs.get("chat_template")
         if configured_chat_template is not None:
             serving_chat_kwargs["chat_template"] = load_chat_template(
                 configured_chat_template
             )
-        # vLLM 0.20's OpenAIServingChat.__init__ does not accept
-        # ``chat_template_kwargs`` — the Jinja kwargs are threaded per-request via
-        # ``request.chat_template_kwargs``. Pull the recipe-provided defaults out
-        # of the init bag and inject them into each incoming request below so
-        # values like ``truncate_history_thinking`` actually reach the template
-        # instead of silently defaulting.
+        # Recipes may name the parameter either way: ``default_chat_template_kwargs``
+        # matches vLLM's own spelling, ``chat_template_kwargs`` is accepted for
+        # recipes written against the older name. Both are popped out of the init
+        # bag because they belong on the renderer, not on OpenAIServingChat.
         default_chat_template_kwargs: dict[str, Any] = (
-            serving_chat_kwargs.pop("chat_template_kwargs", None) or {}
+            serving_chat_kwargs.pop("default_chat_template_kwargs", None)
+            or serving_chat_kwargs.pop("chat_template_kwargs", None)
+            or {}
         )
         online_renderer = NeMoRLOnlineRenderer(
             model_config=engine_client.model_config,
@@ -697,6 +697,11 @@ class VllmAsyncGenerationWorkerImpl(
             # passed to OpenAIServingChat via http_server_serving_chat_kwargs.
             tool_parser=serving_chat_kwargs.get("tool_parser"),
             reasoning_parser=serving_chat_kwargs.get("reasoning_parser"),
+            # vLLM merges these into every render, with request-supplied keys
+            # winning (preprocess_chat's default_template_kwargs). The renderer
+            # is shared by /v1/chat/completions and /tokenize, so setting it
+            # here keeps the two endpoints rendering identical prompts.
+            default_chat_template_kwargs=default_chat_template_kwargs,
         )
         serving_chat_kwargs.update(
             dict(
@@ -757,13 +762,6 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
 
-            # Merge recipe-level chat_template_kwargs into the request. Client-
-            # provided keys win so a caller can still override per request.
-            if default_chat_template_kwargs:
-                request.chat_template_kwargs = {
-                    **default_chat_template_kwargs,
-                    **(request.chat_template_kwargs or {}),
-                }
             try:
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
@@ -832,17 +830,6 @@ class VllmAsyncGenerationWorkerImpl(
 
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
-            # Chat-mode tokenize also renders the chat template — inject the
-            # same default kwargs so /tokenize and /v1/chat/completions produce
-            # identical prompt tokens under multi-turn.
-            if default_chat_template_kwargs and hasattr(
-                request, "chat_template_kwargs"
-            ):
-                request.chat_template_kwargs = {
-                    **default_chat_template_kwargs,
-                    **(request.chat_template_kwargs or {}),
-                }
-
             generator = await openai_serving_tokenization.create_tokenize(
                 request, raw_request
             )
