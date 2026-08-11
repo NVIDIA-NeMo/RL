@@ -1,0 +1,4 @@
+defaults: grpo-dapomath17k-dsv3-megatron.yaml
+data_plane:
+  enabled: true
+  backend: mooncake_cpu
