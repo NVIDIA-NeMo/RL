@@ -14,22 +14,24 @@
 # Qwen3-30B-A3B MoE — Megatron colocated inference, zero-KL precision sweep (BF16 vs MXFP8)
 #
 # Enables zero_train_gen_mismatch which activates batch-invariant kernels (TE GEMM
-# workspace pinned, FA4 num_splits=1). Router replay is enabled separately via
-# policy.router_replay.enabled=true (MoE routing must be set explicitly).
+# workspace pinned, FA4 num_splits=1). Router replay and colocated megatron generation
+# knobs live in the recipe yaml.
+# CUDA graphs (scope=block, persist KV) are enabled in the recipe yaml.
 #
 # MODE (default m-inf-fa4):
 #   m-inf-fa4  — FlashAttention 4 (+policy.megatron_cfg.attention_backend=flash)
 #   m-inf      — TE unfused attention
 #
 # PRECISION (default bf16):
-#   bf16   — examples/configs/grpo_math_qwen30ba3b_megatron.yaml
-#   mxfp8  — examples/configs/grpo_math_qwen30ba3b_megatron_mxfp8.yaml
+#   bf16   — examples/configs/recipes/llm/grpo-dapomath17k-qwen-30ba3b-megatron.yaml
+#   mxfp8  — same base + policy.megatron_cfg.fp8_cfg overrides
 #
 # Usage (from RL/ directory):
 #   sbatch --export=PRECISION=bf16  run_qwen30ba3b_zero_kl_precision.sh
 #   sbatch --export=PRECISION=mxfp8 run_qwen30ba3b_zero_kl_precision.sh
 #   sbatch --export=PRECISION=bf16,ZERO_TRAIN_GEN_MISMATCH=false run_qwen30ba3b_zero_kl_precision.sh
 #   sbatch --export=PRECISION=mxfp8,ZERO_TRAIN_GEN_MISMATCH=false run_qwen30ba3b_zero_kl_precision.sh
+#   sbatch --export=NRL_FORCE_REBUILD_VENVS=true,PRECISION=bf16 run_qwen30ba3b_zero_kl_precision.sh  # after flash-attn-4 bump
 #
 # RESTART=true (default false) — wipe CKPT_DIR and start a fresh W&B run.
 # EXP_TAG — optional suffix on run name (default: today's date).
@@ -97,7 +99,7 @@ if [[ ! "$PRECISION" =~ ^(bf16|mxfp8)$ ]]; then
     exit 1
 fi
 
-GRPO_CONFIG="examples/configs/grpo_math_qwen30ba3b_megatron.yaml"
+GRPO_CONFIG="examples/configs/recipes/llm/grpo-dapomath17k-qwen-30ba3b-megatron.yaml"
 MXFP8_OVERRIDES=""
 case "$PRECISION" in
     bf16)
@@ -168,7 +170,8 @@ echo "  Mode:          ${MODE}"
 echo "  Precision:     ${PRECISION}"
 echo "  Config:        ${GRPO_CONFIG}"
 echo "  zero_train_gen_mismatch: true"
-echo "  Router replay: true"
+echo "  Router replay: true (from recipe yaml)"
+echo "  CUDA graphs:   true (from recipe yaml; scope=block, persist KV)"
 echo "  Max steps:     ${MAX_STEPS}"
 echo "  Nodes:         ${NUM_NODES}"
 echo "  GPUs/node:     ${GPUS_PER_NODE}"
@@ -186,19 +189,10 @@ echo "=============================================="
 
 mkdir -p logs
 
-STUDY_OVERRIDES="\
-    grpo.num_prompts_per_step=4 \
-    grpo.num_generations_per_prompt=16 \
-    policy.train_global_batch_size=64 \
-    policy.megatron_cfg.moe_token_dispatcher_type=alltoall \
-    policy.megatron_cfg.moe_router_dtype=fp32 \
-    policy.max_total_sequence_length=128"
-
 GRPO_ARGS="\
     --config ${GRPO_CONFIG} \
     grpo.max_num_steps=${MAX_STEPS} \
     cluster.num_nodes=${NUM_NODES} cluster.gpus_per_node=${GPUS_PER_NODE} \
-    ${STUDY_OVERRIDES} \
     grpo.val_at_start=false grpo.val_at_end=true grpo.val_period=10 \
     checkpointing.enabled=true \
     checkpointing.checkpoint_dir=${CKPT_DIR} \
@@ -219,19 +213,7 @@ fi
 # grpo_math_1B.yaml's mcore_generation_config and Hydra struct-rejects it.
 MINF_FLAGS="\
     policy.generation.backend=megatron \
-    +policy.megatron_cfg.zero_train_gen_mismatch=true \
-    policy.router_replay.enabled=true \
-    policy.megatron_cfg.tensor_model_parallel_size=1 \
-    +policy.megatron_cfg.cuda_graph_impl=none \
-    +policy.megatron_cfg.moe_pad_experts_for_cuda_graph_inference=false \
-    policy.megatron_cfg.moe_permute_fusion=false \
-    policy.generation.mcore_generation_config.kv_cache_management_mode=recompute \
-    +policy.generation.mcore_generation_config.static_kv_memory_pointers=false \
-    policy.generation.mcore_generation_config.use_cuda_graphs_for_non_decode_steps=False \
-    policy.generation.mcore_generation_config.cuda_graph_impl=none \
-    policy.generation.mcore_generation_config.num_cuda_graphs=0 \
-    policy.generation.mcore_generation_config.inference_cuda_graph_scope=none \
-    policy.generation.mcore_generation_config.buffer_size_gb=16"
+    +policy.megatron_cfg.zero_train_gen_mismatch=true"
 
 CMD="${BASE_CMD} ${MINF_FLAGS} \
     logger.wandb.name=${WANDB_RUN_NAME} \
