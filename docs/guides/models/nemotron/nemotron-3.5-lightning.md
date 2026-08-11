@@ -281,7 +281,7 @@ unset, otherwise the MTP module is instantiated.
 ### Launch training
 
 Launch through `ray.sub` like the other Slurm recipes (see the
-[cluster guide](../cluster.md)). From the repository root:
+[cluster guide](../../../cluster.md)). From the repository root:
 
 ```bash
 CONTAINER=<path-to-nemo-rl-sqsh> \
@@ -305,4 +305,4 @@ from -0.7 to about 0.5 and AIME-2024 validation accuracy improves from 0.33
 to about 0.75. The truncation rate drops from ~0.5 to ~0.1 as responses
 shorten from ~5,500 to ~3,000 generated tokens per sample.
 
-![Nemotron 3.5 Lightning DAPO automodel training curves](../assets/nemotron/nemotron-3.5-lightning-automodel.png)
+![Nemotron 3.5 Lightning DAPO automodel training curves](../../../assets/nemotron/nemotron-3.5-lightning-automodel.png)
