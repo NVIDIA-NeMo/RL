@@ -30,6 +30,7 @@ policy:
     backend: megatron
     mcore_generation_config:
       transformer_impl: inference_optimized
+      moe_router_dtype: fp32
       activation_checkpointing: false
       tensor_model_parallel_size: 4
       expert_model_parallel_size: 4

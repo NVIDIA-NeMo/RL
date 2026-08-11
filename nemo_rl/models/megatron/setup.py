@@ -923,6 +923,28 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
             "moe_pad_experts_for_cuda_graph_inference"
         ]
+    generation_cfg = config.get("generation")
+    mcore_gen_cfg = (
+        (generation_cfg.get("mcore_generation_config") or {})
+        if generation_cfg is not None and generation_cfg.get("backend") == "megatron"
+        else {}
+    )
+    if (
+        mcore_gen_cfg.get("cuda_graph_impl") == "local"
+        and mcore_gen_cfg.get(
+            "transformer_impl", config["megatron_cfg"].get("transformer_impl")
+        )
+        != "inference_optimized"
+        and model_cfg.expert_model_parallel_size > 1
+        and "moe_pad_experts_for_cuda_graph_inference" not in config["megatron_cfg"]
+        and "moe_pad_experts_for_cuda_graph_inference" not in mcore_gen_cfg
+    ):
+        print(
+            "[_apply_moe_config] Setting "
+            "moe_pad_experts_for_cuda_graph_inference=True: CUDA-graph "
+            "inference with expert parallelism requires padded experts."
+        )
+        model_cfg.moe_pad_experts_for_cuda_graph_inference = True
     model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
         "moe_shared_expert_overlap"
     ]
@@ -1529,6 +1551,10 @@ def build_inference_model(
     inference_provider.recompute_granularity = None
     inference_provider.recompute_method = None
     inference_provider.recompute_num_layers = None
+    if inference_provider.transformer_impl == "inference_optimized":
+        inference_provider.moe_pad_experts_for_cuda_graph_inference = False
+    # Need to run __post__init__ with the correct config.
+    TransformerConfig.__post_init__(inference_provider)
 
     world_size = torch.distributed.get_world_size()
     inference_pg_collection = build_inference_pg_collection(
