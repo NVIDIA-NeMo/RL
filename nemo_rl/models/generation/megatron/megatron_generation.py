@@ -26,6 +26,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
+from nemo_rl.models.generation.megatron.validation import (
+    validate_megatron_generation_backend_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 
 if TYPE_CHECKING:
@@ -105,15 +108,16 @@ class MegatronGeneration(GenerationInterface):
             weights_path: Optional path to model weights (non-colocated only).
             skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
         """
-        # Import here to avoid circular imports
-        from nemo_rl.models.policy.lm_policy import Policy
-
         assert (cluster is None) != (policy is None), (
             "Provide exactly one of `cluster` or `policy`."
         )
+        validate_megatron_generation_backend_config(config)
         assert not (skip_weight_load and policy is not None), (
             "skip_weight_load only applies to the dedicated inference policy."
         )
+
+        # Import here to avoid circular imports
+        from nemo_rl.models.policy.lm_policy import Policy
 
         # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
         # `self._policy_config` keeps a reference to the full PolicyConfig.

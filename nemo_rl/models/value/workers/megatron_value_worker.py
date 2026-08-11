@@ -414,13 +414,34 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
 
+    def _model_chunks(self) -> list[Any]:
+        return self.model if isinstance(self.model, list) else [self.model]
+
+    def _primary_model(self) -> Any:
+        return self._model_chunks()[0]
+
+    def _set_models_train_mode(self, training: bool) -> None:
+        for model in self._model_chunks():
+            model.train(training)
+
+    def _zero_grad_buffer(self) -> None:
+        for model in self._model_chunks():
+            model.zero_grad_buffer()
+
+    def _clear_inference_params(self) -> None:
+        for model in self._model_chunks():
+            if hasattr(model, "inference_params"):
+                model.inference_params = None
+
     def enable_forward_pre_hook(self):
-        if isinstance(self.model, DistributedDataParallel):
-            self.model.enable_forward_pre_hook()
+        for model in self._model_chunks():
+            if isinstance(model, DistributedDataParallel):
+                model.enable_forward_pre_hook()
 
     def disable_forward_pre_hook(self, param_sync=True):
-        if isinstance(self.model, DistributedDataParallel):
-            self.model.disable_forward_pre_hook(param_sync=param_sync)
+        for model in self._model_chunks():
+            if isinstance(model, DistributedDataParallel):
+                model.disable_forward_pre_hook(param_sync=param_sync)
 
     @wrap_with_nvtx_name("megatron_value_worker/train")
     def train(
@@ -444,9 +465,8 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         Returns:
             Dictionary with training metrics (global_loss, grad_norm, etc.)
         """
-        self.model.zero_grad_buffer()
-        if hasattr(self.model, "inference_params"):
-            self.model.inference_params = None
+        self._zero_grad_buffer()
+        self._clear_inference_params()
 
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
@@ -463,10 +483,10 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
-            self.model.eval()
+            self._set_models_train_mode(False)
         else:
             ctx = nullcontext()
-            self.model.train()
+            self._set_models_train_mode(True)
 
         with ctx:
             all_mb_metrics = []
@@ -502,7 +522,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                 rerun_state_machine = get_rerun_state_machine()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Zero gradients
-                    self.model.zero_grad_buffer()
+                    self._zero_grad_buffer()
                     self.optimizer.zero_grad()
 
                     # Reuse the policy LossPostProcessor; prepare_fn does the
@@ -536,7 +556,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                         self.optimizer.step()
                     )
 
-                    pg_collection = get_pg_collection(self.model)
+                    pg_collection = get_pg_collection(self._primary_model())
                     update_successful = logical_and_across_model_parallel_group(
                         update_successful, mp_group=pg_collection.mp
                     )
@@ -624,7 +644,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         # Collect MoE aux metrics if applicable
         # Use getattr-by-string so "config" stays out of co_names; torch 2.11
         # cloudpickle otherwise matches torch.distributed.config (non-pickleable).
-        model_config = getattr(self.model, "config", None)
+        model_config = getattr(self._primary_model(), "config", None)
         num_moe_experts = getattr(model_config, "num_moe_experts", None)
         if num_moe_experts is not None and num_moe_experts > 1:
             moe_loss_scale = 1.0 / max(1, total_num_microbatches)
@@ -661,7 +681,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             else self.cfg.get("logprob_batch_size", self.cfg["train_micro_batch_size"])
         )
 
-        self.model.eval()
+        self._set_models_train_mode(False)
 
         pp_grp = get_pipeline_model_parallel_group()
 
@@ -768,7 +788,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True
         )
-        self.model.train()
+        self._set_models_train_mode(True)
 
         if (
             hasattr(self, "optimizer")
@@ -783,7 +803,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
     def prepare_for_inference(self):
         """Prepare model for value inference."""
         self.model = self.move_model(self.model, "cuda", move_grads=False)
-        self.model.eval()
+        self._set_models_train_mode(False)
 
         # Offload gradients
         self.model = self.move_model(
@@ -796,12 +816,20 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
     @torch.no_grad()
     def move_model(
         self,
-        model: torch.nn.Module,
+        model: torch.nn.Module | list[torch.nn.Module],
         device: str,
         move_params: bool = True,
         move_grads: bool = True,
-    ) -> torch.nn.Module:
+    ) -> torch.nn.Module | list[torch.nn.Module]:
         """Move model parameters and gradient buffers to the specified device."""
+        if isinstance(model, list):
+            return [
+                self.move_model(
+                    chunk, device, move_params=move_params, move_grads=move_grads
+                )
+                for chunk in model
+            ]
+
         if isinstance(model, DistributedDataParallel):
             for buffers in [model.buffers, model.expert_parallel_buffers]:
                 for buffer_idx in range(len(buffers)):
@@ -895,7 +923,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             # Save Megatron backbone checkpoint
             save_checkpoint(
                 state=self.mcore_state,
-                model=[self.model],
+                model=self._model_chunks(),
                 optimizer=optimizer_to_save,
                 opt_param_scheduler=scheduler_to_save,
                 num_floating_point_operations_so_far=self.mcore_state.train_state.floating_point_operations_so_far,
@@ -941,7 +969,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True
         )
-        self.model.eval()
+        self._set_models_train_mode(False)
 
         if (
             hasattr(self, "optimizer")

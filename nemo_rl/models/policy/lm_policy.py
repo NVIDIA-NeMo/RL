@@ -38,6 +38,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.models.generation.megatron.validation import (
+    validate_megatron_generation_backend_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -118,6 +121,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
+        if megatron_enable:
+            validate_megatron_generation_backend_config(config)
         if draft_enabled and not megatron_enable:
             raise ValueError(
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
@@ -344,6 +349,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             microbatch_order = config["sequence_packing"].get("microbatch_order")
             if microbatch_order is not None:
                 self.sequence_packing_args["microbatch_order"] = microbatch_order
+            if config["megatron_cfg"]["enabled"]:
+                # For Megatron backend, when virtual pipeline parallelism is enabled, the number of
+                # microbatches must be divisible by pp_size, so we need to pass the correct min_bin_count
+                # and bin_count_multiple.
+                dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+                vpp_size = (
+                    config["megatron_cfg"]["virtual_pipeline_model_parallel_size"] or 1
+                )
+                vpp_layout = config["megatron_cfg"]["pipeline_model_parallel_layout"]
+                make_num_microbatch_divisible_by = None
+                if vpp_size > 1 or vpp_layout is not None:
+                    make_num_microbatch_divisible_by = dp_size * pp_size
+                    self.sequence_packing_args["min_bin_count"] = (
+                        make_num_microbatch_divisible_by
+                    )
+                    self.sequence_packing_args["bin_count_multiple"] = (
+                        make_num_microbatch_divisible_by
+                    )
             assert not config["dynamic_batching"]["enabled"], (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
             )

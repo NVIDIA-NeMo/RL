@@ -152,6 +152,8 @@ def create_megatron_config(
             "tensor_model_parallel_size": tp,
             "pipeline_model_parallel_size": pp,
             "context_parallel_size": cp,
+            "virtual_pipeline_model_parallel_size": None,
+            "pipeline_model_parallel_layout": None,
         },
         "dynamic_batching": {
             "enabled": pp == 1,  # Only enable for single pipeline parallel stage
@@ -169,6 +171,32 @@ def create_megatron_config(
             "betas": [0.9, 0.999],
         },
     }
+
+
+@pytest.mark.parametrize(
+    "megatron_cfg_update",
+    [
+        {"virtual_pipeline_model_parallel_size": 2},
+        {"pipeline_model_parallel_layout": "E(tt|)*13tL"},
+    ],
+)
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_megatron_generation_backend_rejects_virtual_pipeline_parallelism(
+    mock_ray_worker_group,
+    megatron_cfg_update,
+):
+    config = create_megatron_config("test-model", tp=1, pp=2)
+    config["generation"]["backend"] = "megatron"
+    config["megatron_cfg"].update(megatron_cfg_update)
+
+    with pytest.raises(ValueError, match="virtual pipeline parallelism"):
+        Policy(
+            cluster=create_mock_cluster(world_size=2),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    mock_ray_worker_group.assert_not_called()
 
 
 @pytest.mark.parametrize(

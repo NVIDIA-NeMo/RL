@@ -283,6 +283,19 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
 
 
 @requires_weight_folding
+def test_iter_real_quant_refit_params_flattens_vpp_model_chunks():
+    worker = _make_real_quant_worker()
+    chunk_0 = object()
+    chunk_1 = object()
+    worker.model = [chunk_0, chunk_1]
+
+    list(worker._iter_real_quant_refit_params())
+
+    args, _ = worker.megatron_bridge.calls[0]
+    assert args == ([chunk_0, chunk_1],)
+
+
+@requires_weight_folding
 def test_iter_real_quant_refit_params_can_keep_export_on_gpu() -> None:
     worker = _make_real_quant_worker()
     worker.cfg["generation"]["real_quant_export_cpu_offload"] = False

@@ -19,7 +19,7 @@ import re
 import time
 import warnings
 from collections import OrderedDict, defaultdict
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
@@ -515,7 +515,7 @@ class MegatronPolicyWorkerImpl(
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
-            get_model_config(self.model).param_sync_func = param_sync_func
+            self._set_param_sync_func(param_sync_func)
 
         # Step 5: Setup reference model if needed
         if init_reference_model:
@@ -611,37 +611,84 @@ class MegatronPolicyWorkerImpl(
             label="init_complete", worker_type="MegatronPolicyWorker"
         )
 
+    def _model_chunks(self) -> list[Any]:
+        return self.model if isinstance(self.model, list) else [self.model]
+
+    def _primary_model(self) -> Any:
+        return self._model_chunks()[0]
+
+    def _set_models_train_mode(self, training: bool) -> None:
+        for model in self._model_chunks():
+            model.train(training)
+
+    def _zero_grad_buffer(self) -> None:
+        for model in self._model_chunks():
+            model.zero_grad_buffer()
+
+    def _iter_model_modules(self) -> Iterator[torch.nn.Module]:
+        for model in self._model_chunks():
+            yield from model.modules()
+
+    @contextmanager
+    def _model_no_sync(self):
+        with ExitStack() as stack:
+            for model in self._model_chunks():
+                stack.enter_context(model.no_sync())
+            yield
+
+    def _set_param_sync_func(self, param_sync_func: Any) -> None:
+        chunks = self._model_chunks()
+        sync_funcs = (
+            param_sync_func
+            if isinstance(param_sync_func, list)
+            else [param_sync_func] * len(chunks)
+        )
+        for model, sync_func in zip(chunks, sync_funcs, strict=True):
+            get_model_config(model).param_sync_func = sync_func
+
     def enable_forward_pre_hook(self):
-        assert isinstance(self.model, DistributedDataParallel)
-        if not self._forward_pre_hook_enabled():
-            self.model.enable_forward_pre_hook()
+        for model in self._model_chunks():
+            assert isinstance(model, DistributedDataParallel)
+            if not self._forward_pre_hook_enabled(model):
+                model.enable_forward_pre_hook()
 
     def disable_forward_pre_hook(self, param_sync=True):
-        assert isinstance(self.model, DistributedDataParallel)
-        if not self._forward_pre_hook_enabled():
-            return
         if param_sync:
             self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
-        self.model.disable_forward_pre_hook(param_sync=param_sync)
+        for model in self._model_chunks():
+            assert isinstance(model, DistributedDataParallel)
+            if self._forward_pre_hook_enabled(model):
+                model.disable_forward_pre_hook(param_sync=param_sync)
 
-    def _forward_pre_hook_enabled(self) -> bool:
-        if not isinstance(self.model, DistributedDataParallel):
+    def _forward_pre_hook_enabled(self, model: Optional[Any] = None) -> bool:
+        if model is None:
+            return any(
+                self._forward_pre_hook_enabled(chunk) for chunk in self._model_chunks()
+            )
+        if not isinstance(model, DistributedDataParallel):
             return False
-        return len(getattr(self.model, "remove_forward_pre_hook_handles", {})) > 0
+        return len(getattr(model, "remove_forward_pre_hook_handles", {})) > 0
 
     def _disable_forward_pre_hook_until_next_train_step(
         self, *, param_sync: bool = False
     ) -> None:
-        assert isinstance(self.model, DistributedDataParallel)
         if self._forward_pre_hook_enabled():
             self.disable_forward_pre_hook(param_sync=param_sync)
-        model_config = get_model_config(self.model)
-        self._first_train_step_param_sync_func = model_config.param_sync_func
-        model_config.param_sync_func = None
+        model_configs = [get_model_config(model) for model in self._model_chunks()]
+        param_sync_funcs = [
+            model_config.param_sync_func for model_config in model_configs
+        ]
+        self._first_train_step_param_sync_func = (
+            param_sync_funcs[0] if len(param_sync_funcs) == 1 else param_sync_funcs
+        )
+        for model_config in model_configs:
+            model_config.param_sync_func = None
         self._first_train_step_forward_pre_hook_disabled = True
 
     def _copy_main_params_to_param_buffer(self, zero_grad_buffer: bool = False) -> None:
-        if not isinstance(self.model, DistributedDataParallel):
+        if not all(
+            isinstance(model, DistributedDataParallel) for model in self._model_chunks()
+        ):
             return
 
         if not self._uses_mxfp8_overlap_shared_param_buffer():
@@ -651,7 +698,7 @@ class MegatronPolicyWorkerImpl(
             return
 
         if zero_grad_buffer:
-            self.model.zero_grad_buffer()
+            self._zero_grad_buffer()
 
         optimizers = (
             self.optimizer.chained_optimizers
@@ -672,19 +719,21 @@ class MegatronPolicyWorkerImpl(
         if not fp8_enabled:
             return {}
         extra_state = {}
-        for key, value in self.model.state_dict().items():
-            if "._extra_state" not in key:
-                continue
-            if isinstance(value, torch.Tensor):
-                extra_state[key] = value.detach().clone()
-            else:
-                extra_state[key] = copy.deepcopy(value)
+        for chunk_idx, chunk in enumerate(self._model_chunks()):
+            for key, value in chunk.state_dict().items():
+                if "._extra_state" not in key:
+                    continue
+                prefixed_key = f"{chunk_idx}/{key}"
+                if isinstance(value, torch.Tensor):
+                    extra_state[prefixed_key] = value.detach().clone()
+                else:
+                    extra_state[prefixed_key] = copy.deepcopy(value)
         return extra_state
 
     def _restore_model_extra_state_dict(self, extra_state: dict[str, Any]) -> None:
         if not extra_state:
             return
-        self.model.load_state_dict(extra_state, strict=False)
+        self._apply_state_dict_to_model(extra_state)
 
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
@@ -710,15 +759,16 @@ class MegatronPolicyWorkerImpl(
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
-        if hasattr(self.model, "inference_params"):
-            self.model.inference_params = None
+        for model in self.model:
+            if hasattr(model, "inference_params"):
+                model.inference_params = None
 
-        # Reset any cached attention states
-        for module in self.model.modules():
-            if hasattr(module, "reset_inference_cache"):
-                module.reset_inference_cache()
-            if hasattr(module, "_inference_key_value_memory"):
-                module._inference_key_value_memory = None
+            # Reset any cached attention states
+            for module in model.modules():
+                if hasattr(module, "reset_inference_cache"):
+                    module.reset_inference_cache()
+                if hasattr(module, "_inference_key_value_memory"):
+                    module._inference_key_value_memory = None
 
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
@@ -735,7 +785,7 @@ class MegatronPolicyWorkerImpl(
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
-            self.model.eval()
+            self._set_models_train_mode(False)
             saved_extra_state = self._get_model_extra_state_dict()
             reenable_forward_pre_hook_after_eval = (
                 self.should_disable_forward_pre_hook
@@ -746,7 +796,7 @@ class MegatronPolicyWorkerImpl(
         else:
             ctx = nullcontext()
             # Ensure model is in training mode
-            self.model.train()
+            self._set_models_train_mode(True)
             saved_extra_state = None
             reenable_forward_pre_hook_after_eval = False
 
@@ -815,7 +865,7 @@ class MegatronPolicyWorkerImpl(
                     if not (
                         eval_mode and self._uses_mxfp8_overlap_shared_param_buffer()
                     ):
-                        self.model.zero_grad_buffer()
+                        self._zero_grad_buffer()
                         self.optimizer.zero_grad()
                         self._copy_main_params_to_param_buffer()
 
@@ -928,9 +978,7 @@ class MegatronPolicyWorkerImpl(
                     and update_successful
                 ):
                     self.enable_forward_pre_hook()
-                    get_model_config(
-                        self.model
-                    ).param_sync_func = self._first_train_step_param_sync_func
+                    self._set_param_sync_func(self._first_train_step_param_sync_func)
                     self._first_train_step_param_sync_func = None
                     self._first_train_step_forward_pre_hook_disabled = False
 
@@ -1012,7 +1060,7 @@ class MegatronPolicyWorkerImpl(
         # Read "config" via getattr-by-string so the token stays out of
         # train.__code__.co_names; with torch 2.11 cloudpickle otherwise
         # matches torch.distributed.config (a non-pickleable ConfigModuleInstance).
-        model_config = getattr(self.model, "config", None)
+        model_config = getattr(self.model[0], "config", None)
         num_moe_experts = getattr(model_config, "num_moe_experts", None)
         if num_moe_experts is not None and num_moe_experts > 1:
             moe_loss_scale = 1.0 / max(1, total_num_microbatches)
@@ -1172,10 +1220,19 @@ class MegatronPolicyWorkerImpl(
         mid-body. See begin_train_step for why ``.config`` is read via
         getattr-by-string.
         """
-        model_config = getattr(self.model, "config", None)
-        if model_config is not None:
-            model_config.grad_sync_func = state.get("saved_grad_sync_func")
-            model_config.no_sync_func = state.get("saved_no_sync_func")
+        chunks = self._model_chunks()
+        saved_grad_sync_funcs = state.get("saved_grad_sync_func")
+        saved_no_sync_funcs = state.get("saved_no_sync_func")
+        if not isinstance(saved_grad_sync_funcs, list):
+            saved_grad_sync_funcs = [saved_grad_sync_funcs] * len(chunks)
+        if not isinstance(saved_no_sync_funcs, list):
+            saved_no_sync_funcs = [saved_no_sync_funcs] * len(chunks)
+        for model, grad_sync_func, no_sync_func in zip(
+            chunks, saved_grad_sync_funcs, saved_no_sync_funcs, strict=True
+        ):
+            model_config = get_model_config(model)
+            model_config.grad_sync_func = grad_sync_func
+            model_config.no_sync_func = no_sync_func
 
     @wrap_with_nvtx_name("megatron_policy_worker/begin_train_step")
     def begin_train_step(
@@ -1191,16 +1248,17 @@ class MegatronPolicyWorkerImpl(
                 "call finish_train_step or abort_train_step before begin"
             )
         # Match sync train() inference-state reset (line 332-340).
-        if hasattr(self.model, "inference_params"):
-            self.model.inference_params = None
-        for module in self.model.modules():
-            if hasattr(module, "reset_inference_cache"):
-                module.reset_inference_cache()
-            if hasattr(module, "_inference_key_value_memory"):
-                module._inference_key_value_memory = None
+        for model in self._model_chunks():
+            if hasattr(model, "inference_params"):
+                model.inference_params = None
+            for module in model.modules():
+                if hasattr(module, "reset_inference_cache"):
+                    module.reset_inference_cache()
+                if hasattr(module, "_inference_key_value_memory"):
+                    module._inference_key_value_memory = None
 
-        self.model.train()
-        self.model.zero_grad_buffer()
+        self._set_models_train_mode(True)
+        self._zero_grad_buffer()
         self.optimizer.zero_grad()
 
         state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
@@ -1220,17 +1278,28 @@ class MegatronPolicyWorkerImpl(
         # Read "config" via getattr-by-string so the token stays out of
         # begin_train_step.__code__.co_names; otherwise cloudpickle matches
         # torch.distributed.config (a non-pickleable ConfigModuleInstance).
-        model_config = getattr(self.model, "config", None)
-        if model_config is not None:
-            state["saved_grad_sync_func"] = getattr(
-                model_config, "grad_sync_func", None
-            )
-            state["saved_no_sync_func"] = getattr(model_config, "no_sync_func", None)
+        model_configs = [get_model_config(model) for model in self._model_chunks()]
+        saved_grad_sync_funcs = [
+            getattr(model_config, "grad_sync_func", None)
+            for model_config in model_configs
+        ]
+        saved_no_sync_funcs = [
+            getattr(model_config, "no_sync_func", None)
+            for model_config in model_configs
+        ]
+        state["saved_grad_sync_func"] = (
+            saved_grad_sync_funcs[0]
+            if len(saved_grad_sync_funcs) == 1
+            else saved_grad_sync_funcs
+        )
+        state["saved_no_sync_func"] = (
+            saved_no_sync_funcs[0]
+            if len(saved_no_sync_funcs) == 1
+            else saved_no_sync_funcs
+        )
+        for model_config in model_configs:
             model_config.grad_sync_func = None
             model_config.no_sync_func = nullcontext
-        else:
-            state["saved_grad_sync_func"] = None
-            state["saved_no_sync_func"] = None
 
         self._train_step_state = state
 
@@ -1332,7 +1401,7 @@ class MegatronPolicyWorkerImpl(
         # per-call reduce dispatch is gated off.
         with (
             maybe_r3_trace_stage("train", enabled=use_router_replay),
-            self.model.no_sync(),
+            self._model_no_sync(),
         ):
             rerun_state_machine = get_rerun_state_machine()
             while rerun_state_machine.should_run_forward_backward(data_iterator):
@@ -1426,7 +1495,8 @@ class MegatronPolicyWorkerImpl(
         # below sees the rescaled grads; for all_reduce the result is the
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
-        self.model.scale_gradients(inv_n)
+        for model in self._model_chunks():
+            model.scale_gradients(inv_n)
 
         # Cross-DP grad reduce. Megatron-core's BucketGroup.finish_grad_sync,
         # when overlap_grad_reduce=False, internally dispatches the synchronous
@@ -1437,8 +1507,10 @@ class MegatronPolicyWorkerImpl(
         if self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
             "overlap_grad_reduce"
         ]:
-            self.model.start_grad_sync()
-        self.model.finish_grad_sync()
+            for model in self._model_chunks():
+                model.start_grad_sync()
+        for model in self._model_chunks():
+            model.finish_grad_sync()
 
         # Wait for the comm-stream reduce dispatched above before opt.step
         # reads main_grad. Without this, grad_norm collapses to ~1/2.
@@ -1557,7 +1629,7 @@ class MegatronPolicyWorkerImpl(
         # MoE aux-loss metrics: same convention as sync train() — scale
         # by the total pipeline-microbatch count accumulated across all
         # train_microbatch calls.
-        model_config = getattr(self.model, "config", None)
+        model_config = self._get_model_config()
         num_moe_experts = getattr(model_config, "num_moe_experts", None)
         if num_moe_experts is not None and num_moe_experts > 1:
             moe_loss_scale = 1.0 / max(1, state["total_num_microbatches"])
@@ -1579,7 +1651,7 @@ class MegatronPolicyWorkerImpl(
         # Restore grad_sync_func first so the model is back to a normal
         # state before zero_grad_buffer touches anything.
         self._restore_saved_grad_sync_func(state)
-        self.model.zero_grad_buffer()
+        self._zero_grad_buffer()
         self.optimizer.zero_grad()
         self._train_step_state = None
 
@@ -1613,7 +1685,8 @@ class MegatronPolicyWorkerImpl(
             else self.cfg["logprob_batch_size"]
         )
 
-        self.model.eval()
+        for m in self.model:
+            m.eval()
 
         (
             mb_iterator,
@@ -1694,48 +1767,61 @@ class MegatronPolicyWorkerImpl(
 
         - Tensors with matching shape: in-place copy (parameters / buffers).
         - _extra_state keys (e.g. FP8 scale/amax) with shape mismatch or non-Tensor value:
-          resolve the submodule and call set_extra_state(); supports DDP and Float16Module unwrap.
+          resolve the submodule and call set_extra_state() when it is implemented;
+          supports DDP and Float16Module unwrap.
 
         Args:
             source_state_dict: State dict to apply (e.g. reference_state_dict or saved model_state_dict).
+                Keys must be prefixed with the chunk index (e.g. "0/decoder.layers.0...") to
+                avoid collisions between VPP chunks that share identical local layer names.
             raise_if_key_missing: If True, raise when a key in self.model.state_dict() is missing
                 from source_state_dict; if False, skip such keys.
         """
-        for state_dict_key, param_or_buf in self.model.state_dict().items():
-            if (
-                not isinstance(param_or_buf, torch.Tensor)
-                or "draft_model." in state_dict_key
-            ):
-                continue
-            if state_dict_key not in source_state_dict:
-                if raise_if_key_missing:
-                    raise ValueError(
-                        f"Key '{state_dict_key}' not in source state_dict."
-                    )
-                continue
-            source_value = source_state_dict[state_dict_key]
+        for chunk_idx, chunk in enumerate(self._model_chunks()):
+            for state_dict_key, param_or_buf in chunk.state_dict().items():
+                if "draft_model." in state_dict_key:
+                    continue
+                if (
+                    not isinstance(param_or_buf, torch.Tensor)
+                    and "._extra_state" not in state_dict_key
+                ):
+                    continue
+                lookup_key = f"{chunk_idx}/{state_dict_key}"
+                if lookup_key not in source_state_dict:
+                    if raise_if_key_missing:
+                        raise ValueError(
+                            f"Key '{lookup_key}' not in source state_dict."
+                        )
+                    continue
+                source_value = source_state_dict[lookup_key]
 
-            # Case 1: Same shape → in-place copy (parameters / buffers)
-            if (
-                isinstance(source_value, torch.Tensor)
-                and param_or_buf.shape == source_value.shape
-            ):
-                param_or_buf.copy_(source_value)
-                continue
+                # Case 1: Same shape → in-place copy (parameters / buffers)
+                if (
+                    isinstance(param_or_buf, torch.Tensor)
+                    and isinstance(source_value, torch.Tensor)
+                    and param_or_buf.shape == source_value.shape
+                ):
+                    param_or_buf.copy_(source_value)
+                    continue
 
-            # Case 2: _extra_state (shape mismatch or non-Tensor) → set_extra_state()
-            assert "extra_state" in state_dict_key, (
-                f"the {state_dict_key} is not an extra_state, but the param_or_buf is mismatched with the reference_state_dict {source_value.shape} != {param_or_buf.shape}."
-            )
+                # Case 2: _extra_state (shape mismatch or non-Tensor) → set_extra_state()
+                assert "extra_state" in state_dict_key, (
+                    f"the {state_dict_key} is not an extra_state, but the param_or_buf is mismatched with the reference_state_dict {source_value.shape} != {param_or_buf.shape}."
+                )
 
-            submodule_path = state_dict_key.rsplit("._extra_state", 1)[0]
-            base_module = getattr(self.model, "module", self.model)
-            # Unwrap Float16Module/MoEFloat16Module: state_dict keys are relative to inner .module
-            top_level_name = submodule_path.split(".", 1)[0]
-            if not hasattr(base_module, top_level_name):
-                base_module = getattr(base_module, "module", base_module)
-            target_module = base_module.get_submodule(submodule_path)
-            target_module.set_extra_state(source_value)
+                submodule_path = state_dict_key.rsplit("._extra_state", 1)[0]
+                base_module = getattr(chunk, "module", chunk)
+                # Unwrap Float16Module/MoEFloat16Module: state_dict keys are relative to inner .module
+                top_level_name = submodule_path.split(".", 1)[0]
+                if not hasattr(base_module, top_level_name):
+                    base_module = getattr(base_module, "module", base_module)
+                target_module = base_module.get_submodule(submodule_path)
+                if (
+                    type(target_module).set_extra_state
+                    is torch.nn.Module.set_extra_state
+                ):
+                    continue
+                target_module.set_extra_state(source_value)
 
     @contextmanager
     def use_reference_model(self):
@@ -1751,12 +1837,18 @@ class MegatronPolicyWorkerImpl(
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
-            # Save original references
-            model_state_dict = {}
-            for name, item in self.model.state_dict().items():
-                if isinstance(item, torch.Tensor):
-                    item = item.detach().to(device="cpu", non_blocking=True, copy=True)
-                model_state_dict[name] = item
+            # Save original per-chunk state dicts. Keys are prefixed with the chunk
+            # index to avoid collisions: multiple VPP chunks share identical local
+            # layer indices (e.g. "decoder.layers.0") so a flat merge would silently
+            # overwrite earlier chunks' weights with later chunks' weights.
+            model_state_dict = dict()
+            for chunk_idx, chunk in enumerate(self.model):
+                for name, item in chunk.state_dict().items():
+                    if isinstance(item, torch.Tensor):
+                        item = item.detach().to(
+                            device="cpu", non_blocking=True, copy=True
+                        )
+                    model_state_dict[f"{chunk_idx}/{name}"] = item
 
             # Swap reference state into self.model. Use _apply_state_dict_to_model
             # (rather than load_state_dict) so FP8 _extra_state with mismatched shape
@@ -1832,7 +1924,8 @@ class MegatronPolicyWorkerImpl(
             else self.cfg["logprob_batch_size"]
         )
 
-        self.model.eval()
+        for m in self.model:
+            m.eval()
 
         (
             mb_iterator,
@@ -1933,7 +2026,8 @@ class MegatronPolicyWorkerImpl(
                 the model-parallel group, or None when unavailable (e.g. clip_grad == 0 or
                 mtp_detach_heads=False). Logged under "mtp_metrics" as "grad_norm".
         """
-        mtp_num_layers = getattr(self.model.config, "mtp_num_layers", None)
+        model_config = self._get_model_config()
+        mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
         if mtp_num_layers is not None and mtp_num_layers > 0:
             from nemo_rl.models.megatron.common import get_mtp_metrics
 
@@ -1958,7 +2052,7 @@ class MegatronPolicyWorkerImpl(
 
     def _get_model_config(self):
         """Get the underlying model config (handle Float16Module wrapper)."""
-        model = self.model
+        model = self._primary_model()
         if hasattr(model, "module") and hasattr(model.module, "config"):
             return model.module.config
         elif hasattr(model, "config"):
@@ -2040,11 +2134,11 @@ class MegatronPolicyWorkerImpl(
         """
         if self._is_fp8_export():
             return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
-                self.megatron_bridge.hf_pretrained, [self.model]
+                self.megatron_bridge.hf_pretrained, self._model_chunks()
             )
         return [
             task
-            for task in self.megatron_bridge.get_conversion_tasks([self.model])
+            for task in self.megatron_bridge.get_conversion_tasks(self._model_chunks())
             if task is not None
         ]
 
@@ -2116,7 +2210,7 @@ class MegatronPolicyWorkerImpl(
             conversion_tasks = self.refit_conversion_tasks
 
         base_iter = self.megatron_bridge.export_hf_weights(
-            [self.model],
+            self.model,
             show_progress=False,
             conversion_tasks=conversion_tasks,  # used for metadata caching
         )
@@ -2299,7 +2393,7 @@ class MegatronPolicyWorkerImpl(
         # default — the user's per-stage layout overrides
         # (num_layers_in_first/last_pipeline_stage) are applied to the model
         # in setup but never make it into bridge.transformer_config.
-        config = self.model.config
+        config = self._get_model_config()
 
         assert getattr(config, "pipeline_model_parallel_layout", None) is None, (
             "nccl_reshard_refit does not support custom pipeline_model_parallel_layout yet"
@@ -2678,7 +2772,8 @@ class MegatronPolicyWorkerImpl(
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
-        self.model.eval()
+        for m in self.model:
+            m.eval()
 
         # offload grads to cpu
         self.model = self.move_model(
@@ -2700,10 +2795,12 @@ class MegatronPolicyWorkerImpl(
 
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
-        self.model = self.move_model(
-            self.model, "cuda", move_grads=True, move_params=True
-        )
-        self.model.train()
+        self.model = [
+            self.move_model(model, "cuda", move_grads=True, move_params=True)
+            for model in self.model
+        ]
+        for model in self.model:
+            model.train()
 
         # Training expects optimizer state on CUDA. Keep this unconditional rather
         # than trying to mirror every path that may have offloaded it to CPU.
@@ -2722,7 +2819,7 @@ class MegatronPolicyWorkerImpl(
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )
-        self.model.eval()
+        self._set_models_train_mode(False)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -2742,7 +2839,7 @@ class MegatronPolicyWorkerImpl(
         """
         # 1. Clear Transformer Engine workspaces
         workspace_count = 0
-        for module in self.model.modules():
+        for module in self._iter_model_modules():
             if hasattr(module, "_fp8_workspaces"):
                 module._fp8_workspaces.clear()
                 workspace_count += 1
@@ -2795,7 +2892,7 @@ class MegatronPolicyWorkerImpl(
             # Clear MoE token dispatcher persistent routing tensors.
             #
             # MoETokenDispatcher is a plain Python class (NOT an nn.Module), so iterating
-            # self.model.modules() never yields it. We must access it via the token_dispatcher
+            # model modules never yields it. We must access it via the token_dispatcher
             # attribute on MoELayer nn.Module objects.
             #
             # When recompute_mlp=True and fp8=True,
@@ -2811,7 +2908,7 @@ class MegatronPolicyWorkerImpl(
             #   - the routing tensors
             #   - the te_checkpoint ctx saved tensors
             try:
-                for module in self.model.modules():
+                for module in self._iter_model_modules():
                     if not hasattr(module, "token_dispatcher"):
                         continue
                     dispatcher = module.token_dispatcher
@@ -2859,7 +2956,8 @@ class MegatronPolicyWorkerImpl(
         no_grad = torch.no_grad()
         no_grad.__enter__()
         self.model = self.move_model(self.model, "cpu")
-        self.model.eval()
+        for m in self.model:
+            m.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
 
@@ -2873,11 +2971,20 @@ class MegatronPolicyWorkerImpl(
     @torch.no_grad()
     def move_model(
         self,
-        model: torch.nn.Module,
+        model: torch.nn.Module | list[torch.nn.Module],
         device: str,
         move_params: bool = True,
         move_grads: bool = True,
-    ) -> torch.nn.Module:
+    ):
+        # If given a list of model chunks (VPP), move each chunk and return the list.
+        if isinstance(model, list):
+            return [
+                self.move_model(
+                    chunk, device, move_params=move_params, move_grads=move_grads
+                )
+                for chunk in model
+            ]
+
         # move all param and grad buffers to the device
         if isinstance(model, DistributedDataParallel):
             # DDP case
@@ -2993,15 +3100,16 @@ class MegatronPolicyWorkerImpl(
             # Ensure model is in eval mode for consistent saving, unless actively training
             # This is a common practice, though NeMo's save might handle this.
             # For safety, if not in training loop, setting to eval.
-            is_training = self.model.training
+            is_training = self.model[0].training
             if not is_training:
-                self.model.eval()
+                for model in self.model:
+                    model.eval()
 
             if self.should_disable_forward_pre_hook:
                 self.disable_forward_pre_hook()
             save_checkpoint(
                 state=self.mcore_state,
-                model=[self.model],
+                model=self.model,
                 optimizer=optimizer_to_save,
                 opt_param_scheduler=scheduler_to_save,
                 num_floating_point_operations_so_far=self.mcore_state.train_state.floating_point_operations_so_far,
@@ -3018,8 +3126,9 @@ class MegatronPolicyWorkerImpl(
             if self.should_disable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
-            if not is_training:
-                self.model.train()
+            if not is_training:  # Restore training state if it was changed
+                for model in self.model:
+                    model.train()
 
         except Exception as e:
             print(f"Failed to save checkpoint to {weights_path}: {e}")
@@ -3105,28 +3214,31 @@ class MegatronPolicyWorkerImpl(
         non_tp_params = []
         total_params = 0
 
-        for name, param in self.model.named_parameters():
-            total_params += 1
-            tensor_model_parallel = getattr(param, "tensor_model_parallel", False)
+        for chunk in self.model:
+            for name, param in chunk.named_parameters():
+                total_params += 1
+                tensor_model_parallel = getattr(param, "tensor_model_parallel", False)
 
-            if tensor_model_parallel:
-                tp_params.append(
-                    {
-                        "name": name,
-                        "tensor_model_parallel": tensor_model_parallel,
-                        "partition_dim": getattr(param, "partition_dim", None),
-                        "partition_stride": getattr(param, "partition_stride", None),
-                        "shape": list(param.shape),
-                    }
-                )
-            else:
-                non_tp_params.append(
-                    {
-                        "name": name,
-                        "tensor_model_parallel": tensor_model_parallel,
-                        "shape": list(param.shape),
-                    }
-                )
+                if tensor_model_parallel:
+                    tp_params.append(
+                        {
+                            "name": name,
+                            "tensor_model_parallel": tensor_model_parallel,
+                            "partition_dim": getattr(param, "partition_dim", None),
+                            "partition_stride": getattr(
+                                param, "partition_stride", None
+                            ),
+                            "shape": list(param.shape),
+                        }
+                    )
+                else:
+                    non_tp_params.append(
+                        {
+                            "name": name,
+                            "tensor_model_parallel": tensor_model_parallel,
+                            "shape": list(param.shape),
+                        }
+                    )
 
         return {
             "tp_params": tp_params,
@@ -3181,7 +3293,8 @@ class MegatronPolicyWorkerImpl(
         FP8_MAX_K = _get_env_float("FP8_MAX_K", 448.0)
         FP8_MAX_V = _get_env_float("FP8_MAX_V", 448.0)
 
-        self.model.eval()
+        for m in self.model:
+            m.eval()
 
         # Record local percentile amax for q/k/v of each layer
         layer_to_samples_q: dict[str, list[float]] = defaultdict(list)
@@ -3223,7 +3336,12 @@ class MegatronPolicyWorkerImpl(
 
         matched_modules = []
         # Try to register forward_pre_hook on core_attention first
-        for name, module in self.model.named_modules():
+        all_named_modules = (
+            (name, module)
+            for chunk in self.model
+            for name, module in chunk.named_modules()
+        )
+        for name, module in all_named_modules:
             if "self_attention.core_attention" in name:
                 try:
                     handle = module.register_forward_pre_hook(
@@ -3340,6 +3458,12 @@ class MegatronPolicyWorkerImpl(
                 final_result = obj_list[0]  # type: ignore
 
         return final_result
+
+    def get_gpu_info(self) -> dict[str, Any]:
+        """Return information about the GPU being used by this worker."""
+        from nemo_rl.models.policy.utils import get_gpu_info
+
+        return get_gpu_info(self.model[0])
 
 
 @ray.remote(

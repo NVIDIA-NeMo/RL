@@ -59,6 +59,9 @@ class MegatronGenerationMixin:
      - is_generation_colocated: Whether colocated or distributed.
     """
 
+    def _model_for_generation(self):
+        return self.model[0] if isinstance(self.model, list) else self.model
+
     def _init_inference_engine_state(self) -> None:
         """Reset all inference-engine attributes to their uninitialized state."""
         self.dynamic_inference_engine = None
@@ -94,7 +97,8 @@ class MegatronGenerationMixin:
         )
         from megatron.core.utils import get_attr_wrapped_model
 
-        pg_collection = get_attr_wrapped_model(self.model, "pg_collection")
+        model = self._model_for_generation()
+        pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
         num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
@@ -115,7 +119,7 @@ class MegatronGenerationMixin:
         num_speculative_tokens = mcore_generation_config["num_speculative_tokens"]
         max_requests = mcore_generation_config.get("max_requests")
 
-        mamba_inference_state_config = MambaInferenceStateConfig.from_model(self.model)
+        mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
         is_hybrid_model = mamba_inference_state_config is not None
         if is_hybrid_model:
             if (
@@ -140,7 +144,7 @@ class MegatronGenerationMixin:
             logging_step_interval = 0
 
         # flashinfer's fused-RoPE kernel only dispatches fp16/bf16 q/k.
-        use_flashinfer_fused_rope = self.model.config.params_dtype in (
+        use_flashinfer_fused_rope = model.config.params_dtype in (
             torch.float16,
             torch.bfloat16,
         )
@@ -176,15 +180,13 @@ class MegatronGenerationMixin:
         )
 
         if "inference_cuda_graph_scope" in mcore_generation_config:
-            self.model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
+            model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
                 mcore_generation_config["inference_cuda_graph_scope"]
             ]
 
-        self.inference_context = DynamicInferenceContext(
-            self.model.config, inference_config
-        )
+        self.inference_context = DynamicInferenceContext(model.config, inference_config)
         self.inference_wrapped_model = GPTInferenceWrapper(
-            self.model, self.inference_context
+            model, self.inference_context
         )
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=self.inference_wrapped_model,
@@ -347,7 +349,7 @@ class MegatronGenerationMixin:
         print(f"[Rank {self.rank}] finishing generation", flush=True)
         log_gpu_memory("finish_generation START")
 
-        lang_module = unwrap_model(self.model)
+        lang_module = unwrap_model(self._model_for_generation())
 
         if self.is_generation_colocated:
             if self._inference_engine_initialized and not self._inference_engine_asleep:
@@ -380,12 +382,14 @@ class MegatronGenerationMixin:
         log_gpu_memory("prepare_for_generation START")
         mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
 
-        self.model.config.flash_decode = False
+        model = self._model_for_generation()
+        model.config.flash_decode = False
         if self.is_generation_colocated and self.should_disable_forward_pre_hook:
             # Bring offloaded params back to CUDA before colocated generation.
             self.model = self.move_model(
                 self.model, "cuda", move_params=True, move_grads=False
             )
+            model = self._model_for_generation()
             # DP inference schedules requests independently, so a forward pre-hook
             # cannot safely launch a parameter all-gather from only the rank that
             # received work. Gather once across every worker, then keep the hooks
@@ -393,7 +397,7 @@ class MegatronGenerationMixin:
             if self._forward_pre_hook_enabled():
                 self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
 
-        lang_module = unwrap_model(self.model)
+        lang_module = unwrap_model(model)
         lang_module.eval()
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)

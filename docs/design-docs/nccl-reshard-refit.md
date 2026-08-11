@@ -37,8 +37,8 @@ single `ValueError` listing every violation. The current requirements are:
   (`fp8_param=true` + blockwise recipe) ↔ FP8 gen (`vllm_cfg.precision=fp8`).
   BF16 train ↔ FP8 gen is not supported yet.
 * vLLM expert parallelism is supported with the NeMo RL convention
-  `expert_parallel_size == tensor_parallel_size`. 
-* Generation-side, PP > 1 is not supported. 
+  `expert_parallel_size == tensor_parallel_size`.
+* Generation-side, PP > 1 is not supported.
 
 Operational knobs:
 

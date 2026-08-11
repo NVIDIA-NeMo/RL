@@ -49,6 +49,41 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 pytestmark = pytest.mark.mcore
 
 
+class _FakeModelChunk:
+    def __init__(self):
+        self.training_modes: list[bool] = []
+        self.zero_grad_buffer_calls = 0
+        self.inference_params = object()
+
+    def train(self, mode: bool) -> None:
+        self.training_modes.append(mode)
+
+    def zero_grad_buffer(self) -> None:
+        self.zero_grad_buffer_calls += 1
+
+
+def test_value_worker_model_chunk_helpers_apply_to_all_chunks():
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    worker = MegatronValueWorkerImpl.__new__(MegatronValueWorkerImpl)
+    chunks = [_FakeModelChunk(), _FakeModelChunk()]
+    worker.model = chunks
+
+    assert worker._model_chunks() == chunks
+    assert worker._primary_model() is chunks[0]
+
+    worker._set_models_train_mode(False)
+    assert [chunk.training_modes for chunk in chunks] == [[False], [False]]
+
+    worker._zero_grad_buffer()
+    assert [chunk.zero_grad_buffer_calls for chunk in chunks] == [1, 1]
+
+    worker._clear_inference_params()
+    assert [chunk.inference_params for chunk in chunks] == [None, None]
+
+
 def _create_value_test_config(
     model_name: str,
     tp: int = 1,
