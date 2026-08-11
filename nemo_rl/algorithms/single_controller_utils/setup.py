@@ -720,17 +720,36 @@ def setup_single_controller(
     )
 
     telemetry_interval_s = master_config.rollout_checkpointing.telemetry_interval_s
-    vllm_cfg = generation_config.get("vllm_cfg", {})
-    if telemetry_interval_s is not None and not vllm_cfg.get(
-        "enable_vllm_metrics_logger", False
-    ):
-        warnings.warn(
-            "rollout_checkpointing.telemetry_interval_s is enabled, but "
-            "policy.generation.vllm_cfg.enable_vllm_metrics_logger is false. "
-            "Canonical rollout telemetry will be recorded, but vLLM token, "
-            "request, and KV-cache signals will be absent.",
-            stacklevel=2,
-        )
+    if telemetry_interval_s is not None:
+        generation_backend = generation_config["backend"]
+        if generation_backend != "vllm":
+            warnings.warn(
+                "rollout_checkpointing.telemetry_interval_s is enabled with "
+                f"policy.generation.backend={generation_backend!r}. Canonical "
+                "rollout telemetry will be recorded, but vLLM token, request, "
+                "and KV-cache signals are unavailable for this backend.",
+                stacklevel=2,
+            )
+        else:
+            vllm_cfg = generation_config["vllm_cfg"]
+            if not vllm_cfg.get("enable_vllm_metrics_logger"):
+                warnings.warn(
+                    "rollout_checkpointing.telemetry_interval_s is enabled, but "
+                    "policy.generation.vllm_cfg.enable_vllm_metrics_logger is "
+                    "false. Canonical rollout telemetry will be recorded, but "
+                    "vLLM token, request, and KV-cache signals will be absent.",
+                    stacklevel=2,
+                )
+            elif not vllm_cfg["async_engine"]:
+                warnings.warn(
+                    "rollout_checkpointing.telemetry_interval_s and "
+                    "policy.generation.vllm_cfg.enable_vllm_metrics_logger are "
+                    "enabled, but vLLM metric collection requires "
+                    "policy.generation.vllm_cfg.async_engine=true. Canonical "
+                    "rollout telemetry will be recorded, but vLLM token, request, "
+                    "and KV-cache signals will be absent.",
+                    stacklevel=2,
+                )
 
     if data_config["use_multiple_dataloader"]:
         raise NotImplementedError(
