@@ -146,9 +146,11 @@ class SglangSpecificArgs(TypedDict):
     enable_mixed_chunk: NotRequired[bool]
     # Use data parallelism for attention + tensor parallelism for FFN. dp_size must equal tp_size.
     enable_dp_attention: NotRequired[bool]
-    # Legacy MoE flags; superseded by `moe_a2a_backend` in newer SGLang. Kept for back-compat.
-    enable_deepep_moe: NotRequired[bool]
-    enable_ep_moe: NotRequired[bool]
+    # NOTE: `enable_deepep_moe` / `enable_ep_moe` used to be declared here as
+    # legacy back-compat. They were removed because they do not exist in the
+    # pinned SGLang's ServerArgs at all, so they could never be honoured:
+    # setting one was a silent no-op, and forwarding it would raise TypeError.
+    # Use `ep_size` and `moe_a2a_backend` instead.
     # Compile the model with torch.compile (experimental).
     enable_torch_compile: NotRequired[bool]
     # Maximum batch size when using torch.compile.
@@ -211,8 +213,38 @@ class SglangSpecificArgs(TypedDict):
     # Pipeline parallelism size.
     # PP > 1 does not support in current version, therefore, pp_size == 1
     pp_size: int
-    # Expert parallelism size (MoE).
+    # Expert parallelism size (MoE). SGLang splits the MoE dimension as
+    # moe_tp_size = tp_size // ep_size // moe_dp_size, so ep_size == 1 means
+    # every expert's weights are sharded across all tp_size ranks (expert
+    # tensor parallelism) and ep_size > 1 trades that for whole experts placed
+    # on distinct ranks. ep_size * moe_dp_size must divide tp_size.
     ep_size: int
+    # --- MoE parallelism (forwarded only when set) ---
+    # All-to-all dispatch backend. Anything other than "none" makes SGLang
+    # OVERRIDE ep_size to tp_size in ServerArgs._handle_a2a_moe, so the
+    # configured ep_size is advisory once this is set. "deepep" additionally
+    # needs the `deep_ep` package, which the `sglang` extra does not install
+    # today (it is carried by `mcore`, `vllm` and `automodel`), so selecting it
+    # without adding that dependency fails at engine startup.
+    moe_a2a_backend: NotRequired[
+        Literal[
+            "none",
+            "deepep",
+            "mooncake",
+            "nixl",
+            "mori",
+            "ascend_fuseep",
+            "flashinfer",
+            "megamoe",
+        ]
+        | None
+    ]
+    # Extra expert replicas for load balancing under EP. SGLang requires the
+    # resulting physical expert count to divide ep_size, which depends on the
+    # model, so it is checked there rather than here.
+    ep_num_redundant_experts: NotRequired[int | None]
+    # DeepEP dispatch mode.
+    deepep_mode: NotRequired[Literal["auto", "normal", "low_latency"] | None]
     # --- LoRA ---
     # Enable LoRA support; auto-set when `lora_paths` is provided.
     enable_lora: NotRequired[bool | None]
@@ -326,6 +358,29 @@ class SGLangRuntimeConfig(BaseModel, extra="allow"):
     dp_size: PositiveInt
     pp_size: PositiveInt
     ep_size: PositiveInt
+    # MoE parallelism. Left as None unless the operator sets them, and only
+    # forwarded to ServerArgs when set: these names have moved across SGLang
+    # releases, so sending a default nobody asked for would couple the launcher
+    # to that naming without buying anything. Deliberately NOT exposed:
+    # ``moe_dp_size`` (SGLang also requires attn_cp_size == moe_dp_size, which
+    # this launcher does not plumb) and ``moe_dense_tp_size`` (accepted only as
+    # None/1/tp_size). Exposing a knob that always fails is worse than not
+    # exposing it.
+    moe_a2a_backend: (
+        Literal[
+            "none",
+            "deepep",
+            "mooncake",
+            "nixl",
+            "mori",
+            "ascend_fuseep",
+            "flashinfer",
+            "megamoe",
+        ]
+        | None
+    ) = None
+    ep_num_redundant_experts: int | None = Field(default=None, ge=0)
+    deepep_mode: Literal["auto", "normal", "low_latency"] | None = None
     context_length: PositiveInt | None = None
     use_fault_tolerance: bool = False
     rollout_health_check_interval: PositiveFloat | None = None
@@ -357,6 +412,8 @@ class SGLangRuntimeConfig(BaseModel, extra="allow"):
                 "sglang_server_config.num_gpus_per_engine."
             )
 
+        self._validate_moe_parallelism()
+
         if self.use_fault_tolerance:
             missing = [
                 field
@@ -374,6 +431,39 @@ class SGLangRuntimeConfig(BaseModel, extra="allow"):
                     + "."
                 )
         return self
+
+    def _validate_moe_parallelism(self) -> None:
+        """Reject MoE parallelism this launcher cannot honour.
+
+        Deliberately narrow. SGLang's own constraint set is version-specific,
+        model-specific, and in places self-correcting, so mirroring it here
+        produces false rejections as readily as it prevents late failures.
+        Only two things are checked: settings that are silently ignored, and
+        the one arithmetic invariant SGLang does not fix up for us.
+        """
+        extra = self.model_extra or {}
+        legacy = [key for key in ("enable_ep_moe", "enable_deepep_moe") if key in extra]
+        if legacy:
+            raise ValueError(
+                f"{', '.join(legacy)} does not exist in the pinned SGLang's "
+                "ServerArgs and was never forwarded, so setting it did nothing. "
+                "Use ep_size for expert parallelism and moe_a2a_backend for the "
+                "all-to-all dispatch backend."
+            )
+
+        if self.moe_a2a_backend not in (None, "none"):
+            # ServerArgs._handle_a2a_moe overrides ep_size to tp_size for every
+            # non-"none" backend, so validating the configured ep_size here
+            # would reject configurations SGLang goes on to accept.
+            return
+
+        if self.tp_size % self.ep_size != 0:
+            raise ValueError(
+                f"ep_size ({self.ep_size}) must divide tp_size "
+                f"({self.tp_size}): SGLang derives moe_tp_size = tp_size // "
+                "ep_size // moe_dp_size, and the factors must reconstruct "
+                "tp_size exactly."
+            )
 
 
 def normalize_sglang_config(

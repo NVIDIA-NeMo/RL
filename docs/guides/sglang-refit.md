@@ -441,6 +441,64 @@ post-processing, and generation resume complete. Treat these as fatal:
 There is no disk-refit fallback. Diagnose and repair the failed in-memory path
 before retrying.
 
+## MoE Parallelism on the Rollout Engines
+
+SGLang splits a MoE layer as `moe_tp_size = tp_size // ep_size // moe_dp_size`.
+The default `ep_size: 1` therefore does **not** mean "no expert parallelism" —
+it means every expert's weights are sharded across all `tp_size` ranks, which
+is expert *tensor* parallelism. Raising `ep_size` shifts that balance: each
+rank group owns a subset of experts, and only when `moe_tp_size` reaches 1 does
+a rank hold whole experts. `ep_size` must divide `tp_size`, so a TP2 engine can
+run `ep_size` 1 or 2; wider expert parallelism needs wider engines
+(`num_gpus_per_engine`).
+
+| key | meaning |
+| --- | --- |
+| `ep_size` | expert-parallel width |
+| `moe_a2a_backend` | all-to-all dispatch: `none`, `deepep`, `flashinfer`, ... |
+| `ep_num_redundant_experts` | extra expert replicas for load balance |
+| `deepep_mode` | `auto`, `normal`, `low_latency` |
+
+All but `ep_size` are forwarded only when set, because these `ServerArgs` names
+have moved between SGLang releases. Two things are rejected up front:
+
+- `ep_size` that does not divide `tp_size`, when no all-to-all backend is set
+- `enable_ep_moe` / `enable_deepep_moe`, which do not exist in the pinned
+  SGLang's `ServerArgs` at all. They were previously accepted and silently
+  ignored; they now fail with a message naming the replacements.
+
+Validation stops there on purpose. SGLang's own constraint set is
+version-specific, model-specific and in places self-correcting, so mirroring it
+here produces false rejections as readily as it prevents late failures. Two
+consequences worth knowing:
+
+- **Setting any `moe_a2a_backend` other than `none` overrides `ep_size`.**
+  `ServerArgs._handle_a2a_moe` sets `ep_size = tp_size` for `deepep`,
+  `megamoe`, `mooncake`, `nixl` and `ascend_fuseep`, so the `ep_size` you
+  configure is advisory once a backend is selected.
+- **`moe_runner_backend: triton_kernel` asserts `ep_size == 1`, but only for
+  GPT-OSS models** — the assertion lives inside SGLang's model-architecture
+  branch. Plain `triton` and `flashinfer_trtllm` carry no EP restriction at
+  all. `triton_kernel` and `triton` are different backends.
+
+`moe_dp_size` and `moe_dense_tp_size` are deliberately not exposed: SGLang also
+requires `attn_cp_size == moe_dp_size`, which this launcher does not plumb, and
+`moe_dense_tp_size` is accepted only as `None`, `1` or `tp_size`. A knob that
+always fails is worse than an absent one.
+
+Two caveats before turning expert parallelism on:
+
+- **DeepEP needs a dependency that the `sglang` extra does not install.**
+  `deep_ep` is carried by the `mcore`, `vllm` and `automodel` extras only, so
+  `moe_a2a_backend: deepep` reaches SGLang and then fails its own import guard.
+  Adding it is a `pyproject.toml` plus `uv.lock` change.
+- **Refit correctness under `ep_size > 1` is unproven on hardware.** Reading
+  SGLang's `FusedMoE.weight_loader`, a rank maps each global expert id to a
+  local slot and returns early for experts it does not own, so the full HF
+  stream NeMo-RL broadcasts should land correctly with every expert owned by
+  exactly one rank — but that is a source argument, not evidence. Run the
+  value check below with `ep_size: 2` before trusting it.
+
 ## Verifying Refit Values
 
 `NRL_SGLANG_REFIT_SUCCESS` says the transfer completed, and

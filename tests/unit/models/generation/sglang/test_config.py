@@ -263,3 +263,119 @@ def test_external_router_requires_complete_endpoint():
 
     with pytest.raises(ValueError, match="sglang_router_port"):
         normalize_sglang_config(config)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda inner: inner.update(ep_size=3),
+            "must divide tp_size",
+        ),
+        (
+            lambda inner: inner.update(enable_ep_moe=True),
+            "does not exist in the pinned SGLang",
+        ),
+        (
+            lambda inner: inner.update(enable_deepep_moe=True),
+            "does not exist in the pinned SGLang",
+        ),
+    ],
+)
+def test_invalid_moe_parallelism_fails_before_startup(
+    mutate: Callable[[dict[str, Any]], None],
+    message: str,
+):
+    config = _valid_config()
+    mutate(_inner(config))
+
+    with pytest.raises(ValueError, match=message):
+        normalize_sglang_config(config)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        # ep_size must divide tp_size when no a2a backend is in play.
+        lambda inner: inner.update(ep_size=2),
+        # SGLang's _handle_a2a_moe overrides ep_size to tp_size for every
+        # non-"none" backend, so an ep_size it will overwrite must not be
+        # rejected here.
+        lambda inner: inner.update(moe_a2a_backend="deepep"),
+        lambda inner: inner.update(ep_size=2, moe_a2a_backend="deepep"),
+        lambda inner: inner.update(moe_a2a_backend="deepep", deepep_mode="low_latency"),
+        lambda inner: inner.update(ep_size=2, ep_num_redundant_experts=2),
+        # triton_kernel's ep_size==1 assertion lives in SGLang's GPT-OSS
+        # model-specific branch, so it must not be enforced generically.
+        lambda inner: inner.update(moe_runner_backend="triton_kernel", ep_size=2),
+    ],
+)
+def test_valid_moe_parallelism_is_accepted(mutate: Callable[[dict[str, Any]], None]):
+    config = _valid_config()
+    mutate(_inner(config))
+
+    normalize_sglang_config(config)
+
+
+@pytest.mark.parametrize("field", ["moe_a2a_backend", "deepep_mode"])
+def test_moe_enum_typos_are_rejected(field: str):
+    """SGLang turns these into MoeA2ABackend(...) / DeepEPMode(...) deep inside
+    engine startup, where a typo costs a full allocation to discover."""
+    config = _valid_config()
+    _inner(config)[field] = "depep"
+
+    with pytest.raises(ValidationError, match=field):
+        normalize_sglang_config(config)
+
+
+def test_moe_parallelism_is_unset_by_default():
+    """Forwarded only when configured: these ServerArgs names have moved
+    between SGLang releases, so a default nobody asked for would make the
+    launcher fail on a version that merely renamed a knob we do not use."""
+    config = _valid_config()
+
+    normalize_sglang_config(config)
+
+    inner = _inner(config)
+    for key in ("moe_a2a_backend", "ep_num_redundant_experts", "deepep_mode"):
+        assert inner[key] is None
+
+
+def test_moe_parallelism_keys_are_forwarded_to_serverargs():
+    """Guard the passthrough itself: schema acceptance means nothing if
+    `_compute_server_args` never sends the key. `enable_ep_moe` was exactly
+    that failure -- schema-visible, never forwarded, silently ignored."""
+    import ast
+    from pathlib import Path
+
+    from nemo_rl.models.generation.sglang import config as sglang_config
+
+    # Read the worker beside the config module rather than importing it:
+    # sglang_worker pulls in the SGLang stack, which the unit env lacks.
+    source = Path(sglang_config.__file__).with_name("sglang_worker.py").read_text()
+    builder = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "_compute_server_args"
+    )
+    # Only count keys inside a loop that actually assigns into kwargs, so a
+    # dead list of names cannot satisfy this test.
+    forwarded: set[str] = set()
+    for loop in (n for n in ast.walk(builder) if isinstance(n, ast.For)):
+        assigns_kwargs = any(
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "kwargs"
+            for stmt in loop.body
+            for node in ast.walk(stmt)
+        )
+        if not assigns_kwargs or not isinstance(loop.iter, ast.List):
+            continue
+        forwarded.update(
+            element.value
+            for element in loop.iter.elts
+            if isinstance(element, ast.Constant) and isinstance(element.value, str)
+        )
+
+    for key in ("moe_a2a_backend", "ep_num_redundant_experts", "deepep_mode"):
+        assert key in forwarded, f"{key} is configurable but never forwarded"

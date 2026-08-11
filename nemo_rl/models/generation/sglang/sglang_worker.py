@@ -759,6 +759,19 @@ class SGLangGenerationWorker:
             if key in sglang_cfg_inner:
                 kwargs[key] = sglang_cfg_inner[key]
 
+        # MoE parallelism, forwarded only when explicitly configured. These
+        # ServerArgs names have moved between SGLang releases, so passing a
+        # default nobody asked for would make the launcher fail on a version
+        # that merely renamed a knob we were not using.
+        for key in [
+            "moe_a2a_backend",
+            "ep_num_redundant_experts",
+            "deepep_mode",
+        ]:
+            value = sglang_cfg_inner.get(key)
+            if value is not None:
+                kwargs[key] = value
+
         return kwargs
 
     def _to_local_gpu_id(self, physical_gpu_id: int) -> int:
