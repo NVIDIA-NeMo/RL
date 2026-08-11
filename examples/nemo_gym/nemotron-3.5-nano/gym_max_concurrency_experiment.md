@@ -1,5 +1,15 @@
 # Does Ray's actor concurrency cap gate NeMo-Gym rollouts?
 
+> **Follow-up, not the primary validation.** The primary validation is the
+> 8-node before/after in
+> `examples/nemo_gym/nemotron-3-ultra/gym_max_concurrency_n8_validation.md`,
+> which lifts the cap on a failure already reproduced and measured — job
+> 5982305 pinned its rollout in-flight peak at exactly 1000 — at one eighth the
+> nodes and on the `short` QoS. This document instead *induces* a stall in a
+> healthy configuration, which is weaker evidence, and its 68-node arms would
+> compete with the pending v1 jobs. Run it only after the 8-node pair returns a
+> result.
+
 Paired validation for `env.nemo_gym.max_concurrency`, added so the single
 `NemoGym` Ray actor's admission cap is configurable instead of always sitting at
 Ray's default.
