@@ -284,7 +284,10 @@ def patch_transformers_module_dir(env_vars: dict[str, str]):
     # Prefer the explicit cache. A per-run HF_MODULES_CACHE keeps concurrent
     # runs from racing on generated module names, and deriving the directory
     # from HF_HOME instead would silently point at a different tree.
-    module_dir = os.environ.get("HF_MODULES_CACHE")
+    @pytest.fixture(autouse=True)
+    def _isolate_hf_modules_cache(self, monkeypatch):
+        """HF_MODULES_CACHE now outranks HF_HOME, so it must not leak in."""
+        monkeypatch.delenv("HF_MODULES_CACHE", raising=False)
     if module_dir is None:
         hf_home = os.environ.get("HF_HOME")
         if hf_home is None:
