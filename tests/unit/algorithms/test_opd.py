@@ -63,17 +63,17 @@ def test_student_topk_adds_sampled_tail_only_outside_support():
     teacher_target = torch.log(torch.tensor([0.2]))
 
     outside_loss = student_topk_reverse_kl_loss(
-        student_support,
-        teacher_support,
-        student_target,
-        teacher_target,
+        student_support_logprobs=student_support,
+        teacher_support_logprobs=teacher_support,
+        student_target_logprobs=student_target,
+        teacher_target_logprobs=teacher_target,
         target_in_support=torch.tensor([False]),
     )
     inside_loss = student_topk_reverse_kl_loss(
-        student_support,
-        teacher_support,
-        student_target,
-        teacher_target,
+        student_support_logprobs=student_support,
+        teacher_support_logprobs=teacher_support,
+        student_target_logprobs=student_target,
+        teacher_target_logprobs=teacher_target,
         target_in_support=torch.tensor([True]),
     )
 
