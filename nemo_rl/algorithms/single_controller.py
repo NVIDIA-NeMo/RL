@@ -66,6 +66,7 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.logger import Logger
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
@@ -369,6 +370,17 @@ class SingleControllerActor:
         grpo_cfg = self._master_config.grpo
 
         while self._train_steps < grpo_cfg.max_num_steps:
+            # nsys wraps the matched workers with capture-range=cudaProfilerApi,
+            # so without this cudaProfilerStart the .nsys-rep files come out
+            # empty. Mirrors grpo.py's per-step hook; run off the event loop
+            # since start/stop_gpu_profiling is a blocking ray.get fan-out.
+            await asyncio.to_thread(
+                maybe_gpu_profile_step, self._trainer, self._train_steps + 1
+            )
+            await asyncio.to_thread(
+                maybe_gpu_profile_step, self._gen, self._train_steps + 1
+            )
+
             version_during_step = self._trainer_version
             groups_dispatched = 0
             min_sample_version = None
@@ -537,14 +549,16 @@ class SingleControllerActor:
 
             total_time = timing_metrics.get("total_step_time", 0.0)
             total_num_gpus = int(ray.cluster_resources().get("GPU", 0))
-            if (
-                total_time > 0
-                and total_num_gpus > 0
-                and "global_valid_toks" in step_metrics
-            ):
-                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                    step_metrics["global_valid_toks"] / total_time / total_num_gpus
-                )
+            performance_metrics: dict[str, float] = {}
+            if total_time > 0 and total_num_gpus > 0:
+                if "global_valid_toks" in step_metrics:
+                    performance_metrics["valid_tokens_per_sec_per_gpu"] = (
+                        step_metrics["global_valid_toks"] / total_time / total_num_gpus
+                    )
+                if "total_num_tokens" in step_metrics:
+                    performance_metrics["tokens_per_sec_per_gpu"] = (
+                        step_metrics["total_num_tokens"] / total_time / total_num_gpus
+                    )
 
             print("\n⏱️  Timing:")
             print(f"  • Total step time: {total_time:.2f}s")
@@ -564,6 +578,9 @@ class SingleControllerActor:
             print(f"step_metrics={step_metrics}", flush=True)
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
+            )
+            self._logger.log_metrics(
+                performance_metrics, step=self._train_steps, prefix="performance"
             )
             self._logger.log_metrics(
                 timing_metrics, step=self._train_steps, prefix="timing/train"
