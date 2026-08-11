@@ -1,16 +1,14 @@
-# Profile synchronous vLLM rollouts with a plugin
+# Profile vLLM rollouts with a plugin
 
-NeMo RL can drive an optional profiler plugin around complete synchronous vLLM
-rollout attempts. One profiled attempt includes every generation turn and
+NeMo RL can drive an optional profiler plugin around complete vLLM rollout
+attempts. One profiled attempt includes every generation turn and
 `finish_generation()`. Reward processing, policy scoring, validation rollouts,
 and policy training are outside this lifecycle.
 
-The initial integration supports `tensor_parallel_size=1`,
-`pipeline_parallel_size=1`, `expert_parallel_size=1`, and
-`async_engine=false`. NeMo RL rejects a configured rollout profiler for other
-vLLM topologies before allocating generation workers. Parallel and asynchronous
-rollouts can move or overlap GPU work outside one profiled actor and do not have
-a single begin/end boundary, so they are not supported by this interface.
+The integration supports `tensor_parallel_size>=1`,
+`pipeline_parallel_size=1`, and `expert_parallel_size=1` with either synchronous
+or asynchronous vLLM engines. NeMo RL rejects a configured rollout profiler for
+pipeline- or expert-parallel topologies before allocating generation workers.
 
 ## Plugin contract
 
@@ -31,7 +29,7 @@ class MyRolloutProfiler:
         """Close the engine-initialization window identified by token."""
 
     def begin_rollout(self, *, step_id: int | str) -> None:
-        """Start profiling one complete synchronous rollout attempt."""
+        """Start profiling one complete rollout attempt."""
 
     def finish_rollout(self) -> None:
         """Finish a successful rollout attempt."""
@@ -43,15 +41,22 @@ class MyRolloutProfiler:
         """Validate and release profiler resources during worker shutdown."""
 ```
 
-NeMo RL creates one profiler instance in each model-owning
-`VllmGenerationWorker`, before model loading begins, and passes the worker's
-dense Ray rank as a keyword argument. ModelOpt synchronous vLLM workers inherit
-the same integration.
+For a synchronous TP1 engine, NeMo RL creates the profiler in the model-owning
+`VllmGenerationWorker`. For TP>1 or an asynchronous engine, NeMo RL selects a
+generic vLLM worker subclass and creates one profiler inside every GPU worker.
+The latter is necessary because the outer NeMo RL actor only coordinates the
+engine and does not launch its GPU kernels. Every profiler receives a unique,
+dense rollout rank formed from the owning NeMo RL worker's rank and the internal
+vLLM worker rank. The built-in NIXL vLLM worker is supported; another custom
+`vllm_kwargs.worker_cls` cannot currently be combined with rollout profiling.
+Synchronous TP1 ModelOpt workers inherit the outer-actor integration. ModelOpt
+modes that replace vLLM's internal GPU worker are not currently supported by
+the TP/async path.
 
 `begin_engine_initialization()` and `end_engine_initialization()` wrap
-`vllm.LLM(...)` construction. A plugin can use that separate window to observe
-one-time engine setup or compiled graph creation without charging it to measured
-rollout attempts. NeMo RL passes the exact token returned by
+vLLM worker and engine startup through model warmup and compiled graph creation.
+A plugin can use that separate window to observe one-time setup without charging
+it to measured rollout attempts. NeMo RL passes the exact token returned by
 `begin_engine_initialization()` back to the corresponding end call.
 
 The legacy and TransferQueue synchronous GRPO trainers invoke
@@ -63,9 +68,9 @@ shutdown invokes `close()`.
 ## Install the plugin
 
 Install the profiler package and its runtime dependencies in the vLLM
-generation-worker environment. Installing it only in the NeMo RL driver or a
-policy-worker environment is insufficient because rollout generation runs in a
-separate Ray actor environment.
+generation-worker environment. For TP>1 and asynchronous engines, it must also
+be importable by vLLM's internal GPU-worker processes. Installing it only in the
+NeMo RL driver or a policy-worker environment is insufficient.
 
 The profiler's module must be importable from `python-VllmGenerationWorker`. If
 it writes files, their destination must be writable from every selected worker

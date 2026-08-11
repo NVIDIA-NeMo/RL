@@ -764,8 +764,9 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
 - Megatron policy workers support optional profiler plugins around complete
   training updates. See the [policy profiler guide](docs/policy-profiler.md)
   for the plugin contract and configuration.
-- Synchronous TP1/PP1/EP1 vLLM generation workers support optional profiler
-  plugins around engine initialization and complete rollout attempts. See the
+- TP>=1/PP1/EP1 vLLM generation workers support optional profiler plugins around
+  engine initialization and complete rollout attempts for synchronous and
+  asynchronous engines. See the
   [rollout profiler guide](docs/rollout-profiler.md) for the supported scope and
   plugin contract.
 

@@ -23,7 +23,9 @@ import pytest
 
 pytest.importorskip("megatron.bridge")
 
-from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker  # noqa: E402
+from nemo_rl.models.policy.workers.base_policy_worker import (  # noqa: E402
+    AbstractPolicyWorker,
+)
 from nemo_rl.models.policy.workers.megatron_policy_worker import (  # noqa: E402
     MegatronPolicyWorkerImpl,
     _profile_policy_step,
