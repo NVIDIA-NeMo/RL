@@ -22,7 +22,7 @@ import pytest
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
-    ArealAdmissionSamplerConfig,
+    ReadyFirstSamplerConfig,
     SamplerConfig,
 )
 from nemo_rl.algorithms.grpo import GRPOConfig
@@ -274,17 +274,17 @@ class TestSetup:
         ],
         ids=["no_is_correction", "forced_on_policy_ratio"],
     )
-    def test_areal_sampler_rejects_incompatible_loss_config(
+    def test_ready_first_sampler_rejects_incompatible_loss_config(
         self,
         loss_overrides: dict,
         match: str,
         patched_factories,
     ):
-        # areal_admission is only valid with use_importance_sampling_correction=true
+        # ready_first is only valid with use_importance_sampling_correction=true
         # and force_on_policy_ratio=false; anything else is rejected at setup,
         # before any factory allocates resources.
         mc = _make_master_config(
-            sampler_cfg=ArealAdmissionSamplerConfig(max_staleness_versions=1),
+            sampler_cfg=ReadyFirstSamplerConfig(max_staleness_versions=1),
             loss_cfg=ClippedPGLossConfig(**loss_overrides),
         )
 

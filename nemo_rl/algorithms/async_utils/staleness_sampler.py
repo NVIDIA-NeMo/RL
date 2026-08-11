@@ -28,7 +28,7 @@ loop in one object, injected into both pumps:
     knobs, so those consumers can't drift out of sync with the sampler.
 
 ``PromptGroupSampler`` is the interface; ``WindowedSampler`` /
-``ArealAdmissionSampler`` / ``WeightFifoSampler`` / ``InOrderSampler`` are the
+``ReadyFirstSampler`` / ``WeightFifoSampler`` / ``InOrderSampler`` are the
 built-in policies, one per behavior, each owning only the args that apply to it.
 ``create_sampler`` builds one from a discriminated-union config (or a
 ``module:ClassName`` FQN for a policy defined outside this repo) — the config's
@@ -301,8 +301,8 @@ class _GatedSampler(BaseSampler):
         return None
 
 
-class ArealAdmissionSampler(_GatedSampler):
-    """AReaL-style gated admission with mixed-version selection.
+class ReadyFirstSampler(_GatedSampler):
+    """Gated admission with ready-first, mixed-version selection.
 
     Admission limits generation to ``max_staleness_versions`` dispatch batches
     ahead of the current trainer version. Selection remains ready-first across
@@ -451,8 +451,8 @@ class WindowedSamplerConfig(BaseModel, extra="allow"):
     sample_freshest_first: bool = False
 
 
-class ArealAdmissionSamplerConfig(BaseModel, extra="allow"):
-    name: Literal["areal_admission"] = "areal_admission"
+class ReadyFirstSamplerConfig(BaseModel, extra="allow"):
+    name: Literal["ready_first"] = "ready_first"
     # Dispatch lookahead and, when eviction is enabled, selectable weight window.
     max_staleness_versions: NonNegativeInt = 1
     # Keep late stragglers trainable by default; enable for a hard staleness cap.
@@ -484,7 +484,7 @@ class CustomSamplerConfig(BaseModel, extra="allow"):
 SamplerConfig = Annotated[
     Union[
         WindowedSamplerConfig,
-        ArealAdmissionSamplerConfig,
+        ReadyFirstSamplerConfig,
         WeightFifoSamplerConfig,
         InOrderSamplerConfig,
         CustomSamplerConfig,
@@ -498,7 +498,7 @@ def required_buffer_capacity_for_config(
     groups_per_step: int,
 ) -> Optional[int]:
     """Return a built-in sampler's required capacity without constructing it."""
-    if isinstance(cfg, ArealAdmissionSamplerConfig):
+    if isinstance(cfg, ReadyFirstSamplerConfig):
         return _gated_required_buffer_capacity(
             groups_per_step,
             gate_window=cfg.max_staleness_versions,
@@ -527,8 +527,8 @@ def create_sampler(
             max_staleness_versions=cfg.max_staleness_versions,
             sample_freshest_first=cfg.sample_freshest_first,
         )
-    if isinstance(cfg, ArealAdmissionSamplerConfig):
-        return ArealAdmissionSampler(
+    if isinstance(cfg, ReadyFirstSamplerConfig):
+        return ReadyFirstSampler(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             evict_stale_samples=cfg.evict_stale_samples,

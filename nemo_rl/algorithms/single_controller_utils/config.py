@@ -20,8 +20,8 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
-    ArealAdmissionSamplerConfig,
     InOrderSamplerConfig,
+    ReadyFirstSamplerConfig,
     SamplerConfig,
     required_buffer_capacity_for_config,
 )
@@ -119,15 +119,15 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         sampler_name=async_config.sampler.name,
     )
 
-    if isinstance(async_config.sampler, ArealAdmissionSamplerConfig):
+    if isinstance(async_config.sampler, ReadyFirstSamplerConfig):
         if not master_config.loss_fn.use_importance_sampling_correction:
             raise ValueError(
-                "the areal_admission sampler requires "
+                "the ready_first sampler requires "
                 "loss_fn.use_importance_sampling_correction=true"
             )
         if master_config.loss_fn.force_on_policy_ratio:
             raise ValueError(
-                "the areal_admission sampler requires "
+                "the ready_first sampler requires "
                 "loss_fn.force_on_policy_ratio=false so prev_logprobs are used"
             )
 
