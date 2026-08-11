@@ -407,10 +407,28 @@ def _validate_topk_opd_config(
         raise NotImplementedError(
             "Top-k OPD currently supports only grpo.async_grpo.enabled=true."
         )
-    if policy_config["sequence_packing"]["enabled"]:
-        raise NotImplementedError("Top-k OPD does not yet support sequence packing.")
-    if megatron_cfg.get("context_parallel_size", 1) != 1:
-        raise NotImplementedError("Top-k OPD does not yet support context parallelism.")
+    packing_enabled = policy_config["sequence_packing"]["enabled"]
+    context_parallel_size = megatron_cfg.get("context_parallel_size", 1)
+    if topk_source == "student":
+        if packing_enabled:
+            raise NotImplementedError(
+                "Student-top-k OPD does not yet support sequence packing."
+            )
+        if context_parallel_size != 1:
+            raise NotImplementedError(
+                "Student-top-k OPD does not yet support context parallelism."
+            )
+    elif topk_source == "teacher":
+        if context_parallel_size != 1 and not packing_enabled:
+            raise NotImplementedError(
+                "Teacher-top-k OPD requires sequence packing when context "
+                "parallelism is enabled."
+            )
+        if packing_enabled and not policy_config["sequence_packing"]["fuse_loss"]:
+            raise NotImplementedError(
+                "Packed teacher-top-k OPD requires "
+                "policy.sequence_packing.fuse_loss=true."
+            )
     if not megatron_cfg.get("enabled", False):
         raise NotImplementedError(
             "Top-k OPD currently requires the Megatron policy backend."
@@ -424,10 +442,6 @@ def _validate_topk_opd_config(
         raise NotImplementedError(
             "Top-k OPD currently requires unfiltered training distributions "
             "(policy.generation.top_k=null and top_p=1.0)."
-        )
-    if float(generation_config.get("temperature", 1.0)) != 1.0:
-        raise NotImplementedError(
-            "Top-k OPD currently requires policy.generation.temperature=1.0."
         )
     if master_config.loss_fn.reference_policy_kl_penalty != 0:
         raise ValueError("Top-k OPD requires loss_fn.reference_policy_kl_penalty=0.")
@@ -2274,6 +2288,32 @@ def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch
             teacher_logprobs, pad_width, value=0.0
         )
     return teacher_logprobs
+
+
+def _attach_teacher_topk_from_replay(
+    *,
+    train_data: BatchedDataDict[Any],
+    support_indices: Optional[torch.Tensor],
+    support_logprobs: Optional[torch.Tensor],
+) -> None:
+    """Validate, pad, and attach collection-time teacher support for training."""
+    if support_indices is None or support_logprobs is None:
+        raise ValueError(
+            "Teacher-top-k OPD requires collection-time teacher support in the "
+            "replay batch."
+        )
+    if support_indices.shape != support_logprobs.shape:
+        raise ValueError(
+            "Teacher top-k indices and logprobs must have matching shapes, got "
+            f"{support_indices.shape} and {support_logprobs.shape}."
+        )
+    train_sequence_length = train_data["input_ids"].shape[1]
+    train_data["opd_support_indices"] = _pad_teacher_logprobs(
+        support_indices, train_sequence_length
+    )
+    train_data["teacher_support_logprobs"] = _pad_teacher_logprobs(
+        support_logprobs, train_sequence_length
+    )
 
 
 def _create_advantage_estimator(master_config: MasterConfig):
@@ -4872,28 +4912,17 @@ def async_grpo_train(
                             rollout_metrics["teacher_support_logprob_time"] = (
                                 teacher_support_time
                             )
+                            train_data["opd_support_indices"] = support_indices
+                            train_data["teacher_support_logprobs"] = (
+                                teacher_support_logprobs
+                            )
                         else:
                             assert topk_source == "teacher"
-                            if (
-                                trajectory_teacher_topk_indices is None
-                                or trajectory_teacher_topk_logprobs is None
-                            ):
-                                raise ValueError(
-                                    "Teacher-top-k OPD requires collection-time "
-                                    "teacher support in the replay batch."
-                                )
-                            support_indices = _pad_teacher_logprobs(
-                                trajectory_teacher_topk_indices,
-                                train_data["input_ids"].shape[1],
+                            _attach_teacher_topk_from_replay(
+                                train_data=train_data,
+                                support_indices=trajectory_teacher_topk_indices,
+                                support_logprobs=trajectory_teacher_topk_logprobs,
                             )
-                            teacher_support_logprobs = _pad_teacher_logprobs(
-                                trajectory_teacher_topk_logprobs,
-                                train_data["input_ids"].shape[1],
-                            )
-                        train_data["opd_support_indices"] = support_indices
-                        train_data["teacher_support_logprobs"] = (
-                            teacher_support_logprobs
-                        )
 
                     if not skip_reference_logprobs:
                         train_data["reference_policy_logprobs"] = (

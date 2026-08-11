@@ -112,6 +112,22 @@ def test_get_topk_logits_can_return_normalized_logprobs():
     assert result["topk_indices"].shape == (2, 3, 2)
     assert result["topk_logprobs"].shape == (2, 3, 2)
     assert result["logprobs"].shape == (2, 3)
+    torch.testing.assert_close(
+        result["topk_indices"],
+        torch.tensor([[[1, 2], [3, 4], [0, 0]], [[5, 6], [7, 8], [0, 0]]]),
+    )
+    torch.testing.assert_close(
+        result["topk_logprobs"],
+        torch.tensor(
+            [
+                [[-0.1, -1.1], [-0.2, -1.2], [0.0, 0.0]],
+                [[-0.3, -1.3], [-0.4, -1.4], [0.0, 0.0]],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        result["logprobs"], torch.tensor([[0.0, -0.5, 0.0], [0.0, -0.7, 0.0]])
+    )
     postprocessor = forward_backward.call_args.kwargs["post_processing_fn"]
     assert postprocessor.return_logprobs is True
 

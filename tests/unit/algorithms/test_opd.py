@@ -824,6 +824,42 @@ def test_pad_teacher_logprobs():
         _pad_teacher_logprobs(torch.ones(2, 6), 4)
 
 
+def test_attach_teacher_topk_from_replay_validates_pads_and_assigns_support():
+    from nemo_rl.algorithms.grpo import _attach_teacher_topk_from_replay
+
+    indices = torch.tensor([[[5, 6], [7, 8]]], dtype=torch.long)
+    logprobs = torch.tensor([[[-0.1, -0.2], [-0.3, -0.4]]])
+    train_data = BatchedDataDict({"input_ids": torch.ones(1, 4, dtype=torch.long)})
+
+    _attach_teacher_topk_from_replay(
+        train_data=train_data,
+        support_indices=indices,
+        support_logprobs=logprobs,
+    )
+
+    padded_indices = train_data["opd_support_indices"]
+    padded_logprobs = train_data["teacher_support_logprobs"]
+    assert padded_indices.dtype == torch.long
+    torch.testing.assert_close(padded_indices[:, :2], indices)
+    torch.testing.assert_close(padded_indices[:, 2:], torch.zeros(1, 2, 2).long())
+    torch.testing.assert_close(padded_logprobs[:, :2], logprobs)
+    torch.testing.assert_close(padded_logprobs[:, 2:], torch.zeros(1, 2, 2))
+
+    with pytest.raises(ValueError, match="collection-time teacher support"):
+        _attach_teacher_topk_from_replay(
+            train_data=train_data,
+            support_indices=None,
+            support_logprobs=logprobs,
+        )
+
+    with pytest.raises(ValueError, match="matching shapes"):
+        _attach_teacher_topk_from_replay(
+            train_data=train_data,
+            support_indices=indices,
+            support_logprobs=logprobs[..., :1],
+        )
+
+
 def test_create_advantage_estimator_opd_branch():
     import warnings
     from types import SimpleNamespace

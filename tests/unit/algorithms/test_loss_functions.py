@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -25,6 +26,7 @@ from nemo_rl.algorithms.loss import (
     DPOLossFn,
     NLLLossFn,
     prepare_loss_input,
+    prepare_packed_loss_input,
 )
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
@@ -189,6 +191,74 @@ def test_prepare_student_topk_opd_loss_input_uses_full_vocab_normalization():
     expected_support = full_logprobs.gather(-1, data["opd_support_indices"])[:, :-1]
     torch.testing.assert_close(loss_input["current_support_logprobs"], expected_support)
     assert loss_input["next_token_logprobs"].shape == (1, 2)
+
+
+def test_prepare_packed_teacher_topk_opd_loss_input_restores_sequence_alignment():
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            disable_ppo_ratio=True,
+            reference_policy_kl_penalty=0.0,
+        ),
+        opd_topk=2,
+    )
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[10, 11, 12, 0], [20, 21, 0, 0]]),
+            "opd_support_indices": torch.tensor(
+                [
+                    [[1, 2], [3, 4], [5, 6], [0, 0]],
+                    [[7, 8], [9, 10], [0, 0], [0, 0]],
+                ]
+            ),
+        }
+    )
+    logits = torch.randn(1, 4, 8)
+    cu_seqlens = torch.tensor([0, 3, 5])
+    cu_seqlens_padded = torch.tensor([0, 4, 8])
+    tp_group = MagicMock(name="tp_group")
+    cp_group = MagicMock(name="cp_group")
+    selected_full = torch.arange(24, dtype=torch.float32).reshape(1, 8, 3)
+
+    with (
+        patch(
+            "nemo_rl.algorithms.loss.utils.torch.distributed.get_world_size",
+            side_effect=lambda group: 2 if group is cp_group else 1,
+        ),
+        patch(
+            "nemo_rl.algorithms.loss.utils.torch.distributed.get_rank",
+            return_value=0,
+        ),
+        patch(
+            "nemo_rl.algorithms.loss.utils.gather_vocab_parallel_logprobs_at_indices",
+            return_value=selected_full,
+        ) as gather_selected,
+    ):
+        loss_input, _ = prepare_packed_loss_input(
+            logits=logits,
+            data=data,
+            loss_fn=loss_fn,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            vocab_parallel_rank=0,
+            vocab_parallel_group=tp_group,
+            context_parallel_group=cp_group,
+            chunk_size=2,
+        )
+
+    assert gather_selected.call_args.args[1].shape == (1, 4, 3)
+    torch.testing.assert_close(
+        loss_input["current_support_logprobs"],
+        torch.tensor(
+            [
+                [[0.0, 1.0], [3.0, 4.0], [0.0, 0.0]],
+                [[12.0, 13.0], [0.0, 0.0], [0.0, 0.0]],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        loss_input["next_token_logprobs"],
+        torch.tensor([[2.0, 5.0, 0.0], [14.0, 0.0, 0.0]]),
+    )
 
 
 def test_nll_loss():

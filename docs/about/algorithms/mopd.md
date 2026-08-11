@@ -122,10 +122,12 @@ on_policy_distillation:
 
 > [!NOTE]
 > Top-k mode currently requires async GRPO, a Megatron policy backend,
-> token-level loss, `loss_fn.disable_ppo_ratio: true`, sequence packing disabled,
-> context parallel size 1, fused linear log-probabilities disabled, and an
-> unfiltered training distribution (`generation.top_k: null`, `top_p: 1.0`,
-> `temperature: 1.0`).
+> token-level loss, `loss_fn.disable_ppo_ratio: true`, fused linear
+> log-probabilities disabled, and an unfiltered training distribution
+> (`generation.top_k: null`, `top_p: 1.0`). Student-selected top-k additionally
+> requires sequence packing disabled and context parallel size 1.
+> Teacher-selected top-k supports packing and context parallelism when
+> `policy.sequence_packing.fuse_loss: true`; context parallelism requires packing.
 > CISPO, dual PPO clipping, and sequence-level importance ratios are unsupported.
 
 Top-k training reports four additional metrics:

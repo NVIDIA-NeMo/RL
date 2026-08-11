@@ -356,18 +356,20 @@ class TeacherWorkerGroup:
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[TopkLogprobsOutputSpec]:
         """Return target logprobs and teacher-selected support in one forward."""
-        if self.use_sequence_packing:
-            raise NotImplementedError(
-                "Teacher-selected top-k does not yet support sequence packing."
-            )
-        if self.cfg["megatron_cfg"]["context_parallel_size"] != 1:
-            raise NotImplementedError(
-                "Teacher-selected top-k does not yet support context parallelism."
-            )
-
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         mbs = micro_batch_size or self._micro_batch_size
-        sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+        if self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+            unsorted_data_indices = None
         futures = self.worker_group.run_all_workers_sharded_data(
             "get_topk_logits",
             data=sharded_data,
@@ -389,7 +391,7 @@ class TeacherWorkerGroup:
             },
         )
         worker_batches = self.worker_group.get_all_worker_results(futures)
-        return BatchedDataDict[TopkLogprobsOutputSpec](
+        result = BatchedDataDict[TopkLogprobsOutputSpec](
             {
                 "reference_logprobs": torch.cat(
                     [batch["logprobs"] for batch in worker_batches], dim=0
@@ -402,6 +404,9 @@ class TeacherWorkerGroup:
                 ).cpu(),
             }
         )
+        if unsorted_data_indices is not None:
+            result.reorder_data(unsorted_data_indices)
+        return result
 
     def shutdown(self) -> bool:
         """Shut down all workers and clean up resources."""

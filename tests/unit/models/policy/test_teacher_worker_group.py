@@ -172,3 +172,49 @@ def test_get_topk_logprobs_routes_shards_and_preserves_worker_order():
         "micro_batch_size": 3,
         "return_logprobs": True,
     }
+
+
+def test_get_topk_logprobs_packs_and_restores_original_order():
+    from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
+
+    teacher = object.__new__(TeacherWorkerGroup)
+    teacher.use_sequence_packing = True
+    teacher.sequence_packing_args = {
+        "algorithm": "first_fit_decreasing",
+        "input_key": "input_ids",
+        "input_lengths_key": "input_lengths",
+        "sequence_length_pad_multiple": 4,
+    }
+    teacher.cfg = {
+        "megatron_cfg": {"context_parallel_size": 2},
+        "sequence_packing": {"logprob_mb_tokens": 128},
+    }
+    teacher._micro_batch_size = 3
+    teacher.sharding_annotations = MagicMock()
+    teacher.sharding_annotations.get_axis_size.return_value = 1
+    teacher.worker_group = MagicMock()
+    teacher.worker_group.run_all_workers_sharded_data.return_value = ["future"]
+    sorted_indices = torch.tensor([[[10, 11]], [[20, 21]]])
+    sorted_support = torch.tensor([[[-1.0, -2.0]], [[-3.0, -4.0]]])
+    sorted_targets = torch.tensor([[-0.1], [-0.2]])
+    teacher.worker_group.get_all_worker_results.return_value = [
+        {
+            "logprobs": sorted_targets,
+            "topk_indices": sorted_indices,
+            "topk_logprobs": sorted_support,
+        }
+    ]
+    data = MagicMock()
+    data.shard_by_batch_size.return_value = (["packed_shard"], [1, 0])
+
+    result = teacher.get_topk_logprobs(data, k=2)
+
+    torch.testing.assert_close(result["topk_indices"], sorted_indices.flip(0))
+    torch.testing.assert_close(result["topk_logprobs"], sorted_support.flip(0))
+    torch.testing.assert_close(result["reference_logprobs"], sorted_targets.flip(0))
+    assert teacher.sequence_packing_args["max_tokens_per_microbatch"] == 128
+    data.shard_by_batch_size.assert_called_once_with(
+        1,
+        batch_size=None,
+        sequence_packing_args=teacher.sequence_packing_args,
+    )

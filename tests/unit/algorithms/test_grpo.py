@@ -194,7 +194,10 @@ def _enable_valid_topk(master_config: MasterConfig, source: str = "student") -> 
     master_config.grpo.async_grpo.enabled = True
     master_config.grpo.adv_estimator.name = "opd"
     master_config.loss_fn.reference_policy_kl_penalty = 0
-    master_config.policy["sequence_packing"] = {"enabled": False}
+    master_config.policy["sequence_packing"] = {
+        "enabled": False,
+        "fuse_loss": False,
+    }
     master_config.policy["megatron_cfg"] = {
         "enabled": True,
         "context_parallel_size": 1,
@@ -210,6 +213,7 @@ def test_validate_topk_opd_config_accepts_supported_settings(
 ):
     master_config = mock_grpo_components["master_config"]
     _enable_valid_topk(master_config, source)
+    master_config.policy["generation"]["temperature"] = 0.7
 
     _validate_topk_opd_config(master_config, opd_topk=8, topk_source=source)
 
@@ -223,7 +227,6 @@ def test_validate_topk_opd_config_accepts_supported_settings(
         ("context_parallel", NotImplementedError, "context parallelism"),
         ("non_megatron", NotImplementedError, "Megatron policy backend"),
         ("filtered_sampling", NotImplementedError, "unfiltered training distributions"),
-        ("temperature", NotImplementedError, "generation.temperature=1.0"),
         ("reference_kl", ValueError, "reference_policy_kl_penalty=0"),
         ("adv_estimator", ValueError, "adv_estimator.name='opd'"),
     ],
@@ -246,8 +249,6 @@ def test_validate_topk_opd_config_rejects_unsupported_settings(
         master_config.policy["megatron_cfg"]["enabled"] = False
     elif invalid_setting == "filtered_sampling":
         master_config.policy["generation"]["top_k"] = 16
-    elif invalid_setting == "temperature":
-        master_config.policy["generation"]["temperature"] = 0.7
     elif invalid_setting == "reference_kl":
         master_config.loss_fn.reference_policy_kl_penalty = 0.01
     elif invalid_setting == "adv_estimator":
@@ -255,6 +256,48 @@ def test_validate_topk_opd_config_rejects_unsupported_settings(
 
     with pytest.raises(error_type, match=message):
         _validate_topk_opd_config(master_config, opd_topk=8, topk_source="student")
+
+
+def test_validate_teacher_topk_accepts_packing_and_context_parallelism(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    master_config.policy["sequence_packing"] = {
+        "enabled": True,
+        "fuse_loss": True,
+    }
+    master_config.policy["megatron_cfg"]["context_parallel_size"] = 2
+
+    _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
+
+
+@pytest.mark.parametrize(
+    ("packing_enabled", "fuse_loss", "context_parallel_size", "message"),
+    [
+        (False, False, 2, "requires sequence packing"),
+        (True, False, 1, "fuse_loss=true"),
+    ],
+)
+def test_validate_teacher_topk_rejects_incomplete_packed_configuration(
+    mock_grpo_components,
+    packing_enabled,
+    fuse_loss,
+    context_parallel_size,
+    message,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    master_config.policy["sequence_packing"] = {
+        "enabled": packing_enabled,
+        "fuse_loss": fuse_loss,
+    }
+    master_config.policy["megatron_cfg"]["context_parallel_size"] = (
+        context_parallel_size
+    )
+
+    with pytest.raises(NotImplementedError, match=message):
+        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
 
 
 @pytest.fixture
