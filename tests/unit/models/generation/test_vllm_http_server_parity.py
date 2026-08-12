@@ -21,12 +21,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import ray
 import requests
 
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 from tests.unit.models.generation.chat_template_parity_common import (
     FOLLOWUP_USER_MSG,
     GENERATION_TOKEN_IDS_FIELD,
@@ -88,11 +90,12 @@ _BASE_VLLM_CFG: VllmConfig = {
 
 
 def _wait_for_server(base_url: str, timeout: int = 180) -> None:
+    health_url = base_url.rstrip("/").removesuffix("/v1") + "/health"
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            requests.get(base_url, timeout=3)
-            return
+            if requests.get(health_url, timeout=3).status_code == 200:
+                return
         except Exception:
             pass
         time.sleep(2)
@@ -243,13 +246,112 @@ def _load_golden(reasoning_parser: str) -> dict[str, Any]:
     return golden
 
 
+@pytest.fixture(scope="module")
+def tokenizer():
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL, revision=MODEL_REVISION, trust_remote_code=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def _parse_with_vllm(
+    tokenizer,
+    *,
+    raw_output: str,
+    reasoning_parser: str | None,
+    tool_parser: str | None,
+    tools: list[dict[str, Any]] | None,
+    enable_thinking: bool,
+    reasoning_at_start: bool = False,
+) -> dict[str, Any]:
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[{"role": "user", "content": "parser contract"}],
+        tools=tools,
+        chat_template_kwargs={"enable_thinking": enable_thinking},
+    )
+    reasoning_content = ""
+    content: str | None = raw_output
+
+    if reasoning_parser is not None:
+        parser_input = "<think>" + raw_output if reasoning_at_start else raw_output
+        parser_type = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
+        parser = parser_type(tokenizer)
+        reasoning_content, content = parser.extract_reasoning(parser_input, request)
+        reasoning_content = reasoning_content or ""
+
+    normalized_calls: list[dict[str, Any]] = []
+    if tool_parser is not None and tools and content:
+        parser_type = ToolParserManager.get_tool_parser(tool_parser)
+        parser = parser_type(tokenizer, request.tools)
+        parsed = parser.extract_tool_calls(content, request)
+        if parsed.tools_called:
+            content = parsed.content
+            for call in parsed.tool_calls:
+                arguments = call.function.arguments
+                normalized_calls.append(
+                    {
+                        "name": call.function.name,
+                        "arguments": (
+                            json.loads(arguments)
+                            if isinstance(arguments, str)
+                            else arguments
+                        ),
+                    }
+                )
+
+    return {
+        "reasoning_content": reasoning_content,
+        "content": content,
+        "tool_calls": normalized_calls,
+    }
+
+
+@pytest.mark.parametrize("reasoning_parser", tuple(PARSER_SCENARIOS))
+def test_reasoning_parser_contracts(tokenizer, reasoning_parser: str) -> None:
+    for case in REASONING_PARSER_CONTRACT_CASES:
+        actual = _parse_with_vllm(
+            tokenizer,
+            raw_output=case["raw_output"],
+            reasoning_parser=reasoning_parser,
+            tool_parser="hermes",
+            tools=[TOOL_DEF],
+            enable_thinking=case["enable_thinking"],
+            reasoning_at_start=case["reasoning_at_start"],
+        )
+        assert actual == case["expected"], "vLLM %s reasoning contract %r failed" % (
+            reasoning_parser,
+            case["name"],
+        )
+
+
+def test_tool_parser_contracts(tokenizer) -> None:
+    for case in TOOL_PARSER_CONTRACT_CASES:
+        actual = _parse_with_vllm(
+            tokenizer,
+            raw_output=case["raw_output"],
+            reasoning_parser=None,
+            tool_parser="hermes",
+            tools=[TOOL_DEF],
+            enable_thinking=False,
+        )
+        actual_norm = {**actual, "content": (actual["content"] or "").strip() or None}
+        assert actual_norm == case["expected"], (
+            "vLLM Hermes tool contract %r failed" % case["name"]
+        )
+
+
 @pytest.fixture(scope="module", params=tuple(PARSER_SCENARIOS))
 def vllm_server(
     request: pytest.FixtureRequest,
-) -> Iterator[tuple[str, str, list[int], list[int], VllmGeneration]]:
+    tokenizer,
+) -> Iterator[tuple[str, str, list[int], list[int]]]:
     reasoning_parser = request.param
     _load_golden(reasoning_parser)
-    from transformers import AutoTokenizer
 
     cluster = RayVirtualCluster(
         bundle_ct_per_node_list=[1],
@@ -258,11 +360,6 @@ def vllm_server(
         num_gpus_per_node=1,
         name=f"vllm-parity-{reasoning_parser}-cluster",
     )
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL, revision=MODEL_REVISION, trust_remote_code=True
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
     raw_cfg = deepcopy(_BASE_VLLM_CFG)
     raw_cfg["vllm_cfg"]["http_server_serving_chat_kwargs"]["reasoning_parser"] = (
         reasoning_parser
@@ -275,68 +372,16 @@ def vllm_server(
     _wait_for_server(base_urls[0])
     tool_call_start = tokenizer.encode("<tool_call>", add_special_tokens=False)
     tool_call_end = tokenizer.encode("</tool_call>", add_special_tokens=False)
-    yield reasoning_parser, base_urls[0], tool_call_start, tool_call_end, gen
+    yield reasoning_parser, base_urls[0], tool_call_start, tool_call_end
     gen.shutdown()
     cluster.shutdown()
 
 
-def _parse_with_vllm(
-    gen: VllmGeneration,
-    *,
-    raw_output: str,
-    reasoning_parser: str | None,
-    enable_thinking: bool,
-    reasoning_at_start: bool = False,
-) -> dict[str, Any]:
-    worker_idx = gen.worker_group.get_dp_leader_worker_idx(0)
-    result_ref = gen.worker_group.run_single_worker_single_data(
-        "parse_chat_output",
-        worker_idx=worker_idx,
-        raw_output=raw_output,
-        reasoning_parser=reasoning_parser,
-        tool_parser="hermes",
-        tools=[TOOL_DEF],
-        enable_thinking=enable_thinking,
-        reasoning_at_start=reasoning_at_start,
-    )
-    return ray.get(result_ref)
-
-
 def test_parity(
-    vllm_server: tuple[str, str, list[int], list[int], VllmGeneration],
+    vllm_server: tuple[str, str, list[int], list[int]],
 ) -> None:
-    reasoning_parser, base_url, tool_call_start, tool_call_end, gen = vllm_server
+    reasoning_parser, base_url, tool_call_start, tool_call_end = vllm_server
     golden = _load_golden(reasoning_parser)
-
-    for case in REASONING_PARSER_CONTRACT_CASES:
-        actual = _parse_with_vllm(
-            gen,
-            raw_output=case["raw_output"],
-            reasoning_parser=reasoning_parser,
-            enable_thinking=case["enable_thinking"],
-            reasoning_at_start=case["reasoning_at_start"],
-        )
-        assert actual == case["expected"], "vLLM %s reasoning contract %r failed" % (
-            reasoning_parser,
-            case["name"],
-        )
-
-    # Hermes cases need only one parser-parametrized server.
-    if reasoning_parser == "qwen3":
-        for case in TOOL_PARSER_CONTRACT_CASES:
-            actual = _parse_with_vllm(
-                gen,
-                raw_output=case["raw_output"],
-                reasoning_parser=None,
-                enable_thinking=False,
-            )
-            actual_norm = {
-                **actual,
-                "content": (actual["content"] or "").strip() or None,
-            }
-            assert actual_norm == case["expected"], (
-                "vLLM Hermes tool contract %r failed" % case["name"]
-            )
 
     suffix_mismatches = []
     for scenario_name, enable_thinking in PARSER_SCENARIOS[reasoning_parser]:
