@@ -158,7 +158,7 @@ train against the wrong likelihood:
   Optimization*, ICLR 2026.
   [paper](https://openreview.net/forum?id=JaqvespRBP) ·
   [arXiv:2510.08554](https://arxiv.org/abs/2510.08554) ·
-  [code](https://github.com/KevinRojas1499/GDPO).
+  [code](https://github.com/kevinrojas1499/GDPO).
   The SDMC ELBO estimator and the sequence-level objective implemented here.
 - **d1** — Zhao, Gupta, Zheng and Grover, *d1: Scaling Reasoning in Diffusion
   Large Language Models via Reinforcement Learning*, NeurIPS 2025.
