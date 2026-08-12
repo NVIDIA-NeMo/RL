@@ -13,6 +13,11 @@ policy:
       env_vars:
         VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "0"
       gpu_memory_utilization: 0.5
+      quantization_ignored_layer_kws:
+        - linear_attn.conv1d
+        - linear_attn.in_proj_a
+        - linear_attn.in_proj_b
+        - visual
   megatron_cfg:
     moe_router_dtype: fp32
     mtp_num_layers: 0
