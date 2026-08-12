@@ -311,6 +311,16 @@ def _stage_fixture_with_routes(tq_client, name: str, *, rollout_id: str):
     return receipt.model_dump(), row, routes_by_call
 
 
+def _gym_linearize_supports_routes() -> bool:
+    from nemo_gym.token_id_capture.staging.rebuild import LinearizedRow
+
+    return "routed_experts" in getattr(LinearizedRow, "__dataclass_fields__", {})
+
+
+@pytest.mark.skipif(
+    not _gym_linearize_supports_routes(),
+    reason="Gym pin predates LinearizedRow.routed_experts (Gym PR #2278 R3 follow-up)",
+)
 def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
     group_id = "grpr3"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
@@ -360,6 +370,10 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
     assert bool(placeholder.eq(-1).all().item())
 
 
+@pytest.mark.skipif(
+    not _gym_linearize_supports_routes(),
+    reason="Gym pin predates LinearizedRow.routed_experts (Gym PR #2278 R3 follow-up)",
+)
 def test_finalize_group_router_replay_without_routes_fails_loudly(
     tq_client, r3_partitions
 ):
