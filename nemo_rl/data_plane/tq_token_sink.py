@@ -150,6 +150,15 @@ class TQTokenSink:
                 tags=tags,
             )
         except Exception as error:  # noqa: BLE001 — any failure must poison, not crash serving
+            # The reason string is dropped downstream (_failed_coords carries
+            # only the disposition) — this log line is the only place the
+            # actual stage failure is visible.
+            logging.getLogger(__name__).warning(
+                "TQTokenSink.stage failed for %s: %s: %s",
+                key,
+                type(error).__name__,
+                error,
+            )
             return StageResult(
                 ok=False, staging_key=key, error=f"{type(error).__name__}: {error}"
             )
