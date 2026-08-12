@@ -78,6 +78,30 @@ that is already fixed in review. Read the `BRIDGE_REF=` line rather than
 assuming: if it names a branch, the run is not on the shipped combination, and
 that belongs in the report note.
 
+A second lag is easy to miss. When the Bridge fix has already merged (or the
+agent's draft was closed as superseded by a merged PR) but NeMo-RL has not yet
+bumped the submodule, `known_issues.py refresh` correctly retires the entry and
+`pending-fix-ref` returns nothing. Default suite runs then fall back to the
+stale pin and can fail every L1 test at import (e.g. the FSDP
+`isinstance() arg 2 must be a type` break after Bridge#5431). Before trusting a
+baseline or blaming a labeled PR, check whether Bridge `main` (or an open
+NeMo-RL bump PR) contains the fix the pin lacks. If it does, pass
+`--bridge-ref refs/heads/main` to `ensure_baseline.sh` and `run_suite.sh` until
+the NeMo-RL bump merges, and do **not** cache a baseline taken against the
+broken pin.
+
+### L2 suite may be missing from NeMo-RL `main`
+
+`L2_Functional_Tests_Megatron_4.sh` and its subtests were added on the testing
+agent branch and are not always on NeMo-RL `main`. `sync_integration.sh`
+rebuilds the integration branch from bare `main` every sweep, which **drops**
+any prior local cherry-pick — do not assume yesterday's carry is still there.
+The script re-applies `L2_SUITE_CARRY_COMMIT` automatically; if you sync by
+hand or skip that path, confirm the ref still has the suite
+(`git ls-tree <ref> tests/functional/`) before any L2 submit, re-cherry-pick
+if missing, and disclose the carry in the report note. Otherwise prep succeeds
+and the Ray driver fails with `suite not found` after the cluster is already up.
+
 ## Which NeMo-RL is under test
 
 The third leg is pinned the same way, and by default it is **not** plain `main`.
@@ -200,7 +224,7 @@ Re-submit (do not report, do not attempt a fix) when the log shows:
 
 | Signal | Cause |
 |---|---|
-| `NRLTA_PREP_FAIL` | Revision checkout or the megatron import guard failed. |
+| `NRLTA_PREP_FAIL` | Revision checkout or the megatron import guard failed. **The run is void even if tests appear to start afterwards** — on L2 Ray jobs, a failing `--setup-command` historically did not abort the driver. `run_suite.sh` now chains prep into the head command too; still, scancel any allocation whose Slurm log already shows `NRLTA_PREP_FAIL`, fix the pin, and resubmit. Do not parse or report those results. |
 | `QOSMinGRES` / "violates accounting policy" | Job asked for less than a whole node. |
 | `srun: error`, `slurmstepd: ... CANCELLED / TIME LIMIT` | Preemption, node failure, or a too-short `--time`. |
 | `PENDING` for hours with `Reason=Priority` and `StartTime=Unknown` | Usually the QOS, not a full cluster. Compare `scontrol show job <id>` against a job that scheduled quickly: an identical request on a lower-priority QOS can sit behind hundreds of jobs with no slot even planned. Fix `COG_SLURM_QOS` and re-submit rather than waiting. |

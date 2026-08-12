@@ -34,6 +34,25 @@ set -euo pipefail
 workspace="$(pwd)"
 git config --global --add safe.directory '*' || true
 
+# Cluster nodes occasionally cannot reach github.com for a minute or two; a
+# single failed fetch used to abort an otherwise healthy allocation (and on L2
+# the head re-runs prep after setup already succeeded, doubling the exposure).
+nrlta_git_fetch() {
+  local dir="$1" url="$2" ref="$3"
+  local attempt=1 delay
+  while [ "${attempt}" -le 4 ]; do
+    if git -C "${dir}" fetch --depth=1 --force "${url}" "${ref}"; then
+      return 0
+    fi
+    delay=$(( attempt * 15 ))
+    echo "[nrlta-prep] git fetch ${ref} from ${url} failed (attempt ${attempt}/4); retrying in ${delay}s"
+    sleep "${delay}"
+    attempt=$(( attempt + 1 ))
+  done
+  echo "NRLTA_PREP_FAIL: git fetch ${ref} from ${url} failed after 4 attempts"
+  return 1
+}
+
 echo "===NRLTA_PREP_BEGIN node=$(hostname)==="
 
 # 1. Establish which NeMo-RL is under test.
@@ -65,7 +84,7 @@ if [ -n "${NEMO_RL_FETCH_REF:-}" ]; then
     echo "  revision under test cannot be pinned. Re-run with the worktree overlay."
     exit 1
   fi
-  git -C "${CONTAINER_ROOT}" fetch --depth=1 --force "${NEMO_RL_CLONE_URL}" "${NEMO_RL_FETCH_REF}"
+  nrlta_git_fetch "${CONTAINER_ROOT}" "${NEMO_RL_CLONE_URL}" "${NEMO_RL_FETCH_REF}"
   nemo_rl_sha="$(git -C "${CONTAINER_ROOT}" rev-parse FETCH_HEAD)"
 
   if [ -n "${NEMO_RL_EXPECTED_SHA:-}" ] && [ "${nemo_rl_sha}" != "${NEMO_RL_EXPECTED_SHA}" ]; then
@@ -116,7 +135,7 @@ if [ -n "${BRIDGE_FETCH_REF:-}" ]; then
     exit 1
   fi
   bridge_sha_before="$(git -C "${CONTAINER_BRIDGE_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
-  git -C "${CONTAINER_BRIDGE_DIR}" fetch --depth=1 --force "${MEGATRON_BRIDGE_CLONE_URL}" "${BRIDGE_FETCH_REF}"
+  nrlta_git_fetch "${CONTAINER_BRIDGE_DIR}" "${MEGATRON_BRIDGE_CLONE_URL}" "${BRIDGE_FETCH_REF}"
   git -C "${CONTAINER_BRIDGE_DIR}" reset --hard FETCH_HEAD
   # -fd, never -ff: -ff deletes nested git repositories, which would wipe the
   # Megatron-LM submodule checkout living under this directory.
@@ -144,15 +163,23 @@ if ! git -C "${CONTAINER_MCORE_DIR}" rev-parse --git-dir >/dev/null 2>&1; then
   git -C "${CONTAINER_MCORE_DIR}" init -q
 fi
 
-git -C "${CONTAINER_MCORE_DIR}" fetch --depth=1 --force "${MEGATRON_CLONE_URL}" "${MCORE_FETCH_REF}"
-git -C "${CONTAINER_MCORE_DIR}" reset --hard FETCH_HEAD
-# -ffd (not -x) removes stale sources from the previous revision while keeping
-# gitignored build outputs such as the compiled datasets helpers.
-git -C "${CONTAINER_MCORE_DIR}" clean -ffd
-find "${CONTAINER_MCORE_DIR}" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
-
-new_sha="$(git -C "${CONTAINER_MCORE_DIR}" rev-parse HEAD)"
-new_subject="$(git -C "${CONTAINER_MCORE_DIR}" log -1 --pretty=%s)"
+# L2 Ray runs prep twice on the head (setup-command + driver). If setup already
+# landed the expected tip, skip the second github fetch — cluster egress to
+# github.com flakes often enough that the re-fetch alone has aborted healthy jobs.
+if [ -n "${MCORE_EXPECTED_SHA:-}" ] && [ "${orig_sha}" = "${MCORE_EXPECTED_SHA}" ]; then
+  echo "[nrlta-prep] mcore already at expected ${MCORE_EXPECTED_SHA}; skipping fetch"
+  new_sha="${orig_sha}"
+  new_subject="$(git -C "${CONTAINER_MCORE_DIR}" log -1 --pretty=%s)"
+else
+  nrlta_git_fetch "${CONTAINER_MCORE_DIR}" "${MEGATRON_CLONE_URL}" "${MCORE_FETCH_REF}"
+  git -C "${CONTAINER_MCORE_DIR}" reset --hard FETCH_HEAD
+  # -ffd (not -x) removes stale sources from the previous revision while keeping
+  # gitignored build outputs such as the compiled datasets helpers.
+  git -C "${CONTAINER_MCORE_DIR}" clean -ffd
+  find "${CONTAINER_MCORE_DIR}" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
+  new_sha="$(git -C "${CONTAINER_MCORE_DIR}" rev-parse HEAD)"
+  new_subject="$(git -C "${CONTAINER_MCORE_DIR}" log -1 --pretty=%s)"
+fi
 
 if [ -n "${MCORE_EXPECTED_SHA:-}" ] && [ "${new_sha}" != "${MCORE_EXPECTED_SHA}" ]; then
   echo "NRLTA_PREP_FAIL: checked out ${new_sha} but caller expected ${MCORE_EXPECTED_SHA}"
