@@ -141,10 +141,10 @@ TOOL_PARSER_CONTRACT_CASES = (
     },
     {
         "name": "malformed_tool_call_falls_back_to_content",
-        "raw_output": "<tool_call>{bad json}</tool_call>",
+        "raw_output": "<tool_call>\n{bad json}\n</tool_call>",
         "expected": {
             "reasoning_content": "",
-            "content": "<tool_call>{bad json}</tool_call>",
+            "content": "<tool_call>\n{bad json}\n</tool_call>",
             "tool_calls": [],
         },
     },

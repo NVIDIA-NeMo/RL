@@ -11,7 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TRT-LLM chat-completions parity and golden generation."""
+"""TRT-LLM chat-completions parity and golden generation.
+
+Regenerate the golden on one GPU with::
+
+    NEMO_RL_GENERATE_PARITY_GOLDEN=1 uv run --extra trtllm pytest \\
+        tests/unit/models/generation/trtllm/test_trtllm_http_server_parity.py \\
+        -k test_parity -p no:randomly --trtllm-only
+"""
 
 import json
 import multiprocessing
@@ -35,15 +42,15 @@ from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _make_parse_tool_calls,
 )
 from tests.unit.models.generation.chat_template_parity_common import (
-    MODEL,
     FOLLOWUP_USER_MSG,
+    MODEL,
     MODEL_REVISION,
     PARSER_SCENARIOS,
     REASONING_PARSER_CONTRACT_CASES,
     TOOL_CALL_ID,
     TOOL_DEF,
-    TOOL_RESULT,
     TOOL_PARSER_CONTRACT_CASES,
+    TOOL_RESULT,
     USER_MSG,
     prompt_suffix_after_turn,
 )
@@ -281,7 +288,7 @@ def _run_trtllm_server_process(
             tokenizer=tokenizer,
             model_name=MODEL,
             max_seq_len=4096,
-            sampling_config={"temperature": 0.0, "top_p": 1.0},
+            sampling_config={"temperature": 0.0, "top_p": 1.0, "top_k": None},
             tool_parser="qwen3",
             reasoning_parser=TRTLLM_REASONING_PARSERS[reasoning_parser],
         )
@@ -406,7 +413,7 @@ def _parse_with_trtllm(
     }
 
 
-def test_reasoning_start_uses_cached_token_suffixes() -> None:
+def test_ends_with_token_suffix() -> None:
     suffixes = ((7,), (7, 8), (7, 9, 9))
 
     assert _ends_with_token_suffix([1, 2, 7], suffixes)
