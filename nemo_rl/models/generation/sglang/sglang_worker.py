@@ -375,7 +375,6 @@ class SGLangGenerationWorker:
         """Finalize quantized layouts after the last refit bucket."""
         return self._make_request("end_weight_update", {})
 
-
     def start_profile(
         self,
         # The output directory

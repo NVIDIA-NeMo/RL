@@ -58,7 +58,6 @@ def _write_and_verify(
         )
 
 
-
 def _patch_sglang_safe_unpickler() -> None:
     file_to_patch = _get_sglang_file("srt/utils/common.py")
 
@@ -170,9 +169,6 @@ def _patch_megatron_training_hook_mode() -> None:
     if file_path is None:
         return
     _patch_megatron_hook_mode_in(file_path)
-
-
-
 
 
 def _apply_sglang_compat_patches() -> None:
