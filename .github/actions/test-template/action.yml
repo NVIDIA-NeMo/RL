@@ -142,29 +142,31 @@ runs:
         echo -e "\033[1;34m│  script    : ${{ inputs.script }}\033[0m"
         echo -e "\033[1;34m│  runner    : ${{ inputs.runner }}\033[0m"
         echo -e "\033[1;34m│  container : ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }}\033[0m"
-        echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
-
-        # Expose the host's RDMA devices to GPU jobs (H100 and GB200 alike), so
-        # tests using the mooncake_cpu data plane exercise the real transport
-        # instead of finding no verbs device and skipping. libibverbs opens
-        # /dev/infiniband/uverbs*, which a container does not inherit from the
-        # host even though it does see the host's /sys/class/infiniband, and
-        # ibv_reg_mr needs IPC_LOCK plus an unlimited memlock rlimit to pin its
-        # registrations.
+        # Expose the host's RDMA devices so mooncake_cpu tests exercise the real
+        # transport instead of finding no verbs device and skipping. A container
+        # sees the host's /sys/class/infiniband but does NOT inherit
+        # /dev/infiniband/uverbs*, which is what libibverbs actually opens;
+        # ibv_reg_mr additionally needs IPC_LOCK and an unlimited memlock rlimit
+        # to pin its registrations.
         #
-        # Skipped for doc tests, which are CPU work with no data plane. Also
-        # gated on the directory existing: --device on a runner without
-        # /dev/infiniband makes docker run itself fail, which would break every
-        # test rather than only the RDMA ones.
+        # Requires a RoCE device on the host, not merely a verbs directory:
+        # roce_device() does not auto-select InfiniBand, so asserting coverage
+        # on an IB-only host would fail a machine whose RDMA is fine. When the
+        # host does have one, NEMO_RL_REQUIRE_MOONCAKE promotes the tests' skip
+        # into a failure, so losing this passthrough surfaces as a red job
+        # rather than silently dropping mooncake coverage.
+        #
+        # --device against a missing path makes docker run itself fail, which
+        # would break every test rather than only the RDMA ones — hence the
+        # host-side check.
         RDMA_FLAGS=()
-        if [[ "${{ inputs.is_doc_test }}" == "true" ]]; then
-          echo -e "\033[1;34m│  rdma      : skipped (doc test)\033[0m"
-        elif [[ -d /dev/infiniband ]]; then
-          RDMA_FLAGS=(--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1)
-          echo -e "\033[1;34m│  rdma      : /dev/infiniband exposed\033[0m"
-        else
-          echo -e "\033[1;33m│  rdma      : no /dev/infiniband on host — RDMA tests will skip\033[0m"
+        if [[ "${{ inputs.is_doc_test }}" != "true" && -d /dev/infiniband ]] &&
+           grep -qs Ethernet /sys/class/infiniband/mlx5_*/ports/1/link_layer; then
+          RDMA_FLAGS=(--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1
+                      --env NEMO_RL_REQUIRE_MOONCAKE=1)
         fi
+        echo -e "\033[1;34m│  rdma      : ${RDMA_FLAGS[*]:-none}\033[0m"
+        echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
 
         echo "::group::Logs"
         docker run --rm -u root --runtime=nvidia --gpus all \
