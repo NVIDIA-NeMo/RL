@@ -671,7 +671,12 @@ def setup_model_config(
     # construction so RADIO positional encoding and frozen towers are stable
     # and consistent between logprob and training passes.
     for vlm_key, vlm_value in iter_vlm_config_overrides(config["megatron_cfg"]):
-        if hasattr(model_cfg, vlm_key):
+        if not hasattr(model_cfg, vlm_key):
+            raise ValueError(
+                f"megatron_cfg set '{vlm_key}' but {type(model_cfg).__name__} has no "
+                "such field; this provider does not support that tower control."
+            )
+        setattr(model_cfg, vlm_key, vlm_value)
             setattr(model_cfg, vlm_key, vlm_value)
 
     # Validate chunking configuration
