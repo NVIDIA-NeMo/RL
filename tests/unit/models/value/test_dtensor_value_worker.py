@@ -24,9 +24,9 @@ Worker-level tests use a tiny Qwen2 model on a small Ray cluster, mirroring
   * Multi-step training drives loss down
   * Checkpoint save+load round-trip preserves the trained value head
 
-DTensor V2 value worker does not support pipeline parallelism (lm_value.py)
-or sequence packing (setup.validate_and_prepare_config disallows packing for
-reward models), so those parallelism modes are not exercised here.
+DTensor V2 value workers do not support pipeline parallelism. Sequence packing
+and context parallelism are exercised separately because they are incompatible
+with each other.
 """
 
 import os
@@ -52,7 +52,7 @@ pytestmark = pytest.mark.automodel
 
 
 def test_right_shift_values_aligns_value_predictions_to_state_tokens():
-    from nemo_rl.models.value.workers.dtensor_value_worker_v2 import right_shift_values
+    from nemo_rl.models.value.utils import right_shift_values
 
     values = torch.tensor(
         [
@@ -120,10 +120,10 @@ def test_right_shift_loss_wrapper_shifts_logits_and_delegates_attributes():
 def test_cp_value_postprocessors_gather_before_right_shift(monkeypatch):
     """Inference and loss paths must shift only after restoring global CP order."""
     from nemo_rl.models.automodel.train import ValueLossPostProcessor
-    from nemo_rl.models.value.workers import dtensor_value_worker_v2 as worker_module
+    from nemo_rl.models.value import utils as value_utils
+    from nemo_rl.models.value.utils import gather_and_right_shift_values
     from nemo_rl.models.value.workers.dtensor_value_worker_v2 import (
         RightShiftLossWrapper,
-        gather_and_right_shift_values,
     )
 
     local_logits = torch.tensor([[[10.0], [40.0]]])
@@ -136,7 +136,7 @@ def test_cp_value_postprocessors_gather_before_right_shift(monkeypatch):
         assert seq_dim == 1
         return full_logits.squeeze(-1) if values.ndim == 2 else full_logits
 
-    monkeypatch.setattr(worker_module, "allgather_cp_sharded_tensor", fake_allgather)
+    monkeypatch.setattr(value_utils, "allgather_cp_sharded_tensor", fake_allgather)
     monkeypatch.setattr(
         "nemo_rl.models.automodel.train.allgather_cp_sharded_tensor", fake_allgather
     )

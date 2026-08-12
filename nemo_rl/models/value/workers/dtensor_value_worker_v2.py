@@ -34,7 +34,6 @@ from transformers import (
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
@@ -58,31 +57,12 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
+from nemo_rl.models.value.utils import (
+    gather_and_right_shift_values,
+    right_shift_values,
+)
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-
-
-def right_shift_values(values: torch.Tensor) -> torch.Tensor:
-    """Shift values right by 1 along the sequence dim (V(s_{t+1}) -> V(s_t)).
-
-    Aligns value predictions with the Megatron value worker convention so GAE
-    (rewards, returns), value targets, and value clipping all see the same
-    V(s_t) semantics across backends. Preserves the input tensor shape: the
-    first column becomes zeros and column t (t>=1) takes the value from
-    column t-1.
-    """
-    return torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
-
-
-def gather_and_right_shift_values(
-    values: torch.Tensor,
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    sequence_dim: int = 1,
-) -> torch.Tensor:
-    """Restore global CP sequence order before value temporal alignment."""
-    if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
-        values = allgather_cp_sharded_tensor(values, cp_group, seq_dim=sequence_dim)
-    return right_shift_values(values)
 
 
 def validate_context_parallel_sequence_length(seq_len: int, cp_size: int) -> None:
