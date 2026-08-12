@@ -159,6 +159,57 @@ def test_build_mapping_non_gated_expert_up_is_direct():
     assert mapping["model.layers.0.mlp.experts.down_proj.weight"] == (w2, None)
 
 
+def test_build_mapping_resolves_routed_experts_submodule():
+    # vLLM 0.25 hangs the fused-MoE expert weights off a nested
+    # ``routed_experts`` submodule (RoutedExperts is an nn.Module assigned as
+    # MoERunner.routed_experts), so named_parameters() reports
+    # ``...experts.routed_experts.w13_weight``.  The name built from the HF
+    # side has no such segment, and an unresolved grouped expert is a hard
+    # ValueError -- so without the flattened index this raises and every MoE
+    # model fails to refit over nccl_reshard.
+    H, E, Pl = 16, 2, 32
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": "model.layers.0.mlp.experts.gate_proj.weight",
+                    "global_shape": [E, Pl, H],
+                    "grouped_expert_proj": "gate_proj",
+                },
+                {
+                    "name": "model.layers.0.mlp.experts.up_proj.weight",
+                    "global_shape": [E, Pl, H],
+                    "grouped_expert_proj": "up_proj",
+                },
+                {
+                    "name": "model.layers.0.mlp.experts.down_proj.weight",
+                    "global_shape": [E, H, Pl],
+                    "grouped_expert_proj": "down_proj",
+                },
+            ]
+        },
+    }
+    w13 = _param(E, 2 * Pl, H)
+    w2 = _param(E, H, Pl)
+    vllm_params = {
+        "model.layers.0.mlp.experts.routed_experts.w13_weight": w13,
+        "model.layers.0.mlp.experts.routed_experts.w2_weight": w2,
+    }
+    mapping = _make_ext(vllm_params)._build_hf_to_gen_backend_mapping(refit_info)
+
+    assert mapping["model.layers.0.mlp.experts.gate_proj.weight"] == (
+        w13,
+        (slice(None), slice(0, Pl), slice(None)),
+    )
+    assert mapping["model.layers.0.mlp.experts.up_proj.weight"] == (
+        w13,
+        (slice(None), slice(Pl, 2 * Pl), slice(None)),
+    )
+    assert mapping["model.layers.0.mlp.experts.down_proj.weight"] == (w2, None)
+
+
 def test_build_mapping_unmapped_param_raises():
     refit_info = {
         "gen_tp_size": 1,

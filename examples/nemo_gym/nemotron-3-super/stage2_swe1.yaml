@@ -13,7 +13,7 @@ checkpointing:
 grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 16
-  num_val_generations_per_prompt: 1
+  val_num_generations_per_prompt: 1
   max_rollout_turns: 1
   max_num_epochs: 100
   max_num_steps: 1000000
@@ -22,10 +22,15 @@ grpo:
   advantage_clip_low: -100
   advantage_clip_high: 100
   val_period: 10
+  val_start_at: -1
   val_at_start: false
   val_at_end: false
   overlong_filtering: true
   max_val_samples: null
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
 
@@ -54,6 +59,7 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
+    max_generation_failures: 3
     in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: false
 
@@ -221,6 +227,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
@@ -282,6 +291,8 @@ data:
 
 env:
   should_use_nemo_gym: true
+  # false: ignore env mask_sample flags so the loss trains on every sample.
+  should_mask_flagged_samples: true
   nemo_gym:
     uv_venv_dir: "${oc.env:PERSISTENT_CACHE}/gym_venvs"  # overridden by super_launch.sh to $GYM_VENV_DIR
     skip_venv_if_present: true

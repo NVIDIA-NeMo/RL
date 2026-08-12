@@ -17,7 +17,13 @@ from contextlib import contextmanager
 
 import numpy as np
 import torch
-from vllm import LLM, SamplingParams
+
+from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
+
+# Must run before vLLM pulls in tool_parsers (openai<2.25 NamespaceTool compat).
+ensure_vllm_source_compat()
+
+from vllm import LLM, SamplingParams  # noqa: E402
 
 
 @contextmanager

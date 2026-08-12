@@ -700,6 +700,16 @@ class VllmInternalWorkerExtension:
                         self._load_weights(weights)
                     except Exception as error:
                         batch_error = error
+                        # The manifest only keeps the exception message; log
+                        # the full traceback and the batch contents so loader
+                        # failures stay diagnosable from worker logs.
+                        batch_desc = ", ".join(
+                            f"{k}: {tuple(w.shape)} {w.dtype}"
+                            for k, w in (weights or [])[:40]
+                        )
+                        logger.exception(
+                            "IPC weight batch load failed (batch: %s)", batch_desc
+                        )
                     finally:
                         # Synchronize before releasing or ACKing an IPC allocation,
                         # including when a loader failed after scheduling CUDA work.
@@ -882,10 +892,24 @@ class VllmInternalWorkerExtension:
 
         vllm_by_relative = {_layer_relative(n): n for n in vllm_params}
 
+        # vLLM 0.25 moved the fused-MoE expert weights onto a nested
+        # ``routed_experts`` submodule, so real names carry a
+        # ``.routed_experts.`` segment that the name built from the HF side
+        # below does not (``...mlp.experts.w13_weight`` vs
+        # ``...mlp.experts.routed_experts.w13_weight``).  Index the real names
+        # with that segment dropped so either layout resolves; on a 0.20-style
+        # model this index is identical to ``vllm_by_relative``.
+        vllm_by_relative_flat = {
+            _layer_relative(n).replace(".routed_experts.", "."): n for n in vllm_params
+        }
+
         def _to_vllm_name(n: str) -> str:
             if n in vllm_params:
                 return n
-            return vllm_by_relative.get(_layer_relative(n), n)
+            relative = _layer_relative(n)
+            if relative in vllm_by_relative:
+                return vllm_by_relative[relative]
+            return vllm_by_relative_flat.get(relative, n)
 
         for hf_name in hf_shapes:
             # 1) Grouped MoE expert params (gate_proj/up_proj/down_proj, each

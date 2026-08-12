@@ -80,8 +80,12 @@ def _flatten_rollout_message_log_for_tq(
         extract_initial_prompt_messages,
     )
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+    from nemo_rl.experience.rollouts import backfill_missing_routed_experts
 
     pad = {"pad_value_dict": {"token_ids": pad_token_id}}
+    # Must precede the prompt extraction: it reuses the same message dicts, so
+    # backfilling here also covers the prompt flatten below.
+    backfill_missing_routed_experts(message_logs)
     prompt_message_logs = extract_initial_prompt_messages(
         message_logs,
         prompt_lengths,
@@ -259,6 +263,8 @@ class SyncRolloutActor:
                 else None,
                 reward_penalty_config=cfg.reward_penalties,
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
+                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
+                debug_payload_metrics=cfg.grpo.debug_payload_metrics,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:
@@ -270,7 +276,8 @@ class SyncRolloutActor:
             final_batch, rollout_metrics = runner(
                 **common,
                 max_seq_len=cfg.policy["max_total_sequence_length"],
-                max_rollout_turns=cfg.grpo["max_rollout_turns"],
+                max_rollout_turns=cfg.grpo.max_rollout_turns,
+                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
             )
         fb = final_batch.to("cpu")
         del final_batch

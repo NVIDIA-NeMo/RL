@@ -34,6 +34,15 @@ class VllmSpecificArgs(TypedDict):
     async_engine: bool
     load_format: NotRequired[str]
     precision: NotRequired[str]
+    # Whether vLLM returns logprobs before or after generation-time logit
+    # processors. RL policy recomputation uses raw model logits, so recipes
+    # with generation-time processors should request ``raw_logprobs`` when
+    # comparing generation and policy logprobs.
+    logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
+    # Cap each request's generated tokens so the training prompt plus response
+    # fits within max_model_len. This is needed when multimodal processing makes
+    # the training prompt longer than its text-only representation.
+    cap_max_tokens_to_context: NotRequired[bool]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
@@ -147,6 +156,9 @@ class VllmConfig(GenerationConfig):
     # NVFP4 kernels and stream packed quantized weights instead of fake-quant
     # modules. This is intended for ModelOpt NVFP4 rollout experiments.
     real_quant: NotRequired[bool]
+    # CPU offload remains the default. Disabling it is supported only for
+    # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
+    real_quant_export_cpu_offload: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
 
 

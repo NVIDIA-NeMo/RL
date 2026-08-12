@@ -31,6 +31,9 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSampler,
     WindowedSamplerConfig,
 )
+from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -84,9 +87,13 @@ def test_rollout_pump_stamps_target_steps(
             self._buffer = buffer
 
         async def generate_and_push(
-            self, prompt: Any, *, target_step: int | None = None
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
         ) -> None:
-            del prompt
+            del prompt, inflight_registry
             self._buffer.reserve(target_step=target_step)
 
     buffer = _RecordingBuffer()
@@ -96,7 +103,9 @@ def test_rollout_pump_stamps_target_steps(
         max_inflight_prompts=2,
         diagnostics=False,
     )
-    ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # The sampler owns admission + target_step stamping (the dispatch counter
     # lives on the sampler, not the actor).
@@ -110,6 +119,7 @@ def test_rollout_pump_stamps_target_steps(
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._inflight_rollouts = 0
+    ctrl._inflight_by_group_id = {}
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
     ctrl._current_epoch = 0
@@ -120,6 +130,55 @@ def test_rollout_pump_stamps_target_steps(
     assert ctrl._rollout_exhausted.is_set()
 
 
+def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
+    async def _main() -> None:
+        fresh = asyncio.create_task(asyncio.Event().wait())
+        stale = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
+        ctrl._trainer_version = 5
+        ctrl._inflight_by_group_id = {"fresh": (fresh, 5), "stale": (stale, 1)}
+
+        aborted = await ctrl._abort_stale_inflight()
+
+        assert aborted == 1
+        assert stale.cancelled()
+        assert not fresh.cancelled()
+
+        fresh.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await fresh
+
+    asyncio.run(_main())
+
+
+def test_abort_stale_inflight_aggregates_cleanup_failures() -> None:
+    async def _main() -> None:
+        async def _boom() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError("cleanup boom")
+
+        task = asyncio.create_task(_boom())
+        await asyncio.sleep(0)
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=0)
+        ctrl._trainer_version = 5
+        ctrl._inflight_by_group_id = {"g": (task, 0)}
+
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await ctrl._abort_stale_inflight()
+        assert exc_info.value.subgroup(RuntimeError) is not None
+
+    asyncio.run(_main())
+
+
 def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
     class _FailingRolloutManager:
         def __init__(self) -> None:
@@ -128,9 +187,13 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             self.sibling_cancelled = False
 
         async def generate_and_push(
-            self, prompt: Any, *, target_step: int | None = None
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
         ) -> None:
-            del target_step
+            del target_step, inflight_registry
             self._started += 1
             if self._started == 2:
                 self._both_started.set()
@@ -154,7 +217,9 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             max_inflight_prompts=2,
             diagnostics=False,
         )
-        ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        )
         ctrl._rollout_manager = manager
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -173,6 +238,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = asyncio.Semaphore(2)
         ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
@@ -193,9 +259,13 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
 def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> None:
     class _NeverCalledRolloutManager:
         async def generate_and_push(
-            self, prompt: Any, *, target_step: int | None = None
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
         ) -> None:
-            del prompt, target_step
+            del prompt, target_step, inflight_registry
             raise AssertionError("cancelled child unexpectedly started")
 
     class _CancelBeforeStartTaskGroup:
@@ -233,7 +303,9 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             max_inflight_prompts=1,
             diagnostics=False,
         )
-        ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        )
         ctrl._rollout_manager = _NeverCalledRolloutManager()
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -245,6 +317,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = real_semaphore(1)
         ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
@@ -288,13 +361,13 @@ def test_rollout_pump_writes_expected_tq_data(
 
     master_config = MasterConfig.model_construct(
         policy={"train_global_batch_size": expected_samples},
-        grpo={
-            "num_prompts_per_step": num_prompts,
-            "num_generations_per_prompt": num_generations,
-            "max_num_steps": 1,
-            "max_num_epochs": 1,
-        },
-        loss_fn=SimpleNamespace(force_on_policy_ratio=False),
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=num_prompts,
+            num_generations_per_prompt=num_generations,
+            max_num_steps=1,
+            max_num_epochs=1,
+        ),
+        loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
         async_rl=AsyncRLConfig(
             sampler=WindowedSamplerConfig(max_staleness_versions=1),
             min_groups_for_streaming_train=1,
@@ -345,7 +418,9 @@ def test_rollout_pump_writes_expected_tq_data(
         partition_id=_PARTITION_ID,
     )
     ctrl = SingleControllerActor.remote(
-        master_config=master_config, actor_args=actor_args
+        master_config=master_config,
+        actor_args=actor_args,
+        setup_timing_metrics=SetupTimingMetrics(),
     )
 
     vllm_generation.prepare_for_generation()

@@ -27,7 +27,6 @@ import nemo_rl.modelopt.utils as modelopt_utils
 from nemo_rl.modelopt.models.generation.vllm_modelopt import (
     NEMO_MODELOPT_W4A4,
     NEMO_MODELOPT_W4A16,
-    _pad_nvfp4_moe_for_marlin,
     quantization_method_for_mode,
     register_nemo_modelopt_nvfp4,
 )
@@ -334,6 +333,13 @@ def _install_fake_registered_vllm_modelopt(monkeypatch):
             self.moe = moe_config
             self.moe_kernel = None
             self.moe_quant_config = None
+            # Mirror vLLM 0.25: weight-only mode and backend selection are
+            # keyed off the config's quant_method in the base __init__.
+            self.use_a16 = (
+                getattr(quant_config, "quant_method", "NVFP4") == "W4A16_NVFP4"
+            )
+            self.nvfp4_backend = "marlin"
+            self.use_global_sf = False
 
         def create_weights(self, layer, *args, **kwargs):
             events.append(("native_create_weights", layer, args, kwargs))
@@ -372,17 +378,35 @@ def _install_fake_registered_vllm_modelopt(monkeypatch):
             else:
                 self.moe_quant_config = types.SimpleNamespace(source="native")
 
+    class FakeModelOptNvFp4W4A16LinearMethod(FakeModelOptNvFp4LinearMethod):
+        pass
+
     class FakeModelOptNvFp4Config:
         LinearMethodCls = FakeModelOptNvFp4LinearMethod
         FusedMoEMethodCls = FakeModelOptNvFp4FusedMoE
 
-        def __init__(self, group_size=16):
+        def __init__(self, quant_method="NVFP4", group_size=16):
+            self.quant_method = quant_method
             self.group_size = group_size
+            # Mirror vLLM 0.25: __init__ installs LinearMethodCls as an
+            # *instance* attribute keyed off quant_method, shadowing any
+            # subclass class attribute.
+            if quant_method == "NVFP4":
+                self.LinearMethodCls = FakeModelOptNvFp4LinearMethod
+            elif quant_method == "W4A16_NVFP4":
+                self.LinearMethodCls = FakeModelOptNvFp4W4A16LinearMethod
+            else:
+                raise ValueError(
+                    f"Unsupported ModelOpt NVFP4 quant_algo: {quant_method}"
+                )
 
         @classmethod
         def from_config(cls, config):
             target = config.get("quantization", config)
-            instance = cls(group_size=target.get("group_size", 16))
+            instance = cls(
+                quant_method=str(target.get("quant_algo", "NVFP4")).upper(),
+                group_size=target.get("group_size", 16),
+            )
             instance.parsed_config = config
             return instance
 
@@ -480,12 +504,13 @@ def _install_fake_registered_vllm_modelopt(monkeypatch):
         oracle_module.NvFp4MoeBackend.MARLIN,
         FakeMarlinExperts,
     )
-    oracle_module.make_nvfp4_moe_kernel = lambda **kwargs: events.append(
-        ("make_moe_kernel", kwargs)
-    ) or types.SimpleNamespace(
-        fused_experts=types.SimpleNamespace(
-            process_weights_after_loading=lambda layer: events.append(
-                ("process_moe", layer)
+    oracle_module.make_nvfp4_moe_kernel = lambda **kwargs: (
+        events.append(("make_moe_kernel", kwargs))
+        or types.SimpleNamespace(
+            fused_experts=types.SimpleNamespace(
+                process_weights_after_loading=lambda layer: events.append(
+                    ("process_moe", layer)
+                )
             )
         )
     )
@@ -1171,6 +1196,74 @@ def test_real_quant_load_weights_batches_full_experts_and_expands_global_scales(
         extension.prepare_refit_info(state_dict_info)
 
 
+def test_real_quant_load_weights_expands_gated_experts_per_expert(monkeypatch):
+    """Gated fused W13 tensors must be split into per-expert 2-D shards.
+
+    Batched 3-D tensors would route through vLLM 0.25's
+    RoutedExperts.load_weights fused branch, whose orientation heuristic
+    mis-transposes packed NVFP4 weights and block scales.
+    """
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    class ModelOptNvFp4FusedMoE:
+        quant_config = types.SimpleNamespace(get_name=lambda: NEMO_MODELOPT_W4A16)
+
+    model = torch.nn.Module()
+    model.moe = torch.nn.Module()
+    model.moe.quant_method = ModelOptNvFp4FusedMoE()
+    model.moe._expert_map = None
+    model.moe.local_num_experts = 2
+    model.moe.global_num_experts = 2
+
+    prefix = "model.layers.0.mlp"
+    w13_weight = torch.arange(24, dtype=torch.uint8).reshape(2, 4, 3)
+    w13_scale = torch.arange(8, dtype=torch.uint8).reshape(2, 4, 1)
+    state_dict_info = {
+        f"{prefix}.experts.w13_weight": ((2, 4, 3), torch.uint8),
+        f"{prefix}.experts.w13_weight_scale": ((2, 4, 1), torch.uint8),
+        f"{prefix}.experts.w13_weight_scale_2": ((2, 2), torch.float32),
+        f"{prefix}.experts.w2_weight": ((2, 3, 2), torch.uint8),
+        f"{prefix}.experts.w2_weight_scale": ((2, 3, 1), torch.uint8),
+        f"{prefix}.experts.w2_weight_scale_2": ((2,), torch.float32),
+    }
+
+    assert backend._w13_num_shards_from_state_dict_info(state_dict_info) == {prefix: 2}
+
+    forwarded = []
+    extension = _make_real_quant_extension(backend, model, [])
+    extension.prepare_refit_info(state_dict_info)
+    extension._nrl_w13_num_shards_by_prefix = {prefix: 2}
+    _patch_real_quant_load(monkeypatch, backend, forwarded)
+    assert (
+        extension._load_weights(
+            [
+                (f"{prefix}.experts.w13_weight", w13_weight),
+                (f"{prefix}.experts.w13_weight_scale", w13_scale),
+            ]
+        )
+        == "loaded"
+    )
+
+    assert [name for name, _ in forwarded] == [
+        f"{prefix}.experts.0.gate_proj.weight",
+        f"{prefix}.experts.1.gate_proj.weight",
+        f"{prefix}.experts.0.up_proj.weight",
+        f"{prefix}.experts.1.up_proj.weight",
+        f"{prefix}.experts.0.gate_proj.weight_scale",
+        f"{prefix}.experts.1.gate_proj.weight_scale",
+        f"{prefix}.experts.0.up_proj.weight_scale",
+        f"{prefix}.experts.1.up_proj.weight_scale",
+    ]
+    for _, tensor in forwarded:
+        assert tensor.ndim == 2
+    torch.testing.assert_close(forwarded[0][1], w13_weight[0, :2])
+    torch.testing.assert_close(forwarded[1][1], w13_weight[1, :2])
+    torch.testing.assert_close(forwarded[2][1], w13_weight[0, 2:])
+    torch.testing.assert_close(forwarded[3][1], w13_weight[1, 2:])
+    torch.testing.assert_close(forwarded[4][1], w13_scale[0, :2])
+    torch.testing.assert_close(forwarded[7][1], w13_scale[1, 2:])
+
+
 def test_real_quant_load_weights_forwards_ignored_float_weights(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
 
@@ -1473,13 +1566,18 @@ def test_real_quant_caches_scoped_reload_roots(monkeypatch):
     assert calls == [(model, False)]
 
 
-def test_fake_quant_load_weights_exposes_input_quantizer_buffers(monkeypatch):
+def test_fake_quant_load_weights_exposes_activation_quantizer_buffers(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
 
     child = torch.nn.Module()
     child.weight = torch.nn.Parameter(torch.ones(1))
-    child.register_buffer("input_quantizer_amax", torch.tensor([1.0]))
+    child.input_quantizer = torch.nn.Module()
+    child.input_quantizer.register_buffer("_amax", torch.tensor([1.0]))
     child.register_buffer("weight_quantizer_amax", torch.tensor([2.0]))
+    child.self_attn = torch.nn.Module()
+    child.self_attn.attn = torch.nn.Module()
+    child.self_attn.attn.k_bmm_quantizer = torch.nn.Module()
+    child.self_attn.attn.k_bmm_quantizer.register_buffer("_amax", torch.tensor([-1.0]))
     model = torch.nn.Module()
     model.child = child
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
@@ -1487,11 +1585,18 @@ def test_fake_quant_load_weights_exposes_input_quantizer_buffers(monkeypatch):
     seen_names = []
 
     def fake_base_load_weights(self, weights):
+        assert [name for name, _ in weights] == [
+            "child.self_attn.attn.k_bmm_quantizer._amax"
+        ]
         params = dict(child.named_parameters())
         seen_names.extend(params)
-        params["input_quantizer_amax"].weight_loader(
-            params["input_quantizer_amax"],
+        params["input_quantizer._amax"].weight_loader(
+            params["input_quantizer._amax"],
             torch.tensor([3.0]),
+        )
+        params["self_attn.attn.k_bmm_quantizer._amax"].weight_loader(
+            params["self_attn.attn.k_bmm_quantizer._amax"],
+            torch.tensor([4.0]),
         )
         return "loaded"
 
@@ -1506,13 +1611,46 @@ def test_fake_quant_load_weights_exposes_input_quantizer_buffers(monkeypatch):
         fake_base_load_weights,
     )
 
-    assert extension._load_weights([("unused", torch.ones(1))]) == "loaded"
+    assert (
+        extension._load_weights(
+            [("child.self_attn.k_bmm_quantizer._amax", torch.tensor([4.0]))]
+        )
+        == "loaded"
+    )
 
     assert "weight" in seen_names
-    assert "input_quantizer_amax" in seen_names
+    assert "input_quantizer._amax" in seen_names
+    assert "self_attn.attn.k_bmm_quantizer._amax" in seen_names
     assert "weight_quantizer_amax" not in seen_names
-    assert not hasattr(child.input_quantizer_amax, "weight_loader")
-    torch.testing.assert_close(child.input_quantizer_amax, torch.tensor([3.0]))
+    assert not hasattr(child.input_quantizer._amax, "weight_loader")
+    assert not hasattr(child.self_attn.attn.k_bmm_quantizer._amax, "weight_loader")
+    torch.testing.assert_close(child.input_quantizer._amax, torch.tensor([3.0]))
+    torch.testing.assert_close(
+        child.self_attn.attn.k_bmm_quantizer._amax,
+        torch.tensor([4.0]),
+    )
+
+
+def test_fake_quant_eager_input_amax_loader_supports_direct_vllm_load(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = torch.nn.Module()
+    model.input_quantizer = torch.nn.Module()
+    model.input_quantizer.register_buffer("_amax", torch.tensor([1.0]))
+    model.k_bmm_quantizer = torch.nn.Module()
+    model.k_bmm_quantizer.register_buffer("_amax", torch.tensor([2.0]))
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+
+    with extension._attach_input_quantizer_amax_loaders(model):
+        input_amax = model.input_quantizer._amax
+        assert hasattr(input_amax, "weight_loader")
+        assert not hasattr(model.k_bmm_quantizer._amax, "weight_loader")
+
+        input_amax.weight_loader(input_amax, torch.tensor([3.0]))
+        input_amax.weight_loader(input_amax, torch.tensor([2.0]))
+        torch.testing.assert_close(input_amax, torch.tensor([3.0]))
+
+    assert not hasattr(model.input_quantizer._amax, "weight_loader")
 
 
 def test_real_quant_reload_keeps_vllm_config_active_during_layerwise_processing(
@@ -2064,6 +2202,7 @@ def test_get_quantizer_stats_counts_enabled_positive_amax(monkeypatch):
         "enabled": 3,
         "with_amax": 2,
         "positive_amax": 1,
+        "kv_amax": {},
     }
 
 
@@ -2325,8 +2464,12 @@ def test_register_nemo_modelopt_nvfp4_uses_public_vllm_registry(monkeypatch):
     source_config = {"quant_algo": "W4A16_NVFP4", "group_size": 16}
     w4a16_config = fake_vllm.registry[NEMO_MODELOPT_W4A16].from_config(source_config)
     assert source_config["quant_algo"] == "W4A16_NVFP4"
-    assert w4a16_config.parsed_config["quant_algo"] == "NVFP4"
+    # vLLM 0.25 understands W4A16_NVFP4 natively; the algo passes through.
+    assert w4a16_config.parsed_config["quant_algo"] == "W4A16_NVFP4"
     assert w4a16_config.get_name() == NEMO_MODELOPT_W4A16
+    # The base __init__ installs its own LinearMethodCls instance attribute;
+    # the NeMo config must rebind it to the refit-friendly Marlin method.
+    assert w4a16_config.LinearMethodCls.__name__ == "NemoModelOptW4A16LinearMethod"
 
     with pytest.raises(ValueError, match="requires quant_algo='W4A16_NVFP4'"):
         fake_vllm.registry[NEMO_MODELOPT_W4A16].from_config({"quant_algo": "NVFP4"})
@@ -2562,63 +2705,6 @@ def test_registered_w4a16_dense_method_uses_marlin_weight_only(monkeypatch):
     assert kernel_args["bias"] is None
 
 
-@pytest.mark.parametrize(
-    ("is_act_and_mul", "packed_hidden_size", "expected_padded_size"),
-    [
-        (False, 64, 192),
-        (True, 32, 256),
-    ],
-)
-def test_pad_nvfp4_moe_for_marlin_uses_hidden_size_tile_alignment(
-    is_act_and_mul,
-    packed_hidden_size,
-    expected_padded_size,
-):
-    num_shards = 2 if is_act_and_mul else 1
-    intermediate_size = 144
-    w13 = torch.ones(
-        1,
-        num_shards * intermediate_size,
-        packed_hidden_size,
-    )
-    w13_scale = torch.ones(1, num_shards * intermediate_size, 2)
-    w2 = torch.ones(1, 2, intermediate_size // 2)
-    w2_scale = torch.ones(1, 2, intermediate_size // 16)
-
-    padded_w13, padded_w13_scale, padded_w2, padded_w2_scale, padded_size = (
-        _pad_nvfp4_moe_for_marlin(
-            w13,
-            w13_scale,
-            w2,
-            w2_scale,
-            is_act_and_mul=is_act_and_mul,
-        )
-    )
-
-    assert padded_size == expected_padded_size
-    assert padded_w13.shape == (
-        1,
-        num_shards * expected_padded_size,
-        packed_hidden_size,
-    )
-    assert padded_w13_scale.shape == (1, num_shards * expected_padded_size, 2)
-    assert padded_w2.shape == (1, 2, expected_padded_size // 2)
-    assert padded_w2_scale.shape == (1, 2, expected_padded_size // 16)
-
-    padded_w13 = padded_w13.view(
-        1, num_shards, expected_padded_size, packed_hidden_size
-    )
-    padded_w13_scale = padded_w13_scale.view(1, num_shards, expected_padded_size, 2)
-    assert torch.all(padded_w13[:, :, :intermediate_size] == 1)
-    assert torch.count_nonzero(padded_w13[:, :, intermediate_size:]) == 0
-    assert torch.all(padded_w13_scale[:, :, :intermediate_size] == 1)
-    assert torch.count_nonzero(padded_w13_scale[:, :, intermediate_size:]) == 0
-    assert torch.all(padded_w2[..., : intermediate_size // 2] == 1)
-    assert torch.count_nonzero(padded_w2[..., intermediate_size // 2 :]) == 0
-    assert torch.all(padded_w2_scale[..., : intermediate_size // 16] == 1)
-    assert torch.count_nonzero(padded_w2_scale[..., intermediate_size // 16 :]) == 0
-
-
 def test_registered_w4a16_moe_create_weights_keeps_checkpoint_layout(monkeypatch):
     fake_vllm = _install_fake_registered_vllm_modelopt(monkeypatch)
     monkeypatch.setattr(vllm_modelopt, "_registered", False)
@@ -2683,11 +2769,14 @@ def test_registered_w4a16_moe_preserves_kernel_during_reload(monkeypatch):
 
     assert quant_method.moe_kernel is original_kernel
     assert quant_method.moe_quant_config is original_quant_config
+    # vLLM 0.25's native Marlin converter owns tile padding, so the NeMo
+    # override leaves shapes and moe_config untouched and only canonicalizes
+    # the ModelOpt sign-carrying scales in place.
     assert layer.moe_config.intermediate_size_per_partition == 80
-    assert layer.w13_weight.shape == (1, 128, 32)
-    assert layer.w13_weight_scale.shape == (1, 128, 2)
-    assert layer.w2_weight.shape == (1, 2, 64)
-    assert layer.w2_weight_scale.shape == (1, 2, 8)
+    assert layer.w13_weight.shape == (1, 80, 32)
+    assert layer.w13_weight_scale.shape == (1, 80, 2)
+    assert layer.w2_weight.shape == (1, 2, 40)
+    assert layer.w2_weight_scale.shape == (1, 2, 5)
     assert torch.all(layer.w13_weight_scale >= 0)
     assert torch.all(layer.w2_weight_scale >= 0)
-    assert fake_vllm.events == [("native_process_moe", 128)]
+    assert fake_vllm.events == [("native_process_moe", 80)]

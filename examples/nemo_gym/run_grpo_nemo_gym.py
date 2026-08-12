@@ -152,8 +152,14 @@ def main() -> None:
         )
 
     with rl_init_timer.time("tokenizer"):
-        # setup tokenizer
-        tokenizer = get_tokenizer(config.policy["tokenizer"])
+        is_vlm = bool(config.policy.get("is_vlm"))
+        if is_vlm:
+            processor = get_tokenizer(config.policy["tokenizer"], get_processor=True)
+            tokenizer = processor.tokenizer
+        else:
+            processor = None
+            tokenizer = get_tokenizer(config.policy["tokenizer"])
+
         assert config.policy["generation"] is not None, (
             "A generation config is required for GRPO"
         )
@@ -171,6 +177,11 @@ def main() -> None:
             has_refit_draft_weights=has_refit_draft_weights,
             trains_mtp=trains_mtp,
         )
+        if is_vlm and "vllm_cfg" in config.policy["generation"]:
+            assert not config.policy["generation"]["vllm_cfg"]["skip_tokenizer_init"], (
+                "VLMs require tokenizer to be initialized before generation, "
+                "so skip_tokenizer_init must be set to False."
+            )
 
         # NeMo-Gym specific config setup.
         setup_nemo_gym_config(config, tokenizer)
@@ -181,12 +192,13 @@ def main() -> None:
     # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
     with rl_init_timer.time("data"):
         print("\n▶ Setting up data...")
+        data_tokenizer = processor if processor is not None else tokenizer
         train_dataset, val_dataset = setup_response_data(
-            tokenizer, config.data, env_configs=None
+            data_tokenizer, config.data, env_configs=None
         )
 
     # Validation dataset config setup.
-    if config.grpo["max_val_samples"] is not None:
+    if config.grpo.max_val_samples is not None:
         raise ValueError(
             """A non-null `grpo.max_val_samples` parameter is not supported.
 
@@ -199,8 +211,8 @@ The validation set you pass in will directly be used for validation with no addi
         print(
             f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
         )
-        config.grpo["max_val_samples"] = len(val_dataset)
-        config.grpo["val_batch_size"] = config.grpo["max_val_samples"]
+        config.grpo.max_val_samples = len(val_dataset)
+        config.grpo.val_batch_size = config.grpo.max_val_samples
 
     # Print config
     print("Final config:")
@@ -231,7 +243,13 @@ The validation set you pass in will directly be used for validation with no addi
             master_config,
             teacher_worker_groups,
             alias_to_group_alias,
-        ) = setup(config, tokenizer, train_dataset, val_dataset)
+        ) = setup(
+            config,
+            tokenizer,
+            train_dataset,
+            val_dataset,
+            processor=processor,
+        )
 
     rl_init_timer.record("total", time.perf_counter() - main_start)
     rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
@@ -259,28 +277,16 @@ The validation set you pass in will directly be used for validation with no addi
             master_config=master_config,
         )
     # Check if async mode is enabled
-    elif "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
+    elif config.grpo.async_grpo.enabled:
         # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
-        unsupported_features = [
-            "use_dynamic_sampling",
-            "reward_scaling",
-            "reward_shaping",
-        ]
-
-        for feature in unsupported_features:
-            if feature not in config.grpo:
-                continue
-
-            if feature == "use_dynamic_sampling":
-                if config.grpo[feature]:
-                    raise NotImplementedError(
-                        f"{feature} is not supported with async GRPO"
-                    )
-            else:
-                if config.grpo[feature]["enabled"]:
-                    raise NotImplementedError(
-                        f"{feature} is not supported with async GRPO"
-                    )
+        if config.grpo.use_dynamic_sampling:
+            raise NotImplementedError(
+                "use_dynamic_sampling is not supported with async GRPO"
+            )
+        if config.grpo.reward_scaling.enabled:
+            raise NotImplementedError("reward_scaling is not supported with async GRPO")
+        if config.grpo.reward_shaping.enabled:
+            raise NotImplementedError("reward_shaping is not supported with async GRPO")
 
         # Async GRPO does not support multiple dataloaders
         if config.data["use_multiple_dataloader"]:
@@ -292,7 +298,6 @@ The validation set you pass in will directly be used for validation with no addi
 
         print("🚀 Running async GRPO training")
 
-        async_config = config.grpo["async_grpo"]
         # Run async GRPO training
         async_grpo_train(
             policy=policy,
@@ -307,9 +312,10 @@ The validation set you pass in will directly be used for validation with no addi
             checkpointer=checkpointer,
             grpo_save_state=grpo_state,
             master_config=master_config,
-            max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
             teacher_worker_groups=teacher_worker_groups,
             alias_to_group_alias=alias_to_group_alias,
+            processor=processor,
         )
     else:
         print("🚀 Running synchronous GRPO training")
@@ -328,6 +334,7 @@ The validation set you pass in will directly be used for validation with no addi
             checkpointer,
             grpo_state,
             master_config,
+            processor=processor,
         )
 
 

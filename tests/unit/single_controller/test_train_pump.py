@@ -28,6 +28,9 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
+from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -299,13 +302,16 @@ def test_train_pump_drives_mcore_training_step(
 
         master_config = MasterConfig.model_construct(
             policy={"train_global_batch_size": train_gbs},
-            grpo={
-                "num_prompts_per_step": num_prompts,
-                "num_generations_per_prompt": num_generations,
-                "max_num_steps": train_steps,
-                "max_num_epochs": None,
-            },
-            loss_fn=SimpleNamespace(force_on_policy_ratio=False),
+            # _sync_weights gates stale-abort on _should_use_nemo_gym(env); empty
+            # env -> native path (nemo_gym disabled).
+            env={},
+            grpo=GRPOConfig.model_construct(
+                num_prompts_per_step=num_prompts,
+                num_generations_per_prompt=num_generations,
+                max_num_steps=train_steps,
+                max_num_epochs=None,
+            ),
+            loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
             async_rl=AsyncRLConfig(
                 sampler=WindowedSamplerConfig(max_staleness_versions=1),
                 min_groups_for_streaming_train=num_prompts,
@@ -341,6 +347,7 @@ def test_train_pump_drives_mcore_training_step(
             metric_log_handle=log,
             master_config=master_config,
             actor_args=actor_args,
+            setup_timing_metrics=SetupTimingMetrics(),
         )
 
         # train_steps outer steps, each: sampler.select → advantage stage → begin/microbatches/finish → sync.
@@ -363,6 +370,8 @@ def test_train_pump_drives_mcore_training_step(
         for metrics in train_metrics:
             assert math.isfinite(metrics["reward"])
             assert math.isfinite(metrics["advantages/mean"])
+            assert metrics["evicted_stale_prompt_groups"] == 0
+            assert metrics["aborted_stale_inflight_groups"] == 0
 
     finally:
         trainer.shutdown()
