@@ -24,7 +24,11 @@ import asyncio
 import aiohttp
 import pytest
 import ray.exceptions
+from multidict import CIMultiDict, CIMultiDictProxy
+from ray import cloudpickle as ray_cloudpickle
+from yarl import URL
 
+from nemo_rl.environments.nemo_gym import _typed_gym_failure
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -37,6 +41,7 @@ from nemo_rl.experience.failures import (
     RolloutStall,
     RolloutTimeout,
     classify_rollout_failure,
+    http_status_is_infra,
 )
 
 
@@ -201,3 +206,79 @@ def test_infra_and_data_are_disjoint_branches_of_one_base():
     assert issubclass(RolloutDataFailure, RolloutFailure)
     assert not issubclass(RolloutInfraFailure, RolloutDataFailure)
     assert not issubclass(RolloutDataFailure, RolloutInfraFailure)
+
+
+class TestTheRayActorBoundary:
+    """The Ray actor boundary is where classification information goes to die.
+
+    Every NeMo-Gym HTTP failure is raised inside the ``NemoGym`` actor and has to cross
+    back to the driver to reach the retry policy. ``_response_error`` above -- and every
+    other case in this file -- builds a *headerless* ``ClientResponseError``, which
+    pickles cleanly. Production never produces that shape: aiohttp's
+    ``raise_for_status`` passes ``headers=self.headers``, a ``CIMultiDictProxy``, which
+    cloudpickle cannot serialize. Ray then drops the cause and the driver receives a bare
+    error carrying neither type nor ``.status`` -- so the status split below classified
+    every gym failure DATA, capping the gym path at 2 attempts and leaving the 5-attempt
+    infra budget unreachable on the path it was built for.
+
+    These pin the real shape so that cannot silently come back.
+    """
+
+    @staticmethod
+    def _realistic_response_error(status: int) -> aiohttp.ClientResponseError:
+        """Built the way aiohttp's ``raise_for_status`` builds it -- with real headers."""
+        headers = CIMultiDictProxy(CIMultiDict({"Content-Type": "application/json"}))
+        request_info = aiohttp.RequestInfo(
+            URL("http://gym/run"), "POST", headers, URL("http://gym")
+        )
+        return aiohttp.ClientResponseError(
+            request_info,
+            (),
+            status=status,
+            message=f"synthetic {status}",
+            headers=headers,
+        )
+
+    def test_the_realistic_error_cannot_survive_pickling(self):
+        """The premise of the fix. If this ever passes, _typed_gym_failure is dead weight."""
+        with pytest.raises(Exception):
+            ray_cloudpickle.dumps(self._realistic_response_error(503))
+
+    def test_the_headerless_shape_pickles_which_is_why_the_other_tests_missed_this(
+        self,
+    ):
+        ray_cloudpickle.dumps(_response_error(503))
+
+    @pytest.mark.parametrize(
+        ("status", "expected"),
+        [
+            (500, FailureClass.INFRA),  # what Gym's middleware turns inner errors into
+            (503, FailureClass.INFRA),
+            (408, FailureClass.INFRA),
+            (429, FailureClass.INFRA),
+            (400, FailureClass.DATA),  # context-length overflow and friends
+            (404, FailureClass.DATA),
+        ],
+    )
+    def test_what_nemo_gym_raises_survives_the_boundary_and_still_classifies(
+        self, status, expected
+    ):
+        typed = _typed_gym_failure(self._realistic_response_error(status))
+        assert typed is not None, f"HTTP {status} should have been classified at source"
+        # The boundary itself.
+        restored = ray_cloudpickle.loads(ray_cloudpickle.dumps(typed))
+        assert classify_rollout_failure(restored) is expected
+        assert str(status) in str(restored), "the status must survive for the operator"
+
+    def test_an_exception_without_a_status_is_left_untouched(self):
+        """No status means no HTTP verdict to make; the caller re-raises as-is."""
+        assert _typed_gym_failure(RuntimeError("not an HTTP failure")) is None
+
+    def test_both_sides_of_the_boundary_share_one_status_policy(self):
+        """nemo_gym classifies at source, failures.py on the driver -- one rule, not two."""
+        for status in (400, 404, 408, 429, 500, 503):
+            at_source = isinstance(
+                _typed_gym_failure(self._realistic_response_error(status)),
+                GymTransportError,
+            )
+            assert at_source is http_status_is_infra(status)

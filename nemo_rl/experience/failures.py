@@ -29,6 +29,14 @@ the whole retry policy:
 not recognized as infrastructure is treated as data — an unrecognized exception is more
 likely a real bug than a transient blip, and the data path surfaces it loudly instead of
 retrying it into silence.
+
+**Classify where the information still exists.** An exception that crosses a Ray actor
+boundary arrives stripped: Ray pickles the cause, and anything unpicklable (aiohttp's
+``CIMultiDictProxy`` headers, for one) is replaced by a bare error carrying neither type
+nor ``.status``. Driver-side classification is then guessing. So failures raised inside
+an actor are converted to a picklable member of this taxonomy *before* they cross —
+:func:`http_status_is_infra` exists to keep that decision identical on both sides. See
+``_typed_gym_failure`` in ``nemo_rl/environments/nemo_gym.py``.
 """
 
 from __future__ import annotations
@@ -148,6 +156,17 @@ _INFRA_TYPES: Final[tuple[type[BaseException], ...]] = (
     ray.exceptions.RpcError,
     ray.exceptions.GetTimeoutError,
     ray.exceptions.ObjectFetchTimedOutError,
+    # Cluster-resource and object-store failures. None of these say anything about the
+    # prompt, and all of them were previously falling through to DATA -- which meant a
+    # node running out of memory got two attempts and killed the run, while the bounded,
+    # backed-off infra budget built for exactly that sat unused.
+    # ObjectLostError is the parent of OwnerDiedError/ObjectFetchTimedOutError above;
+    # both are kept listed because being explicit about what we have considered is worth
+    # more here than a shorter tuple.
+    ray.exceptions.ObjectLostError,
+    ray.exceptions.OutOfMemoryError,
+    ray.exceptions.ObjectStoreFullError,
+    ray.exceptions.RaySystemError,
     *_AIOHTTP_INFRA_TYPES,
 )
 
@@ -168,6 +187,19 @@ _INFRA_TYPE_NAMES: Final[frozenset[str]] = frozenset(
         "ServerTimeoutError",
     }
 )
+
+
+def http_status_is_infra(status: int) -> bool:
+    """Whether an HTTP status means the endpoint is unwell rather than the request bad.
+
+    5xx and the retriable 4xx are infrastructure; any other 4xx describes the request
+    itself, so another shard would answer it identically.
+
+    Public because NeMo-Gym has to make this same call on the *raising* side of a Ray
+    actor boundary (see ``nemo_rl/environments/nemo_gym.py``), and the two copies of the
+    decision must not drift apart.
+    """
+    return status >= 500 or status in _RETRIABLE_HTTP_STATUSES
 
 
 def _http_status(exc: BaseException) -> Optional[int]:
@@ -194,7 +226,7 @@ def _is_infra(exc: BaseException) -> bool:
     # the retriable 4xx mean the endpoint is unwell, which another shard can serve.
     status = _http_status(exc)
     if status is not None:
-        return status >= 500 or status in _RETRIABLE_HTTP_STATUSES
+        return http_status_is_infra(status)
 
     if isinstance(exc, _INFRA_TYPES):
         return True
