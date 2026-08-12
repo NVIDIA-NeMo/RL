@@ -895,7 +895,10 @@ class AsyncNemoGymRolloutImpl:
             # and a later one end the stream cleanly-but-short, and without this the
             # operator reads "rows missing" with no cause attached at exactly the moment
             # they need one.
-            last_error: Optional[BaseException] = None
+            # Exception, not BaseException: the only writer is the `except Exception`
+            # below, and a wider annotation makes the `raise ... from last_error` at the
+            # end unverifiable.
+            last_error: Optional[Exception] = None
             async with _Deadline(self._timeouts.rollout_s, "NeMo-Gym prompt group"):
                 for attempt in range(1, self._max_gym_row_attempts + 1):
                     pending = [row for row in inputs if results[row["_rowidx"]] is None]
@@ -931,11 +934,16 @@ class AsyncNemoGymRolloutImpl:
 
             missing = [i for i, result in enumerate(results) if result is None]
             if missing:
-                raise GymTransportError(
+                failure = GymTransportError(
                     "NeMo-Gym rollout stream ended before all rows arrived; missing "
                     f"rows {missing} of {total_rows} after "
                     f"{self._max_gym_row_attempts} attempt(s)"
-                ) from last_error
+                )
+                # Narrowed before the raise: pyrefly rejects an Optional in a `from`
+                # clause, even though `raise ... from None` is legal at runtime.
+                if last_error is None:
+                    raise failure
+                raise failure from last_error
 
             completed_results = [result for result in results if result is not None]
             # All N rollouts share the same input prompt; tensorize one copy.
