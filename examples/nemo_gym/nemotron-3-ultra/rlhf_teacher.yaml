@@ -92,6 +92,7 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
+    max_generation_failures: 3
     in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: false
 
@@ -338,6 +339,7 @@ policy:
         reasoning_parser: nano_v3
 
     vllm_kwargs:
+      moe_backend: flashinfer_cutlass
       attention_backend: FLASH_ATTN
       mamba_ssm_cache_dtype: "float32"
       # Hybrid Mamba: one state slot per running seq; the vLLM default (1024) can
