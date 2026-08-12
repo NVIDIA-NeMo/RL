@@ -885,12 +885,22 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                         f"{expected_tokens}."
                     )
             elif self.cfg.get("require_routed_experts", False):
-                raise ValueError(
-                    "policy.router_replay.enabled=true requires NeMo Gym output "
-                    "items to include routed_experts, but the field was missing. "
-                    "Make sure the Gym repo includes routed_experts propagation "
-                    "and the NeMo-RL vLLM OpenAI-compatible server is configured "
-                    "with enable_return_routed_experts."
+                # Routes can be legitimately unrecoverable on the echo path
+                # (e.g. a context-overflow rollout whose only persisted
+                # completion record is the gate's synthetic empty response).
+                # Leave the message routeless: backfill_missing_routed_experts
+                # sentinel-fills it at flatten and Megatron self-routes those
+                # tokens; total absence across a batch still fails loudly at
+                # the rollout actor's ROUTED_EXPERTS_FIELD guard.
+                print(
+                    "router_replay: trainable Gym output item without "
+                    "routed_experts — falling back to the missing-route "
+                    "sentinel for this message "
+                    f"[item_idx={len(nemo_rl_message_log) // 2}, "
+                    f"item_type={output_item_dict.get('type')!r}, "
+                    f"n_prompt={len(prompt_token_ids)}, "
+                    f"n_gen={len(generation_token_ids)}]",
+                    flush=True,
                 )
 
             # The next prompt prefill supplies the real route for the previous
