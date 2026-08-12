@@ -139,6 +139,37 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         sampler_name=async_config.sampler.name,
     )
 
+    # DELIBERATE DIVERGENCE FROM PR 3582 — do not re-add without reading this.
+    #
+    # Upstream pairs ReadyFirstSampler with a guard here rejecting the sampler
+    # unless loss_fn.use_importance_sampling_correction is true and
+    # loss_fn.force_on_policy_ratio is false. The guard is well motivated:
+    # ready_first admits stale data by design, so it wants a genuine importance
+    # -sampling correction, and under force_on_policy_ratio the ratio is 1 by
+    # construction — there is no off-policy correction at all, whatever
+    # use_importance_sampling_correction says.
+    #
+    # It is omitted on this branch because the staleness sweep exists to compare
+    # ready_first against v1 and against the windowed arms, and every one of
+    # those arms runs force_on_policy_ratio=true (inherited from
+    # nemotron-3-ultra/student_rlvr1.yaml). Adopting the guard would abort each
+    # arm at setup; satisfying it would flip _policy_logprobs_required in
+    # SingleControllerActor and put the prev_logprobs forward pass back into the
+    # step — on the ready_first arms only. That moves step time, which is the
+    # metric being compared, so the guard would corrupt the experiment it was
+    # meant to protect.
+    #
+    # This is acceptable *only* because every arm is in the same state. The
+    # supporting evidence is that measured divergence is flat: gen_kl_error and
+    # js_divergence_error vary under 3% across staleness 1-6. Note also the PR
+    # review's separate finding that the guard keys on the sampler's config
+    # class rather than on the staleness actually configured, so it fires on
+    # ready_first at staleness 0 and stays silent on windowed at staleness 6.
+    #
+    # Restore the guard (and set force_on_policy_ratio=false) before ready_first
+    # is used for anything but this comparison. It must not carry into
+    # production as-is.
+
     # A non-zero reference-policy KL penalty makes the loss read
     # ``reference_policy_logprobs``, but the SC train pump only computes them
     # when ``skip_reference_policy_logprobs_calculation`` is false (see
