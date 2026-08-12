@@ -332,12 +332,35 @@ def test_validate_teacher_topk_checks_effective_teacher_override_cp(
 ):
     master_config = mock_grpo_components["master_config"]
     _enable_valid_topk(master_config, "teacher")
-    master_config.on_policy_distillation.teacher_model_by_agent_name = {
-        "large_teacher": "teacher-model"
-    }
-    master_config.on_policy_distillation.non_colocated_teachers.teacher_overrides = {
+    opd_config = master_config.on_policy_distillation.model_dump()
+    opd_config["teacher_model_by_agent_name"] = {"large_teacher": "teacher-model"}
+    opd_config["non_colocated_teachers"]["teacher_overrides"] = {
         "large_teacher": {"megatron_cfg_overrides": {"context_parallel_size": 2}}
     }
+    master_config.on_policy_distillation = OnPolicyDistillationConfig.model_validate(
+        opd_config
+    )
+
+    with pytest.raises(NotImplementedError, match="large_teacher"):
+        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
+
+
+def test_validate_teacher_topk_preserves_default_cp_with_unrelated_alias_override(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    opd_config = master_config.on_policy_distillation.model_dump()
+    opd_config["teacher_model_by_agent_name"] = {"large_teacher": "teacher-model"}
+    opd_config["non_colocated_teachers"]["default_teacher_cfg"][
+        "context_parallel_size"
+    ] = 2
+    opd_config["non_colocated_teachers"]["teacher_overrides"] = {
+        "large_teacher": {"num_nodes": 2}
+    }
+    master_config.on_policy_distillation = OnPolicyDistillationConfig.model_validate(
+        opd_config
+    )
 
     with pytest.raises(NotImplementedError, match="large_teacher"):
         _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")

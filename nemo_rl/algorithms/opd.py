@@ -62,6 +62,8 @@ class TeacherResourceOverrideConfig(BaseModel, extra="allow"):
 
     ``None`` means inherit the default teacher value. ``_opd_cfg`` serializes
     with ``exclude_none=True``, preserving only explicitly supplied overrides.
+    ``megatron_cfg_overrides`` is merged by key over the default map; an empty
+    map inherits all default Megatron overrides rather than clearing them.
     """
 
     tensor_model_parallel_size: Optional[int] = None
@@ -562,12 +564,18 @@ def create_teacher_worker_groups(
         teacher_worker_groups, policy_config["make_sequence_length_divisible_by"]
     )
 
-    # Build alias -> group_alias mapping for deduplication
-    alias_to_group_alias: dict[str, str] = {}
-    model_to_primary: dict[str, str] = {}
-    for teacher_config in teacher_configs:
-        model_to_primary[teacher_config.model_name] = teacher_config.alias
-    for alias, model_name in teacher_model_by_agent_name.items():
-        alias_to_group_alias[alias] = model_to_primary.get(model_name, alias)
+    # Build alias -> group alias mapping. Without deduplication, aliases sharing
+    # a checkpoint still own separate groups and must not be remapped by model.
+    if opd_cfg.get("deduplicate_shared_teacher_checkpoints", True):
+        model_to_primary = {
+            teacher_config.model_name: teacher_config.alias
+            for teacher_config in teacher_configs
+        }
+        alias_to_group_alias = {
+            alias: model_to_primary[model_name]
+            for alias, model_name in teacher_model_by_agent_name.items()
+        }
+    else:
+        alias_to_group_alias = {alias: alias for alias in teacher_model_by_agent_name}
 
     return teacher_worker_groups, alias_to_group_alias

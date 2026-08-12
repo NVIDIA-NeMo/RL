@@ -87,11 +87,13 @@ on_policy_distillation:
   # Map each NeMo Gym agent name to a teacher checkpoint.
   teacher_model_by_agent_name:
     default_teacher: Qwen/Qwen3-1.7B
+    large_teacher: /checkpoints/large-teacher
   # Agents not present in the map fall back to this alias (must be a mapped key).
   default_teacher_alias: default_teacher
   # If true, an unmapped agent raises instead of falling back.
   strict_agent_name_match: false
-  # Aliases that share one checkpoint reuse a single teacher worker group.
+  # Aliases that share one checkpoint and the same effective resource config
+  # reuse a single teacher worker group. Conflicting configs fail validation.
   deduplicate_shared_teacher_checkpoints: true
   non_colocated_teachers:
     enabled: true
@@ -100,13 +102,28 @@ on_policy_distillation:
       tensor_model_parallel_size: 2
       pipeline_model_parallel_size: 1
       context_parallel_size: 1
+      expert_model_parallel_size: 1
       num_nodes: 1
       gpus_per_node: 8
       precision: bf16
       micro_batch_size: 1
-    # Optional per-alias overrides on top of default_teacher_cfg.
-    teacher_overrides: {}
+      # Additional Megatron settings inherited by every teacher.
+      megatron_cfg_overrides:
+        moe_token_dispatcher_type: alltoall
+    # Optional sparse per-alias overrides on top of default_teacher_cfg.
+    # Nested megatron_cfg_overrides merge by key with the default map.
+    teacher_overrides:
+      large_teacher:
+        tensor_model_parallel_size: 8
+        expert_model_parallel_size: 4
+        num_nodes: 2
+        megatron_cfg_overrides:
+          moe_flex_dispatcher_backend: deepep
 ```
+
+An empty per-alias `megatron_cfg_overrides` map inherits all default keys; it
+does not clear them. There is currently no configuration syntax for deleting an
+inherited Megatron override.
 
 > [!NOTE]
 > Teachers run the Megatron backend in inference-only mode. A DTensor-configured

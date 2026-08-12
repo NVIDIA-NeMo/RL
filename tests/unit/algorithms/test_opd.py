@@ -800,6 +800,43 @@ def test_create_teacher_worker_groups_reuses_reserved_clusters(monkeypatch):
     assert alias_to_group_alias == {"math": "math", "code": "code"}
 
 
+def test_create_teacher_worker_groups_keeps_shared_checkpoint_aliases_without_dedup(
+    monkeypatch,
+):
+    """Distinct groups sharing a checkpoint retain their own routing aliases."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms import opd
+    from nemo_rl.models.policy import teacher_worker_group
+
+    class FakeTeacherWorkerGroup:
+        def __init__(self, *, teacher_cfg, cluster, policy_config, tokenizer):
+            self.worker_group = SimpleNamespace(workers=[])
+            self.use_sequence_packing = True
+            self.sequence_length_pad_multiple = 1
+
+    monkeypatch.setattr(
+        teacher_worker_group, "TeacherWorkerGroup", FakeTeacherWorkerGroup
+    )
+    monkeypatch.setattr(opd.ray, "get", lambda refs, timeout: [])
+    config = _teacher_setup_config()
+    config["on_policy_distillation"]["teacher_model_by_agent_name"] = {
+        "math": "/checkpoints/shared",
+        "code": "/checkpoints/shared",
+    }
+    config["on_policy_distillation"]["deduplicate_shared_teacher_checkpoints"] = False
+
+    worker_groups, alias_to_group_alias = opd.create_teacher_worker_groups(
+        config,
+        {"make_sequence_length_divisible_by": 8},
+        tokenizer=object(),
+        teacher_clusters={"math": object(), "code": object()},
+    )
+
+    assert list(worker_groups) == ["math", "code"]
+    assert alias_to_group_alias == {"math": "math", "code": "code"}
+
+
 # ---------------------------------------------------------------------------
 # Teacher-logprob seq-length padding + the "opd" advantage-estimator branch
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -61,23 +62,40 @@ def test_create_teacher_configs_sparse_override_preserves_default_resources():
         non_colocated_teachers={
             "default_teacher_cfg": {
                 "tensor_model_parallel_size": 8,
+                "pipeline_model_parallel_size": 3,
                 "context_parallel_size": 2,
+                "expert_model_parallel_size": 4,
                 "num_nodes": 2,
-                "megatron_cfg_overrides": {"sequence_parallel": True},
+                "megatron_cfg_overrides": {
+                    "moe_token_dispatcher_type": "alltoall",
+                    "moe_flex_dispatcher_backend": "deepep",
+                },
             },
-            "teacher_overrides": {"big": {"num_nodes": 4}},
+            "teacher_overrides": {
+                "big": {
+                    "num_nodes": 4,
+                    "megatron_cfg_overrides": {"sequence_parallel": True},
+                }
+            },
         },
     )
     opd_cfg = _opd_cfg({"on_policy_distillation": config})
 
     assert opd_cfg["non_colocated_teachers"]["teacher_overrides"]["big"] == {
-        "num_nodes": 4
+        "num_nodes": 4,
+        "megatron_cfg_overrides": {"sequence_parallel": True},
     }
     resolved = create_teacher_configs_from_opd_config(opd_cfg)[0]
     assert resolved.tensor_model_parallel_size == 8
+    assert resolved.pipeline_model_parallel_size == 3
     assert resolved.context_parallel_size == 2
+    assert resolved.expert_model_parallel_size == 4
     assert resolved.num_nodes == 4
-    assert resolved.megatron_cfg_overrides == {"sequence_parallel": True}
+    assert resolved.megatron_cfg_overrides == {
+        "moe_token_dispatcher_type": "alltoall",
+        "moe_flex_dispatcher_backend": "deepep",
+        "sequence_parallel": True,
+    }
 
 
 def test_create_teacher_configs_heterogeneous_override():
@@ -163,6 +181,28 @@ def test_create_teacher_configs_deduplicates():
         _opd_cfg({"on_policy_distillation": config})
     )
     assert len(configs) == 2
+
+
+def test_create_teacher_configs_rejects_conflicting_deduplicated_aliases():
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    config = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"math": "/shared", "code": "/shared"},
+        deduplicate_shared_teacher_checkpoints=True,
+        non_colocated_teachers={
+            "default_teacher_cfg": {"tensor_model_parallel_size": 2},
+            "teacher_overrides": {"code": {"num_nodes": 2}},
+        },
+    )
+
+    with pytest.raises(ValueError, match="code.*math.*shared"):
+        create_teacher_configs_from_opd_config(
+            _opd_cfg({"on_policy_distillation": config})
+        )
 
 
 def test_get_logprobs_on_support_routes_shards_and_preserves_worker_order():

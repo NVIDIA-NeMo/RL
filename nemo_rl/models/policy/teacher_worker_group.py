@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 import numpy as np
@@ -69,8 +69,9 @@ def create_teacher_configs_from_opd_config(
 ) -> list[TeacherConfig]:
     """Build per-teacher configs from on_policy_distillation config.
 
-    Handles deduplication (multiple aliases sharing one checkpoint produce
-    one TeacherConfig) and per-teacher overrides on top of defaults.
+    Per-teacher fields and ``megatron_cfg_overrides`` are merged over the
+    defaults. Aliases sharing a checkpoint are deduplicated only when their
+    effective configs are identical; conflicting configs fail fast.
     """
     teacher_model_by_agent_name: dict[str, str] = dict(
         opd_cfg.get("teacher_model_by_agent_name", {})
@@ -81,15 +82,16 @@ def create_teacher_configs_from_opd_config(
     deduplicate = bool(opd_cfg.get("deduplicate_shared_teacher_checkpoints", True))
 
     configs: list[TeacherConfig] = []
-    seen_models: set[str] = set()
+    primary_config_by_model: dict[str, TeacherConfig] = {}
 
     for alias, model_name in teacher_model_by_agent_name.items():
-        if deduplicate and model_name in seen_models:
-            continue
-        seen_models.add(model_name)
-
         # defaults <- per-alias override, then validated/typed by the schema.
-        merged = {**default_cfg, **dict(overrides.get(alias, {}))}
+        alias_override = dict(overrides.get(alias, {}))
+        merged = {**default_cfg, **alias_override}
+        merged["megatron_cfg_overrides"] = {
+            **dict(default_cfg.get("megatron_cfg_overrides", {})),
+            **dict(alias_override.get("megatron_cfg_overrides", {})),
+        }
         res = TeacherResourceConfig(**merged)
 
         # Unknown top-level keys (extra="allow") fold into megatron_cfg_overrides;
@@ -108,21 +110,32 @@ def create_teacher_configs_from_opd_config(
         if "expert_model_parallel_size" in all_overrides:
             ep = int(all_overrides["expert_model_parallel_size"])
 
-        configs.append(
-            TeacherConfig(
-                alias=alias,
-                model_name=model_name,
-                tensor_model_parallel_size=tp,
-                pipeline_model_parallel_size=pp,
-                context_parallel_size=cp,
-                expert_model_parallel_size=ep,
-                num_nodes=res.num_nodes,
-                gpus_per_node=res.gpus_per_node,
-                precision=res.precision,
-                micro_batch_size=res.micro_batch_size,
-                megatron_cfg_overrides=all_overrides,
-            )
+        config = TeacherConfig(
+            alias=alias,
+            model_name=model_name,
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            context_parallel_size=cp,
+            expert_model_parallel_size=ep,
+            num_nodes=res.num_nodes,
+            gpus_per_node=res.gpus_per_node,
+            precision=res.precision,
+            micro_batch_size=res.micro_batch_size,
+            megatron_cfg_overrides=all_overrides,
         )
+        if deduplicate and model_name in primary_config_by_model:
+            primary = primary_config_by_model[model_name]
+            if replace(config, alias=primary.alias) != primary:
+                raise ValueError(
+                    "Aliases sharing a teacher checkpoint must have identical "
+                    "effective resource configs when "
+                    "deduplicate_shared_teacher_checkpoints=true; "
+                    f"'{alias}' conflicts with primary alias '{primary.alias}' "
+                    f"for checkpoint '{model_name}'."
+                )
+            continue
+        primary_config_by_model[model_name] = config
+        configs.append(config)
 
     return configs
 
