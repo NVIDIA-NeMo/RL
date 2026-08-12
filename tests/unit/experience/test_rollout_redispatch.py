@@ -229,9 +229,7 @@ class TestDataFailures:
         manager = _make_manager(
             buffer,
             impl,
-            RolloutRetryPolicy(
-                max_data_attempts=2, skip_on_data_exhausted=True, max_skipped_prompts=5
-            ),
+            RolloutRetryPolicy(max_data_attempts=2, max_skipped_prompts=5),
         )
 
         outcome = asyncio.run(manager.generate_and_push(_sample()))
@@ -243,9 +241,7 @@ class TestDataFailures:
     def test_the_skip_budget_is_run_wide_not_per_prompt(self, no_sleep):
         """Otherwise a systematically broken dataset would skip forever."""
         buffer = _Buffer()
-        policy = RolloutRetryPolicy(
-            max_data_attempts=1, skip_on_data_exhausted=True, max_skipped_prompts=2
-        )
+        policy = RolloutRetryPolicy(max_data_attempts=1, max_skipped_prompts=2)
         impl = _ScriptedImpl([RolloutDataFailure("x")] * 50)
         manager = _make_manager(buffer, impl, policy)
 
@@ -289,7 +285,9 @@ class TestPolicyValidation:
         policy = RolloutRetryPolicy()
         assert policy.max_infra_attempts == 1
         assert policy.max_data_attempts == 1
-        assert not policy.skip_on_data_exhausted
+        # 0 skips allowed: the first data-budget exhaustion propagates the original
+        # failure, which is what the retired on_data_exhausted="fail_fast" meant.
+        assert policy.max_skipped_prompts == 0
 
 
 class TestStats:
@@ -311,9 +309,7 @@ class TestStats:
         manager = _make_manager(
             buffer,
             impl,
-            RolloutRetryPolicy(
-                max_data_attempts=1, skip_on_data_exhausted=True, max_skipped_prompts=5
-            ),
+            RolloutRetryPolicy(max_data_attempts=1, max_skipped_prompts=5),
         )
 
         asyncio.run(manager.generate_and_push(_sample()))
