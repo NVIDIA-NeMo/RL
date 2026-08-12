@@ -105,7 +105,15 @@ def _broadcast_batched_data_dict(
                 dtype = getattr(torch, dtype_str.split(".")[-1])
                 tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
                 out[key] = tensor
-            torch.distributed.broadcast(tensor, src=src, group=group)
+            # NCCL has no int16 ("Short") type; ship as int32 and narrow back
+            # (routed_experts rides TQ as int16).
+            if tensor.dtype == torch.int16:
+                wire = tensor.to(torch.int32)
+                torch.distributed.broadcast(wire, src=src, group=group)
+                tensor = wire.to(torch.int16)
+                out[key] = tensor
+            else:
+                torch.distributed.broadcast(tensor, src=src, group=group)
             # Restore non-leader tensors to the leader's source device
             # so downstream code sees the same layout pre-broadcast.
             if (
