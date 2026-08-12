@@ -35,8 +35,10 @@ import torch
 
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import (
+    FailureClass,
     GenerationUnavailable,
     GymTransportError,
+    classify_rollout_failure,
     RolloutDataFailure,
     RolloutFailure,
     RolloutRedispatchExhausted,
@@ -762,6 +764,39 @@ class TestClassifyGenerationFailure:
             AssertionError("non-contiguous"), prompt_idx=1, traj_idx=2
         )
         assert isinstance(out, RolloutDataFailure)
+
+    @pytest.mark.parametrize(
+        "cause",
+        [
+            RuntimeError("EngineDeadError"),  # vLLM, worker still alive
+            RuntimeError("CUDA out of memory"),
+            ValueError("something we have never seen"),
+        ],
+    )
+    def test_a_ray_boundary_error_from_generation_is_infrastructure(self, cause):
+        """The boundary destroys the cause, so classify by the call site instead.
+
+        An exception raised inside a still-LIVING generation worker arrives as a bare
+        RayTaskError -- not a RayActorError, and not in _INFRA_TYPES -- so the generic
+        classifier can only fall through to DATA, and the prompt got 2 attempts instead
+        of the 5 the fleet-failure path exists for.
+
+        Scoped to this call site on purpose: globally, unrecognized-means-DATA is still
+        the right default. Here we know the RPC was a generation, so "that shard could
+        not serve it" is the correct reading whatever the cause was.
+        """
+        exc = ray.exceptions.RayTaskError("gen", "traceback", cause)
+        out = _classify_generation_failure(exc, prompt_idx=1, traj_idx=2)
+        assert isinstance(out, GenerationUnavailable)
+        assert classify_rollout_failure(out) is FailureClass.INFRA
+
+    def test_a_plain_data_error_is_still_data(self):
+        """The widening is Ray-boundary-only; ordinary bad prompts are unaffected."""
+        out = _classify_generation_failure(
+            ValueError("token ids are not contiguous"), prompt_idx=1, traj_idx=2
+        )
+        assert isinstance(out, RolloutDataFailure)
+        assert classify_rollout_failure(out) is FailureClass.DATA
 
     def test_both_branches_are_rollout_failures(self):
         for exc in (ConnectionResetError("x"), AssertionError("y")):
