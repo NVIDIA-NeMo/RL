@@ -23,7 +23,12 @@ git config --global --add safe.directory "$PROJECT_ROOT"
 
 set -eou pipefail
 
-EXP_NAME=$(basename "$0" .sh)
+# Suffixed with the victim state because BOTH lane entries run this script, and it opens
+# with `rm -rf "$EXP_DIR"` -- so a shared EXP_NAME meant the serving run deleted the idle
+# run's run.log and tensorboard artifacts. When serving then failed in CI, the idle
+# evidence you would compare it against was already gone.
+# VICTIM_STATE is not assigned until below, hence repeating its default here.
+EXP_NAME=$(basename "$0" .sh)-${VICTIM_STATE:-idle}
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
 RUN_LOG=$EXP_DIR/run.log
