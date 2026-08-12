@@ -44,7 +44,17 @@ MIN_GROUPS_FOR_STREAMING_TRAIN = 32
 
 
 class _FakeMeta:
-    """Stands in for KVBatchMeta, which only needs to concat here."""
+    """Stands in for KVBatchMeta: concat, plus the lengths selection totals.
+
+    ``_finalize_selection`` sums ``sequence_lengths`` over the chosen groups to
+    keep the sampler's evicted-vs-selected length statistic, so a fake without
+    the field fails every selection with an AttributeError.
+    """
+
+    def __init__(self, sequence_lengths: Optional[list[int]] = None) -> None:
+        self.sequence_lengths = (
+            [1] if sequence_lengths is None else list(sequence_lengths)
+        )
 
     def concat(self, *others: "_FakeMeta") -> "_FakeMeta":
         return self
