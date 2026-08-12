@@ -21,13 +21,17 @@ from typing import Any
 from nemo_rl.models.generation.dynamo.config import (
     DYNAMO_VLLM_FLAGS,
     DynamoCfg,
+    DynamoWorkerRole,
 )
 
 _MANAGED_FLAGS = {
     "--component",
+    "--disaggregation-mode",
     "--model-name",
     "--model-path",
     "--endpoint",
+    "--kv-events-config",
+    "--kv-transfer-config",
 }
 
 _CREDENTIAL_FLAGS = {
@@ -117,6 +121,8 @@ def build_dynamo_vllm_argv(
     vllm_cfg: Mapping[str, Any],
     vllm_kwargs: Mapping[str, Any],
     dynamo_cfg: DynamoCfg,
+    worker_role: DynamoWorkerRole,
+    kv_event_port: int | None,
 ) -> list[str]:
     """Build a conflict-free ``python -m dynamo.vllm`` argument list."""
     builder = _ArgvBuilder()
@@ -127,6 +133,37 @@ def build_dynamo_vllm_argv(
     builder.add("--request-plane", "tcp", source="managed runtime")
     builder.add("--event-plane", "nats", source="managed runtime")
     builder.add("--enable-rl", source="managed runtime")
+    if worker_role == "aggregated":
+        if kv_event_port is not None:
+            raise ValueError("Aggregated Dynamo workers do not use a KV-event port.")
+    else:
+        builder.add(
+            "--disaggregation-mode",
+            worker_role,
+            source="managed disaggregation",
+        )
+        builder.add(
+            "--kv-transfer-config",
+            {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
+            source="managed disaggregation",
+        )
+        if worker_role == "prefill":
+            if kv_event_port is None:
+                raise ValueError(
+                    "Managed Dynamo prefill workers require a KV-event port."
+                )
+            builder.add(
+                "--kv-events-config",
+                {
+                    "publisher": "zmq",
+                    "topic": "kv-events",
+                    "endpoint": f"tcp://*:{kv_event_port}",
+                    "enable_kv_cache_events": True,
+                },
+                source="managed disaggregation",
+            )
+        elif kv_event_port is not None:
+            raise ValueError("Dynamo decode workers do not use a KV-event port.")
     builder.add(
         "--weight-transfer-config",
         {"backend": "nccl"},

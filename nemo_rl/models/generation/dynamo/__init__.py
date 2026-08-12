@@ -14,6 +14,7 @@
 from nemo_rl.models.generation.dynamo.config import (
     DynamoCfg,
     DynamoConfig,
+    DynamoDisaggregationConfig,
     DynamoFrontendArgs,
     DynamoWorkerArgs,
 )
@@ -22,6 +23,7 @@ from nemo_rl.models.generation.dynamo.dynamo_generation import DynamoGeneration
 __all__ = [
     "DynamoCfg",
     "DynamoConfig",
+    "DynamoDisaggregationConfig",
     "DynamoFrontendArgs",
     "DynamoGeneration",
     "DynamoWorkerArgs",

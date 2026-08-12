@@ -42,6 +42,8 @@ DYNAMO_VLLM_FLAGS: dict[str, str] = {
     "enforce_eager": "--enforce-eager",
 }
 
+DynamoWorkerRole = Literal["aggregated", "decode", "prefill"]
+
 _VLLM_CFG_STRUCTURAL = {
     "env_vars",
     "expert_parallel_size",
@@ -130,6 +132,13 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
     extra_cli_args: list[str]
 
 
+class DynamoDisaggregationConfig(BaseModel, extra="forbid"):
+    """Managed prefill/decode worker counts for one shared engine shape."""
+
+    prefill_workers: PositiveInt
+    decode_workers: PositiveInt
+
+
 class DynamoCfg(BaseModel, extra="forbid"):
     """Driver-owned Dynamo service and worker-fleet configuration."""
 
@@ -137,6 +146,7 @@ class DynamoCfg(BaseModel, extra="forbid"):
     startup_timeout_s: PositiveFloat
     request_timeout_s: PositiveFloat
     control_timeout_s: PositiveFloat
+    disaggregation: DynamoDisaggregationConfig | None = None
     worker_args: DynamoWorkerArgs
     frontend_args: DynamoFrontendArgs
     metrics_include_prefixes: list[str] | None
@@ -268,6 +278,22 @@ class DynamoConfig(BaseModel, extra="allow"):
         """Return the derived ranks in each single-node vLLM engine."""
         return self.vllm_cfg.tensor_parallel_size * self.vllm_cfg.pipeline_parallel_size
 
+    @property
+    def managed_worker_count(self) -> int | None:
+        """Return the configured P/D engine count, or None for aggregated mode."""
+        disaggregation = self.dynamo_cfg.disaggregation
+        if disaggregation is None:
+            return None
+        return disaggregation.prefill_workers + disaggregation.decode_workers
+
+    @property
+    def managed_inference_world_size(self) -> int | None:
+        """Return the configured P/D GPU count, or None for aggregated mode."""
+        worker_count = self.managed_worker_count
+        if worker_count is None:
+            return None
+        return worker_count * self.engine_world_size
+
     @model_validator(mode="after")
     def _validate_backend_boundary(self) -> "DynamoConfig":
         extra = self.model_extra or {}
@@ -286,6 +312,22 @@ class DynamoConfig(BaseModel, extra="allow"):
                 "policy.generation.colocated.enabled must be false when "
                 "backend='dynamo'"
             )
+        if self.dynamo_cfg.disaggregation is not None:
+            resources = (
+                colocated.get("resources") if isinstance(colocated, dict) else None
+            )
+            if isinstance(resources, dict):
+                gpus_per_node = resources.get("gpus_per_node")
+                num_nodes = resources.get("num_nodes")
+                if gpus_per_node is not None and num_nodes is not None:
+                    configured_gpus = int(gpus_per_node) * int(num_nodes)
+                    expected_gpus = self.managed_inference_world_size
+                    if configured_gpus != expected_gpus:
+                        raise ValueError(
+                            "Dynamo disaggregation requires inference GPUs to equal "
+                            "(prefill_workers + decode_workers) * TP * PP: "
+                            f"configured={configured_gpus}, expected={expected_gpus}"
+                        )
         if extra.get("refit_transport") is not None:
             raise ValueError(
                 "policy.generation.refit_transport must be null when "

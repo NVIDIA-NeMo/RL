@@ -101,7 +101,7 @@ install -m 0755 \
   "${dynamo_venv_dir}/bin/nats-server"
 
 "${dynamo_python}" -c \
-  'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.3.0.post1"; assert m.version("vllm") == "0.23.0"; assert m.version("nvidia-nccl-cu13") == "2.30.7"'
+  'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.3.0.post1"; assert m.version("vllm") == "0.23.0"; assert m.version("nvidia-nccl-cu13") == "2.30.7"; assert m.version("nixl") == "1.1.0"; assert m.version("nixl-cu13") == "1.1.0"'
 test -s "${dynamo_venv_dir}/VLLM_BACKPORTS"
 grep -Fqx \
   'vllm PR #44814 merge commit c9e5bf813530fb9ce06024e075da0f520b0718c8' \

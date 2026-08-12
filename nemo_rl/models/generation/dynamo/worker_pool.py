@@ -15,6 +15,8 @@
 """Fixed Ray-managed pool of Dynamo vLLM subprocess owners."""
 
 import os
+from collections import Counter
+from collections.abc import Sequence
 from typing import Any
 
 import ray
@@ -22,12 +24,17 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DYNAMO_KV_EVENT_PORT_RANGE_HIGH,
+    DEFAULT_DYNAMO_KV_EVENT_PORT_RANGE_LOW,
+    DEFAULT_DYNAMO_NIXL_PORT_RANGE_HIGH,
+    DEFAULT_DYNAMO_NIXL_PORT_RANGE_LOW,
     DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH,
     DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
     RayVirtualCluster,
 )
+from nemo_rl.models.generation.dynamo.config import DynamoWorkerRole
 from nemo_rl.models.generation.dynamo.dynamo_worker import (
     DynamoGpuReservation,
     DynamoVllmWorker,
@@ -41,6 +48,28 @@ def _vllm_port_for_node_slot(node_slot: int) -> int:
     return DEFAULT_VLLM_PORT_RANGE_LOW + node_slot * DEFAULT_VLLM_PORTS_PER_ENGINE
 
 
+def _nixl_port_for_node_slot(node_slot: int) -> int:
+    """Return the managed node-local NIXL side-channel port."""
+    port = DEFAULT_DYNAMO_NIXL_PORT_RANGE_LOW + node_slot
+    if port >= DEFAULT_DYNAMO_NIXL_PORT_RANGE_HIGH:
+        raise ValueError(
+            "Managed Dynamo has more node-local engine groups than its "
+            f"NIXL-port band supports: slot={node_slot}"
+        )
+    return port
+
+
+def _kv_event_port_for_node_slot(node_slot: int) -> int:
+    """Return the managed node-local prefill KV-event port."""
+    port = DEFAULT_DYNAMO_KV_EVENT_PORT_RANGE_LOW + node_slot
+    if port >= DEFAULT_DYNAMO_KV_EVENT_PORT_RANGE_HIGH:
+        raise ValueError(
+            "Managed Dynamo has more node-local engine groups than its "
+            f"KV-event-port band supports: slot={node_slot}"
+        )
+    return port
+
+
 class FixedDynamoWorkerPool:
     """Reserve inference GPUs and launch one worker per model-parallel group."""
 
@@ -51,6 +80,7 @@ class FixedDynamoWorkerPool:
         config: dict[str, Any],
         namespace: str,
         engine_world_size: int,
+        worker_roles: Sequence[DynamoWorkerRole],
         manager_env: dict[str, str],
         startup_timeout_s: float,
     ) -> None:
@@ -58,6 +88,9 @@ class FixedDynamoWorkerPool:
         self._config = config
         self._namespace = namespace
         self._engine_world_size = engine_world_size
+        self._worker_roles = tuple(worker_roles)
+        if not self._worker_roles:
+            raise ValueError("Managed Dynamo requires at least one worker role.")
         self._manager_env = manager_env
         self._startup_timeout_s = startup_timeout_s
         self._workers: list[ray.actor.ActorHandle] = []
@@ -87,6 +120,7 @@ class FixedDynamoWorkerPool:
         }
 
         group_index = 0
+        role_indices: Counter[str] = Counter()
         engine_slots_by_node: dict[str, int] = {}
         system_ports_by_node: dict[str, set[int]] = {}
         metadata_refs: list[ray.ObjectRef] = []
@@ -139,7 +173,25 @@ class FixedDynamoWorkerPool:
                 )
                 system_ports.add(system_port)
                 vllm_port = _vllm_port_for_node_slot(node_slot)
-                group_name = f"{self._namespace}-dynamo-vllm-{pg_index}-{group_index}"
+                if group_index >= len(self._worker_roles):
+                    raise ValueError(
+                        "Inference placement groups contain more engine groups than "
+                        f"the configured managed worker roles: {len(self._worker_roles)}"
+                    )
+                worker_role = self._worker_roles[group_index]
+                nixl_port = (
+                    _nixl_port_for_node_slot(node_slot)
+                    if worker_role != "aggregated"
+                    else None
+                )
+                role_index = role_indices[worker_role]
+                role_indices[worker_role] += 1
+                kv_event_port = (
+                    _kv_event_port_for_node_slot(node_slot)
+                    if worker_role == "prefill"
+                    else None
+                )
+                group_name = f"{self._namespace}-dynamo-vllm-{worker_role}-{role_index}"
                 leader_strategy = PlacementGroupSchedulingStrategy(
                     placement_group=placement_group,
                     placement_group_bundle_index=bundle_indices[0],
@@ -163,6 +215,9 @@ class FixedDynamoWorkerPool:
                     cuda_devices=cuda_devices,
                     system_port=system_port,
                     vllm_port=vllm_port,
+                    nixl_port=nixl_port,
+                    kv_event_port=kv_event_port,
+                    worker_role=worker_role,
                     manager_env=self._manager_env,
                     startup_timeout_s=self._startup_timeout_s,
                     seed=pg_index * 1024 + group_index,
@@ -173,6 +228,13 @@ class FixedDynamoWorkerPool:
                 self._metadata.append({})
                 metadata_refs.append(worker.metadata.remote())
                 group_index += 1
+
+        if group_index != len(self._worker_roles):
+            raise ValueError(
+                "Inference placement groups contain fewer engine groups than the "
+                f"configured managed worker roles: placed={group_index}, "
+                f"configured={len(self._worker_roles)}"
+            )
 
         metadata_error: Exception | None = None
         for index, metadata_ref in enumerate(metadata_refs):
