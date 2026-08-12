@@ -40,6 +40,7 @@ set -euo pipefail
 #   SAMPLER=ready_first          # ready_first | in_order | windowed
 #   MAX_LOOKAHEAD_VERSIONS=4     # the sampler's slack, whatever it spells it
 #                                # 1 restores parity with the async-1 baseline
+#   BUFFER_RETENTION_MULTIPLIER=2  # max_buffered_rollouts only; gated samplers
 #   NUM_STORAGE_UNITS=16         # data_plane.num_storage_units
 #   GYM_MAX_CONCURRENCY=1280     # env.nemo_gym.max_concurrency; unset = Ray's 1000
 #   REFIT_TRANSPORT=null         # fall back to the full-tensor NCCL broadcast
@@ -141,7 +142,53 @@ esac
 REFIT_TRANSPORT="${REFIT_TRANSPORT:-nccl_reshard}"
 
 _NUM_PROMPTS_PER_STEP="${_NUM_PROMPTS_PER_STEP:-128}"
-_BUFFER_CAPACITY=$(( _NUM_PROMPTS_PER_STEP * (MAX_LOOKAHEAD_VERSIONS + 1) ))
+
+# Generation quota: the current cohort plus every lookahead cohort in flight at
+# once. This is the number that must not move, because it is what the arms are
+# compared on.
+_MAX_INFLIGHT_PROMPTS=$(( _NUM_PROMPTS_PER_STEP * (MAX_LOOKAHEAD_VERSIONS + 1) ))
+
+# Retention headroom, as a multiple of that quota. These were one variable until
+# ready_first made them different quantities.
+#
+# _buffer_capacity is a per-group semaphore taken at dispatch and released on
+# select, evict, or failure. Zero eviction deletes one of those three release
+# paths, so groups that have finished generating but have not yet been trained
+# on stay resident holding permits. At a multiplier of 1 they are holding
+# permits out of the same pool that admission draws from, so the finished work
+# crowds out new generation -- the fix for eviction creates a throughput
+# problem one layer down.
+#
+# A multiplier above 1 gives retention its own headroom, which is what v1 does:
+# late_arrival_slack=2 sizes its retention at P*lag*2 against a generation quota
+# of P*lag. Retention strictly exceeding what admission can produce is the
+# property that stops completed work from starving dispatch.
+#
+# This is NOT job 6014206 (768 buffered against 384 in flight, 1.8x slower).
+# That arm ran WindowedSampler, which derives from BaseSampler and whose admit
+# returns None immediately -- "dispatch is bounded by buffer capacity, not by
+# version" -- so there the buffer was the only thing limiting dispatch and
+# raising it raised dispatch. ready_first is a _GatedSampler: _dispatch_index
+# caps admission at MAX_LOOKAHEAD_VERSIONS+1 batches independently of the
+# buffer, so raising the buffer raises retention only. The guard below is what
+# keeps that reasoning honest rather than a comment nobody rereads.
+BUFFER_RETENTION_MULTIPLIER="${BUFFER_RETENTION_MULTIPLIER:-1}"
+_MAX_BUFFERED_ROLLOUTS=$(( _MAX_INFLIGHT_PROMPTS * BUFFER_RETENTION_MULTIPLIER ))
+
+if (( BUFFER_RETENTION_MULTIPLIER < 1 )); then
+  echo "BUFFER_RETENTION_MULTIPLIER must be >= 1, got ${BUFFER_RETENTION_MULTIPLIER}." >&2
+  echo "Below 1 the buffer sits under the sampler's required floor and the train" >&2
+  echo "pump waits for a batch the buffer is too small to ever hold." >&2
+  exit 1
+fi
+
+if (( BUFFER_RETENTION_MULTIPLIER > 1 )) && [[ "${SAMPLER}" == "windowed" ]]; then
+  echo "BUFFER_RETENTION_MULTIPLIER=${BUFFER_RETENTION_MULTIPLIER} with SAMPLER=windowed is the 6014206 trap." >&2
+  echo "WindowedSampler.admit returns None, so the buffer is its only dispatch" >&2
+  echo "limit and raising it raises dispatch: that arm ran 1.8x slower. Only the" >&2
+  echo "gated samplers (ready_first, in_order, weight_fifo) can take a multiplier." >&2
+  exit 1
+fi
 
 echo "================================================================"
 echo "  Nemotron 3.5 Nano — RLVR SingleController (honest-dolphin)"
@@ -151,7 +198,7 @@ echo "  Config     : ${CONFIG_PATH}"
 echo "  Refit      : ${REFIT_TRANSPORT}"
 echo "  Streaming  : min ${STREAM_MIN_GROUPS} of ${_NUM_PROMPTS_PER_STEP} groups per dispatch"
 echo "  Sampler    : ${SAMPLER} (slack ${MAX_LOOKAHEAD_VERSIONS})"
-echo "  Capacity   : buffer ${_BUFFER_CAPACITY} groups, ${_BUFFER_CAPACITY} in flight"
+echo "  Capacity   : buffer ${_MAX_BUFFERED_ROLLOUTS} groups (x${BUFFER_RETENTION_MULTIPLIER}), ${_MAX_INFLIGHT_PROMPTS} in flight"
 echo "  TQ units   : ${NUM_STORAGE_UNITS}"
 echo "  Gym concur : ${GYM_MAX_CONCURRENCY:-unset (Ray default 1000)}"
 echo "================================================================"
@@ -160,8 +207,8 @@ echo ""
 exec bash "${SCRIPT_DIR}/nano35_dolphin_launch.sh" \
   "async_rl.min_groups_for_streaming_train=${STREAM_MIN_GROUPS}" \
   "${_SAMPLER_OVERRIDES[@]}" \
-  "async_rl.max_inflight_prompts=${_BUFFER_CAPACITY}" \
-  "async_rl.max_buffered_rollouts=${_BUFFER_CAPACITY}" \
+  "async_rl.max_inflight_prompts=${_MAX_INFLIGHT_PROMPTS}" \
+  "async_rl.max_buffered_rollouts=${_MAX_BUFFERED_ROLLOUTS}" \
   "data_plane.num_storage_units=${NUM_STORAGE_UNITS}" \
   "policy.generation.refit_transport=${REFIT_TRANSPORT}" \
   ${_GYM_OVERRIDES[@]+"${_GYM_OVERRIDES[@]}"} \
