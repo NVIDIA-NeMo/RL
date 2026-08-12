@@ -137,6 +137,8 @@ def _prepopulate_buffer(
     # Group id follows pack_payload's "{group_uuid}_g{i}" convention.
     group_id = meta.sample_ids[0].rpartition("_g")[0]
     buffer._group_ids.append(group_id)
+    buffer.instance_id_list.append("unknown")
+    buffer.prompt_idx_list.append(-1)
 
 
 @pytest.fixture(scope="function")

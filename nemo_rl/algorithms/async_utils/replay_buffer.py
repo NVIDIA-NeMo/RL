@@ -711,6 +711,9 @@ class TQReplayBuffer:
         self.target_step_list: list[Optional[int]] = []
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
+        # Per-slot bookkeeping for eviction logs; unused by scheduling logic.
+        self.instance_id_list: list[str] = []
+        self.prompt_idx_list: list[int] = []
 
     def reserve(
         self,
@@ -718,6 +721,8 @@ class TQReplayBuffer:
         weight_version: int,
         target_step: Optional[int] = None,
         group_id: Optional[str] = None,
+        instance_id: str = "unknown",
+        prompt_idx: int = -1,
     ) -> str:
         """Append an unready slot tagged with weight_version.
 
@@ -725,6 +730,8 @@ class TQReplayBuffer:
             weight_version: Weight version stamped on the slot.
             target_step: Training step this slot targets; only consulted by StalenessSampler.force_in_order.
             group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
+            instance_id: Optional identifier for eviction logging (SWE-bench instance, task name, etc.).
+            prompt_idx: Optional dataloader index for eviction logging.
 
         Returns:
             group_id used by the matching commit.
@@ -737,6 +744,8 @@ class TQReplayBuffer:
         self.target_step_list.append(target_step)
         self.ready_list.append(False)
         self._group_ids.append(group_id)
+        self.instance_id_list.append(instance_id)
+        self.prompt_idx_list.append(prompt_idx)
         return group_id
 
     async def commit(
@@ -887,6 +896,8 @@ class TQReplayBuffer:
             del self.target_step_list[i]
             del self.ready_list[i]
             del self._group_ids[i]
+            del self.instance_id_list[i]
+            del self.prompt_idx_list[i]
 
         if remove_in_dp:
             await self._call_dp(
