@@ -126,7 +126,9 @@ class TestInfraRedispatch:
     ):
         buffer = _Buffer()
         impl = _ScriptedImpl([GenerationUnavailable("shard down")])
-        manager = _make_manager(buffer, impl, RolloutRetryPolicy(max_infra_attempts=3))
+        manager = _make_manager(
+            buffer, impl, RolloutRetryPolicy.single_attempt(max_infra_attempts=3)
+        )
 
         outcome = asyncio.run(manager.generate_and_push(_sample()))
 
@@ -138,7 +140,9 @@ class TestInfraRedispatch:
         """A failed attempt's rows must not be able to collide with the retry's."""
         buffer = _Buffer()
         impl = _ScriptedImpl([GenerationUnavailable("x"), GenerationUnavailable("y")])
-        manager = _make_manager(buffer, impl, RolloutRetryPolicy(max_infra_attempts=5))
+        manager = _make_manager(
+            buffer, impl, RolloutRetryPolicy.single_attempt(max_infra_attempts=5)
+        )
 
         asyncio.run(manager.generate_and_push(_sample()))
 
@@ -151,7 +155,9 @@ class TestInfraRedispatch:
     def test_exhausting_the_infra_budget_reports_fleet_wide_failure(self, no_sleep):
         buffer = _Buffer()
         impl = _ScriptedImpl([ray.exceptions.RayActorError()] * 10)
-        manager = _make_manager(buffer, impl, RolloutRetryPolicy(max_infra_attempts=3))
+        manager = _make_manager(
+            buffer, impl, RolloutRetryPolicy.single_attempt(max_infra_attempts=3)
+        )
 
         with pytest.raises(RolloutRedispatchExhausted, match="after 3 attempt"):
             asyncio.run(manager.generate_and_push(_sample()))
@@ -166,7 +172,7 @@ class TestInfraRedispatch:
         manager = _make_manager(
             buffer,
             impl,
-            RolloutRetryPolicy(
+            RolloutRetryPolicy.single_attempt(
                 max_infra_attempts=6, backoff_base_s=1.0, max_backoff_s=4.0
             ),
         )
@@ -180,7 +186,9 @@ class TestInfraRedispatch:
     def test_single_attempt_policy_reproduces_no_retry(self, no_sleep):
         buffer = _Buffer()
         impl = _ScriptedImpl([GenerationUnavailable("x")] * 3)
-        manager = _make_manager(buffer, impl, RolloutRetryPolicy(max_infra_attempts=1))
+        manager = _make_manager(
+            buffer, impl, RolloutRetryPolicy.single_attempt(max_infra_attempts=1)
+        )
 
         with pytest.raises(RolloutRedispatchExhausted):
             asyncio.run(manager.generate_and_push(_sample()))
@@ -194,7 +202,9 @@ class TestDataFailures:
         """A shard under pressure can return an empty generation that is not the prompt."""
         buffer = _Buffer()
         impl = _ScriptedImpl([RolloutDataFailure("no generation data")])
-        manager = _make_manager(buffer, impl, RolloutRetryPolicy(max_data_attempts=2))
+        manager = _make_manager(
+            buffer, impl, RolloutRetryPolicy.single_attempt(max_data_attempts=2)
+        )
 
         outcome = asyncio.run(manager.generate_and_push(_sample()))
 
@@ -204,7 +214,9 @@ class TestDataFailures:
     def test_a_genuinely_bad_prompt_fails_the_run_by_default(self, no_sleep):
         buffer = _Buffer()
         impl = _ScriptedImpl([RolloutDataFailure("prompt too long")] * 5)
-        manager = _make_manager(buffer, impl, RolloutRetryPolicy(max_data_attempts=2))
+        manager = _make_manager(
+            buffer, impl, RolloutRetryPolicy.single_attempt(max_data_attempts=2)
+        )
 
         with pytest.raises(RolloutDataFailure, match="prompt too long"):
             asyncio.run(manager.generate_and_push(_sample()))
@@ -217,7 +229,9 @@ class TestDataFailures:
         """Waiting cannot help a deterministic failure, so it should not cost time."""
         buffer = _Buffer()
         impl = _ScriptedImpl([RolloutDataFailure("x")] * 5)
-        manager = _make_manager(buffer, impl, RolloutRetryPolicy(max_data_attempts=3))
+        manager = _make_manager(
+            buffer, impl, RolloutRetryPolicy.single_attempt(max_data_attempts=3)
+        )
 
         with pytest.raises(RolloutDataFailure):
             asyncio.run(manager.generate_and_push(_sample()))
@@ -229,7 +243,9 @@ class TestDataFailures:
         manager = _make_manager(
             buffer,
             impl,
-            RolloutRetryPolicy(max_data_attempts=2, max_skipped_prompts=5),
+            RolloutRetryPolicy.single_attempt(
+                max_data_attempts=2, max_skipped_prompts=5
+            ),
         )
 
         outcome = asyncio.run(manager.generate_and_push(_sample()))
@@ -241,7 +257,9 @@ class TestDataFailures:
     def test_the_skip_budget_is_run_wide_not_per_prompt(self, no_sleep):
         """Otherwise a systematically broken dataset would skip forever."""
         buffer = _Buffer()
-        policy = RolloutRetryPolicy(max_data_attempts=1, max_skipped_prompts=2)
+        policy = RolloutRetryPolicy.single_attempt(
+            max_data_attempts=1, max_skipped_prompts=2
+        )
         impl = _ScriptedImpl([RolloutDataFailure("x")] * 50)
         manager = _make_manager(buffer, impl, policy)
 
@@ -258,7 +276,9 @@ class TestCancellationIsNeverRetried:
     def test_cancellation_propagates_and_releases_the_slot(self, no_sleep):
         buffer = _Buffer()
         impl = _ScriptedImpl([asyncio.CancelledError()])
-        manager = _make_manager(buffer, impl, RolloutRetryPolicy(max_infra_attempts=5))
+        manager = _make_manager(
+            buffer, impl, RolloutRetryPolicy.single_attempt(max_infra_attempts=5)
+        )
 
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(manager.generate_and_push(_sample()))
@@ -279,10 +299,11 @@ class TestPolicyValidation:
     def test_zero_attempt_budgets_are_rejected(self, kwargs):
         """A zero budget means "never attempt the rollout", which no caller wants."""
         with pytest.raises(ValueError, match="must be >= 1"):
-            RolloutRetryPolicy(**kwargs)
+            RolloutRetryPolicy.single_attempt(**kwargs)
 
-    def test_the_default_policy_is_single_attempt(self):
-        policy = RolloutRetryPolicy()
+    def test_single_attempt_is_the_no_retry_policy(self):
+        """The attempt budgets are required, so no-retry has to be asked for by name."""
+        policy = RolloutRetryPolicy.single_attempt()
         assert policy.max_infra_attempts == 1
         assert policy.max_data_attempts == 1
         # 0 skips allowed: the first data-budget exhaustion propagates the original
@@ -294,7 +315,9 @@ class TestStats:
     def test_redispatches_and_commits_are_counted(self, no_sleep):
         buffer = _Buffer()
         impl = _ScriptedImpl([GenerationUnavailable("x")])
-        manager = _make_manager(buffer, impl, RolloutRetryPolicy(max_infra_attempts=3))
+        manager = _make_manager(
+            buffer, impl, RolloutRetryPolicy.single_attempt(max_infra_attempts=3)
+        )
 
         asyncio.run(manager.generate_and_push(_sample()))
 
@@ -309,7 +332,9 @@ class TestStats:
         manager = _make_manager(
             buffer,
             impl,
-            RolloutRetryPolicy(max_data_attempts=1, max_skipped_prompts=5),
+            RolloutRetryPolicy.single_attempt(
+                max_data_attempts=1, max_skipped_prompts=5
+            ),
         )
 
         asyncio.run(manager.generate_and_push(_sample()))

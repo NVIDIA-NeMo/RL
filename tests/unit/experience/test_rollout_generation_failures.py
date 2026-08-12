@@ -169,7 +169,9 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
     manager._tq_buffer = buffer
     manager._weight_version = 0
     manager._retry_policy = (
-        retry_policy if retry_policy is not None else RolloutRetryPolicy()
+        retry_policy
+        if retry_policy is not None
+        else RolloutRetryPolicy.single_attempt()
     )
     manager._stats = RolloutStats()
     manager._skipped_prompts = 0
@@ -514,7 +516,9 @@ class _FakeGymMethod:
                 raise
 
 
-def _make_gym_impl(gym_method, *, num_generations=2, timeouts=None, row_attempts=1):
+def _make_gym_impl(
+    gym_method, *, num_generations=2, timeouts=None, row_attempts=1, stats=None
+):
     from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 
     impl = object.__new__(AsyncNemoGymRolloutImpl)
@@ -525,6 +529,9 @@ def _make_gym_impl(gym_method, *, num_generations=2, timeouts=None, row_attempts
     impl._max_rollout_turns = 1
     impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
     impl._max_gym_row_attempts = row_attempts
+    # Real counters by default so row-level re-dispatches are observable; production
+    # shares the owning RolloutManager's instance.
+    impl._stats = stats if stats is not None else RolloutStats()
     # Upstream default; this fixture is about re-dispatch, not sample masking.
     impl._mask_env_flagged_samples = True
     return impl
@@ -608,6 +615,71 @@ class TestPartialGymRedispatch:
         assert method.dispatched == [[0, 1, 2, 3, 4], [3, 4]]
         assert len(completions) == 5
         assert sum(len(d) for d in method.dispatched) == 7
+
+    def test_a_stale_echo_of_a_landed_row_is_rejected(self):
+        """Re-dispatch narrows the stream; an echo of an already-landed row must not win.
+
+        Attempt 1 lands row 0 then dies. Attempt 2 carries only the rows that never
+        arrived, so a stream replaying row 0 is echoing stale work -- and silently
+        accepting it would overwrite a good result with an older one. This guard had no
+        test at all: deleting the two lines it lives in left the suite green.
+        """
+
+        class _EchoingMethod(_PartialGymMethod):
+            def __init__(self) -> None:
+                super().__init__(fail_after_rows=1, failures_before_success=1)
+
+            async def _stream(self, inputs, attempt):
+                if attempt == 0:
+                    yield _row_result(0)
+                    raise ConnectionResetError("stream died after row 0")
+                # Handed rows 1..n-1, but answers with row 0 all the same.
+                yield _row_result(0)
+
+        impl = _make_gym_impl(_EchoingMethod(), num_generations=3, row_attempts=3)
+
+        with pytest.raises(ValueError, match="which was not dispatched"):
+            asyncio.run(impl._run_rollouts(_gym_rows(3), Timer(), "timing/rollout"))
+
+    def test_row_redispatches_are_counted(self):
+        """Otherwise gym retries rows all run with every visible counter flat."""
+        stats = RolloutStats()
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=3, stats=stats)
+
+        asyncio.run(impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout"))
+
+        # Attempt 2 re-sent exactly the two rows that never arrived.
+        assert method.dispatched == [[0, 1, 2, 3], [2, 3]]
+        assert stats.gym_row_redispatches == 2
+        assert stats.as_metrics()["rollout/gym_row_redispatch_total"] == 2.0
+
+    def test_the_transport_error_that_lost_the_rows_is_chained(self):
+        """A short-but-clean final stream otherwise reports missing rows with no cause.
+
+        Attempt 1 dies with a transport error; attempt 2 ends cleanly without supplying
+        the rest. Without the chain the operator reads "rows missing" at exactly the
+        moment they need to know why.
+        """
+
+        class _ShortSecondAttempt(_PartialGymMethod):
+            def __init__(self) -> None:
+                super().__init__(fail_after_rows=1, failures_before_success=1)
+
+            async def _stream(self, inputs, attempt):
+                if attempt == 0:
+                    yield _row_result(0)
+                    raise ConnectionResetError("the transport error to blame")
+                return
+                yield  # unreachable; keeps this an async generator
+
+        impl = _make_gym_impl(_ShortSecondAttempt(), num_generations=3, row_attempts=2)
+
+        with pytest.raises(GymTransportError) as exc_info:
+            asyncio.run(impl._run_rollouts(_gym_rows(3), Timer(), "timing/rollout"))
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, ConnectionResetError)
+        assert "the transport error to blame" in str(cause)
 
     def test_exhausting_the_row_budget_reports_a_transport_failure(self):
         method = _PartialGymMethod(fail_after_rows=1, failures_before_success=99)

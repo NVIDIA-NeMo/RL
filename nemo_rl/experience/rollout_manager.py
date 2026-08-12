@@ -70,24 +70,42 @@ class RolloutOutcome(str, enum.Enum):
 class RolloutRetryPolicy:
     """Retry budgets for one prompt, resolved from ``async_rl.rollout_failure``.
 
-    The defaults here reproduce the historical single-attempt behaviour so that a
-    directly-constructed ``RolloutManager`` does not silently gain retries;
-    ``setup_single_controller`` passes the configured values in.
+    The attempt budgets are **required**. They previously defaulted to 1/1/1, which
+    contradicted ``RolloutFailureConfig``'s 5/2/3 and put a second set of defaults in
+    the codebase -- a reader here came away believing the shipped budget was 1. The only
+    place a retry default lives is ``RolloutFailureConfig``; callers that need the
+    historical no-retry behaviour ask for it by name via :meth:`single_attempt`.
     """
 
     # Attempts for infrastructure failures. 1 means no retry.
-    max_infra_attempts: int = 1
+    max_infra_attempts: int
     # Attempts for deterministic, prompt-specific failures. 1 means no retry.
-    max_data_attempts: int = 1
+    max_data_attempts: int
+    # Attempts to re-dispatch only the NeMo-Gym rows that never arrived, before the
+    # whole prompt group is retried. 1 means no row-level retry.
+    max_gym_row_attempts: int
+    # These three do not contradict RolloutFailureConfig, so they keep their defaults.
     backoff_base_s: float = 1.0
     max_backoff_s: float = 30.0
     # Run-wide cap on prompts that may exhaust their data budget and be dropped,
     # enforced across every generate_and_push call. 0 means none may be: the first
     # exhaustion propagates the original failure.
     max_skipped_prompts: int = 0
-    # Attempts to re-dispatch only the NeMo-Gym rows that never arrived, before the
-    # whole prompt group is retried. 1 means no row-level retry.
-    max_gym_row_attempts: int = 1
+
+    @classmethod
+    def single_attempt(cls, **overrides: Any) -> "RolloutRetryPolicy":
+        """The historical no-retry policy, with optional overrides.
+
+        An explicit choice for callers constructing a ``RolloutManager`` directly, who
+        must not silently gain retries -- not a second set of defaults.
+        """
+        budgets: dict[str, Any] = {
+            "max_infra_attempts": 1,
+            "max_data_attempts": 1,
+            "max_gym_row_attempts": 1,
+        }
+        budgets.update(overrides)
+        return cls(**budgets)
 
     def __post_init__(self) -> None:
         # A zero budget would mean "never attempt the rollout at all", which no caller
@@ -120,12 +138,28 @@ class RolloutStats:
 
     committed: int = 0
     skipped: int = 0
+    # Infra re-dispatches: the fleet is degrading. Kept apart from data retries because
+    # conflating them defeats the whole point of the two-budget split -- an operator
+    # watching redispatch_total climb needs to know whether the cluster is sick or the
+    # dataset is.
     redispatches_by_reason: dict[str, int] = field(default_factory=dict)
+    # Retries of a deterministic, prompt-specific failure.
+    data_retries_by_reason: dict[str, int] = field(default_factory=dict)
+    # Prompts that ran out of data budget entirely.
     data_failures_by_reason: dict[str, int] = field(default_factory=dict)
+    # NeMo-Gym row-level re-dispatches. These recover a partial prompt group without
+    # redoing the whole thing, so they never reached the counters above and gym could
+    # retry rows all run with redispatch_total sitting flat.
+    gym_row_redispatches: int = 0
 
     def record_redispatch(self, reason: str) -> None:
         self.redispatches_by_reason[reason] = (
             self.redispatches_by_reason.get(reason, 0) + 1
+        )
+
+    def record_data_retry(self, reason: str) -> None:
+        self.data_retries_by_reason[reason] = (
+            self.data_retries_by_reason.get(reason, 0) + 1
         )
 
     def record_data_failure(self, reason: str) -> None:
@@ -133,17 +167,31 @@ class RolloutStats:
             self.data_failures_by_reason.get(reason, 0) + 1
         )
 
+    def record_gym_row_redispatch(self, rows: int = 1) -> None:
+        self.gym_row_redispatches += rows
+
     def as_metrics(self) -> dict[str, float]:
         """Flatten into a metric dict for the SingleController logger."""
+        # Every family gets an aggregate, not just per-exception series: alerting on
+        # "any data failure" should not require knowing the exception names up front.
         metrics: dict[str, float] = {
             "rollout/committed_total": float(self.committed),
             "rollout/skipped_total": float(self.skipped),
             "rollout/redispatch_total": float(
                 sum(self.redispatches_by_reason.values())
             ),
+            "rollout/data_retry_total": float(
+                sum(self.data_retries_by_reason.values())
+            ),
+            "rollout/data_failures_total": float(
+                sum(self.data_failures_by_reason.values())
+            ),
+            "rollout/gym_row_redispatch_total": float(self.gym_row_redispatches),
         }
         for reason, count in self.redispatches_by_reason.items():
             metrics[f"rollout/redispatch_total/{reason}"] = float(count)
+        for reason, count in self.data_retries_by_reason.items():
+            metrics[f"rollout/data_retry_total/{reason}"] = float(count)
         for reason, count in self.data_failures_by_reason.items():
             metrics[f"rollout/data_failures_total/{reason}"] = float(count)
         return metrics
@@ -643,6 +691,9 @@ class AsyncNemoGymRolloutImpl:
         # RolloutManager always passes both explicitly.
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
+        # Shared with the owning RolloutManager so row-level re-dispatches are visible
+        # in the same counters as everything else. None when constructed directly.
+        stats: Optional[RolloutStats] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -654,8 +705,11 @@ class AsyncNemoGymRolloutImpl:
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._max_gym_row_attempts = (
-            retry_policy if retry_policy is not None else RolloutRetryPolicy()
+            retry_policy
+            if retry_policy is not None
+            else RolloutRetryPolicy.single_attempt()
         ).max_gym_row_attempts
+        self._stats = stats
 
         self._validate_init_params()
 
@@ -813,6 +867,12 @@ class AsyncNemoGymRolloutImpl:
             # rather than each await: NeMo-Gym yields rows as they finish, so a
             # per-await budget would reset every time a fast row landed and never fire
             # for the slow one holding the group up.
+            # Kept across attempts so the failure below can name the transport error that
+            # actually lost the rows. An intermediate attempt can absorb an INFRA error
+            # and a later one end the stream cleanly-but-short, and without this the
+            # operator reads "rows missing" with no cause attached at exactly the moment
+            # they need one.
+            last_error: Optional[BaseException] = None
             async with _Deadline(self._timeouts.rollout_s, "NeMo-Gym prompt group"):
                 for attempt in range(1, self._max_gym_row_attempts + 1):
                     pending = [row for row in inputs if results[row["_rowidx"]] is None]
@@ -824,11 +884,17 @@ class AsyncNemoGymRolloutImpl:
                             f"row(s) (attempt {attempt}/{self._max_gym_row_attempts})",
                             flush=True,
                         )
+                        # Row re-dispatches are invisible in redispatch_total -- they
+                        # recover a partial group instead of retrying the prompt -- so
+                        # gym could retry rows all run with every counter flat.
+                        if self._stats is not None:
+                            self._stats.record_gym_row_redispatch(len(pending))
                     try:
                         timing_metrics = await self._stream_rows(
                             nemo_gym_env, pending, results, total_rows, timer_prefix
                         )
                     except Exception as error:
+                        last_error = error
                         # Only transport-shaped failures are worth another dispatch; a
                         # prompt NeMo-Gym cannot serve fails the same way every time.
                         if (
@@ -846,7 +912,7 @@ class AsyncNemoGymRolloutImpl:
                     "NeMo-Gym rollout stream ended before all rows arrived; missing "
                     f"rows {missing} of {total_rows} after "
                     f"{self._max_gym_row_attempts} attempt(s)"
-                )
+                ) from last_error
 
             completed_results = [result for result in results if result is not None]
             # All N rollouts share the same input prompt; tensorize one copy.
@@ -995,10 +1061,14 @@ class RolloutManager:
             "num_generations_per_prompt must be >= 1"
         )
         # Resolved before the impl is built: the NeMo-Gym impl reads its row-retry
-        # budget out of it at construction time.
+        # budget out of it at construction time, and shares the counters so its
+        # row-level re-dispatches land in the same place as everything else.
         self._retry_policy = (
-            retry_policy if retry_policy is not None else RolloutRetryPolicy()
+            retry_policy
+            if retry_policy is not None
+            else RolloutRetryPolicy.single_attempt()
         )
+        self._stats = RolloutStats()
 
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
@@ -1024,14 +1094,14 @@ class RolloutManager:
             # None means "no deadlines", which is what async_rl's own defaults resolve
             # to; callers that have a config pass the resolved values in.
             timeouts=timeouts if timeouts is not None else RolloutTimeouts(),
-            # Only the NeMo-Gym impl reads this; the native impl absorbs it via kwargs.
+            # Only the NeMo-Gym impl reads these; the native impl absorbs them via kwargs.
             retry_policy=self._retry_policy,
+            stats=self._stats,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
         self._weight_version: int = 0
-        self._stats = RolloutStats()
         # Run-wide, shared across concurrent generate_and_push calls. Safe as a plain
         # int: every caller runs on the SingleController's single event loop.
         self._skipped_prompts: int = 0
@@ -1175,7 +1245,11 @@ class RolloutManager:
                     )
                     self._stats.skipped += 1
                     return RolloutOutcome.SKIPPED
-                self._stats.record_redispatch(reason)
+                # A data retry, NOT a re-dispatch: the fleet is fine, this prompt is
+                # suspect. Recording it as a re-dispatch made rollout/redispatch_total --
+                # documented above as the sign the fleet is degrading -- climb for bad
+                # data, which is the one distinction the two budgets exist to draw.
+                self._stats.record_data_retry(reason)
                 continue
             except BaseException:
                 # Cancellation and other non-Exception exits: clean up, never retry.
