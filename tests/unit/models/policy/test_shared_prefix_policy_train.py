@@ -63,9 +63,9 @@ def _save_tiny_qwen3(model_path) -> None:
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=16,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        head_dim=8,
         max_position_embeddings=128,
         attention_dropout=0.0,
         tie_word_embeddings=False,
@@ -92,10 +92,10 @@ def _make_rollouts() -> tuple[BatchedDataDict, BatchedDataDict]:
             3 + group * prompt_length,
             3 + (group + 1) * prompt_length,
         )
-        input_ids[row, prompt_length : prompt_length + response_length] = (
-            torch.arange(40 + row * response_length, 40 + (row + 1) * response_length)
-            % 85
-            + 3
+        response_start = 4 + (row % 4) * 32 + (row // 4) * response_length
+        input_ids[row, prompt_length : prompt_length + response_length] = torch.arange(
+            response_start,
+            response_start + response_length,
         )
         input_ids[
             row,
@@ -141,8 +141,9 @@ def _make_rollouts() -> tuple[BatchedDataDict, BatchedDataDict]:
     [
         (4, 1, 4, 2, 1, 36),
         (2, 2, 1, 8, 2, 112),
+        (4, 4, 1, 8, 2, 112),
     ],
-    ids=["dp4_tp1", "dp1_tp2"],
+    ids=["dp4_tp1", "dp1_tp2", "dp1_tp4"],
 )
 def test_shared_prefix_policy_train_fsdp2(
     tmp_path,
@@ -216,8 +217,8 @@ def test_shared_prefix_policy_train_fsdp2(
         train_data["generation_logprobs"] = before.clone()
         train_data["reference_policy_logprobs"] = before.clone()
 
-        # DP=4 forces four compact bins; TP=2 keeps all rollouts in one DP bin
-        # and replicates that physical layout across its two tensor-parallel ranks.
+        # DP=4 forces four compact bins; TP-only cases keep all rollouts in one
+        # DP bin and replicate that physical layout across tensor-parallel ranks.
         shards = policy._shard_for_train(train_data, batch_size=8)
         assert len(shards) == dp_size
         for shard in shards:
