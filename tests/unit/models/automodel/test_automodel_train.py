@@ -38,6 +38,7 @@ from nemo_rl.models.automodel.train import (
     LossPostProcessor,
     ScorePostProcessor,
     TopkLogitsPostProcessor,
+    ValueLossPostProcessor,
     _needs_kv_cache_for_shared_layers,
     apply_temperature_scaling,
     automodel_forward_backward,
@@ -1955,6 +1956,53 @@ class TestTopkLogitsPostProcessorSeqPacking:
 # =====================
 @pytest.mark.automodel
 class TestAutomodelForwardBackwardWithGradients:
+    @pytest.mark.parametrize(
+        ("post_processor_cls", "expected_cp_scale"),
+        [
+            (LossPostProcessor, 2),
+            (ValueLossPostProcessor, 1),
+        ],
+        ids=["policy", "value"],
+    )
+    def test_backward_cp_scale_depends_on_loss_processor(
+        self,
+        monkeypatch,
+        base_cfg,
+        mock_device_mesh,
+        mock_cp_mesh,
+        mock_tp_mesh,
+        post_processor_cls,
+        expected_cp_scale,
+    ):
+        """Full-sequence value loss must not receive another CP factor."""
+        loss_post_processor = post_processor_cls(
+            loss_fn=MagicMock(),
+            cfg=base_cfg,
+            device_mesh=mock_device_mesh,
+            cp_mesh=mock_cp_mesh,
+            tp_mesh=mock_tp_mesh,
+            cp_size=2,
+            dp_size=3,
+        )
+        loss = torch.tensor(1.0, requires_grad=True)
+        processed_mb = MagicMock()
+
+        monkeypatch.setattr(
+            "nemo_rl.models.automodel.train.forward_with_post_processing_fn",
+            lambda **kwargs: (loss, {"loss": torch.tensor(0.0)}, processed_mb),
+        )
+
+        automodel_forward_backward(
+            model=MagicMock(),
+            data_iterator=iter([processed_mb]),
+            post_processing_fn=loss_post_processor,
+            forward_only=False,
+            dp_size=3,
+            cp_size=2,
+        )
+
+        torch.testing.assert_close(loss.grad, torch.tensor(3.0 * expected_cp_scale))
+
     def test_forward_backward_computes_gradients(
         self,
         base_cfg,

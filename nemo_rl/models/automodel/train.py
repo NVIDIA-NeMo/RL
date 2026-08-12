@@ -538,18 +538,16 @@ def automodel_forward_backward(
                     ## by zero in the loss function to prevent them
                     ## from affecting the gradient calculation
 
-                    # when FSDP reduces the gradients over the DP dim, they're automatically averaged
-                    # but we want to sum them so we cancel out the average here
-                    # CP-sharded policy losses need the CP factor to cancel the
-                    # FSDP DP*CP gradient average. ValueLossPostProcessor first
-                    # all-gathers the full sequence and computes the same loss
-                    # on every CP rank; AllGatherCPTensor.backward already sums
-                    # those replicated output gradients across CP.
+                    # ValueLossPostProcessor computes the same full-sequence loss
+                    # on every CP rank. AllGatherCPTensor.backward already sums
+                    # those replicated gradients, so it needs no extra CP scale.
                     backward_cp_scale = (
                         1
-                        if getattr(post_processing_fn, "cp_loss_is_replicated", False)
+                        if isinstance(post_processing_fn, ValueLossPostProcessor)
                         else cp_size
                     )
+                    # FSDP averages gradients over DP*CP. Scale by DP to recover
+                    # a DP sum, and by CP only for CP-sharded policy losses.
                     loss = result * dp_size * backward_cp_scale
                     loss.backward()
 
@@ -669,10 +667,6 @@ class ValueLossPostProcessor(LossPostProcessor):
     values in their original full-sequence layout.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any):
-        super().__init__(*args, **kwargs)
-        self.cp_loss_is_replicated = self.cp_size > 1
-
     def __call__(
         self,
         logits: torch.Tensor,
@@ -692,9 +686,6 @@ class ValueLossPostProcessor(LossPostProcessor):
                 sequence_dim=sequence_dim,
             )
 
-        assert not self.enable_seq_packing, (
-            "DTensor context parallelism is incompatible with sequence packing."
-        )
         local_logits = to_local_if_dtensor(logits).to(torch.float32)
         full_logits = allgather_cp_sharded_tensor(
             local_logits, self.cp_mesh.get_group(), seq_dim=sequence_dim

@@ -283,11 +283,16 @@ def setup(
                 "value.sequence_packing.enabled=true."
             )
     else:
-        # DTensor PPO value model does not support sequence packing.
         assert value_config["dtensor_cfg"]["enabled"], (
             "Exactly one of value.megatron_cfg.enabled or value.dtensor_cfg.enabled "
             "must be true for the PPO value model."
         )
+        if value_config["dtensor_cfg"]["context_parallel_size"] > 1:
+            assert not value_config["sequence_packing"]["enabled"], (
+                "DTensor context parallelism is incompatible with value sequence "
+                "packing. Set value.sequence_packing.enabled=false when "
+                "value.dtensor_cfg.context_parallel_size>1."
+            )
         assert value_config["dynamic_batching"]["enabled"] is False, (
             "Dynamic batching currently has some issue for the DTensor PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2953."
