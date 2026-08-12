@@ -1489,6 +1489,82 @@ class TestAsyncTrajectoryCollector:
         # The filter shuts off once the covered window has been re-yielded.
         assert phase_b._resume_frontier_ordinal is None
 
+    def test_legacy_resume_skips_prompts_that_frontier_resume_regenerates(self):
+        """The measured failure mode in miniature, as an A/B.
+
+        16 prompts stream through in 4 batches. A checkpoint lands with
+        prompts 0-4 trained (frontier=5), groups {6, 7, 10} retained in the
+        buffer, prompts {5, 8, 9, 11} in flight, and the live cursor at
+        batch 3. The legacy resume (still in-tree as the fallback for
+        pre-frontier checkpoints) restores the live cursor and loses every
+        yielded-but-unbuffered prompt; the frontier resume regenerates all of
+        them with no duplicates.
+        """
+
+        def batch_for(prompt_ids):
+            return BatchedDataDict[DatumSpec](
+                {
+                    "task_name": ["test"] * len(prompt_ids),
+                    "message_log": [
+                        [{"role": "user", "content": f"prompt-{i}"}] for i in prompt_ids
+                    ],
+                    "extra_env_info": [{"prompt_id": i} for i in prompt_ids],
+                    "loss_multiplier": torch.ones(len(prompt_ids)),
+                }
+            )
+
+        def resume_stream(collector, loader):
+            self._prime_collection_loop(collector)
+            seen = []
+            collector._process_batch = lambda batch: seen.extend(
+                row["prompt_id"] for row in batch["extra_env_info"]
+            )
+            collector.dataloader = loader
+            collector._collection_loop()
+            return seen
+
+        all_prompts = set(range(16))
+        batches = [batch_for(range(i, i + 4)) for i in range(0, 16, 4)]
+        trained_before_save = set(range(5))  # consumed_samples = 5
+        retained = {6, 7, 10}  # completed groups in replay_buffer.pt
+        live_cursor_pos = 3  # batches 0-2 yielded at save time
+
+        phase_a = self.create_local_collector()
+        resume_stream(phase_a, self._FakeStatefulLoader(batches))
+        snapshot = phase_a.get_checkpoint_dataloader_state(5)
+
+        # Legacy semantics: live cursor restored, no rewind, no filter.
+        legacy_stream = resume_stream(
+            self.create_local_collector(),
+            self._FakeStatefulLoader(batches, start=live_cursor_pos),
+        )
+        legacy_skipped = all_prompts - (
+            trained_before_save | retained | set(legacy_stream)
+        )
+        assert sorted(legacy_skipped) == [5, 8, 9, 11]
+
+        # Frontier semantics: rewind to the saved snapshot, drop covered rows.
+        frontier = self.create_local_collector()
+        frontier._next_nemo_gym_task_index = snapshot["base_ordinal"]
+        frontier._ordinals_frontier_aligned = True
+        frontier._resume_frontier_ordinal = 5
+        frontier._covered_task_indices = set(retained)
+        frontier._skip_horizon = max(retained)
+        frontier_stream = resume_stream(
+            frontier,
+            self._FakeStatefulLoader(
+                batches, start=snapshot["dataloader_state"]["pos"]
+            ),
+        )
+
+        assert frontier_stream == [5, 8, 9, 11, 12, 13, 14, 15]
+        frontier_skipped = all_prompts - (
+            trained_before_save | retained | set(frontier_stream)
+        )
+        duplicates = (trained_before_save | retained) & set(frontier_stream)
+        assert not frontier_skipped
+        assert not duplicates
+
     def test_group_task_index_from_batch(self):
         unanimous = BatchedDataDict[DatumSpec](
             {"extra_env_info": [{NEMO_GYM_TASK_INDEX_KEY: 7}] * 3}
