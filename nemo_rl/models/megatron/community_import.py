@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
@@ -23,7 +24,9 @@ from megatron.core.transformer import ModuleSpec
 from nemo_rl.models.policy import MegatronConfig
 
 
-def iter_vlm_config_overrides(megatron_config: MegatronConfig):
+def iter_vlm_config_overrides(
+    megatron_config: MegatronConfig,
+) -> Iterator[tuple[str, Any]]:
     """Yield explicitly configured Nemotron Omni provider overrides.
 
     Only keys present in the recipe are yielded, so omitting one keeps the
@@ -131,8 +134,16 @@ def import_model_from_hf_name(
 
     if megatron_config is not None:
         for key, value in iter_vlm_config_overrides(megatron_config):
-            if hasattr(model_provider, key):
-                setattr(model_provider, key, value)
+            # Match the import-time behaviour in megatron/setup.py: a key the
+            # recipe set explicitly must not be dropped just because this
+            # provider lacks the field, or a frozen tower silently trains.
+            if not hasattr(model_provider, key):
+                raise ValueError(
+                    f"megatron_cfg set '{key}' but "
+                    f"{type(model_provider).__name__} has no such field; this "
+                    "provider does not support that tower control."
+                )
+            setattr(model_provider, key, value)
 
     # Keep track of defaults so can restore them to the config after loading the model
     orig_tensor_model_parallel_size = model_provider.tensor_model_parallel_size

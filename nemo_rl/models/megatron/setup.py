@@ -677,7 +677,6 @@ def setup_model_config(
                 "such field; this provider does not support that tower control."
             )
         setattr(model_cfg, vlm_key, vlm_value)
-            setattr(model_cfg, vlm_key, vlm_value)
 
     # Validate chunking configuration
     _validate_chunking_config(config)
