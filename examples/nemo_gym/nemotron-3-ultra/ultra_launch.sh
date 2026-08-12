@@ -872,6 +872,30 @@ export SETUP_COMMAND
 TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py}"
 # The recorder runs before training and never fails the job; see its header for
 # why submit-time provenance.txt is not enough on its own.
+#
+# UV_CACHE_DIR points at the warm cache the container already ships at
+# /root/.cache/uv. It used to be /tmp/nemo-gym-uv-cache-${SLURM_JOB_ID:-default},
+# which broke twice over:
+#
+#   - ray.sub scrubs every SLURM_* variable before entering the head container,
+#     so the job-id suffix always collapsed to "default"; and /tmp is node-local
+#     and wiped, so the cache was cold on every node of every job by construction.
+#   - Worse, pointing uv at /tmp discards the image's own cache. That cache holds
+#     git databases for all 13 git dependencies -- including Ascend/TransferQueue
+#     (24a4b760bde96358) and NVIDIA/nvidia-resiliency-ext (b667db27a8ea6b8c) --
+#     so every job re-cloned them from github instead of reading them locally.
+#
+# That is what killed 6071350, 6071353 and 6071948: the mounted Gym differs from
+# the baked one, which invalidates the lock and forces a re-resolve, and the
+# re-resolve then had to reach github from a compute node. It timed out at ~134s
+# on whichever repo was unlucky -- TransferQueue twice, nvidia-resiliency-ext
+# once, which is why this never looked repo-specific for long.
+#
+# Set explicitly rather than simply unset: sbatch --export=ALL carries an
+# inherited UV_CACHE_DIR from the submitting shell all the way into the
+# container, so relying on uv's default is not enough. Verified in job 6072555 —
+# with github made unreachable, the /tmp arm failed exactly as in production and
+# this arm resolved and synced clean.
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 bash ${CODE_ROOT}/examples/nemo_gym/nemotron-3-ultra/record_code_at_start.sh ${CODE_ROOT} ${RUN_DIR} ${PROJECT_ROOT} ; \
 OMP_NUM_THREADS=16 \
@@ -882,7 +906,7 @@ NRL_VLLM_CACHE_SEED_DIR=${NRL_VLLM_CACHE_SEED_DIR} \
 DG_JIT_CACHE_DIR=${NRL_VLLM_LOCAL_CACHE_DIR}/deep_gemm \
 TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
 TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
-UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default} \
+UV_CACHE_DIR=/root/.cache/uv \
 UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
