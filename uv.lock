@@ -138,10 +138,6 @@ name = "flash-attn"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 
 [[manifest.dependency-metadata]]
-name = "flashinfer-cubin"
-version = "0.6.13"
-
-[[manifest.dependency-metadata]]
 name = "flashinfer-python"
 version = "0.6.13"
 requires-dist = ["apache-tvm-ffi", "click", "cuda-tile==1.1.0", "einops", "ninja", "numpy", "nvidia-cudnn-frontend", "nvidia-cutlass-dsl==4.5.2", "nvidia-cutlass-dsl[cu13]==4.5.2 ; extra == 'cu13'", "nvidia-ml-py", "packaging", "requests", "tabulate", "torch", "tqdm"]

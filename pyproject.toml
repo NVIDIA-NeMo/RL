@@ -628,11 +628,6 @@ requires-dist = [
 ]
 
 [[tool.uv.dependency-metadata]]
-name = "flashinfer-cubin"
-version = "0.6.13"
-requires-dist = []
-
-[[tool.uv.dependency-metadata]]
 name = "flash-attn"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 
