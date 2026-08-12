@@ -918,6 +918,10 @@ class VllmAsyncGenerationWorkerImpl(
         # e.g. last-run middleware.
         app = FastAPI()
 
+        @app.get("/health")
+        async def health() -> dict[str, str]:
+            return {"status": "ok"}
+
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.setup_api_server(app)
