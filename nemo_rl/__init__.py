@@ -280,7 +280,9 @@ _patch_nsight_file()
 
 # Need to set PYTHONPATH to include transformers downloaded modules.
 # Assuming the cache directory is the same cross venvs.
-def patch_transformers_module_dir(env_vars: dict[str, str]):
+def patch_transformers_module_dir(
+    env_vars: dict[str, str], *, apply_to_current_interpreter: bool = False
+):
     # Prefer the explicit cache. A per-run HF_MODULES_CACHE keeps concurrent
     # runs from racing on generated module names, and deriving the directory
     # from HF_HOME instead would silently point at a different tree.
@@ -310,4 +312,4 @@ def patch_transformers_module_dir(env_vars: dict[str, str]):
     return env_vars
 
 
-patch_transformers_module_dir(os.environ)
+patch_transformers_module_dir(os.environ, apply_to_current_interpreter=True)
