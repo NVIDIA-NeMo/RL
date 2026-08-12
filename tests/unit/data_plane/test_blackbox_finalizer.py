@@ -245,3 +245,147 @@ def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):
     with pytest.raises((KeyError, RuntimeError, ValueError)):
         rows = _fetch_rows(tq_client, rollout_ids)
         assert not rows  # nothing published
+
+
+# ---------------------------------------------------------------------------
+# Router replay (R3): routed_experts rebuilt from staged extras and published
+# ---------------------------------------------------------------------------
+
+_R3_PARTITION = "rollout_data_fin_r3_test"
+_R3_STAGING = "rollout_staging_fin_r3_test"
+
+
+@pytest.fixture()
+def r3_partitions(tq_client):
+    from nemo_rl.data_plane.tq_token_sink import ROUTED_EXPERTS_FIELD
+
+    tq_client.register_partition(
+        partition_id=_R3_STAGING,
+        fields=list(STAGING_FIELDS) + [ROUTED_EXPERTS_FIELD],
+        num_samples=64,
+        consumer_tasks=["finalize"],
+    )
+    tq_client.register_partition(
+        partition_id=_R3_PARTITION,
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "generation_logprobs",
+            "token_mask",
+            "sample_mask",
+            "prompt_ids_for_adv",
+            "total_reward",
+            "routed_experts",
+        ],
+        num_samples=64,
+        consumer_tasks=["train"],
+    )
+    yield
+    tq_client.clear_samples(sample_ids=None, partition_id=_R3_STAGING)
+    tq_client.clear_samples(sample_ids=None, partition_id=_R3_PARTITION)
+
+
+def _routes_for_delta(call_idx: int, n_tokens: int) -> list:
+    """[n][L=2][K=2] rows, value = call*1000 + pos (recognizable per token)."""
+    return [
+        [[call_idx * 1000 + pos, call_idx * 1000 + pos + 500] for _ in range(2)]
+        for pos in range(n_tokens)
+    ]
+
+
+def _stage_fixture_with_routes(tq_client, name: str, *, rollout_id: str):
+    """Stage the golden fixture with per-call routed_experts extras attached.
+
+    Returns (receipt_dict, expected LinearizedRow, routes_by_call).
+    """
+    fixture = dict(load_fixture(name))
+    fixture["rollout_id"] = rollout_id
+    records, _, receipt, row = build_fixture_artifacts(fixture)
+    sink = TQTokenSink(tq_client, staging_partition=_R3_STAGING)
+    routes_by_call = {}
+    for idx, record in enumerate(records):
+        routes = _routes_for_delta(idx, len(record.token_ids_delta))
+        routes_by_call[record.call_id] = routes
+        staged = record.model_copy(update={"extras": {"routed_experts": routes}})
+        assert sink.stage(staged).ok
+    return receipt.model_dump(), row, routes_by_call
+
+
+def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
+    group_id = "grpr3"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, expected, routes_by_call = _stage_fixture_with_routes(
+        tq_client, "worked_example", rollout_id=rollout_ids[0]
+    )
+
+    finalizer = BlackboxFinalizer(
+        tq_client,
+        partition_id=_R3_PARTITION,
+        staging_partition=_R3_STAGING,
+        pad_token_id=PAD,
+        mixed_weight_version_policy="allow",
+        min_valid_fraction_per_group=None,
+        router_replay_enabled=True,
+    )
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],  # second rollout -> placeholder
+        [1.0, 0.0],
+        fallback_weight_version=9,
+    )
+    assert not finalized.dropped
+    assert "routed_experts" in finalized.meta.fields
+    assert finalized.metrics["finalize/routed_experts_row_coverage"] == 1.0
+    assert finalized.metrics["finalize/routed_experts_sentinel_token_fraction"] == 0.0
+
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=_R3_PARTITION,
+        select_fields=["routed_experts", "input_lengths"],
+    )
+    # Valid row: the delivered chain's staged extras, concatenated in chain
+    # order (the golden fixture is a single linear chain).
+    expected_routes = [
+        row_routes
+        for call_id in expected.call_ids
+        for row_routes in routes_by_call[call_id]
+    ]
+    valid_len = len(expected.token_ids)
+    assert len(expected_routes) == valid_len
+    published = torch.as_tensor(rows["routed_experts"][0]).reshape(-1, 2, 2)
+    assert published[:valid_len].tolist() == expected_routes
+    # Placeholder row: all-sentinel (Megatron self-routes; sample_mask 0).
+    placeholder = torch.as_tensor(rows["routed_experts"][1])
+    assert bool(placeholder.eq(-1).all().item())
+
+
+def test_finalize_group_router_replay_without_routes_fails_loudly(
+    tq_client, r3_partitions
+):
+    group_id = "grpr3b"
+    rollout_id = f"{group_id}_g0"
+    fixture = dict(load_fixture("worked_example"))
+    fixture["rollout_id"] = rollout_id
+    records, _, receipt, _ = build_fixture_artifacts(fixture)
+    sink = TQTokenSink(tq_client, staging_partition=_R3_STAGING)
+    for record in records:
+        assert sink.stage(record).ok  # no extras staged
+
+    finalizer = BlackboxFinalizer(
+        tq_client,
+        partition_id=_R3_PARTITION,
+        staging_partition=_R3_STAGING,
+        pad_token_id=PAD,
+        mixed_weight_version_policy="allow",
+        min_valid_fraction_per_group=None,
+        router_replay_enabled=True,
+    )
+    with pytest.raises(RuntimeError, match="routed_experts"):
+        finalizer.finalize_group(
+            group_id,
+            [rollout_id],
+            [receipt.model_dump()],
+            [1.0],
+            fallback_weight_version=9,
+        )
