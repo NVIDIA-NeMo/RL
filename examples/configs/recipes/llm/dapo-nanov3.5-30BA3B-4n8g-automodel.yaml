@@ -38,8 +38,6 @@ policy:
   logprob_batch_size: 1
   max_total_sequence_length: 9216
   make_sequence_length_divisible_by: 8
-  hf_config_overrides:
-    router_aux_loss_coef: 0.0
   optimizer:
     name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
@@ -74,8 +72,8 @@ policy:
         attn: te
         linear: te
         rms_norm: torch_fp32
-        experts: torch_mm
-        enable_deepep: true
+        experts: gmm
+        dispatcher: deepep
         rope_fusion: false
         enable_hf_state_dict_adapter: true
   sequence_packing:
