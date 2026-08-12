@@ -817,6 +817,23 @@ class SingleControllerActor:
         while True:
             await asyncio.sleep(_TELEMETRY_REPORT_SECONDS)
 
+            # Occupancy against the two capacities that bound it. Both numbers
+            # otherwise appear only in the train pump's stall warning, which
+            # fires after _SELECT_STALL_WARN_SECONDS, so a run that never
+            # stalls reports its occupancy nowhere -- and occupancy over time
+            # is what the async knobs are tuned against. Printed before
+            # anything that can fail or `continue`, so the series has no gaps.
+            print(
+                f"📊 occupancy (train_step={self._train_steps}): "
+                f"inflight={self._inflight_rollouts}/"
+                f"{self._async_cfg.max_inflight_prompts} "
+                f"buffered={len(self._buffer)}/"
+                f"{self._async_cfg.max_buffered_rollouts} "
+                f"dropped={self._dropped_rollouts} "
+                f"trainer_v={self._trainer_version}",
+                flush=True,
+            )
+
             # Reported first, and unconditionally: these totals are local
             # state, so unlike engine saturation they survive a generation
             # fleet that is unreachable or not collecting metrics at all.
