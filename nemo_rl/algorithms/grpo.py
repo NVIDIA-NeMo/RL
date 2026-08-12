@@ -2042,7 +2042,14 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
 
     if backend == "megatron":
         mcore_cfg = generation_config.get("mcore_generation_config", {})
-        return mcore_cfg.get("async_engine", False)
+        if mcore_cfg.get("async_engine") is not None:
+            warnings.warn(
+                "policy.generation.mcore_generation_config.async_engine is deprecated and ignored: "
+                "the Megatron backend always uses async rollouts. Remove the key from your config.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        return True
 
     return False
 
@@ -4102,12 +4109,13 @@ def async_grpo_train(
     # SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron", "trtllm") and _should_use_async_rollouts(
-        master_config
-    ), (
-        "Async GRPO requires an async vLLM, Megatron, or TRT-LLM generation engine. "
-        "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
-        "policy.generation.mcore_generation_config.async_engine=true (Megatron), or "
+    assert backend in ("vllm", "megatron", "trtllm"), (
+        "Async GRPO supports the vLLM, Megatron, and TRT-LLM generation backends; "
+        f"got policy.generation.backend={backend!r}."
+    )
+    assert _should_use_async_rollouts(master_config), (
+        "Async GRPO requires an async generation engine. Set "
+        "policy.generation.vllm_cfg.async_engine=true (vLLM) or "
         "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM)."
     )
     assert master_config.loss_fn.use_importance_sampling_correction, (
