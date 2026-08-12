@@ -88,6 +88,12 @@ def roce_device() -> str:
     device = os.environ.get("MC_MOONCAKE_DEVICE", "")
     if device:
         return device
+    # sysfs lists devices the kernel knows about; libibverbs can only open the
+    # ones exposed as /dev/infiniband/uverbs*. Containers routinely have the
+    # former without the latter, where mooncake fails with "No available RNIC"
+    # well after setup has begun — so treat a missing verbs node as no device.
+    if not glob.glob("/dev/infiniband/uverbs*"):
+        return ""
     for link_layer in sorted(
         glob.glob("/sys/class/infiniband/mlx5_*/ports/1/link_layer")
     ):
