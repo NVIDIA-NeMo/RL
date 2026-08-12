@@ -165,6 +165,8 @@ jobs:
             TEST_LEVEL="L1"
           elif [[ "$LABEL" == "CI:L2" ]]; then
             TEST_LEVEL="L2"
+          elif [[ "$LABEL" == "CI:megatron" ]]; then
+            TEST_LEVEL="megatron"
           else
             # Skip tests by default for non-labeled PRs
             TEST_LEVEL="none"
