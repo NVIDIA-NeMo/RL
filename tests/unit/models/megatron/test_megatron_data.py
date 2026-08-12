@@ -1461,6 +1461,7 @@ class TestGetMicrobatchIterator:
             "sequence_packing": {"enabled": True},
             "megatron_cfg": {
                 "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
                 "pipeline_model_parallel_size": 1,
                 "context_parallel_size": 1,
             },
@@ -1497,6 +1498,19 @@ class TestGetMicrobatchIterator:
             "seq_dim_size": 8,
             "seqlen_validation_calls": 0,
         }
+
+    def test_direct_packed_alignment_requires_sequence_parallel_config(self):
+        from nemo_rl.models.megatron.data import (
+            _get_packed_sequence_alignment_factors,
+        )
+
+        with pytest.raises(KeyError, match="sequence_parallel"):
+            _get_packed_sequence_alignment_factors(
+                {
+                    "tensor_model_parallel_size": 1,
+                    "context_parallel_size": 1,
+                }
+            )
 
     @pytest.mark.parametrize(
         ("pack_length", "fp8_cfg", "required_multiple"),

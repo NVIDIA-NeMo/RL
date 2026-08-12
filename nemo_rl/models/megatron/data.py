@@ -1462,7 +1462,7 @@ def _get_packed_sequence_alignment_factors(
     megatron_cfg: dict[str, Any],
 ) -> tuple[int, int]:
     tp_size = megatron_cfg["tensor_model_parallel_size"]
-    sp = megatron_cfg.get("sequence_parallel", False)
+    sp = megatron_cfg["sequence_parallel"]
     cp_size = megatron_cfg["context_parallel_size"]
     fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
     use_fp8 = fp8_cfg.get("enabled", False)
