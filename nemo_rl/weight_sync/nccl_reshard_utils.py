@@ -667,6 +667,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
         fp8_param = fp8_cfg.get("fp8_param", False)
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
+        trainer_precision = policy.get("precision")
         gen_precision = vllm_cfg.get("precision", None)
 
         # The refit byte-copies weights train -> gen, so gen dtype must match
@@ -698,7 +699,15 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
                         f"when fp8_param=True (got {fp8_recipe!r}); other recipes "
                         "don't produce export-ready scale_inv tensors."
                     )
-            elif not vllm_cfg.get("is_mx"):
+            elif vllm_cfg.get("is_mx"):
+                if trainer_precision != "bfloat16":
+                    violations.append(
+                        "policy.generation.vllm_cfg.is_mx=True with "
+                        "policy.megatron_cfg.fp8_cfg.fp8_param=False requires "
+                        "policy.precision='bfloat16' for receiver-side MXFP8 "
+                        f"quantization (got {trainer_precision!r})."
+                    )
+            else:
                 violations.append(
                     "policy.generation.vllm_cfg.precision='fp8' requires "
                     "policy.megatron_cfg.fp8_cfg.fp8_param=True, or "

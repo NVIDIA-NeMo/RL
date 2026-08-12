@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import subprocess
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -831,3 +832,71 @@ def test_submission_validation_checks_placeholders_paths_and_node_total():
     assert (
         "skipping external hetgroup node-count validation" in missing_node_count.stderr
     )
+
+
+def _run_lightning_launcher(**overrides):
+    launcher = (
+        REPO_ROOT / "examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh"
+    )
+    with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
+        root = Path(temp_dir)
+        gym_source = root / "Gym"
+        gym_actor = (
+            gym_source
+            / "responses_api_models/local_vllm_model/local_vllm_model_actor.py"
+        )
+        gym_actor.parent.mkdir(parents=True)
+        gym_actor.touch()
+        env = {
+            "HOME": str(root),
+            "PATH": os.environ["PATH"],
+            "DRY_RUN": "1",
+            "USE_SNAPSHOT": "0",
+            "EXP_NAME": "lightning-launcher-test",
+            "MODEL_PATH": "test-policy-model",
+            "TRAIN_PATH": str(root / "train.jsonl"),
+            "VAL_PATH": str(root / "validation.jsonl"),
+            "GENRM_MODEL": "test-genrm-model",
+            "NL2BASH_JUDGE_MODEL": "test-nl2bash-model",
+            "SAFETY_JUDGE_MODEL": "test-safety-model",
+            "CONTAINER": "test-container",
+            "SANDBOX_CONTAINER": "test-sandbox-container",
+            "PERSISTENT_CACHE": str(root / "cache"),
+            "RESULTS_DIR": str(root / "results"),
+            "GYM_SOURCE": str(gym_source),
+            "EXTERNAL_VLLM_SHARED_ROOT": str(REPO_ROOT),
+            "SLURM_PARTITION": "test-partition",
+            "SLURM_ACCOUNT": "test-account",
+        }
+        env.update(overrides)
+        return subprocess.run(
+            ["bash", str(launcher)],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_lightning_launcher_dry_run_builds_reference_external_pool_topology():
+    result = _run_lightning_launcher()
+
+    assert result.returncode == 0, result.stderr
+    assert "Nodes:       86 total" in result.stdout
+    assert "Hetgroup 0: 66 NeMo RL nodes" in result.stdout
+    assert "Hetgroup 1: 20 external-service nodes" in result.stdout
+    assert "GenRM:    8 independent TP=8, DP=1 servers" in result.stdout
+    assert "NL2Bash:  4 independent TP=4, DP=1 servers" in result.stdout
+    assert "base_url=__GENRM_BASE_URL__" in result.stdout
+    assert "base_url=__NL2BASH_BASE_URL__" in result.stdout
+    assert "--reasoning-parser\n  nemotron_v3" in result.stdout
+    assert "--reasoning-parser-plugin" not in result.stdout
+    assert "--attention-backend\n  TRITON_ATTN" in result.stdout
+    assert result.stdout.count("--enable-expert-parallel") == 2
+
+
+def test_lightning_launcher_rejects_invalid_external_pool_tp():
+    result = _run_lightning_launcher(GENRM_TENSOR_PARALLEL_SIZE="6")
+
+    assert result.returncode == 2
+    assert "must be divisible by GPUS_PER_NODE=4" in result.stderr

@@ -47,6 +47,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 def _valid_nccl_reshard_config() -> SimpleNamespace:
     return SimpleNamespace(
         policy={
+            "precision": "bfloat16",
             "generation": {
                 "backend": "vllm",
                 "colocated": {"enabled": False},
@@ -67,6 +68,18 @@ def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:
     config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
 
     check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("trainer_precision", ["float16", "float32"])
+def test_check_nccl_reshard_refit_support_rejects_non_bf16_to_mxfp8(
+    trainer_precision: str,
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = trainer_precision
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+
+    with pytest.raises(ValueError, match="requires policy.precision='bfloat16'"):
+        check_nccl_reshard_refit_support(config)
 
 
 def test_check_nccl_reshard_refit_support_keeps_matching_blockwise_fp8() -> None:

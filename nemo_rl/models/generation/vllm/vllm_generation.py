@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,6 +42,11 @@ from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
+)
+from nemo_rl.utils.multimodal_payload_metrics import (
+    collect_multimodal_payload_metrics,
+    collect_sharded_multimodal_payload_metrics,
+    print_multimodal_payload_metrics,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -638,6 +643,13 @@ class VllmGeneration(GenerationInterface):
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
         )
+        print_multimodal_payload_metrics(
+            collect_sharded_multimodal_payload_metrics(
+                sharded_data,
+                "vllm_generation",
+                enabled=bool(self.cfg.get("_debug_payload_metrics")),
+            )
+        )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate",
             data=sharded_data,
@@ -688,6 +700,13 @@ class VllmGeneration(GenerationInterface):
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
+        )
+        print_multimodal_payload_metrics(
+            collect_sharded_multimodal_payload_metrics(
+                sharded_data,
+                "vllm_text_generation",
+                enabled=bool(self.cfg.get("_debug_payload_metrics")),
+            )
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_text",
@@ -757,6 +776,13 @@ class VllmGeneration(GenerationInterface):
         # Determine the leader worker for the current data parallel shard
         leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
             self.current_generate_dp_shard_idx
+        )
+        print_multimodal_payload_metrics(
+            collect_multimodal_payload_metrics(
+                data,
+                "vllm_generation_async",
+                enabled=bool(self.cfg.get("_debug_payload_metrics")),
+            )
         )
 
         # Run the async method on the selected leader worker
