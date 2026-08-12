@@ -446,13 +446,12 @@ def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
     """Translate ``async_rl.rollout_failure`` into the rollout layer's policy object."""
     failure_config = master_config.async_rl.rollout_failure
     return RolloutRetryPolicy(
-        max_infra_attempts=failure_config.max_attempts_per_prompt,
+        max_infra_attempts=failure_config.max_infra_attempts_per_prompt,
         max_data_attempts=failure_config.max_data_attempts_per_prompt,
         backoff_base_s=failure_config.backoff_base_s,
         max_backoff_s=failure_config.max_backoff_s,
-        skip_on_data_exhausted=failure_config.on_data_exhausted == "skip",
         max_skipped_prompts=failure_config.max_skipped_prompts,
-        max_gym_row_attempts=failure_config.max_gym_row_attempts,
+        max_gym_row_attempts=failure_config.nemo_gym.max_row_attempts,
     )
 
 
@@ -729,9 +728,9 @@ def setup_single_controller(
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
-            rollout_s=master_config.async_rl.rollout_timeout_s,
-            generation_s=master_config.async_rl.generation_timeout_s,
-            env_s=master_config.async_rl.env_timeout_s,
+            rollout_s=master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s,
+            generation_s=master_config.async_rl.rollout_failure.native.generation_timeout_s,
+            env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
     )

@@ -42,18 +42,62 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig
 # ── User-facing SingleController configs ────────────────────────────────────
 
 
+class NativeRolloutFTConfig(BaseModel, extra="allow"):
+    """Fault-tolerance knobs read only by ``AsyncRolloutImpl`` (the native GRPO path).
+
+    Setting these on a NeMo-Gym run does nothing; ``validate_single_controller_config``
+    rejects that rather than letting it pass silently.
+    """
+
+    # Deadline for a single generate_async turn. None disables.
+    generation_timeout_s: Optional[PositiveFloat] = None
+    # Deadline for one environment step. None disables.
+    env_timeout_s: Optional[PositiveFloat] = None
+
+
+class NemoGymRolloutFTConfig(BaseModel, extra="allow"):
+    """Fault-tolerance knobs read only by ``AsyncNemoGymRolloutImpl``.
+
+    Setting these on a native run does nothing; ``validate_single_controller_config``
+    rejects that rather than letting it pass silently.
+    """
+
+    # Deadline for one whole prompt-group rollout, re-dispatches included. It spans the
+    # entire stream rather than each await: Gym yields rows as they finish, so a
+    # per-await budget would reset every time a fast row landed and never fire for the
+    # slow row actually holding the group up. None disables.
+    rollout_timeout_s: Optional[PositiveFloat] = None
+    # Attempts to re-dispatch just the rows that never arrived, before falling back to
+    # retrying the whole prompt group. Gym's stream dies on its first failing row, so one
+    # bad row takes every later row with it; recovering those individually is much
+    # cheaper than redoing all num_generations_per_prompt of them.
+    max_row_attempts: PositiveInt = 3
+
+
 class RolloutFailureConfig(BaseModel, extra="allow"):
-    """Retry budgets for a rollout that fails, split by failure class.
+    """Fault tolerance for a rollout that fails.
+
+    The budgets at the top level are consumed by ``generate_and_push``, which sits above
+    the native/NeMo-Gym split, so they govern **both** paths. Everything path-specific
+    lives in the ``native`` and ``nemo_gym`` sub-blocks, so the structure itself says
+    which knob applies where -- these used to dangle on ``async_rl`` among unrelated
+    pump and buffer settings, where a native-path operator could set the most
+    generic-sounding one (``rollout_timeout_s``) and silently get no deadline at all.
 
     Infrastructure failures re-dispatch the prompt onto a different generation shard;
     data failures are deterministic, so their budget is small and exhausting it is
     reported rather than absorbed. Nothing here ever discards a prompt silently.
     """
 
+    # ── shared: consumed by generate_and_push, above the impl split ──
     # Attempts for infrastructure failures (timeout, dead shard, transport). Each retry
     # re-enters shard selection, so it lands elsewhere. Exhausting this means the fleet
     # is broken rather than the prompt, and the run fails.
-    max_attempts_per_prompt: PositiveInt = 5
+    #
+    # Named for the failure class it bounds, not "per prompt": this budget and the data
+    # budget below are INDEPENDENT counters, not a total and a sub-total. Worst case for
+    # one prompt is their sum minus one -- 6 attempts under the defaults below.
+    max_infra_attempts_per_prompt: PositiveInt = 5
     # Attempts for deterministic, prompt-specific failures. One retry separates a
     # transient empty response from a genuinely bad prompt; a second identical failure
     # confirms the prompt is at fault.
@@ -62,16 +106,15 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     backoff_base_s: PositiveFloat = 1.0
     # Ceiling on the exponential backoff, so a long outage retries at a steady rate.
     max_backoff_s: PositiveFloat = 30.0
-    # After max_data_attempts_per_prompt: fail the run, or continue without the prompt.
-    on_data_exhausted: Literal["fail_fast", "skip"] = "fail_fast"
-    # Only with on_data_exhausted="skip": distinct prompts that may be skipped before
-    # the run fails anyway.
+    # Distinct prompts that may exhaust their data budget and be dropped before the run
+    # fails anyway. 0 (the default) fails on the first one, propagating the original
+    # error. One knob rather than two: an enum plus a count could express "skip, but
+    # never actually skip anything", which meant a validator existed purely to reject
+    # that one combination. At 0 the name reads as its own documentation.
     max_skipped_prompts: NonNegativeInt = 0
-    # NeMo-Gym only. Attempts to re-dispatch just the rows that never arrived, before
-    # falling back to retrying the whole prompt group. Gym's stream dies on its first
-    # failing row, so one bad row takes every later row with it; recovering those
-    # individually is much cheaper than redoing all num_generations_per_prompt of them.
-    max_gym_row_attempts: PositiveInt = 3
+    # ── path-specific ──
+    native: NativeRolloutFTConfig = Field(default_factory=NativeRolloutFTConfig)
+    nemo_gym: NemoGymRolloutFTConfig = Field(default_factory=NemoGymRolloutFTConfig)
 
     @model_validator(mode="after")
     def _check_consistent(self) -> "RolloutFailureConfig":
@@ -80,14 +123,29 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
                 f"async_rl.rollout_failure.max_backoff_s ({self.max_backoff_s}) must be "
                 f">= backoff_base_s ({self.backoff_base_s})"
             )
-        # Otherwise "skip" silently behaves exactly like "fail_fast".
-        if self.on_data_exhausted == "skip" and self.max_skipped_prompts < 1:
+        return self
+
+    @model_validator(mode="after")
+    def _reject_renamed_keys(self) -> "RolloutFailureConfig":
+        """Fail loudly on the previous key names rather than ignoring them.
+
+        ``extra="allow"`` means an old key parses fine and then does nothing. For
+        ``on_data_exhausted: skip`` that is a behaviour change -- prompts that used to be
+        skipped now fail the run -- arriving with no diagnostic at all.
+        """
+        renamed = {
+            "max_attempts_per_prompt": "max_infra_attempts_per_prompt",
+            "on_data_exhausted": "max_skipped_prompts (0 = the old 'fail_fast')",
+            "max_gym_row_attempts": "nemo_gym.max_row_attempts",
+        }
+        stale = [
+            f"  async_rl.rollout_failure.{old} -> async_rl.rollout_failure.{new}"
+            for old, new in renamed.items()
+            if getattr(self, old, None) is not None
+        ]
+        if stale:
             raise ValueError(
-                "async_rl.rollout_failure.on_data_exhausted='skip' requires "
-                "max_skipped_prompts >= 1; got "
-                f"{self.max_skipped_prompts}, which would skip nothing and fail the run "
-                "on the first exhausted prompt. Set max_skipped_prompts, or use "
-                "on_data_exhausted='fail_fast'."
+                "async_rl.rollout_failure keys have been renamed:\n" + "\n".join(stale)
             )
         return self
 
@@ -204,14 +262,7 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,
     )
-    # Deadline for one NeMo-Gym prompt-group rollout, covering the whole streaming
-    # response. None disables.
-    rollout_timeout_s: Optional[PositiveFloat] = None
-    # Deadline for a single generate_async turn on the native GRPO path. None disables.
-    generation_timeout_s: Optional[PositiveFloat] = None
-    # Deadline for one environment step on the native GRPO path. None disables.
-    env_timeout_s: Optional[PositiveFloat] = None
-    # Retry budgets for failed rollouts.
+    # Fault tolerance for failed rollouts: shared budgets plus per-path deadlines.
     rollout_failure: RolloutFailureConfig = Field(
         default_factory=RolloutFailureConfig,
     )
@@ -236,15 +287,59 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     def _check_watchdog_outlasts_rollouts(self) -> "AsyncRLConfig":
         # A rollout that is merely slow already has its own deadline; the watchdog must
         # give it a chance to fire first, or every long rollout reads as a stall.
-        if (
-            self.rollout_timeout_s is not None
-            and self.watchdog.stall_timeout_s <= self.rollout_timeout_s
-        ):
+        #
+        # Checks EVERY deadline, not just the NeMo-Gym one. This previously compared
+        # against rollout_timeout_s alone, so the invariant it advertises went unchecked
+        # on the native path -- where generation_timeout_s and env_timeout_s are the
+        # deadlines, and where a stall_timeout_s below either produces exactly the false
+        # stall reports this guard exists to prevent.
+        deadlines = (
+            (
+                "rollout_failure.nemo_gym.rollout_timeout_s",
+                self.rollout_failure.nemo_gym.rollout_timeout_s,
+            ),
+            (
+                "rollout_failure.native.generation_timeout_s",
+                self.rollout_failure.native.generation_timeout_s,
+            ),
+            (
+                "rollout_failure.native.env_timeout_s",
+                self.rollout_failure.native.env_timeout_s,
+            ),
+        )
+        for name, deadline in deadlines:
+            if deadline is not None and self.watchdog.stall_timeout_s <= deadline:
+                raise ValueError(
+                    f"async_rl.watchdog.stall_timeout_s "
+                    f"({self.watchdog.stall_timeout_s}) must be > async_rl.{name} "
+                    f"({deadline}); otherwise the watchdog reports a stall for rollouts "
+                    "that are merely slow and would have timed out on their own."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_relocated_keys(self) -> "AsyncRLConfig":
+        """Fail loudly on keys that moved, instead of ignoring them.
+
+        These models are ``extra="allow"``, so a config written against the previous
+        layout keeps parsing and its fault-tolerance settings simply stop taking effect.
+        A silently ignored ``rollout_timeout_s: 900`` is precisely the failure mode the
+        restructure was meant to remove, so the move must not create one on its way out.
+        """
+        moved = {
+            "rollout_timeout_s": "rollout_failure.nemo_gym.rollout_timeout_s",
+            "generation_timeout_s": "rollout_failure.native.generation_timeout_s",
+            "env_timeout_s": "rollout_failure.native.env_timeout_s",
+        }
+        stale = [
+            f"  async_rl.{old} -> async_rl.{new}"
+            for old, new in moved.items()
+            if getattr(self, old, None) is not None
+        ]
+        if stale:
             raise ValueError(
-                f"async_rl.watchdog.stall_timeout_s ({self.watchdog.stall_timeout_s}) "
-                f"must be > async_rl.rollout_timeout_s ({self.rollout_timeout_s}); "
-                "otherwise the watchdog reports a stall for rollouts that are merely "
-                "slow and would have timed out on their own."
+                "async_rl fault-tolerance keys have moved into rollout_failure:\n"
+                + "\n".join(stale)
             )
         return self
 
@@ -334,6 +429,29 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "computing them on the SingleController path. Set "
             "grpo.skip_reference_policy_logprobs_calculation=false, or set "
             "loss_fn.reference_policy_kl_penalty=0."
+        )
+
+    # Nesting says which knob applies to which path, but nothing stops an operator
+    # filling in the block for the path this run is not taking -- and a populated
+    # wrong-path block is still a silent no-op, which is the failure this whole
+    # restructure exists to remove. Only a check at setup actually closes it.
+    use_nemo_gym = bool(master_config.env.get("should_use_nemo_gym"))
+    unused_name = "native" if use_nemo_gym else "nemo_gym"
+    unused_block = getattr(async_config.rollout_failure, unused_name)
+    unused_defaults = type(unused_block)()
+    populated = [
+        f"  async_rl.rollout_failure.{unused_name}.{field}="
+        f"{getattr(unused_block, field)!r}"
+        for field in type(unused_block).model_fields
+        if getattr(unused_block, field) != getattr(unused_defaults, field)
+    ]
+    if populated:
+        active = "nemo_gym" if use_nemo_gym else "native"
+        raise ValueError(
+            f"this run uses the {active} rollout path, so these "
+            f"{unused_name}-only settings would be silently ignored:\n"
+            + "\n".join(populated)
+            + f"\nMove them under async_rl.rollout_failure.{active}, or remove them."
         )
 
 
