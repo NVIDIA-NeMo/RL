@@ -16,7 +16,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -197,6 +197,10 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     )
     ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
     ctrl._trainer_version = 3
+    ctrl._inflight_by_group_id = {}
+    # env={} -> _should_use_nemo_gym is False, so _sync_weights takes the native
+    # abort path (empty registry -> no-op) instead of the gym gate.
+    ctrl._master_config = SimpleNamespace(env={})
 
     asyncio.run(ctrl._sync_weights())
 
@@ -222,6 +226,10 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     )
     ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
     ctrl._trainer_version = 3
+    ctrl._inflight_by_group_id = {}
+    # env={} -> _should_use_nemo_gym is False, so _sync_weights takes the native
+    # abort path (empty registry -> no-op) instead of the gym gate.
+    ctrl._master_config = SimpleNamespace(env={})
     calibration_data = BatchedDataDict(
         {
             "input_ids": torch.tensor([[1, 2]]),
@@ -263,6 +271,16 @@ class _OneThenEmptySampler(_EmptySampler):
         return meta, 1
 
 
+class _EvictingSampler(_OneThenEmptySampler):
+    async def evict(self, *, current_train_weight: int) -> int:
+        del current_train_weight
+        return 2
+
+    async def select(self, **kwargs):
+        meta, num_groups = await super().select(**kwargs)
+        return meta, 2 if num_groups else 0
+
+
 class _EmptyBuffer:
     def __len__(self) -> int:
         return 0
@@ -280,6 +298,9 @@ class _NoOpTrainer:
 
     def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
         del meta
+
+    def finish_train_step(self) -> dict:
+        return {}
 
 
 class _NoOpDataPlane:
@@ -349,3 +370,25 @@ def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:
         ),
     ):
         asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+
+def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0", "sample-1"],
+        fields=[],
+        sequence_lengths=[1, 1],
+        tags=[{"weight_version": 0}, {"weight_version": 0}],
+    )
+    ctrl = _train_pump_controller(sampler=_EvictingSampler(meta))
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["evicted_stale_prompt_groups"] == 2
+    assert train_metrics["aborted_stale_inflight_groups"] == 1

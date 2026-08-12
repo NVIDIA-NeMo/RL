@@ -38,10 +38,16 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.rollouts import (
     RolloutGroupResult,
+    attach_initial_nemo_gym_image_payloads,
     run_async_multi_turn_rollout_groups,
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
+from nemo_rl.utils.multimodal_payload_metrics import (
+    collect_multimodal_payload_metrics,
+    drain_multimodal_payload_metrics,
+    print_multimodal_payload_metrics,
+)
 from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -66,6 +72,7 @@ class AsyncTrajectoryCollector:
         alias_to_group_alias: Optional[dict[str, str]] = None,
         on_policy_distillation_cfg: Optional[dict[str, Any]] = None,
         next_nemo_gym_task_index: int = 0,
+        processor: Any = None,
     ):
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
@@ -75,6 +82,7 @@ class AsyncTrajectoryCollector:
         self.teacher_worker_groups = teacher_worker_groups or {}
         self.alias_to_group_alias = alias_to_group_alias or {}
         self.on_policy_distillation_cfg = on_policy_distillation_cfg or {}
+        self.processor = processor
         self._has_distillation_teachers = bool(self.teacher_worker_groups)
         self._teacher_seq_pad_multiple = teacher_seq_pad_multiple(
             self.teacher_worker_groups,
@@ -437,7 +445,23 @@ class AsyncTrajectoryCollector:
             rollout_batch = batch.slice(0, num_prompts_to_generate)
             if use_nemo_gym:
                 self._stamp_nemo_gym_task_indices(rollout_batch)
-            repeated_batch = rollout_batch.repeat_interleave(num_generations)
+                if self.master_config.grpo.deduplicate_multimodal_data:
+                    attach_initial_nemo_gym_image_payloads(
+                        rollout_batch, self.processor
+                    )
+            repeated_batch = rollout_batch.repeat_interleave(
+                num_generations,
+                share_immutable_media=(
+                    self.master_config.grpo.deduplicate_multimodal_data
+                ),
+            )
+            print_multimodal_payload_metrics(
+                collect_multimodal_payload_metrics(
+                    repeated_batch,
+                    "prompt_repeat_async",
+                    enabled=self.master_config.grpo.debug_payload_metrics,
+                )
+            )
 
             def _run_rollout_batch() -> None:
                 asyncio.run(
@@ -629,6 +653,15 @@ class AsyncTrajectoryCollector:
             self._efficiency_timer.get_timing_metrics(reduction_op="sum"),
         )
 
+    async def drain_payload_metrics(self) -> dict[str, int | float]:
+        """Close one drain-to-drain collector/Gym telemetry interval.
+
+        Rollout collection is concurrent with training, so the interval is not
+        claimed to own the sampled training batch. Call-normalized metrics make
+        intervals comparable even when their background transfer counts differ.
+        """
+        return drain_multimodal_payload_metrics()
+
     def get_rollouts_state(self) -> dict[str, int]:
         """Get collector-side rollout state for checkpointing."""
         return {NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index}
@@ -801,6 +834,10 @@ class AsyncTrajectoryCollector:
                 mask_env_flagged_samples=should_mask_flagged_samples(
                     self.master_config.env
                 ),
+                deduplicate_multimodal_data=(
+                    self.master_config.grpo.deduplicate_multimodal_data
+                ),
+                debug_payload_metrics=self.master_config.grpo.debug_payload_metrics,
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:
@@ -825,6 +862,9 @@ class AsyncTrajectoryCollector:
             num_generations=num_generations,
             max_rollout_turns=self.master_config.grpo.max_rollout_turns,
             greedy=False,
+            deduplicate_multimodal_data=(
+                self.master_config.grpo.deduplicate_multimodal_data
+            ),
         ):
             yield rollout_result
 
@@ -981,11 +1021,22 @@ class AsyncTrajectoryCollector:
         }
         if rollout_result.task_index is not None:
             trajectory_group[NEMO_GYM_TASK_INDEX_KEY] = rollout_result.task_index
-
         backoff_delay = 0.01
         backoff_started_at: float | None = None
         try:
             while self.running:
+                # Every retry is a distinct Ray submission of the full payload.
+                print_multimodal_payload_metrics(
+                    collect_multimodal_payload_metrics(
+                        (
+                            trajectory_group,
+                            generation_weight_version,
+                            target_weight_version,
+                        ),
+                        "replay_push",
+                        enabled=self.master_config.grpo.debug_payload_metrics,
+                    )
+                )
                 status = await self.replay_buffer.add.remote(
                     trajectory_group,
                     generation_weight_version,

@@ -92,39 +92,38 @@ def format_prompt_for_vllm_generation(
         token_ids = valid_ids.tolist()
         return {"prompt_token_ids": token_ids}
 
-    # Check if this is VLM generation by looking for message_log with images
-    # Support for videos/audio/etc. can be added here
-    # if 'message_log' in data and any('images' in msg for msg in data['message_log']):
+    def _get_multi_modal_data(index: int) -> dict[str, Any]:
+        multi_modal_data = {}
+        images = data.get("vllm_images", None)
+        if images is not None and len(images[index]) > 0:
+            multi_modal_data["image"] = (
+                images[index][0] if len(images[index]) == 1 else images[index]
+            )
+        audios = data.get("vllm_audios", None)
+        if audios is not None and len(audios[index]) > 0:
+            multi_modal_data["audio"] = (
+                audios[index][0] if len(audios[index]) == 1 else audios[index]
+            )
+        videos = data.get("vllm_videos", None)
+        if videos is not None and len(videos[index]) > 0:
+            multi_modal_data["video"] = (
+                videos[index][0] if len(videos[index]) == 1 else videos[index]
+            )
+        return multi_modal_data
+
+    # Native image, audio, and video side channels share this formatter path.
     if "vllm_content" in data:
         # VLM generation using content and multi_modal_data
         for i in range(start_idx, end_idx):
             msg = data["vllm_content"][i]
-            # if msg is None, this conversation had no multimodal content, fallback to regular prompt
-            if msg is None:
-                prompts.append(_get_regular_prompt(i))
-                continue
-            # init prompt dict
-            prompt_dict = {"prompt": msg}
-            # collect multi_modal_data from images, audios, and videos
-            multi_modal_data = {}
-            images = data.get("vllm_images", None)
-            if images is not None and len(images[i]) > 0:
-                multi_modal_data["image"] = (
-                    images[i][0] if len(images[i]) == 1 else images[i]
-                )
-            audios = data.get("vllm_audios", None)
-            if audios is not None and len(audios[i]) > 0:
-                multi_modal_data["audio"] = (
-                    audios[i][0] if len(audios[i]) == 1 else audios[i]
-                )
-            videos = data.get("vllm_videos", None)
-            if videos is not None and len(videos[i]) > 0:
-                multi_modal_data["video"] = (
-                    videos[i][0] if len(videos[i]) == 1 else videos[i]
-                )
+            multi_modal_data = _get_multi_modal_data(i)
             if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
+            # Raw processor content is valid only for the initial turn. Later
+            # turns use the updated pre-tokenized conversation plus the same
+            # native media, preventing vLLM from regenerating the stale prompt.
+            prompt_dict = {"prompt": msg} if msg is not None else _get_regular_prompt(i)
             prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)
     else:

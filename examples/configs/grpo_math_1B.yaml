@@ -170,6 +170,9 @@ policy:
   
   megatron_cfg:
     enabled: false
+    # Arbitrary overrides applied recursively to the Megatron Bridge model
+    # provider before model instantiation. Do not duplicate first-class fields.
+    model_overrides: {}
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true

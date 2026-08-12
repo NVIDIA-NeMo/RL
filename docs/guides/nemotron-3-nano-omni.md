@@ -2,6 +2,20 @@
 
 This guide explains how to post-train the Nemotron 3 Nano Omni vision-language model with GRPO using NeMo RL. Both the AutoModel and Megatron backends are supported for image-and-text training.
 
+## Multimodal payload deduplication
+
+The maintained Nemotron recipes enable `grpo.deduplicate_multimodal_data` to
+share immutable model-ready media segments across logical GRPO generations and
+re-intern them after batching, replay, and sharding. The representation supports
+image, video, and audio payload keys, although the maintained recipes currently
+qualify image inputs only. Deduplication currently requires the vLLM generation
+backend and `data_plane.enabled=false`.
+
+`grpo.debug_payload_metrics` emits logical, physical, and protocol-5 serialized
+payload sizes for the exact Ray boundaries used by generation, replay, logprobs,
+and training. It is disabled by default because measuring serialized size adds
+work and is intended for qualification and debugging rather than production.
+
 ## AutoModel backend
 
 It covers two recipes:
