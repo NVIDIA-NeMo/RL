@@ -108,8 +108,14 @@ class SingleControllerActor:
             master_config.loss_fn.force_on_policy_ratio
             and master_config.grpo.seq_logprob_error_threshold is None
         )
-        self._reference_logprobs_required = not bool(
-            master_config.grpo.skip_reference_policy_logprobs_calculation
+        # The reference model is only built when the reference-KL penalty is
+        # active (setup.py: init_reference_model = reference_policy_kl_penalty
+        # > 0), so gate on the same condition. Otherwise a kl_penalty=0 run
+        # requests reference logprobs the trainer never initialized and
+        # get_reference_policy_logprobs fails with no reference_state_dict.
+        self._reference_logprobs_required = (
+            master_config.loss_fn.reference_policy_kl_penalty > 0
+            and not bool(master_config.grpo.skip_reference_policy_logprobs_calculation)
         )
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
