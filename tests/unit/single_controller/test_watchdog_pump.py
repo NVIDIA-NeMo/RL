@@ -468,11 +468,72 @@ class TestEnvHealthCheck:
             stats=RolloutStats(),
             inflight=0,
             stall_timeout_s=1000.0,
+            stall_action="abort",
             gym_subprocess_check=True,
             env_handles={"nemo_gym": _Handle()},
         )
         with pytest.raises(RuntimeError, match="'nemo_gym' reported unhealthy"):
             asyncio.run(ctrl._watchdog_pump())
+
+    def test_an_unhealthy_environment_only_warns_under_the_default_action(self, capsys):
+        """stall_action="warn" promises to "only report". It has to mean that here too.
+
+        This path raised unconditionally, so with gym_subprocess_check defaulting to
+        true, an unhealthy environment ended the run under the documented default -- a
+        run-killing path switched on by default in a feature that is meant to be
+        inert until configured.
+        """
+
+        class _Handle:
+            health_check = SimpleNamespace(
+                remote=lambda: _failed(RuntimeError("subprocess died"))
+            )
+
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            stall_action="warn",
+            gym_subprocess_check=True,
+            env_handles={"nemo_gym": _Handle()},
+        )
+        # Must complete its ticks rather than blowing up.
+        asyncio.run(_run_ticks(ctrl, 2))
+        out = capsys.readouterr().out
+        assert "environment health" in out
+        assert "nemo_gym" in out
+
+    def test_a_wedged_environment_does_not_stop_the_pump(self):
+        """The failure this whole check exists for must not disable the check.
+
+        NemoGym is an asyncio actor: a wedged one never answers, and an unbounded await
+        meant the pump stopped ticking and stall detection died exactly when it was
+        needed. A probe that does not answer within a tick IS the unhealthy signal.
+        """
+        never_resolves: list[asyncio.Future] = []
+
+        def _hang():
+            future: asyncio.Future = asyncio.get_event_loop().create_future()
+            never_resolves.append(future)
+            return future
+
+        class _Handle:
+            health_check = SimpleNamespace(remote=_hang)
+
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            stall_action="warn",
+            gym_subprocess_check=True,
+            env_handles={"nemo_gym": _Handle()},
+        )
+        asyncio.run(_run_ticks(ctrl, 4))
+        # The pump kept ticking despite the environment never answering.
+        assert len(ctrl._logger.metrics) >= 2, (
+            "watchdog stopped ticking while an environment was wedged"
+        )
+        assert never_resolves, "the health check was never actually polled"
 
     def test_environments_without_a_health_check_are_skipped(self):
         """Only NeMo-Gym has subprocess servers to lose; math envs must not trip this."""

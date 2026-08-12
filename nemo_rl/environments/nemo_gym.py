@@ -42,6 +42,11 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.experience.failures import (
+    GymTransportError,
+    RolloutDataFailure,
+    http_status_is_infra,
+)
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
@@ -72,6 +77,39 @@ def _has_nan_generation_logprobs(result: dict) -> bool:
         and torch.isnan(message["generation_logprobs"]).any()
         for message in result["message_log"]
     )
+
+
+def _typed_gym_failure(error: Exception) -> Optional[Exception]:
+    """Map a NeMo-Gym HTTP failure onto a typed, PICKLABLE failure, or None if not one.
+
+    Classification has to happen here, on the raising side, because ``run_rollouts`` runs
+    inside the ``NemoGym`` Ray actor and the exception must survive the actor boundary to
+    reach the retry policy on the driver.
+
+    It does not survive. aiohttp's ``raise_for_status`` passes ``headers=self.headers``,
+    and those are a ``CIMultiDictProxy``, which cloudpickle cannot serialize -- so Ray
+    drops the cause and the driver receives a bare ``RayTaskError`` with no type and no
+    ``.status``. Every gym HTTP failure then classified DATA, capping the gym path at
+    ``max_data_attempts_per_prompt`` (2) and leaving ``max_attempts_per_prompt`` (5)
+    unreachable on the very path whose dead-endpoint scenario motivates it. Two things
+    made that the dominant case rather than a corner: Gym's middleware turns inner-server
+    failures into 500 -- exactly the status the INFRA branch is for -- and its transport
+    layer retries disconnects in an uncapped loop, so those never arrive at all.
+
+    ``GymTransportError`` and ``RolloutDataFailure`` take a single str, so they pickle
+    cleanly and ``classify_rollout_failure``'s explicit-class fast path wins on the far
+    side.
+
+    Returns None when the exception carries no HTTP status, leaving the caller to
+    re-raise it untouched.
+    """
+    status = getattr(error, "status", None)
+    if not isinstance(status, int):
+        return None
+    detail = f"NeMo-Gym /run failed with HTTP {status}: {error}"
+    if http_status_is_infra(status):
+        return GymTransportError(detail)
+    return RolloutDataFailure(detail)
 
 
 def get_nemo_gym_uv_cache_dir() -> str | None:
@@ -539,6 +577,12 @@ Depending on your data shape, you may want to change these values."""
                             error.response_content,
                             file=sys.stderr,
                         )
+                    typed = _typed_gym_failure(error)
+                    if typed is not None:
+                        # `from None`, deliberately: chaining the original would put the
+                        # unpicklable exception back on the wire as __cause__ and undo
+                        # the whole point. The status and message are already in `detail`.
+                        raise typed from None
                     raise
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):

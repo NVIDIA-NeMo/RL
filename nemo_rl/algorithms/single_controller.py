@@ -698,7 +698,17 @@ class SingleControllerActor:
             self._logger.log_metrics(metrics, step=self._train_steps)
 
             if watchdog_cfg.gym_subprocess_check:
-                await self._check_env_health()
+                # Bounded by one tick so a wedged environment cannot stop the pump, and
+                # routed through stall_action so "warn" means warn -- see
+                # _check_env_health.
+                problems = await self._check_env_health(watchdog_cfg.interval_s)
+                if problems:
+                    detail = "; ".join(problems)
+                    if watchdog_cfg.stall_action == "abort":
+                        raise RuntimeError(
+                            f"environment health check failed -- {detail}"
+                        )
+                    print(f"WARNING: environment health -- {detail}", flush=True)
 
             if self._fleet_monitor is not None:
                 # Raises once too few shards remain for the run to be worth continuing.
@@ -929,22 +939,43 @@ class SingleControllerActor:
                     health.dp_shard_idx, weight_version=self._trainer_version
                 )
 
-    async def _check_env_health(self) -> None:
+    async def _check_env_health(self, timeout_s: float) -> list[str]:
         """Ask each environment actor that exposes a health check whether it is whole.
+
+        Returns the problems found, empty when everything is well. It *reports* rather
+        than raises so the caller can route the verdict through ``stall_action``, the
+        same way the stall path does. Raising here bypassed ``stall_action`` entirely:
+        under the documented default (``"warn"``, which promises to "only report"), and
+        with ``gym_subprocess_check`` defaulting to true, an unhealthy environment killed
+        the run -- a run-ending path switched on by default, in a feature whose whole
+        posture is inert-by-default.
+
+        Each probe is bounded. ``NemoGym`` is an asyncio actor, so a *wedged* environment
+        -- precisely the case this check exists to catch -- left the await hanging
+        forever, the pump never ticked again, and stall detection was dead exactly when
+        it was needed. A probe that does not answer within one tick IS the unhealthy
+        signal; it is not a reason to stop watching.
 
         Environments without the method are skipped rather than treated as unhealthy;
         only NeMo-Gym has subprocess servers to lose.
         """
+        problems: list[str] = []
         for env_name, handle in self._env_handles.items():
             health_check = getattr(handle, "health_check", None)
             if health_check is None:
                 continue
             try:
-                await self._ray_get(health_check.remote())
+                await asyncio.wait_for(
+                    self._ray_get(health_check.remote()), timeout=timeout_s
+                )
+            except asyncio.TimeoutError:
+                problems.append(
+                    f"environment {env_name!r} did not answer its health check within "
+                    f"{timeout_s}s"
+                )
             except Exception as error:
-                raise RuntimeError(
-                    f"environment {env_name!r} reported unhealthy: {error}"
-                ) from error
+                problems.append(f"environment {env_name!r} reported unhealthy: {error}")
+        return problems
 
     async def _abort_stale_inflight(self) -> int:
         """Abort in-flight rollouts that the sampler can no longer select."""
