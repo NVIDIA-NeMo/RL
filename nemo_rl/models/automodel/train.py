@@ -703,10 +703,6 @@ class ValueLossPostProcessor(LossPostProcessor):
     values in their original full-sequence layout.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any):
-        super().__init__(*args, **kwargs)
-        self.cp_loss_is_replicated = self.cp_size > 1
-
     def __call__(
         self,
         logits: torch.Tensor,
@@ -729,9 +725,6 @@ class ValueLossPostProcessor(LossPostProcessor):
                 sequence_dim=sequence_dim,
             )
 
-        assert not self.enable_seq_packing, (
-            "DTensor context parallelism is incompatible with sequence packing."
-        )
         local_logits = to_local_if_dtensor(logits).to(torch.float32)
         full_logits = allgather_cp_sharded_tensor(
             local_logits, self.cp_mesh.get_group(), seq_dim=sequence_dim

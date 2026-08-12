@@ -414,6 +414,12 @@ def setup(
             "Exactly one of value.megatron_cfg.enabled or value.automodel_cfg.enabled "
             "must be true for the PPO value model."
         )
+        if value_config["automodel_cfg"]["context_parallel_size"] > 1:
+            assert not value_config["sequence_packing"]["enabled"], (
+                "Automodel context parallelism is incompatible with value sequence "
+                "packing. Set value.sequence_packing.enabled=false when "
+                "value.automodel_cfg.context_parallel_size>1."
+            )
         assert value_config["dynamic_batching"]["enabled"] is False, (
             "Dynamic batching currently has some issue for the DTensor PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2953."
