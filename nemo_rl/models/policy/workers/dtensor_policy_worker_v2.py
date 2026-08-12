@@ -495,16 +495,7 @@ class DTensorPolicyWorkerV2Impl(
     def _temporarily_offload_optimizer_for_checkpoint(
         self, optimizer_path: Optional[str]
     ) -> Generator[None, None, None]:
-        """Keep FusedAdam state-dict conversion off GPU during checkpointing.
-
-        Transformer Engine materializes unscaled FP32 optimizer states inside
-        ``FusedAdam.state_dict()``. For large models this transient copy can OOM
-        even though training itself fits. Moving the resident state to CPU frees
-        checkpoint headroom; the instance patch installed by Automodel setup also
-        moves every converted state back to CPU immediately instead of retaining
-        the full checkpoint representation on CUDA. Restore the original CUDA
-        residency after the checkpoint manager finishes.
-        """
+        """Temporarily offload optimizer state while saving a checkpoint."""
         if optimizer_path is None or self.optimizer is None:
             yield
             return
@@ -515,26 +506,9 @@ class DTensorPolicyWorkerV2Impl(
             gc.collect()
             torch.cuda.empty_cache()
 
-        # Enable the CPU-safe FusedAdam state_dict even when the optimizer was
-        # already offloaded by the refit path. TE otherwise wraps each CPU local
-        # state back onto the parameter's CUDA mesh and accumulates the full
-        # unscaled checkpoint representation on-device.
-        had_checkpoint_flag = hasattr(
-            self.optimizer, "_nemo_rl_cpu_checkpoint_state_dict"
-        )
-        previous_checkpoint_flag = getattr(
-            self.optimizer, "_nemo_rl_cpu_checkpoint_state_dict", False
-        )
-        self.optimizer._nemo_rl_cpu_checkpoint_state_dict = True
         try:
             yield
         finally:
-            if had_checkpoint_flag:
-                self.optimizer._nemo_rl_cpu_checkpoint_state_dict = (
-                    previous_checkpoint_flag
-                )
-            else:
-                del self.optimizer._nemo_rl_cpu_checkpoint_state_dict
             if restore_cuda:
                 self.move_optimizer_to_device("cuda")
 

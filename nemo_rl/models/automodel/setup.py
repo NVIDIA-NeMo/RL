@@ -17,10 +17,7 @@
 import importlib
 import inspect
 import os
-from copy import deepcopy
 from functools import partial
-from itertools import chain
-from types import MethodType
 from typing import Any, Optional, Union
 
 import torch
@@ -41,7 +38,6 @@ from nemo_automodel.components.distributed.config import (
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
-from torch.distributed.tensor import DTensor
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from transformers import (
     AutoConfig,
@@ -69,132 +65,6 @@ STRING_TO_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
-
-
-def _patch_fused_adam_checkpoint_state_dict(
-    optimizer: torch.optim.Optimizer,
-) -> bool:
-    """Keep TE FusedAdam checkpoint conversion from accumulating on CUDA.
-
-    TE converts reduced-precision optimizer state to its unscaled checkpoint
-    representation in ``state_dict()``. For DTensor parameters it then wraps
-    each local tensor with the parameter's CUDA device mesh, which moves a CPU
-    tensor back to CUDA. Accumulating those FP32 checkpoint tensors can exhaust
-    device memory even when the resident optimizer state was offloaded first.
-
-    Install an instance-local state-dict implementation that is dormant during
-    normal training. When the policy worker enables checkpoint CPU offload, it
-    converts one state at a time and immediately moves the resulting DTensor to
-    CPU while preserving its mesh and placements for distributed checkpointing.
-    """
-    optimizer_type = type(optimizer)
-    if not (
-        optimizer_type.__name__ == "FusedAdam"
-        and optimizer_type.__module__.startswith(
-            "transformer_engine.pytorch.optimizers"
-        )
-        and not getattr(optimizer, "_nemo_rl_checkpoint_state_dict_patched", False)
-    ):
-        return False
-
-    original_state_dict = optimizer.state_dict
-
-    def checkpoint_cpu_state_dict(self) -> dict[str, Any]:
-        if not getattr(self, "_nemo_rl_cpu_checkpoint_state_dict", False):
-            return original_state_dict()
-
-        # Call torch.optim.Optimizer directly to avoid TE's implementation,
-        # which retains every converted DTensor on CUDA until the dict is done.
-        state_dict = torch.optim.Optimizer.state_dict(self)
-        saved_groups = deepcopy(state_dict["param_groups"])
-        id_map = dict(
-            zip(
-                chain.from_iterable(group["params"] for group in saved_groups),
-                chain.from_iterable(group["params"] for group in self.param_groups),
-            )
-        )
-        for key, state in state_dict["state"].items():
-            if key not in id_map:
-                continue
-
-            param = id_map[key]
-            checkpoint_state = {}
-            for name in state:
-                value = self.get_unscaled_state(param, name)
-                if isinstance(param, DTensor):
-                    value = DTensor.from_local(
-                        value,
-                        device_mesh=param.device_mesh,
-                        placements=param.placements,
-                        shape=param.size(),
-                        stride=param.stride(),
-                    )
-                checkpoint_state[name] = value.to("cpu")
-            state_dict["state"][key] = checkpoint_state
-
-        return state_dict
-
-    optimizer.state_dict = MethodType(checkpoint_cpu_state_dict, optimizer)
-    optimizer._nemo_rl_checkpoint_state_dict_patched = True
-    return True
-
-
-def _skip_redundant_fused_adam_fp32_masters(
-    optimizer: torch.optim.Optimizer,
-) -> bool:
-    """Keep TE FusedAdam from duplicating resident FP32 parameters.
-
-    FusedAdam's ``master_weights`` option is optimizer-wide.  Its state
-    initializer consequently creates an FP32 ``master_param`` for every FP32
-    model parameter even though its update kernel operates directly on the
-    resident FP32 parameter and never reads that master.  Mixed-dtype models
-    such as DeepSeek V4 need master weights for their BF16 parameters but also
-    contain a large FP32 lm_head, so the redundant copy can exhaust memory on
-    the first optimizer step.
-
-    Patch only the affected optimizer instance.  BF16/FP16/quantized parameters
-    retain the configured master-weight behavior; FP32 parameters still receive
-    their Adam moment state and are updated through FusedAdam's FP32 path.
-    """
-    optimizer_type = type(optimizer)
-    if not (
-        optimizer_type.__name__ == "FusedAdam"
-        and optimizer_type.__module__.startswith(
-            "transformer_engine.pytorch.optimizers"
-        )
-        and getattr(optimizer, "master_weights", False)
-        and not getattr(optimizer, "_nemo_rl_skip_fp32_master", False)
-    ):
-        return False
-
-    has_fp32_param = any(
-        param.dtype == torch.float32
-        for group in optimizer.param_groups
-        for param in group["params"]
-    )
-    if not has_fp32_param:
-        return False
-
-    original_initialize_state = optimizer.initialize_state
-
-    def initialize_state_without_fp32_master(
-        self, param: torch.nn.Parameter, store_param_remainders: bool
-    ) -> None:
-        if param.dtype != torch.float32 or not self.master_weights:
-            original_initialize_state(param, store_param_remainders)
-            return
-
-        self.master_weights = False
-        try:
-            original_initialize_state(param, False)
-        finally:
-            self.master_weights = True
-
-    optimizer.initialize_state = MethodType(
-        initialize_state_without_fp32_master, optimizer
-    )
-    optimizer._nemo_rl_skip_fp32_master = True
-    return True
 
 
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
@@ -459,10 +329,20 @@ def validate_and_prepare_config(
         else ("sdpa" if cp_size_cfg > 1 else None)
     )
 
+    # Load weights in float32 so the optimizer can keep fp32 master weights.
+    # Exception: TE FusedAdam with master_weights=True keeps its own fp32 master
+    # internally (bf16 params + int16 remainder), so an fp32 load is redundant and
+    # roughly doubles both model- and master-weight memory. In that case load in the
+    # compute dtype instead. See https://github.com/NVIDIA-NeMo/RL/issues/2865.
+    optimizer_cfg = config.get("optimizer") or {}
+    optimizer_kwargs = optimizer_cfg.get("kwargs") or {}
+    optimizer_keeps_fp32_master = bool(optimizer_kwargs.get("master_weights", False))
+    model_load_dtype = dtype if optimizer_keeps_fp32_master else torch.float32
+
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,  # Always load in float32 for master weights
+        torch_dtype=model_load_dtype,
         trust_remote_code=True,
         attn_implementation="flash_attention_2" if enable_seq_packing else None,
         **hf_config_overrides,
@@ -921,8 +801,6 @@ def setup_model_and_optimizer(
                 f"but AutoModel built {len(optimizers)}."
             )
         optimizer = optimizers[0]
-        _patch_fused_adam_checkpoint_state_dict(optimizer)
-        _skip_redundant_fused_adam_fp32_masters(optimizer)
 
     # Initialize scheduler
     scheduler = None
