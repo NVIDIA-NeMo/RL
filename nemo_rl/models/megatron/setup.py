@@ -1524,6 +1524,12 @@ def build_inference_model(
     Returns:
         The inference model module (single element; not DDP-wrapped, no optimizer).
     """
+    if megatron_cfg.dist.use_torch_fsdp2:
+        raise ValueError(
+            "A dedicated inference model (reshard) is not supported with use_torch_fsdp2 training: "
+            "DP inference disables the training model's forward pre-hooks, "
+            "which requires Megatron-core DistributedDataParallel."
+        )
     # Derive the inference provider from the initial snapshot taken by setup_model_and_optimizer.
     inference_provider = megatron_cfg._initial_model_provider
     del megatron_cfg._initial_model_provider
@@ -1581,7 +1587,7 @@ def build_inference_model(
         inference_model = get_model(
             inference_provider,
             megatron_cfg.ddp,
-            use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
+            use_torch_fsdp2=False,  # the inference model is never trained
             data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
             mixed_precision_wrapper=mixed_precision_wrapper,
             pg_collection=inference_pg_collection,

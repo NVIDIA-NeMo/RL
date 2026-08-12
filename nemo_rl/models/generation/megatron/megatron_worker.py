@@ -421,7 +421,9 @@ class MegatronGenerationMixin:
             self.model = self.move_model(
                 self.model, "cuda", move_params=True, move_grads=False
             )
-            # Forward pre-hooks are not safe with cross-DP inference.
+            # Because DP inference requests are asynchronously scheduled per rank, pre-forward hooks that trigger DP collectives (such as an overlapped param gather after optimizer steps) will stall or hang.
+            # Instead, synchronously gather all model compute weights from the sharded model state here, and deactivate all pre-forward hooks.
+            # Incompatible with FSDP2 or Megatron-FSDP for inference.
             if (
                 self.should_disable_forward_pre_hook
                 and self._forward_pre_hook_enabled()
