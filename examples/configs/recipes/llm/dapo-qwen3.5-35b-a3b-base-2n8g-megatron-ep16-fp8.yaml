@@ -50,7 +50,10 @@ policy:
     sequence_parallel: true
     expert_model_parallel_size: 16
     moe_router_dtype: "fp32"
-    moe_token_dispatcher_type: allgather
+    # alltoall (not allgather): sequence packing produces variable-length packs
+    # per DP rank; the allgather dispatcher requires uniform shapes across the
+    # TP*EP group and hangs (NCCL watchdog) on the first packed microbatch.
+    moe_token_dispatcher_type: alltoall
     apply_rope_fusion: false
     mtp_num_layers: 0
     freeze_config:
@@ -77,9 +80,9 @@ policy:
       lr_warmup_init: 1.0e-8
       lr_decay_style: constant
   sequence_packing:
-    enabled: false
-  dynamic_batching:
     enabled: true
+  dynamic_batching:
+    enabled: false
   generation:
     max_new_tokens: 2048
     vllm_cfg:
