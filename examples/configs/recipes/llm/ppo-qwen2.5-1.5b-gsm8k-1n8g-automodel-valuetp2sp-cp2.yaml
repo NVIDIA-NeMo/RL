@@ -1,0 +1,15 @@
+defaults: ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.yaml
+checkpointing:
+  checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-cp2
+value:
+  make_sequence_length_divisible_by: 4
+  dtensor_cfg:
+    context_parallel_size: 2
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+logger:
+  log_dir: logs/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-cp2
+  wandb:
+    name: ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-cp2
