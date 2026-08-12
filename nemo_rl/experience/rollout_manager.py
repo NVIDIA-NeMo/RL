@@ -19,6 +19,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import ray.exceptions
 import torch
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
@@ -221,6 +222,25 @@ def _classify_generation_failure(
     coordinates are attached because a raw generation traceback does not say which
     rollout it belonged to.
 
+    Any Ray-boundary error is infrastructure *here*, by context. An exception raised
+    inside a still-living generation worker -- vLLM ``EngineDeadError``, a CUDA OOM --
+    arrives as a bare ``RayTaskError`` whose cause the boundary degraded, so
+    ``classify_rollout_failure`` can only fall through to DATA and the prompt gets two
+    attempts instead of the five the fleet-failure path is built for.
+
+    Scoped to this call site rather than widened in ``classify_rollout_failure``,
+    deliberately. Globally, "unrecognized means DATA" is the right default: it is about
+    exceptions we can inspect and do not recognize, and flipping it would retry genuine
+    bugs everywhere. Here we have information the classifier does not -- this exception
+    came from a *generation* RPC, so "that shard could not serve it" is the correct
+    reading whatever the destroyed cause was, and re-dispatching to another shard is
+    exactly the right response. A real bug in the worker still surfaces, chained, once
+    the bounded infra budget runs out.
+
+    This also makes the two paths agree: part 2/4's ``_generate_on_shard`` already maps
+    ``ray.exceptions.RayError`` to ``GenerationUnavailable``, so without this the same
+    exception classified INFRA there and DATA here.
+
     Args:
         exc: The exception raised while generating a turn.
         prompt_idx: Index of the prompt whose rollout failed.
@@ -231,7 +251,10 @@ def _classify_generation_failure(
         shard), ``RolloutDataFailure`` otherwise.
     """
     detail = f"prompt_idx={prompt_idx} traj_idx={traj_idx}: {type(exc).__name__}: {exc}"
-    if classify_rollout_failure(exc) is FailureClass.INFRA:
+    if (
+        isinstance(exc, ray.exceptions.RayError)
+        or classify_rollout_failure(exc) is FailureClass.INFRA
+    ):
         return GenerationUnavailable(f"generation unavailable for {detail}")
     return RolloutDataFailure(f"generation failed for {detail}")
 
