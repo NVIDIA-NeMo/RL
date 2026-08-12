@@ -1,3 +1,19 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for dLLM policy config resolution and the setup-time guards."""
+
 import pytest
 
 from nemo_rl.models.policy.dllm import (
@@ -208,3 +224,42 @@ def test_generation_is_not_validated_when_dllm_is_disabled():
     """A non-dLLM policy keeps whatever generation backend it configured."""
     policy = make_policy(dllm=False, generation=make_generation(backend="vllm"))
     validate_dllm_policy(policy, VALID_LOSS)
+
+
+class _Async:
+    def __init__(self, enabled):
+        self.enabled = enabled
+
+
+class _Grpo:
+    def __init__(self, enabled):
+        self.async_grpo = _Async(enabled)
+
+
+def test_async_grpo_is_rejected_for_dllm():
+    """Async rollouts would silently fall back to synchronous ones."""
+    policy = make_policy(generation=make_generation())
+    with pytest.raises(ValueError, match="async_grpo.enabled is not supported"):
+        validate_dllm_policy(policy, VALID_LOSS, _Grpo(True))
+
+
+def test_sync_grpo_is_accepted_for_dllm():
+    validate_dllm_policy(
+        make_policy(generation=make_generation()), VALID_LOSS, _Grpo(False)
+    )
+
+
+def test_async_grpo_as_a_plain_mapping_is_also_rejected():
+    policy = make_policy(generation=make_generation())
+    with pytest.raises(ValueError, match="async_grpo.enabled is not supported"):
+        validate_dllm_policy(policy, VALID_LOSS, {"async_grpo": {"enabled": True}})
+
+
+def test_an_omitted_grpo_config_skips_the_async_check():
+    """Callers without a grpo section (SFT, eval) must still validate."""
+    validate_dllm_policy(make_policy(generation=make_generation()), VALID_LOSS)
+
+
+def test_async_grpo_is_ignored_when_dllm_is_disabled():
+    policy = make_policy(dllm=False, generation=make_generation(backend="vllm"))
+    validate_dllm_policy(policy, VALID_LOSS, _Grpo(True))

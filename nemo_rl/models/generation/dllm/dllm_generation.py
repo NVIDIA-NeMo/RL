@@ -105,3 +105,13 @@ class DllmGeneration(GenerationInterface):
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Accepts the cross-backend refit-prep contract; dLLM needs none of it."""
         pass
+
+    def shutdown(self) -> bool:
+        """Returns success without tearing anything down.
+
+        This backend never owns the policy it denoises with, so shutting it
+        down here would kill workers the trainer still holds. The caller
+        shuts the training policy down separately, the same way
+        ``MegatronGeneration`` behaves when colocated.
+        """
+        return True

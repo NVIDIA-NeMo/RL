@@ -71,6 +71,14 @@ and reference policy). `gauss-2` with `mc_samples: 1` therefore doubles the forw
 cost relative to an autoregressive policy. Setting `cfg_scale > 0` doubles the cost
 of *generation* on top of that.
 
+### Prompt masking
+
+`policy.dllm.p_mask_prompt` corrupts prompt tokens as a regularizer. Leave it at
+`0.0` to reproduce GDPO: its SDMC estimator masks only completion positions, so
+the setting is inert there despite appearing in the published configs, where it
+is inherited from the d1/diffu-GRPO trainer. Corrupted prompt positions are
+never scored.
+
 ### Mask token
 
 The mask token id is read from the model config (LLaDA publishes `mask_token_id`).

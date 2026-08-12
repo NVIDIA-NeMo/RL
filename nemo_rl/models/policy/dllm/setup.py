@@ -47,13 +47,15 @@ def dllm_config_from_policy(policy_cfg: Any) -> Optional[DllmConfig]:
     return cfg if cfg.enabled else None
 
 
-def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any) -> None:
+def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -> None:
     """Rejects dLLM configurations that would train against a wrong likelihood.
 
     Args:
         policy_cfg: The policy config section.
         loss_cfg: The ``loss_fn`` config section (a ``ClippedPGLossConfig`` or
             the equivalent mapping).
+        grpo_cfg: The ``grpo`` config section, when available. Only used to
+            reject async rollouts.
 
     Raises:
         ValueError: If the dLLM policy is combined with a feature that assumes
@@ -109,6 +111,24 @@ def validate_dllm_policy(policy_cfg: Any, loss_cfg: Any) -> None:
             "policy.dllm.enabled=true: context parallelism shards the sequence, "
             "but the ELBO masks positions across the whole sequence. Set it to 1."
         )
+
+    # The dllm backend has no async engine, so _should_use_async_rollouts
+    # returns False for it. Asking for async_grpo would therefore run plain
+    # synchronous rollouts and silently ignore every async setting.
+    if grpo_cfg is not None:
+        async_cfg = getattr(grpo_cfg, "async_grpo", None)
+        if async_cfg is None and hasattr(grpo_cfg, "get"):
+            async_cfg = grpo_cfg.get("async_grpo")
+        enabled = getattr(async_cfg, "enabled", None)
+        if enabled is None and hasattr(async_cfg, "get"):
+            enabled = async_cfg.get("enabled")
+        if enabled:
+            raise ValueError(
+                "grpo.async_grpo.enabled is not supported with "
+                "policy.dllm.enabled=true: the dllm generation backend has no "
+                "async engine, so rollouts would silently run synchronously. "
+                "Set grpo.async_grpo.enabled=false."
+            )
 
     dllm_cfg = dllm_config_from_policy(policy_cfg)
     _validate_dllm_generation(policy_cfg.get("generation"), dllm_cfg)

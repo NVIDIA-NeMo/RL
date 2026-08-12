@@ -662,7 +662,9 @@ def setup(
         )
 
     _validate_use_kl_in_reward_compat(master_config)
-    validate_dllm_policy(master_config.policy, master_config.loss_fn)
+    validate_dllm_policy(
+        master_config.policy, master_config.loss_fn, master_config.grpo
+    )
 
     # ==========================
     #          Cluster

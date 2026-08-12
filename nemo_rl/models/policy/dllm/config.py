@@ -54,9 +54,13 @@ class DllmConfig(BaseModel, extra="allow"):
     """Monte Carlo mask draws per quadrature point (``K`` in the paper)."""
 
     p_mask_prompt: float = 0.0
-    """Probability of masking each prompt token. 0.0 keeps the prompt fully
-    intact, matching the dLLM SFT objective. The d1/diffu-GRPO line of work uses
-    a nonzero value as a regularizer."""
+    """Probability of masking each prompt token, as a regularizer.
+
+    Leave at 0.0 to reproduce GDPO: its SDMC estimator masks only completion
+    positions and zeroes the prompt region outright, so ``p_mask_prompt`` is
+    inert there even though the key appears in the published configs -- it is
+    inherited from the d1/diffu-GRPO trainer GDPO was built on, whose one-shot
+    estimator does use it. Corrupted prompt positions are never scored here."""
 
     shift_targets: bool = False
     """Whether position ``i`` scores token ``i+1`` (autoregressive) rather than
