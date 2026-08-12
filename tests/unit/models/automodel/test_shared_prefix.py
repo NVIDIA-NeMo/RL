@@ -406,22 +406,35 @@ def test_split_attention_matches_logical_dense_attention_and_gradients():
 
 @pytest.mark.automodel
 @pytest.mark.parametrize("activation_checkpointing", [False, True])
+@pytest.mark.parametrize("model_family", ["qwen3", "llama"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
-def test_tiny_qwen3_fa2_logits_and_gradients_match_dense(activation_checkpointing):
+def test_tiny_causal_lm_fa2_logits_and_gradients_match_dense(
+    activation_checkpointing,
+    model_family,
+):
     pytest.importorskip("flash_attn")
-    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    if model_family == "qwen3":
+        from transformers import Qwen3Config as ModelConfig
+        from transformers import Qwen3ForCausalLM as ModelForCausalLM
+    else:
+        from transformers import LlamaConfig as ModelConfig
+        from transformers import LlamaForCausalLM as ModelForCausalLM
 
     register_shared_prefix_attention()
-    dense_config = Qwen3Config(
+    dense_config = ModelConfig(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=16,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        head_dim=8,
         max_position_embeddings=64,
         attention_dropout=0.0,
+        tie_word_embeddings=False,
+        pad_token_id=0,
+        eos_token_id=1,
         use_cache=False,
     )
     dense_config._attn_implementation = "flash_attention_2"
@@ -429,8 +442,8 @@ def test_tiny_qwen3_fa2_logits_and_gradients_match_dense(activation_checkpointin
     shared_config._attn_implementation = SHARED_PREFIX_ATTENTION
 
     torch.manual_seed(42)
-    dense_model = Qwen3ForCausalLM(dense_config).cuda().train()
-    shared_model = Qwen3ForCausalLM(shared_config).cuda().train()
+    dense_model = ModelForCausalLM(dense_config).cuda().train()
+    shared_model = ModelForCausalLM(shared_config).cuda().train()
     shared_model.load_state_dict(dense_model.state_dict())
     if activation_checkpointing:
         dense_model.gradient_checkpointing_enable()
@@ -454,6 +467,20 @@ def test_tiny_qwen3_fa2_logits_and_gradients_match_dense(activation_checkpointin
         prompt_lengths,
         group_ids,
     )
+    assert layout.predictor_indices.tolist() == [
+        2,
+        3,
+        4,
+        2,
+        6,
+        7,
+        11,
+        12,
+        13,
+        11,
+        15,
+        16,
+    ]
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         dense_logits = dense_model(input_ids=input_ids, use_cache=False).logits

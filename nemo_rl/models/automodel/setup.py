@@ -413,14 +413,16 @@ def validate_and_prepare_config(
             raise ValueError(
                 "shared-prefix training currently supports text causal language models only"
             )
-        if model_config.model_type != "qwen3":
+        if model_config.model_type not in {"llama", "qwen3"}:
             raise ValueError(
-                f"shared-prefix training currently supports qwen3, got {model_config.model_type}"
+                "shared-prefix training currently supports Qwen3 and Llama, "
+                f"got {model_config.model_type}"
             )
         layer_types = getattr(model_config, "layer_types", ["full_attention"])
         if any(layer_type != "full_attention" for layer_type in layer_types):
             raise ValueError(
-                "shared-prefix training currently supports full-attention Qwen3 layers only"
+                "shared-prefix training currently supports full-attention "
+                "Qwen3 and Llama models only"
             )
         if getattr(model_config, "attention_dropout", 0.0) != 0.0:
             raise ValueError("shared-prefix training requires attention_dropout=0")

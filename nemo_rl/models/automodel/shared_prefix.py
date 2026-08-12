@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Train-time shared-prefix execution for Hugging Face Qwen3.
+"""Train-time shared-prefix execution for Hugging Face Qwen3 and Llama.
 
 The logical GRPO microbatch remains a normal ``[batch, sequence]`` tensor.  This
 module builds a physical ``[1, compact_tokens]`` representation containing one
-copy of each prompt followed by all responses that share it.  Qwen3 norm, MLP,
-and projections run directly on that compact representation.  The registered
-attention backend preserves the logical causal semantics with two varlen FA2
-calls: prompt self-attention and response-to-(prompt + own response) attention.
+copy of each prompt followed by all responses that share it.  Decoder norms,
+MLPs, and projections run directly on that compact representation.  The
+registered attention backend preserves the logical causal semantics with two
+varlen FA2 calls: prompt self-attention and response-to-(prompt + own response)
+attention.
 """
 
 from dataclasses import dataclass
@@ -310,7 +311,7 @@ def _flash_attention_functions():
         from flash_attn import flash_attn_func, flash_attn_varlen_func
     except ImportError as error:  # pragma: no cover - exercised in the GPU environment
         raise ImportError(
-            "shared-prefix Qwen3 training requires flash-attn with FA2 varlen support"
+            "shared-prefix training requires flash-attn with FA2 varlen support"
         ) from error
     return flash_attn_func, flash_attn_varlen_func
 
@@ -407,10 +408,10 @@ def shared_prefix_flash_attention_forward(
     shared_prefix_layout: SharedPrefixLayout | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
-    """Transformers ``AttentionInterface`` implementation for Qwen3 + FA2."""
+    """Transformers ``AttentionInterface`` for Qwen3/Llama with FA2."""
     if query.dtype == torch.float32:
-        # Match Transformers' native FA2 wrapper. Qwen3's fp32 norm weights can
-        # promote Q/K even while the surrounding forward is autocast to BF16.
+        # Match Transformers' native FA2 wrapper. Some training setups retain
+        # fp32 norm weights, which can promote Q/K despite BF16 autocast.
         from transformers.integrations.flash_attention import get_target_dtype
 
         target_dtype = get_target_dtype(query, module)
@@ -424,7 +425,7 @@ def shared_prefix_flash_attention_forward(
 
     if shared_prefix_layout is None:
         if sliding_window is not None:
-            raise ValueError("the Qwen3 shared-prefix backend requires full attention")
+            raise ValueError("the shared-prefix backend requires full attention")
         output = _standard_flash_attention(
             query,
             key,
@@ -443,9 +444,7 @@ def shared_prefix_flash_attention_forward(
     if attention_mask is not None:
         raise ValueError("shared-prefix attention expects attention_mask=None")
     if sliding_window is not None:
-        raise ValueError(
-            "shared-prefix attention does not support sliding-window Qwen3"
-        )
+        raise ValueError("shared-prefix attention does not support sliding windows")
     if dropout != 0.0:
         raise ValueError("shared-prefix attention requires attention_dropout=0")
     if query.shape[0] != 1:
@@ -497,7 +496,7 @@ def shared_prefix_flash_attention_forward(
 
 
 def register_shared_prefix_attention() -> None:
-    """Register the Qwen3 backend before config/model construction."""
+    """Register the Qwen3/Llama backend before config/model construction."""
     from transformers import AttentionInterface
     from transformers.masking_utils import (
         AttentionMaskInterface,
@@ -581,10 +580,10 @@ def response_logprobs_from_logits(
     layout: SharedPrefixLayout,
     chunk_size: int | None = None,
 ) -> torch.Tensor:
-    """Select response-target logprobs from predictor-only Qwen3 logits."""
+    """Select response-target logprobs from predictor-only model logits."""
     if logits.ndim != 3 or logits.shape[0] != 1:
         raise ValueError(
-            "shared-prefix Qwen3 logits must have shape [1, response_tokens, vocab]"
+            "shared-prefix logits must have shape [1, response_tokens, vocab]"
         )
     if logits.shape[1] != layout.response_tokens:
         raise ValueError(

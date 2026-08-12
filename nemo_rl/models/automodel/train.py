@@ -120,8 +120,9 @@ def model_forward(
     if processed_inputs.shared_prefix_layout is not None:
         layout = processed_inputs.shared_prefix_layout
         model_args["shared_prefix_layout"] = layout
-        # Qwen3 accepts an arbitrary index tensor here. Repeated prompt-last
-        # indices make one shared hidden state predict each response's first token.
+        # Both supported HF causal LMs accept an arbitrary index tensor here.
+        # Repeated prompt-last indices make one shared hidden state predict each
+        # response's first token.
         model_args["logits_to_keep"] = layout.predictor_indices
 
     # Add flash attention kwargs if applicable

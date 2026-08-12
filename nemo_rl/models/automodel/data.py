@@ -61,8 +61,8 @@ class ProcessedInputs:
     cp_buffers: list[torch.Tensor] = field(default_factory=list)
     seq_index: Optional[torch.Tensor] = None
 
-    # Present only for train-time Qwen3 shared-prefix execution. Keeping this
-    # optional preserves the normal inference, reward-model, and VLM paths.
+    # Present only for train-time Qwen3/Llama shared-prefix execution. Keeping
+    # this optional preserves the normal inference, reward-model, and VLM paths.
     shared_prefix_layout: Optional[SharedPrefixLayout] = None
 
     @property

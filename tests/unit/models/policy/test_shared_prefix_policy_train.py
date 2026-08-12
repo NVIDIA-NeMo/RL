@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-GPU integration smokes for Qwen3 shared-prefix ``Policy.train``."""
+"""Multi-GPU integration smokes for shared-prefix ``Policy.train``."""
 
 import sys
 
@@ -21,7 +21,13 @@ import torch
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
+from transformers import (
+    LlamaConfig,
+    LlamaForCausalLM,
+    PreTrainedTokenizerFast,
+    Qwen3Config,
+    Qwen3ForCausalLM,
+)
 
 from nemo_rl.algorithms.grpo import _add_shared_prefix_training_metadata
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
@@ -45,7 +51,7 @@ _DTENSOR_V2_ACTOR = (
 )
 
 
-def _save_tiny_qwen3(model_path) -> None:
+def _save_tiny_causal_lm(model_path, model_family: str) -> None:
     vocab = {"<pad>": 0, "<eos>": 1, "<unk>": 2}
     vocab.update({f"token_{index}": index for index in range(3, 128)})
     tokenizer_backend = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
@@ -58,7 +64,7 @@ def _save_tiny_qwen3(model_path) -> None:
     )
 
     torch.manual_seed(7)
-    config = Qwen3Config(
+    config_kwargs = dict(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
@@ -73,7 +79,10 @@ def _save_tiny_qwen3(model_path) -> None:
         eos_token_id=1,
         use_cache=False,
     )
-    model = Qwen3ForCausalLM(config)
+    if model_family == "qwen3":
+        model = Qwen3ForCausalLM(Qwen3Config(**config_kwargs))
+    else:
+        model = LlamaForCausalLM(LlamaConfig(**config_kwargs))
     model.save_pretrained(model_path)
     tokenizer.save_pretrained(model_path)
 
@@ -137,17 +146,31 @@ def _make_rollouts() -> tuple[BatchedDataDict, BatchedDataDict]:
 @pytest.mark.automodel
 @pytest.mark.timeout(420)
 @pytest.mark.parametrize(
-    "world_size,tp_size,dp_size,shard_size,groups_per_shard,compact_tokens",
+    (
+        "model_family,world_size,tp_size,dp_size,shard_size,groups_per_shard,"
+        "compact_tokens"
+    ),
     [
-        (4, 1, 4, 2, 1, 36),
-        (2, 2, 1, 8, 2, 112),
-        (4, 4, 1, 8, 2, 112),
+        ("qwen3", 4, 1, 4, 2, 1, 36),
+        ("qwen3", 2, 2, 1, 8, 2, 112),
+        ("qwen3", 4, 4, 1, 8, 2, 112),
+        ("llama", 4, 1, 4, 2, 1, 36),
+        ("llama", 2, 2, 1, 8, 2, 112),
+        ("llama", 4, 4, 1, 8, 2, 112),
     ],
-    ids=["dp4_tp1", "dp1_tp2", "dp1_tp4"],
+    ids=[
+        "qwen3_dp4_tp1",
+        "qwen3_dp1_tp2",
+        "qwen3_dp1_tp4",
+        "llama_dp4_tp1",
+        "llama_dp1_tp2",
+        "llama_dp1_tp4",
+    ],
 )
 def test_shared_prefix_policy_train_fsdp2(
     tmp_path,
     monkeypatch,
+    model_family,
     world_size,
     tp_size,
     dp_size,
@@ -163,8 +186,8 @@ def test_shared_prefix_policy_train_fsdp2(
     # a second uv actor environment so this test isolates the training path.
     monkeypatch.setitem(ACTOR_ENVIRONMENT_REGISTRY, _DTENSOR_V2_ACTOR, sys.executable)
 
-    model_path = tmp_path / "tiny_qwen3_shared_prefix"
-    _save_tiny_qwen3(model_path)
+    model_path = tmp_path / f"tiny_{model_family}_shared_prefix"
+    _save_tiny_causal_lm(model_path, model_family)
     config = create_test_config(
         model_name=str(model_path),
         tp=tp_size,
@@ -191,7 +214,7 @@ def test_shared_prefix_policy_train_fsdp2(
     config["make_sequence_length_divisible_by"] = 1
 
     cluster = RayVirtualCluster(
-        name="shared_prefix_policy_train",
+        name=f"shared_prefix_policy_train_{model_family}",
         bundle_ct_per_node_list=[world_size],
         use_gpus=True,
         num_gpus_per_node=world_size,
@@ -205,7 +228,7 @@ def test_shared_prefix_policy_train_fsdp2(
             init_optimizer=True,
             init_reference_model=False,
             cluster=cluster,
-            name_prefix="shared_prefix_policy",
+            name_prefix=f"shared_prefix_policy_{model_family}",
         )
         assert policy.data_parallel_size == dp_size
 

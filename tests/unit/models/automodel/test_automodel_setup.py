@@ -290,13 +290,42 @@ class TestValidateAndPrepareConfig:
         assert result.attn_impl is None
 
     @pytest.mark.parametrize(
-        "tp_size,cp_size,sequence_parallel,expected_error",
+        "model_type,architecture,tp_size,cp_size,sequence_parallel,expected_error",
         [
-            (2, 1, False, None),
-            (2, 2, False, "requires CP=1 and sequence_parallel=false"),
-            (2, 1, True, "requires CP=1 and sequence_parallel=false"),
+            ("qwen3", "Qwen3ForCausalLM", 2, 1, False, None),
+            ("llama", "LlamaForCausalLM", 2, 1, False, None),
+            (
+                "mistral",
+                "MistralForCausalLM",
+                2,
+                1,
+                False,
+                "currently supports Qwen3 and Llama, got mistral",
+            ),
+            (
+                "qwen3",
+                "Qwen3ForCausalLM",
+                2,
+                2,
+                False,
+                "requires CP=1 and sequence_parallel=false",
+            ),
+            (
+                "qwen3",
+                "Qwen3ForCausalLM",
+                2,
+                1,
+                True,
+                "requires CP=1 and sequence_parallel=false",
+            ),
         ],
-        ids=["tp2", "cp2", "sequence_parallel"],
+        ids=[
+            "qwen3_tp2",
+            "llama_tp2",
+            "unsupported_model",
+            "cp2",
+            "sequence_parallel",
+        ],
     )
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -308,14 +337,16 @@ class TestValidateAndPrepareConfig:
         mock_autoconfig_class,
         mock_config,
         mock_autoconfig,
+        model_type,
+        architecture,
         tp_size,
         cp_size,
         sequence_parallel,
         expected_error,
     ):
-        """Shared-prefix training accepts TP but still rejects CP and SP."""
-        mock_autoconfig.model_type = "qwen3"
-        mock_autoconfig.architectures = ["Qwen3ForCausalLM"]
+        """Shared-prefix training accepts Qwen3/Llama TP and rejects other modes."""
+        mock_autoconfig.model_type = model_type
+        mock_autoconfig.architectures = [architecture]
         mock_autoconfig.layer_types = ["full_attention"]
         mock_autoconfig.attention_dropout = 0.0
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
