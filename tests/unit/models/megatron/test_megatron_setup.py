@@ -1209,6 +1209,7 @@ class TestApplyPerformanceConfig:
 
         model_cfg = MagicMock()
         model_cfg.gated_linear_unit = True
+        model_cfg.num_moe_experts = 8
         offload_modules = ["mlp_norm", "moe_act"]
         config = {
             "megatron_cfg": {
