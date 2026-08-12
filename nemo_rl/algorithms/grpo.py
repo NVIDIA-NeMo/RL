@@ -1781,10 +1781,8 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
 
     Assistant messages can be part of the original multi-turn prompt history. Only
     generated assistant messages have generation_logprobs, so use that field as the
-    trainable-token marker. A Gym-confirmed no-progress tail is retained in the
-    trajectory for context and diagnostics but excluded from the policy loss. This
-    function mutates each message in-place by adding a token_loss_mask and, when
-    missing, a zero-valued generation_logprobs tensor.
+    trainable-token marker. This function mutates each message in-place by adding a
+    token_loss_mask and, when missing, a zero-valued generation_logprobs tensor.
 
     Args:
         message_logs: Batch of tokenized message logs. Each message must contain a
@@ -1796,11 +1794,7 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             role = cast(str, message["role"])
             token_ids = cast(torch.Tensor, message["token_ids"])
 
-            if (
-                role == "assistant"
-                and "generation_logprobs" in message
-                and not bool(message.get("is_no_progress_tail", False))
-            ):
+            if role == "assistant" and "generation_logprobs" in message:
                 message["token_loss_mask"] = torch.ones_like(token_ids)
             else:
                 message["token_loss_mask"] = torch.zeros_like(token_ids)

@@ -446,7 +446,6 @@ Depending on your data shape, you may want to change these values."""
                 "generation_logprobs": torch.tensor([0.0], dtype=torch.float32),
                 "is_tool_call": False,
                 "is_invalid_tool_call": False,
-                "is_no_progress_tail": False,
                 "has_malformed_thinking": False,
             }
             return {
@@ -473,9 +472,6 @@ Depending on your data shape, you may want to change these values."""
             and str(item.get("output", "")).startswith("Validation failure for ")
             and item.get("call_id")
         }
-        no_progress_tail_call_ids = set(
-            nemo_gym_result.get("no_progress_tail_call_ids") or []
-        )
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -577,11 +573,6 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 # Structured function calls were parsed and executed by NeMo-Gym.
                 "is_tool_call": output_item_dict.get("type") == "function_call",
                 "is_invalid_tool_call": is_invalid_tool_call,
-                "is_no_progress_tail": (
-                    output_item_dict.get("type") == "function_call"
-                    and output_item_dict.get("call_id")
-                    in no_progress_tail_call_ids
-                ),
                 "is_empty_tool_call": (
                     tool_call_payload_chars == 0
                     if tool_call_payload_chars is not None
