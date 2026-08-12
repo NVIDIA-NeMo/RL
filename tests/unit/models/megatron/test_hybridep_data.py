@@ -24,7 +24,7 @@ import torch
 def test_hybridep_prepads_packed_inputs_before_model_forward():
     from megatron.core.packed_seq_params import PackedSeqParams
 
-    from nemo_rl.models.megatron import data as megatron_data
+    from nemo_rl.models.megatron import hybridep
 
     def set_group_max(target, **_kwargs):
         target.fill_(14)
@@ -44,21 +44,21 @@ def test_hybridep_prepads_packed_inputs_before_model_forward():
 
     with (
         patch.object(
-            megatron_data,
+            hybridep,
             "get_expert_tensor_and_model_parallel_group",
             return_value=MagicMock(),
         ) as mock_get_group,
         patch.object(
-            megatron_data.torch.distributed,
+            hybridep.torch.distributed,
             "all_reduce",
             side_effect=set_group_max,
         ) as mock_all_reduce,
         patch(
-            "nemo_rl.models.megatron.data.torch.distributed.is_available",
+            "nemo_rl.models.megatron.hybridep.torch.distributed.is_available",
             return_value=True,
         ),
         patch(
-            "nemo_rl.models.megatron.data.torch.distributed.is_initialized",
+            "nemo_rl.models.megatron.hybridep.torch.distributed.is_initialized",
             return_value=True,
         ),
     ):
@@ -67,7 +67,7 @@ def test_hybridep_prepads_packed_inputs_before_model_forward():
             padded_local_input_ids,
             padded_params,
             padded_cu_seqlens,
-        ) = megatron_data._pad_packed_seq_for_hybridep(
+        ) = hybridep.pad_packed_seq_for_hybridep(
             input_ids=input_ids,
             input_ids_cp_sharded=input_ids,
             packed_seq_params=packed_seq_params,
@@ -89,28 +89,28 @@ def test_hybridep_prepads_packed_inputs_before_model_forward():
 
 @pytest.mark.mcore
 def test_hybridep_prepadding_rejects_missing_alignment_group():
-    from nemo_rl.models.megatron import data as megatron_data
+    from nemo_rl.models.megatron import hybridep
 
     with (
         patch.object(
-            megatron_data,
+            hybridep,
             "get_expert_tensor_and_model_parallel_group",
             return_value=None,
         ),
-        patch.object(megatron_data.torch.distributed, "all_reduce") as mock_all_reduce,
+        patch.object(hybridep.torch.distributed, "all_reduce") as mock_all_reduce,
         patch(
-            "nemo_rl.models.megatron.data.torch.distributed.is_available",
+            "nemo_rl.models.megatron.hybridep.torch.distributed.is_available",
             return_value=True,
         ),
         patch(
-            "nemo_rl.models.megatron.data.torch.distributed.is_initialized",
+            "nemo_rl.models.megatron.hybridep.torch.distributed.is_initialized",
             return_value=True,
         ),
         pytest.raises(
             RuntimeError, match="HybridEP alignment group is not initialized"
         ),
     ):
-        megatron_data._get_hybridep_aligned_seq_len(
+        hybridep._get_hybridep_aligned_seq_len(
             local_seq_len=12,
             multiple=8,
             device=torch.device("cpu"),
@@ -120,21 +120,34 @@ def test_hybridep_prepadding_rejects_missing_alignment_group():
 
 
 @pytest.mark.mcore
-def test_hybridep_prepadding_preserves_cp_zigzag_layout():
+@pytest.mark.parametrize(
+    ("cp_rank", "input_ids_cp_sharded", "expected_padded_local_input_ids"),
+    [
+        (
+            0,
+            torch.tensor([[1, 2, 3, 4, 13, 14, 15, 16]]),
+            torch.tensor([[1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0, 0]]),
+        ),
+        (
+            1,
+            torch.tensor([[5, 6, 7, 8, 9, 10, 11, 12]]),
+            torch.tensor([[7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0]]),
+        ),
+    ],
+)
+def test_hybridep_prepadding_preserves_cp_zigzag_layout(
+    cp_rank: int,
+    input_ids_cp_sharded: torch.Tensor,
+    expected_padded_local_input_ids: torch.Tensor,
+) -> None:
     from megatron.core.packed_seq_params import PackedSeqParams
 
-    from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
-    from nemo_rl.models.megatron import data as megatron_data
+    from nemo_rl.models.megatron import hybridep
 
     def set_group_max(target, **_kwargs):
         target.fill_(10)
 
     input_ids = torch.arange(1, 17).view(1, 16)
-    input_ids_cp_sharded = _get_tokens_on_this_cp_rank(
-        input_ids,
-        cp_rank=0,
-        cp_size=2,
-    )
     cu_seqlens_padded = torch.tensor([0, 16], dtype=torch.int32)
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens_padded,
@@ -149,21 +162,21 @@ def test_hybridep_prepadding_preserves_cp_zigzag_layout():
 
     with (
         patch.object(
-            megatron_data,
+            hybridep,
             "get_expert_tensor_and_model_parallel_group",
             return_value=MagicMock(),
         ),
         patch.object(
-            megatron_data.torch.distributed,
+            hybridep.torch.distributed,
             "all_reduce",
             side_effect=set_group_max,
         ),
         patch(
-            "nemo_rl.models.megatron.data.torch.distributed.is_available",
+            "nemo_rl.models.megatron.hybridep.torch.distributed.is_available",
             return_value=True,
         ),
         patch(
-            "nemo_rl.models.megatron.data.torch.distributed.is_initialized",
+            "nemo_rl.models.megatron.hybridep.torch.distributed.is_initialized",
             return_value=True,
         ),
     ):
@@ -172,26 +185,59 @@ def test_hybridep_prepadding_preserves_cp_zigzag_layout():
             padded_local_input_ids,
             padded_params,
             padded_cu_seqlens,
-        ) = megatron_data._pad_packed_seq_for_hybridep(
+        ) = hybridep.pad_packed_seq_for_hybridep(
             input_ids=input_ids,
             input_ids_cp_sharded=input_ids_cp_sharded,
             packed_seq_params=packed_seq_params,
             cu_seqlens_padded=cu_seqlens_padded,
             pad_packed_seq_to_multiple_of=8,
-            cp_rank=0,
+            cp_rank=cp_rank,
             cp_size=2,
         )
 
     assert padded_input_ids.shape == (1, 24)
     assert torch.equal(padded_input_ids[:, :16], input_ids)
     assert torch.count_nonzero(padded_input_ids[:, 16:]) == 0
-    assert torch.equal(
-        padded_local_input_ids,
-        torch.tensor([[1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0, 0]]),
-    )
+    assert torch.equal(padded_local_input_ids, expected_padded_local_input_ids)
     assert torch.equal(padded_cu_seqlens, torch.tensor([0, 24]))
     assert padded_params.max_seqlen_q == 24
     assert padded_params.total_tokens == 12
+
+
+@pytest.mark.mcore
+def test_hybridep_prepadding_returns_original_objects_when_already_aligned() -> None:
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    from nemo_rl.models.megatron import hybridep
+
+    input_ids = torch.arange(1, 9).view(1, 8)
+    cu_seqlens_padded = torch.tensor([0, 8], dtype=torch.int32)
+    packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=8,
+        max_seqlen_kv=8,
+        qkv_format="thd",
+        total_tokens=8,
+    )
+
+    with patch.object(hybridep, "_get_hybridep_aligned_seq_len", return_value=8):
+        result = hybridep.pad_packed_seq_for_hybridep(
+            input_ids=input_ids,
+            input_ids_cp_sharded=input_ids,
+            packed_seq_params=packed_seq_params,
+            cu_seqlens_padded=cu_seqlens_padded,
+            pad_packed_seq_to_multiple_of=8,
+            cp_rank=0,
+            cp_size=1,
+        )
+
+    assert result[0] is input_ids
+    assert result[1] is input_ids
+    assert result[2] is packed_seq_params
+    assert result[3] is cu_seqlens_padded
 
 
 @pytest.mark.mcore
