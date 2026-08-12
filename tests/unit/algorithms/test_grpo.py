@@ -3014,13 +3014,13 @@ def test_grpo_advantage_estimator_zero_std():
     assert torch.allclose(result[2:], expected_prompt_1, rtol=1e-4)
 
 
-def test_grpo_advantage_estimator_deduplicates_refine_rounds_by_chain():
+def test_grpo_advantage_estimator_uses_round_rewards_and_ignores_padding():
     estimator = GRPOAdvantageEstimator(
         {"use_leave_one_out_baseline": True, "normalize_rewards": False},
         ClippedPGLossConfig(),
     )
     prompt_ids = torch.tensor([0, 0, 0, 0, 0, 0])
-    rewards = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0, 0.0])
+    rewards = torch.tensor([0.0, 1.0, 1.0, 0.0, 0.0, 0.0])
     repeated_batch = {
         "chain_hash": [
             "chain-a",
@@ -3032,16 +3032,19 @@ def test_grpo_advantage_estimator_deduplicates_refine_rounds_by_chain():
         ]
     }
 
+    mask = torch.ones(6, 2)
+    mask[-1] = 0  # fixed-size dummy slot after an early-success chain
     advantages = estimator.compute_advantage(
         prompt_ids=prompt_ids,
         rewards=rewards,
-        mask=torch.ones(6, 2),
+        mask=mask,
         repeated_batch=repeated_batch,
     )
 
-    # RLOO is calculated across the three unique chains: positive chains see
-    # baseline (1 + 0) / 2, while the negative chain sees (1 + 1) / 2.
-    expected = torch.tensor([0.5, 0.5, 0.5, 0.5, -1.0, -1.0])
+    # RLOO is calculated over the five real rounds. The two rounds from one
+    # chain may have different outcomes; the padding row contributes neither
+    # to the baseline nor to the policy loss.
+    expected = torch.tensor([-0.5, 0.75, 0.75, -0.5, -0.5, 0.0])
     assert torch.equal(advantages[:, 0], expected)
 
 
