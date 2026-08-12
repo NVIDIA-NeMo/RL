@@ -58,7 +58,6 @@ def _collect_entries(
     return [entry for bucket in buckets for entry in bucket]
 
 
-
 def test_mxfp8_iterator_respects_head_tail_and_extra_high_precision(
     monkeypatch,
 ) -> None:

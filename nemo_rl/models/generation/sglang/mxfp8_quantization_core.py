@@ -120,4 +120,3 @@ def quantize_mxfp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     qweight = qweight.view_as(weight)
     scale = scale.view(*weight.shape[:-1], k // 32).contiguous()
     return qweight, scale
-

@@ -99,9 +99,7 @@ def _process_file(
         if not key.endswith(".weight"):
             continue
 
-        if should_quantize(
-            key, tensor, skip_weight_substrings=skip_weight_substrings
-        ):
+        if should_quantize(key, tensor, skip_weight_substrings=skip_weight_substrings):
             qweight, scale = quantize_mxfp8(tensor)
             q_weights[key] = qweight
             q_weights[strip_weight_suffix(key) + MXFP8_SCALE_KEY_SUFFIX] = scale
