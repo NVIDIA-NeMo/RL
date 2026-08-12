@@ -142,7 +142,9 @@ def _make_manager(
     mgr._tq_buffer = buffer
     mgr._weight_version = 0
     mgr._retry_policy = (
-        retry_policy if retry_policy is not None else RolloutRetryPolicy()
+        retry_policy
+        if retry_policy is not None
+        else RolloutRetryPolicy.single_attempt()
     )
     mgr._stats = RolloutStats()
     mgr._skipped_prompts = 0
