@@ -676,13 +676,25 @@ class VllmAsyncGenerationWorkerImpl(
                 configured_chat_template
             )
         # Recipes may name the parameter either way: ``default_chat_template_kwargs``
-        # matches vLLM's own spelling, ``chat_template_kwargs`` is accepted for
-        # recipes written against the older name. Both are popped out of the init
-        # bag because they belong on the renderer, not on OpenAIServingChat.
+        # is vLLM's own spelling, ``chat_template_kwargs`` is accepted for recipes
+        # written against the older name. Normalize onto the native key rather
+        # than popping it: OnlineRenderer, OpenAIServingChat and ServingTokenization
+        # each keep their *own* copy and read it independently -- the chat serving
+        # builds its reasoning parser from it, and the tokenize path passes its own
+        # into preprocess_chat -- so the renderer's copy does not reach either.
+        # vLLM's api_server hands the same value to all three for that reason.
+        #
+        # Popped separately, not `A or B`: short-circuiting on a truthy A would
+        # leave B in the bag and OpenAIServingChat(**kwargs) would reject it.
+        _legacy_chat_template_kwargs = serving_chat_kwargs.pop(
+            "chat_template_kwargs", None
+        )
+        if serving_chat_kwargs.get("default_chat_template_kwargs") is None:
+            serving_chat_kwargs["default_chat_template_kwargs"] = (
+                _legacy_chat_template_kwargs
+            )
         default_chat_template_kwargs: dict[str, Any] = (
-            serving_chat_kwargs.pop("default_chat_template_kwargs", None)
-            or serving_chat_kwargs.pop("chat_template_kwargs", None)
-            or {}
+            serving_chat_kwargs["default_chat_template_kwargs"] or {}
         )
         online_renderer = NeMoRLOnlineRenderer(
             model_config=engine_client.model_config,
@@ -822,6 +834,10 @@ class VllmAsyncGenerationWorkerImpl(
             ],
             models=serving_chat_kwargs["models"],
             online_renderer=online_renderer,
+            # ServingTokenization reads its own copy in preprocess_chat rather
+            # than the renderer's, so /tokenize would otherwise render with {}
+            # and diverge from /v1/chat/completions under multi-turn.
+            default_chat_template_kwargs=default_chat_template_kwargs,
         )
         openai_serving_tokenization = NeMoRLServingTokenization(
             **serving_tokenization_kwargs
