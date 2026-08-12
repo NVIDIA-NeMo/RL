@@ -20,7 +20,7 @@ value_loss_fn:
   scale: 1.0
   cliprange: 0.5
 checkpointing:
-  checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp
+  checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-dynbatch
 policy:
   model_name: Qwen/Qwen2.5-1.5B-Instruct
   train_global_batch_size: 256
@@ -50,9 +50,9 @@ env:
   math:
     math_verify_impl: hf_math_verify
 logger:
-  log_dir: logs/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp
+  log_dir: logs/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-dynbatch
   wandb:
     project: nemo-rl
-    name: ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp
+    name: ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-dynbatch
 cluster:
   gpus_per_node: 8
