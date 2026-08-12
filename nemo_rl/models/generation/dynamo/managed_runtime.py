@@ -43,7 +43,7 @@ from nemo_rl.models.generation.dynamo.arguments import (
     redact_argv,
     redact_environment,
 )
-from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.config import DynamoConfig, DynamoWorkerRole
 from nemo_rl.models.generation.dynamo.venv import (
     get_dynamo_executable,
     get_dynamo_python,
@@ -81,6 +81,40 @@ class ManagedDynamoRuntime:
                 f"node: tp*pp={self._engine_world_size} exceeds "
                 f"cluster.num_gpus_per_node={cluster.num_gpus_per_node}"
             )
+        cluster_world_size = cluster.world_size()
+        if cluster_world_size % self._engine_world_size != 0:
+            raise ValueError(
+                "Managed Dynamo inference GPUs must be divisible by TP * PP: "
+                f"gpus={cluster_world_size}, tp_pp={self._engine_world_size}"
+            )
+        disaggregation = self._dynamo_cfg.disaggregation
+        self._worker_roles: list[DynamoWorkerRole]
+        if disaggregation is None:
+            self._worker_roles = []
+            for _ in range(cluster_world_size // self._engine_world_size):
+                self._worker_roles.append("aggregated")
+            self._expected_components = {"backend": len(self._worker_roles)}
+        else:
+            expected_world_size = (
+                disaggregation.prefill_workers + disaggregation.decode_workers
+            ) * self._engine_world_size
+            if cluster_world_size != expected_world_size:
+                raise ValueError(
+                    "Managed Dynamo disaggregation received the wrong inference "
+                    f"GPU allocation: allocated={cluster_world_size}, "
+                    f"expected={expected_world_size}"
+                )
+            # Keep decode ranks first. This order is also used by the NCCL refit
+            # channel, so rank offsets remain stable across process restarts.
+            self._worker_roles = []
+            for _ in range(disaggregation.decode_workers):
+                self._worker_roles.append("decode")
+            for _ in range(disaggregation.prefill_workers):
+                self._worker_roles.append("prefill")
+            self._expected_components = {
+                "backend": disaggregation.decode_workers,
+                "prefill": disaggregation.prefill_workers,
+            }
         self._namespace = _managed_namespace()
         self._host = ""
         self._etcd_port = 0
@@ -169,12 +203,13 @@ class ManagedDynamoRuntime:
                 config=self._config,
                 namespace=self._namespace,
                 engine_world_size=self._engine_world_size,
+                worker_roles=self._worker_roles,
                 manager_env=self._manager_env,
                 startup_timeout_s=self._dynamo_cfg.startup_timeout_s,
             )
             self._pool.start()
             self._start_frontend()
-            self._wait_for_frontend(self._pool.size)
+            self._wait_for_frontend(self._expected_components)
             self._started = True
         except Exception:
             self.shutdown()
@@ -320,12 +355,14 @@ class ManagedDynamoRuntime:
             command, env=frontend_env, start_new_session=True
         )
 
-    def _wait_for_frontend(self, expected_workers: int) -> None:
+    def _wait_for_frontend(self, expected_components: dict[str, int]) -> None:
         health_url = f"http://127.0.0.1:{self._frontend_port}/health"
         models_url = f"http://127.0.0.1:{self._frontend_port}/v1/models"
         expected_model = str(self._config["model_name"])
         deadline = time.monotonic() + self._dynamo_cfg.startup_timeout_s
-        last_counts = (0, 0)
+        last_counts = {
+            component: {"generate": 0, "rl": 0} for component in expected_components
+        }
         last_models: set[str] = set()
         while time.monotonic() < deadline:
             if self._pool is None or not self._pool.is_alive():
@@ -346,27 +383,39 @@ class ManagedDynamoRuntime:
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
                 time.sleep(1)
                 continue
-            generate_ids: set[str] = set()
-            rl_ids: set[str] = set()
+            observed = {
+                component: {"generate": set(), "rl": set()}
+                for component in expected_components
+            }
             for instance in payload.get("instances", []):
                 if not isinstance(instance, dict):
                     continue
                 if instance.get("namespace") != self._namespace:
                     continue
-                if instance.get("component") != "backend":
+                component = instance.get("component")
+                if not isinstance(component, str) or component not in observed:
                     continue
                 instance_id = instance.get("instance_id")
                 if instance_id is None:
                     continue
                 if instance.get("endpoint") == "generate":
-                    generate_ids.add(str(instance_id))
+                    observed[component]["generate"].add(str(instance_id))
                 elif instance.get("endpoint") == "rl":
-                    rl_ids.add(str(instance_id))
-            last_counts = (len(generate_ids), len(rl_ids))
-            if (
-                last_counts == (expected_workers, expected_workers)
-                and generate_ids == rl_ids
-            ):
+                    observed[component]["rl"].add(str(instance_id))
+            last_counts = {
+                component: {
+                    endpoint: len(instance_ids)
+                    for endpoint, instance_ids in endpoints.items()
+                }
+                for component, endpoints in observed.items()
+            }
+            registrations_ready = all(
+                len(observed[component]["generate"]) == expected_count
+                and len(observed[component]["rl"]) == expected_count
+                and observed[component]["generate"] == observed[component]["rl"]
+                for component, expected_count in expected_components.items()
+            )
+            if registrations_ready:
                 # /health reflects discovery registrations before the frontend's
                 # model watcher has necessarily installed its OpenAI routes. Do
                 # not expose frontend_url until the served model is visible;
@@ -391,16 +440,16 @@ class ManagedDynamoRuntime:
                     time.sleep(1)
                     continue
                 print(
-                    f"  [Dynamo] frontend ready with {expected_workers} generation "
-                    "and RL workers",
+                    "  [Dynamo] frontend ready with managed components "
+                    f"{expected_components}",
                     flush=True,
                 )
                 return
             time.sleep(1)
         raise RuntimeError(
             "Dynamo frontend did not observe the fixed worker fleet within "
-            f"{self._dynamo_cfg.startup_timeout_s}s: expected={expected_workers}, "
-            f"last_generate={last_counts[0]}, last_rl={last_counts[1]}, "
+            f"{self._dynamo_cfg.startup_timeout_s}s: "
+            f"expected={expected_components}, last_counts={last_counts}, "
             f"expected_model={expected_model!r}, last_models={sorted(last_models)!r}."
         )
 
