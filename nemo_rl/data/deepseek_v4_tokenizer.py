@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import copy
-import json
-from pathlib import Path
 from typing import Any
 
 from nemo_rl.data.deepseek_v4_encoding import encode_messages
@@ -22,48 +20,19 @@ from nemo_rl.data.deepseek_v4_encoding import encode_messages
 DEEPSEEK_V4_CHAT_TEMPLATE = "deepseek_v4"
 
 
-def _is_deepseek_v4_model_path(model_path: str) -> bool:
-    config_path = Path(model_path) / "config.json"
-    if not config_path.is_file():
-        return False
-
-    try:
-        with config_path.open(encoding="utf-8") as config_file:
-            config = json.load(config_file)
-    except (OSError, json.JSONDecodeError):
-        return False
-
-    return config.get("model_type") == "deepseek_v4"
-
-
 def should_use_deepseek_v4_chat_template(tokenizer_config: dict[str, Any]) -> bool:
-    """Return whether the config requests the DeepSeek V4 renderer."""
-    chat_template = tokenizer_config.get("chat_template")
-    if (
-        isinstance(chat_template, str)
-        and chat_template.lower() == DEEPSEEK_V4_CHAT_TEMPLATE
-    ):
-        return True
-
-    tokenizer_name = tokenizer_config.get("name")
-    return isinstance(tokenizer_name, str) and _is_deepseek_v4_model_path(
-        tokenizer_name
-    )
+    """Return whether the config explicitly requests the DeepSeek V4 renderer."""
+    return tokenizer_config.get("chat_template") == DEEPSEEK_V4_CHAT_TEMPLATE
 
 
 def get_deepseek_v4_tokenizer(tokenizer: Any) -> Any:
     """Wrap a fast tokenizer with vLLM 0.25.1's DeepSeek V4 encoder."""
-    if getattr(tokenizer, "_nemo_rl_deepseek_v4_chat_template", False):
-        return tokenizer
-
     dsv4_tokenizer = copy.copy(tokenizer)
     added_vocab = tokenizer.get_added_vocab()
     added_vocab_size = len(added_vocab)
     tokenizer_vocab_size = tokenizer.vocab_size
 
     class _DeepseekV4Tokenizer(tokenizer.__class__):  # type: ignore
-        _nemo_rl_deepseek_v4_chat_template = True
-
         def apply_chat_template(
             self,
             messages: list[dict[str, Any]],
@@ -122,6 +91,5 @@ def get_deepseek_v4_tokenizer(tokenizer: Any) -> Any:
 
     _DeepseekV4Tokenizer.__name__ = f"DSV4{tokenizer.__class__.__name__}"
     dsv4_tokenizer.__class__ = _DeepseekV4Tokenizer
-    dsv4_tokenizer.chat_template = DEEPSEEK_V4_CHAT_TEMPLATE
 
     return dsv4_tokenizer
