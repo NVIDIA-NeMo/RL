@@ -166,6 +166,10 @@ def test_logs_setup_timing_metrics(monkeypatch) -> None:
         rollout_manager=SimpleNamespace(_tq_buffer=None),
         train_cluster=None,
         inference_cluster=None,
+        # A real field of SingleControllerActorArgs. Read directly rather than via a
+        # getattr default, so omitting it breaks here instead of silently degrading
+        # watchdog.gym_subprocess_check into a no-op at runtime.
+        env_handles={},
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 

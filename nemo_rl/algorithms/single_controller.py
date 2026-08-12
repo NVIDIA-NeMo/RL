@@ -125,14 +125,13 @@ class SingleControllerActor:
         self._loss_fn = actor_args.loss_fn
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
-        # getattr, not attribute access: `env_handles` is a real field of
-        # SingleControllerActorArgs, so every production caller has it -- but upstream's
-        # unit tests build actor_args as a SimpleNamespace listing only what upstream's
-        # own __init__ reads, and upstream never reads this one. Requiring it here turns
-        # our feature into a construction requirement for tests that do not exercise it,
-        # which is how test_logs_setup_timing_metrics broke on the main sync. Same shape
-        # as the `timeouts` regression in the previous sync.
-        self._env_handles = getattr(actor_args, "env_handles", {})
+        # Direct access, deliberately. A getattr default here reads as defensive but
+        # buys a silent failure mode: rename or drop the field and
+        # watchdog.gym_subprocess_check: true degrades to a health check that iterates
+        # nothing and reports nothing -- the exact class of silent failure this work
+        # exists to remove. A missing field should break loudly at construction, where
+        # it costs five minutes, not quietly at hour three of a run.
+        self._env_handles = actor_args.env_handles
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
