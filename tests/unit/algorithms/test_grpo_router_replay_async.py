@@ -147,7 +147,7 @@ def test_add_shared_prefix_training_metadata_uses_grpo_prompt_groups():
     assert train_data[SHARED_PREFIX_LENGTHS].tolist() == [2, 2, 2, 2]
 
 
-def test_add_shared_prefix_training_metadata_crops_terminal_environment_tokens():
+def test_add_shared_prefix_training_metadata_keeps_terminal_environment_tokens():
     train_data = BatchedDataDict(
         {
             "input_ids": torch.tensor(
@@ -174,7 +174,11 @@ def test_add_shared_prefix_training_metadata_crops_terminal_environment_tokens()
 
     assert train_data[SHARED_PREFIX_LENGTHS].tolist() == [2, 2]
     assert train_data["input_lengths"].dtype == torch.int32
-    assert train_data["input_lengths"].tolist() == [4, 4]
+    # Terminal-environment cropping is disabled for now so that shared-prefix and
+    # the dense/packed baseline consume identical input_lengths; see the disabled
+    # assignment in _add_shared_prefix_training_metadata. Expect [4, 4] again once
+    # the crop is re-enabled.
+    assert train_data["input_lengths"].tolist() == [6, 5]
 
 
 def test_async_grpo_r3_rejects_data_plane_until_async_tq_exists():

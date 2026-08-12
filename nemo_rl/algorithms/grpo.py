@@ -1840,13 +1840,20 @@ def _add_shared_prefix_training_metadata(
         device=train_data["input_lengths"].device,
         dtype=train_data["input_lengths"].dtype,
     )
-    # Native rollouts append a terminal environment observation after the
-    # generated assistant response. It has zero loss mask and no later trainable
-    # token depends on it, so compact training can safely drop that tail.
-    train_data["input_lengths"] = effective_input_lengths.to(
-        device=train_data["input_lengths"].device,
-        dtype=train_data["input_lengths"].dtype,
-    )
+    # Temporarily disabled so the shared-prefix path consumes exactly the same
+    # input_lengths as the dense/packed baseline. Cropping the terminal
+    # environment observation is safe (it has zero loss mask and sits after every
+    # trainable token, so nothing depends on it) and it does shrink the compact
+    # microbatch, but it is an optimization orthogonal to prefix deduplication:
+    # pack_sequences keeps that tail on the dense path, so leaving it enabled
+    # gives shared-prefix a packing advantage that would be miscredited to
+    # deduplication in an A/B. Re-enable once the same crop is applied to both
+    # paths, or once it is measured separately.
+    # train_data["input_lengths"] = effective_input_lengths.to(
+    #     device=train_data["input_lengths"].device,
+    #     dtype=train_data["input_lengths"].dtype,
+    # )
+    del effective_input_lengths
     train_data[SHARED_PREFIX_GROUP_IDS] = (
         torch.arange(
             batch_size, device=train_data["input_ids"].device, dtype=torch.long
