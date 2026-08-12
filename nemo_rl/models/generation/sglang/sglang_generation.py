@@ -138,7 +138,6 @@ class SGLangGeneration(GenerationInterface):
         # Serializes weight refits against engine recovery across processes.
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
 
-
     # ------------------------------------------------------------------
     # Engine topology properties (formerly ``ServerGroup``)
     # ------------------------------------------------------------------
@@ -315,7 +314,6 @@ class SGLangGeneration(GenerationInterface):
             ]
         )
 
-
     def get_updatable_engines_and_lock(self):
         """Return engines eligible for weight updates."""
         return (
@@ -325,7 +323,6 @@ class SGLangGeneration(GenerationInterface):
             self.engine_gpu_counts,
             self.engine_gpu_offsets,
         )
-
 
     def clear_updatable_num_new_engines(self):
         # Called by the refit dispatch once it has connected the new engines, so
