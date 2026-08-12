@@ -128,6 +128,10 @@ policy:
     enabled: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
+    fine_grained_activation_offloading: false
+    # Modules to offload when enabled; null disables module selection.
+    offload_modules: null
     converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
@@ -317,6 +321,10 @@ value:
     enabled: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
+    fine_grained_activation_offloading: false
+    # Modules to offload when enabled; null disables module selection.
+    offload_modules: null
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
