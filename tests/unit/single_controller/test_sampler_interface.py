@@ -304,5 +304,35 @@ class TestDefaultEvictSkipsUnready:
         assert _run(s.evict(current_train_weight=5)) == 0
 
 
+class TestInflightAbortPolicy:
+    def test_windowed_aborts_only_below_weight_window(self):
+        sampler = WindowedSampler(
+            FakeBuffer(),
+            max_staleness_versions=2,
+        )
+
+        assert sampler.should_abort_inflight(
+            start_weight_version=2,
+            current_train_weight=5,
+        )
+        assert not sampler.should_abort_inflight(
+            start_weight_version=3,
+            current_train_weight=5,
+        )
+
+    @pytest.mark.parametrize(
+        "sampler",
+        [
+            WeightFifoSampler(FakeBuffer(), max_staleness_versions=1),
+            InOrderSampler(FakeBuffer(), max_lookahead_versions=1),
+        ],
+    )
+    def test_gated_samplers_never_abort_inflight(self, sampler):
+        assert not sampler.should_abort_inflight(
+            start_weight_version=0,
+            current_train_weight=5,
+        )
+
+
 class EchoSampler(InOrderSampler):
     """Stand-in for a user-defined sampler loaded by FQN."""

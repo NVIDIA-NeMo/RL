@@ -85,6 +85,12 @@ def main() -> None:
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
+    if config.grpo.async_grpo is not None:
+        raise ValueError(
+            "SC requires `grpo.async_grpo: null`; use `async_rl.*` instead. "
+            "See docs/guides/single-controller.md#migrating-a-legacy-async-config."
+        )
+
     dp_cfg = config.data_plane
     if not dp_cfg.get("enabled", False):
         raise ValueError(
