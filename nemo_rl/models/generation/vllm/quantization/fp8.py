@@ -31,6 +31,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
+from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
 from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
@@ -197,11 +198,12 @@ def apply_fp8_patches(self, fp8_config):
                     )
                 )
 
-            # Static scales mode: preserve k_scale/v_scale for manual updates.
-            # DeepSeek V4's MLA cache stores scales inline, so it has no
-            # Parameter-style KV scales for this patch to preserve or refit.
-            if global_fp8_config.kv_cache_dtype != "fp8_ds_mla":
-                func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
+            # Preserve separately refittable static KV scales.
+            if global_fp8_config.kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
+                func5_path = (
+                    "vllm.model_executor.layers.quantization.kv_cache."
+                    "BaseKVCacheMethod.process_weights_after_loading"
+                )
                 patcher5 = patch(func5_path, process_weights_after_loading_kv)
                 fp8_state.vllm_patches.append(patcher5)
 

@@ -27,6 +27,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
+from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -532,7 +533,7 @@ class VllmInternalWorkerExtension:
         if kv_cache_dtype is None:
             return False
         kv_cache_dtype = str(kv_cache_dtype).lower()
-        return "fp8" in kv_cache_dtype and kv_cache_dtype != "fp8_ds_mla"
+        return kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""

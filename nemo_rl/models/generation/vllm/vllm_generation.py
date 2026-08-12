@@ -41,7 +41,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    REFITTABLE_FP8_KV_CACHE_DTYPES,
+    VllmConfig,
+)
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     assert_refit_unsupported_grouped_moe_params,
@@ -1529,10 +1532,8 @@ class VllmGeneration(GenerationInterface):
     def requires_kv_scale_sync(self) -> bool:
         """Check if KV cache scales should be synchronized during refit.
 
-        DeepSeek V4 MLA stores scales inline in its cache tensor rather than as
-        separately refittable k_scale/v_scale parameters.
+        Only traditional per-tensor FP8 caches expose separately refittable
+        k_scale/v_scale parameters.
         """
         kv_cache_dtype = self.cfg["vllm_cfg"].get("kv_cache_dtype")
-        return kv_cache_dtype != "fp8_ds_mla" and bool(
-            kv_cache_dtype and kv_cache_dtype.startswith("fp8")
-        )
+        return kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES
