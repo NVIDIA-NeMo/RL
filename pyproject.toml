@@ -390,6 +390,8 @@ override-dependencies = [
   "mlflow>=3.13.0",
   # Override langchain-core to address CVE GHSA-qh6h-p6c9-ff54 (path traversal in load_prompt)
   "langchain-core>=1.2.22",
+  # Override outlines for Python 3.13 support
+  "outlines>=0.2.0",
   # Upgrade pytest to 9.0.3
   "pytest>=9.0.3",
   "langchain>=0.3.28",      # Address CVE-2025-65106
