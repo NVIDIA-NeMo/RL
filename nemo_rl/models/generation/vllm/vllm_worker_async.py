@@ -324,68 +324,6 @@ class VllmAsyncGenerationWorkerImpl(
             self.kv_cache_usage_perc = []
             self.generation_tokens = []
 
-    def parse_chat_output(
-        self,
-        raw_output: str,
-        reasoning_parser: str | None,
-        tool_parser: str | None,
-        tools: list[dict[str, Any]] | None,
-        enable_thinking: bool,
-        reasoning_at_start: bool = False,
-    ) -> dict[str, Any]:
-        """Run parser parity cases in the vLLM worker environment."""
-        import json
-
-        from vllm.entrypoints.openai.chat_completion.protocol import (
-            ChatCompletionRequest,
-        )
-        from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
-        from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
-
-        request = ChatCompletionRequest(
-            model=self.model_name,
-            messages=[{"role": "user", "content": "parser contract"}],
-            tools=tools,
-            chat_template_kwargs={"enable_thinking": enable_thinking},
-        )
-        tokenizer = self.llm.renderer.tokenizer
-        reasoning_content = ""
-        content: str | None = raw_output
-
-        if reasoning_parser is not None:
-            # Restore the prompt-injected opening tag for parser input.
-            parser_input = "<think>" + raw_output if reasoning_at_start else raw_output
-            parser_type = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
-            parser = parser_type(tokenizer)
-            reasoning_content, content = parser.extract_reasoning(parser_input, request)
-            reasoning_content = reasoning_content or ""
-
-        normalized_calls: list[dict[str, Any]] = []
-        if tool_parser is not None and tools and content:
-            parser_type = ToolParserManager.get_tool_parser(tool_parser)
-            parser = parser_type(tokenizer, request.tools)
-            parsed = parser.extract_tool_calls(content, request)
-            if parsed.tools_called:
-                content = parsed.content
-                for call in parsed.tool_calls:
-                    arguments = call.function.arguments
-                    normalized_calls.append(
-                        {
-                            "name": call.function.name,
-                            "arguments": (
-                                json.loads(arguments)
-                                if isinstance(arguments, str)
-                                else arguments
-                            ),
-                        }
-                    )
-
-        return {
-            "reasoning_content": reasoning_content,
-            "content": content,
-            "tool_calls": normalized_calls,
-        }
-
     async def post_init_async(self):
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
