@@ -4719,6 +4719,55 @@ def test_grpo_advantage_estimator_small_nonzero_std():
     assert result[0, 0] * result[1, 0] < 0
 
 
+def test_gdpo_advantage_estimator_feature_weight_changes_advantage():
+    """Feature weights are applied after per-feature normalization."""
+
+    def compute_advantage(think_weight):
+        estimator_config = AdvEstimatorConfig(
+            use_leave_one_out_baseline=False,
+            normalize_rewards=True,
+            reward_features={
+                "default": {
+                    "length_adjusted_reward": {},
+                    "think_count_delta": {"weight": think_weight},
+                }
+            },
+        )
+        estimator = GDPOAdvantageEstimator(estimator_config, ClippedPGLossConfig())
+        prompt_ids = torch.tensor([[0], [0], [0], [0]])
+        rewards = torch.zeros(4)
+        mask = torch.ones(4, 1)
+        repeated_batch = {
+            "agent_ref": [{"name": "math_with_judge_simple_agent"} for _ in range(4)],
+            "gdpo_reward_features": [
+                {
+                    "length_adjusted_reward": {"reward": 1.0},
+                    "think_count_delta": {"reward": 0.0},
+                },
+                {
+                    "length_adjusted_reward": {"reward": 1.0},
+                    "think_count_delta": {"reward": -1.0},
+                },
+                {
+                    "length_adjusted_reward": {"reward": 0.0},
+                    "think_count_delta": {"reward": 0.0},
+                },
+                {
+                    "length_adjusted_reward": {"reward": 0.0},
+                    "think_count_delta": {"reward": -1.0},
+                },
+            ],
+        }
+        return estimator.compute_advantage(
+            prompt_ids, rewards, mask, repeated_batch=repeated_batch
+        )[:, 0]
+
+    without_think_feature = compute_advantage(0.0)
+    with_think_feature = compute_advantage(1.0)
+
+    assert not torch.allclose(without_think_feature, with_think_feature)
+
+
 # ============================================================================
 # Tests for ReinforcePlusPlusAdvantageEstimator class
 # ============================================================================
