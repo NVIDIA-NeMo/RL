@@ -77,6 +77,14 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         if "default" in data_config and data_config["default"] is not None:
             update_single_dataset_config(cfg, data_config["default"])
         data = load_response_dataset(cfg)
+        if (
+            data.task_name == "megatron_sft_packed"
+            and data.task_name in task_data_processors
+        ):
+            raise ValueError(
+                "SFT does not support multiple megatron_sft_packed datasets "
+                "in the same training split"
+            )
         data_list.append(data)
         # bind task_name to task_data_processors
         data_processor = partial(
@@ -127,6 +135,14 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             if "default" in data_config and data_config["default"] is not None:
                 update_single_dataset_config(cfg, data_config["default"])
             val_data = load_response_dataset(cfg)
+            if (
+                val_data.task_name == "megatron_sft_packed"
+                and val_data.task_name in val_task_data_processors
+            ):
+                raise ValueError(
+                    "SFT does not support multiple megatron_sft_packed datasets "
+                    "in the same validation split"
+                )
             val_data_list.append(val_data.dataset)
             # bind task_name to task_data_processors
             val_data_processor = partial(

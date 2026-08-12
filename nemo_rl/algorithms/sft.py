@@ -143,6 +143,17 @@ def _validate_direct_megatron_sft_setup(
     if not uses_direct_packing:
         return
 
+    for dataset in (train_dataset, val_dataset):
+        if dataset is None or not isinstance(dataset.task_data_processors, dict):
+            continue
+        if (
+            "megatron_sft_packed" in dataset.task_data_processors
+            and len(dataset.task_data_processors) != 1
+        ):
+            raise ValueError(
+                "SFT cannot mix direct Megatron-LM prepacked and regular datasets"
+            )
+
     policy_config = master_config.policy
     megatron_cfg = policy_config.get("megatron_cfg")
     if megatron_cfg is None or not megatron_cfg["enabled"]:

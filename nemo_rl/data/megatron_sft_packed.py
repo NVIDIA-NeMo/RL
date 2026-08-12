@@ -276,6 +276,9 @@ def megatron_sft_packed_preprocessor(
 
         cu_seqlens.append(len(pack_tokens))
 
+        if len(pack_tokens) == pack_length:
+            break
+
         if len(pack_tokens) >= pack_length + 1:
             pack_tokens = pack_tokens[:pack_length]
             pack_targets = pack_targets[:pack_length]

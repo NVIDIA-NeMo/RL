@@ -46,13 +46,10 @@ def _collate_megatron_sft_packed(
     data_batch: list[DatumSpec],
     megatron_sft_context_parallel_size: int | None,
 ) -> BatchedDataDict[Any] | None:
-    packed_fields_by_row = [
-        _MEGATRON_SFT_PACKED_FIELDS.intersection(datum_spec)
-        for datum_spec in data_batch
-    ]
-    if not any(packed_fields_by_row):
+    packed_rows = ["packed_cu_seqlens" in datum_spec for datum_spec in data_batch]
+    if not any(packed_rows):
         return None
-    if any(not packed_fields for packed_fields in packed_fields_by_row):
+    if not all(packed_rows):
         raise ValueError(
             "Megatron SFT collate rows must be all packed or all non-packed"
         )
