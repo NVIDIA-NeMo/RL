@@ -32,6 +32,9 @@ import torch
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import (
+    gather_vocab_parallel_logprobs_at_indices,
+)
 
 pytestmark = pytest.mark.mcore
 
@@ -1111,6 +1114,10 @@ class TestTopkLogitsPostProcessor:
             ),
             patch("torch.distributed.get_world_size", return_value=1),
             patch("torch.distributed.all_gather", side_effect=local_all_gather),
+            patch(
+                "nemo_rl.models.megatron.train.gather_vocab_parallel_logprobs_at_indices",
+                wraps=gather_vocab_parallel_logprobs_at_indices,
+            ) as gather_selected,
         ):
             _, unpacked = TopkLogitsPostProcessor(
                 cfg={
@@ -1124,10 +1131,18 @@ class TestTopkLogitsPostProcessor:
                 cfg={
                     "sequence_packing": {"enabled": True},
                     "megatron_cfg": {"context_parallel_size": 1},
+                    "logprob_chunk_size": 2,
                 },
                 k=2,
                 return_logprobs=True,
             )(data, cu_seqlens_padded=cu_seqlens_padded)(packed_logits)
+
+        packed_target_indices = gather_selected.call_args.args[1][..., -1]
+        torch.testing.assert_close(
+            packed_target_indices,
+            torch.tensor([[1, 2, 0, 0, 4, 0, 3]]),
+        )
+        assert gather_selected.call_args.kwargs["chunk_size"] == 2
 
         for sample_idx, seq_len in enumerate(input_lengths.tolist()):
             for key in ("topk_logits", "topk_indices", "topk_logprobs"):

@@ -45,7 +45,11 @@ from nemo_rl.models.policy.interfaces import (
 
 @dataclass
 class TeacherConfig:
-    """Resolved config for a single non-colocated teacher (built in-process)."""
+    """Resolved config for a single non-colocated teacher (built in-process).
+
+    Parallel-size fields contain the effective values after applying
+    ``megatron_cfg_overrides`` so placement, sharding, and Megatron agree.
+    """
 
     alias: str
     model_name: str  # checkpoint path
@@ -91,15 +95,27 @@ def create_teacher_configs_from_opd_config(
         # Unknown top-level keys (extra="allow") fold into megatron_cfg_overrides;
         # explicit megatron_cfg_overrides take precedence.
         all_overrides = {**(res.model_extra or {}), **res.megatron_cfg_overrides}
+        tp = res.tensor_model_parallel_size
+        pp = res.pipeline_model_parallel_size
+        cp = res.context_parallel_size
+        ep = res.expert_model_parallel_size
+        if "tensor_model_parallel_size" in all_overrides:
+            tp = int(all_overrides["tensor_model_parallel_size"])
+        if "pipeline_model_parallel_size" in all_overrides:
+            pp = int(all_overrides["pipeline_model_parallel_size"])
+        if "context_parallel_size" in all_overrides:
+            cp = int(all_overrides["context_parallel_size"])
+        if "expert_model_parallel_size" in all_overrides:
+            ep = int(all_overrides["expert_model_parallel_size"])
 
         configs.append(
             TeacherConfig(
                 alias=alias,
                 model_name=model_name,
-                tensor_model_parallel_size=res.tensor_model_parallel_size,
-                pipeline_model_parallel_size=res.pipeline_model_parallel_size,
-                context_parallel_size=res.context_parallel_size,
-                expert_model_parallel_size=res.expert_model_parallel_size,
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                context_parallel_size=cp,
+                expert_model_parallel_size=ep,
                 num_nodes=res.num_nodes,
                 gpus_per_node=res.gpus_per_node,
                 precision=res.precision,

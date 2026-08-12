@@ -64,6 +64,43 @@ def test_create_teacher_configs_heterogeneous_override():
     assert code_cfg.tensor_model_parallel_size == 8
 
 
+def test_create_teacher_configs_resolves_parallelism_from_megatron_overrides():
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    config = create_teacher_configs_from_opd_config(
+        {
+            "teacher_model_by_agent_name": {"large": "/ckpt/large"},
+            "non_colocated_teachers": {
+                "default_teacher_cfg": {
+                    "tensor_model_parallel_size": 1,
+                    "pipeline_model_parallel_size": 1,
+                    "context_parallel_size": 1,
+                    "expert_model_parallel_size": 1,
+                },
+                "teacher_overrides": {
+                    "large": {
+                        "megatron_cfg_overrides": {
+                            "tensor_model_parallel_size": 2,
+                            "pipeline_model_parallel_size": 3,
+                            "context_parallel_size": 4,
+                            "expert_model_parallel_size": 5,
+                        }
+                    }
+                },
+            },
+        }
+    )[0]
+
+    assert (
+        config.tensor_model_parallel_size,
+        config.pipeline_model_parallel_size,
+        config.context_parallel_size,
+        config.expert_model_parallel_size,
+    ) == (2, 3, 4, 5)
+
+
 def test_create_teacher_configs_deduplicates():
     from nemo_rl.models.policy.teacher_worker_group import (
         create_teacher_configs_from_opd_config,

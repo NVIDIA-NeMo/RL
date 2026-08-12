@@ -336,10 +336,21 @@ def test_validate_teacher_topk_checks_effective_teacher_override_cp(
         "large_teacher": "teacher-model"
     }
     master_config.on_policy_distillation.non_colocated_teachers.teacher_overrides = {
-        "large_teacher": {"context_parallel_size": 2}
+        "large_teacher": {"megatron_cfg_overrides": {"context_parallel_size": 2}}
     }
 
     with pytest.raises(NotImplementedError, match="large_teacher"):
+        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
+
+
+def test_validate_teacher_topk_rejects_disabled_megatron_before_parallelism_access(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    master_config.policy["megatron_cfg"] = {"enabled": False}
+
+    with pytest.raises(NotImplementedError, match="Megatron policy backend"):
         _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
 
 
