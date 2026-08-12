@@ -129,7 +129,7 @@ def test_rl_collate_fn_does_not_treat_input_ids_extra_as_packed() -> None:
 
     batch = rl_collate_fn([datum])
 
-    assert batch["length"] == torch.tensor([4])
+    assert torch.equal(batch["length"], torch.tensor([4]))
 
 
 @pytest.mark.parametrize(

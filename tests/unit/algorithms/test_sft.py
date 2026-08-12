@@ -550,7 +550,7 @@ def test_setup_rejects_mixed_direct_packed_and_regular_datasets_before_side_effe
     )
     train_dataset = MagicMock()
     train_dataset.task_data_processors = {
-        "megatron_sft_packed:first": MagicMock(),
+        "megatron_sft_packed": MagicMock(),
         "regular_sft": MagicMock(),
     }
 
