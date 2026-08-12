@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import time
 from functools import partial
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import ray
 import torch
@@ -165,6 +165,8 @@ class SingleControllerActor:
         # Cancellation handles for in-flight rollout dispatches.
         self._dispatched_rollouts: set[asyncio.Task[None]] = set()
 
+        self._inflight_by_group_id: dict[str, tuple[asyncio.Task[None], int]] = {}
+
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
         # Acquired before each rollout dispatch; released when the buffer
         # drops a group (sampler.evict or post-train buffer.remove).
@@ -279,7 +281,9 @@ class SingleControllerActor:
             self._inflight_rollouts += 1
             try:
                 await self._rollout_manager.generate_and_push(
-                    prompt, target_step=target_step
+                    prompt,
+                    target_step=target_step,
+                    inflight_registry=self._inflight_by_group_id,
                 )
             except BaseException:
                 # On success ownership transfers to the train pump, which
@@ -371,6 +375,7 @@ class SingleControllerActor:
         while self._train_steps < grpo_cfg.max_num_steps:
             version_during_step = self._trainer_version
             groups_dispatched = 0
+            evicted_stale_prompt_groups = 0
             min_sample_version = None
             step_open = False
             calibration_batches: list[BatchedDataDict[Any]] = []
@@ -385,6 +390,7 @@ class SingleControllerActor:
                         evicted = await self._sampler.evict(
                             current_train_weight=self._trainer_version,
                         )
+                        evicted_stale_prompt_groups += evicted
                         if evicted:
                             print(
                                 f"  evicted {evicted} stale prompt group(s)",
@@ -529,7 +535,15 @@ class SingleControllerActor:
                         if calibration_batches
                         else None
                     )
-                    await self._sync_weights(calibration_data=calibration_data)
+                    aborted_stale_inflight_groups = await self._sync_weights(
+                        calibration_data=calibration_data
+                    )
+                    step_metrics.update(
+                        {
+                            "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
+                            "aborted_stale_inflight_groups": aborted_stale_inflight_groups,
+                        }
+                    )
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
@@ -580,11 +594,46 @@ class SingleControllerActor:
                 flush=True,
             )
 
+    async def _abort_stale_inflight(self) -> int:
+        """Abort in-flight rollouts that the sampler can no longer select."""
+        stale_tasks = [
+            task
+            for task, start_version in self._inflight_by_group_id.values()
+            if self._sampler.should_abort_inflight(
+                start_weight_version=start_version,
+                current_train_weight=self._trainer_version,
+            )
+        ]
+        if not stale_tasks:
+            return 0
+
+        for task in stale_tasks:
+            task.cancel()
+
+        results = await asyncio.gather(*stale_tasks, return_exceptions=True)
+        failures = [
+            result
+            for result in results
+            if isinstance(result, BaseException)
+            and not isinstance(result, asyncio.CancelledError)
+        ]
+        if failures:
+            raise BaseExceptionGroup(
+                "stale in-flight rollout cleanup failed",
+                failures,
+            )
+
+        print(
+            f"  aborted {len(stale_tasks)} stale in-flight rollout(s)",
+            flush=True,
+        )
+        return len(stale_tasks)
+
     async def _sync_weights(
         self,
         *,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
-    ) -> None:
+    ) -> int:
         """Pause new rollout dispatches, synchronize weights, resume.
 
         SC owns the pause gate; in-flight generations continue through the
@@ -596,8 +645,28 @@ class SingleControllerActor:
           2. Optionally calibrate FP8 KV-cache scales.
           3. weight_synchronizer.sync_weights(kv_scales=...)
           4. _rollout_permitted.set()   — resume
+
+        Args:
+            calibration_data: Optional data used to calibrate FP8 KV-cache
+                scales before synchronizing weights.
+
+        Returns:
+            The number of stale in-flight rollout groups aborted before the
+            weight synchronization.
         """
         self._rollout_permitted.clear()
+
+        # TODO(#2625): abort unconditionally once gym-path abort is validated;
+        # for now only the native path aborts. Local import dodges the grpo.py
+        # circular dep (as in async_utils/trajectory_collector.py).
+        from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
+        from nemo_rl.algorithms.grpo import _should_use_nemo_gym
+
+        aborted_stale_inflight_groups = (
+            0
+            if _should_use_nemo_gym(cast(GrpoMasterConfig, self._master_config))
+            else await self._abort_stale_inflight()
+        )
 
         # TODO(#2625): Add drain-gate support during refit.
 
@@ -626,6 +695,7 @@ class SingleControllerActor:
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
         self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_permitted.set()
+        return aborted_stale_inflight_groups
 
     async def _advantage_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Fetch advantage inputs, compute advantages, and write them back.
