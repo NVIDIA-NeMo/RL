@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import re
 import warnings
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -32,6 +31,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
+from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
 )
@@ -449,26 +449,12 @@ def _get_params_in_layers(param_names, layers):
     return params
 
 
-_DEEPSEEK_V4_PACKED_MODULES = {
-    "attn.fused_wqa_wkv": ["attn.wq_a", "attn.wkv"],
-    "compressor.fused_wkv_wgate": ["compressor.wkv", "compressor.wgate"],
-    "shared_experts.gate_up_proj": ["shared_experts.w1", "shared_experts.w3"],
-}
-
-
 def _get_module_from_param_name(
     model: torch.nn.Module, name: str
 ) -> torch.nn.Module | None:
-    is_dsv4 = is_deepseek_v4_model(model)
-    if is_dsv4:
-        # DeepSeek V4 uses regex and suffix mappings that the base
-        # component-wise compatibility path below does not cover.
-        mapper = getattr(model, "hf_to_vllm_mapper", None)
-        if mapper is not None and hasattr(mapper, "apply_list"):
-            mapped_names = mapper.apply_list([name])
-            if not mapped_names:
-                return None
-            name = mapped_names[0]
+    name = deepseek_v4_fp8.map_checkpoint_name(model, name)
+    if name is None:
+        return None
 
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
     # The module path is all but the last part (the parameter's own name)
@@ -484,16 +470,7 @@ def _get_module_from_param_name(
     if module_path[-1] in reversed_mapping.keys():
         module_path[-1] = reversed_mapping[module_path[-1]]
 
-    # DeepSeek V4 defines these multi-component fusions in load_weights rather
-    # than packed_modules_mapping, so the base last-component lookup cannot
-    # resolve them.
-    if is_dsv4:
-        for fused_name, original_names in _DEEPSEEK_V4_PACKED_MODULES.items():
-            for original_name in original_names:
-                original_path = original_name.split(".")
-                if module_path[-len(original_path) :] == original_path:
-                    module_path[-len(original_path) :] = fused_name.split(".")
-                    break
+    module_path = deepseek_v4_fp8.remap_packed_module_path(model, module_path)
 
     if hasattr(model, "hf_to_vllm_mapper") and hasattr(
         model.hf_to_vllm_mapper, "orig_to_new_prefix"
@@ -521,6 +498,15 @@ def _get_module_from_param_name(
                 return current_module.routed_experts
             if isinstance(current_module, RoutedExperts):
                 return current_module
+            if part == "model" and not hasattr(current_module, part):
+                # Some model classes expose the decoder directly while refit
+                # parameter names still carry vLLM's synthetic ``model.`` prefix.
+                continue
+            if part == "layers" and not hasattr(current_module, part):
+                # Qwen3.5-MoE VL keeps its decoder stack below a CausalLM wrapper.
+                wrapped_model = getattr(current_module, "model", None)
+                if wrapped_model is not None and hasattr(wrapped_model, part):
+                    current_module = wrapped_model
             if isinstance(current_module, torch.nn.ModuleList):
                 current_module = current_module[int(part)]
             else:
@@ -582,34 +568,6 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return value, scale
 
 
-def is_deepseek_v4_model(model: torch.nn.Module) -> bool:
-    config = getattr(model, "config", None)
-    return getattr(config, "model_type", None) == "deepseek_v4" or (
-        type(model).__name__.lower() == "deepseekv4forcausallm"
-    )
-
-
-_DEEPSEEK_V4_EXPERT_WEIGHT_RE = re.compile(
-    r"(?:^|\.)ffn\.experts\.(?P<expert_id>\d+)\.w[123]\.weight$"
-)
-
-
-def _is_nonlocal_deepseek_v4_expert_weight(
-    name: str, model: torch.nn.Module
-) -> bool:
-    """Return whether an exported expert weight is not owned by this EP rank."""
-    match = _DEEPSEEK_V4_EXPERT_WEIGHT_RE.search(name)
-    if match is None or not is_deepseek_v4_model(model):
-        return False
-
-    module = _get_module_from_param_name(model, name)
-    if not isinstance(module, RoutedExperts):
-        return False
-
-    expert_id = int(match.group("expert_id"))
-    return module._map_global_expert_id_to_local_expert_id(expert_id) == -1
-
-
 def get_quantized_weight_iterator(
     weights: Iterable[tuple[str, torch.Tensor]],
     model_runner: Any,
@@ -628,8 +586,11 @@ def get_quantized_weight_iterator(
         # by the destination loader. Filter them before FP8 quantization and
         # layerwise buffering; the IPC manifest still accounts for the original
         # received keys outside this function.
-        if _is_nonlocal_deepseek_v4_expert_weight(k, model):
-            continue
+        expert_id = deepseek_v4_fp8.get_exported_expert_id(model, k)
+        if expert_id is not None:
+            module = _get_module_from_param_name(model, k)
+            if deepseek_v4_fp8.is_nonlocal_expert(module, expert_id):
+                continue
 
         # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix
         # (so `_is_fp8_weight` would skip them) and vLLM's grouped loader cannot
@@ -876,90 +837,6 @@ def _assign_param_data(param, value: torch.Tensor) -> None:
             param.data.copy_(value)
     else:
         param.data = value
-
-
-def _reset_fp8_routed_experts_for_refit(model: torch.nn.Module) -> None:
-    """Restore FP8 expert tensors to the checkpoint-loadable layout."""
-    for layer in model.modules():
-        if not isinstance(layer, RoutedExperts):
-            continue
-        weight_block_size = getattr(layer, "weight_block_size", None)
-        if weight_block_size is None:
-            continue
-
-        raw_weight_shapes = {
-            "w13": (
-                int(layer.num_experts),
-                2 * int(layer.intermediate_size_per_partition),
-                int(layer.hidden_size),
-            ),
-            "w2": (
-                int(layer.num_experts),
-                int(layer.hidden_size),
-                int(layer.intermediate_size_per_partition),
-            ),
-        }
-        for prefix, raw_shape in raw_weight_shapes.items():
-            weight = getattr(layer, f"{prefix}_weight", None)
-            if weight is not None and (
-                weight.shape != raw_shape or weight.dtype != torch.float8_e4m3fn
-            ):
-                weight.data = torch.empty(
-                    raw_shape,
-                    dtype=torch.float8_e4m3fn,
-                    device=weight.device,
-                )
-
-        block_m, block_n = (int(size) for size in weight_block_size)
-        for prefix in ("w13", "w2"):
-            weight = getattr(layer, f"{prefix}_weight", None)
-            if weight is None:
-                continue
-            raw_scale_shape = (
-                weight.shape[0],
-                (weight.shape[1] + block_m - 1) // block_m,
-                (weight.shape[2] + block_n - 1) // block_n,
-            )
-            scale = getattr(layer, f"{prefix}_weight_scale_inv", None)
-            if scale is not None and (
-                scale.shape != raw_scale_shape or scale.dtype != torch.float32
-            ):
-                scale.data = torch.empty(
-                    raw_scale_shape,
-                    dtype=torch.float32,
-                    device=scale.device,
-                )
-
-
-def prepare_deepseek_v4_routed_experts_for_refit(model: torch.nn.Module) -> None:
-    """Keep RoutedExperts out of layerwise buffering and load them in place."""
-    from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
-
-    for layer in model.modules():
-        if not isinstance(layer, RoutedExperts):
-            continue
-        if getattr(layer, "weight_block_size", None) is None:
-            continue
-        # Layerwise reload keeps every source expert until the complete fused
-        # MoE parameter is ready. These tensors instead remain materialized so
-        # RoutedExperts.weight_loader can copy each local expert immediately.
-        SKIP_TENSORS.update(layer._parameters)
-
-    _reset_fp8_routed_experts_for_refit(model)
-
-
-@torch.no_grad()
-def finalize_deepseek_v4_routed_experts_refit(model: torch.nn.Module) -> None:
-    """Convert immediately loaded expert tensors back to their kernel layout."""
-    for layer in model.modules():
-        if not isinstance(layer, RoutedExperts):
-            continue
-        if getattr(layer, "weight_block_size", None) is None:
-            continue
-        layer.quant_method.process_weights_after_loading(layer)
-        if layer.w13_weight.is_cuda:
-            # Requantization uses sizeable per-expert float32 temporaries.
-            torch.cuda.empty_cache()
 
 
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175

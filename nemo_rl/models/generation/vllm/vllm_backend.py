@@ -916,7 +916,7 @@ class VllmInternalWorkerExtension:
 
             return
 
-        from nemo_rl.models.generation.vllm.quantization import fp8
+        from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8, fp8
         from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
@@ -925,27 +925,21 @@ class VllmInternalWorkerExtension:
         model = self.model_runner.model
         use_layerwise_reload = fp8.is_fp8_model(
             self.model_runner.vllm_config
-        ) and fp8.is_deepseek_v4_model(model)
+        ) and deepseek_v4_fp8.is_model(model)
         if use_layerwise_reload:
             from vllm.model_executor.model_loader.reload import (
                 finalize_layerwise_reload,
                 initialize_layerwise_reload,
             )
-            from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
-
-            # DeepSeek V4 loads attn_sink with a direct copy_ instead of its
-            # Parameter weight_loader. Keep its kernel storage materialized so
-            # that copy is not lost by layerwise reload's load-count fallback.
-            SKIP_TENSORS.add("attn_sink")
 
             def finalize() -> None:
                 finalize_layerwise_reload(model, self.model_config)
-                fp8.finalize_deepseek_v4_routed_experts_refit(model)
+                deepseek_v4_fp8.finalize_refit(model)
                 self._maybe_process_mtp_drafter_after_loading()
 
             with set_current_vllm_config(self.model_runner.vllm_config):
                 with torch.device(self.device):
-                    fp8.prepare_deepseek_v4_routed_experts_for_refit(model)
+                    deepseek_v4_fp8.prepare_refit(model)
                     initialize_layerwise_reload(model)
                     yield finalize
             self._maybe_process_fp8_kv_cache()
