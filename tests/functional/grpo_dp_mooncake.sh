@@ -13,7 +13,8 @@ set -eou pipefail
 # mooncake_cpu is RDMA-only, so this needs a RoCE-capable mlx5 device. Skip
 # rather than fail on hosts that have none (InfiniBand-only or no RDMA at all).
 if [[ -z "${MC_MOONCAKE_DEVICE:-}" ]] &&
-   ! grep -q Ethernet /sys/class/infiniband/mlx5_*/ports/1/link_layer 2>/dev/null; then
+   { ! compgen -G "/dev/infiniband/uverbs*" >/dev/null ||
+     ! grep -q Ethernet /sys/class/infiniband/mlx5_*/ports/1/link_layer 2>/dev/null; }; then
     echo "[SKIP] no RoCE-capable mlx5 device under /sys/class/infiniband;" \
          "mooncake_cpu requires RDMA. Set MC_MOONCAKE_DEVICE=<dev> to override."
     exit 0
