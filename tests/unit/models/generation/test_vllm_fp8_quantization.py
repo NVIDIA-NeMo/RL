@@ -224,3 +224,96 @@ def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     assert layer.weight_scale_inv is scale_param
     # The processed values must actually land.
     assert torch.equal(layer.weight.data, torch.ones(4, 4))
+
+
+def _grouped_expert_model(fp8, monkeypatch, experts_dtype):
+    """Fake model mirroring vLLM's MoERunner -> RoutedExperts layout at
+    ``layers.0.mlp.experts``, with expert weights in ``experts_dtype``."""
+    import torch
+
+    class _RoutedExperts:
+        pass
+
+    class _MoERunner:
+        pass
+
+    monkeypatch.setattr(fp8, "RoutedExperts", _RoutedExperts)
+    monkeypatch.setattr(fp8, "MoERunner", _MoERunner)
+
+    experts = _RoutedExperts()
+    experts.w13_weight = torch.zeros(2, 4, 4, dtype=experts_dtype)
+    experts.w2_weight = torch.zeros(2, 4, 4, dtype=experts_dtype)
+    runner = _MoERunner()
+    runner.routed_experts = experts
+
+    layer = torch.nn.Module()
+    layer.mlp = types.SimpleNamespace(experts=runner)
+    return types.SimpleNamespace(
+        packed_modules_mapping={},
+        layers=torch.nn.ModuleList([layer]),
+    )
+
+
+def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
+    fp8_module, monkeypatch
+):
+    """Grouped-expert refit must respect ``ignored_layers``.
+
+    Experts covered by num_{first,last}_layers_in_bf16 or
+    quantization_ignored_layer_kws are built by vLLM as unquantized bf16 MoE
+    without ``*_weight_scale_inv`` params, so emitting per-expert FP8 + scale
+    entries for them has nowhere to load. The grouped bf16 slab must pass
+    through untouched.
+    """
+    import torch
+
+    fp8 = fp8_module
+    model = _grouped_expert_model(fp8, monkeypatch, torch.bfloat16)
+    loaded = []
+    model.load_weights = lambda pairs: loaded.extend(pairs)
+
+    gate_up = torch.randn(2, 256, 128).to(torch.bfloat16)
+    down = torch.randn(2, 128, 128).to(torch.bfloat16)
+    fp8.load_weights(
+        [
+            ("model.layers.0.mlp.experts.gate_up_proj", gate_up),
+            ("model.layers.0.mlp.experts.down_proj", down),
+        ],
+        types.SimpleNamespace(model=model),
+    )
+
+    assert [k for k, _ in loaded] == [
+        "model.layers.0.mlp.experts.gate_up_proj",
+        "model.layers.0.mlp.experts.down_proj",
+    ]
+    assert loaded[0][1] is gate_up
+    assert loaded[1][1] is down
+
+
+def test_load_weights_expands_grouped_experts_for_fp8_layers(fp8_module, monkeypatch):
+    """FP8-built experts keep the per-expert expand+quantize refit path."""
+    import torch
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(use_weight_pow2_scale=False)
+    model = _grouped_expert_model(fp8, monkeypatch, torch.float8_e4m3fn)
+    loaded = []
+    model.load_weights = lambda pairs: loaded.extend(pairs)
+
+    gate_up = torch.randn(2, 256, 128).to(torch.bfloat16)
+    fp8.load_weights(
+        [("model.layers.0.mlp.experts.gate_up_proj", gate_up)],
+        types.SimpleNamespace(model=model),
+    )
+
+    base = "model.layers.0.mlp.experts"
+    assert [k for k, _ in loaded] == [
+        f"{base}.{eid}.{proj}.weight{suffix}"
+        for proj in ("gate_proj", "up_proj")
+        for eid in (0, 1)
+        for suffix in ("", "_scale_inv")
+    ]
+    weights = {k: v for k, v in loaded}
+    assert weights[f"{base}.0.gate_proj.weight"].dtype == torch.float8_e4m3fn
+    assert weights[f"{base}.0.gate_proj.weight"].shape == (128, 128)
+    assert weights[f"{base}.0.gate_proj.weight_scale_inv"].shape == (1, 1)

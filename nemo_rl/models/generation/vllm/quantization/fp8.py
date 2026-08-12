@@ -466,8 +466,22 @@ def load_weights(weights, model_runner):
         if k.endswith("mlp.experts.gate_up_proj") or k.endswith(
             "mlp.experts.down_proj"
         ):
-            expanded_moe_experts = _expand_grouped_moe_expert_to_fp8(k, v)
-            weights_quantized.extend(expanded_moe_experts)
+            # Quantize only if vLLM built this layer's experts as FP8. Experts
+            # covered by ``ignored_layers`` (num_{first,last}_layers_in_bf16 /
+            # quantization_ignored_layer_kws) are built unquantized, with bf16
+            # w13/w2 and no ``*_weight_scale_inv`` params, so the per-expert
+            # FP8 + scale entries would have nowhere to load. Pass the grouped
+            # bf16 slab through instead; vLLM's fused expert mapping loads it
+            # directly, same as a bf16 refit.
+            experts_module = _get_module_from_param_name(model, k)
+            if (
+                isinstance(experts_module, RoutedExperts)
+                and experts_module.w13_weight.dtype == torch.float8_e4m3fn
+                and experts_module.w2_weight.dtype == torch.float8_e4m3fn
+            ):
+                weights_quantized.extend(_expand_grouped_moe_expert_to_fp8(k, v))
+            else:
+                weights_quantized.append((k, v))
             continue
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k, v))
