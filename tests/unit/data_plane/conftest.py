@@ -29,6 +29,8 @@ smoke / smoke-backend / smoke-1d / obj-backend / mix-e2e today).
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
@@ -69,12 +71,18 @@ def _session_tq_client_mooncake_cpu():
             "(set NEMO_RL_REQUIRE_MOONCAKE=1 to fail loud)"
         )
     # mooncake_cpu is RDMA-only, so it cannot run without a RoCE-capable
-    # device (InfiniBand is not auto-selected).
+    # device (InfiniBand is not auto-selected). CI sets
+    # NEMO_RL_REQUIRE_MOONCAKE=1 on runners where it exposed /dev/infiniband,
+    # which turns this skip into a failure — otherwise losing the device
+    # passthrough would silently drop mooncake coverage and still go green.
     if not roce_device():
-        pytest.skip(
+        detail = (
             "no RoCE-capable mlx5 device — mooncake_cpu requires RDMA "
             "(set MC_MOONCAKE_DEVICE=<dev> to override)"
         )
+        if os.environ.get("NEMO_RL_REQUIRE_MOONCAKE") == "1":
+            raise RuntimeError(detail)
+        pytest.skip(detail)
     client = build_data_plane_client(_make_tq_cfg("mooncake_cpu"))
     yield client
     client.close()
