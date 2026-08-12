@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ import subprocess
 import sys
 from collections import Counter
 from collections.abc import AsyncGenerator
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
@@ -27,10 +28,9 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.multimodal_utils import (
-    PackedTensor,
+    attach_image_model_inputs_to_message,
     encode_images_in_examples,
-    get_dim_to_pack_along,
-    get_multimodal_keys_from_processor,
+    extract_input_image_sources_from_responses_messages,
     resolve_to_image,
     uses_image_placeholder,
 )
@@ -284,6 +284,48 @@ def _index_per_turn_images(
     return per_turn
 
 
+def _image_sources_equal(left: Any, right: Any) -> bool:
+    return (
+        left == right
+        if isinstance(left, str) and isinstance(right, str)
+        else left is right
+    )
+
+
+def _without_initial_image_sources(
+    messages: Any, initial_sources: list[Any]
+) -> tuple[Any, bool]:
+    """Copy Responses messages and remove one ordered copy of initial images."""
+    if not isinstance(messages, list):
+        return messages, False
+
+    filtered = deepcopy(messages)
+    remaining_sources = list(initial_sources)
+    for message in filtered:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+
+        filtered_content = []
+        for part in content:
+            part_sources = extract_input_image_sources_from_responses_messages(
+                [{"content": [part]}]
+            )
+            if (
+                remaining_sources
+                and len(part_sources) == 1
+                and _image_sources_equal(part_sources[0], remaining_sources[0])
+            ):
+                remaining_sources.pop(0)
+                continue
+            filtered_content.append(part)
+        message["content"] = filtered_content
+
+    return filtered, not remaining_sources
+
+
 def _attach_multimodal_data_to_user_message(
     user_message: dict,
     *,
@@ -300,52 +342,11 @@ def _attach_multimodal_data_to_user_message(
     already contains expanded ``<img>...<image>*N...</img>`` regions, and the
     processor would try to re-expand every embedded ``<image>``.
     """
-    if not images or processor is None:
-        return
-    image_token = getattr(processor, "image_token", "<image>")
-    processed = processor(
-        text=image_token * len(images),
+    attach_image_model_inputs_to_message(
+        user_message,
         images=images,
-        return_tensors="pt",
+        processor=processor,
     )
-    uses_placeholder = uses_image_placeholder(processor)
-    multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    # Historical checkpoints may emit dynamic image tiles without imgs_sizes.
-    # Mirror the media-metadata handling in vlm_hf_data_processor.
-    if (
-        uses_placeholder
-        and "pixel_values" in processed
-        and "imgs_sizes" not in processed
-        and processed["pixel_values"].ndim == 4
-    ):
-        pixel_values = processed["pixel_values"]
-        num_tiles, _, height, width = pixel_values.shape
-        processed["imgs_sizes"] = torch.tensor(
-            [[height, width]] * num_tiles, dtype=torch.long
-        )
-
-    # imgs_sizes / num_frames are not always declared in model_input_names by
-    # bundled image processors. RADIO uses temporal patching even for still
-    # images and requires one num_frames=1 entry per image/tile.
-    if "imgs_sizes" in processed and "imgs_sizes" not in multimodal_keys:
-        multimodal_keys.append("imgs_sizes")
-    if "imgs_sizes" in processed and "num_frames" not in processed:
-        processed["num_frames"] = torch.ones(
-            len(processed["imgs_sizes"]), dtype=torch.long
-        )
-    if "num_frames" in processed and "num_frames" not in multimodal_keys:
-        multimodal_keys.append("num_frames")
-    for key in multimodal_keys:
-        if key not in processed:
-            continue
-        value = processed[key]
-        if key == "imgs_sizes":
-            value = value.to(dtype=torch.int32)
-        user_message[key] = PackedTensor(
-            value,
-            dim_to_pack=get_dim_to_pack_along(processor, key),
-            pad_to_max_shape=uses_placeholder and key == "pixel_values",
-        )
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -473,6 +474,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
+        deduplicate_multimodal_data: bool = False,
     ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
         if not nemo_gym_examples:
@@ -511,7 +513,10 @@ Depending on your data shape, you may want to change these values."""
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_result, tokenizer
+                    nemo_gym_row,
+                    nemo_gym_result,
+                    tokenizer,
+                    include_initial_multimodal_data=not deduplicate_multimodal_data,
                 )
                 if _has_nan_generation_logprobs(nemo_rl_result):
                     raise RuntimeError("Generation logprobs contain NaN")
@@ -548,20 +553,73 @@ Depending on your data shape, you may want to change these values."""
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,
+        nemo_gym_row: dict,
         nemo_gym_result: dict,
         tokenizer: PreTrainedTokenizerBase,
+        *,
+        include_initial_multimodal_data: bool = True,
     ) -> dict:
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
 
         processor = getattr(self, "_processor", None)
+        response = nemo_gym_result["response"]
+        result_input = nemo_gym_result["responses_create_params"].get("input", [])
+        request_input = nemo_gym_row.get("responses_create_params", {}).get("input")
+        raw_input = (
+            request_input
+            if isinstance(request_input, list) and request_input
+            else result_input
+        )
+        initial_input = response.get("agent_input")
+        if not isinstance(initial_input, list) or not initial_input:
+            initial_input = raw_input
+
+        seed_obs = response.get("seed_obs")
+        media_messages = (
+            seed_obs if isinstance(seed_obs, list) and seed_obs else initial_input
+        )
+        raw_initial_sources = extract_input_image_sources_from_responses_messages(
+            raw_input
+        )
+        agent_initial_sources = extract_input_image_sources_from_responses_messages(
+            initial_input
+        )
+        returned_media_sources = extract_input_image_sources_from_responses_messages(
+            media_messages
+        )
+        initial_media_matches_raw_input = (
+            bool(raw_initial_sources)
+            and len(agent_initial_sources) == len(raw_initial_sources)
+            and all(
+                _image_sources_equal(agent_source, raw_source)
+                for agent_source, raw_source in zip(
+                    agent_initial_sources, raw_initial_sources
+                )
+            )
+        )
+        returned_media_matches_raw_input = len(returned_media_sources) == len(
+            raw_initial_sources
+        ) and all(
+            _image_sources_equal(returned_source, raw_source)
+            for returned_source, raw_source in zip(
+                returned_media_sources, raw_initial_sources
+            )
+        )
+        initial_multimodal_data_omitted = (
+            not include_initial_multimodal_data
+            and initial_media_matches_raw_input
+            and returned_media_matches_raw_input
+        )
+        if initial_multimodal_data_omitted:
+            media_messages, _ = _without_initial_image_sources(
+                media_messages, raw_initial_sources
+            )
         per_turn_images = (
             _index_per_turn_images(
-                nemo_gym_result["response"]["output"],
-                input_messages=nemo_gym_result.get("responses_create_params", {}).get(
-                    "input"
-                ),
+                response["output"],
+                input_messages=media_messages,
             )
             if processor is not None
             else []
@@ -736,11 +794,25 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 f"  → If (2): inspect why no assistant content was produced for this rollout."
             )
 
-        return {
+        if initial_multimodal_data_omitted:
+            for container, key in (
+                (nemo_gym_result["responses_create_params"], "input"),
+                (response, "agent_input"),
+                (response, "seed_obs"),
+            ):
+                if key in container:
+                    container[key], _ = _without_initial_image_sources(
+                        container[key], raw_initial_sources
+                    )
+
+        result = {
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
         }
+        if not include_initial_multimodal_data:
+            result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
+        return result
 
     def shutdown(self) -> None:
         self.rh.shutdown()

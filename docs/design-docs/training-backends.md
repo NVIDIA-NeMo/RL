@@ -32,6 +32,31 @@ To enable Megatron-based training:
 
 _Note_: When using Megatron, the optimizer and learning rate schedule are configured through `policy.megatron_cfg.optimizer` and `policy.megatron_cfg.scheduler`, respectively.
 
+Model-provider options that do not have a dedicated NeMo RL config field can be
+passed directly to the Megatron Bridge model config through
+`policy.megatron_cfg.model_overrides`:
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true
+    model_overrides:
+      masked_softmax_fusion: false
+```
+
+NeMo RL merges these values into a newly constructed model provider before
+Megatron Bridge finalizes or instantiates it. That provider is also the model
+config persisted in checkpoint `run_config.yaml` files. Unknown provider fields
+fail during setup with their full config path.
+
+`model_overrides` is only for model-provider fields without a first-class NeMo
+RL setting. A key that duplicates another `megatron_cfg` field is rejected; set
+the first-class field directly instead. Valid fields, values, and nesting are
+defined by the provider in the installed Megatron Bridge version. Nested
+dictionaries follow the hierarchy of nested model-config objects. NeMo
+RL-specific settings such as optimizer, scheduler, checkpointing, and
+environment variables remain under their existing `megatron_cfg` sections.
+
 ### DTensor Backend
 To enable DTensor (FSDP2) training:
 
