@@ -295,6 +295,7 @@ project-includes = [
   "nemo_rl/models/value/__init__.py",
   "nemo_rl/models/value/config.py",
   "nemo_rl/models/value/tq_value.py",
+  "nemo_rl/models/value/utils.py",
   "nemo_rl/models/value/workers/__init__.py",
   "nemo_rl/telemetry/__init__.py",
   "nemo_rl/telemetry/config.py",
