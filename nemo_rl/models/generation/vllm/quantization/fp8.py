@@ -84,7 +84,6 @@ fp8_state: FP8State = FP8State()
 
 fp8_patches_applied = False
 
-
 original_run_engine_core = EngineCoreProc.run_engine_core
 original_init = CoreEngineProcManager.__init__
 
@@ -294,10 +293,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         )
     global_fp8_config = FP8Config(**fp8_config_kwargs)
 
+    # Preserve checkpoint scale metadata below and let vLLM select its
+    # architecture-specific DeepGEMM scale format.
     if vllm_cfg.get("use_deep_gemm", False) and not is_mx:
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-        # Preserve checkpoint scale metadata below and let vLLM select its
-        # architecture-specific DeepGEMM scale format.
 
     if vllm_cfg["async_engine"]:
         EngineCoreProc.run_engine_core = my_run_engine_core
@@ -460,14 +459,16 @@ _DEEPSEEK_V4_PACKED_MODULES = {
 def _get_module_from_param_name(
     model: torch.nn.Module, name: str
 ) -> torch.nn.Module | None:
-    # vLLM 0.25 mappers can also contain regex and suffix rules, which the
-    # component-wise compatibility path below does not cover.
-    mapper = getattr(model, "hf_to_vllm_mapper", None)
-    if mapper is not None and hasattr(mapper, "apply_list"):
-        mapped_names = mapper.apply_list([name])
-        if not mapped_names:
-            return None
-        name = mapped_names[0]
+    is_dsv4 = is_deepseek_v4_model(model)
+    if is_dsv4:
+        # DeepSeek V4 uses regex and suffix mappings that the base
+        # component-wise compatibility path below does not cover.
+        mapper = getattr(model, "hf_to_vllm_mapper", None)
+        if mapper is not None and hasattr(mapper, "apply_list"):
+            mapped_names = mapper.apply_list([name])
+            if not mapped_names:
+                return None
+            name = mapped_names[0]
 
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
     # The module path is all but the last part (the parameter's own name)
@@ -486,7 +487,7 @@ def _get_module_from_param_name(
     # DeepSeek V4 defines these multi-component fusions in load_weights rather
     # than packed_modules_mapping, so the base last-component lookup cannot
     # resolve them.
-    if is_deepseek_v4_model(model):
+    if is_dsv4:
         for fused_name, original_names in _DEEPSEEK_V4_PACKED_MODULES.items():
             for original_name in original_names:
                 original_path = original_name.split(".")
@@ -619,6 +620,7 @@ def get_quantized_weight_iterator(
     ensure_fp8_patches_applied(model_runner)
     fp8_config = _resolve_fp8_config(model_runner)
     model = model_runner.model
+
     for k, v in weights:
         # vLLM's layerwise loader retains every source tensor until the whole
         # RoutedExperts module is ready. Under EP, buffering experts owned by
@@ -732,6 +734,7 @@ def cast_tensor_to_fp8_blockwise(
     # Calculate descale factor
     descale = max_abs / max_dtype
 
+    global global_fp8_config
     if global_fp8_config.use_weight_pow2_scale:
         exponent = torch.ceil(torch.log2(descale))
         # Post process exponent to be in range of -127 to 127 and to be E8M0 biased
@@ -941,8 +944,6 @@ def prepare_deepseek_v4_routed_experts_for_refit(model: torch.nn.Module) -> None
         # MoE parameter is ready. These tensors instead remain materialized so
         # RoutedExperts.weight_loader can copy each local expert immediately.
         SKIP_TENSORS.update(layer._parameters)
-        SKIP_TENSORS.update(layer._buffers)
-        layer._nrl_immediate_refit = True
 
     _reset_fp8_routed_experts_for_refit(model)
 
@@ -951,9 +952,9 @@ def prepare_deepseek_v4_routed_experts_for_refit(model: torch.nn.Module) -> None
 def finalize_deepseek_v4_routed_experts_refit(model: torch.nn.Module) -> None:
     """Convert immediately loaded expert tensors back to their kernel layout."""
     for layer in model.modules():
-        if not isinstance(layer, RoutedExperts) or not getattr(
-            layer, "_nrl_immediate_refit", False
-        ):
+        if not isinstance(layer, RoutedExperts):
+            continue
+        if getattr(layer, "weight_block_size", None) is None:
             continue
         layer.quant_method.process_weights_after_loading(layer)
         if layer.w13_weight.is_cuda:
@@ -1026,22 +1027,8 @@ def process_weights_after_loading(self, layer) -> None:
     # "CUDA Error: out of memory at csrc/cumem_allocator.cpp" ~75 steps
     # into fp8-rollouts runs). The first call may change shapes (layout
     # transforms), so fall back to rebinding then.
-    if (
-        layer.weight.data.shape == weight.shape
-        and layer.weight.data.dtype == weight.dtype
-    ):
-        if layer.weight.data.data_ptr() != weight.data_ptr():
-            layer.weight.data.copy_(weight)
-    else:
-        layer.weight.data = weight.data
-    if (
-        layer.weight_scale_inv.data.shape == weight_scale.shape
-        and layer.weight_scale_inv.data.dtype == weight_scale.dtype
-    ):
-        if layer.weight_scale_inv.data.data_ptr() != weight_scale.data_ptr():
-            layer.weight_scale_inv.data.copy_(weight_scale)
-    else:
-        layer.weight_scale_inv.data = weight_scale.data
+    _assign_param_data(layer.weight, weight.data)
+    _assign_param_data(layer.weight_scale_inv, weight_scale.data)
 
     maybe_post_process_fp8_weight_block(layer)
 
@@ -1246,9 +1233,8 @@ def create_weights_mxfp8_moe(
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
 
-    Compared to the original process_weights_after_loading in vllm, we use .copy_() instead of
-    replace_parameter() to avoid creating new torch.nn.Parameter objects, because that removes
-    the weight_loader attribute which we need for refit.
+    Compared to vLLM, processed values are copied into compatible Parameters to
+    preserve their identity and storage across refits.
 
     Updated for vLLM 0.25 which passes a RoutedExperts module as `layer` and
     sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=..., layer=...).
