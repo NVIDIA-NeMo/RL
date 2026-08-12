@@ -64,17 +64,16 @@ def _build_reasoning_parser(
     *,
     reasoning_at_start: bool = False,
 ) -> Any:
-    from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+    from tensorrt_llm.llmapi.reasoning_parser import (
+        DeepSeekR1Parser,
+        ReasoningParserFactory,
+    )
 
-    if name == "deepseek-r1":
-        from tensorrt_llm.llmapi.reasoning_parser import DeepSeekR1Parser
-
-        return DeepSeekR1Parser(
-            reasoning_at_start=reasoning_at_start,
-            chat_template_kwargs=chat_template_kwargs,
-        )
-
-    return ReasoningParserFactory.create_reasoning_parser(name, chat_template_kwargs)
+    parser = ReasoningParserFactory.create_reasoning_parser(name, chat_template_kwargs)
+    if isinstance(parser, DeepSeekR1Parser):
+        parser.reasoning_at_start = reasoning_at_start
+        parser.in_reasoning = reasoning_at_start
+    return parser
 
 
 def _build_sampling_params(
@@ -137,21 +136,9 @@ def create_app(
         **(default_chat_template_kwargs or {}),
     }
 
-    # Cache tokenized reasoning markers outside the request path.
-    _reasoning_start_suffixes: tuple[tuple[int, ...], ...] = ()
-    if reasoning_parser == "deepseek-r1":
-        _reasoning_start_suffixes = tuple(
-            tuple(tokenizer.encode(text, add_special_tokens=False))
-            for text in (
-                "<think>",
-                "<think>\n",
-                "<think>\n\n",
-                "<think> ",
-                "<think> \n",
-                "<think>\r\n",
-                "<think>\t",
-            )
-        )
+    def _prompt_opens_reasoning(token_ids: list[int]) -> bool:
+        tail = tokenizer.decode(token_ids[-16:], skip_special_tokens=False)
+        return tail.rstrip().endswith("<think>")
 
     # Use the configured parser or infer one from the model config.
     _tool_parser_name = _resolve_tool_parser_name(tool_parser, model_name)
@@ -259,9 +246,9 @@ def create_app(
         )
 
         # Infer parser state from the exact engine prompt.
-        reasoning_at_start = bool(
-            _reasoning_start_suffixes
-        ) and _ends_with_token_suffix(adj_prompt, _reasoning_start_suffixes)
+        reasoning_at_start = reasoning_parser is not None and _prompt_opens_reasoning(
+            adj_prompt
+        )
         _active_reasoning_parser = (
             _build_reasoning_parser(
                 reasoning_parser,

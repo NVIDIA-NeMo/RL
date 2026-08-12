@@ -28,20 +28,20 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from tests.unit.models.generation.chat_template_parity_common import (
-    GENERATION_TOKEN_IDS_FIELD,
     FOLLOWUP_USER_MSG,
+    GENERATION_TOKEN_IDS_FIELD,
     MODEL,
     MODEL_REVISION,
     PARSER_SCENARIOS,
     REASONING_PARSER_CONTRACT_CASES,
     TOOL_CALL_ID,
     TOOL_DEF,
-    TOOL_RESULT,
     TOOL_PARSER_CONTRACT_CASES,
+    TOOL_RESULT,
     USER_MSG,
     inclusive_token_span,
-    token_edit_similarity,
     prompt_suffix_after_turn,
+    token_edit_similarity,
 )
 
 pytestmark = pytest.mark.vllm
@@ -286,6 +286,7 @@ def _parse_with_vllm(
     raw_output: str,
     reasoning_parser: str | None,
     enable_thinking: bool,
+    reasoning_at_start: bool = False,
 ) -> dict[str, Any]:
     worker_idx = gen.worker_group.get_dp_leader_worker_idx(0)
     result_ref = gen.worker_group.run_single_worker_single_data(
@@ -296,14 +297,16 @@ def _parse_with_vllm(
         tool_parser="hermes",
         tools=[TOOL_DEF],
         enable_thinking=enable_thinking,
+        reasoning_at_start=reasoning_at_start,
     )
     return ray.get(result_ref)
 
 
-def test_parser_contracts(
+def test_parity(
     vllm_server: tuple[str, str, list[int], list[int], VllmGeneration],
 ) -> None:
-    reasoning_parser, _, _, _, gen = vllm_server
+    reasoning_parser, base_url, tool_call_start, tool_call_end, gen = vllm_server
+    golden = _load_golden(reasoning_parser)
 
     for case in REASONING_PARSER_CONTRACT_CASES:
         actual = _parse_with_vllm(
@@ -311,6 +314,7 @@ def test_parser_contracts(
             raw_output=case["raw_output"],
             reasoning_parser=reasoning_parser,
             enable_thinking=case["enable_thinking"],
+            reasoning_at_start=case["reasoning_at_start"],
         )
         assert actual == case["expected"], "vLLM %s reasoning contract %r failed" % (
             reasoning_parser,
@@ -333,13 +337,6 @@ def test_parser_contracts(
             assert actual_norm == case["expected"], (
                 "vLLM Hermes tool contract %r failed" % case["name"]
             )
-
-
-def test_parity(
-    vllm_server: tuple[str, str, list[int], list[int], VllmGeneration],
-) -> None:
-    reasoning_parser, base_url, tool_call_start, tool_call_end, _ = vllm_server
-    golden = _load_golden(reasoning_parser)
 
     suffix_mismatches = []
     for scenario_name, enable_thinking in PARSER_SCENARIOS[reasoning_parser]:

@@ -331,6 +331,7 @@ class VllmAsyncGenerationWorkerImpl(
         tool_parser: str | None,
         tools: list[dict[str, Any]] | None,
         enable_thinking: bool,
+        reasoning_at_start: bool = False,
     ) -> dict[str, Any]:
         """Run parser parity cases in the vLLM worker environment."""
         import json
@@ -352,9 +353,11 @@ class VllmAsyncGenerationWorkerImpl(
         content: str | None = raw_output
 
         if reasoning_parser is not None:
+            # Restore the prompt-injected opening tag for parser input.
+            parser_input = "<think>" + raw_output if reasoning_at_start else raw_output
             parser_type = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
             parser = parser_type(tokenizer)
-            reasoning_content, content = parser.extract_reasoning(raw_output, request)
+            reasoning_content, content = parser.extract_reasoning(parser_input, request)
             reasoning_content = reasoning_content or ""
 
         normalized_calls: list[dict[str, Any]] = []
