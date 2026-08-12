@@ -544,6 +544,10 @@ def apply_group_length_adjustments(
     # Phase 3: apply additive adjustments and record GDPO reward features
     additive_base_rewards = [0.0] * n
     for i, r in enumerate(results):
+        # The profiled-length penalty stacks only on rollouts whose group
+        # adjustments are non-negative: a rollout already penalized by the
+        # group-relative channels should not be double-penalized for the same
+        # excess length.
         profiled_adj = all_profiled_length_adj[i] if all_adjustments[i] >= 0 else 0.0
         additive_delta = all_adjustments[i] + profiled_adj
         additive_base_rewards[i] = original_rewards[i] + additive_delta

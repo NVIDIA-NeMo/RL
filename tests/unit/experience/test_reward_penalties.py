@@ -888,6 +888,38 @@ class TestGdpoThinkCountFeature:
         assert entry["reward"] == -1.0
         assert entry["num_close_think_tags"] == 2
 
+    def test_unconfigured_token_id_is_neutral_without_text(self):
+        # No think_close token id configured, no tokenizer, no generation
+        # text: counting is impossible, so the feature must stay neutral
+        # (count=1 -> delta=0) instead of guessing a token id.
+        result = _make_result(
+            message_log=[
+                _msg("user", [100, 12]),
+                _msg("assistant", [300, 13, 400, 13]),
+            ]
+        )
+        _record_gdpo_think_count_features([result], {})
+        entry = result["full_result"]["gdpo_reward_features"]["think_count_delta"]
+        assert entry["reward"] == 0.0
+        assert entry["count_source"] == "unavailable"
+
+    def test_unconfigured_token_id_uses_generation_str(self):
+        # Without a configured token id the generation string count is used
+        # alone (token ids of other tokenizers must not leak into the count).
+        result = _make_result(
+            output_items=[
+                _message_item("answer", generation_str="a </think> b")
+            ],
+            message_log=[
+                _msg("user", [100, 12]),
+                _msg("assistant", [300, 13, 400, 13]),
+            ],
+        )
+        _record_gdpo_think_count_features([result], {})
+        entry = result["full_result"]["gdpo_reward_features"]["think_count_delta"]
+        assert entry["reward"] == 0.0
+        assert entry["num_close_think_tags"] == 1
+
     def test_generic_gdpo_feature_metrics(self):
         r1 = _make_result()
         r1["full_result"]["gdpo_reward_features"] = {
