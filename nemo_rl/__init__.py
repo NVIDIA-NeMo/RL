@@ -305,7 +305,7 @@ def patch_transformers_module_dir(env_vars: dict[str, str]):
     # Updating PYTHONPATH only affects interpreters started after this process.
     # Ray actors may import NeMo RL before unpickling trust_remote_code objects,
     # so make the dynamic module package importable in the current interpreter.
-    if env_vars is os.environ:
+    if apply_to_current_interpreter:
         while module_dir in sys.path:
             sys.path.remove(module_dir)
         sys.path.insert(0, module_dir)
