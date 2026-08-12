@@ -479,6 +479,10 @@ def load_weights(weights, model_runner):
                 and experts_module.w13_weight.dtype == torch.float8_e4m3fn
                 and experts_module.w2_weight.dtype == torch.float8_e4m3fn
             ):
+                if global_fp8_config.is_mx:
+                    raise NotImplementedError(
+                        "MXFP8 refit does not support grouped MoE expert weights."
+                    )
                 weights_quantized.extend(_expand_grouped_moe_expert_to_fp8(k, v))
             else:
                 weights_quantized.append((k, v))

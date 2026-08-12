@@ -594,7 +594,9 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(fp8_module, monkeyp
     import torch
 
     fp8 = fp8_module
-    fp8.global_fp8_config = types.SimpleNamespace(use_weight_pow2_scale=False)
+    fp8.global_fp8_config = types.SimpleNamespace(
+        use_weight_pow2_scale=False, is_mx=False
+    )
     model = _grouped_expert_model(fp8, monkeypatch, torch.float8_e4m3fn)
     loaded = []
     model.load_weights = lambda pairs: loaded.extend(pairs)
