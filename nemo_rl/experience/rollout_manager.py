@@ -653,9 +653,24 @@ class RolloutManager:
         assert self._tq_buffer is not None, (
             "generate_and_push requires tq_buffer to be set at __init__"
         )
+
+        # Pull identity for eviction bookkeeping. Best-effort: unknown/-1 if absent.
+        instance_id = "unknown"
+        prompt_idx = -1
+        try:
+            extra_env_info = input_sample.get("extra_env_info") or {}
+            if isinstance(extra_env_info, dict):
+                instance_id = str(extra_env_info.get("instance_id", "unknown"))
+            prompt_idx = int(input_sample.get("idx", -1))
+        except Exception:
+            pass
+
         start_version = self._weight_version
         group_id = self._tq_buffer.reserve(
-            weight_version=start_version, target_step=target_step
+            weight_version=start_version,
+            target_step=target_step,
+            instance_id=instance_id,
+            prompt_idx=prompt_idx,
         )
 
         record = await self.run_rollout(input_sample)

@@ -410,6 +410,7 @@ class SingleControllerActor:
             step_open = False
             # Observability accumulators for this training step.
             evicted_this_step = 0
+            evicted_tokens_this_step = 0
             step_staleness: list[int] = []
 
             with self._timer.time("total_step_time"):
@@ -419,10 +420,11 @@ class SingleControllerActor:
                         await asyncio.sleep(0)
 
                         # Evict stale groups
-                        evicted = await self._sampler.evict(
+                        evicted, evicted_tokens = await self._sampler.evict(
                             current_train_weight=self._trainer_version,
                         )
                         evicted_this_step += evicted
+                        evicted_tokens_this_step += evicted_tokens
                         if evicted:
                             print(
                                 f"  evicted {evicted} stale prompt group(s)",
@@ -552,6 +554,9 @@ class SingleControllerActor:
                     step_metrics["sample_staleness/max"] = float(max(step_staleness))
                     step_metrics["sample_staleness/min"] = float(min(step_staleness))
                 step_metrics["evicted_groups"] = float(evicted_this_step)
+                # Total tokens in evicted groups; counts only ready (committed)
+                # groups — pre-commit evictions carry no token metadata.
+                step_metrics["evicted_tokens"] = float(evicted_tokens_this_step)
 
                 self._trainer_version += 1
                 self._train_steps += 1

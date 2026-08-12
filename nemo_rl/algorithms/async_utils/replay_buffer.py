@@ -581,6 +581,9 @@ class TQReplayBuffer:
         self.target_step_list: list[Optional[int]] = []
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
+        # Per-slot bookkeeping for eviction logs; unused by scheduling logic.
+        self.instance_id_list: list[str] = []
+        self.prompt_idx_list: list[int] = []
 
     def reserve(
         self,
@@ -588,6 +591,8 @@ class TQReplayBuffer:
         weight_version: int,
         target_step: Optional[int] = None,
         group_id: Optional[str] = None,
+        instance_id: str = "unknown",
+        prompt_idx: int = -1,
     ) -> str:
         """Append an unready slot tagged with weight_version.
 
@@ -595,6 +600,8 @@ class TQReplayBuffer:
             weight_version: Weight version stamped on the slot.
             target_step: Training step this slot targets; only consulted by StalenessSampler.force_in_order.
             group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
+            instance_id: Optional identifier for eviction logging (SWE-bench instance, task name, etc.).
+            prompt_idx: Optional dataloader index for eviction logging.
 
         Returns:
             group_id used by the matching commit.
@@ -607,6 +614,8 @@ class TQReplayBuffer:
         self.target_step_list.append(target_step)
         self.ready_list.append(False)
         self._group_ids.append(group_id)
+        self.instance_id_list.append(instance_id)
+        self.prompt_idx_list.append(prompt_idx)
         return group_id
 
     async def commit(
@@ -632,8 +641,25 @@ class TQReplayBuffer:
             ValueError: group_id has no live slot (removed or never reserved).
         """
         train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
-        sample_ids, fields, tags = pack_payload(
-            train_batch, weight_version=start_weight_version, group_id=group_id
+
+        # Per-row failure attribution stamped into TQ tags so downstream
+        # consumers (StalenessSampler.evict, advantage_pump, dashboards) can
+        # read it without touching Gym's on-disk JSON.
+        from nemo_rl.experience.payload import (
+            compute_failure_reasons_from_record,
+            pack_payload as _pack_payload,
+        )
+        reasons, resolved_flags = compute_failure_reasons_from_record(record)
+        extra_tags = [
+            {"failure_reason": reasons[i], "resolved": bool(resolved_flags[i])}
+            for i in range(len(reasons))
+        ]
+
+        sample_ids, fields, tags = _pack_payload(
+            train_batch,
+            weight_version=start_weight_version,
+            group_id=group_id,
+            extra_tags=extra_tags,
         )
         await self._call_dp(
             "put_samples",
@@ -654,7 +680,38 @@ class TQReplayBuffer:
             tags=[dict(t) for t in tags],
         )
 
-        idx = self._group_ids.index(group_id)
+        # Detect the "slot was evicted while we were still running" race.
+        # Log full rollout details so a human can attribute WHY it was slow,
+        # then clean up the put_samples rows we just orphaned in TQ.
+        try:
+            idx = self._group_ids.index(group_id)
+        except ValueError:
+            per_row_tokens = [int(x) for x in lengths.tolist()]
+            total_tokens = int(lengths.sum())
+            n = len(sample_ids)
+            resolved_int = [int(bool(x)) for x in resolved_flags]
+            resolved_count = sum(resolved_int)
+            print(
+                f"[EVICT_LATE_COMMIT] "
+                f"group_id={group_id} "
+                f"start_v={start_weight_version} "
+                f"end_v={end_weight_version} "
+                f"ready=True "
+                f"num_rows={n} "
+                f"resolved_count={resolved_count}/{n} "
+                f"per_row_reasons={reasons} "
+                f"per_row_resolved={resolved_int} "
+                f"per_row_tokens={per_row_tokens} "
+                f"total_tokens={total_tokens}",
+                flush=True,
+            )
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=list(sample_ids),
+                partition_id=self._partition_id,
+            )
+            raise
+
         self.meta_list[idx] = meta
         self.end_weight_list[idx] = end_weight_version
         self.ready_list[idx] = True
@@ -691,6 +748,10 @@ class TQReplayBuffer:
             del self.target_step_list[i]
             del self.ready_list[i]
             del self._group_ids[i]
+            if self.instance_id_list:
+                del self.instance_id_list[i]
+            if self.prompt_idx_list:
+                del self.prompt_idx_list[i]
 
         if remove_in_dp:
             await self._call_dp(

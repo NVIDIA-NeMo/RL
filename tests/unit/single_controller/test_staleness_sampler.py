@@ -33,6 +33,8 @@ class FakeBuffer:
         self.start_weight_list: list[int] = []
         self.end_weight_list: list[int] = []
         self.ready_list: list[bool] = []
+        self.target_step_list: list[int | None] = []
+        self._group_ids: list[str] = []
         self.remove_calls: list[tuple[list[int], bool]] = []
 
     def add(
@@ -42,18 +44,24 @@ class FakeBuffer:
         group_size: int = 1,
         ready: bool = True,
         end_weight: int | None = None,
+        seq_len: int | None = None,
     ) -> KVBatchMeta:
         sample_ids = [f"{group_id}_g{i}" for i in range(group_size)]
         meta = KVBatchMeta(
             partition_id=self._partition_id,
             task_name=None,
             sample_ids=sample_ids,
+            sequence_lengths=(
+                [seq_len] * group_size if seq_len is not None else None
+            ),
             tags=[{"weight_version": weight, "group_id": group_id}] * group_size,
         )
         self.meta_list.append(meta if ready else None)
         self.start_weight_list.append(weight)
         self.end_weight_list.append(weight if end_weight is None else end_weight)
         self.ready_list.append(ready)
+        self.target_step_list.append(None)
+        self._group_ids.append(group_id)
         return meta
 
     async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
@@ -63,6 +71,8 @@ class FakeBuffer:
             del self.start_weight_list[i]
             del self.end_weight_list[i]
             del self.ready_list[i]
+            del self.target_step_list[i]
+            del self._group_ids[i]
         return len(idxs)
 
 
@@ -306,7 +316,7 @@ class TestStalenessSamplerEvict:
             buf.add(f"g{i}", weight=w)
         sampler = StalenessSampler(buf, max_staleness_versions=1)
 
-        dropped = _run(sampler.evict(current_train_weight=5))
+        dropped, _tokens = _run(sampler.evict(current_train_weight=5))
 
         assert dropped == 3
         assert buf.start_weight_list == [4, 5]
@@ -319,7 +329,7 @@ class TestStalenessSamplerEvict:
             buf.add(f"v{w}", weight=w)
         sampler = StalenessSampler(buf, max_staleness_versions=1)
 
-        assert _run(sampler.evict(current_train_weight=5)) == 0
+        assert _run(sampler.evict(current_train_weight=5)) == (0, 0)
         assert buf.remove_calls == []
 
     def test_evict_keeps_future_groups(self):
@@ -327,7 +337,7 @@ class TestStalenessSamplerEvict:
         buf.add("future", weight=7)
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
-        assert _run(sampler.evict(current_train_weight=5)) == 0
+        assert _run(sampler.evict(current_train_weight=5)) == (0, 0)
         assert buf.start_weight_list == [7]
 
     def test_evict_drops_whole_group(self):
@@ -336,12 +346,28 @@ class TestStalenessSamplerEvict:
         buf.add("fresh", weight=5, group_size=4)
         sampler = StalenessSampler(buf, max_staleness_versions=1)
 
-        dropped = _run(sampler.evict(current_train_weight=5))
+        dropped, _tokens = _run(sampler.evict(current_train_weight=5))
 
         assert dropped == 1
         assert buf.remove_calls == [([0], True)]
         assert buf.start_weight_list == [5]
         assert [m.sample_ids[0] for m in buf.meta_list] == ["fresh_g0"]
+
+    def test_evict_sums_tokens_of_ready_groups_only(self):
+        buf = FakeBuffer()
+        # Two stale groups: one ready (has sequence_lengths), one still
+        # in-flight (meta is None, no token metadata). Only the ready group's
+        # tokens count toward the total.
+        buf.add("stale_ready", weight=1, group_size=2, ready=True, seq_len=100)
+        buf.add("stale_inflight", weight=1, group_size=2, ready=False)
+        buf.add("fresh", weight=5, group_size=1, ready=True, seq_len=999)
+        sampler = StalenessSampler(buf, max_staleness_versions=1)
+
+        dropped, tokens = _run(sampler.evict(current_train_weight=5))
+
+        assert dropped == 2
+        # Only the ready stale group contributes: 2 rows * 100 tokens.
+        assert tokens == 200
 
 
 class TestStalenessSamplerInit:

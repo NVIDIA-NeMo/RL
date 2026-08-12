@@ -18,6 +18,88 @@ from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data_plane import KVBatchMeta
 
 
+def _emit_group_log(
+    tag: str,
+    buffer: TQReplayBuffer,
+    idx: int,
+    current_train_weight: int,
+    *,
+    ready: bool | None = None,
+) -> int | None:
+    """Print one ``[tag]`` line describing the group at ``buffer`` index ``idx``.
+
+    Shared by evict (``[EVICT]``) and select (``[SELECT]``) so their per-group
+    logs share one format for downstream parsing. Fields:
+      group_id / instance_id / prompt_idx — identity
+      start_v / end_v / target_step / train_v / lag — timing
+      ready — commit-before-eviction flag (evict only; omitted when None)
+      num_rows / resolved_count — group-level pass/fail summary
+      per_row_reasons / per_row_resolved — per-rollout attribution
+      per_row_tokens / total_tokens — per-row token lengths (ready groups only)
+
+    Args:
+        tag: Log marker, "EVICT" or "SELECT".
+        buffer: The replay buffer holding the group's metadata.
+        idx: Index of the group within the buffer's parallel lists.
+        current_train_weight: Current trainer weight version (for lag).
+        ready: When not None, adds a ``ready=`` field. Evict passes the slot's
+            ready flag; select omits it since every selected group is ready.
+
+    Returns:
+        The group's total token count (sum of per-row lengths) when known, else
+        None — evict uses it to accumulate evicted-token totals.
+    """
+    meta = buffer.meta_list[idx]
+    start_v = buffer.start_weight_list[idx]
+    end_v = buffer.end_weight_list[idx]
+    target_step = buffer.target_step_list[idx]
+    group_id = buffer._group_ids[idx]
+    instance_id = (
+        buffer.instance_id_list[idx]
+        if getattr(buffer, "instance_id_list", None)
+        else "unknown"
+    )
+    prompt_idx = (
+        buffer.prompt_idx_list[idx]
+        if getattr(buffer, "prompt_idx_list", None)
+        else -1
+    )
+    lag = current_train_weight - start_v
+    if meta and meta.tags:
+        per_row_reasons = [t.get("failure_reason", "?") for t in meta.tags]
+        per_row_resolved = [int(bool(t.get("resolved", False))) for t in meta.tags]
+    else:
+        per_row_reasons = None
+        per_row_resolved = None
+    per_row_tokens = (
+        list(meta.sequence_lengths) if meta and meta.sequence_lengths else None
+    )
+    total_tokens = sum(per_row_tokens) if per_row_tokens else None
+    num_rows = len(meta.sample_ids) if meta else None
+    resolved_count = sum(per_row_resolved) if per_row_resolved else None
+    ready_field = f"ready={ready} " if ready is not None else ""
+    print(
+        f"[{tag}] "
+        f"group_id={group_id} "
+        f"instance_id={instance_id} "
+        f"prompt_idx={prompt_idx} "
+        f"start_v={start_v} "
+        f"end_v={end_v} "
+        f"target_step={target_step} "
+        f"train_v={current_train_weight} "
+        f"lag={lag} "
+        f"{ready_field}"
+        f"num_rows={num_rows} "
+        f"resolved_count={resolved_count}/{num_rows if num_rows is not None else '?'} "
+        f"per_row_reasons={per_row_reasons} "
+        f"per_row_resolved={per_row_resolved} "
+        f"per_row_tokens={per_row_tokens} "
+        f"total_tokens={total_tokens}",
+        flush=True,
+    )
+    return total_tokens
+
+
 class StalenessSampler:
     """Pick complete prompt groups from a TQReplayBuffer.
 
@@ -130,6 +212,13 @@ class StalenessSampler:
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
 
+        # Per-group [SELECT] log (same format as [EVICT], no ready field since all
+        # selected groups are ready) so downstream analysis can compare the token
+        # lengths of ACCEPTED rollouts against evicted ones. Emitted before the
+        # drop, while the buffer indices are still valid.
+        for i in selected_idxs:
+            _emit_group_log("SELECT", self._buffer, i, current_train_weight)
+
         await self._buffer.remove(selected_idxs, remove_in_dp=False)
 
         return (
@@ -137,7 +226,7 @@ class StalenessSampler:
             len(selected_idxs),
         )
 
-    async def evict(self, *, current_train_weight: int) -> int:
+    async def evict(self, *, current_train_weight: int) -> tuple[int, int]:
         """Drop groups whose weight falls below the staleness window.
 
         Future entries (weight > current_train_weight) are left alone.
@@ -147,7 +236,10 @@ class StalenessSampler:
                 weight < current_train_weight - max_staleness_versions are dropped.
 
         Returns:
-            Number of group entries removed from the buffer.
+            (num_groups_removed, total_evicted_tokens). The token total counts
+            only ready (committed) groups, whose ``meta.sequence_lengths`` is
+            populated; groups evicted before their rollout committed have no
+            token metadata and contribute 0.
         """
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         stale_idxs = [
@@ -156,5 +248,21 @@ class StalenessSampler:
             if weight < min_valid_version
         ]
         if not stale_idxs:
-            return 0
-        return await self._buffer.remove(stale_idxs, remove_in_dp=True)
+            return 0, 0
+
+        # Per-group [EVICT] log; token totals accumulate over ready slots only
+        # (unready slots were evicted before commit and carry no token metadata).
+        evicted_tokens = 0
+        for i in stale_idxs:
+            total_tokens = _emit_group_log(
+                "EVICT",
+                self._buffer,
+                i,
+                current_train_weight,
+                ready=self._buffer.ready_list[i],
+            )
+            if total_tokens:
+                evicted_tokens += total_tokens
+
+        num_removed = await self._buffer.remove(stale_idxs, remove_in_dp=True)
+        return num_removed, evicted_tokens
