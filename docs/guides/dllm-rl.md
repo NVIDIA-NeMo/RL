@@ -2,7 +2,8 @@
 
 NeMo RL can train masked diffusion language models (dLLMs) such as
 [LLaDA](https://github.com/ML-GSAI/LLaDA) with GRPO. This implements the setup of
-[GDPO: Group Diffusion Policy Optimization](https://arxiv.org/abs/2510.08554).
+[GDPO](https://openreview.net/forum?id=JaqvespRBP), *Improving Reasoning for
+Diffusion Language Models via Group Diffusion Policy Optimization* (ICLR 2026).
 
 ```{note}
 This is unrelated to `grpo.adv_estimator.name = "gdpo"`, which is the
@@ -76,8 +77,10 @@ of *generation* on top of that.
 `policy.dllm.p_mask_prompt` corrupts prompt tokens as a regularizer. Leave it at
 `0.0` to reproduce GDPO: its SDMC estimator masks only completion positions, so
 the setting is inert there despite appearing in the published configs, where it
-is inherited from the d1/diffu-GRPO trainer. Corrupted prompt positions are
-never scored.
+is inherited from the [d1](https://github.com/dllm-reasoning/d1) *diffu*-GRPO
+trainer that GDPO builds on. d1's one-shot estimator does use it, dividing the
+loss at each position by that position's masking probability. Corrupted prompt
+positions are never scored here.
 
 ### Mask token
 
@@ -147,3 +150,24 @@ train against the wrong likelihood:
 | `dtensor_cfg.context_parallel_size > 1` | Shards the sequence, but the ELBO masks positions across the whole sequence. |
 | `logprob_batch_size != train_micro_batch_size` | Masks are drawn from a seeded generator over the microbatch shape, so differing sizes would compare ELBOs taken at different masks. |
 | Autoregressive generation backends | The ELBO path needs the in-worker denoiser. SGLang can serve LLaDA2.0 and SDAR for inference, but wiring that into RL rollouts is not implemented yet. |
+
+## References
+
+- **GDPO** — Rojas, Lin, Rasul, Schneider, Nevmyvaka, Tao and Deng, *Improving
+  Reasoning for Diffusion Language Models via Group Diffusion Policy
+  Optimization*, ICLR 2026.
+  [paper](https://openreview.net/forum?id=JaqvespRBP) ·
+  [arXiv:2510.08554](https://arxiv.org/abs/2510.08554) ·
+  [code](https://github.com/KevinRojas1499/GDPO).
+  The SDMC ELBO estimator and the sequence-level objective implemented here.
+- **d1** — Zhao, Gupta, Zheng and Grover, *d1: Scaling Reasoning in Diffusion
+  Large Language Models via Reinforcement Learning*, NeurIPS 2025.
+  [paper](https://openreview.net/forum?id=7ZVRlBFuEv) ·
+  [code](https://github.com/dllm-reasoning/d1).
+  Introduced *diffu*-GRPO and the prompt-masking regularizer; GDPO builds on its
+  trainer, which is why some of its config keys survive into GDPO's recipes.
+- **LLaDA** — [code](https://github.com/ML-GSAI/LLaDA). The block-wise
+  denoising sampler and the low-confidence remasking rule.
+- **Dr.GRPO** — Liu et al., *Understanding R1-Zero-Like Training: A Critical
+  Perspective*. [arXiv:2503.20783](https://arxiv.org/abs/2503.20783). The
+  unnormalized advantages GDPO adopts.

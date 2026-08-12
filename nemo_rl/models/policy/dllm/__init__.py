@@ -13,8 +13,10 @@
 # limitations under the License.
 """Masked diffusion language model (dLLM) support for RL training.
 
-Implements the sequence-level ELBO likelihood used by GDPO
-(https://arxiv.org/abs/2510.08554). Not to be confused with
+Implements the sequence-level ELBO likelihood used by GDPO, "Improving
+Reasoning for Diffusion Language Models via Group Diffusion Policy
+Optimization", ICLR 2026 (https://openreview.net/forum?id=JaqvespRBP,
+https://arxiv.org/abs/2510.08554). Not to be confused with
 ``grpo.adv_estimator.name = "gdpo"``, which is the unrelated multi-reward
 estimator from https://arxiv.org/abs/2601.05242.
 """
