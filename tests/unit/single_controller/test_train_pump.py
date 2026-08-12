@@ -302,6 +302,9 @@ def test_train_pump_drives_mcore_training_step(
 
         master_config = MasterConfig.model_construct(
             policy={"train_global_batch_size": train_gbs},
+            # _sync_weights gates stale-abort on _should_use_nemo_gym(env); empty
+            # env -> native path (nemo_gym disabled).
+            env={},
             grpo=GRPOConfig.model_construct(
                 num_prompts_per_step=num_prompts,
                 num_generations_per_prompt=num_generations,
@@ -367,6 +370,8 @@ def test_train_pump_drives_mcore_training_step(
         for metrics in train_metrics:
             assert math.isfinite(metrics["reward"])
             assert math.isfinite(metrics["advantages/mean"])
+            assert metrics["evicted_stale_prompt_groups"] == 0
+            assert metrics["aborted_stale_inflight_groups"] == 0
 
     finally:
         trainer.shutdown()

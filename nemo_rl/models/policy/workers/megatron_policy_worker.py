@@ -40,7 +40,8 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-    FullyShardedDataParallel as custom_FSDP,
+    FullyShardedDataParallelV1,
+    FullyShardedDataParallelV2,
 )
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -2895,7 +2896,9 @@ class MegatronPolicyWorkerImpl(
                         raise ValueError(
                             f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
                         )
-        elif isinstance(model, custom_FSDP):
+        elif isinstance(
+            model, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
+        ):
             if device == "cpu":
                 model.param_and_grad_buffer.offload_to_cpu(move_params, move_grads)
             elif device == "cuda":

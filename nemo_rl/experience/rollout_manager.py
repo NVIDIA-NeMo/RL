@@ -1052,7 +1052,11 @@ class RolloutManager:
         return await self._impl.run_rollout(input_sample)
 
     async def generate_and_push(
-        self, input_sample: DatumSpec, *, target_step: Optional[int] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        target_step: Optional[int] = None,
+        inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
     ) -> RolloutOutcome:
         """Roll out one prompt and commit it, re-dispatching on infrastructure failure.
 
@@ -1071,6 +1075,8 @@ class RolloutManager:
         Args:
             input_sample: A single prompt (one DatumSpec entry).
             target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
+            inflight_registry: Optional controller-owned mapping from group ID to
+                its dispatch task and start weight version.
 
         Returns:
             ``COMMITTED`` when the group reached the buffer, ``SKIPPED`` when the prompt
@@ -1100,7 +1106,19 @@ class RolloutManager:
                 weight_version=start_version, target_step=target_step
             )
             try:
-                record = await self.run_rollout(input_sample)
+                # Registered per ATTEMPT, not per prompt: each retry reserves a fresh
+                # group_id, so the controller's registry must follow the attempt that
+                # actually owns the slot it might abort.
+                if inflight_registry is not None:
+                    current_task = asyncio.current_task()
+                    assert current_task is not None
+                    inflight_registry[group_id] = (current_task, start_version)
+                # Unregister before commit so cancellation cannot interrupt it.
+                try:
+                    record = await self.run_rollout(input_sample)
+                finally:
+                    if inflight_registry is not None:
+                        inflight_registry.pop(group_id, None)
                 end_version = self._weight_version
                 await self._tq_buffer.commit(
                     group_id,
@@ -1111,7 +1129,14 @@ class RolloutManager:
             except Exception as error:
                 # A failed rollout must not leave an unready slot that can block an
                 # in-order sampler. commit() rolls back any DataPlane rows it wrote.
-                await self._tq_buffer.remove_group(group_id)
+                # Cleanup failure must not mask the error that caused it.
+                try:
+                    await self._tq_buffer.remove_group(group_id)
+                except Exception as cleanup_exc:
+                    print(
+                        f"  warn: remove_group({group_id}) cleanup failed: {cleanup_exc!r}",
+                        flush=True,
+                    )
                 reason = type(error).__name__
 
                 if classify_rollout_failure(error) is FailureClass.INFRA:
@@ -1148,7 +1173,13 @@ class RolloutManager:
                 continue
             except BaseException:
                 # Cancellation and other non-Exception exits: clean up, never retry.
-                await self._tq_buffer.remove_group(group_id)
+                try:
+                    await self._tq_buffer.remove_group(group_id)
+                except Exception as cleanup_exc:
+                    print(
+                        f"  warn: remove_group({group_id}) cleanup failed: {cleanup_exc!r}",
+                        flush=True,
+                    )
                 raise
 
             self._stats.committed += 1
