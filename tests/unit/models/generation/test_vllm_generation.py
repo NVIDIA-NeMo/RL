@@ -19,6 +19,7 @@ import sys
 import types
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -153,6 +154,7 @@ def _complete_token_request(**updates):
         "return_assistant_tokens_mask": False,
         "add_special_tokens": False,
         "return_prompt_text": False,
+        "required_prefix_token_ids": [3, 4],
     }
     values.update(updates)
     return types.SimpleNamespace(**values)
@@ -287,9 +289,14 @@ def test_complete_token_injection_eligibility_rejects_model_options(
             id="unsupported_role",
         ),
         pytest.param(
-            [{"role": "user", "content": ["text"]}],
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "question"}],
+                }
+            ],
             "non-text message content",
-            id="non_text_content",
+            id="responses_text_parts",
         ),
         pytest.param(
             [
@@ -317,6 +324,19 @@ def test_complete_token_injection_eligibility_rejects_messages(
 
     assert ordinal is None
     assert reason == expected_reason
+
+
+def test_complete_token_injection_eligibility_rejects_mismatched_prefix() -> None:
+    ordinal, reason = _complete_token_injection_eligibility(
+        _complete_token_request(required_prefix_token_ids=[1, 2]),
+        _tokenized_assistant_messages(),
+        has_multimodal_config=False,
+        prompt_embeds_enabled=False,
+        renderer_supported=True,
+    )
+
+    assert ordinal is None
+    assert reason == "client-supplied prefix does not match message token metadata"
 
 
 def test_context_capped_max_new_tokens():
@@ -1865,6 +1885,25 @@ def _wait_for_vllm_http_server_spinup(base_url: str):
             pass
 
 
+def _get_complete_token_injection_stats(
+    vllm_generation: VllmGeneration,
+) -> dict[str, Any]:
+    futures = vllm_generation.worker_group.run_all_workers_single_data(
+        "_get_complete_token_injection_stats",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+    worker_stats = ray.get(futures)
+    fallback_counts: dict[str, int] = {}
+    for stats in worker_stats:
+        for reason, count in stats["fallbacks"].items():
+            fallback_counts[reason] = fallback_counts.get(reason, 0) + count
+    return {
+        "attempts": sum(stats["attempts"] for stats in worker_stats),
+        "successes": sum(stats["successes"] for stats in worker_stats),
+        "fallbacks": fallback_counts,
+    }
+
+
 def test_vllm_http_server(cluster, tokenizer):
     """Test that vLLM http server works."""
 
@@ -2331,7 +2370,8 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
         vllm_http_server_generated_token["token"].removeprefix("token_id:")
     )
 
-    # Compare the injected continuation prompt with the native /tokenize path.
+    # Compare the injected continuation prompt with the legacy /tokenize
+    # prefix-replacement path.
     first_message = vllm_http_server_result["choices"][0]["message"]
     continuation_messages = [
         body["messages"][0],
@@ -2360,6 +2400,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     }
     native_response = requests.post(url=f"{base_urls[0]}/../tokenize", json=native_body)
     native_response.raise_for_status()
+    stats_before_injection = _get_complete_token_injection_stats(vllm_generation)
     injected_response = requests.post(
         url=f"{base_urls[0]}/chat/completions", json=continuation_body
     )
@@ -2368,6 +2409,10 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
         injected_response.json()["choices"][0]["message"]["prompt_token_ids"]
         == native_response.json()["tokens"]
     )
+    stats_after_injection = _get_complete_token_injection_stats(vllm_generation)
+    assert stats_after_injection["attempts"] == stats_before_injection["attempts"] + 1
+    assert stats_after_injection["successes"] == stats_before_injection["successes"] + 1
+    assert stats_after_injection["fallbacks"] == stats_before_injection["fallbacks"]
 
     async for _, generate_result in vllm_generation.generate_async(
         BatchedDataDict[GenerationDatumSpec](

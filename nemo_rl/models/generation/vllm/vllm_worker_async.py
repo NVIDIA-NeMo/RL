@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import json
 import logging
 import threading
 import time
@@ -62,6 +63,25 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 LOGGER = logging.getLogger(__name__)
 
 
+def _prefix_matches_tokenized_assistant(
+    required_prefix_token_ids: list[int], message: Any
+) -> bool:
+    """Return whether a prefix is the exact token metadata from one message."""
+    prompt_token_ids = message.get("prompt_token_ids")
+    generation_token_ids = message.get("generation_token_ids")
+    if not isinstance(prompt_token_ids, list) or not isinstance(
+        generation_token_ids, list
+    ):
+        return False
+
+    prompt_length = len(prompt_token_ids)
+    return (
+        len(required_prefix_token_ids) == prompt_length + len(generation_token_ids)
+        and required_prefix_token_ids[:prompt_length] == prompt_token_ids
+        and required_prefix_token_ids[prompt_length:] == generation_token_ids
+    )
+
+
 def _complete_token_injection_eligibility(
     request: Any,
     messages: list[Any],
@@ -71,19 +91,19 @@ def _complete_token_injection_eligibility(
     renderer_supported: bool,
 ) -> tuple[int | None, str | None]:
     """Return an assistant ordinal or a reason to use native preprocessing."""
-    if getattr(request, "stream", False):
+    if request.stream:
         return None, "streaming request"
-    if getattr(request, "n", 1) not in (None, 1):
+    if request.n not in (None, 1):
         return None, "multiple response choices"
-    if getattr(request, "continue_final_message", False):
+    if request.continue_final_message:
         return None, "continue_final_message request"
-    if getattr(request, "echo", False):
+    if request.echo:
         return None, "echo request"
-    if getattr(request, "return_assistant_tokens_mask", False):
+    if request.return_assistant_tokens_mask:
         return None, "assistant token mask request"
-    if getattr(request, "add_special_tokens", False):
+    if request.add_special_tokens:
         return None, "add_special_tokens request"
-    if getattr(request, "return_prompt_text", False):
+    if request.return_prompt_text:
         return None, "return_prompt_text request"
     if has_multimodal_config:
         return None, "multimodal model"
@@ -94,16 +114,24 @@ def _complete_token_injection_eligibility(
     for message in messages:
         if not isinstance(message, dict):
             return None, "non-object message"
+        # vLLM can consolidate developer and system messages, which can change
+        # the assistant ordinal and invalidate the splice boundary.
         if message.get("role") not in {"system", "user", "assistant", "tool"}:
             return None, "unsupported message role"
         content = message.get("content")
+        # Responses-style content-part lists stay on native preprocessing. Chat
+        # templates can treat these lists differently from flattened text.
         if content is not None and not isinstance(content, str):
             return None, "non-text message content"
 
     tokenized_assistant = find_latest_tokenized_assistant(messages)
     if tokenized_assistant is None:
         return None, "no fully tokenized assistant"
-    assistant_ordinal, _ = tokenized_assistant
+    assistant_ordinal, message = tokenized_assistant
+    if not _prefix_matches_tokenized_assistant(
+        request.required_prefix_token_ids, message
+    ):
+        return None, "client-supplied prefix does not match message token metadata"
     return assistant_ordinal, None
 
 
@@ -148,6 +176,7 @@ class VllmAsyncGenerationWorkerImpl(
         self.server_thread = None
         self.base_url = None
         self.http_server = None
+        self._online_renderer = None
 
         super().__init__(
             config,
@@ -177,6 +206,12 @@ class VllmAsyncGenerationWorkerImpl(
         return bool(
             self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
         )
+
+    def _get_complete_token_injection_stats(self) -> dict[str, Any]:
+        """Return a snapshot of complete-token injection renderer counters."""
+        if self._online_renderer is None:
+            return {"attempts": 0, "successes": 0, "fallbacks": {}}
+        return self._online_renderer._get_complete_token_injection_stats()
 
     def _reserve_port(self) -> None:
         """Bind and listen on a TCP socket to reserve a free port from the OS.
@@ -515,6 +550,25 @@ class VllmAsyncGenerationWorkerImpl(
                     reason,
                 )
 
+            def _get_complete_token_injection_stats(self) -> dict[str, Any]:
+                """Return a copy of the complete-token injection counters."""
+                return {
+                    "attempts": self._complete_token_injection_attempts,
+                    "successes": self._complete_token_injection_successes,
+                    "fallbacks": dict(self._complete_token_injection_fallbacks),
+                }
+
+            def _maybe_log_complete_token_injection_stats(self) -> None:
+                attempts = self._complete_token_injection_attempts
+                if attempts != 1 and attempts % 1000 != 0:
+                    return
+                LOGGER.info(
+                    "Complete-token injection statistics: %s",
+                    json.dumps(
+                        self._get_complete_token_injection_stats(), sort_keys=True
+                    ),
+                )
+
             async def _preprocess_chat_with_complete_token_ids(
                 self,
                 request,
@@ -528,7 +582,11 @@ class VllmAsyncGenerationWorkerImpl(
                 *,
                 skip_mm_cache: bool,
             ):
-                """Preserve vLLM preprocessing while skipping prompt re-encoding."""
+                """Preserve vLLM preprocessing while skipping prompt re-encoding.
+
+                This mirrors vLLM 0.25.1 ``OnlineRenderer.preprocess_chat``.
+                Re-diff that function and its render helpers during vLLM upgrades.
+                """
                 renderer = self.renderer
                 arrival_time = time.time()
                 default_template_kwargs = merge_kwargs(
@@ -587,6 +645,8 @@ class VllmAsyncGenerationWorkerImpl(
                         )
                     return rendered
 
+                # Do not use vLLM's one-worker renderer executor here. It would
+                # serialize the fast path and can remove the measured speedup.
                 prompt_token_ids = await asyncio.to_thread(
                     build_complete_prompt_token_ids,
                     tokenizer=tokenizer,
@@ -599,14 +659,9 @@ class VllmAsyncGenerationWorkerImpl(
                 tokenized_prompt = await renderer.tokenize_prompt_async(
                     prompt, tok_params
                 )
-                renderer._apply_prompt_extras(
-                    [tokenized_prompt],
-                    {
-                        key: value
-                        for key in ("mm_processor_kwargs", "cache_salt")
-                        if (value := getattr(request, key, None)) is not None
-                    },
-                )
+                for key in ("mm_processor_kwargs", "cache_salt"):
+                    if (value := getattr(request, key, None)) is not None:
+                        tokenized_prompt[key] = value
                 engine_prompt = await renderer.process_for_engine_async(
                     tokenized_prompt,
                     arrival_time,
@@ -689,6 +744,7 @@ class VllmAsyncGenerationWorkerImpl(
                     )
                     if fallback_reason is not None:
                         self._record_complete_token_injection_fallback(fallback_reason)
+                        self._maybe_log_complete_token_injection_stats()
                     else:
                         assert assistant_ordinal is not None
                         try:
@@ -707,8 +763,10 @@ class VllmAsyncGenerationWorkerImpl(
                             )
                         except CompleteTokenInjectionError as e:
                             self._record_complete_token_injection_fallback(str(e))
+                            self._maybe_log_complete_token_injection_stats()
                         else:
                             self._complete_token_injection_successes += 1
+                            self._maybe_log_complete_token_injection_stats()
                             if actual_request_max_tokens is not None:
                                 self._clamp_max_tokens(
                                     request,
@@ -955,6 +1013,7 @@ class VllmAsyncGenerationWorkerImpl(
             # here keeps the two endpoints rendering identical prompts.
             default_chat_template_kwargs=default_chat_template_kwargs,
         )
+        self._online_renderer = online_renderer
         serving_chat_kwargs.update(
             dict(
                 engine_client=engine_client,

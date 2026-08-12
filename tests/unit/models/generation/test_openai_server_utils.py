@@ -13,10 +13,15 @@
 # limitations under the License.
 """Tests for the shared on-policy prefix splice used by the vLLM/TRT-LLM OpenAI servers."""
 
+from collections import UserDict
+from copy import deepcopy
+from types import MappingProxyType
+
 import pytest
 
 from nemo_rl.models.generation.openai_server_utils import (
     CompleteTokenInjectionError,
+    _coerce_token_id_list,
     build_complete_prompt_token_ids,
     find_latest_tokenized_assistant,
     replace_prefix_tokens,
@@ -87,6 +92,7 @@ def test_build_complete_prompt_token_ids_preserves_prefix_and_suffix() -> None:
         {"role": "assistant", "content": "first"},
         {"role": "user", "content": "next"},
     ]
+    original_conversation = deepcopy(conversation)
 
     result = build_complete_prompt_token_ids(
         tokenizer=tokenizer,
@@ -97,9 +103,7 @@ def test_build_complete_prompt_token_ids_preserves_prefix_and_suffix() -> None:
     )
 
     assert result == [10, 777, 2, 40, 31, 32, 2, 40, 99]
-    assert conversation[1]["tool_calls"][0]["function"]["arguments"] == {
-        "command": "pwd"
-    }
+    assert conversation == original_conversation
 
 
 @pytest.mark.parametrize(
@@ -177,7 +181,9 @@ def test_complete_token_injection_finds_latest_tokenized_assistant(
 
 
 @pytest.mark.parametrize("gap", ["", " \n\t"])
-def test_complete_token_injection_requires_adjacent_assistant_eos(gap) -> None:
+def test_complete_token_injection_tolerates_whitespace_before_assistant_eos(
+    gap,
+) -> None:
     tokenizer = _CompleteTokenTokenizer()
     marker = "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E"
 
@@ -220,7 +226,10 @@ def test_complete_token_injection_requires_assistant_eos() -> None:
         {"role": "user", "content": "next"},
     ]
 
-    with pytest.raises(CompleteTokenInjectionError, match="did not close"):
+    with pytest.raises(
+        CompleteTokenInjectionError,
+        match="did not close the tokenized assistant with EOS",
+    ):
         build_complete_prompt_token_ids(
             tokenizer=tokenizer,
             conversation=conversation,
@@ -230,6 +239,243 @@ def test_complete_token_injection_requires_assistant_eos() -> None:
                 "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E missing boundary close"
             ),
         )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [pytest.param((2, 40), id="non_list"), pytest.param(None, id="none")],
+)
+def test_complete_token_injection_rejects_non_list_token_ids(value) -> None:
+    with pytest.raises(CompleteTokenInjectionError, match="must be a list"):
+        _coerce_token_id_list(value, "Token IDs")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(["2"], id="string"),
+        pytest.param([2.9], id="float"),
+        pytest.param([True], id="bool"),
+    ],
+)
+def test_complete_token_injection_rejects_non_integer_token_ids(value) -> None:
+    with pytest.raises(CompleteTokenInjectionError, match="only integer token IDs"):
+        _coerce_token_id_list(value, "Token IDs")
+
+
+def test_complete_token_injection_copies_valid_token_ids() -> None:
+    token_ids = [2, 40]
+
+    result = _coerce_token_id_list(token_ids, "Token IDs")
+
+    assert result == token_ids
+    assert result is not token_ids
+
+
+def test_complete_token_injection_wraps_copy_failure() -> None:
+    conversation = [MappingProxyType({"role": "assistant", "content": "first"})]
+
+    with pytest.raises(CompleteTokenInjectionError, match="could not be copied"):
+        build_complete_prompt_token_ids(
+            tokenizer=_CompleteTokenTokenizer(),
+            conversation=conversation,
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=_render_marked_conversation,
+        )
+
+
+def test_complete_token_injection_rejects_marker_collision() -> None:
+    with pytest.raises(CompleteTokenInjectionError, match="marker collided"):
+        build_complete_prompt_token_ids(
+            tokenizer=_CompleteTokenTokenizer(),
+            conversation=[
+                {
+                    "role": "assistant",
+                    "content": "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E",
+                }
+            ],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=_render_marked_conversation,
+        )
+
+
+def test_complete_token_injection_rejects_missing_assistant_ordinal() -> None:
+    with pytest.raises(
+        CompleteTokenInjectionError, match="not present after chat parsing"
+    ):
+        build_complete_prompt_token_ids(
+            tokenizer=_CompleteTokenTokenizer(),
+            conversation=[{"role": "assistant", "content": "first"}],
+            assistant_ordinal=1,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=_render_marked_conversation,
+        )
+
+
+def test_complete_token_injection_rejects_non_dict_assistant() -> None:
+    with pytest.raises(CompleteTokenInjectionError, match="not a message object"):
+        build_complete_prompt_token_ids(
+            tokenizer=_CompleteTokenTokenizer(),
+            conversation=[UserDict({"role": "assistant", "content": "first"})],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=_render_marked_conversation,
+        )
+
+
+def test_complete_token_injection_preserves_render_fallback() -> None:
+    def render_prompt_text(messages):
+        raise CompleteTokenInjectionError("renderer requested native preprocessing")
+
+    with pytest.raises(
+        CompleteTokenInjectionError,
+        match="renderer requested native preprocessing",
+    ):
+        build_complete_prompt_token_ids(
+            tokenizer=_CompleteTokenTokenizer(),
+            conversation=[{"role": "assistant", "content": "first"}],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=render_prompt_text,
+        )
+
+
+def test_complete_token_injection_wraps_render_failure() -> None:
+    def render_prompt_text(messages):
+        raise RuntimeError("render failed")
+
+    with pytest.raises(CompleteTokenInjectionError, match="could not be rendered"):
+        build_complete_prompt_token_ids(
+            tokenizer=_CompleteTokenTokenizer(),
+            conversation=[{"role": "assistant", "content": "first"}],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=render_prompt_text,
+        )
+
+
+@pytest.mark.parametrize(
+    ("rendered", "expected_error"),
+    [
+        pytest.param([], "must render as text", id="non_text"),
+        pytest.param("missing marker<eos>", "did not preserve", id="missing_marker"),
+    ],
+)
+def test_complete_token_injection_rejects_invalid_render_output(
+    rendered, expected_error
+) -> None:
+    with pytest.raises(CompleteTokenInjectionError, match=expected_error):
+        build_complete_prompt_token_ids(
+            tokenizer=_CompleteTokenTokenizer(),
+            conversation=[{"role": "assistant", "content": "first"}],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=lambda messages: rendered,
+        )
+
+
+def test_complete_token_injection_requires_tokenizer_eos() -> None:
+    tokenizer = _CompleteTokenTokenizer()
+    tokenizer.eos_token = None
+
+    with pytest.raises(CompleteTokenInjectionError, match="requires tokenizer EOS"):
+        build_complete_prompt_token_ids(
+            tokenizer=tokenizer,
+            conversation=[{"role": "assistant", "content": "first"}],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=lambda messages: (
+                "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E<eos>nextGEN"
+            ),
+        )
+
+
+def test_complete_token_injection_preserves_encoding_fallback() -> None:
+    tokenizer = _CompleteTokenTokenizer()
+
+    def encode(text, add_special_tokens=False):
+        raise CompleteTokenInjectionError("encoder requested native preprocessing")
+
+    tokenizer.encode = encode
+    with pytest.raises(
+        CompleteTokenInjectionError,
+        match="encoder requested native preprocessing",
+    ):
+        build_complete_prompt_token_ids(
+            tokenizer=tokenizer,
+            conversation=[{"role": "assistant", "content": "first"}],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=lambda messages: (
+                "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E<eos>nextGEN"
+            ),
+        )
+
+
+def test_complete_token_injection_wraps_encoding_failure() -> None:
+    tokenizer = _CompleteTokenTokenizer()
+
+    def encode(text, add_special_tokens=False):
+        raise RuntimeError("encode failed")
+
+    tokenizer.encode = encode
+    with pytest.raises(CompleteTokenInjectionError, match="could not be tokenized"):
+        build_complete_prompt_token_ids(
+            tokenizer=tokenizer,
+            conversation=[{"role": "assistant", "content": "first"}],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=lambda messages: (
+                "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E<eos>nextGEN"
+            ),
+        )
+
+
+def test_complete_token_injection_requires_encoded_suffix_eos() -> None:
+    tokenizer = _CompleteTokenTokenizer()
+    tokenizer.encode = lambda text, add_special_tokens=False: [40]
+
+    with pytest.raises(CompleteTokenInjectionError, match="did not begin with EOS"):
+        build_complete_prompt_token_ids(
+            tokenizer=tokenizer,
+            conversation=[{"role": "assistant", "content": "first"}],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=lambda messages: (
+                "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E<eos>nextGEN"
+            ),
+        )
+
+
+def test_complete_token_injection_rejects_empty_model_prefix() -> None:
+    with pytest.raises(
+        CompleteTokenInjectionError, match="prefix token IDs were empty"
+    ):
+        build_complete_prompt_token_ids(
+            tokenizer=_CompleteTokenTokenizer(),
+            conversation=[{"role": "assistant", "content": "first"}],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[],
+            render_prompt_text=lambda messages: (
+                "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E<eos>nextGEN"
+            ),
+        )
+
+
+def test_complete_token_injection_appends_eos_when_prefix_has_no_eos() -> None:
+    result = build_complete_prompt_token_ids(
+        tokenizer=_CompleteTokenTokenizer(),
+        conversation=[{"role": "assistant", "content": "first"}],
+        assistant_ordinal=0,
+        model_prefix_token_ids=[31, 32],
+        render_prompt_text=lambda messages: (
+            "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E<eos>nextGEN"
+        ),
+    )
+
+    assert result == [31, 32, 2, 40, 99]
 
 
 def test_replace_prefix_tokens_empty_model_prefix_returns_template():

@@ -24,6 +24,7 @@ retokenization drift to correct.
 """
 
 from collections.abc import Callable, Mapping
+from copy import Error as CopyError
 from copy import deepcopy
 from typing import Any
 
@@ -70,12 +71,11 @@ def _assistant_index_from_ordinal(
 def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
     if not isinstance(value, list):
         raise CompleteTokenInjectionError(f"{field_name} must be a list.")
-    try:
-        return [int(token_id) for token_id in value]
-    except (TypeError, ValueError) as e:
+    if any(type(token_id) is not int for token_id in value):
         raise CompleteTokenInjectionError(
             f"{field_name} must contain only integer token IDs."
-        ) from e
+        )
+    return list(value)
 
 
 def build_complete_prompt_token_ids(
@@ -96,7 +96,12 @@ def build_complete_prompt_token_ids(
     by a marker. This preserves context-sensitive template behavior after that
     assistant while making its closing EOS the exact splice boundary.
     """
-    marked_conversation = deepcopy(conversation)
+    try:
+        marked_conversation = deepcopy(conversation)
+    except (CopyError, TypeError) as e:
+        raise CompleteTokenInjectionError(
+            "The conversation could not be copied for complete-token injection."
+        ) from e
     if any(
         _COMPLETE_TOKEN_BOUNDARY_MARKER in str(message)
         for message in marked_conversation
@@ -152,6 +157,8 @@ def build_complete_prompt_token_ids(
             "The chat template did not close the tokenized assistant with EOS."
         )
     marker_end = marker_pos + len(_COMPLETE_TOKEN_BOUNDARY_MARKER)
+    # The legacy prefix replacement also cuts at EOS, so dropping whitespace
+    # between the marker and EOS keeps both paths token-identical.
     if marked_text[marker_end:suffix_pos].strip():
         raise CompleteTokenInjectionError(
             "The chat template did not close the tokenized assistant immediately; "
@@ -174,8 +181,10 @@ def build_complete_prompt_token_ids(
         raise CompleteTokenInjectionError(
             "The contextual suffix did not begin with EOS."
         )
+    if not model_prefix_token_ids:
+        raise CompleteTokenInjectionError("The model prefix token IDs were empty.")
     model_cut_end = len(model_prefix_token_ids)
-    if model_prefix_token_ids and model_prefix_token_ids[-1] == eos_token_id:
+    if model_prefix_token_ids[-1] == eos_token_id:
         model_cut_end -= 1
     return model_prefix_token_ids[:model_cut_end] + suffix_token_ids
 
