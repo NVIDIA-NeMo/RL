@@ -870,7 +870,10 @@ export SETUP_COMMAND
 # SingleController recipes swap this for ./examples/run_grpo_single_controller.py.
 # Both drivers accept the same --config and Hydra override surface.
 TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py}"
+# The recorder runs before training and never fails the job; see its header for
+# why submit-time provenance.txt is not enough on its own.
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
+bash ${CODE_ROOT}/examples/nemo_gym/nemotron-3-ultra/record_code_at_start.sh ${CODE_ROOT} ${RUN_DIR} ${PROJECT_ROOT} ; \
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
 WANDB_INIT_TIMEOUT=300 \

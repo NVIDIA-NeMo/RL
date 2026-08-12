@@ -37,7 +37,8 @@ set -euo pipefail
 # Optional:
 #   NRL_MAX_STEPS=10             # short pipeclean
 #   STREAM_MIN_GROUPS=32         # async_rl.min_groups_for_streaming_train
-#   MAX_LOOKAHEAD_VERSIONS=4     # async_rl.sampler.max_lookahead_versions
+#   SAMPLER=ready_first          # ready_first | in_order | windowed
+#   MAX_LOOKAHEAD_VERSIONS=4     # the sampler's slack, whatever it spells it
 #                                # 1 restores parity with the async-1 baseline
 #   NUM_STORAGE_UNITS=16         # data_plane.num_storage_units
 #   GYM_MAX_CONCURRENCY=1280     # env.nemo_gym.max_concurrency; unset = Ray's 1000
@@ -65,9 +66,12 @@ export EXP_NAME="${EXP_NAME:-akamehra-nano35-honest-dolphin-v10-iter6000-rlvr-sc
 # rlvr_dolphin_sc.yaml is never what runs — keep the two in step. It shards a
 # global pool rather than reserving per unit, so over-provisioning costs only a
 # CPU actor each; the windowed sweep's 14336 peak rows are 1.4% of capacity.
-# MAX_LOOKAHEAD_VERSIONS is the off-policyness ceiling; raising it also raises
-# the two capacity floors below, which validate_sampler_buffer_capacity
-# enforces (max_buffered_rollouts >= num_prompts_per_step * (lookahead + 1)).
+# MAX_LOOKAHEAD_VERSIONS is the sampler's slack, in trainer versions, whichever
+# sampler is selected; raising it also raises the two capacity floors below,
+# which validate_sampler_buffer_capacity enforces (max_buffered_rollouts >=
+# num_prompts_per_step * (slack + 1)). Under ready_first it bounds admission
+# only — a group that commits late is still trained on, so it is not a ceiling
+# on realized staleness the way its name suggests.
 STREAM_MIN_GROUPS="${STREAM_MIN_GROUPS:-32}"
 NUM_STORAGE_UNITS="${NUM_STORAGE_UNITS:-16}"
 MAX_LOOKAHEAD_VERSIONS="${MAX_LOOKAHEAD_VERSIONS:-4}"
@@ -86,30 +90,47 @@ if [[ -n "${GYM_MAX_CONCURRENCY}" ]]; then
   _GYM_OVERRIDES+=("env.nemo_gym.max_concurrency=${GYM_MAX_CONCURRENCY}")
 fi
 
-# Which selection policy the slack above configures. The two samplers spell it
-# differently — in_order counts dispatch batches of lookahead, windowed counts
-# weight versions of staleness — and both configs are extra="allow", so passing
-# the wrong key is accepted and silently ignored, leaving every arm of a sweep
-# sitting at the default. Emitting only the key that matches SAMPLER is what
-# stops a sweep from quietly running four copies of the same configuration.
-SAMPLER="${SAMPLER:-in_order}"
+# Which selection policy the slack above configures. The samplers spell it
+# differently — in_order counts dispatch batches of lookahead, ready_first and
+# windowed count weight versions of staleness — and every sampler config is
+# extra="allow", so passing the wrong key is accepted and silently ignored,
+# leaving that arm sitting at the default of 1. Emitting only the key that
+# matches SAMPLER is what stops a sweep from quietly running four copies of the
+# same configuration; tests/unit/algorithms/test_sc_ready_first.py pins the
+# footgun so the launcher and the schema cannot drift apart.
+#
+# rlvr_dolphin_sc.yaml now declares the ready_first block, so ready_first and
+# windowed override their key in place while in_order has to add its own. Hydra
+# runs in struct mode: `+` on a key that already exists is an error, and a plain
+# override of one that does not is also an error, so these forms are not
+# interchangeable. Keys belonging to the samplers not chosen stay in the dict
+# and are inert — every config accepts extras — but they do show up in the
+# resolved config, so read `name` first when checking an arm.
+SAMPLER="${SAMPLER:-ready_first}"
 case "${SAMPLER}" in
+  ready_first)
+    _SAMPLER_OVERRIDES=(
+      "async_rl.sampler.name=ready_first"
+      "async_rl.sampler.max_staleness_versions=${MAX_LOOKAHEAD_VERSIONS}"
+      # Restated per arm even though the recipe sets it, so the run's own
+      # provenance records that zero eviction was chosen rather than defaulted.
+      "async_rl.sampler.evict_stale_samples=false"
+    )
+    ;;
   in_order)
     _SAMPLER_OVERRIDES=(
       "async_rl.sampler.name=in_order"
-      "async_rl.sampler.max_lookahead_versions=${MAX_LOOKAHEAD_VERSIONS}"
+      "+async_rl.sampler.max_lookahead_versions=${MAX_LOOKAHEAD_VERSIONS}"
     )
     ;;
   windowed)
-    # The recipe declares the in_order key, and Hydra runs in struct mode, so
-    # this one has to be added rather than overridden.
     _SAMPLER_OVERRIDES=(
       "async_rl.sampler.name=windowed"
-      "+async_rl.sampler.max_staleness_versions=${MAX_LOOKAHEAD_VERSIONS}"
+      "async_rl.sampler.max_staleness_versions=${MAX_LOOKAHEAD_VERSIONS}"
     )
     ;;
   *)
-    echo "SAMPLER must be in_order or windowed, got '${SAMPLER}'" >&2
+    echo "SAMPLER must be ready_first, in_order or windowed, got '${SAMPLER}'" >&2
     exit 1
     ;;
 esac

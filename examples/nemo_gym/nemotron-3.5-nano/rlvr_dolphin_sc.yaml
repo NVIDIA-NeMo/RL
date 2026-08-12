@@ -71,6 +71,27 @@ policy:
 
   generation:
     # -------------------------------------------------------------------------
+    # Pinned, not interpolated. rlvr_dolphin.yaml ties max_new_tokens to
+    # ${policy.max_total_sequence_length}, which also feeds vllm_cfg.max_model_len
+    # — so the generation budget and the context window are the same number and
+    # a prompt at exactly that length can never emit a token. It is rejected
+    # deterministically instead, and because Gym prepends system prompts and tool
+    # schemas at rollout time and rollouts are multi-turn, no first-turn filter
+    # bounds it: that pairing rejected 2108 prompts in one 8-node ultra probe arm
+    # and 1344 in another at a 16384 window.
+    #
+    # 73728 is the value the interpolation already resolves to here, kept
+    # identical on purpose so these arms stay comparable with the v1 and windowed
+    # arms they are measured against. The pin buys decoupling, not headroom: what
+    # actually keeps rejections at zero on this recipe is that the window is 4.5x
+    # the ultra one and no row of the dolphin blend approaches it (job 5995586
+    # logged no context rejections at this window). Anyone lowering
+    # max_total_sequence_length here must now choose a smaller max_new_tokens
+    # deliberately, which is the step the ultra fan-in config skipped.
+    # -------------------------------------------------------------------------
+    max_new_tokens: 73728
+
+    # -------------------------------------------------------------------------
     # Weight refit transport. The inherited default (null) broadcasts every full
     # parameter tensor from the 32 training ranks to all 160 generation ranks.
     # nccl_reshard instead moves each parameter shard-to-shard between the two
@@ -130,25 +151,50 @@ policy:
 # SingleController async RL — required by MasterConfig
 # =============================================================================
 async_rl:
-  # in_order stamps each dispatched cohort with its exact target optimizer step.
-  # The lookahead is the ceiling on off-policyness: generation may start a
-  # cohort at most this many optimizer steps before the step that trains on it,
-  # so the reported `lag` settles there once generation is the bottleneck.
+  # ready_first: gated admission, streaming selection, zero eviction.
   #
-  # 4 buys deep generation/training overlap at the cost of policy freshness,
-  # matching the 6K Ultra SC recipe. Note this is NOT the baseline's
-  # grpo.async_grpo.max_trajectory_age_steps=1, so the two runs are no longer
-  # iso-off-policy: a quality difference between them is confounded with the
-  # staleness difference, and only throughput is cleanly comparable.
+  # Admission is the same gate in_order uses — generation may run at most
+  # max_staleness_versions dispatch batches ahead of the trainer — but selection
+  # takes any ready group whose start weight does not exceed the trainer
+  # version, oldest first, rather than only the cohort stamped for this step.
+  # A step therefore closes on the first num_prompts_per_step groups that are
+  # ready, and a prompt lost to a rollout fault is backfilled instead of waited
+  # for. That removes the 5982927 wedge structurally rather than by credit.
   #
-  # The loss compensates via truncated importance sampling (inherited
-  # use_importance_sampling_correction with truncated_importance_sampling_ratio
-  # 5), but watch token_mult_prob_error and is_oob_ratio — if they climb, the
-  # correction is being asked to cover too large a policy gap. Drop to 1 (which
-  # does mirror the baseline) if training destabilizes.
+  # This replaces in_order for the staleness sweep because the two v2 samplers
+  # that already ran both discard generated work: windowed evicts 21.4 / 6.6 /
+  # 3.0% of groups at staleness 2 / 4 / 6, and those are the long ones
+  # (2.4-2.8x the retained mean). ready_first keeps them. Do not read its step
+  # time against a windowed baseline — the batches are legitimately longer, and
+  # at staleness 1 that comparison is off by more than 3x in the direction that
+  # makes the correct change look like a regression. Compare against v1, or
+  # compare loss-bearing tokens/sec.
+  #
+  # Set explicitly rather than inherited: false is also the upstream default,
+  # but this is the setting the whole design rests on and it should be visible
+  # in the recipe. Turning it on re-arms an uncredited-eviction wedge — evicted
+  # groups do not advance the admission counter, so past P * staleness
+  # cumulative evictions the gate stays shut against a step that can no longer
+  # fill and the run hangs rather than errors. tests/unit/algorithms/
+  # test_sc_ready_first.py pins both halves of that.
+  #
+  # NOTE ON THE LOSS. loss_fn.force_on_policy_ratio is true here, inherited from
+  # student_rlvr1.yaml, which pins the importance ratio at 1 — so despite
+  # use_importance_sampling_correction there is no off-policy correction at all.
+  # PR 3582 ships a validator refusing ready_first in exactly this state. It is
+  # deliberately not adopted on this branch; see the comment in
+  # nemo_rl/algorithms/single_controller_utils/config.py for why, and do not
+  # promote this recipe to production without revisiting it.
+  #
+  # The launcher overrides name and the slack per arm. It emits the key that
+  # matches the sampler it selected: ready_first and windowed both spell it
+  # max_staleness_versions, in_order spells it max_lookahead_versions, and every
+  # sampler config is extra="allow", so the wrong key is accepted in silence and
+  # leaves the arm at the default of 1.
   sampler:
-    name: in_order
-    max_lookahead_versions: 4
+    name: ready_first
+    max_staleness_versions: 4
+    evict_stale_samples: false
 
   recompute_kv_cache_after_weight_updates: false
 
@@ -159,13 +205,17 @@ async_rl:
   min_groups_for_streaming_train: 32
 
   # Let the current cohort and all four lookahead cohorts generate
-  # concurrently: num_prompts_per_step * (max_lookahead_versions + 1) = 128 * 5.
+  # concurrently: num_prompts_per_step * (max_staleness_versions + 1) = 128 * 5.
   max_inflight_prompts: 640
 
   # Hard floor, not a preference: validate_sampler_buffer_capacity raises if
-  # this is below num_prompts_per_step * (max_lookahead_versions + 1) = 640,
+  # this is below num_prompts_per_step * (max_staleness_versions + 1) = 640,
   # because the rollout pump would deadlock waiting for buffer slots. It scales
-  # with the lookahead, so raising one raises both.
+  # with the slack, so raising one raises both.
+  #
+  # Keep it EQUAL to max_inflight_prompts, never above. The buffer permit is
+  # acquired before dispatch, so it is a dispatch semaphore rather than passive
+  # capacity: job 6014206 set 768 against 384 in flight and ran 1.8x slower.
   max_buffered_rollouts: 640
 
   # Rollout fault tolerance. Gym retries dropped connections itself, but hands
