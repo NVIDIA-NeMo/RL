@@ -222,7 +222,9 @@ class BlackboxFinalizer:
             staging_keys=staging_keys,
             min_wv=min_wv,
             max_wv=max_wv,
-            routed_experts=row.routed_experts,
+            # getattr: pre-R3 Gym pins' LinearizedRow has no routed_experts;
+            # capture-R3 then degrades to the sentinel/group-drop path.
+            routed_experts=getattr(row, "routed_experts", None),
         )
 
     # ── per group ───────────────────────────────────────────────────────────
