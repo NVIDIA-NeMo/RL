@@ -201,9 +201,9 @@ def make_actor_runtime_env(actor_class_fqn: str) -> dict:
     ``VIRTUAL_ENV`` / ``UV_PROJECT_ENVIRONMENT`` env vars so workers see
     the same interpreter as the driver.
 
-    Used by ReplayBuffer, AsyncTrajectoryCollector, and
-    SyncRolloutActor — three actors that need the VLLM tier's
-    venv on every node.
+    Used by ReplayBuffer, AsyncTrajectoryCollector, and SyncRolloutActor
+    — three actors that need the VLLM tier's venv on every node. Also
+    used by the SGLang router and SGLang generation engines (SGLANG tier).
     """
     # Local import — venvs.py is dep-light; the registry imports
     # PY_EXECUTABLES which transitively pulls heavier deps.

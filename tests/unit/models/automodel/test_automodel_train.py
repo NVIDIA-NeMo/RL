@@ -38,6 +38,7 @@ from nemo_rl.models.automodel.train import (
     LossPostProcessor,
     ScorePostProcessor,
     TopkLogitsPostProcessor,
+    _needs_kv_cache_for_shared_layers,
     apply_temperature_scaling,
     automodel_forward_backward,
     extract_logits,
@@ -180,6 +181,157 @@ class TestModelForward:
         # Flash attention should be removed for multimodal
         assert "flash_attn_kwargs" not in call_kwargs
 
+    def test_forward_filters_unsupported_multimodal_metadata(
+        self, processed_inputs_multimodal
+    ):
+        class ExplicitMultimodalModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.pixel_values = None
+
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+            ):
+                self.pixel_values = pixel_values
+                return MagicMock(logits=torch.randn(2, 64, 1000))
+
+        model = ExplicitMultimodalModel()
+        processed_inputs_multimodal.vlm_kwargs.update(
+            {
+                "imgs_sizes": torch.tensor([[224, 224]]),
+                "num_frames": torch.tensor([1]),
+            }
+        )
+
+        model_forward(model, processed_inputs_multimodal)
+
+        assert (
+            model.pixel_values is processed_inputs_multimodal.vlm_kwargs["pixel_values"]
+        )
+
+    def test_forward_rejects_mixed_resolution_without_imgs_sizes_support(
+        self, processed_inputs_multimodal
+    ):
+        class ExplicitMultimodalModel(torch.nn.Module):
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+            ):
+                return MagicMock(logits=torch.randn(2, 64, 1000))
+
+        model = ExplicitMultimodalModel()
+        processed_inputs_multimodal.vlm_kwargs.update(
+            {
+                "imgs_sizes": torch.tensor([[224, 320], [256, 288]]),
+                "num_frames": torch.ones(2, dtype=torch.long),
+            }
+        )
+
+        with pytest.raises(ValueError, match="mixed-resolution"):
+            model_forward(model, processed_inputs_multimodal)
+
+    def test_forward_allows_uniform_resolution_without_imgs_sizes_support(
+        self, processed_inputs_multimodal
+    ):
+        class ExplicitMultimodalModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.pixel_values = None
+
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+            ):
+                self.pixel_values = pixel_values
+                return MagicMock(logits=torch.randn(2, 64, 1000))
+
+        model = ExplicitMultimodalModel()
+        processed_inputs_multimodal.vlm_kwargs.update(
+            {
+                "imgs_sizes": torch.tensor([[224, 224], [224, 224]]),
+                "num_frames": torch.ones(2, dtype=torch.long),
+            }
+        )
+
+        # Uniform sizes (the shipped fixed-tile case): no raise, and imgs_sizes
+        # is filtered out for a model that cannot consume it.
+        model_forward(model, processed_inputs_multimodal)
+
+        assert (
+            model.pixel_values is processed_inputs_multimodal.vlm_kwargs["pixel_values"]
+        )
+
+    def test_forward_preserves_dynamic_resolution_omni_inputs(
+        self, processed_inputs_multimodal
+    ):
+        class DynamicResolutionOmniLikeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_kwargs = {}
+
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+                imgs_sizes=None,
+            ):
+                self.forward_kwargs = {
+                    "pixel_values": pixel_values,
+                    "imgs_sizes": imgs_sizes,
+                }
+                return MagicMock(logits=torch.randn(2, 64, 1000))
+
+        model = DynamicResolutionOmniLikeModel()
+        padded_images = torch.randn(2, 3, 256, 320)
+        image_sizes = torch.tensor([[224, 320], [256, 288]])
+        processed_inputs_multimodal.vlm_kwargs.update(
+            {
+                "pixel_values": padded_images,
+                "imgs_sizes": image_sizes,
+                "num_frames": torch.ones(2, dtype=torch.long),
+            }
+        )
+
+        model_forward(model, processed_inputs_multimodal)
+
+        assert model.forward_kwargs["pixel_values"] is padded_images
+        assert model.forward_kwargs["imgs_sizes"] is image_sizes
+
+    def test_forward_preserves_multimodal_metadata_for_kwargs_model(
+        self, processed_inputs_multimodal
+    ):
+        class KwargsModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_kwargs = {}
+
+            def forward(self, **kwargs):
+                self.forward_kwargs = kwargs
+                return MagicMock(logits=torch.randn(2, 64, 1000))
+
+        model = KwargsModel()
+        processed_inputs_multimodal.vlm_kwargs["num_frames"] = torch.tensor([1])
+
+        model_forward(model, processed_inputs_multimodal)
+
+        assert "num_frames" in model.forward_kwargs
+
     def test_forward_reward_model_removes_flash_attn(
         self, mock_model, processed_inputs_with_flash
     ):
@@ -202,6 +354,82 @@ class TestModelForward:
         mock_model.assert_called_once()
         call_kwargs = mock_model.call_args[1]
         assert "flash_attn_kwargs" not in call_kwargs
+
+    def test_forward_injects_mm_token_type_ids_for_gemma4(
+        self, mock_model, processed_inputs_no_flash
+    ):
+        # Gemma 4 needs mm_token_type_ids even for text-only inputs.
+        mock_model.config.model_type = "gemma4"
+
+        result = model_forward(mock_model, processed_inputs_no_flash)
+
+        call_kwargs = mock_model.call_args[1]
+        assert "mm_token_type_ids" in call_kwargs
+        assert torch.equal(
+            call_kwargs["mm_token_type_ids"],
+            torch.zeros_like(processed_inputs_no_flash.input_ids),
+        )
+
+    def test_forward_omits_mm_token_type_ids_for_non_gemma4(
+        self, mock_model, processed_inputs_no_flash
+    ):
+        mock_model.config.model_type = "llama"
+
+        result = model_forward(mock_model, processed_inputs_no_flash)
+
+        call_kwargs = mock_model.call_args[1]
+        assert "mm_token_type_ids" not in call_kwargs
+
+
+# ==========================================
+# Test _needs_kv_cache_for_shared_layers
+# ==========================================
+@pytest.mark.automodel
+class TestNeedsKvCacheForSharedLayers:
+    def test_nested_text_config_positive(self):
+        import types
+
+        model = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                text_config=types.SimpleNamespace(num_kv_shared_layers=4)
+            )
+        )
+        assert _needs_kv_cache_for_shared_layers(model) is True
+
+    def test_flat_config_zero_is_false(self):
+        import types
+
+        model = types.SimpleNamespace(
+            config=types.SimpleNamespace(num_kv_shared_layers=0)
+        )
+        assert _needs_kv_cache_for_shared_layers(model) is False
+
+    def test_missing_config_is_false(self):
+        import types
+
+        assert _needs_kv_cache_for_shared_layers(types.SimpleNamespace()) is False
+
+    def test_workaround_obsolete_tripwire(self):
+        """Tripwire: fires once transformers>=5.5.2 (PR #45312) lands.
+
+        PR #45312 fixes KV sharing without requiring use_cache=True, which makes
+        the _needs_kv_cache_for_shared_layers workaround (and the use_cache
+        plumbing it drives in model_forward / automodel_forward_backward) obsolete.
+        There is no importable symbol/signature to key on, so we key on the
+        transformers version the TODO names. When this assertion fails, remove the
+        workaround in nemo_rl/models/automodel/train.py and this test.
+        """
+        import transformers
+        from packaging.version import Version
+
+        assert Version(transformers.__version__) < Version("5.5.2"), (
+            f"transformers {transformers.__version__} >= 5.5.2 detected "
+            "(PR #45312 fixes KV sharing without use_cache=True). The "
+            "_needs_kv_cache_for_shared_layers workaround in "
+            "nemo_rl/models/automodel/train.py (and the use_cache plumbing in "
+            "model_forward / automodel_forward_backward) is now obsolete - "
+            "remove it and this test."
+        )
 
 
 # =====================

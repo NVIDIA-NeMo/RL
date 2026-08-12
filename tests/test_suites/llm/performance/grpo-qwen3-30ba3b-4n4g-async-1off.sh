@@ -5,10 +5,11 @@ source $SCRIPT_DIR/common.env
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
 GPUS_PER_NODE=4
+SEGMENT_SIZE=2     # nodes per NVLink-domain segment; tools/launch passes it as sbatch --segment. Matches cluster.segment_size in the yaml.
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=100
+NUM_MINUTES=200
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

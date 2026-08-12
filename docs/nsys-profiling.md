@@ -28,6 +28,26 @@ format is colon separated integers representing `start:stop`, where `start` is i
 export NRL_NSYS_PROFILE_STEP_RANGE=3:5
 ```
 
+### Extra Nsys Options (Optional)
+
+Set `NRL_NSYS_EXTRA_OPTIONS` to a JSON object to add or override nsys CLI flags on top of
+the built-in defaults. Keys are the nsys flag names (without leading `--`); values are the
+flag values (string, or anything Ray's nsight runtime_env accepts). User-supplied keys win
+on conflict with the built-in defaults (`t`, `o`, `stop-on-exit`, `capture-range`,
+`capture-range-end`, `cuda-graph-trace`).
+
+```bash
+export NRL_NSYS_EXTRA_OPTIONS='{"gpu-metrics-device": "all", "cuda-memory-usage": "true", "cpuctxsw": "none"}'
+```
+
+Common additions:
+- `gpu-metrics-device`: sample SM/memory utilization counters (e.g. `"all"` or a specific device id).
+- `cuda-memory-usage`: track host/device memory allocations (`"true"`).
+- `cpuctxsw`: control CPU context-switch sampling (`"none"`, `"process-tree"`).
+
+Empty or unset means no extras — defaults apply unchanged. Invalid JSON or a non-object
+payload raises at startup so misconfiguration surfaces immediately.
+
 ### Pattern Format
 
 - Use shell-style wildcards (`*`, `?`, `[seq]`, `[!seq]`)
@@ -41,6 +61,7 @@ export NRL_NSYS_PROFILE_STEP_RANGE=3:5
 The supported worker types are:
 - **DTensorPolicyWorker**: Pattern matched against `"dtensor_policy_worker"`
 - **VllmGenerationWorker**: Pattern matched against `"vllm_generation_worker"`
+- **TrtllmAsyncGenerationWorker**: Pattern matched against `"trtllm_async_generation_worker"`
 
 ## Example Usage
 
@@ -71,6 +92,14 @@ LD_LIBRARY_PATH="/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda/lib64:
 NRL_NSYS_PROFILE_STEP_RANGE=2:3 NRL_NSYS_WORKER_PATTERNS="megatron_policy_worker,vllm_generation_worker" uv run examples/run_grpo.py --config examples/configs/grpo_math_1B_megatron.yaml grpo.max_num_steps=5
 ```
 
+### Profile TensorRT-LLM Generation Workers
+
+```bash
+NRL_NSYS_PROFILE_STEP_RANGE=2:3 NRL_NSYS_WORKER_PATTERNS="trtllm_async_generation_worker" uv run examples/run_grpo.py --config examples/configs/grpo_math_1B_trtllm.yaml grpo.max_num_steps=5
+```
+
+The outer `TrtllmAsyncGenerationWorker` actor is CPU-only, so nsys wraps TensorRT-LLM's **internal** RayExecutor GPU workers instead. This is done by injecting `ray_worker_nsight_options` (with `capture-range=cudaProfilerApi`, deferred capture) into the `AsyncLLM` constructor. When `start_gpu_profiling()` is called, it broadcasts `collective_rpc("start_gpu_profiling")` to the internal GPU workers, each of which calls `torch.cuda.profiler.start()` to trigger the capture. Traces are one `.nsys-rep` per internal GPU worker (replicas × TP).
+
 ## Profile Output
 
 When profiling is enabled, it generates the following logs and files:
@@ -84,13 +113,14 @@ When profiling is enabled, it generates the following logs and files:
    ```
    dtensor_policy_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
+   trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    worker_process_<PID>.nsys-rep
    ```
-If you are not using model parallelism in Vllm, you should directly refer to `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` for nsight reports; If you are using model parallelism, the `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` will be empty, and the `worker_process_<PID>.nsys-rep` are nsight profiles from vllm's ray distributed executors (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information).
+For TensorRT-LLM, the meaningful generation profiles are the per-internal-GPU-worker files (`trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep`), one per GPU (replicas × TP). If you are not using model parallelism in Vllm, you should directly refer to `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` for nsight reports; If you are using model parallelism, nsight is NOT applied to the outer `VllmGenerationWorker` to avoid interfering with Ray's compiled DAG. Instead, `ray_workers_use_nsight` is enabled and vLLM's default nsight config is monkey-patched to use `capture-range=cudaProfilerApi` (deferred capture). This means the internal TP workers run under nsys with near-zero overhead until `start_gpu_profiling()` triggers `cudaProfilerStart()` on each worker via `collective_rpc`. The `vllm_tp_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` files are the nsight profiles from the internal TP workers. (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information).
 
 3. **File Location**: Profile files are saved in `/tmp/ray/session*/logs/nsight/` directory on each worker node. Ensure you check both `ls /tmp/ray/session_[0-9]*/logs/nsight` and `ls /tmp/ray/session_latest/logs/nsight` for the profiles, since the "latest" pointer may be stale.
 
-**Note for SLURM users with `ray.sub`**: When using `ray.sub` on SLURM, set `RAY_LOG_SYNC_FREQUENCY=$NUM_SEC` (e.g., `RAY_LOG_SYNC_FREQUENCY=30`) to ensure that the nsight profile files get copied from the container's ephemeral filesystem (`/tmp/ray`) to the persistent directory. The header node's files will be synced to ``$SLURM_JOB_ID-logs/ray`, and other nodes' files will be synced to `$SLURM_JOB_ID-logs/ray/$node_ip/` where `$node_ip` is the IP address of the node.
+**Note for SLURM users with `ray.sub`**: When using `ray.sub` on SLURM, set `RAY_LOG_SYNC_FREQUENCY=$NUM_SEC` (e.g., `RAY_LOG_SYNC_FREQUENCY=30`) to ensure that the nsight profile files get copied from the container's ephemeral filesystem (`/tmp/ray`) to the persistent directory. The head node's files will be synced to `$SLURM_JOB_ID-logs/ray`, and other nodes' files will be synced to `$SLURM_JOB_ID-logs/ray/$node_ip/` where `$node_ip` is the IP address of the node.
 
 ## Analyze Profile Files
 

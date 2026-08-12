@@ -147,6 +147,96 @@ def test_tags_travel_with_subset_slice_concat():
     assert joined.tags == m.tags
 
 
+def test_drop_removes_indices_and_keeps_remaining_rows():
+    """Rows at ``indices`` disappear; survivors keep their tags/seqlens."""
+    m = KVBatchMeta(
+        partition_id="p",
+        task_name="t",
+        sample_ids=["a", "b", "c", "d"],
+        sequence_lengths=[1, 2, 3, 4],
+        tags=[{"i": 0}, {"i": 1}, {"i": 2}, {"i": 3}],
+    )
+    remaining = m.drop([1, 3])
+    assert remaining.sample_ids == ["a", "c"]
+    assert remaining.sequence_lengths == [1, 3]
+    assert remaining.tags == [{"i": 0}, {"i": 2}]
+
+
+def test_drop_empty_indices_returns_identical_content():
+    """``drop([])`` returns a fresh copy with the same rows."""
+    m = KVBatchMeta(
+        partition_id="p",
+        task_name="t",
+        sample_ids=["a", "b"],
+        sequence_lengths=[1, 2],
+    )
+    out = m.drop([])
+    assert out.sample_ids == m.sample_ids
+    assert out.sequence_lengths == m.sequence_lengths
+    assert out is not m
+
+
+def test_drop_all_returns_none():
+    """Dropping every row returns ``None`` (callers chain into ``is None`` branches)."""
+    m = KVBatchMeta(
+        partition_id="p",
+        task_name="t",
+        sample_ids=["a", "b"],
+        tags=[{"i": 0}, {"i": 1}],
+    )
+    assert m.drop([0, 1]) is None
+
+
+def test_drop_indices_can_be_unordered_or_duplicated():
+    """Duplicate / out-of-order indices collapse via the internal set."""
+    m = KVBatchMeta(
+        partition_id="p",
+        task_name="t",
+        sample_ids=["a", "b", "c"],
+    )
+    assert m.drop([2, 0, 0]).sample_ids == ["b"]
+
+
+def test_with_fields_appends_and_dedupes_preserving_order():
+    """Merges into ``fields`` with order-preserving dedup."""
+    m = KVBatchMeta(
+        partition_id="p",
+        task_name="t",
+        sample_ids=["a"],
+        fields=["input_ids", "advantages"],
+    )
+    out = m.with_fields(["advantages", "logprobs"])
+    assert out.fields == ["input_ids", "advantages", "logprobs"]
+
+
+def test_with_fields_initializes_from_none():
+    """Seeds ``fields`` from the argument when previously ``None``."""
+    m = KVBatchMeta(partition_id="p", task_name="t", sample_ids=["a"])
+    out = m.with_fields(["x", "y", "x"])
+    assert out.fields == ["x", "y"]
+
+
+def test_with_fields_returns_independent_copy():
+    """Returned meta does not share mutable references with the source."""
+    m = KVBatchMeta(
+        partition_id="p",
+        task_name="t",
+        sample_ids=["a", "b"],
+        sequence_lengths=[1, 2],
+        extra_info={"step": 0},
+        tags=[{"x": 1}, {"x": 2}],
+    )
+    out = m.with_fields(["z"])
+    out.sample_ids.append("c")
+    out.sequence_lengths.append(3)  # type: ignore[union-attr]
+    out.extra_info["step"] = 99
+    out.tags[0]["x"] = 999  # type: ignore[index]
+    assert m.sample_ids == ["a", "b"]
+    assert m.sequence_lengths == [1, 2]
+    assert m.extra_info == {"step": 0}
+    assert m.tags == [{"x": 1}, {"x": 2}]
+
+
 def test_tags_none_when_either_side_missing_in_concat():
     """``concat`` drops tags if either side has none — symmetric with
     the ``sequence_lengths`` behavior."""

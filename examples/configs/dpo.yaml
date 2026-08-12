@@ -124,8 +124,11 @@ policy:
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
-    use_linear_ce_fusion_loss: false
-    linear_ce_fusion_chunk_size: 256
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+    use_fused_linear_logprobs: false
+    fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1
     activation_checkpointing: false
@@ -135,8 +138,9 @@ policy:
     fine_grained_activation_offloading: false
     # Modules to offload when fine_grained_activation_offloading is true.
     # Valid options: ["attn_norm", "qkv_linear", "core_attn", "attn_proj",
-    # "mlp_norm", "expert_fc1", "moe_act"]. "attn_proj" requires "core_attn".
-    # See: https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L1440-L1448
+    # "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp"].
+    # "attn_proj" requires "core_attn".
+    # See: https://github.com/NVIDIA/Megatron-LM/blob/d12f6c8c9aff51e166d872fd70151687a8e3f375/megatron/core/transformer/transformer_config.py#L1234-L1245
     offload_modules: null
     # recompute_granularity controls activation checkpointing depth.
     # "full": recompute all activations (default, max memory savings).
@@ -172,7 +176,9 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
 
     peft:
       enabled: false
@@ -320,3 +326,4 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

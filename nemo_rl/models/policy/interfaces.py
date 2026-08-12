@@ -178,26 +178,44 @@ class ColocatablePolicyInterface(PolicyInterface):
     def offload_after_refit(self) -> None:
         pass
 
+    def offload_to_cpu(self) -> None:
+        pass
+
     @abstractmethod
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass
 
     @abstractmethod
     def stream_weights_via_ipc_zmq(
-        self, *args: Any, **kwargs: Any
+        self,
+        buffer_size_bytes: int,
+        kv_scales: Optional[dict[str, float]] = None,
     ) -> list[ray.ObjectRef]:
         pass
 
     def stream_weights_via_http(
-        self, sglang_url_to_gpu_uuids: dict[str, list[str]]
+        self,
+        rollout_engine_urls: list[str],
+        buffer_size_bytes: int,
     ) -> list[ray.ObjectRef]:
-        """Stream model weights to SGLang servers via HTTP API.
+        """Stream model weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+            rollout_engine_urls: ``http://host:port`` base URLs of each
+                engine's ``node_rank=0`` SGLang HTTP server.
+            buffer_size_bytes: Max bucket size in bytes before flushing.
+
+        The rollout TP size (``num_gpus_per_engine``) is captured once via
+        ``set_rollout_num_gpus_per_engine`` and reused on every refit.
         """
         raise NotImplementedError(
             "stream_weights_via_http is not implemented for this policy worker"
+        )
+
+    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
+        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
+        raise NotImplementedError(
+            "set_rollout_num_gpus_per_engine is not implemented for this policy worker"
         )
 
     @abstractmethod
@@ -205,6 +223,22 @@ class ColocatablePolicyInterface(PolicyInterface):
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> list[ray.ObjectRef]:
         pass
+
+    def prepare_nccl_reshard_refit_info(
+        self,
+        train_parallelism: dict[str, int],
+        gen_parallelism: dict[str, int],
+        train_world_size: int,
+        gen_world_size: int,
+    ) -> Any:
+        """Prepare per-layer param metadata for nccl_reshard-based refit."""
+        raise NotImplementedError
+
+    def nccl_reshard_refit(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
+        """Sync weights to generation workers via the NCCL-reshard path."""
+        raise NotImplementedError
 
     @abstractmethod
     def prepare_for_lp_inference(self) -> None:

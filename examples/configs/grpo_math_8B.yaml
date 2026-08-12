@@ -7,6 +7,7 @@ grpo:
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
+    max_generation_failures: 0
 
 policy:
   model_name: "meta-llama/Llama-3.1-8B-Instruct"
@@ -60,3 +61,4 @@ policy:
 cluster:
   gpus_per_node: 8
   num_nodes: 1
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

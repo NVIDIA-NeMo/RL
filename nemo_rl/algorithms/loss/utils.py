@@ -22,6 +22,9 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.algorithms.x_token.loss_utils import (
+    prepare_xtoken_cross_tokenizer_loss_input,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
@@ -40,6 +43,7 @@ def prepare_loss_input(
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     d2t: Optional[torch.Tensor] = None,
+    chunk_size: Optional[int] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -52,6 +56,9 @@ def prepare_loss_input(
         context_parallel_group: Context parallel group.
         sampling_params: Sampling parameters.
         d2t: Draft to target token mapping.
+        chunk_size: Sequence-dim chunk size for the vocab-parallel logprob
+            computation (policy.logprob_chunk_size); avoids materializing
+            full-size float32 logits during training.
 
     Notes:
         vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
@@ -67,7 +74,10 @@ def prepare_loss_input(
     elif loss_fn.input_type == LossInputType.LOGPROB:
         # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
         # Keep normal path unchanged for standard logits (3D tensor).
-        if hasattr(loss_fn, "use_linear_ce_fusion") and loss_fn.use_linear_ce_fusion:
+        if (
+            hasattr(loss_fn, "use_fused_linear_logprobs")
+            and loss_fn.use_fused_linear_logprobs
+        ):
             logprobs = logits
             logprobs = logprobs.to(torch.float32)
             logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
@@ -80,6 +90,7 @@ def prepare_loss_input(
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
                 sampling_params=sampling_params,
+                chunk_size=chunk_size,
             )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
@@ -102,6 +113,8 @@ def prepare_loss_input(
                     vocab_parallel_group=vocab_parallel_group,
                     context_parallel_group=context_parallel_group,
                     sampling_params=None,  # no filtering
+                    # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
+                    chunk_size=None,
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
@@ -125,6 +138,34 @@ def prepare_loss_input(
             "student_topk_logprobs": student_topk_logprobs,
             "teacher_topk_logprobs": teacher_topk_logprobs,
             "H_all": H_all,
+        }
+    elif loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
+        # Rebuild each teacher's full-vocab logits from its per-rank CUDA IPC
+        # handles and do the shared CP-resolution the loss needs; the loss fn
+        # does the per-teacher projection / chunk-average / KL reductions and
+        # aggregates them by ``kd_loss_mode``. ``projection_matrix_paths`` drives
+        # the teacher count and which teachers are same-tokenizer (``None``). The
+        # TP/CP groups are derived from the student logits' own device mesh.
+        (
+            student_logits_contig,
+            teacher_full_logits_by_idx,
+            aligns_by_idx,
+            tp_group,
+            cp_group,
+        ) = prepare_xtoken_cross_tokenizer_loss_input(
+            logits,
+            data,
+            projection_matrix_paths=loss_fn.projection_matrix_paths,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+        loss_input = {
+            "logits": logits,
+            "student_logits_contig": student_logits_contig,
+            "teacher_full_logits_by_idx": teacher_full_logits_by_idx,
+            "aligns_by_idx": aligns_by_idx,
+            "tp_group": tp_group,
+            "cp_group": cp_group,
         }
     elif loss_fn.input_type == LossInputType.DRAFT:
         from megatron.core.transformer.multi_token_prediction import roll_tensor
@@ -205,7 +246,12 @@ def _pack_input_ids(
         padded_len = int((cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]).item())
         packed_start = int(cu_seqlens_q_padded[i].item())
         seq = torch.zeros(padded_len, dtype=input_ids.dtype, device=input_ids.device)
-        seq[:actual_len] = input_ids[i, :actual_len]
+        # The packer absorbs bin-level alignment padding into the last
+        # sequence's effective length (see _get_pack_sequence_parameters_for_megatron),
+        # so cu_seqlens can exceed the unpacked row width. Copy only real
+        # tokens; the tail stays zero and is excluded from the loss by token_mask.
+        copy_len = min(actual_len, input_ids.shape[1])
+        seq[:copy_len] = input_ids[i, :copy_len]
         if roll_shift != 0:
             seq = seq.roll(shifts=roll_shift, dims=0)
         sharded = _get_tokens_on_this_cp_rank(seq, cp_rank, cp_size, seq_dim=0)
@@ -225,6 +271,7 @@ def prepare_packed_loss_input(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    chunk_size: Optional[int] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input from packed logits in a single fused pass.
 
@@ -244,6 +291,9 @@ def prepare_packed_loss_input(
         vocab_parallel_group: Vocab parallel group.
         context_parallel_group: Context parallel group.
         sampling_params: Sampling parameters.
+        chunk_size: Sequence-dim chunk size for the logprob computation
+            (policy.logprob_chunk_size); avoids materializing full-size
+            float32 logits during training.
 
     Returns:
         tuple(loss_input, maybe_updated_data)
@@ -283,8 +333,15 @@ def prepare_packed_loss_input(
         roll_shift=-1,
     )
 
+    # With chunking, keep logits in their original dtype: the chunked logprob
+    # kernel casts each chunk to float32 internally.
+    use_chunking = chunk_size is not None and not need_top_k_or_top_p_filtering(
+        sampling_params
+    )
+    logits_for_logprobs = logits if use_chunking else logits.to(torch.float32)
+
     logprobs = from_parallel_logits_to_logprobs_packed_sequences(
-        logits.to(torch.float32),
+        logits_for_logprobs,
         packed_rolled_targets,
         cu_seqlens_q_padded,
         unpacked_seqlen,
@@ -294,6 +351,7 @@ def prepare_packed_loss_input(
         inference_only=False,
         cp_group=context_parallel_group,
         sampling_params=sampling_params,
+        chunk_size=chunk_size if use_chunking else None,
         target_is_pre_rolled=True,
     )
 
@@ -309,7 +367,7 @@ def prepare_packed_loss_input(
         ):
             data["curr_logprobs_unfiltered"] = (
                 from_parallel_logits_to_logprobs_packed_sequences(
-                    logits.to(torch.float32),
+                    logits_for_logprobs,
                     packed_rolled_targets,
                     cu_seqlens_q_padded,
                     unpacked_seqlen,
@@ -319,6 +377,7 @@ def prepare_packed_loss_input(
                     inference_only=False,
                     cp_group=context_parallel_group,
                     sampling_params=None,
+                    chunk_size=chunk_size if use_chunking else None,
                     target_is_pre_rolled=True,
                 )
             )

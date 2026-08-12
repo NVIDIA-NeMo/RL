@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,15 +27,35 @@ from nemo_rl.algorithms.advantage_estimator import (
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
+    AdvEstimatorConfig,
+    AsyncGRPOConfig,
+    GRPOConfig,
     MasterConfig,
-    _default_grpo_save_state,
+    RewardPenaltyConfig,
+    RewardScalingConfig,
+    _apply_configured_message_level_advantage_penalties,
+    _apply_mask_sample_filter,
+    _apply_message_level_advantage_penalties,
+    _get_grpo_save_state,
+    _initial_grpo_save_state,
+    _initial_policy_generation_stale,
+    _raise_if_reward_penalties_enabled_without_nemo_gym,
+    _resolve_logprob_skip_flags,
+    _resolve_message_level_advantage_penalties,
+    _save_async_replay_buffer_checkpoint,
+    _should_use_async_rollouts,
+    _validate_multimodal_dedup_capability,
+    _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
     grpo_train,
+    refit_policy_generation,
+    setup,
     validate,
 )
+from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -42,127 +63,125 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollouts import calculate_rewards
+from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
     create_mock_batch,
 )
 
-# ============================================================================
-# Stub classes for async GRPO testing (non-Ray versions for easy mocking)
-# ============================================================================
+
+def _mock_policy_generation() -> MagicMock:
+    """Generation-interface stand-in for grpo_train / async_grpo_train tests."""
+    policy_generation = MagicMock(spec=MegatronGeneration)
+    policy_generation.requires_kv_scale_sync = False
+    policy_generation.get_logger_metrics.return_value = {}
+    return policy_generation
 
 
-class StubReplayBuffer:
-    """Non-Ray stub of ReplayBuffer for unit testing
+def test_save_async_replay_buffer_checkpoint(tmp_path):
+    replay_buffer = MagicMock()
+    replay_buffer.save_to_path.remote.return_value = 7
 
-    Each method returns a MagicMock with a 'remote' attribute that can be called.
-    """
-
-    def __init__(self, initial_size=10, mock_batch=None, mock_rollout_metrics=None):
-        self._size = initial_size
-        self._trajectories = []
-        self._mock_batch = mock_batch
-        self._mock_rollout_metrics = mock_rollout_metrics or {}
-
-    @property
-    def size(self):
-        """Return a mock that returns buffer size when .remote() is called"""
-        mock = MagicMock()
-        mock.remote = MagicMock(return_value=self._size)  # ray.get will extract this
-        return mock
-
-    @property
-    def sample(self):
-        """Return a mock that returns sample result when .remote() is called"""
-
-        def _sample(num_prompt_groups, current_weight_version, max_age_steps):
-            # Return proper trajectory structure expected by async GRPO
-            trajectories = [
-                {
-                    "batch": self._mock_batch,
-                    "rollout_metrics": self._mock_rollout_metrics,
-                }
-                for _ in range(num_prompt_groups)
-            ]
-            return {
-                "trajectories": trajectories,
-                "avg_trajectory_age": 0.5,
-            }
-
-        mock = MagicMock()
-        mock.remote = MagicMock(
-            side_effect=lambda *args, **kwargs: _sample(*args, **kwargs)
+    with patch("nemo_rl.algorithms.grpo.ray.get", side_effect=lambda value: value):
+        count = _save_async_replay_buffer_checkpoint(
+            replay_buffer,
+            str(tmp_path),
         )
-        return mock
 
-    @property
-    def get_debug_info(self):
-        """Return a mock that returns debug info when .remote() is called"""
-        mock = MagicMock()
-        mock.remote = MagicMock(
-            return_value={
-                "total_trajectories": self._size,
-                "trajectory_versions": [0],
-                "target_weight_versions": [0],
-                "max_size": 100,
+    assert count == 7
+    replay_buffer.save_to_path.remote.assert_called_once_with(
+        str(tmp_path / "replay_buffer.pt")
+    )
+
+
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
+    mock_ray: MagicMock,
+) -> None:
+    mock_ray.get.return_value = [True]
+    policy = MagicMock()
+    policy_generation = MagicMock()
+    # Match VllmGeneration's default; a bare MagicMock would auto-create a truthy
+    # weight_synchronizer and refit_policy_generation would delegate to it instead
+    # of taking the colocated IPC path under test.
+    policy_generation.weight_synchronizer = None
+    kv_scales = {"layer.0": 0.5}
+
+    refit_policy_generation(
+        policy,
+        policy_generation,
+        colocated_inference=True,
+        _refit_buffer_size_gb=1.0,
+        kv_scales=kv_scales,
+    )
+
+    policy.stream_weights_via_ipc_zmq.assert_called_once_with(
+        buffer_size_bytes=1024**3,
+        kv_scales=kv_scales,
+    )
+
+
+class TestMaskSampleFilter:
+    def test_masks_env_flagged_samples(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
+                "mask_sample": torch.tensor([False, True, True]),
             }
         )
-        return mock
+
+        num_masked = _apply_mask_sample_filter(repeated_batch)
+
+        assert num_masked == 2
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.0, 0.0])
+        )
+
+    def test_masks_list_valued_mask_sample(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
+                "mask_sample": [True, False, True],
+            }
+        )
+
+        num_masked = _apply_mask_sample_filter(repeated_batch)
+
+        assert num_masked == 2
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([0.0, 0.5, 0.0])
+        )
+
+    def test_missing_mask_sample_is_noop(self):
+        repeated_batch = BatchedDataDict(
+            {"loss_multiplier": torch.tensor([1.0, 0.5, 1.0])}
+        )
+
+        num_masked = _apply_mask_sample_filter(repeated_batch)
+
+        assert num_masked == 0
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
+        )
 
 
-class StubAsyncTrajectoryCollector:
-    """Non-Ray stub of AsyncTrajectoryCollector for unit testing
+def test_initial_policy_generation_stale() -> None:
+    generation = MagicMock()
+    generation.weight_synchronizer.is_stale = False
 
-    Each method is a property that returns a MagicMock with a 'remote' attribute.
-    """
+    assert not _initial_policy_generation_stale(generation, completed_steps=0)
+    assert _initial_policy_generation_stale(generation, completed_steps=1)
 
-    @property
-    def start_collection(self):
-        """Start collection - returns a remote-callable mock"""
-        mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())  # Returns a fake ObjectRef
-        return mock
-
-    @property
-    def set_weight_version(self):
-        """Set weight version - returns a remote-callable mock"""
-        mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())
-        return mock
-
-    @property
-    def pause(self):
-        """Pause collection - returns a remote-callable mock"""
-        mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())
-        return mock
-
-    @property
-    def resume(self):
-        """Resume collection - returns a remote-callable mock"""
-        mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())
-        return mock
-
-    @property
-    def stop(self):
-        """Stop collection - returns a remote-callable mock"""
-        mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())
-        return mock
-
-    @property
-    def wait_for_stop(self):
-        """Wait for stop - returns a remote-callable mock"""
-        mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())
-        return mock
+    generation.weight_synchronizer.is_stale = True
+    assert _initial_policy_generation_stale(generation, completed_steps=0)
 
 
 @pytest.fixture
@@ -262,37 +281,45 @@ def mock_grpo_components():
     # Create mock master config
     master_config = MasterConfig.model_construct(
         **{
-            "grpo": {
-                "max_num_steps": 5,
-                "max_num_epochs": 2,
-                "num_prompts_per_step": 1,
-                "num_generations_per_prompt": 1,
-                "max_rollout_turns": 1,
-                "val_period": 100,
-                "val_batch_size": 1,
-                "val_at_start": False,
-                "val_at_end": False,
-                "max_val_samples": 10,
-                "seed": 42,
-                "advantage_normalization": "global",
-                "use_leave_one_out_baseline": False,
-                "normalize_rewards": False,
-                "overlong_filtering": False,
-                "reward_scaling": {"enabled": False},
-                "reward_shaping": {"enabled": False},
-                "use_dynamic_sampling": False,
-                "async_grpo": {
-                    "enabled": False,
-                    "max_trajectory_age_steps": 1,
-                },
-                "seq_logprob_error_threshold": None,
-                "adv_estimator": {
-                    "name": "grpo",
-                    "use_leave_one_out_baseline": False,
-                    "normalize_rewards": True,
-                },
-            },
+            "grpo": GRPOConfig.model_construct(
+                max_num_steps=5,
+                max_num_epochs=2,
+                num_prompts_per_step=1,
+                num_generations_per_prompt=1,
+                max_rollout_turns=1,
+                val_period=100,
+                val_start_at=-1,
+                val_num_generations_per_prompt=1,
+                val_batch_size=1,
+                val_at_start=False,
+                val_at_end=False,
+                max_val_samples=10,
+                stop_at_validation_metric=None,
+                stop_at_validation_threshold=None,
+                seed=42,
+                advantage_normalization="global",
+                use_leave_one_out_baseline=False,
+                normalize_rewards=False,
+                overlong_filtering=False,
+                advantage_clip_low=None,
+                advantage_clip_high=None,
+                reward_scaling=RewardScalingConfig.model_construct(enabled=False),
+                reward_shaping=RewardShapingConfig.model_construct(enabled=False),
+                use_dynamic_sampling=False,
+                async_grpo=AsyncGRPOConfig.model_construct(
+                    enabled=False,
+                    max_trajectory_age_steps=1,
+                    max_generation_failures=0,
+                ),
+                seq_logprob_error_threshold=None,
+                adv_estimator=AdvEstimatorConfig.model_construct(
+                    name="grpo",
+                    use_leave_one_out_baseline=False,
+                    normalize_rewards=True,
+                ),
+            ),
             "policy": {
+                "precision": "bfloat16",
                 "train_global_batch_size": 1,
                 "train_micro_batch_size": 1,
                 "max_total_sequence_length": 2048,
@@ -301,6 +328,9 @@ def mock_grpo_components():
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": None,
+                    "val_temperature": 1.0,
+                    "val_top_p": 1.0,
+                    "val_top_k": None,
                     "backend": "vllm",
                     "colocated": {"enabled": True},
                     "vllm_cfg": {"async_engine": True},  # Support async mode
@@ -342,7 +372,678 @@ def mock_grpo_components():
     }
 
 
-def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
+def test_get_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
+    assert _get_grpo_save_state({}) == _initial_grpo_save_state()
+
+    loaded_state = {
+        "consumed_samples": 32,
+        "current_step": 3,
+        "current_epoch": 1,
+        "total_steps": 13,
+        "val:accuracy": 0.75,
+    }
+
+    save_state = _get_grpo_save_state(loaded_state)
+
+    assert vars(save_state) == {
+        "consumed_samples": 32,
+        "current_step": 3,
+        "current_epoch": 1,
+        "total_steps": 13,
+        "total_valid_tokens": 0,
+        "val_reward": -99999999.0,
+    }
+    assert "total_valid_tokens" not in loaded_state
+    assert not hasattr(save_state, "val:accuracy")
+
+
+def test_grpo_save_state_checkpoint_round_trip():
+    save_state = _initial_grpo_save_state()
+    save_state.current_step = 4
+    save_state.total_steps = 4
+    save_state.total_valid_tokens = 128
+    save_state.val_reward = 0.8
+    setattr(save_state, "val:accuracy", 0.8)
+
+    restored_state = _get_grpo_save_state(vars(save_state))
+
+    assert restored_state.current_step == 4
+    assert restored_state.total_steps == 4
+    assert restored_state.total_valid_tokens == 128
+    assert restored_state.val_reward == 0.8
+    assert not hasattr(restored_state, "val:accuracy")
+
+
+def test_grpo_config_dynamic_sampling_default_matches_exemplar():
+    assert GRPOConfig().dynamic_sampling_max_gen_batches == 10
+
+
+def test_grpo_config_nested_defaults_are_populated():
+    first = GRPOConfig()
+    second = GRPOConfig()
+
+    assert isinstance(first.async_grpo, AsyncGRPOConfig)
+    assert isinstance(first.adv_estimator, AdvEstimatorConfig)
+    assert isinstance(first.reward_shaping, RewardShapingConfig)
+    assert isinstance(first.reward_scaling, RewardScalingConfig)
+    assert first.async_grpo.enabled is False
+    assert first.async_grpo.max_generation_failures == 0
+    assert first.adv_estimator.use_leave_one_out_baseline is True
+    assert first.adv_estimator.normalize_rewards is True
+    assert first.adv_estimator.minus_baseline is True
+    assert first.async_grpo is not second.async_grpo
+    assert first.adv_estimator is not second.adv_estimator
+    assert first.reward_shaping is not second.reward_shaping
+    assert first.reward_scaling is not second.reward_scaling
+
+
+def _mock_seq_logprob_error_result() -> dict[str, object]:
+    return {
+        "max_seq_mult_prob_error": 0.0,
+        "mean_seq_mult_prob_error": 0.0,
+        "min_seq_mult_prob_error": 0.0,
+        "max_seq_mult_prob_error_after_mask": 0.0,
+        "mean_seq_mult_prob_error_after_mask": 0.0,
+        "min_seq_mult_prob_error_after_mask": 0.0,
+        "num_masked_seqs": 0,
+        "masked_correct_pct": 0.0,
+    }
+
+
+def _logged_train_metrics_with_key(logger, key: str):
+    for call in logger.log_metrics.call_args_list:
+        metrics = call.args[0]
+        if call.kwargs.get("prefix") == "train" and key in metrics:
+            return metrics
+    raise AssertionError(f"No train metrics payload contained {key}")
+
+
+def test_apply_message_level_advantage_penalties_targets_flagged_message_spans():
+    train_data = BatchedDataDict(
+        {
+            "advantages": torch.tensor(
+                [
+                    [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+                    [10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+                ]
+            )
+        }
+    )
+    repeated_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "token_ids": torch.tensor([1, 2]),
+                        "is_invalid_tool_call": True,
+                    },
+                    {
+                        "role": "assistant",
+                        "token_ids": torch.tensor([3, 4]),
+                        "generation_logprobs": torch.tensor([0.1, 0.2]),
+                        "is_invalid_tool_call": True,
+                    },
+                    {
+                        "role": "assistant",
+                        "token_ids": torch.tensor([5, 6]),
+                        "generation_logprobs": torch.tensor([0.3, 0.4]),
+                    },
+                ],
+                [
+                    {
+                        "role": "user",
+                        "token_ids": torch.tensor([7]),
+                    },
+                    {
+                        "role": "assistant",
+                        "token_ids": torch.tensor([8, 9, 10]),
+                        "generation_logprobs": torch.tensor([0.5, 0.6, 0.7]),
+                        "has_malformed_thinking": True,
+                    },
+                    {
+                        "role": "assistant",
+                        "token_ids": torch.tensor([11, 12]),
+                        "generation_logprobs": torch.tensor([0.8, 0.9]),
+                    },
+                ],
+            ]
+        }
+    )
+    _apply_message_level_advantage_penalties(
+        train_data=train_data,
+        message_logs=repeated_batch["message_log"],
+        invalid_tool_call_advantage=-5.0,
+        malformed_thinking_advantage=-7.0,
+    )
+
+    expected = torch.tensor(
+        [
+            [0.0, 1.0, -5.0, -5.0, 4.0, 5.0],
+            [10.0, -7.0, -7.0, -7.0, 14.0, 15.0],
+        ]
+    )
+    torch.testing.assert_close(train_data["advantages"], expected)
+
+
+def test_apply_message_level_advantage_penalties_materializes_broadcasted_advantages():
+    per_sample_advantages = torch.tensor([[1.0], [10.0]])
+    train_data = BatchedDataDict({"advantages": per_sample_advantages.expand(2, 6)})
+    message_logs = [
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([1]),
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([2, 3, 4]),
+                "generation_logprobs": torch.tensor([0.1, 0.2, 0.3]),
+                "is_invalid_tool_call": True,
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([5, 6]),
+                "generation_logprobs": torch.tensor([0.4, 0.5]),
+            },
+        ],
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([7, 8]),
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([9, 10]),
+                "generation_logprobs": torch.tensor([0.6, 0.7]),
+                "has_malformed_thinking": True,
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([11, 12]),
+                "generation_logprobs": torch.tensor([0.8, 0.9]),
+            },
+        ],
+    ]
+
+    _apply_message_level_advantage_penalties(
+        train_data=train_data,
+        message_logs=message_logs,
+        invalid_tool_call_advantage=-5.0,
+        malformed_thinking_advantage=-7.0,
+    )
+
+    expected = torch.tensor(
+        [
+            [1.0, -5.0, -5.0, -5.0, 1.0, 1.0],
+            [10.0, 10.0, -7.0, -7.0, 10.0, 10.0],
+        ]
+    )
+    torch.testing.assert_close(train_data["advantages"], expected)
+    torch.testing.assert_close(per_sample_advantages, torch.tensor([[1.0], [10.0]]))
+    assert train_data["advantages"].stride(-1) != 0
+
+
+def test_apply_configured_message_level_advantage_penalties_noops_when_disabled(
+    mock_grpo_components,
+):
+    train_data = BatchedDataDict(
+        {"advantages": torch.tensor([[1.0, 2.0]], dtype=torch.float32)}
+    )
+    message_logs = [
+        [
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([1, 2]),
+                "generation_logprobs": torch.tensor([0.1, 0.2]),
+                "is_invalid_tool_call": True,
+            }
+        ]
+    ]
+    master_config = mock_grpo_components["master_config"]
+
+    with patch("nemo_rl.algorithms.grpo._should_use_nemo_gym") as should_use_nemo_gym:
+        _apply_configured_message_level_advantage_penalties(
+            train_data, message_logs, master_config
+        )
+
+    should_use_nemo_gym.assert_not_called()
+    torch.testing.assert_close(
+        train_data["advantages"], torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+    )
+
+
+def test_apply_configured_message_level_advantage_penalties_uses_config(
+    capsys, mock_grpo_components
+):
+    train_data = BatchedDataDict(
+        {"advantages": torch.tensor([[0.0, 1.0, 2.0]], dtype=torch.float32)}
+    )
+    message_logs = [
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([1]),
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([2, 3]),
+                "generation_logprobs": torch.tensor([0.1, 0.2]),
+                "is_invalid_tool_call": True,
+            },
+        ]
+    ]
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.invalid_tool_call_advantage = -4.0
+    master_config.grpo.malformed_thinking_advantage = -6.0
+
+    with patch(
+        "nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=True
+    ) as should_use_nemo_gym:
+        _apply_configured_message_level_advantage_penalties(
+            train_data, message_logs, master_config, log_config=True
+        )
+
+    should_use_nemo_gym.assert_called_once_with(master_config)
+    torch.testing.assert_close(
+        train_data["advantages"], torch.tensor([[0.0, -4.0, -4.0]])
+    )
+    captured = capsys.readouterr()
+    assert "Invalid tool call advantage: -4.0" in captured.out
+    assert "Malformed thinking advantage: -6.0" in captured.out
+
+
+def test_resolve_message_level_advantage_penalties_requires_nemo_gym(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.invalid_tool_call_advantage = -5.0
+
+    with patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False):
+        with pytest.raises(ValueError, match="NeMo-Gym path"):
+            _resolve_message_level_advantage_penalties(master_config)
+
+
+def test_raise_if_reward_penalties_enabled_without_nemo_gym_noops_when_all_flags_false(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.reward_penalties = RewardPenaltyConfig()
+
+    _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=False
+    )
+
+
+@pytest.mark.parametrize(
+    "penalty_flag",
+    [
+        "penalize_duplicated_reasoning",
+        "penalize_empty_final_answer",
+        "penalize_unwanted_tokens",
+        "penalize_malformed_think_tag",
+    ],
+)
+def test_raise_if_reward_penalties_enabled_without_nemo_gym_raises(
+    mock_grpo_components,
+    penalty_flag,
+):
+    master_config = mock_grpo_components["master_config"]
+    penalty_kwargs: dict[str, Any] = {penalty_flag: True}
+    if penalty_flag == "penalize_unwanted_tokens":
+        penalty_kwargs["token_ids"] = {"unwanted": [2]}
+    master_config.reward_penalties = RewardPenaltyConfig(**penalty_kwargs)
+
+    with pytest.raises(ValueError, match="reward_penalties require the NeMo-Gym path"):
+        _raise_if_reward_penalties_enabled_without_nemo_gym(
+            master_config, enable_nemo_gym=False
+        )
+
+
+def test_raise_if_reward_penalties_enabled_without_nemo_gym_allows_nemo_gym(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.reward_penalties = RewardPenaltyConfig(
+        penalize_empty_final_answer=True
+    )
+
+    _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=True
+    )
+
+
+def test_raise_if_message_level_advantage_penalties_enabled_noops_when_unset(
+    mock_grpo_components,
+):
+    from nemo_rl.algorithms.grpo_sync import (
+        _raise_if_message_level_advantage_penalties_enabled,
+    )
+
+    master_config = mock_grpo_components["master_config"]
+    _raise_if_message_level_advantage_penalties_enabled(master_config)
+
+
+def test_raise_if_message_level_advantage_penalties_enabled_raises_when_set(
+    mock_grpo_components,
+):
+    from nemo_rl.algorithms.grpo_sync import (
+        _raise_if_message_level_advantage_penalties_enabled,
+    )
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.invalid_tool_call_advantage = -5.0
+    with pytest.raises(NotImplementedError, match="data_plane.enabled=true"):
+        _raise_if_message_level_advantage_penalties_enabled(master_config)
+
+
+def test_multimodal_dedup_rejects_unqualified_transfer_paths(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.deduplicate_multimodal_data = True
+    master_config.policy["generation"]["backend"] = "sglang"
+
+    with pytest.raises(NotImplementedError, match="backend=vllm"):
+        _validate_multimodal_dedup_capability(master_config)
+
+    master_config.policy["generation"]["backend"] = "vllm"
+    master_config.data_plane = {"enabled": True}
+    with pytest.raises(NotImplementedError, match="data_plane.enabled=false"):
+        _validate_multimodal_dedup_capability(master_config)
+
+    master_config.data_plane = {"enabled": False}
+    _validate_multimodal_dedup_capability(master_config)
+
+
+def test_grpo_sync_seq_logprob_error_helper_accepts_dict_result(monkeypatch):
+    from nemo_rl.algorithms import grpo_sync as grpo_sync_mod
+
+    seq_error_result = {
+        "max_seq_mult_prob_error": 2.5,
+        "mean_seq_mult_prob_error": 1.5,
+        "min_seq_mult_prob_error": 1.0,
+        "max_seq_mult_prob_error_after_mask": 1.2,
+        "mean_seq_mult_prob_error_after_mask": 1.1,
+        "min_seq_mult_prob_error_after_mask": 1.0,
+        "num_masked_seqs": 2,
+        "masked_correct_pct": 0.5,
+    }
+
+    def fake_masking(train_data, rewards, seq_logprob_error_threshold):
+        assert seq_logprob_error_threshold == 1.2
+        assert rewards.tolist() == [1.0, 0.0]
+        train_data["sample_mask"] = torch.tensor([1.0, 0.0])
+        return seq_error_result
+
+    monkeypatch.setattr(
+        grpo_sync_mod,
+        "compute_and_apply_seq_logprob_error_masking",
+        fake_masking,
+    )
+
+    sample_mask, metrics = grpo_sync_mod._compute_seq_logprob_error_metrics(
+        token_mask=torch.ones(2, 3),
+        sample_mask=torch.ones(2),
+        prev_logprobs=torch.zeros(2, 3),
+        generation_logprobs=torch.zeros(2, 3),
+        rewards=torch.tensor([1.0, 0.0]),
+        seq_logprob_error_threshold=1.2,
+    )
+
+    assert torch.equal(sample_mask, torch.tensor([1.0, 0.0]))
+    assert metrics["max_seq_mult_prob_error"] == 2.5
+    assert metrics["mean_seq_mult_prob_error"] == 1.5
+    assert metrics["min_seq_mult_prob_error"] == 1.0
+    assert metrics["max_seq_mult_prob_error_after_mask"] == 1.2
+    assert metrics["mean_seq_mult_prob_error_after_mask"] == 1.1
+    assert metrics["min_seq_mult_prob_error_after_mask"] == 1.0
+    assert metrics["num_masked_seqs_by_logprob_error"] == 2
+    assert metrics["masked_correct_pct"] == 0.5
+
+
+# ============================================================================
+# Stub classes for async GRPO testing (non-Ray versions for easy mocking)
+# ============================================================================
+
+
+class StubReplayBuffer:
+    """Non-Ray stub of ReplayBuffer for unit testing
+
+    Each method returns a MagicMock with a 'remote' attribute that can be called.
+    """
+
+    def __init__(self, initial_size=10, mock_batch=None, mock_rollout_metrics=None):
+        self._size = initial_size
+        self._trajectories = []
+        self._mock_batch = mock_batch
+        self._mock_rollout_metrics = mock_rollout_metrics or {}
+
+    @property
+    def size(self):
+        """Return a mock that returns buffer size when .remote() is called"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=self._size)  # ray.get will extract this
+        return mock
+
+    @property
+    def sample(self):
+        """Return a mock that returns sample result when .remote() is called"""
+
+        def _sample(num_prompt_groups, current_weight_version, max_age_steps):
+            # Return proper trajectory structure expected by async GRPO
+            trajectories = [
+                {
+                    "batch": self._mock_batch,
+                    "rollout_metrics": self._mock_rollout_metrics,
+                }
+                for _ in range(num_prompt_groups)
+            ]
+            return {
+                "trajectories": trajectories,
+                "avg_trajectory_age": 0.5,
+            }
+
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            side_effect=lambda *args, **kwargs: _sample(*args, **kwargs)
+        )
+        return mock
+
+    @property
+    def get_debug_info(self):
+        """Return a mock that returns debug info when .remote() is called"""
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            return_value={
+                "total_trajectories": self._size,
+                "trajectory_versions": [0],
+                "target_weight_versions": [0],
+                "max_size": 100,
+            }
+        )
+        return mock
+
+    @property
+    def state_dict(self):
+        """Return a mock that returns checkpointable buffer state."""
+        trajectories = self._trajectories or [
+            {
+                "batch": self._mock_batch,
+                "rollout_metrics": self._mock_rollout_metrics,
+            }
+            for _ in range(self._size)
+        ]
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            return_value={
+                "trajectories": list(trajectories),
+                "trajectory_versions": [0] * len(trajectories),
+                "target_weight_versions": [0] * len(trajectories),
+                "last_target_weight_already_generated": 0,
+                "max_size": self._size,
+            }
+        )
+        return mock
+
+    @property
+    def load_state_dict(self):
+        """Return a mock that accepts restored buffer state."""
+
+        def _load_state_dict(state, *args, **kwargs):
+            self._trajectories = list(state["trajectories"])
+            self._size = len(self._trajectories)
+
+        mock = MagicMock()
+        mock.remote = MagicMock(side_effect=_load_state_dict)
+        return mock
+
+    @property
+    def save_to_path(self):
+        """Return a mock that checkpoints state without a driver-sized return."""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=self._size)
+        return mock
+
+    @property
+    def load_from_path(self):
+        """Return compact restore metadata."""
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            return_value={
+                "num_trajectories": self._size,
+                "next_ng_task_index": 0,
+            }
+        )
+        return mock
+
+    @property
+    def get_trajectories_needed(self):
+        """Return a mock that reports how many prompt groups are still needed."""
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            side_effect=lambda _target_step, num_prompts_per_step, *_args: max(
+                0, num_prompts_per_step - self._size
+            )
+        )
+        return mock
+
+    @property
+    def has_complete_batch(self):
+        """Return a mock that reports whether the current step can train."""
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            side_effect=lambda _target_step, num_prompts_per_step, *_args: (
+                self._size >= num_prompts_per_step
+            )
+        )
+        return mock
+
+
+class StubAsyncTrajectoryCollector:
+    """Non-Ray stub of AsyncTrajectoryCollector for unit testing.
+
+    Actor methods expose MagicMocks with a ``remote`` attribute.
+    """
+
+    def __init__(self, health_side_effect=None):
+        self.check_health = MagicMock()
+        self.check_health.remote = MagicMock(
+            return_value=None, side_effect=health_side_effect
+        )
+
+    @property
+    def start_collection(self):
+        """Start collection - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())  # Returns a fake ObjectRef
+        return mock
+
+    @property
+    def set_weight_version(self):
+        """Set weight version - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def pause(self):
+        """Pause collection - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def resume(self):
+        """Resume collection - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def prepare_for_refit(self):
+        """Prepare for refit - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def resume_after_refit(self):
+        """Resume after refit - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def stop(self):
+        """Stop collection - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def wait_for_stop(self):
+        """Wait for stop - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def get_efficiency_metrics(self):
+        """Get efficiency metrics - returns a remote-callable mock.
+
+        Returns an empty dict so the driver's efficiency-summary aggregation
+        (which iterates ``.items()``) is exercised without real collector timing.
+        """
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={})
+        return mock
+
+    @property
+    def get_dataloader_state(self):
+        """Return a remote-callable mock yielding a checkpointable dataloader state.
+
+        Exercised by async_grpo_train's checkpoint-save path, which persists the
+        collector's dataloader state alongside the replay buffer.
+        """
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={})
+        return mock
+
+    @property
+    def get_rollouts_state(self):
+        """Return a remote-callable mock yielding collector rollout state."""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={NEXT_NEMO_GYM_TASK_INDEX_KEY: 0})
+        return mock
+
+
+def mock_async_grpo_infrastructure(
+    mock_batch,
+    mock_rollout_metrics,
+    seq_logprob_error_result=None,
+    collector_health_side_effect=None,
+):
     """
     Context manager that mocks all async GRPO infrastructure (Ray actors, venv, etc).
 
@@ -358,7 +1059,9 @@ def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
         mock_batch=mock_batch,
         mock_rollout_metrics=mock_rollout_metrics,
     )
-    stub_collector = StubAsyncTrajectoryCollector()
+    stub_collector = StubAsyncTrajectoryCollector(
+        health_side_effect=collector_health_side_effect
+    )
 
     # Patch venv creation
     stack.enter_context(
@@ -433,14 +1136,171 @@ def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
     )
 
     # Mock compute_and_apply_seq_logprob_error_masking to avoid needing real logprob data
+    seq_logprob_error_result = (
+        seq_logprob_error_result or _mock_seq_logprob_error_result()
+    )
     stack.enter_context(
         patch(
             "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
-            return_value=(0.0, 0, 0.0),
+            return_value=seq_logprob_error_result,
         )
     )
 
     return stack
+
+
+def mock_sync_grpo_infrastructure(policy):
+    """Context manager that mocks the TQ/data-plane infrastructure of grpo_train_sync.
+
+    Mirrors ``mock_async_grpo_infrastructure``: the Ray rollout actor and the
+    TQ round-trips are stubbed so the driver loop runs for real, with small
+    real tensors standing in for the per-sample slices the driver computes
+    against. ``validate_sync`` is intentionally left unpatched so tests can
+    install their own capturing mock.
+    """
+    stack = ExitStack()
+
+    # Slice returned by the stubbed rollout actor; baseline/std are computed
+    # for real on the driver from these fields.
+    driver_carry = BatchedDataDict(
+        {
+            "total_reward": torch.tensor([1.0]),
+            "prompt_ids_for_adv": torch.tensor([[1, 2, 3]]),
+            "input_lengths": torch.tensor([4]),
+            "loss_multiplier": torch.tensor([1.0]),
+            "truncated": torch.tensor([False]),
+            "length": torch.tensor([3]),
+        }
+    )
+    meta = MagicMock()
+    meta.fields = ["input_ids"]
+    rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    rollout_actor = MagicMock()
+    rollout_actor.rollout_to_tq.remote.return_value = (
+        meta,
+        driver_carry,
+        rollout_metrics,
+        {},
+    )
+    rollout_actor_cls = MagicMock()
+    rollout_actor_cls.options.return_value.remote.return_value = rollout_actor
+    stack.enter_context(
+        patch("nemo_rl.algorithms.grpo_sync.SyncRolloutActor", rollout_actor_cls)
+    )
+    stack.enter_context(
+        patch("nemo_rl.algorithms.grpo_sync.make_actor_runtime_env", return_value={})
+    )
+    # The only ray.get on the driver path receives the stub actor's plain tuple.
+    stack.enter_context(patch("ray.get", side_effect=lambda ref: ref))
+
+    stack.enter_context(
+        patch("nemo_rl.algorithms.grpo_sync.refit_policy_generation", return_value=None)
+    )
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo_sync._compute_seq_logprob_error_metrics",
+            return_value=(torch.ones(1), _mock_seq_logprob_error_result()),
+        )
+    )
+    adv_estimator = MagicMock()
+    adv_estimator.compute_advantage.return_value = torch.zeros(1, 4)
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo_sync._create_advantage_estimator",
+            return_value=adv_estimator,
+        )
+    )
+    stack.enter_context(
+        patch("nemo_rl.algorithms.grpo_sync.print_performance_metrics", return_value={})
+    )
+
+    # TQ-mediated policy methods: per-token slices read back from the data
+    # plane, and train results in the same shape as ``policy.train``.
+    dp_bank = {
+        "generation_logprobs": torch.zeros(1, 4),
+        "token_mask": torch.ones(1, 4),
+        "prev_logprobs": torch.zeros(1, 4),
+        "reference_policy_logprobs": torch.zeros(1, 4),
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+    }
+    policy.read_from_dataplane.side_effect = lambda meta, select_fields, **kw: (
+        BatchedDataDict({k: dp_bank[k].clone() for k in select_fields})
+    )
+    policy.train_from_meta.return_value = policy.train.return_value
+    policy.tq_partition_id = 0
+
+    return stack
+
+
+def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components):
+    """A fatal collector health result aborts the trainer and still cleans up."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    with (
+        mock_async_grpo_infrastructure(
+            mock_batch,
+            mock_rollout_metrics,
+            collector_health_side_effect=[
+                None,
+                RuntimeError("collector health failed"),
+            ],
+        ),
+        pytest.raises(RuntimeError, match="collector health failed"),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    mock_grpo_components["checkpointer"].shutdown.assert_called_once()
+    mock_grpo_components["policy"].shutdown.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("generation_config", "expected"),
+    [
+        ({"backend": "vllm", "vllm_cfg": {"async_engine": False}}, False),
+        ({"backend": "vllm", "vllm_cfg": {"async_engine": True}}, True),
+        (
+            {
+                "backend": "vllm",
+                "use_async_rollouts": True,
+                "vllm_cfg": {"async_engine": False},
+            },
+            False,
+        ),
+    ],
+)
+def test_should_use_async_rollouts_selects_backend_specific_config(
+    generation_config, expected
+):
+    master_config = MagicMock()
+    master_config.policy = {"generation": generation_config}
+
+    assert _should_use_async_rollouts(master_config) is expected
 
 
 @contextmanager
@@ -649,7 +1509,7 @@ def test_calculate_rewards_missing_environment():
         calculate_rewards(batch, task_to_env)
 
 
-def test_dapo_dynamic_sampling_filters_nonzero_std():
+def test_dapo_dynamic_sampling_filters_nonzero_std(mock_grpo_components):
     """Test that DAPO dynamic sampling only selects prompts with non-zero standard deviation."""
     # Create mock batch data with 6 prompts (2 prompts * 3 generations each)
     batch_size = 6
@@ -686,16 +1546,11 @@ def test_dapo_dynamic_sampling_filters_nonzero_std():
     baseline = torch.tensor([0.67, 0.67, 0.67, 0.33, 0.33, 0.33])  # Mock baselines
 
     # Configuration for dynamic sampling
-    master_config = MasterConfig.model_construct(
-        **{
-            "grpo": {
-                "use_dynamic_sampling": True,
-                "num_prompts_per_step": 2,  # Want 2 prompts
-                "num_generations_per_prompt": 3,  # Each with 3 generations
-                "dynamic_sampling_max_gen_batches": 5,
-            }
-        }
-    )
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.grpo.num_prompts_per_step = 2  # Want 2 prompts
+    master_config.grpo.num_generations_per_prompt = 3  # Each with 3 generations
+    master_config.grpo.dynamic_sampling_max_gen_batches = 5
 
     timer = Timer()
     dynamic_sampling_num_gen_batches = 1
@@ -717,7 +1572,7 @@ def test_dapo_dynamic_sampling_filters_nonzero_std():
     assert torch.allclose(result_batch["baseline"], baseline)
 
 
-def test_dapo_dynamic_sampling_filters_zero_std():
+def test_dapo_dynamic_sampling_filters_zero_std(mock_grpo_components):
     """Test that DAPO dynamic sampling filters out prompts with zero standard deviation."""
     # Create mock batch data
     batch_size = 6
@@ -754,16 +1609,11 @@ def test_dapo_dynamic_sampling_filters_zero_std():
     )  # First prompt has zero std, second has non-zero
     baseline = torch.tensor([1.0, 1.0, 1.0, 0.33, 0.33, 0.33])
 
-    master_config = MasterConfig.model_construct(
-        **{
-            "grpo": {
-                "use_dynamic_sampling": True,
-                "num_prompts_per_step": 1,  # Want 1 prompt only
-                "num_generations_per_prompt": 3,
-                "dynamic_sampling_max_gen_batches": 5,
-            }
-        }
-    )
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.grpo.num_prompts_per_step = 1  # Want 1 prompt only
+    master_config.grpo.num_generations_per_prompt = 3
+    master_config.grpo.dynamic_sampling_max_gen_batches = 5
 
     timer = Timer()
     dynamic_sampling_num_gen_batches = 1
@@ -803,7 +1653,51 @@ def test_dapo_dynamic_sampling_filters_zero_std():
     assert torch.allclose(result_batch["filtered_reward"], expected_filtered_rewards)
 
 
-def test_dapo_dynamic_sampling_batch_caching():
+def test_dapo_dynamic_sampling_preserves_mask_sample_alignment(mock_grpo_components):
+    """mask_sample should follow rows through dynamic-sampling filter and slice."""
+    batch_size = 9
+    message_logs = [
+        [
+            {"role": "user", "content": f"prompt_{i // 3}"},
+            {"role": "assistant", "content": f"response_{i}"},
+        ]
+        for i in range(batch_size)
+    ]
+    repeated_batch = create_mock_batch(batch_size, ["math"] * batch_size, message_logs)
+    repeated_batch["total_reward"] = torch.tensor(
+        [1.0, 0.0, 1.0, 0.5, 0.0, 0.5, 0.2, 0.6, 0.9]
+    )
+    repeated_batch["mask_sample"] = torch.tensor(
+        [False, True, False, True, False, True, False, False, True]
+    )
+
+    std = torch.tensor([0.5, 0.5, 0.5, 0.25, 0.25, 0.25, 0.35, 0.35, 0.35])
+    baseline = torch.tensor([0.67, 0.67, 0.67, 0.33, 0.33, 0.33, 0.57, 0.57, 0.57])
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.grpo.num_prompts_per_step = 2
+    master_config.grpo.num_generations_per_prompt = 3
+    master_config.grpo.dynamic_sampling_max_gen_batches = 5
+
+    result_batch, is_batch_complete, _, _ = dynamic_sampling(
+        repeated_batch,
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches=1,
+        master_config=master_config,
+        timer=Timer(),
+    )
+
+    assert is_batch_complete is True
+    assert result_batch.size == 6
+    assert torch.equal(
+        result_batch["mask_sample"],
+        torch.tensor([False, True, False, True, False, True]),
+    )
+
+
+def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
     """Test that DAPO dynamic sampling uses batch caching when insufficient non-zero std prompts are found."""
     # Create mock batch with only 1 prompt having non-zero std, but we need 2
     batch_size = 3
@@ -830,16 +1724,11 @@ def test_dapo_dynamic_sampling_batch_caching():
     std = torch.tensor([0.4, 0.4, 0.4])  # Only one prompt with non-zero std
     baseline = torch.tensor([0.5, 0.5, 0.5])
 
-    master_config = MasterConfig.model_construct(
-        **{
-            "grpo": {
-                "use_dynamic_sampling": True,
-                "num_prompts_per_step": 2,  # Need 2 prompts but only have 1
-                "num_generations_per_prompt": 3,
-                "dynamic_sampling_max_gen_batches": 5,
-            }
-        }
-    )
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.grpo.num_prompts_per_step = 2  # Need 2 prompts but only have 1
+    master_config.grpo.num_generations_per_prompt = 3
+    master_config.grpo.dynamic_sampling_max_gen_batches = 5
 
     timer = Timer()
     dynamic_sampling_num_gen_batches = 1
@@ -881,7 +1770,64 @@ def test_dapo_dynamic_sampling_batch_caching():
     assert batch_cache is not None
 
 
-def test_dapo_dynamic_sampling_disabled():
+def test_dapo_cache_aligns_deduplicated_media_with_text_only_batch(
+    mock_grpo_components,
+):
+    def make_batch(prompt: str, *, with_media: bool) -> BatchedDataDict:
+        message_logs = [
+            [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": f"response_{i}"},
+            ]
+            for i in range(3)
+        ]
+        batch = create_mock_batch(3, ["math"] * 3, message_logs)
+        batch["total_reward"] = torch.tensor([1.0, 0.0, 0.5])
+        if with_media:
+            media = PackedTensor(
+                torch.tensor([[1.0]]), dim_to_pack=0
+            ).enable_deduplication()
+            batch["pixel_values"] = PackedTensor.concat([media] * 3)
+        return batch
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.grpo.num_prompts_per_step = 2
+    master_config.grpo.num_generations_per_prompt = 3
+    master_config.grpo.dynamic_sampling_max_gen_batches = 5
+    master_config.grpo.deduplicate_multimodal_data = True
+    std = torch.tensor([0.4, 0.4, 0.4])
+    baseline = torch.tensor([0.5, 0.5, 0.5])
+
+    _, complete, cache, _ = dynamic_sampling(
+        make_batch("visual", with_media=True),
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches=1,
+        master_config=master_config,
+        timer=Timer(),
+    )
+    assert not complete
+    assert cache is not None
+
+    result, complete, _, _ = dynamic_sampling(
+        make_batch("text", with_media=False),
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches=2,
+        master_config=master_config,
+        timer=Timer(),
+        batch_cache=cache,
+    )
+
+    assert complete
+    assert result.size == 6
+    assert len(result["pixel_values"]) == 6
+    assert len(result["pixel_values"].tensors) == 1
+    assert result["pixel_values"].slice([3, 4, 5]).as_tensor() is None
+
+
+def test_dapo_dynamic_sampling_disabled(mock_grpo_components):
     """Test that when dynamic sampling is disabled, all prompts are kept regardless of std."""
     batch_size = 6
     message_logs = [
@@ -912,16 +1858,11 @@ def test_dapo_dynamic_sampling_disabled():
     baseline = torch.tensor([1.0, 1.0, 1.0, 0.33, 0.33, 0.33])
 
     # Disable dynamic sampling
-    master_config = MasterConfig.model_construct(
-        **{
-            "grpo": {
-                "use_dynamic_sampling": False,
-                "num_prompts_per_step": 2,
-                "num_generations_per_prompt": 3,
-                "dynamic_sampling_max_gen_batches": 5,
-            }
-        }
-    )
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.grpo.num_prompts_per_step = 2
+    master_config.grpo.num_generations_per_prompt = 3
+    master_config.grpo.dynamic_sampling_max_gen_batches = 5
 
     timer = Timer()
     dynamic_sampling_num_gen_batches = 1
@@ -942,7 +1883,9 @@ def test_dapo_dynamic_sampling_disabled():
     assert batch_cache is None  # No caching when disabled
 
 
-def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping():
+def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
+    mock_grpo_components,
+):
     """Regression test for the issue where DAPO dynamic sampling filtered on
     shaped reward std instead of the raw task metric.
 
@@ -1005,16 +1948,11 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping():
     assert torch.allclose(raw_std[:3], torch.zeros(3))
     assert (raw_std[3:] > 0).all()
 
-    master_config = MasterConfig.model_construct(
-        **{
-            "grpo": {
-                "use_dynamic_sampling": True,
-                "num_prompts_per_step": 1,
-                "num_generations_per_prompt": 3,
-                "dynamic_sampling_max_gen_batches": 5,
-            }
-        }
-    )
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.grpo.num_prompts_per_step = 1
+    master_config.grpo.num_generations_per_prompt = 3
+    master_config.grpo.dynamic_sampling_max_gen_batches = 5
 
     result_batch, is_batch_complete, _, _ = dynamic_sampling(
         repeated_batch,
@@ -1035,55 +1973,28 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping():
     assert surviving_prompts == ["prompt_1", "prompt_1", "prompt_1"]
 
 
-def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
+def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
+    mock_grpo_components,
+):
     """Test that non-colocated inference requires explicit gpus_per_node when policy_nodes=1."""
     from unittest.mock import MagicMock, patch
 
     from nemo_rl.algorithms.grpo import setup
 
-    # Create minimal config - only what's needed before the validation we're testing
-    master_config = MasterConfig.model_construct(
-        **{
-            "policy": {
-                "generation": {
-                    "temperature": 1.0,
-                    "top_p": 1.0,
-                    "top_k": None,
-                    "backend": "vllm",
-                    "colocated": {
-                        "enabled": False,  # Non-colocated
-                        "resources": {
-                            "gpus_per_node": None,  # This should trigger error
-                            "num_nodes": None,
-                        },
-                    },
-                },
-            },
-            "loss_fn": ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
-            "env": {},  # Config extraction requires this key
-            "grpo": {
-                "seed": 42,
-                "num_prompts_per_step": 1,
-                "val_period": 0,
-                "val_at_start": False,
-                "val_at_end": False,
-                "use_dynamic_sampling": False,
-                "batch_multiplier": 1,
-            },
-            "data": {
-                "shuffle": False,
-                "num_workers": 1,
-                "env_name": None,
-                "use_multiple_dataloader": False,
-            },
-            "logger": {},  # Config extraction requires this key
-            "checkpointing": {},  # Config extraction requires this key
-            "cluster": {
-                "num_nodes": 1,  # Single node, so policy_nodes=1
-                "gpus_per_node": 8,
-            },
-        }
-    )
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"] = {
+        "enabled": False,  # Non-colocated
+        "resources": {
+            "gpus_per_node": None,  # This should trigger error
+            "num_nodes": None,
+        },
+    }
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.cluster["num_nodes"] = 1  # Single node, so policy_nodes=1
+    master_config.cluster["gpus_per_node"] = 8
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 1
 
     tokenizer = MagicMock()
     dataset = MagicMock()
@@ -1104,55 +2015,29 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         setup(master_config, tokenizer, dataset, None)
 
 
-def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
+def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
+    mock_grpo_components,
+):
     """Test that non-colocated inference requires explicit gpus_per_node when policy_nodes>1."""
     from unittest.mock import MagicMock, patch
 
     from nemo_rl.algorithms.grpo import setup
 
-    # Create minimal config - only what's needed before the validation we're testing
-    master_config = MasterConfig.model_construct(
-        **{
-            "policy": {
-                "generation": {
-                    "temperature": 1.0,
-                    "top_p": 1.0,
-                    "top_k": None,
-                    "backend": "vllm",
-                    "colocated": {
-                        "enabled": False,  # Non-colocated
-                        "resources": {
-                            "gpus_per_node": None,  # This should trigger error
-                            "num_nodes": 1,  # Use 1 node for inference
-                        },
-                    },
-                },
-            },
-            "loss_fn": ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
-            "env": {},  # Config extraction requires this key
-            "grpo": {
-                "seed": 42,
-                "num_prompts_per_step": 1,
-                "val_period": 0,
-                "val_at_start": False,
-                "val_at_end": False,
-                "use_dynamic_sampling": False,
-                "batch_multiplier": 1,
-            },
-            "data": {
-                "shuffle": False,
-                "num_workers": 1,
-                "env_name": None,
-                "use_multiple_dataloader": False,
-            },
-            "logger": {},  # Config extraction requires this key
-            "checkpointing": {},  # Config extraction requires this key
-            "cluster": {
-                "num_nodes": 2,  # Multi-node, so policy_nodes=1 after subtracting inference
-                "gpus_per_node": 8,
-            },
-        }
-    )
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"] = {
+        "enabled": False,  # Non-colocated
+        "resources": {
+            "gpus_per_node": None,  # This should trigger error
+            "num_nodes": 1,  # Use 1 node for inference
+        },
+    }
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    # Multi-node, so policy_nodes=1 after subtracting inference
+    master_config.cluster["num_nodes"] = 2
+    master_config.cluster["gpus_per_node"] = 8
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 1
 
     tokenizer = MagicMock()
     dataset = MagicMock()
@@ -1173,23 +2058,77 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
         setup(master_config, tokenizer, dataset, None)
 
 
+def test_noncolocated_opd_teacher_must_fit_on_one_cluster_node(
+    mock_grpo_components,
+):
+    """Reject teacher placement groups wider than a physical cluster node."""
+    from unittest.mock import MagicMock, patch
+
+    from nemo_rl.algorithms.grpo import setup
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.cluster["num_nodes"] = 3
+    master_config.cluster["gpus_per_node"] = 4
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.on_policy_distillation = OnPolicyDistillationConfig.model_validate(
+        {
+            "enabled": True,
+            "teacher_model_by_agent_name": {
+                "default_teacher": "/checkpoints/default_teacher"
+            },
+            "non_colocated_teachers": {
+                "enabled": True,
+                "default_teacher_cfg": {
+                    "num_nodes": 1,
+                },
+            },
+        }
+    )
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 1
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger"),
+        patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        patch(
+            "nemo_rl.algorithms.grpo.opd_module.reserve_teacher_clusters"
+        ) as mock_reserve_teacher_clusters,
+        pytest.raises(
+            AssertionError,
+            match=(
+                "OPD teacher 'default_teacher' requests gpus_per_node=8 > "
+                "cluster.gpus_per_node=4"
+            ),
+        ),
+    ):
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        setup(master_config, tokenizer, dataset, None)
+
+    mock_reserve_teacher_clusters.assert_not_called()
+
+
 @pytest.mark.parametrize(
-    "colocated_inference, expected_parallel",
-    [(True, 0.0), (False, True)],
+    "initial_skip_flag",
+    [None, False],
 )
-def test_setup_sglang_sets_model_path_and_parallel_flag(
-    monkeypatch, colocated_inference, expected_parallel
+def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
+    monkeypatch, mock_grpo_components, initial_skip_flag
 ):
     from nemo_rl.algorithms import grpo as grpo_mod
-
-    logged = {}
 
     class DummyLogger:
         def log_hyperparams(self, *_args, **_kwargs):
             pass
 
-        def log_metrics(self, metrics, *_args, **_kwargs):
-            logged["metrics"] = metrics
+        def log_metrics(self, *_args, **_kwargs):
+            pass
 
     class DummyCheckpointer:
         def get_latest_checkpoint_path(self):
@@ -1231,7 +2170,35 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
         def prepare_refit_info(self):
             return {}
 
+        def set_rollout_num_gpus_per_engine(self, _num_gpus_per_engine):
+            pass
+
+    def legacy_policy_factory(
+        *,
+        cluster,
+        config,
+        tokenizer,
+        processor,
+        weights_path,
+        optimizer_path,
+        init_optimizer,
+        init_reference_model,
+    ):
+        del (
+            cluster,
+            config,
+            tokenizer,
+            processor,
+            weights_path,
+            optimizer_path,
+            init_optimizer,
+            init_reference_model,
+        )
+        return DummyPolicy()
+
     class DummySGLangGeneration:
+        num_gpus_per_engine = 1
+
         def finish_generation(self):
             pass
 
@@ -1250,7 +2217,6 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
     )
     monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
     monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
-    monkeypatch.setattr(grpo_mod, "Policy", lambda *_args, **_kwargs: DummyPolicy())
     monkeypatch.setattr(
         grpo_mod,
         "SGLangGeneration",
@@ -1258,165 +2224,73 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
     )
     monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
 
-    generation_resources = {
-        "gpus_per_node": 1,
-        "num_nodes": 1,
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["model_name"] = "fake-model"
+    master_config.policy["dtensor_cfg"] = {"enabled": False}
+    master_config.policy["megatron_cfg"] = {
+        "enabled": False,
+        "pipeline_model_parallel_size": 1,
     }
-    if colocated_inference:
-        generation_resources = {"gpus_per_node": None, "num_nodes": None}
-
-    master_config = MasterConfig.model_construct(
-        **{
-            "policy": {
-                "model_name": "fake-model",
-                "train_global_batch_size": 1,
-                "train_micro_batch_size": 1,
-                "max_total_sequence_length": 8,
-                "make_sequence_length_divisible_by": 1,
-                "dtensor_cfg": {"enabled": False},
-                "megatron_cfg": {"enabled": False, "pipeline_model_parallel_size": 1},
-                "generation": {
-                    "temperature": 1.0,
-                    "top_p": 1.0,
-                    "top_k": None,
-                    "backend": "sglang",
-                    "colocated": {
-                        "enabled": colocated_inference,
-                        "resources": generation_resources,
-                    },
-                    "sglang_cfg": {
-                        "gpus_per_server": 1,
-                        "dp_size": 1,
-                        "pp_size": 1,
-                        "ep_size": 1,
-                    },
-                },
-            },
-            "loss_fn": ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
-            "env": {},
-            "grpo": {
-                "seed": 1,
-                "num_prompts_per_step": 1,
-                "num_generations_per_prompt": 1,
-                "max_num_steps": 1,
-                "max_num_epochs": 1,
-                "val_period": 0,
-                "val_batch_size": 1,
-                "val_at_start": False,
-                "val_at_end": False,
-                "max_val_samples": 1,
-                "use_dynamic_sampling": False,
-                "batch_multiplier": 1,
-                "normalize_rewards": False,
-                "use_leave_one_out_baseline": False,
-                "reward_scaling": {"enabled": False},
-                "reward_shaping": {"enabled": False},
-                "overlong_filtering": False,
-            },
-            "data": {
-                "shuffle": False,
-                "num_workers": 0,
-                "env_name": None,
-                "use_multiple_dataloader": False,
-            },
-            "logger": {"num_val_samples_to_print": 0},
-            "checkpointing": {"enabled": False},
-            "cluster": {"num_nodes": 1, "gpus_per_node": 4},
-        }
-    )
+    master_config.policy["generation"]["backend"] = "sglang"
+    master_config.policy["generation"]["colocated"] = {
+        "enabled": True,
+        "resources": {"gpus_per_node": None, "num_nodes": None},
+    }
+    master_config.policy["generation"]["sglang_cfg"] = {
+        "gpus_per_server": 1,
+        "dp_size": 1,
+        "pp_size": 1,
+        "ep_size": 1,
+    }
+    master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    if initial_skip_flag is not None:
+        master_config.grpo.skip_reference_policy_logprobs_calculation = (
+            initial_skip_flag
+        )
+    master_config.cluster["gpus_per_node"] = 4
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 0
 
     tokenizer = MagicMock()
     dataset = MagicMock()
     dataset.__len__ = MagicMock(return_value=1)
 
-    grpo_mod.setup(master_config, tokenizer, dataset, None)
-
-    assert (
-        master_config.policy["generation"]["sglang_cfg"]["model_path"]
-        == master_config.policy["model_name"]
-    )
-    assert logged["metrics"]["parallel_init_enabled"] == expected_parallel
-
-
-def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    calls = {
-        "prepare_for_generation_tags": [],
-        "invalidate_kv_cache": 0,
-        "stream_weights_via_http": [],
-        "offload_before_refit": 0,
-        "offload_after_refit": 0,
-    }
-
-    class DummySGLangGeneration:
-        def prepare_for_generation(self, tags=None):
-            calls["prepare_for_generation_tags"].append(tags)
-
-        def get_sglang_url_to_gpu_uuids(self):
-            return {"http://localhost:12345": ["gpu-uuid-0"]}
-
-        def invalidate_kv_cache(self):
-            calls["invalidate_kv_cache"] += 1
-            return True
-
-    class DummyPolicy:
-        def offload_before_refit(self):
-            calls["offload_before_refit"] += 1
-
-        def offload_after_refit(self):
-            calls["offload_after_refit"] += 1
-
-        def get_free_memory_bytes(self):
-            return 1024 * 1024 * 1024
-
-        def stream_weights_via_http(self, sglang_url_to_gpu_uuids):
-            calls["stream_weights_via_http"].append(sglang_url_to_gpu_uuids)
-            return ["ok"]
-
-    monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
-    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
-
-    grpo_mod.refit_policy_generation(
-        policy=DummyPolicy(),
-        policy_generation=DummySGLangGeneration(),
-        colocated_inference=True,
+    grpo_mod.setup(
+        master_config,
+        tokenizer,
+        dataset,
+        None,
+        policy_factory=legacy_policy_factory,
     )
 
-    assert calls["offload_before_refit"] == 1
-    assert calls["offload_after_refit"] == 1
-    assert calls["invalidate_kv_cache"] == 1
-    assert calls["stream_weights_via_http"] == [
-        {"http://localhost:12345": ["gpu-uuid-0"]}
-    ]
-    assert calls["prepare_for_generation_tags"] == [["weights"], ["kv_cache"]]
+    assert master_config.grpo.skip_reference_policy_logprobs_calculation is True
 
 
-def test_refit_policy_generation_sglang_non_colocated_raises(monkeypatch):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    class DummySGLangGeneration:
-        pass
-
-    monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
-
-    with pytest.raises(NotImplementedError):
-        grpo_mod.refit_policy_generation(
-            policy=object(),
-            policy_generation=DummySGLangGeneration(),
-            colocated_inference=False,
-        )
-
-
-def test_grpo_train_collects_generation_logger_metrics(
+def test_grpo_train_collects_generation_logger_and_seq_metrics(
     monkeypatch, mock_grpo_components
 ):
     from nemo_rl.algorithms import grpo as grpo_mod
 
+    generation_logger_metrics = {
+        "inflight_batch_sizes": {0: [0, 1, 2]},
+        "num_pending_samples": {0: [3, 2, 0]},
+    }
+    seq_logprob_error_result = {
+        "max_seq_mult_prob_error": 2.5,
+        "mean_seq_mult_prob_error": 1.5,
+        "min_seq_mult_prob_error": 1.0,
+        "max_seq_mult_prob_error_after_mask": 1.2,
+        "mean_seq_mult_prob_error_after_mask": 1.1,
+        "min_seq_mult_prob_error_after_mask": 1.0,
+        "num_masked_seqs": 2,
+        "masked_correct_pct": 0.5,
+    }
     policy_generation = MagicMock()
     policy_generation.clear_logger_metrics = MagicMock()
     policy_generation.get_logger_metrics = MagicMock(
-        return_value={"pending_requests": 1}
+        return_value=generation_logger_metrics
     )
     policy_generation.prepare_for_generation = MagicMock()
     policy_generation.finish_generation = MagicMock()
@@ -1460,7 +2334,9 @@ def test_grpo_train_collects_generation_logger_metrics(
         lambda *_args, **_kwargs: (torch.tensor([0.1]), torch.tensor([1.0])),
     )
     monkeypatch.setattr(
-        grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: None
+        grpo_mod,
+        "refit_policy_generation",
+        lambda *_args, **_kwargs: {"delta/changed_pct": 4.0},
     )
     monkeypatch.setattr(
         grpo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
@@ -1471,15 +2347,15 @@ def test_grpo_train_collects_generation_logger_metrics(
     monkeypatch.setattr(
         grpo_mod,
         "compute_and_apply_seq_logprob_error_masking",
-        lambda *_args, **_kwargs: (0.0, 0, 0.0),
+        lambda *_args, **_kwargs: seq_logprob_error_result,
     )
 
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo["max_num_steps"] = 1
-    master_config.grpo["max_num_epochs"] = 1
-    master_config.grpo["val_period"] = 0
-    master_config.grpo["val_at_start"] = False
-    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.use_dynamic_sampling = False
 
     grpo_mod.grpo_train(
         mock_grpo_components["policy"],
@@ -1492,44 +2368,215 @@ def test_grpo_train_collects_generation_logger_metrics(
         mock_grpo_components["val_task_to_env"],
         mock_grpo_components["logger"],
         mock_grpo_components["checkpointer"],
-        _default_grpo_save_state(),
+        _initial_grpo_save_state(),
         master_config,
     )
 
     assert policy_generation.clear_logger_metrics.called
-    policy_generation.finish_generation.assert_called_once_with(discard_weights=True)
     assert policy_generation.get_logger_metrics.called
+    train_metrics = _logged_train_metrics_with_key(
+        mock_grpo_components["logger"], "generation_logger_metrics"
+    )
+    assert train_metrics["generation_logger_metrics"] == generation_logger_metrics
+    assert train_metrics["max_seq_mult_prob_error"] == 2.5
+    assert train_metrics["mean_seq_mult_prob_error"] == 1.5
+    assert train_metrics["min_seq_mult_prob_error"] == 1.0
+    assert train_metrics["max_seq_mult_prob_error_after_mask"] == 1.2
+    assert train_metrics["mean_seq_mult_prob_error_after_mask"] == 1.1
+    assert train_metrics["min_seq_mult_prob_error_after_mask"] == 1.0
+    assert train_metrics["num_masked_seqs_by_logprob_error"] == 2
+    assert train_metrics["masked_correct_pct"] == 0.5
     assert any(
-        "generation_logger_metrics" in call.args[0]
+        call.args[0] == {"delta/changed_pct": 4.0}
+        and call.kwargs.get("prefix") == "refit"
         for call in mock_grpo_components["logger"].log_metrics.call_args_list
     )
 
 
+def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path):
+    """Regression test for epoch-bounded runs losing the final async checkpoint.
+
+    When training exits because max_num_epochs is reached (not max_num_steps or
+    timeout), the last step may start background checkpoint finalization via
+    begin_finalization() but never hit the inline shutdown() early returns.
+    grpo_train must flush pending finalization in a finally block.
+    """
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    checkpointer = mock_grpo_components["checkpointer"]
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.max_num_steps = 100
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["save_period"] = 1000
+    master_config.checkpointing["metric_name"] = None
+
+    single_batch_dataloader = MagicMock(spec=StatefulDataLoader)
+    single_batch_dataloader.__iter__ = lambda self: iter([mock_batch])
+    single_batch_dataloader.__len__ = MagicMock(return_value=1)
+    single_batch_dataloader.state_dict = MagicMock(return_value={})
+
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/checkpoint"
+    # grpo_train writes latest_checkpoint_status.json under checkpoint_dir; give
+    # the mocked checkpointer a real directory so that write succeeds.
+    checkpointer.checkpoint_dir = tmp_path
+
+    with (
+        _patched_logprob_phase(policy),
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+        patch("nemo_rl.algorithms.grpo.torch.save"),
+    ):
+        grpo_mod.grpo_train(
+            policy,
+            _mock_policy_generation(),
+            single_batch_dataloader,
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    checkpointer.begin_finalization.assert_called_once()
+    checkpointer.shutdown.assert_called_once()
+
+
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
-def test_grpo_train_skips_reference_policy_logprobs_when_configured(
-    mock_grpo_components, train_func
+def test_grpo_ft_save_period_triggers_periodic_saves(
+    mock_grpo_components, train_func, tmp_path
 ):
+    """ft_save_period triggers checkpoint saves independent of save_period.
+
+    Covers both GRPO training paths (grpo_train and async_grpo_train). With
+    save_period large enough to only fire on the final step, ft_save_period=2
+    must add saves at steps 2 and 4, and the last step (5) is saved as usual.
+    """
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    checkpointer = mock_grpo_components["checkpointer"]
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["save_period"] = 100  # only the final step saves
+    master_config.checkpointing["ft_save_period"] = 2
+    master_config.checkpointing["metric_name"] = None
+
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/checkpoint"
+    # Both paths write latest_checkpoint_status.json under checkpoint_dir; give
+    # the mocked checkpointer a real directory so that write succeeds.
+    checkpointer.checkpoint_dir = tmp_path
+
+    if train_func == async_grpo_train:
+        master_config.policy["generation"]["colocated"]["enabled"] = False
+        with (
+            mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+            _patched_logprob_phase(policy),
+            patch("nemo_rl.algorithms.grpo.torch.save"),
+        ):
+            train_func(
+                policy,
+                _mock_policy_generation(),
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                checkpointer,
+                _initial_grpo_save_state(),
+                master_config,
+            )
+    else:
+        with (
+            _patched_logprob_phase(policy),
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                return_value=(mock_batch, mock_rollout_metrics),
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+                return_value=(mock_batch, mock_rollout_metrics),
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                return_value=_mock_seq_logprob_error_result(),
+            ),
+            patch("nemo_rl.algorithms.grpo.torch.save"),
+        ):
+            train_func(
+                policy,
+                _mock_policy_generation(),
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                checkpointer,
+                _initial_grpo_save_state(),
+                master_config,
+            )
+
+    # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last
+    # step (5). Each save calls init_tmp_checkpoint(step, ...).
+    saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
+    assert saved_steps == [2, 4, 5]
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_skips_reference_policy_logprobs(mock_grpo_components, train_func):
     """Regression test for issue #1968 (Bug 1) and PRs #2174 / #2178.
 
-    When ``grpo.skip_reference_policy_logprobs_calculation=True`` and
-    ``loss_fn.reference_policy_kl_penalty=0``, both ``grpo_train`` and
-    ``async_grpo_train`` MUST NOT call ``policy.get_reference_policy_logprobs``.
-    Without the skip guards in ``grpo.py``, training would crash inside
-    ``use_reference_model()`` because the reference model state was never loaded.
+    When skip_reference_policy_logprobs_calculation=True, both grpo_train
+    and async_grpo_train MUST NOT call policy.get_reference_policy_logprobs.
+    Without the skip guards in grpo.py, training would crash inside
+    use_reference_model() because the reference model state was never loaded.
     """
     master_config = mock_grpo_components["master_config"]
     master_config.loss_fn.reference_policy_kl_penalty = 0
-    master_config.grpo["skip_reference_policy_logprobs_calculation"] = True
-    master_config.grpo["max_num_steps"] = 1
-    master_config.grpo["max_num_epochs"] = 1
-    master_config.grpo["val_period"] = 0
-    master_config.grpo["val_at_start"] = False
-    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.grpo.skip_reference_policy_logprobs_calculation = True
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.use_dynamic_sampling = False
 
     if train_func == async_grpo_train:
         master_config.policy["generation"]["colocated"]["enabled"] = False
 
-    grpo_save_state = _default_grpo_save_state()
+    grpo_save_state = _initial_grpo_save_state()
     mock_rollout_metrics = {
         "mean_gen_tokens_per_sample": 10.0,
         "max_gen_tokens": 20,
@@ -1545,7 +2592,7 @@ def test_grpo_train_skips_reference_policy_logprobs_when_configured(
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -1570,12 +2617,12 @@ def test_grpo_train_skips_reference_policy_logprobs_when_configured(
             ),
             patch(
                 "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
-                return_value=(0.0, 0, 0.0),
+                return_value=_mock_seq_logprob_error_result(),
             ),
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -1595,6 +2642,141 @@ def test_grpo_train_skips_reference_policy_logprobs_when_configured(
     )
 
 
+def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
+    """Run one GRPO training step with rollout/logprob infrastructure mocked."""
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.use_dynamic_sampling = False
+
+    if train_func == async_grpo_train:
+        master_config.policy["generation"]["colocated"]["enabled"] = False
+        with (
+            mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+            _patched_logprob_phase(policy),
+        ):
+            train_func(
+                policy,
+                _mock_policy_generation(),
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                _initial_grpo_save_state(),
+                master_config,
+            )
+    else:
+        with (
+            _patched_logprob_phase(policy),
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                return_value=(mock_batch, mock_rollout_metrics),
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+                return_value=(mock_batch, mock_rollout_metrics),
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                return_value=_mock_seq_logprob_error_result(),
+            ),
+        ):
+            train_func(
+                policy,
+                _mock_policy_generation(),
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                _initial_grpo_save_state(),
+                master_config,
+            )
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_clips_advantages_when_configured(
+    mock_grpo_components, train_func, monkeypatch
+):
+    """Advantages passed to policy.train are clamped when clip bounds are set."""
+    extreme_advantages = torch.tensor([[-10.0, 15.0]])
+    mock_adv_estimator = MagicMock()
+    mock_adv_estimator.compute_advantage.return_value = extreme_advantages.clone()
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._create_advantage_estimator",
+        lambda _cfg: mock_adv_estimator,
+    )
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.advantage_clip_low = -2.0
+    master_config.grpo.advantage_clip_high = 3.0
+
+    _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch)
+
+    policy = mock_grpo_components["policy"]
+    policy.train.assert_called_once()
+    clipped = policy.train.call_args[0][0]["advantages"]
+    assert clipped.min().item() == -2.0
+    assert clipped.max().item() == 3.0
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_preserves_advantages_when_clipping_disabled(
+    mock_grpo_components, train_func, monkeypatch
+):
+    """Advantages are unchanged when advantage_clip_low/high are null."""
+    extreme_advantages = torch.tensor([[-10.0, 15.0]])
+    mock_adv_estimator = MagicMock()
+    mock_adv_estimator.compute_advantage.return_value = extreme_advantages.clone()
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._create_advantage_estimator",
+        lambda _cfg: mock_adv_estimator,
+    )
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.advantage_clip_low = None
+    master_config.grpo.advantage_clip_high = None
+
+    _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch)
+
+    policy = mock_grpo_components["policy"]
+    policy.train.assert_called_once()
+    advantages = policy.train.call_args[0][0]["advantages"]
+    assert torch.equal(advantages, extreme_advantages)
+
+
+def test_clip_grpo_advantages_respects_config_bounds():
+    """Shared clip helper clamps only when bounds are configured."""
+    from nemo_rl.algorithms.grpo import _clip_grpo_advantages
+
+    extreme_advantages = torch.tensor([[-10.0, 15.0], [0.0, 5.0]])
+
+    clipped = _clip_grpo_advantages(
+        extreme_advantages.clone(),
+        GRPOConfig.model_construct(advantage_clip_low=-2.0, advantage_clip_high=3.0),
+    )
+    assert clipped.min().item() == -2.0
+    assert clipped.max().item() == 3.0
+
+    unclipped = _clip_grpo_advantages(
+        extreme_advantages.clone(),
+        GRPOConfig.model_construct(advantage_clip_low=None, advantage_clip_high=None),
+    )
+    assert torch.equal(unclipped, extreme_advantages)
+
+
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
 def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
     mock_grpo_components, train_func
@@ -1608,17 +2790,17 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
     """
     master_config = mock_grpo_components["master_config"]
     master_config.loss_fn.force_on_policy_ratio = True
-    master_config.grpo["seq_logprob_error_threshold"] = None
-    master_config.grpo["max_num_steps"] = 1
-    master_config.grpo["max_num_epochs"] = 1
-    master_config.grpo["val_period"] = 0
-    master_config.grpo["val_at_start"] = False
-    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.grpo.seq_logprob_error_threshold = None
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.use_dynamic_sampling = False
 
     if train_func == async_grpo_train:
         master_config.policy["generation"]["colocated"]["enabled"] = False
 
-    grpo_save_state = _default_grpo_save_state()
+    grpo_save_state = _initial_grpo_save_state()
     mock_rollout_metrics = {
         "mean_gen_tokens_per_sample": 10.0,
         "max_gen_tokens": 20,
@@ -1634,7 +2816,7 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -1659,12 +2841,12 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
             ),
             patch(
                 "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
-                return_value=(0.0, 0, 0.0),
+                return_value=_mock_seq_logprob_error_result(),
             ),
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -1683,14 +2865,396 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
     )
 
 
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+@pytest.mark.parametrize(
+    ("val_at_end", "expected_validation_steps"),
+    [(False, [4]), (True, [4, 5])],
+)
+def test_periodic_validation_starts_at_configured_step(
+    mock_grpo_components, train_func, val_at_end, expected_validation_steps
+):
+    """All three trainers preserve cadence while honoring the validation lower bound."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.val_start_at = 3
+    master_config.grpo.val_at_end = val_at_end
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with ExitStack() as stack:
+        validate_target = "nemo_rl.algorithms.grpo.validate"
+        if train_func is grpo_train_sync:
+            master_config.data_plane = {"enabled": True}
+            stack.enter_context(
+                mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
+            )
+            validate_target = "nemo_rl.algorithms.grpo_sync.validate_sync"
+        elif train_func is async_grpo_train:
+            master_config.policy["generation"]["colocated"]["enabled"] = False
+            stack.enter_context(
+                mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
+            )
+        else:
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                    return_value=(mock_batch, mock_rollout_metrics),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+                    return_value=(mock_batch, mock_rollout_metrics),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                    return_value=_mock_seq_logprob_error_result(),
+                )
+            )
+
+        mock_validate = stack.enter_context(
+            patch(validate_target, return_value=({}, {}))
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == (
+        expected_validation_steps
+    )
+
+
+def _enter_stop_test_mocks(
+    stack,
+    train_func,
+    master_config,
+    mock_grpo_components,
+    mock_batch,
+    mock_rollout_metrics,
+):
+    """Enter per-trainer infrastructure mocks; returns the validate patch target."""
+    if train_func is grpo_train_sync:
+        master_config.data_plane = {"enabled": True}
+        stack.enter_context(
+            mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
+        )
+        return "nemo_rl.algorithms.grpo_sync.validate_sync"
+    if train_func is async_grpo_train:
+        master_config.policy["generation"]["colocated"]["enabled"] = False
+        stack.enter_context(
+            mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
+        )
+        return "nemo_rl.algorithms.grpo.validate"
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        )
+    )
+    return "nemo_rl.algorithms.grpo.validate"
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_training_stops_at_validation_threshold(mock_grpo_components, train_func):
+    """All three trainers stop early once the stop metric reaches the threshold."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.stop_at_validation_metric = "accuracy"
+    master_config.grpo.stop_at_validation_threshold = 0.5
+    master_config.grpo.val_at_end = False
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with ExitStack() as stack:
+        validate_target = _enter_stop_test_mocks(
+            stack,
+            train_func,
+            master_config,
+            mock_grpo_components,
+            mock_batch,
+            mock_rollout_metrics,
+        )
+        mock_validate = stack.enter_context(
+            patch(validate_target, return_value=({"accuracy": 0.75}, {}))
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    # Validation fires at step 2 with accuracy above the threshold, so
+    # training stops before the step-4 validation ever runs.
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == [2]
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_training_stops_at_initial_validation(mock_grpo_components, train_func):
+    """A val_at_start result meeting the threshold stops before any training."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.val_at_start = True
+    master_config.grpo.stop_at_validation_metric = "accuracy"
+    master_config.grpo.stop_at_validation_threshold = 0.5
+    master_config.grpo.val_at_end = False
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with ExitStack() as stack:
+        validate_target = _enter_stop_test_mocks(
+            stack,
+            train_func,
+            master_config,
+            mock_grpo_components,
+            mock_batch,
+            mock_rollout_metrics,
+        )
+        mock_validate = stack.enter_context(
+            patch(validate_target, return_value=({"accuracy": 0.75}, {}))
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    # The initial validation already meets the threshold, so training exits
+    # before the periodic step-2/step-4 validations ever run.
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == [0]
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_early_stop_saves_final_checkpoint(mock_grpo_components, train_func, tmp_path):
+    """The early-stop step is checkpointed before training exits."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.stop_at_validation_metric = "accuracy"
+    master_config.grpo.stop_at_validation_threshold = 0.5
+    master_config.grpo.val_at_end = False
+    master_config.checkpointing["enabled"] = True
+    # save_period alone can never fire, so only the early stop saves.
+    master_config.checkpointing["save_period"] = 1000
+    master_config.checkpointing["metric_name"] = None
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    checkpointer.checkpoint_dir = tmp_path
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with ExitStack() as stack:
+        validate_target = _enter_stop_test_mocks(
+            stack,
+            train_func,
+            master_config,
+            mock_grpo_components,
+            mock_batch,
+            mock_rollout_metrics,
+        )
+        stack.enter_context(patch("nemo_rl.algorithms.grpo.torch.save"))
+        stack.enter_context(patch("nemo_rl.algorithms.grpo_sync.torch.save"))
+        mock_validate = stack.enter_context(
+            patch(validate_target, return_value=({"accuracy": 0.75}, {}))
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    # Training stopped after the step-2 validation...
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == [2]
+    # ...but only after checkpointing that step with its validation metrics.
+    checkpointer.init_tmp_checkpoint.assert_called_once()
+    assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 2
+    assert checkpointer.init_tmp_checkpoint.call_args.args[1]["val_reward"] == 0.75
+    mock_grpo_components["policy"].save_checkpoint.assert_called_once()
+    assert checkpointer.shutdown.called
+
+
+def test_training_stops_on_configured_pass_k_metric(mock_grpo_components):
+    """grpo.stop_at_validation_metric=pass_k stops on pass_k, not accuracy."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.stop_at_validation_threshold = 0.69
+    master_config.grpo.stop_at_validation_metric = "pass_k"
+    master_config.grpo.val_at_end = False
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.validate",
+            # accuracy stays below the threshold; only pass_k crosses it.
+            return_value=({"accuracy": 0.63, "pass_k": 0.74}, {}),
+        ) as mock_validate,
+    ):
+        grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    # pass_k (0.74) crosses 0.69 at the first validation (step 2).
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == [2]
+
+
+def test_stop_metric_missing_from_validation_fails_loudly(mock_grpo_components):
+    """A stop metric that validation does not report raises, not skips."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.stop_at_validation_threshold = 0.69
+    master_config.grpo.stop_at_validation_metric = "pass_k"
+    master_config.grpo.val_at_end = False
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.validate",
+            return_value=({"accuracy": 0.99}, {}),
+        ),
+        pytest.raises(AssertionError, match="stop_at_validation_metric"),
+    ):
+        grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
 def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_steps is reached"""
     # Set max steps to 12
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo["max_num_steps"] = 12
+    master_config.grpo.max_num_steps = 12
 
-    grpo_save_state = _default_grpo_save_state()
+    grpo_save_state = _initial_grpo_save_state()
 
     # Async GRPO requires non-colocated inference
     if train_func == async_grpo_train:
@@ -1709,7 +3273,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
         with mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
             train_func(
                 mock_grpo_components["policy"],
-                None,  # policy_generation
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -1733,11 +3297,11 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
             ):
                 with patch(
                     "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
-                    return_value=(0.0, 0, 0.0),
+                    return_value=_mock_seq_logprob_error_result(),
                 ):
                     train_func(
                         mock_grpo_components["policy"],
-                        None,  # policy_generation
+                        _mock_policy_generation(),
                         mock_grpo_components["train_dataloader"],
                         mock_grpo_components["val_dataloader"],
                         mock_grpo_components["tokenizer"],
@@ -1761,10 +3325,10 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo["max_num_epochs"] = 2
-    master_config.grpo["max_num_steps"] = 100
+    master_config.grpo.max_num_epochs = 2
+    master_config.grpo.max_num_steps = 100
 
-    grpo_save_state = _default_grpo_save_state()
+    grpo_save_state = _initial_grpo_save_state()
 
     # Mock rollout functions to return proper metrics
     mock_rollout_metrics = {
@@ -1786,12 +3350,12 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
 
             with patch(
                 "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
-                return_value=(0.0, 0, 0.0),
+                return_value=_mock_seq_logprob_error_result(),
             ):
                 # Run training
                 train_func(
                     mock_grpo_components["policy"],
-                    None,  # policy_generation
+                    _mock_policy_generation(),
                     mock_grpo_components["train_dataloader"],
                     mock_grpo_components["val_dataloader"],
                     mock_grpo_components["tokenizer"],
@@ -1813,10 +3377,10 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
     """Test that GRPO training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo["max_num_steps"] = 100
-    master_config.grpo["max_num_epochs"] = 10
+    master_config.grpo.max_num_steps = 100
+    master_config.grpo.max_num_epochs = 10
 
-    grpo_save_state = _default_grpo_save_state()
+    grpo_save_state = _initial_grpo_save_state()
 
     # Async GRPO requires non-colocated inference
     if train_func == async_grpo_train:
@@ -1842,7 +3406,7 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
             with mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
                 train_func(
                     mock_grpo_components["policy"],
-                    None,  # policy_generation
+                    _mock_policy_generation(),
                     mock_grpo_components["train_dataloader"],
                     mock_grpo_components["val_dataloader"],
                     mock_grpo_components["tokenizer"],
@@ -1865,11 +3429,11 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
                 ):
                     with patch(
                         "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
-                        return_value=(0.0, 0, 0.0),
+                        return_value=_mock_seq_logprob_error_result(),
                     ):
                         train_func(
                             mock_grpo_components["policy"],
-                            None,  # policy_generation
+                            _mock_policy_generation(),
                             mock_grpo_components["train_dataloader"],
                             mock_grpo_components["val_dataloader"],
                             mock_grpo_components["tokenizer"],
@@ -1934,10 +3498,10 @@ def test_grpo_advantage_estimator_zero_std():
     1. When std=0 (all rewards identical for a prompt), normalization is skipped and advantage=0
     2. When std>0, advantages are properly normalized by std
     """
-    estimator_config = {
-        "use_leave_one_out_baseline": False,
-        "normalize_rewards": True,
-    }
+    estimator_config = AdvEstimatorConfig.model_construct(
+        use_leave_one_out_baseline=False,
+        normalize_rewards=True,
+    )
     loss_config = ClippedPGLossConfig()
     estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
 
@@ -1973,10 +3537,10 @@ def test_grpo_advantage_estimator_tensor_shapes():
     1. Small batch size (batch=2, single prompt)
     2. Larger batch size (batch=10, single prompt)
     """
-    estimator_config = {
-        "use_leave_one_out_baseline": False,
-        "normalize_rewards": True,
-    }
+    estimator_config = AdvEstimatorConfig.model_construct(
+        use_leave_one_out_baseline=False,
+        normalize_rewards=True,
+    )
     loss_config = ClippedPGLossConfig()
     estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
 
@@ -2020,10 +3584,10 @@ def test_grpo_advantage_estimator_negative_advantages():
 
     This test verifies that negative advantages are handled correctly.
     """
-    estimator_config = {
-        "use_leave_one_out_baseline": False,
-        "normalize_rewards": True,
-    }
+    estimator_config = AdvEstimatorConfig.model_construct(
+        use_leave_one_out_baseline=False,
+        normalize_rewards=True,
+    )
     loss_config = ClippedPGLossConfig()
     estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
 
@@ -2054,10 +3618,10 @@ def test_grpo_advantage_estimator_zero_std_and_zero_advantage():
     1. The advantages are all zero (since reward - mean = 0)
     2. No division by zero occurs (normalization is skipped when std=0)
     """
-    estimator_config = {
-        "use_leave_one_out_baseline": False,
-        "normalize_rewards": True,
-    }
+    estimator_config = AdvEstimatorConfig.model_construct(
+        use_leave_one_out_baseline=False,
+        normalize_rewards=True,
+    )
     loss_config = ClippedPGLossConfig()
     estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
 
@@ -2083,10 +3647,10 @@ def test_grpo_advantage_estimator_small_nonzero_std():
     This test verifies that small but non-zero std values are still normalized
     (no arbitrary threshold that would skip normalization).
     """
-    estimator_config = {
-        "use_leave_one_out_baseline": False,
-        "normalize_rewards": True,
-    }
+    estimator_config = AdvEstimatorConfig.model_construct(
+        use_leave_one_out_baseline=False,
+        normalize_rewards=True,
+    )
     loss_config = ClippedPGLossConfig()
     estimator = GRPOAdvantageEstimator(estimator_config, loss_config)
 
@@ -2119,19 +3683,19 @@ def test_grpo_advantage_estimator_small_nonzero_std():
 
 def test_gdpo_advantage_estimator_multiple_rewards():
     """Test GDPOAdvantageEstimator with multiple rewards."""
-    estimator_config = {
-        "use_leave_one_out_baseline": False,
-        "normalize_rewards": True,
-    }
+    estimator_config = AdvEstimatorConfig.model_construct(
+        use_leave_one_out_baseline=False,
+        normalize_rewards=True,
+    )
     loss_config = ClippedPGLossConfig()
     estimator = GDPOAdvantageEstimator(estimator_config, loss_config)
 
     prompt_ids = torch.tensor([[0], [0]])
     mask = torch.ones(2, 3)
     repeated_batch = {
-        "reward1": torch.tensor([1.0, 1.0]),
-        "reward2": torch.tensor([1.0, -1.0]),
-        "reward3": torch.tensor([1.0, 0.0]),
+        "reward/correctness": torch.tensor([1.0, 1.0]),
+        "reward/integer": torch.tensor([1.0, -1.0]),
+        "reward/format": torch.tensor([1.0, 0.0]),
     }
 
     result = estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
@@ -2142,19 +3706,51 @@ def test_gdpo_advantage_estimator_multiple_rewards():
 
 def test_gdpo_advantage_estimator_single_reward():
     """Test GDPOAdvantageEstimator with multiple rewards."""
-    estimator_config = {
-        "use_leave_one_out_baseline": False,
-        "normalize_rewards": True,
-    }
+    estimator_config = AdvEstimatorConfig.model_construct(
+        use_leave_one_out_baseline=False,
+        normalize_rewards=True,
+    )
     loss_config = ClippedPGLossConfig()
     estimator = GDPOAdvantageEstimator(estimator_config, loss_config)
 
     prompt_ids = torch.tensor([[0], [0]])
     mask = torch.ones(2, 3)
-    repeated_batch = {"reward1": torch.tensor([1.0, 3.0])}
+    repeated_batch = {"reward/correctness": torch.tensor([1.0, 3.0])}
 
     with pytest.raises(ValueError):
         estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
+
+
+def test_gdpo_advantage_estimator_reward_weights():
+    """GDPO per-reward weights: uniform weights match the default; non-uniform differ; wrong length raises."""
+    loss_config = ClippedPGLossConfig()
+    prompt_ids = torch.tensor([[0], [0], [0]])
+    mask = torch.ones(3, 2)
+    repeated_batch = {
+        "reward/correctness": torch.tensor([1.0, 0.0, 1.0]),
+        "reward/format": torch.tensor([1.0, 1.0, 0.0]),
+    }
+
+    def run(weights):
+        config = AdvEstimatorConfig(
+            use_leave_one_out_baseline=False,
+            normalize_rewards=True,
+            reward_weights=weights,
+        )
+        estimator = GDPOAdvantageEstimator(config, loss_config)
+        return estimator.compute_advantage(prompt_ids, None, mask, dict(repeated_batch))
+
+    default = run(None)
+
+    # Any positive uniform scaling is invariant after the final per-batch normalization.
+    assert torch.allclose(default, run([2.0, 2.0]), atol=1e-5)
+
+    # Non-uniform weights change the advantages.
+    assert not torch.allclose(default, run([1.0, 0.25]), atol=1e-3)
+
+    # Wrong number of weights -> ValueError.
+    with pytest.raises(ValueError):
+        run([1.0])
 
 
 # ============================================================================
@@ -2169,9 +3765,9 @@ def test_reinforce_plus_plus_global_normalization():
     1. After global normalization, the mean of advantages is approximately 0
     2. The advantages are properly scaled by the global std
     """
-    estimator_config = {
-        "minus_baseline": True,
-    }
+    estimator_config = AdvEstimatorConfig.model_construct(
+        minus_baseline=True,
+    )
     loss_config = ClippedPGLossConfig(
         use_kl_in_reward=False,
         reference_policy_kl_penalty=0.0001,
@@ -2208,7 +3804,7 @@ def test_reinforce_plus_plus_global_normalization():
 class TestValidateFunction:
     """Tests for the validate() function."""
 
-    def test_validate_logs_data_when_logger_provided(self, tmp_path):
+    def test_validate_logs_data_when_logger_provided(self, mock_grpo_components):
         """Test that validation data is logged to JSONL when logger is provided."""
 
         # Create mock components
@@ -2273,29 +3869,9 @@ class TestValidateFunction:
         mock_logger.log_batched_dict_as_jsonl = MagicMock(side_effect=capture_log)
 
         # Mock config
-        mock_config = MasterConfig.model_construct(
-            **{
-                "grpo": {
-                    "max_val_samples": 10,
-                    "val_batch_size": 2,
-                    "max_rollout_turns": 1,
-                },
-                "policy": {
-                    "max_total_sequence_length": 2048,
-                    "generation": {
-                        "temperature": 1.0,
-                        "top_p": 1.0,
-                        "top_k": None,
-                        "backend": "vllm",
-                        "colocated": {"enabled": True},
-                        "vllm_cfg": {"async_engine": False},
-                    },
-                },
-                "logger": {
-                    "num_val_samples_to_print": 2,
-                },
-            }
-        )
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.val_batch_size = 2
+        mock_config.logger["num_val_samples_to_print"] = 2
 
         mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
 
@@ -2329,7 +3905,7 @@ class TestValidateFunction:
         assert "content" in logged_data["data"]
         assert "rewards" in logged_data["data"]
 
-    def test_validate_works_without_logger(self):
+    def test_validate_works_without_logger(self, mock_grpo_components):
         """Test that validation works when logger is None (backward compat)."""
         # Create mock components
         mock_policy_gen = MagicMock()
@@ -2371,29 +3947,8 @@ class TestValidateFunction:
         mock_env.global_post_process_and_metrics.return_value = (mock_batch, {})
 
         # Mock config
-        mock_config = MasterConfig.model_construct(
-            **{
-                "grpo": {
-                    "max_val_samples": 10,
-                    "val_batch_size": 1,
-                    "max_rollout_turns": 1,
-                },
-                "policy": {
-                    "max_total_sequence_length": 2048,
-                    "generation": {
-                        "temperature": 1.0,
-                        "top_p": 1.0,
-                        "top_k": None,
-                        "backend": "vllm",
-                        "colocated": {"enabled": True},
-                        "vllm_cfg": {"async_engine": False},
-                    },
-                },
-                "logger": {
-                    "num_val_samples_to_print": 1,
-                },
-            }
-        )
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.logger["num_val_samples_to_print"] = 1
 
         mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
 
@@ -2422,16 +3977,148 @@ class TestValidateFunction:
         assert "accuracy" in val_metrics
         assert "avg_length" in val_metrics
 
-    def test_validate_returns_empty_when_no_dataloader(self):
+    def test_grouped_validation_reports_pass_k(self, mock_grpo_components):
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [{"role": "user", "content": "a", "token_ids": torch.tensor([1])}],
+                    [{"role": "user", "content": "b", "token_ids": torch.tensor([2])}],
+                ],
+                "task_name": ["math", "math"],
+                "extra_env_info": [{}, {}],
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "idx": torch.tensor([0, 1]),
+                "length": torch.tensor([1, 1]),
+                "total_reward": torch.tensor([0.0, 0.0]),
+            }
+        )
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.max_val_samples = 2
+        mock_config.grpo.val_batch_size = 2
+        mock_config.grpo.val_num_generations_per_prompt = 4
+
+        def run_rollout(_policy, repeated_batch, *_args, **_kwargs):
+            # Each prompt is repeated k=4 times, contiguously.
+            assert repeated_batch["idx"].tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
+            # Prompt 0 passes once out of 4; prompt 1 never passes.
+            repeated_batch["total_reward"] = torch.tensor(
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            )
+            return repeated_batch, {"mean_gen_tokens_per_sample": 1.0}
+
+        with (
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                side_effect=run_rollout,
+            ),
+            patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False),
+            patch(
+                "nemo_rl.algorithms.grpo._should_use_async_rollouts",
+                return_value=False,
+            ),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            val_metrics, _ = validate(
+                MagicMock(),
+                mock_dataloader,
+                MagicMock(),
+                {"math": MagicMock(spec=EnvironmentInterface)},
+                step=0,
+                master_config=mock_config,
+            )
+
+        # accuracy stays the plain mean over all 8 rollouts; pass@4 counts
+        # prompts with at least one passing rollout (1 of 2).
+        assert val_metrics["accuracy"] == pytest.approx(0.125)
+        assert val_metrics["pass_k"] == pytest.approx(0.5)
+
+    def test_validation_uses_val_sampling_params_on_gym_path(
+        self, mock_grpo_components
+    ):
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [{"role": "user", "content": "a", "token_ids": torch.tensor([1])}],
+                    [{"role": "user", "content": "b", "token_ids": torch.tensor([2])}],
+                ],
+                "task_name": ["math", "math"],
+                "extra_env_info": [{}, {}],
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "idx": torch.tensor([0, 1]),
+                "length": torch.tensor([1, 1]),
+                "total_reward": torch.tensor([0.0, 0.0]),
+            }
+        )
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.max_val_samples = 2
+        mock_config.grpo.val_batch_size = 2
+        mock_config.grpo.val_num_generations_per_prompt = 2
+        # Train samples at 1.0/1.0; validation runs near-greedy.
+        mock_config.policy["generation"].update(
+            {"val_temperature": 0.1, "val_top_p": 0.9, "val_top_k": None}
+        )
+        mock_config.logger.update({"wandb_enabled": False, "wandb": {}})
+        mock_config.env = {}
+
+        def run_gym_rollout(**kwargs):
+            repeated_batch = kwargs["input_batch"]
+            # 2 prompts x k=2 validation rollouts, contiguous per prompt.
+            assert repeated_batch["idx"].tolist() == [0, 0, 1, 1]
+            repeated_batch["total_reward"] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+            return MagicMock(
+                final_batch=repeated_batch,
+                rollout_metrics={"mean_gen_tokens_per_sample": 1.0},
+            )
+
+        with (
+            patch(
+                "nemo_rl.algorithms.grpo.run_nemo_gym_rollout_sync",
+                side_effect=run_gym_rollout,
+            ) as mock_rollout,
+            patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=True),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            val_metrics, _ = validate(
+                MagicMock(),
+                mock_dataloader,
+                MagicMock(),
+                {"math": MagicMock(spec=EnvironmentInterface)},
+                step=0,
+                master_config=mock_config,
+            )
+
+        sampling_params = mock_rollout.call_args.kwargs["sampling_params"]
+        assert sampling_params.temperature == pytest.approx(0.1)
+        assert sampling_params.top_p == pytest.approx(0.9)
+        assert sampling_params.top_k is None
+        assert val_metrics["accuracy"] == pytest.approx(0.25)
+        assert val_metrics["pass_k"] == pytest.approx(0.5)
+
+    def test_setup_rejects_val_sampling_outside_gym_vllm_path(
+        self, mock_grpo_components
+    ):
+        master_config = mock_grpo_components["master_config"]
+        # Non-gym rollouts (env has no nemo_gym) with validation sampling
+        # different from training must be rejected at setup time.
+        master_config.policy["generation"].update(
+            {"backend": "megatron", "val_temperature": 0.1}
+        )
+        master_config.env = {}
+
+        with pytest.raises(AssertionError, match="only supported for vLLM NeMo-Gym"):
+            setup(master_config, MagicMock(), MagicMock(), None)
+
+    def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""
         mock_policy_gen = MagicMock()
         mock_tokenizer = MagicMock()
 
-        mock_config = MasterConfig.model_construct(
-            **{
-                "grpo": {"val_period": 0},  # Required for the assertion
-            }
-        )
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.val_period = 0  # Required for the assertion
 
         val_metrics, timing = validate(
             mock_policy_gen,
@@ -2498,14 +4185,16 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         rewards = torch.tensor([1.0, 0.0, 1.0, 0.0])
         original_sample_mask = train_data["sample_mask"].clone()
 
-        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+        result = compute_and_apply_seq_logprob_error_masking(
             train_data, rewards, seq_logprob_error_threshold=None
         )
 
         # Verify metrics are computed
-        assert max_error > 0.0, "Should compute max error"
-        assert num_masked == 0, "Should not mask any sequences when threshold is None"
-        assert masked_pct == 0.0, "Should have 0% masked"
+        assert result["max_seq_mult_prob_error"] > 0.0, "Should compute max error"
+        assert result["num_masked_seqs"] == 0, (
+            "Should not mask any sequences when threshold is None"
+        )
+        assert result["masked_correct_pct"] == 0.0, "Should have 0% masked"
         # Verify sample_mask is unchanged
         assert torch.equal(train_data["sample_mask"], original_sample_mask)
 
@@ -2536,16 +4225,18 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         rewards = torch.tensor([1.0, 0.0, 1.0, 0.0])
 
         # Use threshold 1.2 which should mask sequences 2 and 3
-        _max_error, num_masked, masked_pct = (
-            compute_and_apply_seq_logprob_error_masking(
-                train_data, rewards, seq_logprob_error_threshold=1.2
-            )
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=1.2
         )
 
         # Verify masking occurred
-        assert num_masked == 2, "Should mask 2 sequences (indices 2 and 3)"
+        assert result["num_masked_seqs"] == 2, (
+            "Should mask 2 sequences (indices 2 and 3)"
+        )
         # Sequence 2 had reward=1, sequence 3 had reward=0, so 50% correct
-        assert masked_pct == 0.5, "50% of masked sequences should be correct"
+        assert result["masked_correct_pct"] == 0.5, (
+            "50% of masked sequences should be correct"
+        )
 
         # Verify sample_mask is updated correctly
         expected_mask = torch.tensor([1.0, 1.0, 0.0, 0.0])
@@ -2568,15 +4259,13 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         rewards = torch.tensor([1.0, 1.0, 1.0])
         original_sample_mask = train_data["sample_mask"].clone()
 
-        _max_error, num_masked, masked_pct = (
-            compute_and_apply_seq_logprob_error_masking(
-                train_data, rewards, seq_logprob_error_threshold=2.0
-            )
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=2.0
         )
 
         # Verify no masking occurred
-        assert num_masked == 0, "Should not mask any sequences"
-        assert masked_pct == 0.0
+        assert result["num_masked_seqs"] == 0, "Should not mask any sequences"
+        assert result["masked_correct_pct"] == 0.0
         # All sequences should remain in sample_mask
         assert torch.equal(train_data["sample_mask"], original_sample_mask)
 
@@ -2594,15 +4283,13 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         )
         rewards = torch.tensor([1.0, 0.0, 1.0])  # 2 correct, 1 incorrect
 
-        _max_error, num_masked, masked_pct = (
-            compute_and_apply_seq_logprob_error_masking(
-                train_data, rewards, seq_logprob_error_threshold=1.0
-            )
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=1.0
         )
 
         # Verify all sequences are masked
-        assert num_masked == 3, "Should mask all 3 sequences"
-        assert masked_pct == pytest.approx(2 / 3, rel=1e-5), (
+        assert result["num_masked_seqs"] == 3, "Should mask all 3 sequences"
+        assert result["masked_correct_pct"] == pytest.approx(2 / 3, rel=1e-5), (
             "2/3 of masked should be correct"
         )
         # All sequences should be zeroed in sample_mask
@@ -2629,16 +4316,16 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         )
         rewards = torch.tensor([1.0, 1.0, 0.0, 1.0])
 
-        _max_error, num_masked, masked_pct = (
-            compute_and_apply_seq_logprob_error_masking(
-                train_data, rewards, seq_logprob_error_threshold=1.0
-            )
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=1.0
         )
 
         # Only 3 sequences were originally unmasked, all should be masked now
-        assert num_masked == 3, "Should mask 3 sequences (indices 0, 2, 3)"
+        assert result["num_masked_seqs"] == 3, (
+            "Should mask 3 sequences (indices 0, 2, 3)"
+        )
         # Sequences 0 and 3 had reward=1, sequence 2 had reward=0
-        assert masked_pct == pytest.approx(2 / 3, rel=1e-5), (
+        assert result["masked_correct_pct"] == pytest.approx(2 / 3, rel=1e-5), (
             "2/3 of newly masked should be correct"
         )
         # All should be zeroed (including already-masked seq 1)
@@ -2659,15 +4346,13 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         # Rewards: seq 2 correct, seq 3 incorrect, seq 4 correct
         rewards = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0])
 
-        _max_error, num_masked, masked_pct = (
-            compute_and_apply_seq_logprob_error_masking(
-                train_data, rewards, seq_logprob_error_threshold=1.5
-            )
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=1.5
         )
 
-        assert num_masked == 3, "Should mask 3 sequences"
+        assert result["num_masked_seqs"] == 3, "Should mask 3 sequences"
         # 2 out of 3 masked sequences were correct (reward=1)
-        assert masked_pct == pytest.approx(2 / 3, rel=1e-5), (
+        assert result["masked_correct_pct"] == pytest.approx(2 / 3, rel=1e-5), (
             "2/3 of masked should be correct"
         )
 
@@ -2701,17 +4386,55 @@ class TestComputeAndApplySeqLogprobErrorMasking:
 
         # Sequence 0 should have lower error due to masked tokens
         # Sequence 1 should have higher error
-        _max_error, num_masked, masked_pct = (
-            compute_and_apply_seq_logprob_error_masking(
-                train_data, rewards, seq_logprob_error_threshold=2.0
-            )
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=2.0
         )
 
         # Only sequence 1 should be masked (seq 0 has reduced error due to token_mask)
-        assert num_masked == 1, "Should mask only sequence 1"
-        assert masked_pct == 0.0, "Masked sequence had reward=0"
+        assert result["num_masked_seqs"] == 1, "Should mask only sequence 1"
+        assert result["masked_correct_pct"] == 0.0, "Masked sequence had reward=0"
         assert train_data["sample_mask"][0] == 1.0, "Sequence 0 should remain unmasked"
         assert train_data["sample_mask"][1] == 0.0, "Sequence 1 should be masked"
+
+    def test_fully_token_masked_sequences_are_excluded_from_metrics(self):
+        """Fully token-masked sequences should not drag reported error metrics to 0."""
+        batch_size, seq_length = 3, 3
+
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs[0, 1] = torch.log(torch.tensor(2.0))
+        generation_logprobs[1, 1] = torch.log(torch.tensor(4.0))
+        generation_logprobs[2, 1] = torch.log(torch.tensor(16.0))
+
+        token_mask = torch.tensor(
+            [
+                [0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        )
+        train_data = self._create_train_data(
+            batch_size,
+            seq_length,
+            prev_logprobs,
+            generation_logprobs,
+            token_mask=token_mask,
+        )
+        rewards = torch.tensor([0.0, 1.0, 1.0])
+
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=3.0
+        )
+
+        assert result["max_seq_mult_prob_error"] == pytest.approx(4.0)
+        assert result["mean_seq_mult_prob_error"] == pytest.approx(3.0)
+        assert result["min_seq_mult_prob_error"] == pytest.approx(2.0)
+        assert result["num_masked_seqs"] == 1
+        assert result["masked_correct_pct"] == 1.0
+        assert result["max_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
+        assert result["mean_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
+        assert result["min_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
+        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 1.0]))
 
     def test_empty_batch_returns_zero_metrics(self):
         """Test handling of edge case with empty batch."""
@@ -2726,13 +4449,17 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         )
         rewards = torch.zeros(0)
 
-        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+        result = compute_and_apply_seq_logprob_error_masking(
             train_data, rewards, seq_logprob_error_threshold=1.5
         )
 
-        assert max_error == 0.0, "Empty batch should have max_error=0"
-        assert num_masked == 0, "Empty batch should have no masked sequences"
-        assert masked_pct == 0.0, "Empty batch should have 0% masked"
+        assert result["max_seq_mult_prob_error"] == 0.0, (
+            "Empty batch should have max_error=0"
+        )
+        assert result["num_masked_seqs"] == 0, (
+            "Empty batch should have no masked sequences"
+        )
+        assert result["masked_correct_pct"] == 0.0, "Empty batch should have 0% masked"
 
     def test_threshold_boundary_values(self):
         """Test behavior at exact threshold boundary."""
@@ -2764,12 +4491,12 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         rewards = torch.tensor([1.0, 1.0, 1.0])
 
         # Threshold of 1.5 should mask sequence 2 (exp(0.41) > 1.5)
-        max_error, num_masked, masked_pct = compute_and_apply_seq_logprob_error_masking(
+        result = compute_and_apply_seq_logprob_error_masking(
             train_data, rewards, seq_logprob_error_threshold=1.5
         )
 
         # At least sequence 2 should be masked
-        assert num_masked >= 1, "At least one sequence should be masked"
+        assert result["num_masked_seqs"] >= 1, "At least one sequence should be masked"
         assert train_data["sample_mask"][0] == 1.0, "Sequence 0 should be kept"
 
 
@@ -2844,3 +4571,58 @@ class TestAggregateRolloutMetrics:
         assert result["total_turns"] == 45
         assert result["accuracy"] == pytest.approx(0.8)
         assert result["min_accuracy_rate"] == pytest.approx(0.2)
+
+
+def _cfg(
+    *, force=False, threshold=None, skip_ref=None, kl_reward=False, kl_penalty=0.01
+):
+    return MasterConfig.model_construct(
+        loss_fn=ClippedPGLossConfig(
+            force_on_policy_ratio=force,
+            use_kl_in_reward=kl_reward,
+            reference_policy_kl_penalty=kl_penalty,
+        ),
+        grpo=GRPOConfig.model_construct(
+            seq_logprob_error_threshold=threshold,
+            skip_reference_policy_logprobs_calculation=skip_ref,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "kw, expected",
+    [
+        ({}, (False, None)),
+        ({"force": True}, (True, None)),
+        ({"force": True, "threshold": 1.5}, (False, None)),  # threshold overrides skip
+        ({"skip_ref": True}, (False, True)),
+    ],
+    ids=["default", "force_on_policy", "force_plus_threshold", "skip_ref"],
+)
+def test_resolve_logprob_skip_flags(kw, expected):
+    if kw.get("force") and kw.get("threshold") is not None:
+        with pytest.warns(UserWarning, match="seq_logprob_error_threshold is set"):
+            assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+    else:
+        assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+
+
+def test_validate_use_kl_in_reward_rejects_force_on_policy_ratio():
+    with pytest.raises(AssertionError, match="use_kl_in_reward"):
+        _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True))
+
+
+def test_validate_use_kl_in_reward_allows_zero_kl_penalty():
+    # kl_coef=0 zeros the KL term regardless, so a zero-placeholder
+    # prev_logprobs can't corrupt the advantage.
+    _validate_use_kl_in_reward_compat(_cfg(force=True, kl_reward=True, kl_penalty=0.0))
+
+
+@pytest.mark.parametrize(
+    "skip_prev_logprobs, expect_prev",
+    [(False, True), (True, False)],
+    ids=["keep_prev_logprobs", "skip_prev_logprobs"],
+)
+def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
+    fields = _train_fields_for_step(skip_prev_logprobs)
+    assert ("prev_logprobs" in fields) is expect_prev

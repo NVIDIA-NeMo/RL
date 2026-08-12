@@ -117,12 +117,7 @@ html_extra_path = ["project.json", "versions1.json"]
 linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
-]
-
-# PyTorch docs anchor IDs change between stable versions; verify the page
-# loads but skip anchor validation to avoid spurious failures on redirects.
-linkcheck_anchors_ignore_for_url = [
-    "https://docs.pytorch.org/.*",
+    "https://huggingface\\.co/datasets/nvidia/Nemotron-RL-Lightning-Training-Blend",
 ]
 
 

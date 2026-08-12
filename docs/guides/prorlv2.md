@@ -18,7 +18,7 @@ This document focuses on ProRLv2-specific knobs and gotchas. For foundational co
 Use the example configuration [`examples/configs/prorlv2.v2.yaml`](../../examples/configs/prorlv2.v2.yaml):
 
 ```bash
-uv run examples/run_grpo_math.py --config examples/configs/prorlv2.v2.yaml {overrides}
+uv run examples/run_grpo.py --config examples/configs/prorlv2.v2.yaml {overrides}
 ```
 
 `prorlv2.v2.yaml` inherits from [`examples/configs/grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml) and only overrides a small set of fields under `grpo` and `loss_fn`, plus output directories.
@@ -143,9 +143,9 @@ All filtering modes require `use_importance_sampling_correction: true`. ICE-POP 
 
 ---
 
-**`"tis"` — Clamp to Max**
+**`"tis"` — Clamp to Bounds**
 
-Clamp IS weights to `<= truncated_importance_sampling_ratio`. Simple but retains biased signal from router-flipped tokens.
+Clamp IS weights to `[truncated_importance_sampling_ratio_min, truncated_importance_sampling_ratio]`. If `truncated_importance_sampling_ratio_min` is unset, the lower bound defaults to `0`. Simple but retains biased signal from router-flipped tokens.
 
 ---
 
@@ -209,7 +209,7 @@ Use [`examples/configs/prorlv2_1_moe.v2.yaml`](../../examples/configs/prorlv2_1_
 
 ```bash
 # Launch ProRL v2.1 for MoE models
-uv run examples/run_grpo_math.py --config examples/configs/prorlv2_1_moe.v2.yaml {overrides}
+uv run examples/run_grpo.py --config examples/configs/prorlv2_1_moe.v2.yaml {overrides}
 ```
 
 ## Full Example Configs
@@ -222,7 +222,7 @@ uv run examples/run_grpo_math.py --config examples/configs/prorlv2_1_moe.v2.yaml
 A few common overrides when launching:
 
 ```bash
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
   --config examples/configs/prorlv2.v2.yaml \
   policy.model_name="Qwen/Qwen2.5-1.5B" \
   logger.wandb_enabled=true \
@@ -234,7 +234,7 @@ uv run examples/run_grpo_math.py \
 If you want to enable DAPO overlong reward shaping instead of stop-properly:
 
 ```bash
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
   --config examples/configs/prorlv2.v2.yaml \
   grpo.reward_shaping.stop_properly_penalty_coef=null \
   grpo.reward_shaping.overlong_buffer_length=4096 \
@@ -248,7 +248,7 @@ In addition to task rewards/accuracy, a few stability signals are particularly u
 
 - **Dynamic sampling efficiency**: if enabled, watch how often batches need multiple generation rounds (see `dapo.md` for detailed guidance).
 - **Training–generation mismatch**: `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error` are computed in `ClippedPGLossFn` (see the [GRPO metrics section](grpo.md#metrics)).
-- **IS out-of-bounds ratio** (`is_oob_ratio`): the fraction of tokens (ICE-POP) or sequences (seq-mask-tis) filtered out by truncated IS. A persistently high value suggests large backend mismatch — check precision settings or relax the bounds.
+- **IS out-of-bounds ratio** (`is_oob_ratio`): the fraction of tokens (TIS clamped outside [min, max], ICE-POP outside [min, max]) or sequences (seq-mask-tis) whose importance weight falls outside the truncation bounds. A persistently high value suggests large backend mismatch — check precision settings or relax the bounds.
 - **Truncation rate**: if high, either increase `policy.max_total_sequence_length`/`policy.generation.max_model_len` or relax truncation penalty (`stop_properly_penalty_coef`).
 
 ## References

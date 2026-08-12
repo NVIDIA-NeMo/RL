@@ -21,7 +21,7 @@ from typing import ContextManager, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
-from megatron.training.utils import unwrap_model
+from megatron.core.utils import unwrap_model
 from torch import Tensor, nn
 
 

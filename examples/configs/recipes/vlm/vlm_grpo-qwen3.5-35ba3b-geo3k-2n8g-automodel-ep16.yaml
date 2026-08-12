@@ -10,6 +10,14 @@ checkpointing:
   checkpoint_dir: results/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16
 policy:
   model_name: Qwen/Qwen3.5-35B-A3B-Base
+  hf_config_overrides:
+    text_config:
+      # Disable the MoE load-balancing aux loss for RL: Automodel otherwise
+      # injects router gradients that conflict with the policy objective and
+      # degrade accuracy. Keep as 0.0, not 0: Hugging Face strict config
+      # validation declares router_aux_loss_coef as float and rejects YAML's
+      # integer 0.
+      router_aux_loss_coef: 0.0
   train_global_batch_size: 512
   logprob_batch_size: 1
   max_total_sequence_length: 3072
@@ -33,10 +41,15 @@ policy:
         attn: te
         linear: te
         rms_norm: te
-        enable_deepep: true
+        experts: gmm
+        dispatcher: deepep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: false
+        freeze_audio_tower: true
+        freeze_language_model: false
   generation:
     max_new_tokens: 2048
     vllm_cfg:

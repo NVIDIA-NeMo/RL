@@ -34,6 +34,7 @@ from nemo_rl.environments.rewards import (
     combine_reward_functions,
     exact_answer_alphanumeric_reward,
     format_reward,
+    geo3k_reward,
     math_expression_reward,
 )
 from nemo_rl.environments.utils import chunk_list_to_workers
@@ -76,6 +77,8 @@ class VLMVerifyWorker:
                 reward_func = math_expression_reward
             elif reward_func_name == "bbox_giou":
                 reward_func = bbox_giou_reward
+            elif reward_func_name == "geo3k":
+                reward_func = geo3k_reward
             else:
                 raise ValueError(f"Invalid reward function: {reward_func_name}")
 

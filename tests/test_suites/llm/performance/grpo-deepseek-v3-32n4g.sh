@@ -13,6 +13,7 @@ fi
 # ===== BEGIN CONFIG =====
 NUM_NODES=32
 GPUS_PER_NODE=4
+SEGMENT_SIZE=16    # nodes per NVLink-domain segment; tools/launch passes it as sbatch --segment (keeps MoE EP intra-rack, #2937). Matches cluster.segment_size in the yaml.
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up

@@ -12,14 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import atexit
+import json
 import os
-from typing import Protocol
+from typing import Any, Protocol
 
 import rich
 import torch
 
 NRL_NSYS_WORKER_PATTERNS = os.environ.get("NRL_NSYS_WORKER_PATTERNS", "")
 NRL_NSYS_PROFILE_STEP_RANGE = os.environ.get("NRL_NSYS_PROFILE_STEP_RANGE", "")
+
+
+def _parse_extra_options(raw: str) -> dict[str, Any]:
+    """Parse NRL_NSYS_EXTRA_OPTIONS as a JSON object of nsys flag -> value.
+
+    Empty string parses to an empty dict. Invalid JSON or non-object payloads raise
+    so misconfiguration surfaces immediately rather than silently being ignored.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Failed to parse NRL_NSYS_EXTRA_OPTIONS as JSON: {e}. "
+            "Expected a JSON object mapping nsys flag names (without leading --) to "
+            'values, e.g. \'{"gpu-metrics-device": "all", "cuda-memory-usage": "true"}\'. '
+            "See https://github.com/NVIDIA/NeMo-RL/tree/main/docs/nsys-profiling.md for more details."
+        ) from e
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"NRL_NSYS_EXTRA_OPTIONS must be a JSON object, got {type(parsed).__name__}. "
+            "See https://github.com/NVIDIA/NeMo-RL/tree/main/docs/nsys-profiling.md for more details."
+        )
+    return parsed
+
+
+NRL_NSYS_EXTRA_OPTIONS: dict[str, Any] = _parse_extra_options(
+    os.environ.get("NRL_NSYS_EXTRA_OPTIONS", "")
+)
 
 
 class ProfilablePolicy(Protocol):

@@ -45,14 +45,19 @@ import torch
 
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
+    get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
+    run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
+from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 # Carry keys producible by the rollout actor only when the caller opts in.
 # These are np.ndarray(object) per-row arrays from decompose_message_log; the
@@ -60,6 +65,43 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 # the training/dynamic-sampling path only handles tensors/lists. Validation
 # requests them explicitly to print per-sample message logs.
 OPT_IN_CARRY_KEYS: tuple[str, ...] = ("turn_roles", "turn_contents")
+
+
+def _flatten_rollout_message_log_for_tq(
+    message_logs: list[Any],
+    prompt_lengths: torch.Tensor,
+    *,
+    pad_token_id: int,
+    make_sequence_length_divisible_by: int,
+) -> tuple[BatchedDataDict[Any], torch.Tensor, BatchedDataDict[Any]]:
+    """Prepare rollout message logs for the TQ payload and driver carry."""
+    from nemo_rl.algorithms.grpo import (
+        add_grpo_token_loss_masks_and_generation_logprobs,
+        extract_initial_prompt_messages,
+    )
+    from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+    from nemo_rl.experience.rollouts import backfill_missing_routed_experts
+
+    pad = {"pad_value_dict": {"token_ids": pad_token_id}}
+    # Must precede the prompt extraction: it reuses the same message dicts, so
+    # backfilling here also covers the prompt flatten below.
+    backfill_missing_routed_experts(message_logs)
+    prompt_message_logs = extract_initial_prompt_messages(
+        message_logs,
+        prompt_lengths,
+    )
+    prompt_flat, _ = batched_message_log_to_flat_message(
+        prompt_message_logs,
+        **pad,
+    )
+
+    add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
+    flat, input_lengths = batched_message_log_to_flat_message(
+        message_logs,
+        **pad,
+        make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+    )
+    return flat, input_lengths, prompt_flat
 
 
 @ray.remote  # pragma: no cover
@@ -170,15 +212,12 @@ class SyncRolloutActor:
         """
         # Lazy imports — avoid pulling grpo into this module at load.
         from nemo_rl.algorithms.grpo import (
-            _extract_prompt_only_messages,
             _should_use_async_rollouts,
             _should_use_nemo_gym,
         )
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import (
             MESSAGE_LOG_BULK_FIELDS,
-            add_loss_mask_to_message_log,
-            batched_message_log_to_flat_message,
             decompose_message_log,
         )
 
@@ -207,11 +246,25 @@ class SyncRolloutActor:
 
         # Rollout dispatch (mirrors grpo_sync.py:294-349).
         if _should_use_nemo_gym(cfg):
-            r = run_async_nemo_gym_rollout(
+            r = run_nemo_gym_rollout_sync(
                 **common,
                 max_seq_len=None,
                 max_rollout_turns=None,
                 generation_config=cfg.policy["generation"],
+                log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                    wandb_enabled=cfg.logger["wandb_enabled"],
+                    wandb_config=cfg.logger["wandb"],
+                ),
+                effort_config=EffortLevelsConfig.model_validate(
+                    cfg.env["nemo_gym"].get("effort_levels")
+                )
+                if "nemo_gym" in cfg.env
+                and cfg.env["nemo_gym"].get("effort_levels") is not None
+                else None,
+                reward_penalty_config=cfg.reward_penalties,
+                thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
+                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
+                debug_payload_metrics=cfg.grpo.debug_payload_metrics,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:
@@ -223,35 +276,34 @@ class SyncRolloutActor:
             final_batch, rollout_metrics = runner(
                 **common,
                 max_seq_len=cfg.policy["max_total_sequence_length"],
-                max_rollout_turns=cfg.grpo["max_rollout_turns"],
+                max_rollout_turns=cfg.grpo.max_rollout_turns,
+                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
             )
         fb = final_batch.to("cpu")
         del final_batch
 
-        # Assistant-only loss mask (shared helper); seed missing
-        # generation_logprobs (e.g. when the env wraps assistant turns
-        # without a backing logprob, or for greedy/replay rollouts).
-        add_loss_mask_to_message_log(fb["message_log"])
-        for ml in fb["message_log"]:
-            for msg in ml:
-                msg.setdefault(
-                    "generation_logprobs",
-                    torch.zeros_like(msg["token_ids"], dtype=torch.float32),
-                )
-
-        # Flatten message_log → bulk tensors + extract prompt-only ids.
-        pad = {"pad_value_dict": {"token_ids": self.tokenizer.pad_token_id}}
-        flat, input_lengths = batched_message_log_to_flat_message(
+        # Flatten message_log → bulk tensors + extract original prompt ids.
+        # GRPO masks only generated assistant turns, even if the dataset
+        # prompt itself contains assistant messages as conversation history.
+        flat, input_lengths, prompt_flat = _flatten_rollout_message_log_for_tq(
             fb["message_log"],
-            **pad,
+            fb["length"],
+            pad_token_id=self.tokenizer.pad_token_id,
             make_sequence_length_divisible_by=cfg.policy[
                 "make_sequence_length_divisible_by"
             ],
         )
-        prompt_flat, _ = batched_message_log_to_flat_message(
-            _extract_prompt_only_messages(fb["message_log"]),
-            **pad,
+
+        router_replay_enabled = bool(
+            (cfg.policy.get("router_replay") or {}).get("enabled", False)
         )
+        if router_replay_enabled and ROUTED_EXPERTS_FIELD not in flat:
+            raise RuntimeError(
+                "policy.router_replay.enabled=true requires routed_experts in "
+                "the rollout bulk payload, but rollout flattening did not "
+                "produce that field. Check vLLM routed-expert capture and the "
+                "message-log flattening path."
+            )
 
         # TQ bulk payload — DP_TRAIN_FIELDS + multimodal extras.
         bulk_batch = BatchedDataDict[Any](
@@ -263,6 +315,8 @@ class SyncRolloutActor:
                 "sample_mask": fb["loss_multiplier"],
             }
         )
+        if ROUTED_EXPERTS_FIELD in flat:
+            bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
         for k, v in flat.get_multimodal_dict(as_tensors=False).items():
             if isinstance(v, torch.Tensor):
                 bulk_batch[k] = v
@@ -345,6 +399,7 @@ class SyncRolloutActor:
         n_per_prompt = n_samples // n_prompts
         uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
         sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
+        trace_rollout_payload(keys=sample_ids, data=bulk_batch)
         meta = kv_first_write(
             bulk_batch,
             sample_ids=sample_ids,

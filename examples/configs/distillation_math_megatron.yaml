@@ -29,6 +29,7 @@ policy: &POLICY_BASE
         train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
         logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
         algorithm: "modified_first_fit_decreasing"
+        microbatch_order: "packer"
         sequence_length_round: 64
 
     max_grad_norm: 1.0
@@ -45,8 +46,9 @@ policy: &POLICY_BASE
         fine_grained_activation_offloading: false
         # Modules to offload when fine_grained_activation_offloading is true.
         # Valid options: ["attn_norm", "qkv_linear", "core_attn", "attn_proj",
-        # "mlp_norm", "expert_fc1", "moe_act"]. "attn_proj" requires "core_attn".
-        # See: https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L1440-L1448
+        # "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp"].
+        # "attn_proj" requires "core_attn".
+        # See: https://github.com/NVIDIA/Megatron-LM/blob/d12f6c8c9aff51e166d872fd70151687a8e3f375/megatron/core/transformer/transformer_config.py#L1234-L1245
         offload_modules: null
         # recompute_granularity controls activation checkpointing depth.
         # "full": recompute all activations (default, max memory savings).
@@ -59,7 +61,6 @@ policy: &POLICY_BASE
         # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
         # Use ["moe"] for MoE models to recompute expert activations only.
         recompute_modules: null
-        converter_type: "Qwen3ForCausalLM"
         tensor_model_parallel_size: 2
         expert_tensor_parallel_size: 1
         expert_model_parallel_size: 1
@@ -82,6 +83,7 @@ policy: &POLICY_BASE
         moe_enable_deepep: false
         moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
+        use_gloo_process_groups: false
         peft:
             enabled: false
             target_modules: []
@@ -198,3 +200,4 @@ logger:
 cluster:
     gpus_per_node: 8
     num_nodes: 1
+    segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

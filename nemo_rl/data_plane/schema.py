@@ -13,7 +13,7 @@
 # limitations under the License.
 """Shared constants and type aliases for the data-plane meta contract."""
 
-from typing import Literal
+from typing import Literal, Sequence
 
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
 Layout = Literal["padded", "jagged"]
@@ -60,3 +60,36 @@ LP_SEED_FIELDS = (
 # grid metadata, etc.) when present; it's harmlessly absent for
 # text-only models so the filter skips it on those.
 DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS, "multi_modal_inputs")
+
+ROUTED_EXPERTS_FIELD = "routed_experts"
+
+# Per-sample 1D scalar fields. The TQ adapter promotes these to ``(N, 1)``
+# on write to work around TQ v0.1.9's KVStorageManager schema/data mismatch on
+# the Mooncake backend, and squeezes them back to ``(N,)`` on read. This is the
+# authoritative user-level schema; no per-row shape metadata is carried.
+#
+# Fields listed here must be dense ``(N,)`` tensors when written through the
+# Mooncake adapter. Dense 1D fields not listed here are rejected on that path so
+# a new field cannot silently reintroduce the upstream shape mismatch.
+#
+# Delete this set and the corresponding adapter transforms when upstream TQ
+# fixes 1D field schema extraction.
+PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
+    {
+        INPUT_LENGTHS,
+        "total_reward",
+        SAMPLE_MASK,
+    }
+)
+
+
+def fields_with_optional_routed_experts(
+    fields: Sequence[str],
+    *,
+    enabled: bool,
+) -> list[str]:
+    """Return `fields` plus routed experts when router replay is enabled."""
+    out = list(fields)
+    if enabled and ROUTED_EXPERTS_FIELD not in out:
+        out.append(ROUTED_EXPERTS_FIELD)
+    return out

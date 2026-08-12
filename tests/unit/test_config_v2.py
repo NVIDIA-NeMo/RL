@@ -28,6 +28,7 @@ from omegaconf import OmegaConf
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
+from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
@@ -125,6 +126,8 @@ def test_config_v2_same_as_v1(config_file):
         master_config_class = SFTMasterConfig
     elif "grpo" in config_v1:
         master_config_class = GRPOMasterConfig
+    elif "ppo" in config_v1:
+        master_config_class = PPOMasterConfig
     elif "rm" in config_v1:
         master_config_class = RMMasterConfig
 

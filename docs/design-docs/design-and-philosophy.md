@@ -1,6 +1,6 @@
 # Design and Philosophy
 
-This section introduces the NeMo RL APIs, configuration patterns with TypedDicts, and addresses the challenges of online Reinforcement Learning (RL). Coordinating various software components, known as RL Actors, requires effective resource allocation, isolation, coordination, and communication. Our design philosophy focuses on creating modular abstractions for these tasks, ensuring scalability from one GPU to thousands, regardless of the RL Actor's implementation.
+This section introduces the NeMo RL APIs, configuration patterns (Pydantic `BaseModel` for user-facing config, `@dataclass` for internal classes, and `TypedDict` for legacy config still being migrated), and addresses the challenges of online Reinforcement Learning (RL). Coordinating various software components, known as RL Actors, requires effective resource allocation, isolation, coordination, and communication. Our design philosophy focuses on creating modular abstractions for these tasks, ensuring scalability from one GPU to thousands, regardless of the RL Actor's implementation.
 
 ## Motivation
 
@@ -114,23 +114,35 @@ def grpo_train(
 For a complete implementation of GRPO, including validation, checkpointing, memory movement, and the data processing steps not detailed here, see [grpo_train](../../nemo_rl/algorithms/grpo.py).
 
 
-### TypedDict and Configuration Defaults
+### Configuration Schema: BaseModel, dataclass, and TypedDict
 
-In NeMo RL, we use YAML files for configuration and load them with `omegaconf` into a recursive `dict`. Within the codebase,
-the root `dict` and sub-`dict`s are typed with `TypedDict` subclasses to provide type hints when accessing attributes. This
-allows our type checker to validate if an undocumented attribute is accessed when not present in the `TypedDict` subclass,
-or to identify an incompatible type.
+In NeMo RL, we use YAML files for configuration and load them with `omegaconf` into a recursive `dict`. Within the codebase, that `dict` is described by typed schemas so static type checkers can flag undocumented attributes or incompatible types.
 
-We chose this design because it's simple and gives users the flexibility to use older configuration files without encountering errors during config loading due to unexpected attributes, whether obsolete or user defined. While we considered using dataclasses or other structured configuration formats, those approaches introduce more boilerplate and would require config versioning to support loading across different versions of NeMo RL.
+We are **incrementally migrating** the config schema from `typing.TypedDict` (v1) to `pydantic.BaseModel` (v2). Both styles currently coexist; the migration is tracked by `tests/unit/test_config_v2.py` against the reference configs in `tests/unit/reference_configs/`, which will be removed once the migration is complete.
+
+**v2 — the new conventions (use these for all new code):**
+
+- **`pydantic.BaseModel` — v2, user-facing config (the new default).** Any class a user touches via YAML — currently the top-level `MasterConfig` of each algorithm and a few shared schemas like `ClippedPGLossConfig` — is declared as a `BaseModel` with `extra="allow"`. The `extra="allow"` flag preserves the original motivation behind picking `TypedDict`: users can keep using older configuration files with obsolete or user-defined keys without load-time errors. New user-facing configs should be `BaseModel`, and existing `TypedDict`s should be migrated as the codebase moves.
+- **`@dataclass` — v2, internal classes, *not* loaded from YAML.** Process-local data containers (worker metadata, datum specs, internal state passed between Python components) use `@dataclass`. They are not config and should not pretend to be.
+
+**v1 — legacy, being migrated away:**
+
+- **`typing.TypedDict` — v1, legacy user-facing config still being migrated.** Most nested sub-configs (e.g. `GRPOConfig`, `RewardScalingConfig`) remain `TypedDict` for now and continue to follow the same default-handling rules below until they are migrated to `BaseModel`. Do not add new `TypedDict`-based config classes.
 
 We follow a few design principles regarding configuration:
 
-1. We forbid defaults in the code, except in limited cases (e.g., alpha features). Defaults should be defined in YAML configuration files. Setting defaults in code makes it difficult to trace where values originate during debugging.
-    * Forbidden examples include:
+1. **New code follows the v2 convention directly.** Any newly added user-facing config class must be a `pydantic.BaseModel` (with `extra="allow"` when appropriate), and any newly added internal (non-YAML-loaded) class must be a `@dataclass`. Do not introduce new `TypedDict`-based config classes — only edits to existing, not-yet-migrated `TypedDict`s are expected.
+2. **Defaults must not be scattered at call sites.** A default for a config value must live in exactly one place; readers should never have to grep through algo code to find what value was actually used. *Where* that one place is depends on the schema:
+    * **v2 (BaseModel, user config):** the default lives on the BaseModel field as a Python value — the BaseModel class is the centralized source of truth for user-facing defaults, and the exemplar YAML serves as documentation / override examples. E.g. `disable_ppo_ratio: bool = False` on `ClippedPGLossConfig`.
+    * **v1 (TypedDict, legacy user config):** the default lives only in the exemplar YAML — no class-level default, and the Python code reads the value without supplying a fallback.
+    * **`@dataclass` (internal class, not loaded from YAML):** usually no defaults at all — fields are populated by the producing code path.
+    * Forbidden examples (any schema type — they all hide defaults at the call site):
         * `grpo_config.get("num_prompts_per_step", 32)`
         * `policy_config.get("model_name", "meta-llama/Llama-3.1-8B-Instruct")`
+        * `def build_policy(policy_cfg, precision: str = "bfloat16"): ...`
     * Acceptable examples:
-        * If an attribute is typed `typing.NotRequired[...]`, it is okay for the code to check for absence/`None`, e.g., `assert "milestones" in scheduler_cfg` or `if "milestones" in scheduler_cfg`
-1. All configs under [examples/configs/*.yaml](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs) are exemplars and should contain the defaults for `typing.Required` or `typing.NotRequired` attributes, along with accompanying documentation.
+        * Reading a required attribute directly: `master_config.policy.precision` (v2) or `policy_cfg["precision"]` (v1).
+        * If an attribute is typed `typing.NotRequired[...]` (TypedDict) or `Optional[...] = None` (BaseModel), it is okay for the code to check for absence/`None`, e.g., `assert "milestones" in scheduler_cfg` or `if "milestones" in scheduler_cfg`.
+3. All configs under [examples/configs/*.yaml](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs) are exemplars and should contain the defaults for required or optional attributes, along with accompanying documentation.
    * All configs under [examples/configs/recipes/**/*.yaml](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs/recipes) do not require documentation and are snapshots of functional configurations.
-1. All configs under [examples/configs/**/*.yaml](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs) should adhere to their `TypedDict` subclass configuration. Unit tests in [tests/unit/test_config_validation.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tests/unit/test_config_validation.py) are run to validate compliance.
+4. All configs under [examples/configs/**/*.yaml](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs) should adhere to their `BaseModel`/`TypedDict` subclass configuration. Unit tests in [tests/unit/test_config_validation.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tests/unit/test_config_validation.py) validate schema compliance, and [tests/unit/test_config_v2.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tests/unit/test_config_v2.py) guards the in-progress v1→v2 migration against accidental new defaults.

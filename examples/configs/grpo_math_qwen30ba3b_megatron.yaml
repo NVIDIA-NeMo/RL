@@ -15,6 +15,8 @@ policy:
   logprob_batch_size: 4
   max_total_sequence_length: 4096
   precision: "bfloat16"
+  router_replay:
+    enabled: false
 
   dtensor_cfg:
     enabled: false
@@ -29,7 +31,6 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    converter_type: "LlamaForCausalLM"
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 1
     context_parallel_size: 1
@@ -72,7 +73,12 @@ policy:
       gpu_memory_utilization: 0.7
       enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
+    vllm_kwargs:
+      # vLLM 0.20's default FlashInfer TRTLLM MoE backend isn't refit-compatible,
+      # change to triton to keep same behavior as vLLM 0.17.
+      moe_backend: triton
 
 cluster:
   gpus_per_node: 8
   num_nodes: 8
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

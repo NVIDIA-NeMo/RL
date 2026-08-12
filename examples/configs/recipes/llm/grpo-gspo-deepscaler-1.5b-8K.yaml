@@ -29,6 +29,9 @@ policy:
   generation:
     vllm_cfg:
       enforce_eager: true
+    vllm_kwargs:
+      compilation_config:
+        custom_ops: ["all", "-rotary_embedding"]
 data:
   train:
     dataset_name: DeepScaler

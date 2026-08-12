@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import shutil
 import tempfile
 from unittest.mock import MagicMock, call, patch
@@ -27,7 +28,9 @@ from nemo_rl.utils.logger import (
     TensorboardLogger,
     WandbLogger,
     flatten_dict,
+    log_container_init_timing,
     print_message_log_samples,
+    should_log_nemo_gym_full_result_tables,
 )
 
 
@@ -54,6 +57,88 @@ class TestFlattenDict:
         d = {"a": 1, "b": {"c": 2, "d": 3}}
         expected = {"a": 1, "b_c": 2, "b_d": 3}
         assert flatten_dict(d, sep="_") == expected
+
+    def test_expand_lists_false_keeps_lists_intact(self):
+        """expand_lists=False keeps each list under a single stable key.
+
+        Regression guard for metric-key cardinality explosion: variable-length
+        per-event lists must not be expanded into one key per index.
+        """
+        d = {"m": {0: [1, 2, 3], 1: [4, 6]}, "scalar": 1}
+        # Default behavior is unchanged: lists are expanded by index.
+        assert flatten_dict(d) == {
+            "m.0.0": 1,
+            "m.0.1": 2,
+            "m.0.2": 3,
+            "m.1.0": 4,
+            "m.1.1": 6,
+            "scalar": 1,
+        }
+        # expand_lists=False keeps each list intact under one stable key.
+        assert flatten_dict(d, expand_lists=False) == {
+            "m.0": [1, 2, 3],
+            "m.1": [4, 6],
+            "scalar": 1,
+        }
+
+    def test_summarize_list(self):
+        """_summarize_list reduces a numeric list to a bounded stat set."""
+        from nemo_rl.utils.logger import _summarize_list
+
+        stats = _summarize_list([1.0, 2.0, 3.0, 4.0])
+        assert stats == {
+            "mean": 2.5,
+            "p50": 2.5,
+            "p90": pytest.approx(3.7),
+            "max": 4.0,
+        }
+        # The key set is fixed and bounded regardless of input length.
+        assert set(_summarize_list([5.0])) == {"mean", "p50", "p90", "max"}
+        # Empty / non-numeric inputs yield no metrics.
+        assert _summarize_list([]) == {}
+        assert _summarize_list(["x", True]) == {}
+        # numpy scalars are accepted (parity with stock MLflow float coercion).
+        import numpy as np
+
+        assert _summarize_list([np.int64(2), np.float64(4)])["mean"] == 3.0
+
+    def test_merge_generation_logger_workers(self):
+        """Per-worker generation-logger lists merge into one list per metric."""
+        from nemo_rl.utils.logger import _merge_generation_logger_workers
+
+        metrics = {
+            "generation_logger_metrics": {"kv": {0: [1, 2], 1: [3]}},
+            "loss": 0.5,
+        }
+        merged = _merge_generation_logger_workers(metrics)
+        assert merged["generation_logger_metrics"] == {"kv": [1, 2, 3]}
+        assert merged["loss"] == 0.5
+        # Input is not mutated (other backends still see per-worker data).
+        assert metrics["generation_logger_metrics"]["kv"] == {0: [1, 2], 1: [3]}
+
+
+@pytest.mark.parametrize(
+    ("wandb_enabled", "table_flag", "expected"),
+    [
+        (False, None, False),
+        (True, None, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
+)
+def test_should_log_nemo_gym_full_result_tables(wandb_enabled, table_flag, expected):
+    """Full-result Tables require both an active W&B logger and explicit opt-in."""
+    wandb_config = {}
+    if table_flag is not None:
+        wandb_config["log_nemo_gym_full_result_tables"] = table_flag
+
+    assert (
+        should_log_nemo_gym_full_result_tables(
+            wandb_enabled=wandb_enabled, wandb_config=wandb_config
+        )
+        is expected
+    )
 
 
 class TestTensorboardLogger:
@@ -243,6 +328,7 @@ class TestWandbLogger:
             "entity": "custom-entity",
             "group": "custom-group",
             "tags": ["tag1", "tag2"],
+            "log_nemo_gym_full_result_tables": True,
         }
         WandbLogger(cfg, log_dir=temp_dir)
 
@@ -564,6 +650,59 @@ class TestMLflowLogger:
         mock_mlflow.log_metrics.assert_any_call(
             {"train/loss": 0.5, "train/accuracy": 0.8}, step=10, run_id=logger.run_id
         )
+
+    @patch("nemo_rl.utils.logger.mlflow")
+    def test_log_metrics_summarizes_lists(self, mock_mlflow, temp_dir):
+        """List-valued metrics are reduced to bounded per-step summary stats.
+
+        Regression test for metric-key cardinality explosion: per-event async
+        vLLM ``generation_logger_metrics`` (dict[str, dict[int, list]]) and
+        per-sample histograms must not create one MLflow metric key per element.
+        Each list collapses to a fixed set of summary statistics logged at the
+        real training step (so the x-axis matches every other scalar metric).
+        """
+        cfg = {
+            "experiment_name": "test-experiment",
+            "run_name": "test-run",
+            "tracking_uri": None,
+        }
+        logger = MLflowLogger(cfg, log_dir=temp_dir)
+
+        metrics = {
+            "generation_logger_metrics": {
+                "num_pending_samples": {0: [1.0, 2.0, 3.0], 1: [4.0, 6.0]},
+            },
+            "loss": 0.5,
+        }
+        logger.log_metrics(metrics, step=7)
+
+        # A single call at the real training step; no per-element keys and no
+        # synthetic-step history series (MlflowClient.log_batch is never used).
+        mock_mlflow.log_metrics.assert_called_once()
+        mock_mlflow.MlflowClient.assert_not_called()
+        args, kwargs = mock_mlflow.log_metrics.call_args
+        logged = args[0]
+        assert kwargs == {"step": 7, "run_id": logger.run_id}
+
+        # Scalars pass through unchanged.
+        assert logged["loss"] == 0.5
+
+        # Per-worker lists are merged ([1,2,3,4,6]) and summarized under one
+        # "/"-nested key per metric (so the MLflow UI groups them).
+        base = "generation_logger_metrics/num_pending_samples"
+        assert logged[f"{base}/mean"] == pytest.approx(3.2)
+        assert logged[f"{base}/p50"] == 3.0
+        assert logged[f"{base}/max"] == 6.0
+        assert {k for k in logged if k.startswith("generation_logger_metrics")} == {
+            f"{base}/mean",
+            f"{base}/p50",
+            f"{base}/p90",
+            f"{base}/max",
+        }
+
+        # Bounded: 1 scalar + 4 stats; nothing exploded and no per-worker index.
+        assert len(logged) == 1 + 4
+        assert not any(seg.isdigit() for key in logged for seg in key.split("/"))
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_log_hyperparams(self, mock_mlflow, temp_dir):
@@ -1945,6 +2084,35 @@ class TestLogger:
 
         mock_subplots.assert_not_called()
         backend_logger.log_plot.assert_not_called()
+
+
+class TestLogContainerInitTiming:
+    def test_warns_when_job_start_unset(self, monkeypatch, caplog, capsys):
+        monkeypatch.delenv("NRL_JOB_START_EPOCH", raising=False)
+        with caplog.at_level(logging.WARNING):
+            log_container_init_timing()
+        assert "NRL_JOB_START_EPOCH not set" in caplog.text
+        assert "CONTAINER INIT TIMING" not in capsys.readouterr().out
+
+    def test_prints_total_only(self, monkeypatch, capsys):
+        monkeypatch.delenv("SLURM_JOB_START_TIME", raising=False)
+        monkeypatch.delenv("NRL_RAY_READY_EPOCH", raising=False)
+        monkeypatch.setenv("NRL_JOB_START_EPOCH", "1.0")
+        log_container_init_timing()
+        out = capsys.readouterr().out
+        assert "CONTAINER INIT TIMING" in out and "total:" in out
+        assert "slurm_prologue" not in out and "cluster_startup" not in out
+
+    def test_prints_full_breakdown(self, monkeypatch, capsys):
+        monkeypatch.setenv("SLURM_JOB_START_TIME", "1.0")
+        monkeypatch.setenv("NRL_JOB_START_EPOCH", "2.0")
+        monkeypatch.setenv("NRL_RAY_READY_EPOCH", "3.0")
+        log_container_init_timing()
+        out = capsys.readouterr().out
+        assert "slurm_prologue: 1.0s" in out
+        assert "cluster_startup (orchestrator+container+ray): 1.0s" in out
+        assert "driver_startup (launch+python+imports):" in out
+        assert "total:" in out
 
 
 def test_print_message_log_samples(capsys):

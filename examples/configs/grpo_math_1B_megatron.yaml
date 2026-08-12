@@ -16,6 +16,7 @@ grpo:
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
+    max_generation_failures: 0
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -72,6 +73,7 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
 
   max_grad_norm: 1.0
@@ -92,8 +94,9 @@ policy:
     fine_grained_activation_offloading: false
     # Modules to offload when fine_grained_activation_offloading is true.
     # Valid options: ["attn_norm", "qkv_linear", "core_attn", "attn_proj",
-    # "mlp_norm", "expert_fc1", "moe_act"]. "attn_proj" requires "core_attn".
-    # See: https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L1440-L1448
+    # "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp"].
+    # "attn_proj" requires "core_attn".
+    # See: https://github.com/NVIDIA/Megatron-LM/blob/d12f6c8c9aff51e166d872fd70151687a8e3f375/megatron/core/transformer/transformer_config.py#L1234-L1245
     offload_modules: null
     # recompute_granularity controls activation checkpointing depth.
     # "full": recompute all activations (default, max memory savings).
@@ -106,7 +109,6 @@ policy:
     # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
     # Use ["moe"] for MoE models to recompute expert activations only.
     recompute_modules: null
-    converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -124,7 +126,8 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
-    #gives ~20% training perf speedup with sequence packing 
+    use_gloo_process_groups: false
+    #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
 
     peft:
@@ -185,15 +188,6 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
-    mcore_generation_config:
-      buffer_size_gb: 10  # Total buffer size is 2x this value (active requests + paused requests)
-      num_cuda_graphs: 4  # Number of CUDA graphs to pre-compile for different batch sizes
-      block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
-      use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
-      enable_chunked_prefill: false  # Split long prefills into chunks for better memory management
-      unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
-      max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
-
     vllm_cfg:
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.6
@@ -229,3 +223,4 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

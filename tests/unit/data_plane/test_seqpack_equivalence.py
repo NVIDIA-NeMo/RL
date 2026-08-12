@@ -44,15 +44,11 @@ from tensordict import TensorDict
 pytest.importorskip("ray")
 transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
-from nemo_rl.data_plane import build_data_plane_client, materialize  # noqa: E402
+from nemo_rl.data_plane import materialize  # noqa: E402
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
 
-from ._rollout_shapes import mooncake_available
-
-# Ray is initialized once by the parent autouse fixture
-# ``tests/unit/conftest.py::init_ray_cluster`` (mirrors production: NeMo-RL
-# inits Ray at startup; the data plane attaches on top). Each test just
-# builds a TQ client on the shared Ray and closes it on teardown.
+# The parametrized ``tq_client_backends`` fixture (simple + mooncake_cpu)
+# is provided by ``tests/unit/data_plane/conftest.py``.
 
 
 # Mirror of the seed-field set in nemo_rl/algorithms/grpo_sync.py.
@@ -66,51 +62,6 @@ _DP_SEED_FIELDS = (
     "token_mask",
     "sample_mask",
 )
-
-# ── loud-skip helpers ─────────────────────────────────────────────────────────
-
-# ── fixtures ──────────────────────────────────────────────────────────────────
-
-
-def _make_tq_cfg(backend: str) -> dict:
-    # DataPlaneConfig requires the full schema (see interfaces.py); the
-    # adapter dereferences ``claim_meta_poll_interval_s`` at construction
-    # so missing it short-circuits the fixture before any test runs.
-    # ``global_segment_size`` / ``local_buffer_size`` only matter for
-    # ``mooncake_cpu`` but are required for schema conformance.
-    return {
-        "enabled": True,
-        "impl": "transfer_queue",
-        "backend": backend,
-        "storage_capacity": 1024,
-        "num_storage_units": 1,
-        "claim_meta_poll_interval_s": 0.5,
-        "global_segment_size": 8589934592,  # 8 GiB — sized for CI host RAM, not prod
-        "local_buffer_size": 1073741824,  # 1 GiB
-    }
-
-
-@pytest.fixture(
-    params=["simple", "mooncake_cpu"],
-    ids=["simple", "mooncake_cpu"],
-)
-def tq_client(request):
-    """Parametrized fixture over simple and mooncake_cpu backends.
-
-    mooncake_cpu is skipped when the mooncake wheel is not installed.
-    Set NEMO_RL_REQUIRE_MOONCAKE=1 to promote the skip to a loud failure.
-
-    Relies on parent autouse ``init_ray_cluster`` for the Ray runtime.
-    """
-    backend = request.param
-    if backend == "mooncake_cpu" and not mooncake_available():
-        pytest.skip(
-            "mooncake not installed — skipping mooncake_cpu seqpack equivalence "
-            "(set NEMO_RL_REQUIRE_MOONCAKE=1 to fail loud)"
-        )
-    client = build_data_plane_client(_make_tq_cfg(backend))
-    yield client
-    client.close()
 
 
 def _make_fake_train_data(
@@ -147,7 +98,7 @@ def _make_fake_train_data(
 
 
 def _round_trip_shards_through_tq(
-    tq_client,
+    client,
     pre_shards: list,
     partition_id: str,
 ) -> list[BatchedDataDict]:
@@ -158,7 +109,7 @@ def _round_trip_shards_through_tq(
     fetches its slice and attaches ``extra_info`` packing metadata.
     """
     n_total = sum(int(s["sample_mask"].shape[0]) for s in pre_shards)
-    tq_client.register_partition(
+    client.register_partition(
         partition_id=partition_id,
         fields=list(_DP_SEED_FIELDS),
         num_samples=n_total,
@@ -177,12 +128,12 @@ def _round_trip_shards_through_tq(
             {f: shard[f].detach().contiguous() for f in names},
             batch_size=[n],
         )
-        tq_client.put_samples(
+        client.put_samples(
             sample_ids=keys,
             partition_id=partition_id,
             fields=fields,
         )
-        td_back = tq_client.get_samples(
+        td_back = client.get_samples(
             sample_ids=keys,
             partition_id=partition_id,
             select_fields=list(names),
@@ -227,7 +178,7 @@ def _assert_shards_byte_equal(legacy, recovered, *, expect_metadata: bool) -> No
             )
 
 
-def test_seqpack_legacy_equals_tq(tq_client):
+def test_seqpack_legacy_equals_tq(tq_client_backends):
     """Sequence packing: legacy shards == TQ-roundtripped shards (byte-level)."""
     DP_WORLD = 4
     GBS = 64
@@ -251,14 +202,14 @@ def test_seqpack_legacy_equals_tq(tq_client):
         sequence_packing_args=spa,
     )
     recovered = _round_trip_shards_through_tq(
-        tq_client,
+        tq_client_backends,
         tq_pre_shards,
         partition_id="seqpack-eq",
     )
     _assert_shards_byte_equal(legacy_shards, recovered, expect_metadata=True)
 
 
-def test_dynbatch_legacy_equals_tq(tq_client):
+def test_dynbatch_legacy_equals_tq(tq_client_backends):
     """Dynamic batching: same equivalence claim as seqpack."""
     DP_WORLD = 4
     GBS = 64
@@ -281,14 +232,14 @@ def test_dynbatch_legacy_equals_tq(tq_client):
         dynamic_batching_args=dba,
     )
     recovered = _round_trip_shards_through_tq(
-        tq_client,
+        tq_client_backends,
         tq_pre_shards,
         partition_id="dynbatch-eq",
     )
     _assert_shards_byte_equal(legacy_shards, recovered, expect_metadata=True)
 
 
-def test_no_packing_legacy_equals_tq(tq_client):
+def test_no_packing_legacy_equals_tq(tq_client_backends):
     """Sanity: even without packing/dynbatch the transport should be lossless."""
     DP_WORLD = 4
     GBS = 64
@@ -297,7 +248,7 @@ def test_no_packing_legacy_equals_tq(tq_client):
     legacy_shards = data.shard_by_batch_size(DP_WORLD, batch_size=GBS)
     tq_pre_shards = data.shard_by_batch_size(DP_WORLD, batch_size=GBS)
     recovered = _round_trip_shards_through_tq(
-        tq_client,
+        tq_client_backends,
         tq_pre_shards,
         partition_id="nopack-eq",
     )

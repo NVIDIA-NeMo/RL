@@ -28,8 +28,10 @@ from nemo_rl.distributed.model_utils import (
     _compute_distributed_log_softmax,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
+    distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
+    gather_logits_at_global_indices,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -1438,6 +1440,143 @@ def test_sampling_params_distributed_logprob(
             top_p=top_p,
             chunk_size=chunk_size,
         )
+        results = ray.get(futures)
+        for i, result in enumerate(results):
+            assert result["success"], f"Worker {i} failed: {result['error']}"
+        worker_group.shutdown(force=True)
+    finally:
+        cluster.shutdown()
+
+
+@ray.remote(num_gpus=1)
+class DistributedVocabTopkOpsTestActor:
+    """Equivalence of the chunked, TP-sharded top-k / gather ops vs an fp32 baseline."""
+
+    def __init__(self, tp_size, chunk_size, sharding):
+        self.tp_size = tp_size
+        self.chunk_size = chunk_size
+        self.sharding = sharding
+        self.env_vars = dict(os.environ)
+        torch.distributed.init_process_group(backend="nccl")
+        self.tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+
+    def test_distributed_vocab_topk(self):
+        """Top-k values match the global fp32 top-k and indices point at them."""
+        tp_rank = torch.distributed.get_rank(self.tp_group)
+        batch_size = 2
+        seq_len = 16
+        vocab_size = 256
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start_index = tp_rank * vocab_part_size
+        vocab_end_index = (tp_rank + 1) * vocab_part_size
+        k = 5
+
+        torch.manual_seed(1337)
+        full_logits = torch.randn(
+            batch_size, seq_len, vocab_size, device="cuda", dtype=torch.bfloat16
+        )
+
+        expected_vals, _ = torch.topk(full_logits.float(), k, dim=-1)
+        topk_vals, topk_indices = distributed_vocab_topk(
+            full_logits[:, :, vocab_start_index:vocab_end_index],
+            k,
+            self.tp_group,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+            chunk_size=self.chunk_size,
+        )
+
+        torch.testing.assert_close(topk_vals, expected_vals, rtol=0, atol=0)
+        regathered = torch.gather(full_logits.float(), -1, topk_indices)
+        torch.testing.assert_close(regathered, topk_vals, rtol=0, atol=0)
+        return {"success": True, "error": None}
+
+    def test_gather_logits_at_global_indices(self):
+        """Gathered logits at global indices match the single-GPU fp32 gather."""
+        tp_rank = torch.distributed.get_rank(self.tp_group)
+        batch_size = 2
+        seq_len = 16
+        vocab_size = 256
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start_index = tp_rank * vocab_part_size
+        vocab_end_index = (tp_rank + 1) * vocab_part_size
+
+        torch.manual_seed(2024)
+        full_logits = torch.randn(
+            batch_size, seq_len, vocab_size, device="cuda", dtype=torch.bfloat16
+        )
+        global_indices = torch.randint(
+            0, vocab_size, (batch_size, seq_len, 4), device="cuda"
+        )
+
+        expected = torch.gather(full_logits.float(), -1, global_indices)
+        gathered = gather_logits_at_global_indices(
+            full_logits[:, :, vocab_start_index:vocab_end_index],
+            global_indices,
+            tp_group=self.tp_group,
+            cp_group=None,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+            chunk_size=self.chunk_size,
+        )
+
+        torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+        return {"success": True, "error": None}
+
+
+DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN = (
+    f"{DistributedVocabTopkOpsTestActor.__module__}.DistributedVocabTopkOpsTestActor"
+)
+
+
+@pytest.fixture
+def register_distributed_vocab_topk_ops_test_actor():
+    """Register the DistributedVocabTopkOpsTestActor for use in tests."""
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(
+        DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN
+    )
+    ACTOR_ENVIRONMENT_REGISTRY[DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN] = (
+        PY_EXECUTABLES.SYSTEM
+    )
+
+    yield DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN
+
+    if DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
+        if original_registry_value is None:
+            del ACTOR_ENVIRONMENT_REGISTRY[DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN]
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN] = (
+                original_registry_value
+            )
+
+
+# chunk_size 5 leaves a remainder, 4 divides seq_len, None disables chunking.
+@pytest.mark.parametrize("tp_size, chunk_size", [(1, 5), (2, 4), (2, None)])
+@pytest.mark.parametrize(
+    "method_name",
+    ["test_distributed_vocab_topk", "test_gather_logits_at_global_indices"],
+)
+def test_distributed_vocab_topk_ops(
+    register_distributed_vocab_topk_ops_test_actor, method_name, tp_size, chunk_size
+):
+    """Test chunked, TP-sharded top-k and gather equivalence vs an fp32 baseline."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() < tp_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {tp_size}, got {torch.cuda.device_count()}"
+        )
+
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[tp_size], use_gpus=True)
+    try:
+        actor_fqn = register_distributed_vocab_topk_ops_test_actor
+        sharding = NamedSharding(layout=list(range(tp_size)), names=["tp"])
+        builder = RayWorkerBuilder(actor_fqn, tp_size, chunk_size, sharding)
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+        futures = worker_group.run_all_workers_single_data(method_name)
         results = ray.get(futures)
         for i, result in enumerate(results):
             assert result["success"], f"Worker {i} failed: {result['error']}"

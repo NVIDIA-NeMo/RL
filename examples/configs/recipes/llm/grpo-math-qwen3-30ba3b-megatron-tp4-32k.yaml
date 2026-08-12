@@ -22,7 +22,6 @@ policy:
   scheduler: null
   megatron_cfg:
     enabled: true
-    converter_type: LlamaForCausalLM
     tensor_model_parallel_size: 4
     expert_model_parallel_size: 8
     sequence_parallel: true
@@ -39,6 +38,10 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 4
       enforce_eager: true
+    vllm_kwargs:
+      # vLLM 0.20's default FlashInfer TRTLLM MoE backend isn't refit-compatible,
+      # change to triton to keep same behavior as vLLM 0.17.
+      moe_backend: triton
 logger:
   log_dir: logs/grpo-math-qwen3-30ba3b-megatron-tp4-32k
   wandb_enabled: true

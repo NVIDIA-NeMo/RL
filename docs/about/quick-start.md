@@ -38,3 +38,12 @@ uv run examples/run_grpo.py \
   --config examples/configs/grpo_math_1B_megatron.yaml
 ```
 
+### Smoke Test
+
+To validate your install end-to-end more quickly, use the smoke recipe — it switches to GSM8K and caps the run at 10 optimizer steps:
+
+```sh
+uv run examples/run_grpo.py \
+  --config examples/configs/grpo_smoke.yaml
+```
+

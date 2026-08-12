@@ -33,8 +33,15 @@ class RawDataset:
     task_spec: TaskDataSpec
     preprocessor: TaskDataPreProcessFnCallable | None = None
 
-    def split_train_validation(self, test_size: float, seed: int):
+    def split_train_validation(self, test_size: float | int, seed: int):
         if test_size > 0:
+            # train_test_split accepts a fraction in (0, 1) or an absolute row
+            # count, but the absolute form must be an int — a whole-number float
+            # (e.g. 256.0, produced when an int recipe value is merged over a
+            # float config default) is otherwise rejected as an out-of-range
+            # fraction.
+            if test_size >= 1:
+                test_size = int(test_size)
             split_dataset = self.dataset.train_test_split(
                 test_size=test_size, seed=seed
             )

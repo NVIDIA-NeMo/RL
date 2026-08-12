@@ -5,10 +5,12 @@ grpo:
   max_num_steps: 500
 loss_fn:
   use_importance_sampling_correction: true
+  force_on_policy_ratio: true
 checkpointing:
   checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n4g
 policy:
   model_name: meta-llama/Llama-3.1-8B-Instruct
+  train_global_batch_size: 2048
   tokenizer:
     name: meta-llama/Llama-3.1-8B-Instruct
   train_micro_batch_size: 1
@@ -20,7 +22,6 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    converter_type: LlamaForCausalLM
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     sequence_parallel: false
@@ -55,4 +56,3 @@ logger:
 cluster:
   gpus_per_node: 4
   num_nodes: 2
-

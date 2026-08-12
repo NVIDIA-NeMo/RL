@@ -1,0 +1,4 @@
+defaults: grpo-nanov3-30BA3B-2n8g-fsdp2.yaml
+data_plane:
+  enabled: true
+  backend: mooncake_cpu

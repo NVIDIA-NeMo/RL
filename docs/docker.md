@@ -35,7 +35,7 @@ docker buildx build --build-context nemo-rl=. -f docker/Dockerfile \
 
 ## Skipping vLLM or SGLang Dependencies
 
-If you don't need vLLM or SGLang support, you can skip building those dependencies to reduce build time and image size. Use the `SKIP_VLLM_BUILD` and/or `SKIP_SGLANG_BUILD` build arguments:
+If you don't need vLLM, SGLang, or TRT-LLM support, you can skip building those dependencies to reduce build time and image size. Use the `SKIP_VLLM_BUILD`, `SKIP_SGLANG_BUILD`, and/or `SKIP_TRTLLM_BUILD` build arguments:
 
 ```sh
 # Skip vLLM dependencies:
@@ -50,10 +50,17 @@ docker buildx build -f docker/Dockerfile \
     --tag <registry>/nemo-rl:latest \
     .
 
-# Skip both vLLM and SGLang dependencies:
+# Skip TRT-LLM dependencies:
+docker buildx build -f docker/Dockerfile \
+    --build-arg SKIP_TRTLLM_BUILD=1 \
+    --tag <registry>/nemo-rl:latest \
+    .
+
+# Skip all three:
 docker buildx build -f docker/Dockerfile \
     --build-arg SKIP_VLLM_BUILD=1 \
     --build-arg SKIP_SGLANG_BUILD=1 \
+    --build-arg SKIP_TRTLLM_BUILD=1 \
     --tag <registry>/nemo-rl:latest \
     .
 ```
@@ -61,4 +68,35 @@ docker buildx build -f docker/Dockerfile \
 When these build arguments are set, the corresponding `uv sync --extra` commands are skipped, and the virtual environment prefetching will exclude actors that depend on those packages.
 
 > [!NOTE]
-> If you skip vLLM or SGLang during the build but later try to use those backends at runtime, the dependencies will be fetched and built on-demand. This may add significant setup time on first use.
+> If you skip vLLM, SGLang, or TRT-LLM during the build but later try to use those backends at runtime, the dependencies will be fetched and built on-demand. This may add significant setup time on first use.
+
+## Custom Setup Commands
+
+By default, the Docker image installs [apptainer](https://apptainer.org/) (with a `singularity` symlink) via a pluggable `custom-setup` build stage. The default script is `docker/install_apptainer.sh`. You can override or skip this step at build time.
+
+### Override with a custom script
+
+Create a directory containing your setup script(s), then pass it as a build context along with the script filename:
+
+```sh
+# my-setup-dir/my_script.sh
+#!/bin/bash
+set -euo pipefail
+apt-get update && apt-get install -y my-custom-package
+apt-get clean && rm -rf /var/lib/apt/lists/*
+```
+
+```sh
+docker buildx build \
+  --build-context custom-setup=my-setup-dir/ \
+  --build-arg CUSTOM_SETUP_FNAME=my_script.sh \
+  -f docker/Dockerfile --tag <registry>/nemo-rl:latest .
+```
+
+### Skip custom setup entirely
+
+To build without any custom setup commands, set `CUSTOM_SETUP_FNAME` to empty:
+
+```sh
+docker buildx build --build-arg CUSTOM_SETUP_FNAME= -f docker/Dockerfile --tag <registry>/nemo-rl:latest .
+```

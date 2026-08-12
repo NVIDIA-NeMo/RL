@@ -1,0 +1,4 @@
+defaults: prorlv2-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v2.yaml
+data_plane:
+  enabled: true
+  backend: mooncake_cpu

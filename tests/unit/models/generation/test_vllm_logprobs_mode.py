@@ -12,10 +12,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test vLLM logprobs_mode functionality to verify processed_logprobs matches expectations."""
+"""Tests for vLLM generation log probabilities."""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
+
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+@pytest.mark.vllm
+def test_worker_generate_records_sampled_token_logprob(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    sampled_token_id = 880
+    generation = SimpleNamespace(
+        token_ids=[sampled_token_id],
+        logprobs=[
+            {
+                512: SimpleNamespace(logprob=-0.10, rank=1),
+                sampled_token_id: SimpleNamespace(logprob=-2.30, rank=2),
+            }
+        ],
+        finish_reason="stop",
+    )
+    raw_output = SimpleNamespace(outputs=[generation])
+
+    worker = vllm_worker.VllmGenerationWorkerImpl.__new__(
+        vllm_worker.VllmGenerationWorkerImpl
+    )
+    worker.cfg = {
+        "_pad_token_id": 0,
+        "vllm_cfg": {"use_tqdm": False},
+        "vllm_kwargs": {},
+    }
+    worker.routed_experts_dtype = torch.int32
+    worker.llm = SimpleNamespace(
+        generate=MagicMock(return_value=[raw_output]),
+        llm_engine=SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=16, model="test-model")
+        ),
+    )
+    worker._merge_stop_strings = lambda _stop_strings: []
+    worker._build_sampling_params = lambda **_kwargs: object()
+
+    monkeypatch.setattr(
+        vllm_worker, "verify_right_padding", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        vllm_worker,
+        "format_prompt_for_vllm_generation",
+        lambda _data: ["prompt"],
+    )
+    monkeypatch.setattr(
+        vllm_worker,
+        "pad_and_align_routed_expert_indices",
+        lambda *_args, **_kwargs: (
+            None,
+            {"missing_routes": 0, "expected_routes": 0, "actual_routes": 0},
+        ),
+    )
+
+    result = worker.generate(
+        BatchedDataDict(
+            {
+                "input_ids": torch.tensor([[101, 102, 0]]),
+                "input_lengths": torch.tensor([2]),
+            }
+        )
+    )
+
+    assert result["output_ids"][0].tolist() == [101, 102, sampled_token_id, 0]
+    assert result["logprobs"][0].tolist() == pytest.approx([0.0, 0.0, -2.30, 0.0])
 
 
 @pytest.mark.vllm
@@ -55,6 +125,11 @@ def test_processed_logprobs_matches_manual_computation():
 
     Note: Run with: uv run --extra vllm --group test pytest ... --vllm-only
     """
+    import os
+
+    # Force spawn: parent already has CUDA initialized, so vLLM's default fork
+    # of EngineCore would crash. Must be set before LLM().
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from vllm import LLM, SamplingParams

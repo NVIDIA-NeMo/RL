@@ -38,13 +38,14 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
+from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
+    fields_with_optional_routed_experts,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.lm_policy import Policy
@@ -98,7 +99,7 @@ class TQPolicy(Policy):
     def __init__(
         self,
         *args: Any,
-        dp_cfg: dict[str, Any],
+        dp_cfg: DataPlaneConfig,
         tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:
@@ -117,6 +118,9 @@ class TQPolicy(Policy):
         self.dp_cfg = dp_cfg
         self.dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
         self.tq_partition_id = tq_partition_id
+        self._router_replay_enabled = bool(
+            (self.cfg.get("router_replay") or {}).get("enabled", False)
+        )
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -156,7 +160,9 @@ class TQPolicy(Policy):
         """
         self.dp_client.register_partition(
             partition_id=self.tq_partition_id,
-            fields=list(DP_TRAIN_FIELDS),
+            fields=fields_with_optional_routed_experts(
+                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            ),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
             grpo_group_size=group_size,
@@ -173,7 +179,9 @@ class TQPolicy(Policy):
         """
         self.dp_client.register_partition(
             partition_id=partition_id,
-            fields=list(DP_TRAIN_FIELDS),
+            fields=fields_with_optional_routed_experts(
+                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            ),
             num_samples=num_samples,
             consumer_tasks=[partition_id],
             grpo_group_size=None,
@@ -268,6 +276,7 @@ class TQPolicy(Policy):
         timer_prefix: str,
         timer: Optional[Timer],
         common_kwargs: dict[str, Any],
+        include_router_replay: bool = False,
     ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
@@ -280,7 +289,14 @@ class TQPolicy(Policy):
         """
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("logprob_mb_tokens")
-        lp_meta = replace(meta, fields=list(LP_SEED_FIELDS), task_name=task_name)
+        lp_meta = replace(
+            meta,
+            fields=fields_with_optional_routed_experts(
+                LP_SEED_FIELDS,
+                enabled=self._router_replay_enabled and include_router_replay,
+            ),
+            task_name=task_name,
+        )
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
                 lp_meta,
@@ -322,6 +338,7 @@ class TQPolicy(Policy):
             timer_prefix="get_logprobs",
             timer=timer,
             common_kwargs={"micro_batch_size": micro_batch_size},
+            include_router_replay=True,
         )
 
     def get_reference_policy_logprobs_from_meta(
@@ -347,6 +364,7 @@ class TQPolicy(Policy):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
+        train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
     ) -> dict[str, Any]:
         """1-hop counterpart to :meth:`train`.
 
@@ -362,6 +380,10 @@ class TQPolicy(Policy):
             gbs: Global batch size; defaults to ``cfg["train_global_batch_size"]``.
             mbs: Micro batch size; defaults to ``cfg["train_micro_batch_size"]``.
             timer: Optional timer for nested ``policy_training/*`` measurements.
+            train_fields: TQ columns workers fetch this step; defaults to the
+                full ``DP_TRAIN_FIELDS`` schema. Caller may narrow it to drop
+                columns it skipped writing (e.g. ``prev_logprobs`` when
+                ``force_on_policy_ratio=True``).
 
         Returns:
             Aggregated training-step output dict.
@@ -371,13 +393,15 @@ class TQPolicy(Policy):
 
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
-        # Train workers fetch the full DP_TRAIN_FIELDS schema (rollout +
-        # logprob deltas + advantages + sample_mask). Caller is responsible
-        # for ensuring those columns have been written to TQ before this
-        # call (workers + driver delta-writes).
+        # ``train_fields`` (rollout + logprob deltas + advantages + sample_mask;
+        # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
+        # by workers + driver delta-writes. Caller may narrow to drop columns
+        # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
         train_meta = replace(
             meta,
-            fields=list(DP_TRAIN_FIELDS),
+            fields=fields_with_optional_routed_experts(
+                train_fields, enabled=self._router_replay_enabled
+            ),
             task_name="train",
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
@@ -438,3 +462,142 @@ class TQPolicy(Policy):
                 warnings.warn(f"Error getting theoretical flops: {e}")
 
         return aggregated_results
+
+    # ── split-API fanout (SC async path) ───────────────────────────────────
+    #
+    # Counterpart to :meth:`train_from_meta`, consumed directly by
+    # :class:`SingleControllerActor` so it can stream microbatches without
+    # forcing a full-step optimizer.step on every dispatch.
+    #
+    # Lifecycle (one step open at a time — workers raise on a second
+    # ``begin``, so no step identifier is threaded through the API):
+    #   begin_train_step                    — open step; broadcast loss_fn/gbs/mbs
+    #   train_microbatches_from_meta (N×)   — DP-sharded fwd/bwd, grads accumulate
+    #   finish_train_step                   — all_reduce + opt.step + sched.step
+    #   abort_train_step                    — drop accumulators, no opt.step
+    #
+    # ``train_from_meta`` is unchanged and remains the sync entrypoint.
+
+    def begin_train_step(
+        self,
+        loss_fn: LossFunction,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        """Open a logical train step on every worker."""
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()
+        # run_all_workers_single_data returns plain ObjectRefs (one per
+        # GPU), not a MultiWorkerFuture — consume with ray.get, matching
+        # every other single-data fan-out in lm_policy.
+        futures = self.worker_group.run_all_workers_single_data(
+            "begin_train_step_presharded",
+            loss_fn=loss_fn,
+            gbs=batch_size,
+            mbs=micro_batch_size,
+        )
+        ray.get(futures)
+
+    def train_microbatches_from_meta(
+        self,
+        meta: KVBatchMeta,
+        timer: Optional[Timer] = None,
+    ) -> None:
+        """Dispatch one meta slice (DP-sharded) into an open train step.
+
+        Named plural because one call fans out to every DP rank and the
+        backend then iterates its own internal (pipeline/packed)
+        microbatches — with a 2x packing ratio a group of G generations is
+        G/2 backend microbatches inside this single call, not G/2 calls.
+
+        Mirrors the sharding logic of :meth:`train_from_meta` but without
+        a logical-batch sizing constraint: this routes ``meta`` to DP
+        ranks and runs forward+backward; gradients accumulate in
+        ``.grad``. Returns nothing — per-microbatch metrics accumulate in
+        the workers' open-step state and surface once via
+        :meth:`finish_train_step`.
+        """
+        self._stamp_pad_seqlen(meta)
+        spa, dba = self._packing_args("train_mb_tokens")
+        train_meta = replace(
+            meta,
+            fields=fields_with_optional_routed_experts(
+                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            ),
+            task_name="train",
+        )
+        with timer.time("policy_training/shard_meta") if timer else nullcontext():
+            dp_metas, _ = shard_meta_for_dp(
+                train_meta,
+                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                batch_size=None,
+                sequence_packing_args=spa,
+                dynamic_batching_args=dba,
+            )
+
+        if self.flops_tracker is not None:
+            for m in dp_metas:
+                self.flops_tracker.track_batch(list(m.sequence_lengths or []))
+
+        with (
+            timer.time("policy_training/submit_microbatch_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train_microbatch_presharded",
+                meta=dp_metas,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+            )
+        # Wait for completion only — workers return None (metrics
+        # accumulate in their open-step state until finish_train_step).
+        self.worker_group.get_all_worker_results(futures)
+
+    def finish_train_step(self) -> dict[str, Any]:
+        """Close an open train step: all_reduce, rescale, optimizer.step.
+
+        Aggregates per-rank step results into the same shape as
+        :meth:`train_from_meta` so callers don't have to special-case
+        the split path.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "finish_train_step_presharded",
+        )
+        results = ray.get(futures)
+        # Filter to DP-replica leaders only. ``run_all_workers_single_data``
+        # returns one result per GPU (TP×CP×PP×DP), but TP/CP/non-last-PP
+        # twins hold identical copies of their DP shard's metric list.
+        # Aggregating without dedup inflates every per-token metric by
+        # TP*CP*(1 if PP==1 else PP_last_stage_count). ``train_from_meta``
+        # gets this for free via ``output_is_replicated`` on its sharded
+        # dispatch; finish has no data to shard, so we dedupe here.
+        leader_results = [r for r in results if r.get("is_replica_leader", True)]
+        aggregated_results = _aggregate_train_results(leader_results)
+
+        if self.flops_tracker is not None:
+            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+            aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
+
+        return aggregated_results
+
+    def abort_train_step(self) -> None:
+        """Drop partial step state on every worker. No optimizer.step."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "abort_train_step_presharded",
+        )
+        ray.get(futures)
+
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()

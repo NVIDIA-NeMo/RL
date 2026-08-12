@@ -12,50 +12,85 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from nemo_rl.utils.nvml import (
-    device_id_to_physical_device_id,
-    get_device_uuid,
-    nvml_context,
+    _resolve_device_id,
+    log_gpu_memory_diagnostics,
 )
 
 
+def test_resolve_device_id_explicit_arg():
+    """Explicit device_id argument takes highest priority."""
+    assert _resolve_device_id(device_id=3) == 3
+    assert _resolve_device_id(device_id="2") == 2
+
+
+def test_resolve_device_id_cuda_initialized():
+    with (
+        patch("torch.cuda.is_initialized", return_value=True),
+        patch("torch.cuda.current_device", return_value=1),
+    ):
+        assert _resolve_device_id() == 1
+
+
+def test_resolve_device_id_local_rank_env():
+    with (
+        patch("torch.cuda.is_initialized", return_value=False),
+        patch.dict(os.environ, {"LOCAL_RANK": "2"}),
+    ):
+        assert _resolve_device_id() == 2
+
+
+def test_resolve_device_id_default_zero():
+    with (
+        patch("torch.cuda.is_initialized", return_value=False),
+        patch.dict(os.environ, {}, clear=True),
+    ):
+        assert _resolve_device_id() == 0
+
+
+def test_resolve_device_id_invalid_local_rank():
+    with (
+        patch("torch.cuda.is_initialized", return_value=False),
+        patch.dict(os.environ, {"LOCAL_RANK": "not-a-number"}),
+    ):
+        assert _resolve_device_id() == 0
+
+
 @patch("nemo_rl.utils.nvml.pynvml")
-def test_nvml_context(mock_pynvml):
-    """Test that nvml_context initializes and shuts down NVML."""
-    with nvml_context():
-        pass
+def test_log_gpu_memory_diagnostics_emits_prefix(mock_pynvml, capfd):
+    mock_pynvml.nvmlDeviceGetHandleByIndex.return_value = MagicMock()
+    mock_pynvml.nvmlDeviceGetUUID.return_value = b"GPU-FAKE-UUID"
+    mem_info = MagicMock()
+    mem_info.total, mem_info.used, mem_info.free = (
+        24 * 1024**3,
+        4 * 1024**3,
+        20 * 1024**3,
+    )
+    mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mem_info
+    mock_pynvml.nvmlDeviceGetComputeRunningProcesses.return_value = []
 
-    # Verify init and shutdown were called
-    mock_pynvml.nvmlInit.assert_called_once()
-    mock_pynvml.nvmlShutdown.assert_called_once()
+    log_gpu_memory_diagnostics(
+        label="test-label", worker_type="TestWorker", device_id=0
+    )
+
+    out = capfd.readouterr().out
+    assert "[GPU_DIAG]" in out and "TestWorker" in out and "test-label" in out
 
 
-def test_device_id_conversion():
-    """Test device ID conversion with and without CUDA_VISIBLE_DEVICES."""
-    with patch.dict(os.environ, {}, clear=True):
-        assert device_id_to_physical_device_id(0) == 0
-
-    with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "2,3"}):
-        assert device_id_to_physical_device_id(0) == 2
-        assert device_id_to_physical_device_id(1) == 3
-
-
-@patch("nemo_rl.utils.nvml.device_id_to_physical_device_id")
 @patch("nemo_rl.utils.nvml.pynvml")
-def test_get_device_uuid(mock_pynvml, mock_convert_id):
-    """Test that get_device_uuid correctly retrieves a UUID."""
+def test_log_gpu_memory_diagnostics_never_raises_on_nvml_failure(mock_pynvml, capfd):
+    mock_pynvml.nvmlInit.side_effect = Exception("NVML not available")
+    log_gpu_memory_diagnostics(label="fail-label", worker_type="TestWorker")
+    out = capfd.readouterr().out
+    assert "[GPU_DIAG]" in out and "nvml_error" in out
 
-    # Setup
-    mock_convert_id.return_value = 1
-    mock_handle = mock_pynvml.nvmlDeviceGetHandleByIndex.return_value
-    mock_pynvml.nvmlDeviceGetUUID.return_value = b"GPU-12345"
 
-    # Call function
-    uuid = get_device_uuid(0)
-
-    # Verify
-    assert uuid == "GPU-12345"
-    mock_convert_id.assert_called_once_with(0)
-    mock_pynvml.nvmlDeviceGetHandleByIndex.assert_called_once_with(1)
+@patch("nemo_rl.utils.nvml.pynvml")
+def test_log_gpu_memory_diagnostics_extra_context(mock_pynvml, capfd):
+    mock_pynvml.nvmlInit.side_effect = Exception("skip")
+    log_gpu_memory_diagnostics(
+        label="ctx-label", worker_type="TestWorker", extra_context="my_custom_info=42"
+    )
+    assert "my_custom_info=42" in capfd.readouterr().out

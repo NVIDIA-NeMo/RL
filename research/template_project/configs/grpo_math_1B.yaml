@@ -8,10 +8,17 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
+  val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
   max_val_samples: 256
+  # Validation rollouts per prompt; k > 1 also reports the pass_k metric.
+  val_num_generations_per_prompt: 1
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
   use_dynamic_sampling: false
@@ -43,8 +50,9 @@ grpo:
     enabled: false # Set to true to enable async training mode
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
+    max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -134,7 +142,6 @@ policy:
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false
-    converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -159,6 +166,7 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
 
     peft:
       enabled: false
@@ -281,6 +289,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
@@ -289,7 +300,6 @@ policy:
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
-      unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
     vllm_cfg:
       async_engine: false

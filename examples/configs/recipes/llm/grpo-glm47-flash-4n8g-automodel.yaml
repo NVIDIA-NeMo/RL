@@ -60,6 +60,12 @@ policy:
     max_new_tokens: 8192
     vllm_cfg:
       tensor_parallel_size: 4
+      # WAR for vLLM 0.20.0: UnquantizedFusedMoEMethod.process_weights_after_loading
+      # uses replace_parameter() (reallocates w13/w2), so the colocated refit re-shuffle
+      # invalidates the captured decode CUDA graphs -> generation reads stale MoE weights.
+      # Fixed upstream in vLLM 0.21.0 (PR #40390, prefer_copy=is_weight_update). Remove
+      # this once the vLLM pin is bumped to >=0.21.0.
+      enforce_eager: true
 data:
   max_input_seq_length: 2048
   train:

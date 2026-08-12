@@ -119,3 +119,47 @@ def test_async_and_sync_actors_share_env_tier() -> None:
     assert sync_env == async_env, (
         f"Sync vs async env tier drift: sync={sync_env!r}, async={async_env!r}"
     )
+
+
+def test_sync_rollout_actor_prompt_extraction_and_masks_match_grpo() -> None:
+    """TQ rollouts must mirror GRPO's length-based prompt extraction."""
+    import torch
+
+    from nemo_rl.experience.sync_rollout_actor import (
+        _flatten_rollout_message_log_for_tq,
+    )
+
+    message_logs = [
+        [
+            {"role": "user", "content": "first", "token_ids": torch.tensor([1, 2])},
+            {
+                "role": "assistant",
+                "content": "history",
+                "token_ids": torch.tensor([3, 4]),
+            },
+            {"role": "user", "content": "next", "token_ids": torch.tensor([5])},
+            {
+                "role": "assistant",
+                "content": "generated",
+                "token_ids": torch.tensor([6, 7]),
+                "generation_logprobs": torch.tensor([0.1, 0.2]),
+            },
+        ]
+    ]
+
+    flat, _input_lengths, prompt_flat = _flatten_rollout_message_log_for_tq(
+        message_logs,
+        torch.tensor([5]),
+        pad_token_id=0,
+        make_sequence_length_divisible_by=1,
+    )
+
+    assert torch.equal(prompt_flat["token_ids"], torch.tensor([[1, 2, 3, 4, 5]]))
+    assert torch.equal(
+        flat["token_loss_mask"],
+        torch.tensor([[0, 0, 0, 0, 0, 1, 1]]),
+    )
+    assert torch.allclose(
+        flat["generation_logprobs"],
+        torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.2]]),
+    )

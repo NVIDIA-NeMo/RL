@@ -41,8 +41,9 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1  # Maximum age, in training steps, for trajectories
+    max_generation_failures: 0  # Consecutive worker failures to tolerate
     in_flight_weight_updates: false  # Enable for faster weight synchronization
-    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after weight-updates
 ```
 
 ### Complete Example Config
@@ -67,8 +68,9 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
+    max_generation_failures: 0  # Consecutive worker failures to tolerate
     in_flight_weight_updates: false  # Enable for faster weight synchronization
-    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after weight-updates
 
 cluster:
   num_nodes: 2
@@ -151,6 +153,31 @@ sequenceDiagram
     end
 ```
 
+## Checkpointing
+
+Async GRPO checkpoints the replay buffer alongside the rest of training state so that in-progress trajectory generation is not lost across restarts.
+
+### What is saved
+
+On each checkpoint, a `replay_buffer.pt` file is written next to the other checkpoint artifacts. It contains all trajectories currently in the buffer together with their weight and target versions, and the `last_target_weight_already_generated` watermark.
+
+### Restore behaviour
+
+On resume, the buffer is restored before the trajectory collector starts, then cleaned up as follows:
+
+1. **Past targets dropped** — trajectories whose target step is earlier than the resume step are removed.
+2. **Stale trajectories evicted** — if `max_trajectory_age_steps` is set, trajectories too old for their target step are removed.
+3. **Incomplete targets kept** — target steps that still lack a full batch are kept in the buffer. The collector will *gap-fill* only the missing trajectories for those targets before moving on.
+4. **Buffer truncated** — if the restored count exceeds `max_size`, the buffer is truncated, prioritising entries closest to the resume step.
+
+### Gap-filling after restore
+
+After a restore, `last_target_weight_already_generated` is reset to `current_training_step - 1` so the collector re-evaluates every target from the resume step onward. For each target it queries `get_trajectories_needed` and spawns only the workers required to complete the batch — previously buffered trajectories are reused and the collector does not regenerate them.
+
+### Disabling replay-buffer restore
+
+If no `replay_buffer.pt` file is found in the latest checkpoint directory, training starts with an empty buffer and waits for the collector to fill it before the first training step.
+
 ## Usage Tips
 
 1. **Buffer Sizing**: The replay buffer size is automatically calculated as:
@@ -164,8 +191,7 @@ sequenceDiagram
 
 4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` when using `async_engine: true` for updating the weights of vLLM engine during generation. This prevents stalling training pipeline until longest generation finishes and provides significant performance benefits.
 
-5. **Recompute KV Cache After Weight Updates**: While using in-flight weight update, user can choose whether to recompute
-KV caches after weight udpate by configuring `recompute_kv_cache_after_weight_update` configuration.
+5. **Recompute KV Cache After Weight Updates**: A user can choose whether to invalidate and recompute KV caches after weight updates by setting the `recompute_kv_cache_after_weight_updates` configuration. This is applicable to async GRPO and independent of in-flight updates.
 
 ## Why Importance Sampling Correction Is Required for Async
 
