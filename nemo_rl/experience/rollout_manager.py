@@ -61,7 +61,7 @@ class RolloutOutcome(str, enum.Enum):
 
     # The prompt group reached the replay buffer.
     COMMITTED = "committed"
-    # The prompt exhausted its data-failure budget and on_data_exhausted="skip".
+    # The prompt exhausted its data-failure budget within max_skipped_prompts.
     # No group was committed, so the caller owns releasing its backpressure permit.
     SKIPPED = "skipped"
 
@@ -153,8 +153,9 @@ class RolloutStats:
 class RolloutTimeouts:
     """Deadlines for the blocking waits inside one rollout.
 
-    Resolved from ``async_rl.rollout_timeout_s`` / ``generation_timeout_s`` /
-    ``env_timeout_s``, which own the user-facing defaults. ``None`` means no deadline,
+    Resolved from ``async_rl.rollout_failure.nemo_gym.rollout_timeout_s`` and
+    ``async_rl.rollout_failure.native.{generation,env}_timeout_s``, which own the
+    user-facing defaults. ``None`` means no deadline,
     reproducing the historical behaviour of waiting indefinitely.
     """
 
@@ -1080,7 +1081,7 @@ class RolloutManager:
 
         Returns:
             ``COMMITTED`` when the group reached the buffer, ``SKIPPED`` when the prompt
-            exhausted its data budget under ``on_data_exhausted="skip"``.
+            exhausted its data budget within ``max_skipped_prompts``.
 
         Raises:
             RolloutRedispatchExhausted: The infra budget ran out.
@@ -1199,7 +1200,8 @@ class RolloutManager:
         assert last_infra_error is not None
         raise RolloutRedispatchExhausted(
             f"prompt idx={input_sample['idx']} exhausted its infrastructure retry "
-            f"budget after {infra_attempts} attempt(s) (max_attempts_per_prompt="
+            f"budget after {infra_attempts} attempt(s) "
+            f"(max_infra_attempts_per_prompt="
             f"{policy.max_infra_attempts}); last failure was "
             f"{type(last_infra_error).__name__}: {last_infra_error}"
         ) from last_infra_error
