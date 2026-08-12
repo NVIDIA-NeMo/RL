@@ -32,7 +32,11 @@ from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PromptGroupRecord,
 )
-from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.experience.payload import (
+    compute_failure_reasons_from_record,
+    pack_payload,
+    record_to_train_batch,
+)
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 
@@ -766,8 +770,21 @@ class TQReplayBuffer:
                 f"reserve() must precede commit() (or the slot was already removed)"
             )
         train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
+
+        # Per-row failure attribution stamped into TQ tags so downstream
+        # consumers (sampler evict/select logs, advantage stage, dashboards) can
+        # read it without touching Gym's on-disk JSON.
+        reasons, resolved_flags = compute_failure_reasons_from_record(record)
+        extra_tags = [
+            {"failure_reason": reasons[i], "resolved": bool(resolved_flags[i])}
+            for i in range(len(reasons))
+        ]
+
         sample_ids, fields, tags = pack_payload(
-            train_batch, weight_version=start_weight_version, group_id=group_id
+            train_batch,
+            weight_version=start_weight_version,
+            group_id=group_id,
+            extra_tags=extra_tags,
         )
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
