@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from nemo_rl.models.policy.workers import mamba_determinism_patches as patches
+from nemo_rl.models.policy.workers import mamba_alignment_patches as patches
 
 
 class FakeMambaMixer:
@@ -59,7 +59,7 @@ def _reshape_for_test(tensor, pattern, **axes):
 
 @pytest.fixture
 def fake_mamba_module(monkeypatch):
-    patches.restore_mamba_determinism_patch()
+    patches.restore_mamba_alignment_patch()
     module = SimpleNamespace(
         MambaMixer=FakeMambaMixer,
         rearrange=_reshape_for_test,
@@ -70,7 +70,7 @@ def fake_mamba_module(monkeypatch):
     import_module = MagicMock(return_value=module)
     monkeypatch.setattr(patches.importlib, "import_module", import_module)
     yield module, import_module
-    patches.restore_mamba_determinism_patch()
+    patches.restore_mamba_alignment_patch()
 
 
 def test_patch_is_idempotent_and_restorable(fake_mamba_module, capsys):
@@ -78,16 +78,16 @@ def test_patch_is_idempotent_and_restorable(fake_mamba_module, capsys):
     original_prefill = module.MambaMixer._ssm_prefill
     original_decode = module.MambaMixer._ssm_decode
 
-    patches.apply_mamba_determinism_patch()
-    patches.apply_mamba_determinism_patch()
+    patches.apply_mamba_alignment_patch()
+    patches.apply_mamba_alignment_patch()
 
     assert module.MambaMixer._ssm_prefill is patches._nrl_patched_ssm_prefill
     assert module.MambaMixer._ssm_decode is patches._nrl_patched_ssm_decode
     assert hasattr(module.MambaMixer, "_bik_decode_buffered_scan")
     import_module.assert_called_once_with("megatron.core.ssm.mamba_mixer")
-    assert capsys.readouterr().out.count("installed batch-invariant Mamba") == 1
+    assert capsys.readouterr().out.count("installed Mamba train/prefill/decode") == 1
 
-    patches.restore_mamba_determinism_patch()
+    patches.restore_mamba_alignment_patch()
 
     assert module.MambaMixer._ssm_prefill is original_prefill
     assert module.MambaMixer._ssm_decode is original_decode
@@ -95,7 +95,7 @@ def test_patch_is_idempotent_and_restorable(fake_mamba_module, capsys):
 
 
 def test_non_bik_calls_delegate_to_original_methods(fake_mamba_module):
-    patches.apply_mamba_determinism_patch()
+    patches.apply_mamba_alignment_patch()
     mixer = FakeMambaMixer()
     mixer.config = SimpleNamespace(batch_invariant_mode=False)
 
@@ -104,7 +104,7 @@ def test_non_bik_calls_delegate_to_original_methods(fake_mamba_module):
 
 
 def test_bik_decode_dispatches_to_reference_helpers(fake_mamba_module):
-    patches.apply_mamba_determinism_patch()
+    patches.apply_mamba_alignment_patch()
     mixer = FakeMambaMixer()
     mixer.config = SimpleNamespace(batch_invariant_mode=True)
     mixer.d_inner_local_tp = 2
@@ -130,7 +130,7 @@ def test_bik_decode_dispatches_to_reference_helpers(fake_mamba_module):
 
 def test_buffered_scan_zeroes_inactive_slots(fake_mamba_module):
     module, _ = fake_mamba_module
-    patches.apply_mamba_determinism_patch()
+    patches.apply_mamba_alignment_patch()
     mixer = FakeMambaMixer()
     mixer.chunk_size = 4
     mixer.ngroups_local_tp = 1
@@ -159,7 +159,7 @@ def test_buffered_scan_zeroes_inactive_slots(fake_mamba_module):
 
 
 def test_bik_decode_rejects_speculative_rollback_buffers(fake_mamba_module):
-    patches.apply_mamba_determinism_patch()
+    patches.apply_mamba_alignment_patch()
     mixer = FakeMambaMixer()
     mixer.config = SimpleNamespace(batch_invariant_mode=True)
 
@@ -217,15 +217,15 @@ def test_patch_skips_when_not_required_and_signature_mismatch(
     module.MambaMixer = FakeMambaMixerNewApi
     original_prefill = module.MambaMixer._ssm_prefill
 
-    patches.apply_mamba_determinism_patch(required=False)
+    patches.apply_mamba_alignment_patch(required=False)
 
     assert module.MambaMixer._ssm_prefill is original_prefill
-    assert "skipping Mamba determinism patch" in capsys.readouterr().out
+    assert "skipping Mamba alignment patch" in capsys.readouterr().out
     import_module.assert_called_once_with("megatron.core.ssm.mamba_mixer")
 
 
 def test_reference_prefill_rejects_prefix_cache(fake_mamba_module):
-    patches.apply_mamba_determinism_patch()
+    patches.apply_mamba_alignment_patch()
     mixer = FakeMambaMixer()
 
     with pytest.raises(NotImplementedError, match="prefix caching"):

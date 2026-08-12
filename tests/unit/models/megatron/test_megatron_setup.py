@@ -3628,8 +3628,8 @@ def test_zero_train_gen_mismatch_forces_te_generation_spec():
 
     with (
         patch(
-            "nemo_rl.models.policy.workers.mamba_determinism_patches."
-            "apply_mamba_determinism_patch"
+            "nemo_rl.models.policy.workers.mamba_alignment_patches."
+            "apply_mamba_alignment_patch"
         ) as apply_mamba_patch,
         patch(
             "nemo_rl.models.policy.workers.moe_determinism_patches."
@@ -3662,8 +3662,8 @@ def test_zero_train_gen_mismatch_skips_mamba_patch_for_non_mamba_models():
 
     with (
         patch(
-            "nemo_rl.models.policy.workers.mamba_determinism_patches."
-            "apply_mamba_determinism_patch"
+            "nemo_rl.models.policy.workers.mamba_alignment_patches."
+            "apply_mamba_alignment_patch"
         ) as apply_mamba_patch,
         patch(
             "nemo_rl.models.policy.workers.moe_determinism_patches."

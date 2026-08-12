@@ -1561,16 +1561,17 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     layer spec so generation and scoring share the patched MoE unpermute path.
     Also applies TE cuBLAS workspace shrink via patches.py, MoE fixed-order
     unpermute, router replay, and inference-compatible TP=1 log-softmax via
-    moe_determinism_patches.py, and defaults env vars for cuBLAS/MoE
-    determinism if not already set by the environment. Router replay and
-    moe_grouped_gemm must be configured explicitly.
+    moe_determinism_patches.py, Mamba train/prefill/decode alignment via
+    mamba_alignment_patches.py, and defaults env vars for cuBLAS/MoE/Mamba
+    if not already set by the environment. Router replay and moe_grouped_gemm
+    must be configured explicitly.
     """
     if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
     import os
 
-    from nemo_rl.models.policy.workers.mamba_determinism_patches import (
-        apply_mamba_determinism_patch,
+    from nemo_rl.models.policy.workers.mamba_alignment_patches import (
+        apply_mamba_alignment_patch,
         policy_uses_mamba_layers,
     )
     from nemo_rl.models.policy.workers.moe_determinism_patches import (
@@ -1590,7 +1591,7 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
         generation["mcore_generation_config"]["transformer_impl"] = "transformer_engine"
     apply_te_gemm_cublas_pinned_patch()
     apply_moe_determinism_patches()
-    apply_mamba_determinism_patch(required=policy_uses_mamba_layers(config))
+    apply_mamba_alignment_patch(required=policy_uses_mamba_layers(config))
     # Starve PyTorch's own cuBLAS workspace so non-TE aten::mm/addmm paths also
     # pick workspace-free (splitK=1, reduction=NONE) algorithms.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runtime Mamba inference patches for zero train/generation mismatch.
+"""Runtime Mamba train/prefill/decode alignment patches for zero train/gen mismatch.
 
 This ports the final ``mamba_mixer.py`` behavior from YigongQin/Megatron-LM
 commits 41fce34, 6e08a0d, d3f7bea, and 0f78b26. The patch is intentionally
@@ -72,7 +72,7 @@ _HELPER_METHODS = {
 
 def _mamba_module() -> ModuleType:
     if _MAMBA_MIXER_MODULE is None:
-        raise RuntimeError("Mamba determinism patch has not been installed")
+        raise RuntimeError("Mamba alignment patch has not been installed")
     return _MAMBA_MIXER_MODULE
 
 
@@ -747,14 +747,14 @@ def _validate_method_signature(
     actual_parameters = tuple(inspect.signature(method).parameters)
     if actual_parameters != expected_parameters:
         raise RuntimeError(
-            "Cannot install Mamba determinism patch: "
+            "Cannot install Mamba alignment patch: "
             f"MambaMixer.{method_name} signature changed from "
             f"{expected_parameters} to {actual_parameters}. Rebase the patch "
             "onto the installed Megatron-LM version."
         )
 
 
-def apply_mamba_determinism_patch(*, required: bool = True) -> None:
+def apply_mamba_alignment_patch(*, required: bool = True) -> None:
     """Install the zero-KL Mamba prefill and decode paths once per process.
 
     When ``required`` is False (non-Mamba models), signature mismatches are
@@ -778,7 +778,7 @@ def apply_mamba_determinism_patch(*, required: bool = True) -> None:
     except RuntimeError as exc:
         if not required:
             print(
-                "[zero_train_gen_mismatch] skipping Mamba determinism patch "
+                "[zero_train_gen_mismatch] skipping Mamba alignment patch "
                 f"(model has no Mamba layers): {exc}",
                 flush=True,
             )
@@ -787,7 +787,7 @@ def apply_mamba_determinism_patch(*, required: bool = True) -> None:
     for method_name in _HELPER_METHODS:
         if hasattr(mixer_class, method_name):
             raise RuntimeError(
-                "Cannot install NeMo-RL Mamba determinism patch because "
+                "Cannot install NeMo-RL Mamba alignment patch because "
                 f"MambaMixer.{method_name} already exists. The installed "
                 "Megatron-LM may already contain an equivalent upstream patch."
             )
@@ -800,13 +800,13 @@ def apply_mamba_determinism_patch(*, required: bool = True) -> None:
     mixer_class._ssm_prefill = _nrl_patched_ssm_prefill
     mixer_class._ssm_decode = _nrl_patched_ssm_decode
     print(
-        "[zero_train_gen_mismatch] installed batch-invariant Mamba "
-        "reference prefill/decode paths",
+        "[zero_train_gen_mismatch] installed Mamba train/prefill/decode "
+        "alignment reference paths",
         flush=True,
     )
 
 
-def restore_mamba_determinism_patch() -> None:
+def restore_mamba_alignment_patch() -> None:
     """Restore original MambaMixer methods for isolated tests."""
     global _MAMBA_MIXER_MODULE, _ORIGINAL_SSM_DECODE, _ORIGINAL_SSM_PREFILL
     if _ORIGINAL_SSM_PREFILL is None or _MAMBA_MIXER_MODULE is None:
