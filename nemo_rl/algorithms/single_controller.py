@@ -128,15 +128,16 @@ class SingleControllerActor:
         self._loss_fn = actor_args.loss_fn
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
-        # getattr, not attribute access: these are real fields of
-        # SingleControllerActorArgs, so every production caller has them -- but
-        # upstream's unit tests build actor_args as a SimpleNamespace listing only what
-        # upstream's own __init__ reads, and upstream reads none of them. Requiring them
-        # here turns our features into construction requirements for tests that do not
-        # exercise them, which is how test_logs_setup_timing_metrics broke on the main
-        # sync. Same shape as the `timeouts` regression in the previous sync.
-        self._env_handles = getattr(actor_args, "env_handles", {})
-        # None means the feature is off, which is also the default for both.
+        # Direct access, deliberately. A getattr default here reads as defensive but
+        # buys a silent failure mode: rename or drop the field and
+        # watchdog.gym_subprocess_check: true degrades to a health check that iterates
+        # nothing and reports nothing -- the exact class of silent failure this work
+        # exists to remove. A missing field should break loudly at construction, where
+        # it costs five minutes, not quietly at hour three of a run.
+        self._env_handles = actor_args.env_handles
+        # These two keep the getattr for a genuinely different reason: None is a
+        # meaningful value meaning "feature off", and it is also their default. Absence
+        # therefore degrades to the documented off state rather than to a broken one.
         self._fleet_monitor = getattr(actor_args, "fleet_monitor", None)
         self._policy_router = getattr(actor_args, "policy_router", None)
         # Forces the first reconcile: the router starts believing every backend serves.
