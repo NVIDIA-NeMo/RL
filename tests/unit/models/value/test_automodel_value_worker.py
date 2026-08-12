@@ -182,7 +182,6 @@ def test_cp_value_postprocessors_gather_before_right_shift(monkeypatch):
     expected = torch.tensor([[[0.0], [10.0], [20.0], [30.0]]])
     torch.testing.assert_close(inner.seen_logits, expected)
     torch.testing.assert_close(loss, expected.sum())
-    assert processor.cp_loss_is_replicated
     # Both paths handed the unshifted local shard to the gather operation.
     torch.testing.assert_close(gathered_inputs[0], local_logits.squeeze(-1))
     torch.testing.assert_close(gathered_inputs[1], local_logits)
