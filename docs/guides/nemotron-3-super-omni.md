@@ -98,7 +98,7 @@ container cannot read a `wandb login` credential from `~/.netrc`; only
 ```bash
 export WANDB_API_KEY=<key>       # log live
 export WANDB_MODE=offline        # log locally, `wandb sync <run-dir>` later
-EXTRA_HYDRA_ARGS="logger.wandb_enabled=false"   # skip W&B entirely
+export EXTRA_HYDRA_ARGS="logger.wandb_enabled=false"   # skip W&B entirely
 ```
 
 The launcher checks this before submitting and refuses to burn an allocation
