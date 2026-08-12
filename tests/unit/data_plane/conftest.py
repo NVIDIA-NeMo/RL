@@ -34,7 +34,7 @@ import os
 import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
-from nemo_rl.data_plane.adapters.transfer_queue import roce_device
+from nemo_rl.data_plane.adapters.transfer_queue import rdma_device
 
 from ._rollout_shapes import mooncake_available
 
@@ -70,14 +70,13 @@ def _session_tq_client_mooncake_cpu():
             "mooncake not installed — skipping mooncake_cpu "
             "(set NEMO_RL_REQUIRE_MOONCAKE=1 to fail loud)"
         )
-    # mooncake_cpu is RDMA-only, so it cannot run without a RoCE-capable
-    # device (InfiniBand is not auto-selected). CI sets
-    # NEMO_RL_REQUIRE_MOONCAKE=1 on runners where it exposed /dev/infiniband,
-    # which turns this skip into a failure — otherwise losing the device
-    # passthrough would silently drop mooncake coverage and still go green.
-    if not roce_device():
+    # mooncake_cpu is RDMA-only, so it cannot run without an RDMA device. CI
+    # sets NEMO_RL_REQUIRE_MOONCAKE=1 on runners that have one, which turns
+    # this skip into a failure — otherwise losing the device passthrough would
+    # silently drop mooncake coverage and still go green.
+    if not rdma_device():
         detail = (
-            "no RoCE-capable mlx5 device — mooncake_cpu requires RDMA "
+            "no usable mlx5 RDMA device — mooncake_cpu requires RDMA "
             "(set MC_MOONCAKE_DEVICE=<dev> to override)"
         )
         if os.environ.get("NEMO_RL_REQUIRE_MOONCAKE") == "1":
