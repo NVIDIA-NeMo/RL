@@ -2253,14 +2253,20 @@ def _count_close_think_tags(
     reward_penalty_config: dict[str, Any] | BaseModel | None,
     tokenizer: TokenizerType | None = None,
 ) -> dict[str, Any]:
+    # Token-based counting requires an explicit think_close token id from the
+    # reward-penalty config. Token ids are tokenizer-specific, so guessing a
+    # default here would count unrelated tokens (e.g. newlines) on other
+    # tokenizers and silently inject large spurious penalties.
     think_close_token_id = _get_reward_penalty_token_id(
         reward_penalty_config or {}, "think_close"
     )
-    if think_close_token_id is None:
-        think_close_token_id = 13
 
     assistant_ids = _assistant_generated_token_ids(result)
-    token_count = sum(1 for token_id in assistant_ids if token_id == think_close_token_id)
+    token_count = (
+        sum(1 for token_id in assistant_ids if token_id == think_close_token_id)
+        if think_close_token_id is not None
+        else None
+    )
 
     decoded_count = None
     if tokenizer is not None and assistant_ids:
@@ -2277,16 +2283,26 @@ def _count_close_think_tags(
         close_count = decoded_count
         source = "decoded_assistant_tokens"
     elif generation_text:
-        close_count = max(token_count, generation_str_count)
+        close_count = (
+            max(token_count, generation_str_count)
+            if token_count is not None
+            else generation_str_count
+        )
         source = "max_token_or_generation_str"
-    else:
+    elif token_count is not None:
         close_count = token_count
         source = "assistant_token_ids"
+    else:
+        # No way to count: no tokenizer decode, no generation text, and no
+        # configured think_close token id. Report one close tag so the
+        # think_count_delta feature stays neutral rather than penalizing.
+        close_count = 1
+        source = "unavailable"
 
     return {
         "count": int(close_count),
         "source": source,
-        "token_count": int(token_count),
+        "token_count": int(token_count) if token_count is not None else None,
         "generation_str_count": int(generation_str_count),
         "decoded_count": decoded_count,
     }
@@ -2603,9 +2619,9 @@ async def run_async_nemo_gym_rollout(
                         tokenizer=tokenizer,
                         log_full_result_tables=log_full_result_tables,
                         effort_config=effort_config,
-                    reward_penalty_config=reward_penalty_config,
-                    length_adjustment_config=length_adjustment_config,
-                    thinking_tags=thinking_tags,
+                        reward_penalty_config=reward_penalty_config,
+                        length_adjustment_config=length_adjustment_config,
+                        thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
                     )
                     if accumulator.is_complete:
