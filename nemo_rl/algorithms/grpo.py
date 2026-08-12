@@ -120,6 +120,7 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
+    REFITTABLE_FP8_KV_CACHE_DTYPES,
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_vllm_refit_config,
 )
@@ -1516,18 +1517,16 @@ def setup(
                 f"kv_cache_dtype='{kv_cache_dtype}' requires precision='fp8'. "
                 "FP8 KV cache can only be used together with FP8 model weights."
             )
-            # These restrictions come from synchronizing separately stored KV
-            # scales. DeepSeek V4 MLA packs its scales into the cache tensor.
-            if kv_cache_dtype != "fp8_ds_mla":
-                assert policy_config["dtensor_cfg"]["enabled"] == False, (
-                    "DTensor backend is not supported with kv cache fp8 enabled."
-                )
-                assert not should_use_async_rollouts(generation_config), (
-                    "Async rollouts is not supported with kv cache fp8 enabled."
-                )
-                assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                    "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
-                )
+        if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
+            assert policy_config["dtensor_cfg"]["enabled"] == False, (
+                "DTensor backend is not supported with kv cache fp8 enabled."
+            )
+            assert not should_use_async_rollouts(generation_config), (
+                "Async rollouts is not supported with kv cache fp8 enabled."
+            )
+            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
+                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
+            )
 
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
