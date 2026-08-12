@@ -10,8 +10,9 @@
 #
 # Registered in the SingleController L1 lane (full mode). It was originally kept out as
 # "timing-sensitive", but that no longer justifies exclusion: the death deadline is now
-# 600s against an observed 222s, the victim selection is asserted rather than assumed, and
-# the recovery tests in the same lane kill processes the same way. Leaving it out meant
+# 600s against an observed 222s, and the victim selection is asserted rather than assumed.
+# (The shard-recovery harness added in part 3/4 of this series kills processes the same
+# way, from the same lane.) Leaving it out meant
 # the containment behaviour had no end-to-end coverage at all -- and a wedge is precisely
 # the failure that no other test can detect, because it raises nothing.
 #
@@ -81,7 +82,8 @@ VICTIM_WAIT_S=${VICTIM_WAIT_S:-300}
 # Generation takes a while to come up, and conflating the two made 'no actors' and
 # 'actors never reached the state' indistinguishable in the log.
 ACTOR_WAIT_S=${ACTOR_WAIT_S:-300}
-# Hard bound on ONE discovery attempt; see the recovery test for why.
+# Hard bound on ONE discovery attempt: an unbounded Ray actor-table query against a GCS
+# that is itself unwell hangs the harness rather than the run it is watching.
 ACTOR_QUERY_TIMEOUT_S=${ACTOR_QUERY_TIMEOUT_S:-20}
 # GPUs this test pins itself to, independent of how many the host has. One shard of
 # generation and one trainer: killing the shard leaves the fleet empty, which is the
@@ -245,7 +247,8 @@ ACTORS=()
 ATTEMPT=0
 for _ in $(seq 1 $((ACTOR_WAIT_S / 3))); do
     kill -0 $TRAIN_PID 2>/dev/null || { echo "[chaos] FAIL: job died before any actor appeared"; break; }
-    # Keep stderr -- see the recovery test for why discarding it cost three rounds.
+    # Keep stderr: discarding it cost three debugging rounds, because a failed discovery
+    # is indistinguishable from an empty fleet once the reason is thrown away.
     # stderr inline, into this log -- a separate artifact twice failed to survive to be
     # read. stdout (the pids) to a temp file, stderr to a variable.
     : > "$EXP_DIR/pids.tmp"
