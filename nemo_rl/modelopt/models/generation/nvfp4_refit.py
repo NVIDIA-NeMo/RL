@@ -22,6 +22,7 @@ from typing import Literal, cast
 import torch
 
 NVFP4RefitMode = Literal["w4a16", "w4a4"]
+NVFP4RoutedExpertFamily = Literal["gated", "non_gated"]
 
 _BLOCK_SIZE = 16
 _NVFP4_AMAX_DENOMINATOR = 6.0 * 448.0
@@ -29,8 +30,13 @@ _NVFP4_MAXBOUND = 6.0
 _FP8_E4M3_MIN = 2**-9
 _FP8_E4M3_MAX = 448.0
 _EXPERT_PROJECTION = re.compile(
-    r"^(?P<prefix>.+\.experts\.\d+)\.(?P<projection>gate|up|down)_proj\.weight$"
+    r"^(?P<family_prefix>.+\.experts)\.(?P<expert>\d+)\."
+    r"(?P<projection>gate|up|down)_proj\.weight$"
 )
+_ROUTED_EXPERT_PROJECTIONS: dict[NVFP4RoutedExpertFamily, frozenset[str]] = {
+    "gated": frozenset({"gate", "up", "down"}),
+    "non_gated": frozenset({"up", "down"}),
+}
 
 
 @dataclass(frozen=True)
@@ -124,7 +130,93 @@ def get_modelopt_quant_exporter(quant_mode: str) -> tuple[str, object]:
     return qformat, _quantize_nvfp4_weight
 
 
-def nvfp4_refit_group(name: str) -> tuple[str, tuple[str, ...]]:
+def nvfp4_routed_expert_projections(
+    projection_family: NVFP4RoutedExpertFamily,
+) -> frozenset[str]:
+    """Return the complete projection set for one routed-expert family."""
+    try:
+        return _ROUTED_EXPERT_PROJECTIONS[projection_family]
+    except KeyError as error:
+        raise ValueError(
+            f"Unsupported NVFP4 routed-expert family: {projection_family!r}"
+        ) from error
+
+
+def resolve_nvfp4_routed_expert_families(
+    names: Iterable[str],
+) -> dict[str, str]:
+    """Resolve and validate gated or non-gated experts for each MoE prefix."""
+    projections_by_expert = _routed_expert_projections_by_expert(names)
+
+    family_by_prefix: dict[str, str] = {}
+    for (prefix, expert), projections in sorted(projections_by_expert.items()):
+        if projections == _ROUTED_EXPERT_PROJECTIONS["gated"]:
+            family: NVFP4RoutedExpertFamily = "gated"
+        elif projections == _ROUTED_EXPERT_PROJECTIONS["non_gated"]:
+            family = "non_gated"
+        else:
+            raise ValueError(
+                "BF16-to-NVFP4 NCCL refit found an incomplete routed-expert "
+                f"family for {prefix}.{expert}: got {sorted(projections)}"
+            )
+
+        existing = family_by_prefix.setdefault(prefix, family)
+        if existing != family:
+            raise ValueError(
+                "BF16-to-NVFP4 NCCL refit mixes gated and non-gated experts "
+                f"under {prefix!r}"
+            )
+    return family_by_prefix
+
+
+def validate_nvfp4_routed_expert_selection(
+    names: Iterable[str],
+    *,
+    available_names: Iterable[str],
+) -> dict[str, str]:
+    """Validate that quantization selects complete source expert families."""
+    selected_names = frozenset(names)
+    available_names = frozenset(available_names)
+    unexpected = selected_names.difference(available_names)
+    if unexpected:
+        raise ValueError(
+            f"NVFP4 routed-expert selection contains unknown weights: {sorted(unexpected)}"
+        )
+
+    available_families = resolve_nvfp4_routed_expert_families(available_names)
+    selected_by_expert = _routed_expert_projections_by_expert(selected_names)
+    selected_families: dict[str, str] = {}
+    for (prefix, expert), projections in sorted(selected_by_expert.items()):
+        family = cast(NVFP4RoutedExpertFamily, available_families[prefix])
+        expected = nvfp4_routed_expert_projections(family)
+        if projections != expected:
+            raise ValueError(
+                f"BF16-to-NVFP4 NCCL refit partially selects {family} routed "
+                f"expert {prefix}.{expert}: expected {sorted(expected)}, "
+                f"got {sorted(projections)}"
+            )
+        selected_families[prefix] = family
+    return selected_families
+
+
+def _routed_expert_projections_by_expert(
+    names: Iterable[str],
+) -> dict[tuple[str, int], set[str]]:
+    projections_by_expert: dict[tuple[str, int], set[str]] = {}
+    for name in names:
+        match = _EXPERT_PROJECTION.fullmatch(name)
+        if match is None:
+            raise ValueError(f"Expected a routed-expert NVFP4 weight, got {name!r}")
+        key = (match.group("family_prefix"), int(match.group("expert")))
+        projections_by_expert.setdefault(key, set()).add(match.group("projection"))
+    return projections_by_expert
+
+
+def nvfp4_refit_group(
+    name: str,
+    *,
+    projection_family: NVFP4RoutedExpertFamily = "gated",
+) -> tuple[str, tuple[str, ...]]:
     """Return a staging key and complete member names for an HF weight.
 
     The returned ``w13`` and ``w2`` suffixes are completeness keys only. They
@@ -137,13 +229,22 @@ def nvfp4_refit_group(name: str) -> tuple[str, tuple[str, ...]]:
             f"BF16 to NVFP4 refit supports routed-expert weights only, got {name!r}"
         )
 
-    prefix = match.group("prefix")
+    family_prefix = match.group("family_prefix")
+    prefix = f"{family_prefix}.{match.group('expert')}"
     projection = match.group("projection")
+    expected_projections = nvfp4_routed_expert_projections(projection_family)
+    if projection not in expected_projections:
+        raise ValueError(
+            f"Projection {projection!r} does not belong to {projection_family!r} "
+            f"NVFP4 routed experts"
+        )
     if projection == "down":
         return f"{prefix}.w2", (name,)
 
-    gate_name = f"{prefix}.gate_proj.weight"
     up_name = f"{prefix}.up_proj.weight"
+    if projection_family == "non_gated":
+        return f"{prefix}.w13", (up_name,)
+    gate_name = f"{prefix}.gate_proj.weight"
     return f"{prefix}.w13", (gate_name, up_name)
 
 
@@ -152,6 +253,7 @@ def serialize_bf16_nvfp4_group(
     *,
     mode: NVFP4RefitMode,
     calibration: NVFP4Calibration | None,
+    projection_family: NVFP4RoutedExpertFamily = "gated",
 ) -> list[tuple[str, torch.Tensor]]:
     """Serialize one complete BF16 NVFP4 refit group with ModelOpt.
 
@@ -159,6 +261,7 @@ def serialize_bf16_nvfp4_group(
         tensors: Logical BF16 HF weights belonging to one refit group.
         mode: ``w4a16`` for weight-only NVFP4 or ``w4a4`` for calibrated NVFP4.
         calibration: Named input amax values required by W4A4.
+        projection_family: Gated ``gate/up/down`` or non-gated ``up/down`` MoE.
 
     Returns:
         ModelOpt checkpoint-layout tensors in exporter order.
@@ -175,7 +278,10 @@ def serialize_bf16_nvfp4_group(
     if not eligible_tensors:
         return []
 
-    _, resolved_names = _validate_group_members(eligible_tensors)
+    _, resolved_names = _validate_group_members(
+        eligible_tensors,
+        projection_family=projection_family,
+    )
     weights = [eligible_tensors[name] for name in resolved_names]
     _validate_weight_shapes(resolved_names, weights)
     shared_amax = _shared_weight_amax(resolved_names, weights)
@@ -275,16 +381,27 @@ def _quantize_nvfp4_weight(
 
 def _validate_group_members(
     tensors: Mapping[str, torch.Tensor],
+    *,
+    projection_family: NVFP4RoutedExpertFamily,
 ) -> tuple[str, tuple[str, ...]]:
-    groups = {nvfp4_refit_group(name)[0] for name in tensors}
+    groups = {
+        nvfp4_refit_group(name, projection_family=projection_family)[0]
+        for name in tensors
+    }
     if len(groups) != 1:
         raise ValueError(f"Expected one complete NVFP4 group, got {sorted(groups)}")
 
     group_name = next(iter(groups))
-    resolved_names = nvfp4_refit_group(next(iter(tensors)))[1]
+    resolved_names = nvfp4_refit_group(
+        next(iter(tensors)),
+        projection_family=projection_family,
+    )[1]
     if not resolved_names:
         raise ValueError(f"NVFP4 group {group_name} has no expected members")
-    expected_groups = {nvfp4_refit_group(name)[0] for name in resolved_names}
+    expected_groups = {
+        nvfp4_refit_group(name, projection_family=projection_family)[0]
+        for name in resolved_names
+    }
     if expected_groups != {group_name}:
         raise ValueError(
             f"NVFP4 group {group_name} has members from different groups: "

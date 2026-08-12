@@ -28,6 +28,7 @@ from nemo_rl.modelopt.models.generation import nvfp4_refit
 
 _GATE = "model.layers.0.mlp.experts.3.gate_proj.weight"
 _UP = "model.layers.0.mlp.experts.3.up_proj.weight"
+_DOWN = "model.layers.0.mlp.experts.3.down_proj.weight"
 
 
 def _write_calibration(path: Path) -> None:
@@ -199,6 +200,88 @@ def test_serialize_gate_up_shares_largest_weight_amax(
     assert [meta.weight_amax.item() for _, meta in calls] == [3.0, 3.0]
 
 
+@pytest.mark.parametrize("name", [_UP, _DOWN])
+@pytest.mark.parametrize("mode", ["w4a16", "w4a4"])
+def test_serialize_non_gated_group_preserves_original_name(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    mode: nvfp4_refit.NVFP4RefitMode,
+) -> None:
+    calls: list[tuple[str, Any]] = []
+    monkeypatch.setattr(
+        nvfp4_refit,
+        "get_modelopt_quant_exporter",
+        lambda _mode: ("nvfp4", _recording_exporter(calls)),
+    )
+    monkeypatch.setattr(
+        nvfp4_refit,
+        "compute_nvfp4_input_scale",
+        lambda input_amax: input_amax,
+    )
+    calibration = (
+        nvfp4_refit.NVFP4Calibration(input_amax={name: torch.tensor(20.0)})
+        if mode == "w4a4"
+        else None
+    )
+
+    serialized = nvfp4_refit.serialize_bf16_nvfp4_group(
+        {name: torch.ones((32, 16), dtype=torch.bfloat16)},
+        mode=mode,
+        calibration=calibration,
+        projection_family="non_gated",
+    )
+
+    assert [serialized_name for serialized_name, _ in serialized] == [name]
+    assert [called_name for called_name, _ in calls] == [name]
+
+
+def test_resolve_routed_expert_families_accepts_non_gated_experts() -> None:
+    names = {
+        f"model.layers.0.mlp.experts.{expert}.{projection}_proj.weight"
+        for expert in range(2)
+        for projection in ("up", "down")
+    }
+
+    assert nvfp4_refit.resolve_nvfp4_routed_expert_families(names) == {
+        "model.layers.0.mlp.experts": "non_gated"
+    }
+
+
+def test_resolve_routed_expert_families_rejects_mixed_family_per_prefix() -> None:
+    names = {
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.0.up_proj.weight",
+        "model.layers.0.mlp.experts.0.down_proj.weight",
+        "model.layers.0.mlp.experts.1.up_proj.weight",
+        "model.layers.0.mlp.experts.1.down_proj.weight",
+    }
+
+    with pytest.raises(ValueError, match="mixes gated and non-gated"):
+        nvfp4_refit.resolve_nvfp4_routed_expert_families(names)
+
+
+def test_resolve_routed_expert_families_rejects_incomplete_expert() -> None:
+    with pytest.raises(ValueError, match="incomplete routed-expert family"):
+        nvfp4_refit.resolve_nvfp4_routed_expert_families({_UP})
+
+
+def test_validate_routed_expert_selection_rejects_ignored_gate() -> None:
+    available_names = {_GATE, _UP, _DOWN}
+
+    with pytest.raises(ValueError, match="partially selects gated"):
+        nvfp4_refit.validate_nvfp4_routed_expert_selection(
+            {_UP, _DOWN},
+            available_names=available_names,
+        )
+
+
+def test_validate_routed_expert_selection_accepts_non_gated_family() -> None:
+    assert nvfp4_refit.validate_nvfp4_routed_expert_selection(
+        {_UP, _DOWN},
+        available_names={_UP, _DOWN},
+    ) == {"model.layers.0.mlp.experts": "non_gated"}
+
+
 def test_serialize_rejects_incomplete_routed_gate_up_group() -> None:
     with pytest.raises(ValueError, match=r"not complete: missing .*up_proj\.weight"):
         nvfp4_refit.serialize_bf16_nvfp4_group(
@@ -298,6 +381,139 @@ def test_bf16_nvfp4_receiver_ignores_embedding_weight() -> None:
         },
         ignore_patterns=[],
     )
+
+
+def test_bf16_nvfp4_receiver_accepts_non_gated_experts() -> None:
+    backend = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend",
+    )
+    state_dict_info = {
+        f"model.layers.0.mlp.experts.{expert}.{projection}_proj.weight": (
+            (32, 16),
+            torch.bfloat16,
+        )
+        for expert in range(2)
+        for projection in ("up", "down")
+    }
+
+    assert backend._classify_bf16_routed_experts(
+        state_dict_info,
+        ignore_patterns=[],
+    ) == frozenset(state_dict_info)
+
+
+def test_non_gated_receiver_builds_up_only_w13_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend",
+    )
+    prefix = "model.layers.0.mlp.experts"
+    grouped_up = f"{prefix}.up_proj.weight"
+    grouped_down = f"{prefix}.down_proj.weight"
+    expert_names = {
+        f"{prefix}.{expert}.{projection}_proj.weight"
+        for expert in range(2)
+        for projection in ("up", "down")
+    }
+    base_map = backend.HFToLocalParamMap(
+        specs={
+            grouped_up: backend.LocalParamSpec(base=torch.empty(0)),
+            grouped_down: backend.LocalParamSpec(base=torch.empty(0)),
+        }
+    )
+    monkeypatch.setattr(
+        backend.VllmInternalWorkerExtension,
+        "build_hf_to_local_param_map",
+        lambda _self, _refit_info: base_map,
+    )
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda _self: True,
+    )
+
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension.device = torch.device("cpu")
+    extension._nrl_bf16_nvfp4_names = frozenset(expert_names)
+    extension._nrl_bf16_nvfp4_projection_families = {prefix: "non_gated"}
+    mesh = SimpleNamespace(mesh=torch.empty(1))
+    placement = SimpleNamespace(dim=None)
+    refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": grouped_up,
+                    "global_shape": (2, 32, 16),
+                    "dst_mesh_info": mesh,
+                    "dst_placements": (placement,),
+                },
+                {
+                    "name": grouped_down,
+                    "global_shape": (2, 16, 32),
+                    "dst_mesh_info": mesh,
+                    "dst_placements": (placement,),
+                },
+            ]
+        },
+    }
+
+    result = extension.build_hf_to_local_param_map(refit_info)
+
+    assert set(result.specs) == {grouped_up, grouped_down}
+    assert extension._nrl_bf16_nvfp4_group_members == {
+        f"{prefix}.w13": (grouped_up,),
+        f"{prefix}.w2": (grouped_down,),
+    }
+    assert extension._nrl_bf16_nvfp4_group_families == {
+        f"{prefix}.w13": "non_gated",
+        f"{prefix}.w2": "non_gated",
+    }
+
+
+def test_non_gated_receiver_serializes_each_expert_without_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend",
+    )
+    prefix = "model.layers.0.mlp.experts"
+    grouped_up = f"{prefix}.up_proj.weight"
+    calls: list[tuple[dict[str, torch.Tensor], str]] = []
+    loaded: list[tuple[str, torch.Tensor]] = []
+
+    def serialize(tensors, *, mode, calibration, projection_family):
+        assert mode == "w4a16"
+        assert calibration is None
+        calls.append((dict(tensors), projection_family))
+        return list(tensors.items())
+
+    monkeypatch.setattr(backend, "serialize_bf16_nvfp4_group", serialize)
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension._nrl_bf16_nvfp4_group_members = {f"{prefix}.w13": (grouped_up,)}
+    extension._nrl_bf16_nvfp4_group_families = {f"{prefix}.w13": "non_gated"}
+    extension._nrl_bf16_nvfp4_staging = {}
+    extension._nrl_bf16_nvfp4_mode = "w4a16"
+    extension._nrl_bf16_nvfp4_calibration = None
+    extension._load_weights = loaded.extend
+
+    weight = torch.arange(64, dtype=torch.bfloat16).reshape(2, 2, 16)
+    extension._stage_bf16_nvfp4_group(
+        completion_key=f"{prefix}.w13",
+        grouped_name=grouped_up,
+        weight=weight,
+    )
+
+    assert [family for _, family in calls] == ["non_gated", "non_gated"]
+    assert [list(tensors) for tensors, _ in calls] == [
+        [f"{prefix}.0.up_proj.weight"],
+        [f"{prefix}.1.up_proj.weight"],
+    ]
+    assert [name for name, _ in loaded] == [
+        f"{prefix}.0.up_proj.weight",
+        f"{prefix}.1.up_proj.weight",
+    ]
 
 
 def test_w4a4_calibration_uses_resolved_revision_without_explicit_revision() -> None:

@@ -251,6 +251,14 @@ def setup(
                 "distillation support is tracked in "
                 "https://github.com/NVIDIA-NeMo/RL/issues/3275."
             )
+        if refit_transport == "nccl_reshard":
+            raise ValueError(
+                "policy.generation.refit_transport='nccl_reshard' is not "
+                "supported by distillation because distillation does not initialize "
+                "the NCCL-reshard refit path. Set "
+                "policy.generation.refit_transport=null to use distillation's "
+                "default collective refit."
+            )
         checkpoint_engine_config = checkpoint_engine_refit_config(vllm_config)
 
     # Disallow SP + packing for dtensor path

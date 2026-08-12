@@ -17,7 +17,7 @@ import re
 import types
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from typing import Any
+from typing import Any, cast
 
 import torch
 import vllm  # noqa: F401
@@ -28,7 +28,11 @@ from nemo_rl.modelopt.calibration_artifact import load_nvfp4_calibration
 from nemo_rl.modelopt.models.generation.nvfp4_refit import (
     NVFP4Calibration,
     NVFP4RefitMode,
+    NVFP4RoutedExpertFamily,
+    nvfp4_routed_expert_projections,
+    resolve_nvfp4_routed_expert_families,
     serialize_bf16_nvfp4_group,
+    validate_nvfp4_routed_expert_selection,
 )
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
@@ -123,21 +127,28 @@ def _classify_bf16_routed_experts(
 ) -> frozenset[str]:
     """Validate and return the routed-expert BF16 weights to quantize."""
     routed: set[str] = set()
+    available_routed: set[str] = set()
     unsupported: set[str] = set()
     pre_grouped: set[str] = set()
 
     for name, (shape, dtype) in state_dict_info.items():
-        if dtype != torch.bfloat16 or matches_quant_ignore_pattern(
-            name, ignore_patterns
-        ):
+        if dtype != torch.bfloat16:
+            continue
+        routed_match = (
+            _ROUTED_EXPERT_WEIGHT_RE.fullmatch(name)
+            if len(shape) == 2 and name.endswith(".weight")
+            else None
+        )
+        if routed_match is not None:
+            available_routed.add(name)
+        if matches_quant_ignore_pattern(name, ignore_patterns):
             continue
         if name.endswith(_PRE_GROUPED_EXPERT_SUFFIXES):
             pre_grouped.add(name)
             continue
         if len(shape) != 2 or not name.endswith(".weight"):
             continue
-        match = _ROUTED_EXPERT_WEIGHT_RE.fullmatch(name)
-        if match is not None:
+        if routed_match is not None:
             routed.add(name)
             continue
         if name.endswith(_UNSUPPORTED_BF16_NVFP4_SUFFIXES):
@@ -155,22 +166,10 @@ def _classify_bf16_routed_experts(
             f"real_quant_ignore: {sorted(unsupported)}"
         )
 
-    projections_by_expert: dict[tuple[str, int], set[str]] = {}
-    for name in routed:
-        match = _ROUTED_EXPERT_WEIGHT_RE.fullmatch(name)
-        assert match is not None
-        key = (match.group("prefix"), int(match.group("expert")))
-        projections_by_expert.setdefault(key, set()).add(match.group("projection"))
-    incomplete = {
-        key: sorted({"gate", "up", "down"} - projections)
-        for key, projections in projections_by_expert.items()
-        if projections != {"gate", "up", "down"}
-    }
-    if incomplete:
-        raise ValueError(
-            "BF16-to-NVFP4 NCCL refit requires complete routed-expert "
-            f"gate/up/down families; missing projections: {incomplete}"
-        )
+    validate_nvfp4_routed_expert_selection(
+        routed,
+        available_names=available_routed,
+    )
     return frozenset(routed)
 
 
@@ -597,7 +596,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     _nrl_bf16_nvfp4_names: frozenset[str]
     _nrl_bf16_nvfp4_mode: NVFP4RefitMode
     _nrl_bf16_nvfp4_calibration: NVFP4Calibration | None
+    _nrl_bf16_nvfp4_projection_families: dict[str, str]
     _nrl_bf16_nvfp4_group_members: dict[str, tuple[str, ...]]
+    _nrl_bf16_nvfp4_group_families: dict[str, str]
     _nrl_bf16_nvfp4_staging: dict[str, dict[str, torch.Tensor]]
 
     def maybe_init_zmq(self) -> None:
@@ -701,8 +702,15 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             state_dict_info,
             ignore_patterns=ignore_patterns,
         )
+        self._nrl_bf16_nvfp4_projection_families = {
+            prefix: str(family)
+            for prefix, family in resolve_nvfp4_routed_expert_families(
+                self._nrl_bf16_nvfp4_names
+            ).items()
+        }
         self._nrl_bf16_nvfp4_calibration = None
         self._nrl_bf16_nvfp4_group_members = {}
+        self._nrl_bf16_nvfp4_group_families = {}
         self._nrl_bf16_nvfp4_staging = {}
 
         if self._nrl_bf16_nvfp4_names:
@@ -794,18 +802,33 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             )
 
         group_members: dict[str, tuple[str, ...]] = {}
+        group_families: dict[str, str] = {}
         for prefix, projections in grouped_by_prefix.items():
-            if set(projections) != {"gate", "up", "down"}:
+            projection_family = cast(
+                NVFP4RoutedExpertFamily | None,
+                self._nrl_bf16_nvfp4_projection_families.get(prefix),
+            )
+            if projection_family is None:
+                raise ValueError(
+                    f"NVFP4 routed-expert metadata has no family for {prefix!r}"
+                )
+            expected_projections = nvfp4_routed_expert_projections(projection_family)
+            if set(projections) != expected_projections:
                 raise ValueError(
                     f"NVFP4 routed-expert metadata for {prefix!r} requires "
-                    f"gate/up/down, got {sorted(projections)}"
+                    f"{sorted(expected_projections)}, got {sorted(projections)}"
                 )
-            group_members[f"{prefix}.w13"] = (
-                projections["gate"],
-                projections["up"],
+            w13_members = (
+                (projections["gate"], projections["up"])
+                if projection_family == "gated"
+                else (projections["up"],)
             )
+            group_members[f"{prefix}.w13"] = w13_members
             group_members[f"{prefix}.w2"] = (projections["down"],)
+            group_families[f"{prefix}.w13"] = projection_family
+            group_families[f"{prefix}.w2"] = projection_family
         self._nrl_bf16_nvfp4_group_members = group_members
+        self._nrl_bf16_nvfp4_group_families = group_families
         self._nrl_bf16_nvfp4_staging = {}
 
         specs = dict(base_map.specs)
@@ -866,7 +889,15 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     ) -> None:
         """Serialize and load one complete grouped routed-expert family."""
         expected_names = self._nrl_bf16_nvfp4_group_members.get(completion_key)
-        if expected_names is None or grouped_name not in expected_names:
+        projection_family = cast(
+            NVFP4RoutedExpertFamily | None,
+            self._nrl_bf16_nvfp4_group_families.get(completion_key),
+        )
+        if (
+            expected_names is None
+            or projection_family is None
+            or grouped_name not in expected_names
+        ):
             raise RuntimeError(
                 f"Unknown NVFP4 completion group {completion_key!r} "
                 f"for {grouped_name!r}"
@@ -901,6 +932,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                     tensors,
                     mode=self._nrl_bf16_nvfp4_mode,
                     calibration=self._nrl_bf16_nvfp4_calibration,
+                    projection_family=projection_family,
                 )
             )
 
