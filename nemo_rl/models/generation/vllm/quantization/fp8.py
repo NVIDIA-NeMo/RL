@@ -460,46 +460,77 @@ _DEEPSEEK_V4_PACKED_MODULES = {
 def _get_module_from_param_name(
     model: torch.nn.Module, name: str
 ) -> torch.nn.Module | None:
+    # vLLM 0.25 mappers can also contain regex and suffix rules, which the
+    # component-wise compatibility path below does not cover.
     mapper = getattr(model, "hf_to_vllm_mapper", None)
-    candidate_names = mapper.apply_list([name]) if mapper is not None else [name]
-    packed_modules = dict(getattr(model, "packed_modules_mapping", {}) or {})
-    if is_deepseek_v4_model(model):
-        packed_modules.update(_DEEPSEEK_V4_PACKED_MODULES)
+    if mapper is not None and hasattr(mapper, "apply_list"):
+        mapped_names = mapper.apply_list([name])
+        if not mapped_names:
+            return None
+        name = mapped_names[0]
 
-    for candidate_name in candidate_names:
-        module_path = candidate_name.split(".")[:-1]
-        for fused_name, source_names in packed_modules.items():
-            for source_name in source_names:
-                source_path = source_name.split(".")
-                if module_path[-len(source_path) :] == source_path:
-                    module_path = module_path[: -len(source_path)] + fused_name.split(
-                        "."
-                    )
+    # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
+    # The module path is all but the last part (the parameter's own name)
+    path_parts = name.split(".")
+    module_path = path_parts[:-1]
+    # Replace with the fused model name
+    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    reversed_mapping = {
+        original_name: fused_name
+        for fused_name, original_names_list in packed_modules_mapping.items()
+        for original_name in original_names_list
+    }
+    if module_path[-1] in reversed_mapping.keys():
+        module_path[-1] = reversed_mapping[module_path[-1]]
+
+    # DeepSeek V4 defines these multi-component fusions in load_weights rather
+    # than packed_modules_mapping, so the base last-component lookup cannot
+    # resolve them.
+    if is_deepseek_v4_model(model):
+        for fused_name, original_names in _DEEPSEEK_V4_PACKED_MODULES.items():
+            for original_name in original_names:
+                original_path = original_name.split(".")
+                if module_path[-len(original_path) :] == original_path:
+                    module_path[-len(original_path) :] = fused_name.split(".")
                     break
 
-        candidate_paths = [module_path]
-        if module_path and module_path[0] != "model" and hasattr(model, "model"):
-            candidate_paths.append(["model", *module_path])
+    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
+        model.hf_to_vllm_mapper, "orig_to_new_prefix"
+    ):
+        if module_path[0] in model.hf_to_vllm_mapper.orig_to_new_prefix:
+            module_path[0] = model.hf_to_vllm_mapper.orig_to_new_prefix[module_path[0]]
+    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
+        model.hf_to_vllm_mapper, "orig_to_new_substr"
+    ):
+        for i in range(len(module_path)):
+            if module_path[i] in model.hf_to_vllm_mapper.orig_to_new_substr:
+                module_path[i] = model.hf_to_vllm_mapper.orig_to_new_substr[
+                    module_path[i]
+                ]
 
-        for candidate_path in candidate_paths:
-            module = model
-            try:
-                for part in candidate_path:
-                    if isinstance(module, MoERunner):
-                        return module.routed_experts
-                    if isinstance(module, RoutedExperts):
-                        return module
-                    module = (
-                        module[int(part)]
-                        if isinstance(module, torch.nn.ModuleList)
-                        else getattr(module, part)
-                    )
-            except (AttributeError, IndexError, ValueError):
-                continue
-            return module.routed_experts if isinstance(module, MoERunner) else module
-
-    print(f"Warning: Could not find module for parameter '{name}'.")
-    return None
+    current_module = model
+    try:
+        # Traverse the model hierarchy
+        for part in module_path:
+            # vLLM 0.25 split the old FusedMoE module into a MoERunner that
+            # delegates to a RoutedExperts submodule owning the expert weights
+            # (w13_weight/w2_weight), so stop at either and return the
+            # weight-owning module.
+            if isinstance(current_module, MoERunner):
+                return current_module.routed_experts
+            if isinstance(current_module, RoutedExperts):
+                return current_module
+            if isinstance(current_module, torch.nn.ModuleList):
+                current_module = current_module[int(part)]
+            else:
+                current_module = getattr(current_module, part)
+    except (AttributeError, IndexError, ValueError) as e:
+        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
+    # Fused param names (e.g. "...experts.w13_weight") end the traversal on the
+    # MoERunner itself; normalize to the weight-owning RoutedExperts submodule.
+    if isinstance(current_module, MoERunner):
+        return current_module.routed_experts
+    return current_module
 
 
 def _is_fp8_weight(name, model):
