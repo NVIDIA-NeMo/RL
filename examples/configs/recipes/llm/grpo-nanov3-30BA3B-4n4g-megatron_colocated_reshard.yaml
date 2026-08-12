@@ -1,5 +1,4 @@
 defaults: ../../grpo_math_1B.yaml
-# Sync (non-async) colocated GRPO with Megatron generation (Nemotron-3-Nano-30B-A3B), with reshard allowed.
 grpo:
   num_prompts_per_step: 2
   num_generations_per_prompt: 8
