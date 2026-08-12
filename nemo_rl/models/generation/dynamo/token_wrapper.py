@@ -383,7 +383,12 @@ class DynamoTokenWrapperServer:
                 if self.request_timeout_s is not None
                 else aiohttp.ClientTimeout(total=None)
             )
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                # Explicit: the default TCPConnector(limit=100) would cap the whole
+                # rollout path at 100 concurrent requests to the frontend.
+                connector=aiohttp.TCPConnector(limit=0),
+            ) as session:
                 self._client_session = session
                 try:
                     yield
