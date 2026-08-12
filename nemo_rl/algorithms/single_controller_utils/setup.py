@@ -636,21 +636,31 @@ def setup_single_controller(
     # (see TQDataPlaneClient.register_partition).
     token_capture_cfg = master_config.token_capture
     if token_capture_cfg.enabled:
-        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+        from nemo_rl.data_plane.schema import (
+            DP_TRAIN_FIELDS,
+            fields_with_optional_routed_experts,
+        )
+        from nemo_rl.data_plane.tq_token_sink import (
+            ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
+        )
         from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
 
+        r3_enabled = router_replay_enabled(master_config.policy)
         group_size = grpo_config.num_generations_per_prompt
         num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
         dp_client.register_partition(
             partition_id=partition_id,
-            fields=list(DP_TRAIN_FIELDS),
+            fields=fields_with_optional_routed_experts(
+                DP_TRAIN_FIELDS, enabled=r3_enabled
+            ),
             num_samples=num_rollout_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
             grpo_group_size=group_size,
         )
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
-            fields=list(STAGING_FIELDS),
+            fields=list(STAGING_FIELDS)
+            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize"],
         )
@@ -718,6 +728,7 @@ def setup_single_controller(
             pad_token_id=pad_id,
             mixed_weight_version_policy=token_capture_cfg.mixed_weight_version_policy,
             min_valid_fraction_per_group=token_capture_cfg.min_valid_fraction_per_group,
+            router_replay_enabled=router_replay_enabled(policy_config),
         )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,

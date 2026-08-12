@@ -79,24 +79,46 @@ class TQTokenSink:
     def stage(self, record: StagedCallRecord) -> StageResult:
         key = record.staging_key
         try:
-            fields = TensorDict(
-                {
-                    "token_ids_delta": torch.tensor(
-                        [record.token_ids_delta], dtype=torch.int64
-                    ),
-                    "token_mask_delta": torch.tensor(
-                        [record.token_mask_delta], dtype=torch.float32
-                    ),
-                    "generation_logprobs_delta": torch.tensor(
-                        [record.generation_logprobs_delta], dtype=torch.float32
-                    ),
-                    "prev_len": torch.tensor([record.prev_len], dtype=torch.int64),
-                    "weight_version": torch.tensor(
-                        [record.weight_version], dtype=torch.int64
-                    ),
-                },
-                batch_size=[1],
-            )
+            field_dict = {
+                "token_ids_delta": torch.tensor(
+                    [record.token_ids_delta], dtype=torch.int64
+                ),
+                "token_mask_delta": torch.tensor(
+                    [record.token_mask_delta], dtype=torch.float32
+                ),
+                "generation_logprobs_delta": torch.tensor(
+                    [record.generation_logprobs_delta], dtype=torch.float32
+                ),
+                "prev_len": torch.tensor([record.prev_len], dtype=torch.int64),
+                "weight_version": torch.tensor(
+                    [record.weight_version], dtype=torch.int64
+                ),
+            }
+            routed = (record.extras or {}).get("routed_experts")
+            if routed is not None:
+                # Worker sends full prompt+generation coverage of this call's
+                # spliced sequence; the delta-aligned slice is [prev_len:].
+                # A length mismatch stages the delta WITHOUT extras (replay
+                # degrades to Megatron's own router for this call) rather
+                # than poisoning the rollout.
+                delta_len = len(record.token_ids_delta)
+                # int16 covers every practical expert count (<32k) and the -1
+                # sentinel; halves staged bytes vs int32.
+                experts = torch.tensor(routed, dtype=torch.int16)
+                if experts.shape[0] == record.prev_len + delta_len:
+                    experts = experts[record.prev_len :]
+                if experts.shape[0] == delta_len:
+                    field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
+                else:
+                    logging.getLogger(__name__).warning(
+                        "routed_experts length %d does not cover delta %d "
+                        "(prev_len %d) for %s — staging without extras",
+                        experts.shape[0],
+                        delta_len,
+                        record.prev_len,
+                        key,
+                    )
+            fields = TensorDict(field_dict, batch_size=[1])
             tags = [
                 {
                     "rollout_id": record.rollout_id,

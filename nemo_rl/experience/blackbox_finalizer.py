@@ -40,6 +40,9 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.row_dump import maybe_dump_train_rows
+from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL as _ROUTED_EXPERTS_SENTINEL,
+)
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,9 @@ class FinalizedRollout:
     staging_keys: list[str]
     min_wv: Optional[int] = None
     max_wv: Optional[int] = None
+    # Router replay (R3): [len(token_ids)][num_moe_layers][topk] from the
+    # rebuilt chain; None when the rollout staged no extras.
+    routed_experts: Optional[list] = None
 
 
 @dataclass
@@ -85,12 +91,18 @@ class BlackboxFinalizer:
         pad_token_id: int,
         mixed_weight_version_policy: str,
         min_valid_fraction_per_group: Optional[float],
+        router_replay_enabled: bool = False,
     ) -> None:
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_token_id = int(pad_token_id)
         self._mixed_weight_version_policy = mixed_weight_version_policy
         self._min_valid_fraction = min_valid_fraction_per_group
+        self._router_replay_enabled = router_replay_enabled
+        # (num_moe_layers, topk), learned from the first rebuilt row that
+        # carries routes; placeholder-only groups need it to shape their
+        # sentinel tensors consistently with the model.
+        self._routed_dims: Optional[tuple[int, int]] = None
         self._source = TQTokenSource(dp_client, staging_partition=staging_partition)
         # The sink's clear() is the staging-partition delete; no staging
         # writes happen here.
@@ -210,6 +222,7 @@ class BlackboxFinalizer:
             staging_keys=staging_keys,
             min_wv=min_wv,
             max_wv=max_wv,
+            routed_experts=row.routed_experts,
         )
 
     # ── per group ───────────────────────────────────────────────────────────
@@ -311,6 +324,10 @@ class BlackboxFinalizer:
             "prompt_ids_for_adv": prompt_ids_for_adv,
             "total_reward": rewards_t,
         }
+        if self._router_replay_enabled:
+            train_batch["routed_experts"] = self._build_routed_experts_tensor(
+                rows, max_len=max_len, metrics=metrics
+            )
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=group_min_wv, group_id=group_id
         )
@@ -352,6 +369,76 @@ class BlackboxFinalizer:
         )
 
     # ── internals ───────────────────────────────────────────────────────────
+
+    def _build_routed_experts_tensor(
+        self,
+        rows: list[FinalizedRollout],
+        *,
+        max_len: int,
+        metrics: dict[str, float],
+    ) -> torch.Tensor:
+        """[n, max_len, L, K] int16 routes for the group; sentinel elsewhere.
+
+        Padding, placeholder rows, and valid rows whose rebuild carried no
+        routes are all-sentinel: Megatron's replay falls back to its own
+        router for exactly those positions. (L, K) is learned from the first
+        rebuilt row that carries routes and cached for placeholder-only
+        groups; a group arriving before any routed row has been seen cannot
+        be shaped and fails loudly (unreachable once the first real rollout
+        of the run finalizes).
+        """
+        for row in rows:
+            if row.valid and row.routed_experts:
+                first = row.routed_experts[0]
+                self._routed_dims = (len(first), len(first[0]))
+                break
+        if self._routed_dims is None:
+            raise RuntimeError(
+                "policy.router_replay.enabled=true (token-capture mode) but no "
+                "finalized rollout has carried routed_experts yet, so the "
+                "placeholder group tensor cannot be shaped. Check vLLM "
+                "enable_return_routed_experts and the staging-extras path."
+            )
+        num_moe_layers, topk = self._routed_dims
+        routed = torch.full(
+            (len(rows), max_len, num_moe_layers, topk),
+            _ROUTED_EXPERTS_SENTINEL,
+            dtype=torch.int16,
+        )
+        rows_with_routes = 0
+        valid_rows = 0
+        sentinel_tokens = 0
+        covered_tokens = 0
+        for i, row in enumerate(rows):
+            if not row.valid:
+                continue
+            valid_rows += 1
+            covered_tokens += len(row.token_ids)
+            if not row.routed_experts:
+                sentinel_tokens += len(row.token_ids)
+                continue
+            rows_with_routes += 1
+            row_routes = torch.tensor(row.routed_experts, dtype=torch.int16)
+            if row_routes.shape != (len(row.token_ids), num_moe_layers, topk):
+                raise RuntimeError(
+                    "rebuilt routed_experts shape "
+                    f"{tuple(row_routes.shape)} does not match "
+                    f"({len(row.token_ids)}, {num_moe_layers}, {topk}) for "
+                    f"rollout {row.rollout_id}"
+                )
+            routed[i, : row_routes.shape[0]] = row_routes
+            sentinel_tokens += int(
+                row_routes.eq(_ROUTED_EXPERTS_SENTINEL).all(-1).all(-1).sum().item()
+            )
+        if valid_rows:
+            metrics["finalize/routed_experts_row_coverage"] = (
+                rows_with_routes / valid_rows
+            )
+        if covered_tokens:
+            metrics["finalize/routed_experts_sentinel_token_fraction"] = (
+                sentinel_tokens / covered_tokens
+            )
+        return routed
 
     def _clear_staging(self, staging_keys: list[str]) -> None:
         if not staging_keys:
