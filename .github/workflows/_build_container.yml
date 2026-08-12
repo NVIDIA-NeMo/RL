@@ -101,9 +101,7 @@ jobs:
           MEGATRON_LM_COMMIT: ${{ inputs.megatron-lm-commit }}
         run: |
           megatron_lm_dir="3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
-          git -C "$megatron_lm_dir" fetch --depth=1 origin "$MEGATRON_LM_COMMIT"
-          git -C "$megatron_lm_dir" checkout --detach FETCH_HEAD
-          test "$(git -C "$megatron_lm_dir" rev-parse HEAD)" = "$MEGATRON_LM_COMMIT"
+          bash .github/scripts/checkout-megatron-lm-commit.sh "$megatron_lm_dir" "$MEGATRON_LM_COMMIT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
