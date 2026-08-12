@@ -951,12 +951,6 @@ class VllmInternalWorkerExtension:
             self._maybe_process_fp8_kv_cache()
             return
 
-        if fp8.is_fp8_model(self.model_runner.vllm_config):
-            # E8M0 DeepGEMM runtime scales use a packed layout. Restore their
-            # raw block-scale shape once per complete streamed update so each
-            # IPC/collective chunk can load into the same refit parameters.
-            fp8.prepare_fp8_model_for_refit(self.model_runner)
-
         def finalize() -> None:
             with set_current_vllm_config(self.model_runner.vllm_config):
                 process_weights_after_loading(
