@@ -528,6 +528,48 @@ def test_setup_rejects_direct_packed_context_parallel_mismatch_before_side_effec
             )
 
 
+def test_setup_rejects_mixed_direct_packed_and_regular_datasets_before_side_effects(
+    mock_components,
+):
+    master_config = mock_components["master_config"]
+    master_config.data = {"shuffle": False, "num_workers": 0}
+    master_config.logger = {}
+    master_config.policy.update(
+        {
+            "megatron_cfg": {
+                "enabled": True,
+                "use_fused_linear_logprobs": False,
+                "context_parallel_size": 1,
+            },
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": False},
+            "draft": {"enabled": False},
+            "router_replay": {"enabled": False},
+        }
+    )
+    train_dataset = MagicMock()
+    train_dataset.task_data_processors = {
+        "megatron_sft_packed:first": MagicMock(),
+        "regular_sft": MagicMock(),
+    }
+
+    with patch(
+        "nemo_rl.algorithms.sft.Logger",
+        side_effect=AssertionError("setup continued into logger initialization"),
+    ):
+        with pytest.raises(
+            ValueError,
+            match="cannot mix direct Megatron-LM prepacked and regular datasets",
+        ):
+            setup(
+                master_config,
+                mock_components["tokenizer"],
+                train_dataset,
+                None,
+            )
+
+
 def _direct_packed_batch(batch_size: int = 1) -> BatchedDataDict:
     return BatchedDataDict(
         {

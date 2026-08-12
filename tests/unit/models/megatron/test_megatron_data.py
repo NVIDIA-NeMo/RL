@@ -1498,6 +1498,62 @@ class TestGetMicrobatchIterator:
             "seqlen_validation_calls": 0,
         }
 
+    @pytest.mark.parametrize(
+        ("pack_length", "fp8_cfg", "required_multiple"),
+        [
+            pytest.param(3, {"enabled": False}, 2, id="tp2-sp"),
+            pytest.param(
+                128,
+                {"enabled": True, "fp8_recipe": "blockwise"},
+                256,
+                id="tp2-sp-blockwise-fp8",
+            ),
+        ],
+    )
+    def test_get_microbatch_iterator_rejects_misaligned_direct_packed_length(
+        self,
+        pack_length,
+        fp8_cfg,
+        required_multiple,
+    ):
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        data = MagicMock()
+        data.size = 1
+        data.__contains__.side_effect = lambda key: key == "packed_cu_seqlens"
+        data.__getitem__.side_effect = lambda key: (
+            torch.zeros(1, pack_length, dtype=torch.long)
+            if key == "input_ids"
+            else None
+        )
+        data.make_microbatch_iterator.return_value = iter([])
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": True},
+            "make_sequence_length_divisible_by": 2,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 2,
+                "sequence_parallel": True,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 1,
+                "fp8_cfg": fp8_cfg,
+            },
+        }
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                rf"Direct packed sequence length {pack_length} "
+                rf"must be divisible by {required_multiple}"
+            ),
+        ):
+            get_microbatch_iterator(
+                data=data,
+                cfg=cfg,
+                mbs=1,
+                straggler_timer=MagicMock(),
+            )
+
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
     def test_get_microbatch_iterator_regular(

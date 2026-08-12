@@ -662,5 +662,42 @@ def test_packed_preprocessor_right_truncates_to_pack_length_plus_one() -> None:
     assert torch.equal(processed["packed_cu_seqlens"], torch.tensor([0, 4]))
 
 
+def test_packed_preprocessor_stops_after_exactly_filling_the_pack() -> None:
+    messages = [
+        {"role": "system", "content": "s1"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "system", "content": "s2"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    tokenizer = _DummyTokenizer(
+        {
+            ("system", "s1"): [10],
+            ("user", "u1"): [20],
+            ("assistant", "a1"): [30, 40],
+            ("system", "s2"): [50],
+            ("user", "u2"): [60],
+            ("assistant", "a2"): [70],
+        }
+    )
+
+    processed = _preprocess(
+        messages,
+        tokenizer,
+        max_seq_length=4,
+        prompt_format="identity",
+    )
+
+    assert torch.equal(processed["input_ids"], torch.tensor([10, 20, 30, 40]))
+    assert torch.equal(processed["packed_cu_seqlens"], torch.tensor([0, 4]))
+    assert bool(
+        (
+            (processed["packed_cu_seqlens"][1:] - processed["packed_cu_seqlens"][:-1])
+            > 0
+        ).all()
+    )
+
+
 def test_megatron_sft_packed_dataset_is_registered() -> None:
     assert DATASET_REGISTRY["megatron_sft_packed"] is MegatronSFTPackedDataset

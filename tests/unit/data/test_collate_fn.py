@@ -106,7 +106,7 @@ def test_rl_collate_fn_rejects_mixed_packed_and_non_packed_rows() -> None:
 def test_rl_collate_fn_rejects_partial_packed_row() -> None:
     partial = DatumSpec(
         message_log=[],
-        input_ids=torch.arange(4),
+        packed_cu_seqlens=torch.tensor([0, 4]),
         length=4,
         loss_multiplier=1.0,
         extra_env_info=None,
@@ -115,6 +115,21 @@ def test_rl_collate_fn_rejects_partial_packed_row() -> None:
 
     with pytest.raises(ValueError, match="partial Megatron SFT packed fields"):
         rl_collate_fn([partial])
+
+
+def test_rl_collate_fn_does_not_treat_input_ids_extra_as_packed() -> None:
+    datum = DatumSpec(
+        message_log=[],
+        input_ids=torch.arange(4),
+        length=4,
+        loss_multiplier=1.0,
+        extra_env_info=None,
+        idx=0,
+    )
+
+    batch = rl_collate_fn([datum])
+
+    assert batch["length"] == torch.tensor([4])
 
 
 @pytest.mark.parametrize(
