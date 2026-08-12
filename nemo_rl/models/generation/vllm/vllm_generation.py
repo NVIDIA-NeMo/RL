@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -46,6 +46,11 @@ from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
+)
+from nemo_rl.utils.multimodal_payload_metrics import (
+    collect_multimodal_payload_metrics,
+    collect_sharded_multimodal_payload_metrics,
+    print_multimodal_payload_metrics,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.membership import RefitMembership
@@ -726,6 +731,13 @@ class VllmGeneration(GenerationInterface):
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
         )
+        print_multimodal_payload_metrics(
+            collect_sharded_multimodal_payload_metrics(
+                sharded_data,
+                "vllm_generation",
+                enabled=bool(self.cfg.get("_debug_payload_metrics")),
+            )
+        )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate",
             data=sharded_data,
@@ -776,6 +788,13 @@ class VllmGeneration(GenerationInterface):
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
+        )
+        print_multimodal_payload_metrics(
+            collect_sharded_multimodal_payload_metrics(
+                sharded_data,
+                "vllm_text_generation",
+                enabled=bool(self.cfg.get("_debug_payload_metrics")),
+            )
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_text",
@@ -847,6 +866,13 @@ class VllmGeneration(GenerationInterface):
         # health-blind round-robin, so an unconfigured run behaves exactly as before.
         dp_shard_idx = self._next_dp_shard_idx()
         leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_shard_idx)
+        print_multimodal_payload_metrics(
+            collect_multimodal_payload_metrics(
+                data,
+                "vllm_generation_async",
+                enabled=bool(self.cfg.get("_debug_payload_metrics")),
+            )
+        )
 
         if self.fleet_selector is not None:
             self.fleet_selector.acquire(dp_shard_idx)
@@ -917,6 +943,7 @@ class VllmGeneration(GenerationInterface):
             os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "900")
         )  # Default 15 minutes
 
+        # Propagate cancellation to the Ray worker and its vLLM request.
         try:
             worker_gen_proxy = self.worker_group.run_single_worker_single_data(
                 method_name=method_name,
@@ -942,12 +969,20 @@ class VllmGeneration(GenerationInterface):
                     sample_result_ref, timeout=timeout_seconds
                 )
             except asyncio.TimeoutError:
+                ray.cancel(worker_gen_proxy)
                 raise RuntimeError(
                     f"Timeout waiting for worker results after {timeout_seconds}s. "
                     f"For longer sequences, increase timeout by setting: "
                     f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
                     f"{int(timeout_seconds * 2)}"
                 )
+
+            # sample_result is a tuple: (original_idx, BatchedDataDict).
+            original_idx, result_batch = sample_result
+            result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
+            # Inside the try: main added the cancellation handler below precisely so a
+            # consumer abandoning this generator mid-yield still cancels the Ray call.
+            yield (original_idx, result_batch)
         except ray.exceptions.RayError as error:
             if self.fleet_monitor is not None:
                 self.fleet_monitor.report_failure(dp_shard_idx, error)
@@ -955,11 +990,9 @@ class VllmGeneration(GenerationInterface):
                 f"generation shard {dp_shard_idx} (worker {leader_worker_idx}) "
                 f"is unavailable: {type(error).__name__}: {error}"
             ) from error
-
-        # sample_result is a tuple: (original_idx, BatchedDataDict).
-        original_idx, result_batch = sample_result
-        result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
-        yield (original_idx, result_batch)
+        except (asyncio.CancelledError, GeneratorExit):
+            ray.cancel(worker_gen_proxy)
+            raise
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

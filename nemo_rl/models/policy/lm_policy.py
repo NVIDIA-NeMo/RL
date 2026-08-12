@@ -56,6 +56,10 @@ from nemo_rl.utils.flops_tracker import (
     get_default_hf_config,
     get_theoretical_tflops,
 )
+from nemo_rl.utils.multimodal_payload_metrics import (
+    collect_sharded_multimodal_payload_metrics,
+    print_multimodal_payload_metrics,
+)
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
@@ -99,6 +103,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         worker_extension_cls_fqn: Optional[str] = None,
         skip_weight_load: bool = False,
     ):
+        self.debug_payload_metrics = False
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
@@ -523,6 +528,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         return sharded_data
 
+    def _report_sharded_payload(
+        self,
+        sharded_data: list["SlicedDataDict"],
+        boundary: str,
+    ) -> None:
+        """Measure the exact unique per-DP-shard Ray arguments."""
+        if not self.debug_payload_metrics:
+            return
+        print_multimodal_payload_metrics(
+            collect_sharded_multimodal_payload_metrics(
+                sharded_data,
+                boundary,
+                enabled=True,
+            )
+        )
+
     def get_logprobs(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -537,6 +558,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """
         with timer.time("get_logprobs/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+        self._report_sharded_payload(sharded_data, "policy_get_logprobs")
 
         with (
             timer.time("get_logprobs/submit_logprob_futures")
@@ -585,6 +607,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             else nullcontext()
         ):
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+        self._report_sharded_payload(sharded_data, "policy_get_reference_logprobs")
 
         with (
             timer.time(
@@ -751,6 +774,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Shard and replicate the batch
         with timer.time("policy_training/sharding_data") if timer else nullcontext():
             sharded_data = self._shard_for_train(data, batch_size)
+        self._report_sharded_payload(sharded_data, "policy_train")
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
@@ -995,6 +1019,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 dp_size,
                 batch_size=None,
             )
+        self._report_sharded_payload(sharded_data, "policy_kv_calibration")
 
         futures = self.worker_group.run_all_workers_sharded_data(
             "calibrate_qkv_fp8_scales",

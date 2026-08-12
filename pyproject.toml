@@ -443,6 +443,26 @@ exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 conflicts = [
   [
+    { package = "nemo-rl", extra = "automodel" },
+    { package = "nemo-gym", extra = "vllm" },
+  ],
+  [
+    { package = "nemo-rl", extra = "vllm" },
+    { package = "nemo-gym", extra = "vllm" },
+  ],
+  [
+    { package = "nemo-rl", extra = "sglang" },
+    { package = "nemo-gym", extra = "vllm" },
+  ],
+  [
+    { package = "nemo-rl", extra = "mcore" },
+    { package = "nemo-gym", extra = "vllm" },
+  ],
+  [
+    { package = "nemo-rl", extra = "trtllm" },
+    { package = "nemo-gym", extra = "vllm" },
+  ],
+  [
     { extra = "fsdp" },
     { extra = "sglang" },
   ],

@@ -1,5 +1,6 @@
 defaults: ../../vlm_grpo_3B_megatron.yaml
 grpo:
+  deduplicate_multimodal_data: true
   num_prompts_per_step: 1
   num_val_generations_per_prompt: 1
   max_num_steps: 100

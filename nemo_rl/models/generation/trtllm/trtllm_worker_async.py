@@ -295,6 +295,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             sampling_config={
                 "temperature": self.cfg["temperature"],
                 "top_p": self.cfg["top_p"],
+                "top_k": self.cfg["top_k"],
             },
             stop_token_ids=list(self.cfg.get("stop_token_ids") or []),
             default_chat_template_kwargs=self.cfg["trtllm_cfg"].get(
@@ -565,35 +566,11 @@ class TrtllmAsyncGenerationWorkerImpl:
     #  Helpers
     # ------------------------------------------------------------------ #
 
-    def _resolve_end_id(self) -> Optional[int]:
-        """Resolve end_id from model config.json, cached after first call.
-
-        Mirrors vLLM engine which reads eos_token_id from config.json automatically
-        at startup. TRT-LLM requires it to be passed explicitly as end_id.
-        """
-        if hasattr(self, "_end_id_cache"):
-            return self._end_id_cache
-        end_id: Optional[int] = None
-        try:
-            from transformers import AutoConfig
-
-            hf_config = AutoConfig.from_pretrained(
-                self.model_name, trust_remote_code=True
-            )
-            eos_id = getattr(hf_config, "eos_token_id", None)
-            if eos_id is not None:
-                end_id = eos_id[0] if isinstance(eos_id, list) else eos_id
-        except Exception as e:
-            print(f"[TrtllmAsyncWorker] AutoConfig load failed: {e}", flush=True)
-        self._end_id_cache = end_id
-        return end_id
-
     def _build_sampling_params(self, *, greedy: bool):
         top_k_cfg = self.cfg["top_k"]
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else 0)
         temperature = 0.0 if greedy else self.cfg["temperature"]
 
-        end_id = self._resolve_end_id()
         stop_ids = list(self.cfg.get("stop_token_ids") or [])
 
         return self.TrtSamplingParams(
@@ -601,7 +578,6 @@ class TrtllmAsyncGenerationWorkerImpl:
             top_p=self.cfg["top_p"],
             top_k=top_k_val,
             max_tokens=self.cfg["max_new_tokens"],
-            end_id=end_id,
             stop_token_ids=stop_ids or None,
             # Keep the EOS / stop token in the returned token_ids so that the
             # response sequence matches HF / vLLM behavior. Required for

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import gc
 import statistics
 import threading as _threading
 import uuid
@@ -21,11 +22,16 @@ from collections.abc import Mapping
 from typing import Any, Iterable, Optional
 
 import ray
+import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_TASK_INDEX_KEY,
+    NEXT_NEMO_GYM_TASK_INDEX_KEY,
+    PromptGroupRecord,
+)
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
@@ -339,6 +345,44 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 ),
                 "max_size": self.max_size,
             }
+
+    def save_to_path(self, path: str) -> int:
+        """Serialize inside the actor without materializing the buffer on the driver."""
+        state = self.state_dict()
+        torch.save(state, path)
+        num_trajectories = len(state["trajectories"])
+        del state
+        gc.collect()
+        return num_trajectories
+
+    def load_from_path(
+        self,
+        path: str,
+        num_prompts_per_step: int | None = None,
+        current_training_step: int | None = None,
+        max_age_steps: int | None = None,
+    ) -> dict[str, int]:
+        """Restore inside the actor and return only compact coordination metadata."""
+        state = torch.load(path, weights_only=False)
+        saved_task_indices = [
+            int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
+            for trajectory in state.get("trajectories", [])
+            if trajectory.get(NEMO_GYM_TASK_INDEX_KEY) is not None
+        ]
+        next_task_index = max(saved_task_indices, default=-1) + 1
+        num_trajectories = len(state["trajectories"])
+        self.load_state_dict(
+            state,
+            num_prompts_per_step=num_prompts_per_step,
+            current_training_step=current_training_step,
+            max_age_steps=max_age_steps,
+        )
+        del state
+        gc.collect()
+        return {
+            "num_trajectories": num_trajectories,
+            NEXT_NEMO_GYM_TASK_INDEX_KEY: next_task_index,
+        }
 
     def load_state_dict(
         self,

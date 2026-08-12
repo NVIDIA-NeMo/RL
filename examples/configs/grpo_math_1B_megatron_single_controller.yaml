@@ -3,6 +3,9 @@ defaults: grpo_math_1B.yaml
 
 # SC does not support validation yet.
 grpo:
+  # Null out the legacy async_grpo block inherited from grpo_math_1B.yaml:
+  # SC reads async_rl instead, and the entrypoint raises if this block is set.
+  async_grpo: null
   val_period: 0
 
 async_rl:
