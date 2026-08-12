@@ -70,11 +70,15 @@ for a dense Qwen model, and `attn_proj` must be paired with `core_attn`.
 policy:
   megatron_cfg:
     enabled: true
+    cuda_graph_impl: transformer_engine
     env_vars:
       NVTE_CPU_OFFLOAD_V1: "1"
     fine_grained_activation_offloading: true
     offload_modules: ["core_attn", "attn_proj"]
 ```
+
+Pinned MCore requires the `transformer_engine` CUDA-graph implementation for
+this dense module pair; `local` CUDA graphs support only partial MoE offload.
 
 Supported module names are `attn_norm`, `qkv_linear`, `core_attn`,
 `attn_proj`, `mlp_norm`, `expert_fc1`, `moe_act`, and `fused_group_mlp`.
