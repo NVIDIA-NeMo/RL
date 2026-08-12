@@ -7,14 +7,9 @@ loss_fn:
   truncated_importance_sampling_ratio: 2
 policy:
   make_sequence_length_divisible_by: 16
-  dynamic_batching:
-    enabled: true
-  sequence_packing:
-    enabled: false
   megatron_cfg:
     context_parallel_size: 1
     moe_router_dtype: fp32
-    moe_token_dispatcher_type: allgather
     freeze_config:
       freeze_vision_model: true
       freeze_vision_projection: true
