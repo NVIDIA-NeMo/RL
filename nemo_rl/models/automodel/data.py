@@ -271,9 +271,9 @@ def process_microbatch(
             ],  # flash attention 2 expects flattened input
             padding_value=tokenizer.eos_token_id,
             return_attention_mask=False,
-            # The fixed-size tail is a TP workaround. Shared-prefix v1 requires
-            # TP=1, and its model-wide custom backend needs physical tokens to
-            # match the real-token cu_seqlens during dense logprob forwards.
+            # The fixed-size tail is a TP workaround for ordinary packed
+            # forwards. The shared-prefix backend instead requires physical
+            # tokens to match the real-token cu_seqlens.
             min_seq_len=(
                 0
                 if cfg.get("shared_prefix_training")

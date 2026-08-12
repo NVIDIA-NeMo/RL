@@ -23,6 +23,8 @@ import functools
 
 import pytest
 import torch
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
@@ -30,6 +32,7 @@ from nemo_rl.distributed.model_utils import (
     ChunkedDistributedLogprob,
     DistributedLogprob,
     _compute_distributed_log_softmax,
+    get_aligned_target_logprobs_from_vocab_parallel_logits,
     get_next_token_logprobs_from_logits,
 )
 
@@ -140,6 +143,64 @@ def _run_logprob_forward_and_backward(rank, world_size, tp_size, chunk_size):
     )
 
 
+def _run_aligned_dtensor_logprob(
+    rank, world_size, tp_size, chunk_size, dtype, atol, rtol
+):
+    """Test aligned DTensor targets against a full-vocabulary reference."""
+    tp_mesh = init_device_mesh(
+        "cuda",
+        (tp_size,),
+        mesh_dim_names=("tp",),
+    )
+    full_vocab_size = 128
+    vocab_part_size = full_vocab_size // tp_size
+    target_ids = []
+    for shard in range(tp_size):
+        target_ids.extend([shard * vocab_part_size, (shard + 1) * vocab_part_size - 1])
+    target = torch.tensor([target_ids], device="cuda", dtype=torch.long)
+
+    torch.manual_seed(123)
+    full_logits = torch.randn(
+        1,
+        target.shape[1],
+        full_vocab_size,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
+    vocab_start_index = rank * vocab_part_size
+    vocab_end_index = (rank + 1) * vocab_part_size
+    local_logits = (
+        full_logits.detach()[..., vocab_start_index:vocab_end_index]
+        .clone()
+        .requires_grad_()
+    )
+    vocab_parallel_logits = DTensor.from_local(
+        local_logits,
+        device_mesh=tp_mesh,
+        placements=[Shard(-1)],
+        run_check=False,
+    )
+    weights = torch.linspace(-1.0, 1.0, target.shape[1], device="cuda")
+
+    actual = get_aligned_target_logprobs_from_vocab_parallel_logits(
+        vocab_parallel_logits,
+        target,
+        chunk_size=chunk_size,
+    )
+    expected = _torch_baseline_logprob(full_logits.float(), target)
+    actual_loss = (actual * weights).sum()
+    expected_loss = (expected * weights).sum()
+    actual_grad = torch.autograd.grad(actual_loss, local_logits)[0]
+    expected_grad = torch.autograd.grad(expected_loss, full_logits)[0][
+        ..., vocab_start_index:vocab_end_index
+    ]
+
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    torch.testing.assert_close(actual_loss, expected_loss, atol=atol, rtol=rtol)
+    torch.testing.assert_close(actual_grad, expected_grad, atol=atol, rtol=rtol)
+
+
 def _run_log_softmax(rank, world_size, tp_size):
     """Test _compute_distributed_log_softmax against PyTorch baseline."""
     tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
@@ -240,6 +301,37 @@ def test_distributed_logprob_forward_and_backward(
 ):
     test_fn = functools.partial(
         _run_logprob_forward_and_backward, tp_size=tp_size, chunk_size=chunk_size
+    )
+    distributed_test_runner(test_fn, world_size=tp_size)
+
+
+@pytest.mark.parametrize(
+    "tp_size,chunk_size,dtype,atol,rtol",
+    [
+        (1, None, torch.bfloat16, 5e-3, 5e-3),
+        (2, None, torch.float32, 1e-4, 1e-4),
+        (2, None, torch.bfloat16, 5e-3, 5e-3),
+        (2, 1, torch.float32, 1e-4, 1e-4),
+        (2, 3, torch.bfloat16, 5e-3, 5e-3),
+        (4, 3, torch.float32, 1e-4, 1e-4),
+        (4, 64, torch.bfloat16, 5e-3, 5e-3),
+    ],
+)
+def test_aligned_dtensor_logprob_forward_and_backward(
+    distributed_test_runner,
+    tp_size,
+    chunk_size,
+    dtype,
+    atol,
+    rtol,
+):
+    test_fn = functools.partial(
+        _run_aligned_dtensor_logprob,
+        tp_size=tp_size,
+        chunk_size=chunk_size,
+        dtype=dtype,
+        atol=atol,
+        rtol=rtol,
     )
     distributed_test_runner(test_fn, world_size=tp_size)
 

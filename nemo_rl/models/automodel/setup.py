@@ -400,9 +400,9 @@ def validate_and_prepare_config(
             raise ValueError("shared-prefix training requires sequence packing")
         if config["dynamic_batching"]["enabled"]:
             raise ValueError("shared-prefix training does not support dynamic batching")
-        if tp_size != 1 or cp_size != 1 or sequence_parallel_enabled:
+        if cp_size != 1 or sequence_parallel_enabled:
             raise ValueError(
-                "shared-prefix training currently requires TP=1, CP=1, and sequence_parallel=false"
+                "shared-prefix training currently requires CP=1 and sequence_parallel=false"
             )
         if automodel_kwargs is None or automodel_kwargs.get("force_hf") is not True:
             raise ValueError(

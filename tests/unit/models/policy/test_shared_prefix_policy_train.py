@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Four-GPU integration smoke for Qwen3 shared-prefix ``Policy.train``."""
+"""Multi-GPU integration smokes for Qwen3 shared-prefix ``Policy.train``."""
 
 import sys
 
@@ -136,8 +136,25 @@ def _make_rollouts() -> tuple[BatchedDataDict, BatchedDataDict]:
 
 @pytest.mark.automodel
 @pytest.mark.timeout(420)
-def test_shared_prefix_policy_train_fsdp2_four_gpus(tmp_path, monkeypatch):
-    """Exercise dense LP -> compact FSDP2 train -> dense LP on four DP ranks."""
+@pytest.mark.parametrize(
+    "world_size,tp_size,dp_size,shard_size,groups_per_shard,compact_tokens",
+    [
+        (4, 1, 4, 2, 1, 36),
+        (2, 2, 1, 8, 2, 112),
+    ],
+    ids=["dp4_tp1", "dp1_tp2"],
+)
+def test_shared_prefix_policy_train_fsdp2(
+    tmp_path,
+    monkeypatch,
+    world_size,
+    tp_size,
+    dp_size,
+    shard_size,
+    groups_per_shard,
+    compact_tokens,
+):
+    """Exercise dense LP -> compact FSDP2 train -> dense LP with DP or TP."""
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
     monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
@@ -149,6 +166,7 @@ def test_shared_prefix_policy_train_fsdp2_four_gpus(tmp_path, monkeypatch):
     _save_tiny_qwen3(model_path)
     config = create_test_config(
         model_name=str(model_path),
+        tp=tp_size,
         dtensor_v2=True,
         precision="bfloat16",
         sequence_packing_enabled=True,
@@ -173,9 +191,9 @@ def test_shared_prefix_policy_train_fsdp2_four_gpus(tmp_path, monkeypatch):
 
     cluster = RayVirtualCluster(
         name="shared_prefix_policy_train",
-        bundle_ct_per_node_list=[4],
+        bundle_ct_per_node_list=[world_size],
         use_gpus=True,
-        num_gpus_per_node=4,
+        num_gpus_per_node=world_size,
         max_colocated_worker_groups=1,
     )
     policy = None
@@ -188,31 +206,32 @@ def test_shared_prefix_policy_train_fsdp2_four_gpus(tmp_path, monkeypatch):
             cluster=cluster,
             name_prefix="shared_prefix_policy",
         )
-        assert policy.data_parallel_size == 4
+        assert policy.data_parallel_size == dp_size
 
         dense_data, train_data = _make_rollouts()
-        assert train_data["input_lengths"].tolist() == [24] * 8
+        assert train_data["input_lengths"].tolist() == [26] * 8
         policy.prepare_for_lp_inference()
         before = policy.get_logprobs(dense_data)["logprobs"]
         train_data["prev_logprobs"] = before.clone()
         train_data["generation_logprobs"] = before.clone()
         train_data["reference_policy_logprobs"] = before.clone()
 
-        # The 128-token batch would fit in one shared bin. DP=4 forces four
-        # nonempty bins: two responses per bin, and each split group recomputes
-        # its 16-token prompt exactly once on each receiving rank.
+        # DP=4 forces four compact bins; TP=2 keeps all rollouts in one DP bin
+        # and replicates that physical layout across its two tensor-parallel ranks.
         shards = policy._shard_for_train(train_data, batch_size=8)
-        assert len(shards) == 4
+        assert len(shards) == dp_size
         for shard in shards:
-            assert shard.size == 2
-            assert torch.unique(shard[SHARED_PREFIX_GROUP_IDS]).numel() == 1
+            assert shard.size == shard_size
+            assert (
+                torch.unique(shard[SHARED_PREFIX_GROUP_IDS]).numel() == groups_per_shard
+            )
             layout = build_shared_prefix_layout(
                 shard["input_ids"],
                 shard["input_lengths"],
                 shard[SHARED_PREFIX_LENGTHS],
                 shard[SHARED_PREFIX_GROUP_IDS],
             )
-            assert layout.compact_tokens == 32
+            assert layout.compact_tokens == compact_tokens
 
         policy.prepare_for_training()
         result = policy.train(
@@ -222,7 +241,7 @@ def test_shared_prefix_policy_train_fsdp2_four_gpus(tmp_path, monkeypatch):
         assert torch.isfinite(result["loss"]).all()
         assert torch.isfinite(result["grad_norm"]).all()
         assert result["grad_norm"].item() > 0
-        assert len(result["all_mb_metrics"]["loss"]) == 4
+        assert len(result["all_mb_metrics"]["loss"]) == dp_size
 
         policy.prepare_for_lp_inference()
         after = policy.get_logprobs(dense_data)["logprobs"]

@@ -289,6 +289,58 @@ class TestValidateAndPrepareConfig:
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.attn_impl is None
 
+    @pytest.mark.parametrize(
+        "tp_size,cp_size,sequence_parallel,expected_error",
+        [
+            (2, 1, False, None),
+            (2, 2, False, "requires CP=1 and sequence_parallel=false"),
+            (2, 1, True, "requires CP=1 and sequence_parallel=false"),
+        ],
+        ids=["tp2", "cp2", "sequence_parallel"],
+    )
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_shared_prefix_parallelism_validation(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+        tp_size,
+        cp_size,
+        sequence_parallel,
+        expected_error,
+    ):
+        """Shared-prefix training accepts TP but still rejects CP and SP."""
+        mock_autoconfig.model_type = "qwen3"
+        mock_autoconfig.architectures = ["Qwen3ForCausalLM"]
+        mock_autoconfig.layer_types = ["full_attention"]
+        mock_autoconfig.attention_dropout = 0.0
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        mock_config["shared_prefix_training"] = True
+        mock_config["sequence_packing"]["enabled"] = True
+        mock_config["dynamic_batching"] = {"enabled": False}
+        mock_config["dtensor_cfg"].update(
+            {
+                "_v2": True,
+                "tensor_parallel_size": tp_size,
+                "context_parallel_size": cp_size,
+                "sequence_parallel": sequence_parallel,
+                "automodel_kwargs": {"force_hf": True},
+            }
+        )
+
+        if expected_error is None:
+            result = validate_and_prepare_config(mock_config, None, 0)
+            assert isinstance(result, RuntimeConfig)
+        else:
+            with pytest.raises(ValueError, match=expected_error):
+                validate_and_prepare_config(mock_config, None, 0)
+
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")

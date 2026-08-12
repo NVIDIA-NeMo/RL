@@ -49,6 +49,7 @@ from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     cp_load_balanced_to_contiguous,
     distributed_vocab_topk,
+    get_aligned_target_logprobs_from_vocab_parallel_logits,
     get_logprobs_from_vocab_parallel_logits,
 )
 from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
@@ -631,12 +632,20 @@ class LossPostProcessor:
                 raise ValueError(
                     "shared-prefix training does not support train-time top-k/top-p"
                 )
-            local_logits = to_local_if_dtensor(logits)
-            response_logprobs = response_logprobs_from_logits(
-                local_logits,
-                layout,
-                chunk_size=self.cfg.get("logprob_chunk_size"),
-            )
+            if isinstance(logits, DTensor):
+                response_logprobs = (
+                    get_aligned_target_logprobs_from_vocab_parallel_logits(
+                        logits,
+                        layout.response_target_ids.unsqueeze(0),
+                        chunk_size=self.cfg.get("logprob_chunk_size"),
+                    ).squeeze(0)
+                )
+            else:
+                response_logprobs = response_logprobs_from_logits(
+                    logits,
+                    layout,
+                    chunk_size=self.cfg.get("logprob_chunk_size"),
+                )
             prev_logprobs = data_dict.get("prev_logprobs")
             logprob_base = (
                 prev_logprobs[:, 1:]

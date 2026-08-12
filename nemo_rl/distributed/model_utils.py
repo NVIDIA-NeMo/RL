@@ -1555,6 +1555,88 @@ def get_logprobs_from_vocab_parallel_logits(
     )
 
 
+def get_aligned_target_logprobs_from_vocab_parallel_logits(
+    vocab_parallel_logits: DTensor,
+    target: torch.Tensor,
+    *,
+    chunk_size: Optional[int] = None,
+) -> torch.Tensor:
+    """Compute TP logprobs for targets already aligned with their predictors.
+
+    Unlike :func:`get_logprobs_from_vocab_parallel_logits`, this helper does
+    not shift targets or drop the final predictor. It is intended for layouts
+    such as shared-prefix training, where predictor positions are gathered into
+    a custom order before the vocabulary-parallel LM head.
+
+    Args:
+        vocab_parallel_logits: Vocabulary-sharded DTensor with global shape
+            ``[batch_size, num_predictors, vocab_size]``.
+        target: Global token IDs with shape ``[batch_size, num_predictors]``.
+        chunk_size: Optional predictor-dimension chunk size.
+
+    Returns:
+        Target log probabilities with shape ``[batch_size, num_predictors]``.
+
+    Raises:
+        ValueError: If the logits, targets, or TP vocabulary shard are invalid.
+    """
+    if vocab_parallel_logits.ndim != 3:
+        raise ValueError(
+            "aligned target logprobs require rank-3 vocabulary-parallel logits"
+        )
+    if target.shape != vocab_parallel_logits.shape[:-1]:
+        raise ValueError(
+            "aligned target IDs must match the logits batch and predictor dimensions"
+        )
+    if target.dtype != torch.long:
+        raise ValueError("aligned target IDs must use torch.long dtype")
+    if chunk_size is not None and chunk_size <= 0:
+        raise ValueError("aligned target logprob chunk_size must be positive")
+
+    device_mesh = vocab_parallel_logits.device_mesh
+    if device_mesh.mesh_dim_names is None or "tp" not in device_mesh.mesh_dim_names:
+        raise ValueError("vocabulary-parallel logits must use a named TP mesh")
+    tp_group = device_mesh.get_group("tp")
+    tp_rank = tp_group.rank()
+    tp_size = tp_group.size()
+    global_vocab_size = vocab_parallel_logits.shape[-1]
+    if global_vocab_size % tp_size != 0:
+        raise ValueError("global vocabulary size must be divisible by TP size")
+
+    local_logits = vocab_parallel_logits.to_local()
+    vocab_interval_per_rank = global_vocab_size // tp_size
+    if local_logits.shape != (*target.shape, vocab_interval_per_rank):
+        raise ValueError(
+            "vocabulary-parallel logits must be sharded only on the vocabulary dimension"
+        )
+    if target.device != local_logits.device:
+        raise ValueError(
+            "aligned target IDs and local logits must be on the same device"
+        )
+
+    vocab_start_index = vocab_interval_per_rank * tp_rank
+    vocab_end_index = vocab_interval_per_rank * (tp_rank + 1)
+    inference_only = not torch.is_grad_enabled()
+    if chunk_size is not None:
+        return ChunkedDistributedLogprob.apply(  # type: ignore
+            local_logits,
+            target,
+            vocab_start_index,
+            vocab_end_index,
+            chunk_size,
+            tp_group,
+            inference_only,
+        ).contiguous()
+    return DistributedLogprob.apply(  # type: ignore
+        local_logits,
+        target,
+        vocab_start_index,
+        vocab_end_index,
+        tp_group,
+        inference_only,
+    ).contiguous()
+
+
 def get_next_token_logprobs_from_logits(
     input_ids: torch.Tensor,
     next_token_logits: torch.Tensor,
