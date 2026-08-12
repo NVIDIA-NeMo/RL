@@ -56,6 +56,7 @@ class TeacherConfig:
     tensor_model_parallel_size: int
     pipeline_model_parallel_size: int
     context_parallel_size: int
+    expert_tensor_parallel_size: int
     expert_model_parallel_size: int
     num_nodes: int
     gpus_per_node: int
@@ -70,8 +71,14 @@ def create_teacher_configs_from_opd_config(
     """Build per-teacher configs from on_policy_distillation config.
 
     Per-teacher fields and ``megatron_cfg_overrides`` are merged over the
-    defaults. Aliases sharing a checkpoint are deduplicated only when their
-    effective configs are identical; conflicting configs fail fast.
+    defaults. The precedence from least to most specific is default field,
+    default Megatron override, alias field, then alias Megatron override.
+    Aliases sharing a checkpoint are deduplicated only when their effective
+    configs are identical.
+
+    Raises:
+        ValueError: If aliases sharing a checkpoint have conflicting effective
+            configs while checkpoint deduplication is enabled.
     """
     teacher_model_by_agent_name: dict[str, str] = dict(
         opd_cfg.get("teacher_model_by_agent_name", {})
@@ -88,9 +95,15 @@ def create_teacher_configs_from_opd_config(
         # defaults <- per-alias override, then validated/typed by the schema.
         alias_override = dict(overrides.get(alias, {}))
         merged = {**default_cfg, **alias_override}
+        alias_mco = dict(alias_override.get("megatron_cfg_overrides", {}))
+        default_mco = {
+            key: value
+            for key, value in default_cfg.get("megatron_cfg_overrides", {}).items()
+            if key not in alias_override
+        }
         merged["megatron_cfg_overrides"] = {
-            **dict(default_cfg.get("megatron_cfg_overrides", {})),
-            **dict(alias_override.get("megatron_cfg_overrides", {})),
+            **default_mco,
+            **alias_mco,
         }
         res = TeacherResourceConfig(**merged)
 
@@ -100,6 +113,7 @@ def create_teacher_configs_from_opd_config(
         tp = res.tensor_model_parallel_size
         pp = res.pipeline_model_parallel_size
         cp = res.context_parallel_size
+        etp = res.expert_tensor_parallel_size
         ep = res.expert_model_parallel_size
         if "tensor_model_parallel_size" in all_overrides:
             tp = int(all_overrides["tensor_model_parallel_size"])
@@ -107,6 +121,8 @@ def create_teacher_configs_from_opd_config(
             pp = int(all_overrides["pipeline_model_parallel_size"])
         if "context_parallel_size" in all_overrides:
             cp = int(all_overrides["context_parallel_size"])
+        if "expert_tensor_parallel_size" in all_overrides:
+            etp = int(all_overrides["expert_tensor_parallel_size"])
         if "expert_model_parallel_size" in all_overrides:
             ep = int(all_overrides["expert_model_parallel_size"])
 
@@ -116,6 +132,7 @@ def create_teacher_configs_from_opd_config(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
             context_parallel_size=cp,
+            expert_tensor_parallel_size=etp,
             expert_model_parallel_size=ep,
             num_nodes=res.num_nodes,
             gpus_per_node=res.gpus_per_node,
@@ -131,7 +148,9 @@ def create_teacher_configs_from_opd_config(
                     "effective resource configs when "
                     "deduplicate_shared_teacher_checkpoints=true; "
                     f"'{alias}' conflicts with primary alias '{primary.alias}' "
-                    f"for checkpoint '{model_name}'."
+                    f"for checkpoint '{model_name}'. Align the aliases' overrides "
+                    "or set deduplicate_shared_teacher_checkpoints=false to run "
+                    "separate teacher groups."
                 )
             continue
         primary_config_by_model[model_name] = config
@@ -175,6 +194,9 @@ class TeacherWorkerGroup:
             teacher_cfg.pipeline_model_parallel_size
         )
         cfg["megatron_cfg"]["context_parallel_size"] = teacher_cfg.context_parallel_size
+        cfg["megatron_cfg"]["expert_tensor_parallel_size"] = (
+            teacher_cfg.expert_tensor_parallel_size
+        )
         cfg["megatron_cfg"]["expert_model_parallel_size"] = (
             teacher_cfg.expert_model_parallel_size
         )
@@ -208,6 +230,8 @@ class TeacherWorkerGroup:
         tp = teacher_cfg.tensor_model_parallel_size
         pp = teacher_cfg.pipeline_model_parallel_size
         cp = teacher_cfg.context_parallel_size
+        etp = teacher_cfg.expert_tensor_parallel_size
+        ep = teacher_cfg.expert_model_parallel_size
 
         # Validate parallelism fits the cluster (matches lm_policy.py)
         world_size = cluster.world_size()
@@ -219,6 +243,17 @@ class TeacherWorkerGroup:
         if world_size % model_parallel_size != 0:
             raise ValueError(
                 f"Teacher '{self.alias}': world_size ({world_size}) not divisible by TP({tp}) * PP({pp}) * CP({cp}) = {model_parallel_size}"
+            )
+        expert_parallel_size = etp * ep * pp
+        if world_size < expert_parallel_size:
+            raise ValueError(
+                f"Teacher '{self.alias}': world_size ({world_size}) < "
+                f"ETP({etp}) * EP({ep}) * PP({pp}) = {expert_parallel_size}"
+            )
+        if world_size % expert_parallel_size != 0:
+            raise ValueError(
+                f"Teacher '{self.alias}': world_size ({world_size}) not divisible "
+                f"by ETP({etp}) * EP({ep}) * PP({pp}) = {expert_parallel_size}"
             )
 
         self.sharding_annotations = NamedSharding(

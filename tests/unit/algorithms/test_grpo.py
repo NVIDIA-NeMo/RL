@@ -354,9 +354,15 @@ def test_validate_teacher_topk_preserves_default_cp_with_unrelated_alias_overrid
     opd_config["teacher_model_by_agent_name"] = {"large_teacher": "teacher-model"}
     opd_config["non_colocated_teachers"]["default_teacher_cfg"][
         "context_parallel_size"
-    ] = 2
+    ] = 1
+    opd_config["non_colocated_teachers"]["default_teacher_cfg"][
+        "megatron_cfg_overrides"
+    ] = {"context_parallel_size": 2}
     opd_config["non_colocated_teachers"]["teacher_overrides"] = {
-        "large_teacher": {"num_nodes": 2}
+        "large_teacher": {
+            "num_nodes": 2,
+            "megatron_cfg_overrides": {"sequence_parallel": True},
+        }
     }
     master_config.on_policy_distillation = OnPolicyDistillationConfig.model_validate(
         opd_config

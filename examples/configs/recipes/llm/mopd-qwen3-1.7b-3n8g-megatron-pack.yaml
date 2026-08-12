@@ -139,6 +139,7 @@ on_policy_distillation:
       tensor_model_parallel_size: 2
       pipeline_model_parallel_size: 1
       context_parallel_size: 1
+      expert_tensor_parallel_size: 1
       num_nodes: 1
       gpus_per_node: 8
       precision: bf16

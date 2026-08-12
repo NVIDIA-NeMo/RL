@@ -26,6 +26,7 @@ def test_teacher_resource_config_defaults():
     res = TeacherResourceConfig(tensor_model_parallel_size=4)
     assert res.tensor_model_parallel_size == 4
     assert res.pipeline_model_parallel_size == 1
+    assert res.expert_tensor_parallel_size == 1
     assert res.gpus_per_node == 8
     assert res.precision == "bf16"
 
@@ -64,16 +65,19 @@ def test_create_teacher_configs_sparse_override_preserves_default_resources():
                 "tensor_model_parallel_size": 8,
                 "pipeline_model_parallel_size": 3,
                 "context_parallel_size": 2,
+                "expert_tensor_parallel_size": 5,
                 "expert_model_parallel_size": 4,
-                "num_nodes": 2,
+                "num_nodes": 6,
+                "gpus_per_node": 7,
+                "micro_batch_size": 9,
                 "megatron_cfg_overrides": {
-                    "moe_token_dispatcher_type": "alltoall",
+                    "moe_token_dispatcher_type": "flex",
                     "moe_flex_dispatcher_backend": "deepep",
                 },
             },
             "teacher_overrides": {
                 "big": {
-                    "num_nodes": 4,
+                    "num_nodes": 10,
                     "megatron_cfg_overrides": {"sequence_parallel": True},
                 }
             },
@@ -82,20 +86,54 @@ def test_create_teacher_configs_sparse_override_preserves_default_resources():
     opd_cfg = _opd_cfg({"on_policy_distillation": config})
 
     assert opd_cfg["non_colocated_teachers"]["teacher_overrides"]["big"] == {
-        "num_nodes": 4,
+        "num_nodes": 10,
         "megatron_cfg_overrides": {"sequence_parallel": True},
     }
     resolved = create_teacher_configs_from_opd_config(opd_cfg)[0]
     assert resolved.tensor_model_parallel_size == 8
     assert resolved.pipeline_model_parallel_size == 3
     assert resolved.context_parallel_size == 2
+    assert resolved.expert_tensor_parallel_size == 5
     assert resolved.expert_model_parallel_size == 4
-    assert resolved.num_nodes == 4
+    assert resolved.num_nodes == 10
+    assert resolved.gpus_per_node == 7
+    assert resolved.micro_batch_size == 9
     assert resolved.megatron_cfg_overrides == {
-        "moe_token_dispatcher_type": "alltoall",
+        "moe_token_dispatcher_type": "flex",
         "moe_flex_dispatcher_backend": "deepep",
         "sequence_parallel": True,
     }
+
+
+def test_alias_field_overrides_same_default_megatron_override():
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    config = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"large": "/ckpt/large"},
+        non_colocated_teachers={
+            "default_teacher_cfg": {
+                "context_parallel_size": 1,
+                "megatron_cfg_overrides": {"context_parallel_size": 2},
+            },
+            "teacher_overrides": {
+                "large": {
+                    "context_parallel_size": 4,
+                    "megatron_cfg_overrides": {"sequence_parallel": True},
+                }
+            },
+        },
+    )
+
+    resolved = create_teacher_configs_from_opd_config(
+        _opd_cfg({"on_policy_distillation": config})
+    )[0]
+
+    assert resolved.context_parallel_size == 4
+    assert resolved.megatron_cfg_overrides == {"sequence_parallel": True}
 
 
 def test_create_teacher_configs_heterogeneous_override():
@@ -141,6 +179,7 @@ def test_create_teacher_configs_resolves_parallelism_from_megatron_overrides():
                         "tensor_model_parallel_size": 2,
                         "pipeline_model_parallel_size": 3,
                         "context_parallel_size": 4,
+                        "expert_tensor_parallel_size": 6,
                         "expert_model_parallel_size": 5,
                     }
                 }
@@ -155,8 +194,9 @@ def test_create_teacher_configs_resolves_parallelism_from_megatron_overrides():
         resolved.tensor_model_parallel_size,
         resolved.pipeline_model_parallel_size,
         resolved.context_parallel_size,
+        resolved.expert_tensor_parallel_size,
         resolved.expert_model_parallel_size,
-    ) == (2, 3, 4, 5)
+    ) == (2, 3, 4, 6, 5)
 
 
 def test_create_teacher_configs_deduplicates():
@@ -202,6 +242,57 @@ def test_create_teacher_configs_rejects_conflicting_deduplicated_aliases():
     with pytest.raises(ValueError, match="code.*math.*shared"):
         create_teacher_configs_from_opd_config(
             _opd_cfg({"on_policy_distillation": config})
+        )
+
+
+def test_create_teacher_configs_keeps_shared_checkpoint_aliases_without_dedup():
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    config = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"math": "/shared", "code": "/shared"},
+        deduplicate_shared_teacher_checkpoints=False,
+    )
+
+    configs = create_teacher_configs_from_opd_config(
+        _opd_cfg({"on_policy_distillation": config})
+    )
+
+    assert [config.alias for config in configs] == ["math", "code"]
+
+
+def test_teacher_worker_group_rejects_invalid_expert_parallel_grid():
+    from nemo_rl.models.policy.teacher_worker_group import (
+        TeacherConfig,
+        TeacherWorkerGroup,
+    )
+
+    teacher_cfg = TeacherConfig(
+        alias="large",
+        model_name="/ckpt/large",
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_tensor_parallel_size=8,
+        expert_model_parallel_size=4,
+        num_nodes=2,
+        gpus_per_node=8,
+        precision="bf16",
+        micro_batch_size=1,
+        megatron_cfg_overrides={},
+    )
+    cluster = MagicMock()
+    cluster.world_size.return_value = 16
+
+    with pytest.raises(ValueError, match=r"ETP\(8\) \* EP\(4\) \* PP\(1\) = 32"):
+        TeacherWorkerGroup(
+            teacher_cfg=teacher_cfg,
+            cluster=cluster,
+            policy_config={"megatron_cfg": {"enabled": True}},
+            tokenizer=object(),
         )
 
 

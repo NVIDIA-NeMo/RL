@@ -102,6 +102,7 @@ on_policy_distillation:
       tensor_model_parallel_size: 2
       pipeline_model_parallel_size: 1
       context_parallel_size: 1
+      expert_tensor_parallel_size: 1
       expert_model_parallel_size: 1
       num_nodes: 1
       gpus_per_node: 8
@@ -118,12 +119,17 @@ on_policy_distillation:
         expert_model_parallel_size: 4
         num_nodes: 2
         megatron_cfg_overrides:
+          moe_token_dispatcher_type: flex
+          moe_enable_deepep: true
+          moe_shared_expert_overlap: false
           moe_flex_dispatcher_backend: deepep
 ```
 
 An empty per-alias `megatron_cfg_overrides` map inherits all default keys; it
 does not clear them. There is currently no configuration syntax for deleting an
-inherited Megatron override.
+inherited Megatron override. When the same setting appears in more than one
+place, precedence is: default field, default Megatron override, alias field,
+then alias Megatron override.
 
 > [!NOTE]
 > Teachers run the Megatron backend in inference-only mode. A DTensor-configured
@@ -162,7 +168,12 @@ back to `default_teacher_alias`), samples are grouped by teacher, and each group
 is scored by exactly one teacher — there is no ensemble averaging across
 teachers. When several aliases map to the same checkpoint,
 `deduplicate_shared_teacher_checkpoints` collapses them onto a single worker
-group so they share GPUs.
+group so they share GPUs. Those aliases must have identical effective resource
+and Megatron overrides; conflicting overrides fail during setup. Align the
+overrides to share one group, or set deduplication to `false` to create a
+separate group—and reserve separate nodes—for every alias. Configurations that
+previously relied on a later alias override being silently discarded must make
+that choice explicitly.
 
 ### Resourcing
 
