@@ -13,8 +13,21 @@ worker group must fit on one node. Its world size is derived from vLLM tensor
 parallelism times pipeline parallelism; expert parallelism must be either one
 or equal to tensor parallelism.
 
+Aggregated mode creates one homogeneous backend fleet from all inference GPU
+groups. Disaggregated mode creates fixed decode and prefill pools. The pools
+have independent replica counts but share TP, PP, EP, and all other vLLM
+settings. Decode engines are ordered before prefill engines. This order is the
+fixed engine order for placement, membership checks, metrics, and refit ranks.
+
+Every P/D engine uses Dynamo's `NixlConnector`. NeMo RL owns each engine's
+NIXL host and side-channel port. Prefill engines also publish managed KV events
+for the router. Same-node transfer can use CUDA transport. Cross-node transfer
+requires a working NIXL UCX/RDMA path and is not qualified when it falls back
+to TCP.
+
 Startup completes only after the frontend sees the same fixed membership at
-the generation and RL endpoints and advertises the configured model. Worker
+the generation and RL endpoints for both the `backend` and `prefill`
+components and advertises the configured model. Worker
 handles are recorded before readiness checks so partial startup failures can
 be torn down. Shutdown is idempotent and guards the frontend, worker pool,
 NATS, etcd, and temporary state independently.
@@ -35,10 +48,11 @@ driver-side invalidation lifecycle.
 ## Weight refit
 
 Dynamo uses `CollectiveWeightSynchronizer`. If each engine has world size `E`,
-worker `i` starts at rank `training_world_size + i * E`. The policy sender uses
-vLLM's peer initialization and its fixed packed-transfer geometry: two 1-GiB
-buffers. The isolated vLLM environment validates the same constants before a
-worker starts.
+worker `i` starts at rank `training_world_size + i * E`. In P/D mode, this
+includes all decode engines followed by all prefill engines. The policy sender
+uses vLLM's peer initialization and its fixed packed-transfer geometry: two
+1-GiB buffers. The isolated vLLM environment validates the same constants
+before a worker starts.
 
 Generation is drained before refit. The worker then runs vLLM's native
 `start_weight_update`, `update_weights`, and `finish_weight_update` transaction.
@@ -49,8 +63,9 @@ cache mode determines where it runs.
 
 `BUILD_DYNAMO=1` adds a Python 3.12 `/opt/dynamo_venv` to the standard image.
 It contains only `ai-dynamo[vllm]==1.3.0.post1`, its pinned vLLM 0.23.0, etcd,
-and NATS. NeMo-RL's normal Ray and engine environments are unchanged; the
-standard NeMo-RL vLLM environment currently uses vLLM 0.25.1.
+NATS, and its NIXL 1.1.0 CU13 dependency. NeMo-RL's normal Ray and engine
+environments are unchanged; the standard NeMo-RL vLLM environment currently
+uses vLLM 0.25.1.
 
 vLLM 0.23.0 predates PR #44814, which fixes layerwise reload accounting for
 composed loaders. The installer asserts the exact vLLM version, checks and

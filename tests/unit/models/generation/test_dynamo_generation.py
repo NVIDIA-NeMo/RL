@@ -266,8 +266,16 @@ def test_token_wrapper_is_used_for_nemo_gym(monkeypatch) -> None:
 
 def test_refit_rank_offsets_update_and_pickled_cache_invalidation(monkeypatch) -> None:
     workers = [
-        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
-        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+        {
+            "instance_id": "decode-0",
+            "system_url": "http://10.0.0.2:4000",
+            "role": "decode",
+        },
+        {
+            "instance_id": "prefill-0",
+            "system_url": "http://10.0.0.3:4000",
+            "role": "prefill",
+        },
     ]
     _patch_runtime(monkeypatch, workers=workers)
     init_calls = []
@@ -294,6 +302,10 @@ def test_refit_rank_offsets_update_and_pickled_cache_invalidation(monkeypatch) -
     assert [call["payload"]["init_info"]["rank_offset"] for call in init_calls] == [
         3,
         5,
+    ]
+    assert [call["system_url"] for call in init_calls] == [
+        "http://10.0.0.2:4000",
+        "http://10.0.0.3:4000",
     ]
     assert all(call["timeout_s"] == 10 for call in init_calls)
     assert generation.update_weights_from_collective() == [True, True]

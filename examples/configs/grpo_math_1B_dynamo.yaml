@@ -46,6 +46,7 @@ policy:
       startup_timeout_s: 600
       request_timeout_s: 900
       control_timeout_s: 600
+      disaggregation: null
       metrics_include_prefixes: null
       metrics_exclude_prefixes: null
       worker_args:
