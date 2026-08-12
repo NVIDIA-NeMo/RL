@@ -41,7 +41,7 @@ def _valid_nvfp4_config(*, mode: str) -> SimpleNamespace:
                 ),
                 "vllm_cfg": {
                     "precision": "bfloat16",
-                    "tensor_parallel_size": 2,
+                    "tensor_parallel_size": 1,
                     "expert_parallel_size": 1,
                     "pipeline_parallel_size": 1,
                 },
@@ -64,6 +64,59 @@ def test_validator_accepts_plain_bf16_to_supported_nvfp4(
     )
 
     check_nccl_reshard_refit_support(_valid_nvfp4_config(mode=mode))
+
+
+def test_validator_rejects_unsupported_policy_precision_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        modelopt_utils,
+        "resolve_nvfp4_real_quant_mode",
+        lambda _quant_cfg: "w4a16",
+    )
+    config = _valid_nvfp4_config(mode="w4a16")
+    config.policy["precision"] = "bf16"
+
+    with pytest.raises(ValueError, match="policy.precision must be 'bfloat16'"):
+        check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize(
+    ("precision", "is_mx"),
+    [("fp8", False), ("fp8", True), ("bfloat16", True)],
+)
+def test_validator_rejects_mixed_generation_quantization_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    precision: str,
+    is_mx: bool,
+) -> None:
+    monkeypatch.setattr(
+        modelopt_utils,
+        "resolve_nvfp4_real_quant_mode",
+        lambda _quant_cfg: "w4a16",
+    )
+    config = _valid_nvfp4_config(mode="w4a16")
+    config.policy["generation"]["vllm_cfg"].update(
+        {"precision": precision, "is_mx": is_mx}
+    )
+
+    with pytest.raises(ValueError, match="real NVFP4.*vllm_cfg"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_validator_rejects_tensor_parallel_nvfp4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        modelopt_utils,
+        "resolve_nvfp4_real_quant_mode",
+        lambda _quant_cfg: "w4a16",
+    )
+    config = _valid_nvfp4_config(mode="w4a16")
+    config.policy["generation"]["vllm_cfg"]["tensor_parallel_size"] = 2
+
+    with pytest.raises(ValueError, match="tensor_parallel_size must be 1"):
+        check_nccl_reshard_refit_support(config)
 
 
 def test_validator_rejects_expert_parallel_nvfp4(

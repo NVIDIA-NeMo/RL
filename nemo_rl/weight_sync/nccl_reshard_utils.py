@@ -586,10 +586,18 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
                 "performs NVFP4 serialization."
             )
         policy_precision = policy.get("precision")
-        if policy_precision not in {"bf16", "bfloat16"}:
+        if policy_precision != "bfloat16":
             violations.append(
-                "policy.precision must be 'bf16' or 'bfloat16' for real NVFP4 "
+                "policy.precision must be 'bfloat16' for real NVFP4 "
                 f"NCCL refit (got {policy_precision!r})."
+            )
+
+        generation_precision = vllm_cfg.get("precision")
+        if generation_precision != "bfloat16" or vllm_cfg.get("is_mx"):
+            violations.append(
+                "real NVFP4 requires policy.generation.vllm_cfg.precision="
+                f"'bfloat16' and is_mx=False (got precision={generation_precision!r}, "
+                f"is_mx={bool(vllm_cfg.get('is_mx'))})."
             )
 
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
@@ -728,6 +736,12 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         gen_tp = vllm_cfg.get("tensor_parallel_size", 1)
         gen_ep = vllm_cfg.get("expert_parallel_size", 1)
         gen_pp = vllm_cfg.get("pipeline_parallel_size", 1)
+        if real_nvfp4 and gen_tp != 1:
+            violations.append(
+                "policy.generation.vllm_cfg.tensor_parallel_size must be 1 for "
+                "real NVFP4 NCCL refit because the receiver serializes TP-local "
+                f"expert shards (got tp={gen_tp})."
+            )
         if real_nvfp4 and gen_ep != 1:
             violations.append(
                 "policy.generation.vllm_cfg.expert_parallel_size must be 1 for "

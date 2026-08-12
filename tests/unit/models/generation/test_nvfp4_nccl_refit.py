@@ -16,6 +16,7 @@ import json
 import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -83,6 +84,29 @@ def test_calibration_artifact_rejects_projection_mismatch(tmp_path: Path) -> Non
             model_revision="revision-1",
             quant_cfg="NVFP4_TEST_CFG",
             expected_projection_names={_GATE},
+        )
+
+
+def test_calibration_artifact_requires_digest_for_file_config(tmp_path: Path) -> None:
+    quant_cfg = tmp_path / "nvfp4.yaml"
+    quant_cfg.write_text("quant_cfg: []\n")
+    artifact_path = tmp_path / "calibration.safetensors"
+    save_file(
+        {_GATE: torch.tensor(10.0)},
+        str(artifact_path),
+        metadata={
+            "model_id": json.dumps("Qwen/Qwen3-30B-A3B"),
+            "model_revision": json.dumps("revision-1"),
+            "quant_cfg": json.dumps(str(quant_cfg)),
+        },
+    )
+
+    with pytest.raises(ValueError, match="quant_cfg_sha256.*required"):
+        load_nvfp4_calibration(
+            artifact_path,
+            model_id="Qwen/Qwen3-30B-A3B",
+            model_revision="revision-1",
+            quant_cfg=str(quant_cfg),
         )
 
 
@@ -220,6 +244,76 @@ def test_bf16_nvfp4_receiver_rejects_qkvo_scope(projection: str) -> None:
             {name: ((32, 16), torch.bfloat16)},
             ignore_patterns=[],
         )
+
+
+def test_bf16_nvfp4_receiver_rejects_unignored_projection_scope() -> None:
+    backend = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend",
+    )
+
+    with pytest.raises(ValueError, match="supports routed experts only"):
+        backend._classify_bf16_routed_experts(
+            {
+                "backbone.layers.0.mixer.in_proj.weight": (
+                    (32, 16),
+                    torch.bfloat16,
+                )
+            },
+            ignore_patterns=[],
+        )
+
+
+def test_bf16_nvfp4_receiver_rejects_pre_grouped_experts() -> None:
+    backend = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend",
+    )
+
+    with pytest.raises(ValueError, match="pre-grouped routed experts"):
+        backend._classify_bf16_routed_experts(
+            {
+                "model.layers.0.mlp.experts.gate_up_proj": (
+                    (8, 64, 16),
+                    torch.bfloat16,
+                ),
+                "model.layers.0.mlp.experts.down_proj": (
+                    (8, 16, 32),
+                    torch.bfloat16,
+                ),
+            },
+            ignore_patterns=[],
+        )
+
+
+def test_bf16_nvfp4_receiver_ignores_embedding_weight() -> None:
+    backend = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend",
+    )
+
+    assert not backend._classify_bf16_routed_experts(
+        {
+            "model.embed_tokens.weight": (
+                (1024, 256),
+                torch.bfloat16,
+            )
+        },
+        ignore_patterns=[],
+    )
+
+
+def test_w4a4_calibration_uses_resolved_revision_without_explicit_revision() -> None:
+    backend = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend",
+    )
+    model_config = SimpleNamespace(
+        model="Qwen/Qwen3-30B-A3B",
+        revision=None,
+        hf_config=SimpleNamespace(_commit_hash="resolved-commit"),
+    )
+
+    assert backend._vllm_calibration_provenance(model_config) == (
+        "Qwen/Qwen3-30B-A3B",
+        "resolved-commit",
+    )
 
 
 @pytest.mark.parametrize("mode", ["w4a4", "w4a16"])

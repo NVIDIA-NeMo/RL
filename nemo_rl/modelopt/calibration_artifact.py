@@ -151,8 +151,13 @@ def _validate_identity(
     }
     for key, expected_value in expected.items():
         actual_value = metadata[key]
-        if key == "quant_cfg" and isinstance(metadata.get(_QUANT_CFG_SHA256_KEY), str):
+        if key == "quant_cfg" and _resolve_quant_cfg_path(expected_value) is not None:
             quant_cfg_sha256 = metadata.get(_QUANT_CFG_SHA256_KEY)
+            if not isinstance(quant_cfg_sha256, str):
+                raise ValueError(
+                    "NVFP4 calibration metadata 'quant_cfg_sha256' is required "
+                    "when quant_cfg resolves to a file"
+                )
             matches = quant_cfg_sha256 == _file_sha256(expected_value)
         else:
             matches = actual_value == expected_value

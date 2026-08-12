@@ -74,6 +74,14 @@ _UNSUPPORTED_BF16_NVFP4_SUFFIXES = (
     "gate_proj.weight",
     "up_proj.weight",
     "down_proj.weight",
+    "in_proj.weight",
+    "out_proj.weight",
+    "linear_proj.weight",
+    "linear_qkv.weight",
+)
+_PRE_GROUPED_EXPERT_SUFFIXES = (
+    "experts.gate_up_proj",
+    "experts.down_proj",
 )
 
 
@@ -83,16 +91,16 @@ def _vllm_calibration_provenance(model_config: Any) -> tuple[str, str]:
     if not isinstance(model_id, str) or not model_id:
         raise ValueError("vLLM model config requires a non-empty model id")
 
-    configured_revision = model_config.revision
-    if not isinstance(configured_revision, str) or not configured_revision:
-        raise ValueError(
-            "BF16 W4A4 calibration requires an explicit model revision in "
-            "the vLLM model config"
-        )
-
     resolved_revision = getattr(model_config.hf_config, "_commit_hash", None)
     if isinstance(resolved_revision, str) and resolved_revision:
         return model_id, resolved_revision
+
+    configured_revision = model_config.revision
+    if not isinstance(configured_revision, str) or not configured_revision:
+        raise ValueError(
+            "BF16 W4A4 calibration requires a resolved Hugging Face commit or "
+            "an explicit model revision in the vLLM model config"
+        )
     return model_id, configured_revision
 
 
@@ -116,14 +124,17 @@ def _classify_bf16_routed_experts(
     """Validate and return the routed-expert BF16 weights to quantize."""
     routed: set[str] = set()
     unsupported: set[str] = set()
+    pre_grouped: set[str] = set()
 
     for name, (shape, dtype) in state_dict_info.items():
-        if (
-            dtype != torch.bfloat16
-            or len(shape) != 2
-            or not name.endswith(".weight")
-            or matches_quant_ignore_pattern(name, ignore_patterns)
+        if dtype != torch.bfloat16 or matches_quant_ignore_pattern(
+            name, ignore_patterns
         ):
+            continue
+        if name.endswith(_PRE_GROUPED_EXPERT_SUFFIXES):
+            pre_grouped.add(name)
+            continue
+        if len(shape) != 2 or not name.endswith(".weight"):
             continue
         match = _ROUTED_EXPERT_WEIGHT_RE.fullmatch(name)
         if match is not None:
@@ -132,6 +143,11 @@ def _classify_bf16_routed_experts(
         if name.endswith(_UNSUPPORTED_BF16_NVFP4_SUFFIXES):
             unsupported.add(name)
 
+    if pre_grouped:
+        raise ValueError(
+            "BF16-to-NVFP4 NCCL refit does not support pre-grouped routed experts; "
+            f"got {sorted(pre_grouped)}"
+        )
     if unsupported:
         raise ValueError(
             "BF16-to-NVFP4 NCCL refit currently supports routed experts only; "
