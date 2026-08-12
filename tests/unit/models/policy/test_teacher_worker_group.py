@@ -30,94 +30,137 @@ def test_teacher_resource_config_defaults():
 
 
 def test_create_teacher_configs_homogeneous():
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
     from nemo_rl.models.policy.teacher_worker_group import (
         create_teacher_configs_from_opd_config,
     )
 
+    config = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"math": "/ckpt/math", "code": "/ckpt/code"},
+        non_colocated_teachers={
+            "default_teacher_cfg": {"tensor_model_parallel_size": 4}
+        },
+    )
     configs = create_teacher_configs_from_opd_config(
-        {
-            "teacher_model_by_agent_name": {"math": "/ckpt/math", "code": "/ckpt/code"},
-            "non_colocated_teachers": {
-                "default_teacher_cfg": {"tensor_model_parallel_size": 4}
-            },
-        }
+        _opd_cfg({"on_policy_distillation": config})
     )
     assert len(configs) == 2
     assert all(c.tensor_model_parallel_size == 4 for c in configs)
 
 
-def test_create_teacher_configs_heterogeneous_override():
+def test_create_teacher_configs_sparse_override_preserves_default_resources():
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
     from nemo_rl.models.policy.teacher_worker_group import (
         create_teacher_configs_from_opd_config,
     )
 
-    configs = create_teacher_configs_from_opd_config(
-        {
-            "teacher_model_by_agent_name": {"math": "/ckpt/math", "code": "/ckpt/code"},
-            "non_colocated_teachers": {
-                "default_teacher_cfg": {"tensor_model_parallel_size": 4},
-                "teacher_overrides": {"code": {"tensor_model_parallel_size": 8}},
+    config = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"big": "/ckpt/big"},
+        non_colocated_teachers={
+            "default_teacher_cfg": {
+                "tensor_model_parallel_size": 8,
+                "context_parallel_size": 2,
+                "num_nodes": 2,
+                "megatron_cfg_overrides": {"sequence_parallel": True},
             },
-        }
+            "teacher_overrides": {"big": {"num_nodes": 4}},
+        },
+    )
+    opd_cfg = _opd_cfg({"on_policy_distillation": config})
+
+    assert opd_cfg["non_colocated_teachers"]["teacher_overrides"]["big"] == {
+        "num_nodes": 4
+    }
+    resolved = create_teacher_configs_from_opd_config(opd_cfg)[0]
+    assert resolved.tensor_model_parallel_size == 8
+    assert resolved.context_parallel_size == 2
+    assert resolved.num_nodes == 4
+    assert resolved.megatron_cfg_overrides == {"sequence_parallel": True}
+
+
+def test_create_teacher_configs_heterogeneous_override():
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    config = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"math": "/ckpt/math", "code": "/ckpt/code"},
+        non_colocated_teachers={
+            "default_teacher_cfg": {"tensor_model_parallel_size": 4},
+            "teacher_overrides": {"code": {"tensor_model_parallel_size": 8}},
+        },
+    )
+    configs = create_teacher_configs_from_opd_config(
+        _opd_cfg({"on_policy_distillation": config})
     )
     code_cfg = [c for c in configs if c.alias == "code"][0]
     assert code_cfg.tensor_model_parallel_size == 8
 
 
 def test_create_teacher_configs_resolves_parallelism_from_megatron_overrides():
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
     from nemo_rl.models.policy.teacher_worker_group import (
         create_teacher_configs_from_opd_config,
     )
 
-    config = create_teacher_configs_from_opd_config(
-        {
-            "teacher_model_by_agent_name": {"large": "/ckpt/large"},
-            "non_colocated_teachers": {
-                "default_teacher_cfg": {
-                    "tensor_model_parallel_size": 1,
-                    "pipeline_model_parallel_size": 1,
-                    "context_parallel_size": 1,
-                    "expert_model_parallel_size": 1,
-                },
-                "teacher_overrides": {
-                    "large": {
-                        "megatron_cfg_overrides": {
-                            "tensor_model_parallel_size": 2,
-                            "pipeline_model_parallel_size": 3,
-                            "context_parallel_size": 4,
-                            "expert_model_parallel_size": 5,
-                        }
-                    }
-                },
+    config = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"large": "/ckpt/large"},
+        non_colocated_teachers={
+            "default_teacher_cfg": {
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 1,
+                "expert_model_parallel_size": 1,
             },
-        }
+            "teacher_overrides": {
+                "large": {
+                    "megatron_cfg_overrides": {
+                        "tensor_model_parallel_size": 2,
+                        "pipeline_model_parallel_size": 3,
+                        "context_parallel_size": 4,
+                        "expert_model_parallel_size": 5,
+                    }
+                }
+            },
+        },
+    )
+    resolved = create_teacher_configs_from_opd_config(
+        _opd_cfg({"on_policy_distillation": config})
     )[0]
 
     assert (
-        config.tensor_model_parallel_size,
-        config.pipeline_model_parallel_size,
-        config.context_parallel_size,
-        config.expert_model_parallel_size,
+        resolved.tensor_model_parallel_size,
+        resolved.pipeline_model_parallel_size,
+        resolved.context_parallel_size,
+        resolved.expert_model_parallel_size,
     ) == (2, 3, 4, 5)
 
 
 def test_create_teacher_configs_deduplicates():
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
     from nemo_rl.models.policy.teacher_worker_group import (
         create_teacher_configs_from_opd_config,
     )
 
+    config = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={
+            "math": "/shared",
+            "code": "/shared",
+            "rlhf": "/rlhf",
+        },
+        deduplicate_shared_teacher_checkpoints=True,
+        non_colocated_teachers={
+            "default_teacher_cfg": {"tensor_model_parallel_size": 2}
+        },
+    )
     configs = create_teacher_configs_from_opd_config(
-        {
-            "teacher_model_by_agent_name": {
-                "math": "/shared",
-                "code": "/shared",
-                "rlhf": "/rlhf",
-            },
-            "deduplicate_shared_teacher_checkpoints": True,
-            "non_colocated_teachers": {
-                "default_teacher_cfg": {"tensor_model_parallel_size": 2}
-            },
-        }
+        _opd_cfg({"on_policy_distillation": config})
     )
     assert len(configs) == 2
 

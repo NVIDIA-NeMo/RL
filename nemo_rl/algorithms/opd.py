@@ -57,6 +57,24 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
+class TeacherResourceOverrideConfig(BaseModel, extra="allow"):
+    """Sparse per-teacher patch applied over ``default_teacher_cfg``.
+
+    ``None`` means inherit the default teacher value. ``_opd_cfg`` serializes
+    with ``exclude_none=True``, preserving only explicitly supplied overrides.
+    """
+
+    tensor_model_parallel_size: Optional[int] = None
+    pipeline_model_parallel_size: Optional[int] = None
+    context_parallel_size: Optional[int] = None
+    expert_model_parallel_size: Optional[int] = None
+    num_nodes: Optional[int] = None
+    gpus_per_node: Optional[int] = None
+    precision: Optional[str] = None
+    micro_batch_size: Optional[int] = None
+    megatron_cfg_overrides: Optional[dict[str, Any]] = None
+
+
 class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     """Non-colocated (separate-GPU) teacher resourcing for on-policy distillation."""
 
@@ -64,7 +82,9 @@ class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     default_teacher_cfg: TeacherResourceConfig = Field(
         default_factory=TeacherResourceConfig
     )
-    teacher_overrides: dict[str, TeacherResourceConfig] = Field(default_factory=dict)
+    teacher_overrides: dict[str, TeacherResourceOverrideConfig] = Field(
+        default_factory=dict
+    )
 
 
 class OnPolicyDistillationConfig(BaseModel, extra="allow"):
