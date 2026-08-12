@@ -220,6 +220,18 @@ def topk_reverse_kl_loss(
     All log-probabilities must be normalized against their model's full
     vocabulary. Support selection and teacher values are treated as constants;
     gradients flow only through the current student log-probabilities.
+
+    Note:
+        The tail term is a score-function estimator evaluated with the current
+        student's log-probability at the sampled target token. It is unbiased
+        only when that token is sampled from the current student policy. Under
+        async replay, the token comes from a stale policy and no importance
+        ratio corrects the sampling-distribution mismatch. The estimator thus
+        inherits async GRPO's off-policy bias and relies on on-policy training
+        or a sufficiently small policy lag, for example one bounded via
+        ICE-POP. Requiring ``disable_ppo_ratio=True`` avoids applying a policy
+        gradient ratio to this reverse-KL loss, but does not compensate for
+        replay staleness.
     """
     if student_support_logprobs.shape != teacher_support_logprobs.shape:
         raise ValueError(

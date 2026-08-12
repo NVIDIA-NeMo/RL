@@ -110,6 +110,21 @@ def test_student_topk_opd_loss_configuration_guards():
             False,
             "token-level loss and importance ratios",
         ),
+        (
+            {"use_importance_sampling_correction": True},
+            False,
+            "use_importance_sampling_correction=True",
+        ),
+        (
+            {"truncated_importance_sampling_type": "tis"},
+            False,
+            "truncated_importance_sampling_type",
+        ),
+        (
+            {"positive_example_nll_weight": 0.1},
+            False,
+            "positive_example_nll_weight",
+        ),
     ],
 )
 def test_student_topk_opd_loss_rejects_incompatible_options(
@@ -146,13 +161,17 @@ def test_student_topk_opd_loss_uses_head_and_sampled_tail():
     current_target = torch.tensor([[-0.6, -1.3]], requires_grad=True)
     current_support = torch.tensor([[[-0.3, -1.6], [-0.4, -1.7]]], requires_grad=True)
 
-    loss, metrics = loss_fn(
-        next_token_logprobs=current_target,
-        current_support_logprobs=current_support,
-        data=data,
-        global_valid_seqs=torch.tensor(1.0),
-        global_valid_toks=torch.tensor(1.0),
-    )
+    with patch(
+        "nemo_rl.algorithms.loss.loss_functions.torch.max",
+        side_effect=AssertionError("PPO clipping must not run for top-k OPD"),
+    ):
+        loss, metrics = loss_fn(
+            next_token_logprobs=current_target,
+            current_support_logprobs=current_support,
+            data=data,
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(1.0),
+        )
 
     expected = topk_reverse_kl_loss(
         student_support_logprobs=current_support,
@@ -166,6 +185,17 @@ def test_student_topk_opd_loss_uses_head_and_sampled_tail():
     assert current_target.grad is not None
     assert current_support.grad is not None
     assert metrics["opd_topk_target_outside_fraction"] == pytest.approx(1.0)
+    expected_metrics = {
+        "loss",
+        "kl_penalty",
+        "num_valid_samples",
+        "opd_topk_head_loss",
+        "opd_topk_tail_loss",
+        "opd_topk_student_mass",
+        "opd_topk_target_outside_fraction",
+    }
+    assert metrics.keys() == expected_metrics
+    assert loss_fn.metric_normalizations.keys() == expected_metrics
 
 
 def test_prepare_student_topk_opd_loss_input_uses_full_vocab_normalization():
