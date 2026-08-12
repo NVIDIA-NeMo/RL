@@ -38,16 +38,21 @@ console = Console()
 error_console = Console(stderr=True)
 
 
-def merge_tb_logs_to_json(log_dir, output_path, error_on_conflicts=False):
+def merge_tb_logs_to_json(
+    log_dir, output_path, error_on_conflicts=False, required_tag_prefix=None
+):
     """Merge multiple TensorBoard event files into a single JSON file.
 
     Arguments:
         log_dir: Path to directory containing TensorBoard event files (searched recursively)
         output_path: Path to save the output JSON file
         error_on_conflicts: If True, raise an error if conflicting values are found for the same step
+        required_tag_prefix: If set, require at least one TensorBoard tag in any
+            plugin category to start with this prefix
 
     Raises:
-        ValueError: If conflicting values are found for the same step and error_on_conflicts is True
+        ValueError: If conflicting values are found for the same step and
+            error_on_conflicts is True, or if required_tag_prefix is not found
     """
     # Find all event files recursively
     files = glob.glob(f"{log_dir}/**/events*tfevents*", recursive=True)
@@ -76,6 +81,7 @@ def merge_tb_logs_to_json(log_dir, output_path, error_on_conflicts=False):
 
     # {metric_name: {step: (value, source_file)}}
     merged_data = defaultdict(dict)
+    tensorboard_tags = set()
 
     console.print("[bold green]Processing event files...[/bold green]")
 
@@ -84,6 +90,10 @@ def merge_tb_logs_to_json(log_dir, output_path, error_on_conflicts=False):
 
         ea = event_accumulator.EventAccumulator(event_file, size_guidance=SIZE_GUIDANCE)
         ea.Reload()
+
+        for tags in ea.Tags().values():
+            if isinstance(tags, list):
+                tensorboard_tags.update(tags)
 
         for metric_name in ea.scalars.Keys():
             for scalar in ea.Scalars(metric_name):
@@ -106,6 +116,13 @@ def merge_tb_logs_to_json(log_dir, output_path, error_on_conflicts=False):
 
                 # Add or override the value
                 merged_data[metric_name][step] = (value, event_file)
+
+    if required_tag_prefix is not None and not any(
+        tag.startswith(required_tag_prefix) for tag in tensorboard_tags
+    ):
+        raise ValueError(
+            f"No TensorBoard tag starts with '{required_tag_prefix}' under {log_dir}"
+        )
 
     # Convert defaultdict to regular dict and sort the steps
     output_data = {}
@@ -222,11 +239,21 @@ if __name__ == "__main__":
         action="store_true",
         help="Error out when conflicting values are found for the same step",
     )
+    parser.add_argument(
+        "--require-tag-prefix",
+        default=None,
+        help="Require a TensorBoard tag in any plugin category with this prefix",
+    )
 
     args = parser.parse_args()
 
     try:
-        merge_tb_logs_to_json(args.log_dir, args.output_path, args.error_on_conflicts)
+        merge_tb_logs_to_json(
+            args.log_dir,
+            args.output_path,
+            args.error_on_conflicts,
+            args.require_tag_prefix,
+        )
     except Exception as e:
         error_console.print(f"[bold red]Error: {e}[/bold red]")
         sys.exit(1)

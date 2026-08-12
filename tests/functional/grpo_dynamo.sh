@@ -69,15 +69,11 @@ fi
 metrics_json=${EXP_DIR}/metrics.json
 uv run --no-sync tests/json_dump_tb_logs.py \
   "${LOG_DIR}" \
-  --output_path "${metrics_json}"
+  --output_path "${metrics_json}" \
+  --require-tag-prefix "generation_metrics/"
 uv run --no-sync tests/check_metrics.py \
   "${metrics_json}" \
   'max(data["train/token_mult_prob_error"]) < 1.05'
-if ! jq -e 'any(keys[]; startswith("generation_metrics/"))' \
-  "${metrics_json}" > /dev/null; then
-  echo "No generation_metrics/* TensorBoard tag was recorded" >&2
-  exit 1
-fi
 
 if pgrep -f '[d]ynamo.frontend|[d]ynamo.vllm|[/]opt/dynamo_venv/bin/etcd|[/]opt/dynamo_venv/bin/nats-server'; then
   echo "Managed Dynamo processes remain after GRPO shutdown" >&2
