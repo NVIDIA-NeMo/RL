@@ -823,7 +823,30 @@ class TQReplayBuffer:
                 tags=[dict(t) for t in tags],
             )
 
-            idx = self._group_ids.index(group_id)
+            # Detect the "slot was evicted while put_samples was in flight"
+            # race. Log full rollout details so a human can attribute WHY it
+            # was slow; the handler below clears the rows we just orphaned.
+            try:
+                idx = self._group_ids.index(group_id)
+            except ValueError:
+                per_row_tokens = [int(x) for x in lengths.tolist()]
+                resolved_int = [int(bool(x)) for x in resolved_flags]
+                print(
+                    f"[EVICT_LATE_COMMIT] "
+                    f"group_id={group_id} "
+                    f"start_v={start_weight_version} "
+                    f"end_v={end_weight_version} "
+                    f"ready=True "
+                    f"num_rows={len(sample_ids)} "
+                    f"resolved_count={sum(resolved_int)}/{len(sample_ids)} "
+                    f"per_row_reasons={reasons} "
+                    f"per_row_resolved={resolved_int} "
+                    f"per_row_tokens={per_row_tokens} "
+                    f"total_tokens={sum(per_row_tokens)}",
+                    flush=True,
+                )
+                raise
+
             self.meta_list[idx] = meta
             self.end_weight_list[idx] = end_weight_version
             self.ready_list[idx] = True

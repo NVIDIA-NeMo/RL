@@ -385,6 +385,7 @@ class SingleControllerActor:
             min_sample_version = None
             step_open = False
             calibration_batches: list[BatchedDataDict[Any]] = []
+            evicted_tokens_this_step = 0
 
             with self._timer.time("total_step_time"):
                 while groups_dispatched < grpo_cfg.num_prompts_per_step:
@@ -393,10 +394,11 @@ class SingleControllerActor:
                         await asyncio.sleep(0)
 
                         # Evict stale groups
-                        evicted = await self._sampler.evict(
+                        evicted, evicted_tokens = await self._sampler.evict(
                             current_train_weight=self._trainer_version,
                         )
                         evicted_stale_prompt_groups += evicted
+                        evicted_tokens_this_step += evicted_tokens
                         if evicted:
                             print(
                                 f"  evicted {evicted} stale prompt group(s)",
@@ -548,6 +550,10 @@ class SingleControllerActor:
                         {
                             "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
                             "aborted_stale_inflight_groups": aborted_stale_inflight_groups,
+                            # Total tokens in evicted groups; counts only ready
+                            # (committed) groups — pre-commit evictions carry no
+                            # token metadata.
+                            "evicted_tokens": float(evicted_tokens_this_step),
                         }
                     )
 

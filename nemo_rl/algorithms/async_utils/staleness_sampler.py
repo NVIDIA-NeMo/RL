@@ -60,6 +60,84 @@ from nemo_rl.data_plane import KVBatchMeta
 _GATE_POLL_SECONDS = 0.005
 
 
+def _emit_group_log(
+    tag: str,
+    buffer: TQReplayBuffer,
+    idx: int,
+    current_train_weight: int,
+    *,
+    ready: Optional[bool] = None,
+) -> Optional[int]:
+    """Print one ``[tag]`` line describing the group at ``buffer`` index ``idx``.
+
+    Shared by evict (``[EVICT]``) and select (``[SELECT]``) so their per-group
+    logs share one format for downstream parsing. Fields:
+      group_id / instance_id / prompt_idx — identity
+      start_v / end_v / target_step / train_v / lag — timing
+      ready — commit-before-eviction flag (evict only; omitted when None)
+      num_rows / resolved_count — group-level pass/fail summary
+      per_row_reasons / per_row_resolved — per-rollout attribution
+      per_row_tokens / total_tokens — per-row token lengths (ready groups only)
+
+    Args:
+        tag: Log marker, "EVICT" or "SELECT".
+        buffer: The replay buffer holding the group's metadata.
+        idx: Index of the group within the buffer's parallel lists.
+        current_train_weight: Current trainer weight version (for lag).
+        ready: When not None, adds a ``ready=`` field. Evict passes the slot's
+            ready flag; select omits it since every selected group is ready.
+
+    Returns:
+        The group's total token count (sum of per-row lengths) when known, else
+        None — evict uses it to accumulate evicted-token totals.
+    """
+    meta = buffer.meta_list[idx]
+    start_v = buffer.start_weight_list[idx]
+    end_v = buffer.end_weight_list[idx]
+    target_step = buffer.target_step_list[idx]
+    group_id = buffer._group_ids[idx]
+    # getattr fallbacks: this is a pure logging path and must not break custom
+    # PromptGroupSampler buffers that predate the eviction-bookkeeping lists.
+    instance_id_list = getattr(buffer, "instance_id_list", None)
+    instance_id = instance_id_list[idx] if instance_id_list else "unknown"
+    prompt_idx_list = getattr(buffer, "prompt_idx_list", None)
+    prompt_idx = prompt_idx_list[idx] if prompt_idx_list else -1
+    lag = current_train_weight - start_v
+    if meta and meta.tags:
+        per_row_reasons = [t.get("failure_reason", "?") for t in meta.tags]
+        per_row_resolved = [int(bool(t.get("resolved", False))) for t in meta.tags]
+    else:
+        per_row_reasons = None
+        per_row_resolved = None
+    per_row_tokens = (
+        list(meta.sequence_lengths) if meta and meta.sequence_lengths else None
+    )
+    total_tokens = sum(per_row_tokens) if per_row_tokens else None
+    num_rows = len(meta.sample_ids) if meta else None
+    resolved_count = sum(per_row_resolved) if per_row_resolved else None
+    ready_field = f"ready={ready} " if ready is not None else ""
+    print(
+        f"[{tag}] "
+        f"group_id={group_id} "
+        f"instance_id={instance_id} "
+        f"prompt_idx={prompt_idx} "
+        f"start_v={start_v} "
+        f"end_v={end_v} "
+        f"target_step={target_step} "
+        f"train_v={current_train_weight} "
+        f"lag={lag} "
+        f"{ready_field}"
+        f"num_rows={num_rows} "
+        f"resolved_count={resolved_count}/{num_rows if num_rows is not None else '?'} "
+        f"per_row_reasons={per_row_reasons} "
+        f"per_row_resolved={per_row_resolved} "
+        f"per_row_tokens={per_row_tokens} "
+        f"total_tokens={total_tokens}",
+        flush=True,
+    )
+    return total_tokens
+
+
 @runtime_checkable
 class PromptGroupSampler(Protocol):
     """Staleness policy shared by the SC rollout and train pumps.
@@ -91,8 +169,12 @@ class PromptGroupSampler(Protocol):
         """Pick up to ``max_prompt_groups`` eligible groups; drop them locally."""
         ...
 
-    async def evict(self, *, current_train_weight: int) -> int:
-        """Drop groups that can no longer be selected; clear their DP rows."""
+    async def evict(self, *, current_train_weight: int) -> tuple[int, int]:
+        """Drop groups that can no longer be selected; clear their DP rows.
+
+        Returns:
+            (num_groups_removed, total_evicted_tokens).
+        """
         ...
 
     def should_abort_inflight(
@@ -144,13 +226,19 @@ class BaseSampler(abc.ABC):
         max_prompt_groups: int,
     ) -> tuple[Optional[KVBatchMeta], int]: ...
 
-    async def evict(self, *, current_train_weight: int) -> int:
+    async def evict(self, *, current_train_weight: int) -> tuple[int, int]:
         """Default: drop *ready* groups below the weight window.
 
         Skips unready (reserved-but-uncommitted) slots so eviction can't race a
         concurrent ``commit`` that re-looks-up the slot after its ``await``.
         Policies whose ``select`` key isn't the start weight (e.g.
         ``InOrderSampler``) override this so evict and select agree.
+
+        Returns:
+            (num_groups_removed, total_evicted_tokens). The token total counts
+            only ready (committed) groups, whose ``meta.sequence_lengths`` is
+            populated; groups evicted before their rollout committed have no
+            token metadata and contribute 0.
         """
         min_valid_version = max(0, current_train_weight - self._eviction_window())
         stale_idxs = [
@@ -158,9 +246,33 @@ class BaseSampler(abc.ABC):
             for i, weight in enumerate(self._buffer.start_weight_list)
             if weight < min_valid_version and self._buffer.ready_list[i]
         ]
+        return await self._evict_idxs(stale_idxs, current_train_weight)
+
+    async def _evict_idxs(
+        self, stale_idxs: list[int], current_train_weight: int
+    ) -> tuple[int, int]:
+        """Log each evicted group, drop them, and total their tokens.
+
+        Shared by the default weight-window ``evict`` and ``InOrderSampler``'s
+        target-step override so both emit the same ``[EVICT]`` format.
+        """
         if not stale_idxs:
-            return 0
-        return await self._buffer.remove(stale_idxs, remove_in_dp=True)
+            return 0, 0
+
+        evicted_tokens = 0
+        for i in stale_idxs:
+            total_tokens = _emit_group_log(
+                "EVICT",
+                self._buffer,
+                i,
+                current_train_weight,
+                ready=self._buffer.ready_list[i],
+            )
+            if total_tokens:
+                evicted_tokens += total_tokens
+
+        num_removed = await self._buffer.remove(stale_idxs, remove_in_dp=True)
+        return num_removed, evicted_tokens
 
     # ── derived facts ────────────────────────────────────────────────────
     def should_abort_inflight(
@@ -198,6 +310,7 @@ class BaseSampler(abc.ABC):
         valid_idxs: list[int],
         min_prompt_groups: int,
         max_prompt_groups: int,
+        current_train_weight: int,
     ) -> tuple[Optional[KVBatchMeta], int]:
         """Cap, drop from the buffer, and concat the chosen groups.
 
@@ -210,6 +323,14 @@ class BaseSampler(abc.ABC):
         requested_groups = min(len(valid_idxs), max_prompt_groups)
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
+
+        # Per-group [SELECT] log (same format as [EVICT], no ready field since
+        # all selected groups are ready) so downstream analysis can compare the
+        # token lengths of ACCEPTED rollouts against evicted ones. Emitted
+        # before the drop, while the buffer indices are still valid.
+        for i in selected_idxs:
+            _emit_group_log("SELECT", self._buffer, i, current_train_weight)
+
         await self._buffer.remove(selected_idxs, remove_in_dp=False)
         return (
             selected_metas[0].concat(*selected_metas[1:]),  # type: ignore
@@ -284,7 +405,7 @@ class WindowedSampler(BaseSampler):
                 )
             )
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs, min_prompt_groups, max_prompt_groups, current_train_weight
         )
 
 
@@ -364,7 +485,7 @@ class WeightFifoSampler(_GatedSampler):
             if weight == target_version and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs, min_prompt_groups, max_prompt_groups, current_train_weight
         )
 
 
@@ -399,10 +520,10 @@ class InOrderSampler(_GatedSampler):
             if target == current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs, min_prompt_groups, max_prompt_groups, current_train_weight
         )
 
-    async def evict(self, *, current_train_weight: int) -> int:
+    async def evict(self, *, current_train_weight: int) -> tuple[int, int]:
         # Keyed on target_step (matches `select`): a ready group whose target
         # step has already passed can never be selected, so it is stale. Unready
         # slots are skipped to avoid racing a concurrent commit.
@@ -413,9 +534,7 @@ class InOrderSampler(_GatedSampler):
             and target < current_train_weight
             and self._buffer.ready_list[i]
         ]
-        if not stale_idxs:
-            return 0
-        return await self._buffer.remove(stale_idxs, remove_in_dp=True)
+        return await self._evict_idxs(stale_idxs, current_train_weight)
 
 
 # ── config + factory ────────────────────────────────────────────────────────

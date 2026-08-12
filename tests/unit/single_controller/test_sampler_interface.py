@@ -48,6 +48,9 @@ class FakeBuffer:
         self.end_weight_list: list[int] = []
         self.target_step_list: list[int | None] = []
         self.ready_list: list[bool] = []
+        self._group_ids: list[str] = []
+        self.instance_id_list: list[str] = []
+        self.prompt_idx_list: list[int] = []
         self.remove_calls: list[tuple[list[int], bool]] = []
 
     def add(
@@ -57,18 +60,25 @@ class FakeBuffer:
         *,
         ready: bool = True,
         target_step: int | None = None,
+        group_size: int = 1,
+        seq_len: int | None = None,
     ) -> None:
+        sample_ids = [f"{group_id}_g{i}" for i in range(group_size)]
         meta = KVBatchMeta(
             partition_id=self._partition_id,
             task_name=None,
-            sample_ids=[f"{group_id}_g0"],
-            tags=[{"weight_version": weight, "group_id": group_id}],
+            sample_ids=sample_ids,
+            sequence_lengths=([seq_len] * group_size if seq_len is not None else None),
+            tags=[{"weight_version": weight, "group_id": group_id}] * group_size,
         )
         self.meta_list.append(meta if ready else None)
         self.start_weight_list.append(weight)
         self.end_weight_list.append(weight)
         self.target_step_list.append(target_step)
         self.ready_list.append(ready)
+        self._group_ids.append(group_id)
+        self.instance_id_list.append("unknown")
+        self.prompt_idx_list.append(-1)
 
     async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
         self.remove_calls.append((list(idxs), remove_in_dp))
@@ -78,6 +88,9 @@ class FakeBuffer:
             del self.end_weight_list[i]
             del self.target_step_list[i]
             del self.ready_list[i]
+            del self._group_ids[i]
+            del self.instance_id_list[i]
+            del self.prompt_idx_list[i]
         return len(idxs)
 
 
@@ -131,15 +144,18 @@ class TestInOrderEvictMatchesSelect:
         # weight far below the window, but target_step is still upcoming.
         buf.add("g", weight=0, ready=True, target_step=2)
         s = InOrderSampler(buf, max_lookahead_versions=1)
-        removed = _run(s.evict(current_train_weight=2))
+        removed, tokens = _run(s.evict(current_train_weight=2))
         assert removed == 0  # target_step 2 == current, not past -> kept
+        assert tokens == 0
         assert len(buf.target_step_list) == 1
 
     def test_past_target_ready_slot_is_evicted(self):
         buf = FakeBuffer()
         buf.add("g", weight=0, ready=True, target_step=1)
         s = InOrderSampler(buf, max_lookahead_versions=1)
-        removed = _run(s.evict(current_train_weight=3))  # target 1 < 3 -> stale
+        removed, _tokens = _run(
+            s.evict(current_train_weight=3)
+        )  # target 1 < 3 -> stale
         assert removed == 1
 
     def test_unready_slot_is_never_evicted(self):
@@ -147,7 +163,7 @@ class TestInOrderEvictMatchesSelect:
         buf.add("g", weight=0, ready=False, target_step=1)
         s = InOrderSampler(buf, max_lookahead_versions=1)
         # past target, but unready -> skipped to avoid the commit race.
-        assert _run(s.evict(current_train_weight=5)) == 0
+        assert _run(s.evict(current_train_weight=5)) == (0, 0)
 
 
 class TestFactory:
@@ -293,7 +309,7 @@ class TestDefaultEvictSkipsUnready:
         buf.add("stale", weight=0, ready=True)
         buf.add("fresh", weight=5, ready=True)
         s = WindowedSampler(buf, max_staleness_versions=1)
-        removed = _run(s.evict(current_train_weight=5))  # min_valid = 4
+        removed, _tokens = _run(s.evict(current_train_weight=5))  # min_valid = 4
         assert removed == 1
         assert buf.start_weight_list == [5]
 
@@ -301,7 +317,23 @@ class TestDefaultEvictSkipsUnready:
         buf = FakeBuffer()
         buf.add("stale_unready", weight=0, ready=False)
         s = WindowedSampler(buf, max_staleness_versions=1)
-        assert _run(s.evict(current_train_weight=5)) == 0
+        assert _run(s.evict(current_train_weight=5)) == (0, 0)
+
+    def test_evict_sums_tokens_of_ready_groups_only(self):
+        buf = FakeBuffer()
+        # Two stale groups: one ready (has sequence_lengths), one still
+        # in-flight (meta is None, no token metadata). Only the ready group's
+        # tokens count toward the total; the unready one is skipped entirely.
+        buf.add("stale_ready", weight=1, group_size=2, ready=True, seq_len=100)
+        buf.add("stale_inflight", weight=1, group_size=2, ready=False)
+        buf.add("fresh", weight=5, group_size=1, ready=True, seq_len=999)
+        s = WindowedSampler(buf, max_staleness_versions=1)
+
+        dropped, tokens = _run(s.evict(current_train_weight=5))
+
+        # Only the ready stale group is removed and contributes: 2 rows * 100.
+        assert dropped == 1
+        assert tokens == 200
 
 
 class TestInflightAbortPolicy:
