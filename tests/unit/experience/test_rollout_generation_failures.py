@@ -38,11 +38,11 @@ from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
     GymTransportError,
-    classify_rollout_failure,
     RolloutDataFailure,
     RolloutFailure,
     RolloutRedispatchExhausted,
     RolloutTimeout,
+    classify_rollout_failure,
 )
 from nemo_rl.experience.rollout_manager import (
     AsyncRolloutImpl,
