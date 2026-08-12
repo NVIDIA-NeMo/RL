@@ -217,6 +217,8 @@ class SingleControllerActor:
             await asyncio.gather(rollout_task, train_task, return_exceptions=True)
             try:
                 self._weight_synchronizer.shutdown()
+            except Exception as e:  # teardown must not mask the original failure
+                print(f"Error during weight-synchronizer shutdown: {e}", flush=True)
             finally:
                 self._logger.finish()
 

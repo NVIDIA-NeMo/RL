@@ -210,10 +210,11 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             make_nccl_reshard_refit_info_wire_safe,
         )
 
-        # nccl_reshard_refit_info contains Torch Tensors that are created by
-        # Megatron, which will invoke `import megatron` when unpickled.
-        # To avoid this, we remove the Torch Tensors and restore them later,
-        # via `restore_nccl_reshard_refit_info()`.
+        # nccl_reshard_refit_info holds MeshInfo rank tensors created under
+        # Megatron, whose pickles resolve a Megatron-patched storage loader and
+        # therefore need `import megatron` on unpickle. Convert them to plain
+        # lists here; the vLLM worker rebuilds them in
+        # `restore_refit_info_placements()`.
         wire_refit_info = make_nccl_reshard_refit_info_wire_safe(
             nccl_reshard_refit_info
         )
