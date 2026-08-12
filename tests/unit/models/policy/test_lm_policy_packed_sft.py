@@ -66,6 +66,7 @@ def _policy(
     }
     policy.use_dynamic_batches = dynamic
     policy.use_sequence_packing = True
+    policy.debug_payload_metrics = False
     policy.dynamic_batching_args = {}
     policy.sequence_packing_args = {}
     policy.sharding_annotations = MagicMock()
