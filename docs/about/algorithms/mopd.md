@@ -106,7 +106,7 @@ on_policy_distillation:
       expert_model_parallel_size: 1
       num_nodes: 1
       gpus_per_node: 8
-      precision: bf16
+      precision: bfloat16
       micro_batch_size: 1
       # Additional Megatron settings inherited by every teacher.
       megatron_cfg_overrides:
@@ -130,6 +130,12 @@ does not clear them. There is currently no configuration syntax for deleting an
 inherited Megatron override. When the same setting appears in more than one
 place, precedence is: default field, default Megatron override, alias field,
 then alias Megatron override.
+
+Teacher parallelism and precision are independent of the policy configuration.
+In particular, `expert_tensor_parallel_size` defaults to 1; setup warns when
+that differs from the policy because reducing ETP can increase per-rank expert
+memory. Precision accepts `float32`, `bfloat16`, or `float16`; the legacy
+spelling `bf16` is normalized to `bfloat16`.
 
 > [!NOTE]
 > Teachers run the Megatron backend in inference-only mode. A DTensor-configured

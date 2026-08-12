@@ -29,7 +29,7 @@ import numpy as np
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.opd import TeacherResourceConfig
+from nemo_rl.algorithms.opd import TeacherPrecision, TeacherResourceConfig
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     SequencePackingArgs,
@@ -60,7 +60,7 @@ class TeacherConfig:
     expert_model_parallel_size: int
     num_nodes: int
     gpus_per_node: int
-    precision: str
+    precision: TeacherPrecision
     micro_batch_size: int
     megatron_cfg_overrides: dict[str, Any]
 
@@ -159,6 +159,36 @@ def create_teacher_configs_from_opd_config(
     return configs
 
 
+def _apply_teacher_resource_config(
+    cfg: dict[str, Any], teacher_cfg: TeacherConfig
+) -> None:
+    """Apply resolved teacher resources to a copied policy config."""
+    policy_etp = cfg["megatron_cfg"].get("expert_tensor_parallel_size")
+    teacher_etp = teacher_cfg.expert_tensor_parallel_size
+    if policy_etp is not None and int(policy_etp) != teacher_etp:
+        warnings.warn(
+            f"Teacher '{teacher_cfg.alias}' uses expert_tensor_parallel_size="
+            f"{teacher_etp}, independently of the policy value {policy_etp}. "
+            "This may change per-rank expert memory compared with configurations "
+            "that previously inherited the policy value.",
+            stacklevel=2,
+        )
+
+    cfg["precision"] = teacher_cfg.precision
+    cfg["megatron_cfg"]["enabled"] = True
+    cfg["megatron_cfg"]["tensor_model_parallel_size"] = (
+        teacher_cfg.tensor_model_parallel_size
+    )
+    cfg["megatron_cfg"]["pipeline_model_parallel_size"] = (
+        teacher_cfg.pipeline_model_parallel_size
+    )
+    cfg["megatron_cfg"]["context_parallel_size"] = teacher_cfg.context_parallel_size
+    cfg["megatron_cfg"]["expert_tensor_parallel_size"] = teacher_etp
+    cfg["megatron_cfg"]["expert_model_parallel_size"] = (
+        teacher_cfg.expert_model_parallel_size
+    )
+
+
 class TeacherWorkerGroup:
     """Inference-only mcore worker group for a single teacher model.
 
@@ -186,20 +216,7 @@ class TeacherWorkerGroup:
         # Override parallelism from teacher config.
         if "megatron_cfg" not in cfg:
             cfg["megatron_cfg"] = {}
-        cfg["megatron_cfg"]["enabled"] = True
-        cfg["megatron_cfg"]["tensor_model_parallel_size"] = (
-            teacher_cfg.tensor_model_parallel_size
-        )
-        cfg["megatron_cfg"]["pipeline_model_parallel_size"] = (
-            teacher_cfg.pipeline_model_parallel_size
-        )
-        cfg["megatron_cfg"]["context_parallel_size"] = teacher_cfg.context_parallel_size
-        cfg["megatron_cfg"]["expert_tensor_parallel_size"] = (
-            teacher_cfg.expert_tensor_parallel_size
-        )
-        cfg["megatron_cfg"]["expert_model_parallel_size"] = (
-            teacher_cfg.expert_model_parallel_size
-        )
+        _apply_teacher_resource_config(cfg, teacher_cfg)
 
         # Apply any additional megatron config overrides from teacher config.
         for key, value in teacher_cfg.megatron_cfg_overrides.items():

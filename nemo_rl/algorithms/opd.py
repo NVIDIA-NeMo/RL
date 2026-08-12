@@ -21,11 +21,11 @@ IS truncation lives in loss_functions.ClippedPGLoss (ICE-POP mode).
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import ray
 import torch
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
 
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
@@ -33,6 +33,17 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 
 TopkSource = Literal["student", "teacher"]
+
+
+def _normalize_teacher_precision(value: Any) -> Any:
+    """Normalize the legacy bf16 spelling to the Megatron precision name."""
+    return "bfloat16" if value == "bf16" else value
+
+
+TeacherPrecision = Annotated[
+    Literal["float32", "bfloat16", "float16"],
+    BeforeValidator(_normalize_teacher_precision),
+]
 
 # ---------------------------------------------------------------------------
 # Config schemas
@@ -53,7 +64,7 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     expert_model_parallel_size: int = 1
     num_nodes: int = 1
     gpus_per_node: int = 8
-    precision: str = "bf16"
+    precision: TeacherPrecision = "bfloat16"
     micro_batch_size: int = 4
     megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
 
@@ -74,7 +85,7 @@ class TeacherResourceOverrideConfig(BaseModel, extra="allow"):
     expert_model_parallel_size: Optional[int] = None
     num_nodes: Optional[int] = None
     gpus_per_node: Optional[int] = None
-    precision: Optional[str] = None
+    precision: Optional[TeacherPrecision] = None
     micro_batch_size: Optional[int] = None
     megatron_cfg_overrides: Optional[dict[str, Any]] = None
 

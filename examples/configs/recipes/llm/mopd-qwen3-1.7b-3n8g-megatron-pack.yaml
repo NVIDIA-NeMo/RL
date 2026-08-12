@@ -142,5 +142,5 @@ on_policy_distillation:
       expert_tensor_parallel_size: 1
       num_nodes: 1
       gpus_per_node: 8
-      precision: bf16
+      precision: bfloat16
       micro_batch_size: 1

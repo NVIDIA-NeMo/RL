@@ -28,7 +28,59 @@ def test_teacher_resource_config_defaults():
     assert res.pipeline_model_parallel_size == 1
     assert res.expert_tensor_parallel_size == 1
     assert res.gpus_per_node == 8
-    assert res.precision == "bf16"
+    assert res.precision == "bfloat16"
+
+
+def test_teacher_resource_config_normalizes_legacy_bf16_precision():
+    from nemo_rl.algorithms.opd import TeacherResourceConfig
+
+    assert TeacherResourceConfig(precision="bf16").precision == "bfloat16"
+
+
+def test_apply_teacher_resource_config_sets_precision_and_warns_on_etp_change():
+    from nemo_rl.models.policy.teacher_worker_group import (
+        TeacherConfig,
+        _apply_teacher_resource_config,
+    )
+
+    cfg = {
+        "precision": "float32",
+        "megatron_cfg": {
+            "enabled": True,
+            "tensor_model_parallel_size": 8,
+            "pipeline_model_parallel_size": 2,
+            "context_parallel_size": 2,
+            "expert_tensor_parallel_size": 8,
+            "expert_model_parallel_size": 4,
+        },
+    }
+    teacher_cfg = TeacherConfig(
+        alias="large",
+        model_name="/ckpt/large",
+        tensor_model_parallel_size=4,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_tensor_parallel_size=1,
+        expert_model_parallel_size=2,
+        num_nodes=1,
+        gpus_per_node=8,
+        precision="bfloat16",
+        micro_batch_size=1,
+        megatron_cfg_overrides={},
+    )
+
+    with pytest.warns(UserWarning, match="independently of the policy value 8"):
+        _apply_teacher_resource_config(cfg, teacher_cfg)
+
+    assert cfg["precision"] == "bfloat16"
+    assert cfg["megatron_cfg"] == {
+        "enabled": True,
+        "tensor_model_parallel_size": 4,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "expert_tensor_parallel_size": 1,
+        "expert_model_parallel_size": 2,
+    }
 
 
 def test_create_teacher_configs_homogeneous():
