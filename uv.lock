@@ -3352,7 +3352,7 @@ requires-dist = [
     { name = "mamba-ssm", marker = "extra == 'ssm'" },
     { name = "megatron-core", extras = ["dev", "mlm"], editable = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM" },
     { name = "mistral-common", specifier = ">=1.10.0" },
-    { name = "mlflow", specifier = ">=3.15.1" },
+    { name = "mlflow", specifier = ">=3.9.0" },
     { name = "nemo-run", marker = "extra == 'recipes'" },
     { name = "nvdlfw-inspect", marker = "extra == 'tensor-inspect'", specifier = "==0.2.1" },
     { name = "nvidia-resiliency-ext" },
@@ -3513,7 +3513,6 @@ requires-dist = [
 provides-extras = ["training", "mlm", "dev", "lts", "te", "ssm"]
 
 [package.metadata.requires-dev]
-batch-invariant = [{ name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=714dd1a4a980f7937a74343d19a8eba4fe321480" }]
 build = [
     { name = "cython", specifier = ">=3.0.0" },
     { name = "hatchling" },
@@ -3538,14 +3537,13 @@ docs = [
     { name = "sphinx-copybutton" },
 ]
 linting = [
-    { name = "black", specifier = "==26.3.0" },
+    { name = "black", specifier = "==24.4.2" },
     { name = "flake8", specifier = "==7.1.0" },
     { name = "isort", specifier = "==5.13.2" },
     { name = "pylint", specifier = "==3.2.6" },
     { name = "ruff", specifier = "~=0.9.0" },
 ]
 no-pypi-wheels = [
-    { name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=714dd1a4a980f7937a74343d19a8eba4fe321480" },
     { name = "emerging-optimizers", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.2.0" },
     { name = "flash-mla", git = "https://github.com/deepseek-ai/FlashMLA?rev=nv_dev" },
 ]
@@ -3556,7 +3554,7 @@ test = [
     { name = "nltk" },
     { name = "pydantic" },
     { name = "pygithub" },
-    { name = "pytest", specifier = "==9.1.1" },
+    { name = "pytest", specifier = "==8.3.5" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "pytest-mock" },
