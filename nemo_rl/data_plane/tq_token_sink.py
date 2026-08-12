@@ -104,12 +104,13 @@ class TQTokenSink:
                 delta_len = len(record.token_ids_delta)
                 if isinstance(routed, str):
                     # The worker ships routes as the nrlre1 base64 envelope
-                    # (#3292); decode preserves the wire dtype (int8/int16).
+                    # (#3292). int16 covers every practical expert count
+                    # (<32k) and the -1 sentinel.
                     from nemo_rl.utils.routed_experts_codec import (
                         decode_routed_experts,
                     )
 
-                    experts = decode_routed_experts(routed)
+                    experts = decode_routed_experts(routed, torch.int16)
                 else:
                     # int16 covers every practical expert count (<32k) and
                     # the -1 sentinel; halves staged bytes vs int32.
