@@ -32,7 +32,18 @@ on:
           - L0
           - L1
           - L2
-        description: Test level to run. docs = doc tests only (reuses main container), Lfast = fast subset (reuses main container), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
+          - megatron
+        description: Test level to run. docs = doc tests only (reuses main container), Lfast = fast subset (reuses main container), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence, megatron = Megatron functional tests only
+      functional_test_script_pattern:
+        description: "Case-insensitive substring used to select functional test script names (for example, Megatron_1)."
+        required: false
+        default: ""
+        type: string
+      megatron_lm_commit:
+        description: "Full Megatron-LM commit SHA to check out in the Megatron-Bridge submodule."
+        required: false
+        default: ""
+        type: string
       image_tag:
         description: "Override container image tag (e.g. 'main'). Skips container build."
         required: false
@@ -51,6 +62,8 @@ jobs:
     outputs:
       test_level: ${{ steps.evaluate.outputs.test_level }}
       image_tag: ${{ steps.evaluate.outputs.image_tag }}
+      functional_test_script_pattern: ${{ steps.evaluate.outputs.functional_test_script_pattern }}
+      megatron_lm_commit: ${{ steps.evaluate.outputs.megatron_lm_commit }}
       base_ref: ${{ steps.base-head-ref.outputs.base_ref }}
       base_sha: ${{ steps.base-head-ref.outputs.base_sha }}
       head_ref: ${{ steps.base-head-ref.outputs.head_ref }}
@@ -126,6 +139,10 @@ jobs:
           IS_PULLREQUEST: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
           LABEL: ${{ steps.base-head-ref.outputs.ci_label }}
           MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+          DISPATCH_TEST_LEVEL: ${{ inputs.test_to_run }}
+          DISPATCH_IMAGE_TAG: ${{ inputs.image_tag }}
+          FUNCTIONAL_TEST_SCRIPT_PATTERN: ${{ inputs.functional_test_script_pattern }}
+          MEGATRON_LM_COMMIT: ${{ inputs.megatron_lm_commit }}
         run: |
           # Some output that's helpful for debugging
           echo "Docs changed: $CHANGED_DOCS"
@@ -160,19 +177,53 @@ jobs:
 
           # Override test level if specified in workflow_dispatch
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "Overriding test level from $TEST_LEVEL to ${{ inputs.test_to_run }}"
-            TEST_LEVEL="${{ inputs.test_to_run }}"
+            echo "Overriding test level from $TEST_LEVEL to $DISPATCH_TEST_LEVEL"
+            TEST_LEVEL="$DISPATCH_TEST_LEVEL"
           fi
 
-          echo "test_level=$TEST_LEVEL" | tee -a "$GITHUB_OUTPUT"
+          if [[ -n "$MEGATRON_LM_COMMIT" && ! "$MEGATRON_LM_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "megatron_lm_commit must be a full 40-character hexadecimal commit SHA." >&2
+            exit 1
+          fi
+          if [[ -n "$FUNCTIONAL_TEST_SCRIPT_PATTERN" && ! "$FUNCTIONAL_TEST_SCRIPT_PATTERN" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+            echo "functional_test_script_pattern may contain only letters, numbers, dots, underscores, and hyphens." >&2
+            exit 1
+          fi
+
+          if [[ "$TEST_LEVEL" == "megatron" || -n "$FUNCTIONAL_TEST_SCRIPT_PATTERN" ]]; then
+            match_count=0
+            while IFS= read -r script; do
+              script_lower="${script,,}"
+              if [[ "$TEST_LEVEL" == "megatron" && "$script_lower" != *megatron* ]]; then
+                continue
+              fi
+              if [[ -n "$FUNCTIONAL_TEST_SCRIPT_PATTERN" && "$script_lower" != *"${FUNCTIONAL_TEST_SCRIPT_PATTERN,,}"* ]]; then
+                continue
+              fi
+              ((match_count += 1))
+            done < <(
+              grep -E '^[[:space:]]*-[[:space:]]*script:[[:space:]]*L1_Functional' .github/workflows/cicd-main.yml |
+                sed -E 's/^[[:space:]]*-[[:space:]]*script:[[:space:]]*//' | sort -u
+            )
+            if ((match_count == 0)); then
+              echo "No functional test scripts match the requested selection." >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "test_level=$TEST_LEVEL"
+            echo "functional_test_script_pattern=$FUNCTIONAL_TEST_SCRIPT_PATTERN"
+            echo "megatron_lm_commit=${MEGATRON_LM_COMMIT,,}"
+          } | tee -a "$GITHUB_OUTPUT"
 
           # Determine image tag: Lfast and docs reuse the main container, workflow_dispatch can override
           IMAGE_TAG=""
           if [[ "$TEST_LEVEL" == "Lfast" || "$TEST_LEVEL" == "docs" ]]; then
             IMAGE_TAG="main"
           fi
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.image_tag }}" ]]; then
-            IMAGE_TAG="${{ inputs.image_tag }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "$DISPATCH_IMAGE_TAG" ]]; then
+            IMAGE_TAG="$DISPATCH_IMAGE_TAG"
           fi
           echo "image_tag=$IMAGE_TAG" | tee -a "$GITHUB_OUTPUT"
 
@@ -303,7 +354,7 @@ jobs:
       ${{
         always() &&
         startsWith(github.ref, 'refs/heads/pull-request/') &&
-        contains('Lfast L0 L1 L2', needs.pre-flight.outputs.test_level) &&
+        contains('Lfast L0 L1 L2 megatron', needs.pre-flight.outputs.test_level) &&
         needs.pre-flight.result == 'success' &&
         needs.lint-check.result == 'success' &&
         !cancelled()
@@ -318,7 +369,7 @@ jobs:
       ${{
         always() &&
         needs.pre-flight.result == 'success' &&
-        needs.pre-flight.outputs.test_level != 'none' &&
+        contains('docs Lfast L0 L1 L2', needs.pre-flight.outputs.test_level) &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
           needs.pre-flight.outputs.test_level == 'docs' ||
@@ -361,6 +412,7 @@ jobs:
         ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
       trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
+      megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
       build-args: |
         MAX_JOBS=4
         TRTLLM_BUILD_JOBS=24
@@ -378,7 +430,7 @@ jobs:
         needs.pre-flight.outputs.image_tag == '' &&
         needs.org-member-pre-flight.outputs.is_member == 'true' &&
         vars.DISABLE_GB200_TESTS != 'true' &&
-        contains('L1 L2', needs.pre-flight.outputs.test_level) &&
+        contains('L1 L2 megatron', needs.pre-flight.outputs.test_level) &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
           !startsWith(github.ref, 'refs/heads/pull-request/')
@@ -403,6 +455,7 @@ jobs:
         ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.gb200-config.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
       trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
+      megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
       build-args: |
         MAX_JOBS=4
         TRTLLM_BUILD_JOBS=8
@@ -656,7 +709,7 @@ jobs:
     if: >-
       ${{
         always() &&
-        contains('L1 L2 Lfast', needs.pre-flight.outputs.test_level) &&
+        contains('L1 L2 Lfast megatron', needs.pre-flight.outputs.test_level) &&
         needs.pre-flight.result == 'success' &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
@@ -741,7 +794,7 @@ jobs:
     if: >-
       ${{
         always() &&
-        contains('L1 L2', needs.pre-flight.outputs.test_level) &&
+        contains('L1 L2 megatron', needs.pre-flight.outputs.test_level) &&
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
         (
@@ -749,15 +802,20 @@ jobs:
           !startsWith(github.ref, 'refs/heads/pull-request/')
         ) &&
         (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
-        needs.cicd-unit-tests.result == 'success' &&
+        (
+          needs.cicd-unit-tests.result == 'success' ||
+          (needs.pre-flight.outputs.test_level == 'megatron' && needs.cicd-unit-tests.result == 'skipped')
+        ) &&
         needs.functional-test-script-check.result == 'success' &&
         !cancelled()
       }}
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
     steps:
       - name: Checkout
+        if: ${{ (needs.pre-flight.outputs.test_level != 'megatron' || contains(matrix.script, 'megatron')) && (needs.pre-flight.outputs.functional_test_script_pattern == '' || contains(matrix.script, needs.pre-flight.outputs.functional_test_script_pattern)) }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: main
+        if: ${{ (needs.pre-flight.outputs.test_level != 'megatron' || contains(matrix.script, 'megatron')) && (needs.pre-flight.outputs.functional_test_script_pattern == '' || contains(matrix.script, needs.pre-flight.outputs.functional_test_script_pattern)) }}
         uses: ./.github/actions/test-template
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -768,6 +826,7 @@ jobs:
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           script: ${{ matrix.script }}
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
+          megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
 
   cicd-functional-tests-gb200:
     strategy:
@@ -816,7 +875,7 @@ jobs:
     if: >-
       ${{
         always() &&
-        contains('L1 L2', needs.pre-flight.outputs.test_level) &&
+        contains('L1 L2 megatron', needs.pre-flight.outputs.test_level) &&
         needs.org-member-pre-flight.outputs.is_member == 'true' &&
         vars.DISABLE_GB200_TESTS != 'true' &&
         needs.pre-flight.result == 'success' &&
@@ -826,15 +885,20 @@ jobs:
           !startsWith(github.ref, 'refs/heads/pull-request/')
         ) &&
         (needs.build-container-gb200.result == 'success' || needs.build-container-gb200.result == 'skipped') &&
-        needs.cicd-unit-tests.result == 'success' &&
+        (
+          needs.cicd-unit-tests.result == 'success' ||
+          (needs.pre-flight.outputs.test_level == 'megatron' && needs.cicd-unit-tests.result == 'skipped')
+        ) &&
         needs.functional-test-script-check.result == 'success' &&
         !cancelled()
       }}
     name: gb200_${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
     steps:
       - name: Checkout
+        if: ${{ (needs.pre-flight.outputs.test_level != 'megatron' || contains(matrix.script, 'megatron')) && (needs.pre-flight.outputs.functional_test_script_pattern == '' || contains(matrix.script, needs.pre-flight.outputs.functional_test_script_pattern)) }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: main
+        if: ${{ (needs.pre-flight.outputs.test_level != 'megatron' || contains(matrix.script, 'megatron')) && (needs.pre-flight.outputs.functional_test_script_pattern == '' || contains(matrix.script, needs.pre-flight.outputs.functional_test_script_pattern)) }}
         uses: ./.github/actions/test-template
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -846,6 +910,7 @@ jobs:
           image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           script: ${{ matrix.script }}
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
+          megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
 
   cicd-fast-functional-tests:
     strategy:
@@ -904,8 +969,10 @@ jobs:
     name: fast_${{ matrix.script }}
     steps:
       - name: Checkout
+        if: ${{ needs.pre-flight.outputs.functional_test_script_pattern == '' || contains(matrix.script, needs.pre-flight.outputs.functional_test_script_pattern) }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: main
+        if: ${{ needs.pre-flight.outputs.functional_test_script_pattern == '' || contains(matrix.script, needs.pre-flight.outputs.functional_test_script_pattern) }}
         uses: ./.github/actions/test-template
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -917,6 +984,7 @@ jobs:
           image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
+          megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
 
   CI_QA_Gate:
     name: "CI quality check${{ needs.pre-flight.outputs.test_level == 'none' && ' (No tests run: Label CI:L*)' || '' }}"
@@ -950,7 +1018,7 @@ jobs:
               (needs.pr-branch-up-to-date-check.result == 'success' || needs.pr-branch-up-to-date-check.result == 'skipped') &&
               (
                 needs.pre-flight.outputs.test_level != 'none' &&
-                needs.sphinx-build.result == 'success' &&
+                (needs.sphinx-build.result == 'success' || (needs.pre-flight.outputs.test_level == 'megatron' && needs.sphinx-build.result == 'skipped')) &&
                 (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
                 (needs.build-container-gb200.result == 'success' || needs.build-container-gb200.result == 'skipped') &&
                 (
@@ -965,17 +1033,17 @@ jobs:
                       needs.unit-test-script-check.result == 'success'
                     ) &&
                     (
-                      !contains('L1 L2 Lfast', needs.pre-flight.outputs.test_level) ||
+                      !contains('L1 L2 Lfast megatron', needs.pre-flight.outputs.test_level) ||
                       needs.functional-test-script-check.result == 'success'
                     ) &&
                     (
-                      !contains('L1 L2', needs.pre-flight.outputs.test_level) ||
+                      !contains('L1 L2 megatron', needs.pre-flight.outputs.test_level) ||
                       needs.cicd-functional-tests.result == 'success'
                     ) &&
                     (
                       needs.org-member-pre-flight.outputs.is_member != 'true' ||
                       vars.DISABLE_GB200_TESTS == 'true' ||
-                      !contains('L1 L2', needs.pre-flight.outputs.test_level) ||
+                      !contains('L1 L2 megatron', needs.pre-flight.outputs.test_level) ||
                       needs.cicd-functional-tests-gb200.result == 'success'
                     ) &&
                     (

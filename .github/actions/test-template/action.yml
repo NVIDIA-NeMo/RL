@@ -60,6 +60,10 @@ inputs:
     description: "Commit SHA to use for test"
     required: false
     default: ""
+  megatron-lm-commit:
+    description: "Full Megatron-LM commit SHA to check out in the Megatron-Bridge submodule"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -93,6 +97,18 @@ runs:
         submodules: "recursive"
         path: ${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl
         ref: ${{ inputs.test-commit-sha }}
+
+    - name: Override Megatron-LM commit
+      if: inputs.megatron-lm-commit != ''
+      shell: bash -e -u -o pipefail {0}
+      working-directory: ${{ github.workspace }}/${{ github.run_id }}/${{ steps.uuid.outputs.id }}/nemo-rl
+      env:
+        MEGATRON_LM_COMMIT: ${{ inputs.megatron-lm-commit }}
+      run: |
+        megatron_lm_dir="3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+        git -C "$megatron_lm_dir" fetch --depth=1 origin "$MEGATRON_LM_COMMIT"
+        git -C "$megatron_lm_dir" checkout --detach FETCH_HEAD
+        test "$(git -C "$megatron_lm_dir" rev-parse HEAD)" = "$MEGATRON_LM_COMMIT"
 
     - name: Run tests
       id: test

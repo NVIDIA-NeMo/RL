@@ -21,6 +21,11 @@ on:
         default: ${{ github.sha }}
         description: Ref, branch, or SHA to build.
         type: string
+      megatron-lm-commit:
+        required: false
+        default: ""
+        description: Full Megatron-LM commit SHA to check out in the Megatron-Bridge submodule.
+        type: string
       image-name:
         required: true
         description: Name of the image to build and push.
@@ -89,6 +94,16 @@ jobs:
         with:
           ref: ${{ inputs.build-ref }}
           submodules: recursive
+
+      - name: Override Megatron-LM commit
+        if: inputs.megatron-lm-commit != ''
+        env:
+          MEGATRON_LM_COMMIT: ${{ inputs.megatron-lm-commit }}
+        run: |
+          megatron_lm_dir="3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+          git -C "$megatron_lm_dir" fetch --depth=1 origin "$MEGATRON_LM_COMMIT"
+          git -C "$megatron_lm_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$megatron_lm_dir" rev-parse HEAD)" = "$MEGATRON_LM_COMMIT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
