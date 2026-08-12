@@ -325,6 +325,28 @@ class BlackboxFinalizer:
             "total_reward": rewards_t,
         }
         if self._router_replay_enabled:
+            has_routed_row = any(r.valid and r.routed_experts for r in rows)
+            if not has_routed_row and self._routed_dims is None:
+                # Nothing to learn (L, K) from yet — e.g. an all-poisoned
+                # group before the first healthy rollout. Dropping loses no
+                # training signal (no valid rows or routes) and keeps the
+                # partition schema consistent for groups that do publish.
+                print(
+                    f"  finalize: group {group_id} dropped — router replay on "
+                    "but no rollout carried routed_experts and (L, K) is "
+                    "unknown yet",
+                    flush=True,
+                )
+                self._clear_staging(staging_keys)
+                metrics["finalize/group_dropped"] = 1.0
+                return FinalizedGroup(
+                    meta=None,
+                    group_min_wv=group_min_wv,
+                    group_max_wv=group_max_wv,
+                    staging_keys=[],
+                    metrics=metrics,
+                    dropped=True,
+                )
             train_batch["routed_experts"] = self._build_routed_experts_tensor(
                 rows, max_len=max_len, metrics=metrics
             )
