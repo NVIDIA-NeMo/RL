@@ -142,6 +142,20 @@ Train Qwen2.5-Omni-7B with GRPO on PhilipC/IntentTrain (audio-visual intent reco
 Train Qwen3-30B-A3B-Thinking into a SWE agent with a pivot stage plus end-to-end agentic RL on SWE-bench.
 :::
 
+:::{grid-item-card} {octicon}`database` Nano SWE with TransferQueue
+:link: guides/nano-swe-transferqueue
+:link-type: doc
+
+Six-node SWE RL smoke on Nemotron-3-Nano-30B-A3B with rollouts flowing through the TransferQueue data plane via SingleController.
+:::
+
+:::{grid-item-card} {octicon}`shield-check` Nano SWE with Token Capture
+:link: guides/nano-swe-token-capture
+:link-type: doc
+
+Exact-token SWE RL: the worker stages each call's token delta into TransferQueue and the gate serves verified prefixes back — no token echo, no re-tokenization.
+:::
+
 :::{grid-item-card} {octicon}`plus-circle` Adding New Models
 :link: adding-new-models
 :link-type: doc
@@ -297,6 +311,8 @@ guides/lora.md
 guides/cispo.md
 guides/prorlv2.md
 guides/swe-rl-qwen3.md
+guides/nano-swe-transferqueue.md
+guides/nano-swe-token-capture.md
 guides/grpo.md
 guides/ppo.md
 guides/grpo-deepscaler.md

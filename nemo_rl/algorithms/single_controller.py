@@ -582,6 +582,8 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 timing_metrics, step=self._train_steps, prefix="timing/train"
             )
+            if self._master_config.token_capture.enabled:
+                await self._log_gate_metrics()
             self._timer.reset()
 
             # min sample version refers to the version each consumed sample was
@@ -694,8 +696,37 @@ class SingleControllerActor:
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
         self._rollout_manager.set_weight_version(self._trainer_version)
+        if self._master_config.token_capture.enabled:
+            # Rotate the version vLLM workers stamp on captured model calls
+            # (per-call tagging; group staleness = min over the group's calls).
+            await asyncio.to_thread(
+                self._gen.set_rollout_weight_version, self._trainer_version
+            )
         self._rollout_permitted.set()
         return aborted_stale_inflight_groups
+
+    async def _log_gate_metrics(self) -> None:
+        """Log the capture gate's cumulative § 8 counters + token_in_rate.
+
+        Counters are cumulative over the run; ``gate/token_in_rate`` is the
+        cumulative marker-hit rate over all admitted model calls. Fetch
+        failures are logged and swallowed — metrics must never kill a step.
+        """
+        try:
+            counters = await self._rollout_manager.gate_metrics()
+        except (RuntimeError, OSError) as error:
+            print(f"gate metrics fetch failed: {error}", flush=True)
+            return
+        if not counters:
+            return
+        calls = counters["token_in"] + sum(
+            v for k, v in counters.items() if k.startswith("fallback_")
+        )
+        gate_metrics: dict[str, float] = {k: float(v) for k, v in counters.items()}
+        if calls:
+            gate_metrics["token_in_rate"] = counters["token_in"] / calls
+        self._logger.log_metrics(gate_metrics, step=self._train_steps, prefix="gate")
+        print(f"gate_metrics={gate_metrics}", flush=True)
 
     async def _advantage_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Fetch advantage inputs, compute advantages, and write them back.
@@ -752,6 +783,9 @@ class SingleControllerActor:
             rewards=rewards,
             mask=mask,
             repeated_batch=repeated_batch,
+            # Real validity (token-capture placeholders carry sample_mask 0)
+            # instead of the hardwired all-ones — § 9.1, advantage_estimator.
+            valid_mask=sample_mask,
             **kwargs,
         )
         response_advantages = torch.masked_select(advantages, mask.bool())
