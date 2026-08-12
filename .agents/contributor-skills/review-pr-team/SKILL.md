@@ -27,12 +27,12 @@ Review a pull request using a coordinated team of specialized agents.
 teams (teammate spawning, shared task list, `SendMessage`) are an experimental
 Claude Code feature.
 
-**Sandbox note**: In some environments (e.g. inside containers or git
-worktrees without user-namespace network privileges), the Bash sandbox fails
-to initialize with `bwrap: loopback: Failed RTM_NEWADDR: Operation not
-permitted`, breaking ALL commands — not just network-dependent ones like
-`gh`. If you hit this error, retry with `dangerouslyDisableSandbox: true`
-and use it for the remaining Bash calls in the session.
+**Sandbox**: Always pass `dangerouslyDisableSandbox: true` on every Bash
+tool call in this skill. The sandbox's bubblewrap (bwrap) container fails to
+initialize in worktree/container environments with
+`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, breaking ALL
+commands — not just network-dependent ones like `gh`. Do NOT attempt any Bash
+call in sandbox mode first; it will fail and waste a round-trip.
 
 ---
 
@@ -104,25 +104,6 @@ the PR description and comments for quantitative evidence:
 
 Record whether evidence was found: `$PERF_EVIDENCE_FOUND` (yes/no/not-applicable). Pass
 this to the `rl-expert` agent in its prompt.
-
-### 1.2b Release-roadmap & documentation check
-
-Release-targeted features are tracked in a community-facing roadmap issue titled
-`[NeMo RL] v<X.Y.Z> Release Roadmap` (e.g. [#2591](https://github.com/NVIDIA-NeMo/RL/issues/2591)
-for v0.7.0). Presence in the roadmap's feature tables means the feature is officially
-planned for the release and MUST have user-facing documentation:
-
-1. Find the current roadmap issue:
-   ```bash
-   gh issue list --repo NVIDIA-NeMo/RL --state open --search "Release Roadmap in:title" --json number,title
-   ```
-2. Check whether this PR or any of its linked issues appear in the roadmap's feature tables
-3. Check `docs/` folder for documentation about this feature; check if example configs
-   or a how-to guide exist
-4. If roadmap-listed but undocumented, flag as `[DOC-ROADMAP]` finding — the PR should
-   include or reference a documentation update
-
-Record: `$ON_ROADMAP` (yes/no), `$HAS_DOCS` (yes/no). Pass to agents.
 
 ### 1.3 Determine touched submodules
 
@@ -409,10 +390,6 @@ Tasks:
    - Modifications: expect before/after comparison or proof of no regression
    If evidence is missing, report as [PERF-EVIDENCE] with a specific ask: what numbers/curves
    the author should provide given the nature of the change.
-6. ROADMAP DOCUMENTATION: If the leader indicates this PR (or a linked issue) appears in the
-   current release-roadmap issue, check `docs/` for user-facing documentation about this
-   feature (how-to guide, config reference, etc.). If roadmap-listed but undocumented,
-   report as [DOC-ROADMAP].
 
 You are also available to answer questions from other agents via SendMessage.
 ```
@@ -776,7 +753,7 @@ discount it: on #3262 it reinstated a finding it had previously agreed to kill.
 
 After all Wave 2 agents complete:
 
-1. Gather ALL findings from ALL agents. Categories: `[BUG]`, `[TEST]`, `[GUIDELINE]`, `[DOC]`, `[UPSTREAM]`, `[DOCSTRING]`, `[PERF-EVIDENCE]`, `[DOC-ROADMAP]`, `[DESIGN]`
+1. Gather ALL findings from ALL agents. Categories: `[BUG]`, `[TEST]`, `[GUIDELINE]`, `[DOC]`, `[UPSTREAM]`, `[DOCSTRING]`, `[PERF-EVIDENCE]`, `[DESIGN]`
 2. Apply devil-advocate verdicts: remove DISPUTED findings, adjust scores for DOWNGRADED ones
 3. Deduplicate: same file + same line range + same core issue = one finding
 4. Confidence threshold: discard anything scoring below 80
