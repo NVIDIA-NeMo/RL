@@ -262,13 +262,18 @@ cog_args_masked=("${cog_args[@]}")
 
 if [[ "${launcher}" == "ray" ]]; then
   # Ray fans the suite out across nodes: prep must run everywhere, the suite
-  # only on the head (it is the driver).
+  # only on the head (it is the driver). cog's --setup-command runs on every
+  # node but a failing setup does NOT abort the driver command — we learned
+  # that the hard way when both workers logged NRLTA_PREP_FAIL and the suite
+  # still started against the wrong mcore tip. So the head command also runs
+  # prep (idempotent) and chains with && so a pin mismatch kills the job
+  # before any test executes.
   cog_args+=(--launcher ray)
   cog_args+=(--setup-command "${token_env} ${remote_env} ${prep_cmd}")
-  cog_args+=(--command "${token_env} ${remote_env} ${run_cmd}")
+  cog_args+=(--command "${token_env} ${remote_env} ${prep_cmd} && ${run_cmd}")
   cog_args_masked+=(--launcher ray)
   cog_args_masked+=(--setup-command "${token_env_masked} ${remote_env} ${prep_cmd}")
-  cog_args_masked+=(--command "${token_env_masked} ${remote_env} ${run_cmd}")
+  cog_args_masked+=(--command "${token_env_masked} ${remote_env} ${prep_cmd} && ${run_cmd}")
 else
   cog_args+=(--command "${token_env} ${remote_env} ${prep_cmd} && ${run_cmd}")
   cog_args_masked+=(--command "${token_env_masked} ${remote_env} ${prep_cmd} && ${run_cmd}")

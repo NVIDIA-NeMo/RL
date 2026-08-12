@@ -152,6 +152,41 @@ for number in ${pr_numbers[@]+"${pr_numbers[@]}"}; do
   fi
 done
 
+# Local carries that do not ride an open fix PR. The rebuild above starts from
+# bare main, so anything previously cherry-picked here is gone unless we put it
+# back. L2 is the one that has bitten twice: the suite is not on main yet, and a
+# silent drop only shows up after the cluster is allocated ("suite not found").
+local_carries_json='[]'
+if [[ -n "${L2_SUITE:-}" && -n "${L2_SUITE_CARRY_COMMIT:-}" ]]; then
+  if ! git -C "${worktree}" cat-file -e "HEAD:${L2_SUITE}" 2>/dev/null; then
+    nrlta_log "L2 suite missing from rebuild; cherry-picking ${L2_SUITE_CARRY_COMMIT:0:8}"
+    # The commit may live only on the operator checkout / agent branch, not on
+    # the shallow fetch of main — make it reachable from the worktree.
+    if ! git -C "${worktree}" cat-file -e "${L2_SUITE_CARRY_COMMIT}^{commit}" 2>/dev/null; then
+      git -C "${worktree}" fetch --quiet "${NEMO_RL_REPO_PATH}" "${L2_SUITE_CARRY_COMMIT}"
+    fi
+    author_date="$(git -C "${worktree}" show -s --format=%aI "${L2_SUITE_CARRY_COMMIT}")"
+    if GIT_COMMITTER_DATE="${author_date}" \
+        git -C "${worktree}" cherry-pick --allow-empty "${L2_SUITE_CARRY_COMMIT}" >/dev/null 2>&1; then
+      carry_sha="$(git -C "${worktree}" rev-parse HEAD)"
+      local_carries_json="$(python3 -c '
+import json, sys
+print(json.dumps([{
+  "id": "l2-megatron-functional-suite",
+  "sha": sys.argv[1],
+  "note": "Cherry-pick of L2 Megatron functional suite (%s); not yet on NeMo-RL main" % sys.argv[2][:8],
+}]))
+' "${carry_sha}" "${L2_SUITE_CARRY_COMMIT}")"
+      nrlta_log "re-applied L2 suite carry -> ${carry_sha:0:8}"
+    else
+      git -C "${worktree}" cherry-pick --abort >/dev/null 2>&1 || true
+      nrlta_die "failed to cherry-pick L2 suite carry ${L2_SUITE_CARRY_COMMIT:0:8}; L2 submits would be void"
+    fi
+  else
+    nrlta_log "L2 suite already present on integration rebuild"
+  fi
+fi
+
 git -C "${worktree}" branch --force "${NEMO_RL_INTEGRATION_BRANCH}" HEAD
 integration_sha="$(git -C "${worktree}" rev-parse HEAD)"
 
@@ -162,11 +197,11 @@ git -C "${worktree}" -c "credential.helper=!gh auth git-credential" \
   "${NEMO_RL_INTEGRATION_BRANCH}:refs/heads/${NEMO_RL_INTEGRATION_BRANCH}"
 
 python3 - "${manifest}" "${integration_sha}" "${base_sha}" \
-  "${applied[*]-}" "${skipped[*]-}" "${prs_json}" <<'PY'
+  "${applied[*]-}" "${skipped[*]-}" "${prs_json}" "${local_carries_json}" <<'PY'
 import json, sys
 from datetime import datetime, timezone
 
-manifest, integration_sha, base_sha, applied, skipped, prs_json = sys.argv[1:7]
+manifest, integration_sha, base_sha, applied, skipped, prs_json, local_carries_json = sys.argv[1:8]
 by_number = {str(pr["number"]): pr for pr in json.loads(prs_json)}
 
 payload = {
@@ -185,6 +220,7 @@ payload = {
         {"pr": int(entry.split(":")[0]), "reason": entry.split(":", 1)[1]}
         for entry in skipped.split()
     ],
+    "local_carries": json.loads(local_carries_json),
 }
 with open(manifest, "w") as handle:
     json.dump(payload, handle, indent=2)
@@ -192,6 +228,8 @@ with open(manifest, "w") as handle:
 print(f"integration branch = {base_sha[:8]} + {len(payload['applied'])} fix(es) -> {integration_sha[:8]}")
 for item in payload["skipped"]:
     print(f"  NOT applied: #{item['pr']} ({item['reason']})")
+for carry in payload["local_carries"]:
+    print(f"  local carry: {carry['id']} @ {carry['sha'][:8]}")
 PY
 
 nrlta_log "manifest written to ${manifest}"
