@@ -1,0 +1,122 @@
+# Nano SWE teacher — Single Controller + TQ partial-rollout checkpoint benchmark
+#
+# Treatment:
+#   rollout_checkpointing.interval_s: 120
+#
+# Baseline override:
+#   rollout_checkpointing.interval_s=null
+#
+# Alternative interval:
+#   rollout_checkpointing.interval_s=300
+
+defaults:
+  - nano_swe_teacher_qwen3mesh.yaml
+
+# SingleController's own async config (SC uses this, not grpo.async_grpo). Mirrors
+# examples/configs/grpo_math_1B_megatron_single_controller.yaml.
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1        # how far generation may run ahead of the trainer
+  recompute_kv_cache_after_weight_updates: false
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: 64          # DataPlane backpressure cap
+  diagnostics: false
+
+# -----------------------------------------------------------------------------
+# GRPO experiment shape
+# -----------------------------------------------------------------------------
+grpo:
+  val_period: 0
+
+# -----------------------------------------------------------------------------
+# Durable trainer checkpoints
+# -----------------------------------------------------------------------------
+checkpointing:
+  enabled: true
+
+  # Rollout snapshots after step zero require a matching durable trainer
+  # checkpoint. Save every step so periodic rollout snapshots remain active
+  # throughout the four-step experiment.
+  save_period: 1
+
+  # Inherited from the SWE base, but made explicit because recovery needs the
+  # complete trainer state.
+  save_optimizer: true
+
+  checkpoint_must_save_by: null
+
+# -----------------------------------------------------------------------------
+# TransferQueue
+# -----------------------------------------------------------------------------
+data_plane:
+  # Remaining TQ settings—including backend, storage capacity and number of
+  # storage units—come from nano_swe_teacher_qwen3mesh.yaml.
+  enabled: true
+  impl: transfer_queue
+  checkpointing_enabled: true
+
+# -----------------------------------------------------------------------------
+# Gym gate token capture
+# -----------------------------------------------------------------------------
+token_capture:
+  enabled: true
+
+
+# -----------------------------------------------------------------------------
+# Periodic partial-rollout snapshots and benchmark telemetry
+# -----------------------------------------------------------------------------
+rollout_checkpointing:
+  # Treatment configuration. Override to null for the no-periodic-snapshot
+  # baseline, or 300 for the lower-frequency arm.
+  interval_s: 120
+
+  # Sample throughput independently of trainer steps and checkpoint cadence.
+  # Keep this identical in every experimental arm.
+  telemetry_interval_s: 30
+
+  # Retain only the newest two full TQ snapshot bundles under each trainer
+  # checkpoint anchor.
+  keep_latest_k: 2
+
+  # Every benchmark run should start fresh. Use "latest" for the separate
+  # crash/recovery correctness experiment.
+  restore_mode: none
+
+# -----------------------------------------------------------------------------
+# Policy
+# -----------------------------------------------------------------------------
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 4
+    expert_model_parallel_size: 8
+    # swe_teacher.yaml inherits flex/hybridep, whose deep_ep kernel REQUIRES EP>=2
+    # (AssertionError "hybrid-ep kernel ... at least 2 ranks, but got 1"). With EP1
+    # use the proven Nano alltoall dispatcher (the _nano_smoke .inc's intent).
+    moe_token_dispatcher_type: "alltoall"
+
+    # MoE router settings from the Qwen3 reference
+    # freeze_moe_router: true
+    # moe_router_bias_update_rate: 0.001
+    # moe_aux_loss_coeff: 0.0
+    # moe_router_enable_expert_bias: true
+
+  # Single Controller reads the draft block even when speculative decoding is
+  # disabled.
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+# -----------------------------------------------------------------------------
+# Loss
+# -----------------------------------------------------------------------------
+loss_fn:
+  # The Single Controller refit path expects reference-policy state when this
+  # workflow uses the reference model.
+  reference_policy_kl_penalty: 0.01

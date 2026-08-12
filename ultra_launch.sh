@@ -666,6 +666,49 @@ _seed_cache "\$CACHE_READ/inductor_cache.tar.zst" "\$LOCAL_IND" "Inductor"
 _seed_cache "\$CACHE_READ/triton_cache.tar.zst" "\$LOCAL_TRI" "Triton"
 
 echo "[CACHE SEED] Done."
+
+# prefetch_venvs.py bakes the vLLM worker venv from the static
+# ACTOR_ENVIRONMENT_REGISTRY (--extra vllm), but token_capture.enabled swaps the
+# actor to PY_EXECUTABLES.VLLM_GYM at runtime. The baked venv is reused as-is, so
+# nemo_gym's deps (orjson) must be added here or the worker dies on import.
+if [ -n "${NRL_VLLM_WORKER_PIP_INSTALL:-}" ]; then
+  _worker_venv="\${NEMO_RL_VENV_DIR:-/opt/ray_venvs}/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+  if [ -x "\$_worker_venv/bin/python" ]; then
+    if uv pip install --python "\$_worker_venv/bin/python" ${NRL_VLLM_WORKER_PIP_INSTALL}; then
+      echo "[WORKER DEPS] installed '${NRL_VLLM_WORKER_PIP_INSTALL}' into \$_worker_venv"
+    else
+      echo "[WORKER DEPS] FAILED to install '${NRL_VLLM_WORKER_PIP_INSTALL}' into \$_worker_venv" >&2
+      exit 1
+    fi
+  else
+    echo "[WORKER DEPS] no vLLM worker venv at \$_worker_venv — set NRL_FORCE_REBUILD_VENVS=true instead" >&2
+    exit 1
+  fi
+fi
+
+# Gym builds a third set of venvs (uv_venv_dir, from NEMO_GYM_VENV_DIR) that the
+# image bakes with an older ray than the cluster runs, so every Gym server dies
+# in check_version_info. Gym's own spec is `ray[default]>=2.55.1` — a floor with
+# no ceiling — so rebuilding them re-resolves to whatever is newest on PyPI and
+# can overshoot just as badly. Install the exact cluster version instead.
+if [ -n "${NRL_GYM_VENV_PIP_INSTALL:-}" ]; then
+  _gym_root="\${NEMO_GYM_VENV_DIR:-/opt/gym_venvs}"
+  _gym_found=0
+  for _gv in "\$_gym_root"/*/*/.venv; do
+    [ -x "\$_gv/bin/python" ] || continue
+    _gym_found=1
+    if uv pip install --python "\$_gv/bin/python" ${NRL_GYM_VENV_PIP_INSTALL}; then
+      echo "[GYM DEPS] installed '${NRL_GYM_VENV_PIP_INSTALL}' into \$_gv"
+    else
+      echo "[GYM DEPS] FAILED to install '${NRL_GYM_VENV_PIP_INSTALL}' into \$_gv" >&2
+      exit 1
+    fi
+  done
+  if [ "\$_gym_found" -eq 0 ]; then
+    echo "[GYM DEPS] no Gym venvs under \$_gym_root — nothing to reconcile" >&2
+    exit 1
+  fi
+fi
 SETUPEOF
 export SETUP_COMMAND
 
@@ -677,8 +720,10 @@ export SETUP_COMMAND
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
+${NRL_DRIVER_PIP_INSTALL:+uv pip install --python /opt/nemo_rl_venv/bin/python ${NRL_DRIVER_PIP_INSTALL} ; }\
 ${GENRM_RUNTIME_SETUP}\
 ${VLLM_ENV_SOURCE}\
+${NRL_DRIVER_PYTHONPATH:+PYTHONPATH=${NRL_DRIVER_PYTHONPATH} }\
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
 WANDB_INIT_TIMEOUT=300 \
@@ -690,13 +735,15 @@ TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
 UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default} \
 UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
-UV_HTTP_TIMEOUT=10 \
+UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-600} \
 VLLM_USE_FLASHINFER_MOE_FP8=1 \
 VLLM_FLASHINFER_MOE_BACKEND=latency \
 NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 \
 NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=${HF_TOKEN:-} \
+${NEMO_RL_VENV_DIR:+NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR} }\
+${NG_TIC_FP_CANONICAL:+NG_TIC_FP_CANONICAL=${NG_TIC_FP_CANONICAL} }\
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
 uv run ${NRL_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py} \
 --config ${CONFIG_PATH} \
