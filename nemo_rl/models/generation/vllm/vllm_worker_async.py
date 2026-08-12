@@ -45,8 +45,9 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 )
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
+    attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
-    model_dump_chat_response_with_routed_experts,
+    model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
@@ -594,6 +595,22 @@ class VllmAsyncGenerationWorkerImpl(
                 *args,
                 **kwargs,
             ):
+                return_as_token_id = (
+                    request.return_tokens_as_token_ids
+                    if request.return_tokens_as_token_ids is not None
+                    else self.return_tokens_as_token_ids
+                )
+                if (
+                    request.logprobs
+                    and return_as_token_id
+                    and request.top_logprobs is None
+                ):
+                    raise VLLMValidationError(
+                        "`top_logprobs` must be set when requesting token "
+                        "information from the NeMo-RL chat endpoint.",
+                        parameter="top_logprobs",
+                    )
+
                 final_res = None
 
                 async def capture_result_generator():
@@ -609,19 +626,27 @@ class VllmAsyncGenerationWorkerImpl(
                     **kwargs,
                 )
                 if (
-                    not worker_self._return_routed_experts_enabled()
-                    or not isinstance(response, ChatCompletionResponse)
+                    not isinstance(response, ChatCompletionResponse)
                     or final_res is None
                 ):
                     return response
 
-                return attach_routed_experts_to_chat_response_choices(
-                    response,
-                    final_res,
-                    device=torch.device("cpu"),
-                    logger=LOGGER,
-                    routed_experts_dtype=worker_self.routed_experts_dtype,
-                )
+                if request.logprobs and return_as_token_id:
+                    response = attach_token_information_to_chat_response_choices(
+                        response,
+                        final_res,
+                    )
+
+                if worker_self._return_routed_experts_enabled():
+                    response = attach_routed_experts_to_chat_response_choices(
+                        response,
+                        final_res,
+                        device=torch.device("cpu"),
+                        logger=LOGGER,
+                        routed_experts_dtype=worker_self.routed_experts_dtype,
+                    )
+
+                return response
 
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
             pass
@@ -678,9 +703,38 @@ class VllmAsyncGenerationWorkerImpl(
             request.top_k = -1
 
             # The request sampling params need to exactly match those as are set in NeMo RL.
-            # If they do not match, the inference will be off policy and destroy training stability.
-            assert request.temperature == generation_config["temperature"]
-            assert request.top_p == generation_config["top_p"]
+            # If they do not match, the inference will be off policy and destroy training
+            # stability. Validation rollouts are the one exception: they are stamped with
+            # the validation sampling profile (generation.val_temperature / val_top_p),
+            # which is metric-only and safe to serve — grpo.validate() is the only
+            # caller that constructs a non-train GenerationSamplingParams. Multi-turn
+            # agents issue their own requests, so this server-side check is the one
+            # chokepoint they all pass.
+            # vLLM resolves an unset top_p from the model's generation_config.json
+            # (ModelConfig.generation_config defaults to "auto"), NOT to 1.0, so a
+            # request omitting it would sample off-policy while passing this check.
+            assert request.top_p is not None, (
+                "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
+                "resolved by vLLM from the model's generation_config.json and would "
+                "bypass the on-policy sampling check."
+            )
+            request_top_p = request.top_p
+            is_train_sampling = (
+                request.temperature == generation_config["temperature"]
+                and request_top_p == generation_config["top_p"]
+            )
+            is_val_sampling = (
+                request.temperature == generation_config["val_temperature"]
+                and request_top_p == generation_config["val_top_p"]
+            )
+            assert is_train_sampling or is_val_sampling, (
+                f"request sampling (temperature={request.temperature}, "
+                f"top_p={request.top_p}) matches neither the train sampling params "
+                f"(temperature={generation_config['temperature']}, "
+                f"top_p={generation_config['top_p']}) nor the validation sampling "
+                f"params (val_temperature={generation_config['val_temperature']}, "
+                f"val_top_p={generation_config['val_top_p']})"
+            )
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
@@ -709,7 +763,9 @@ class VllmAsyncGenerationWorkerImpl(
 
             elif isinstance(generator, ChatCompletionResponse):
                 return JSONResponse(
-                    content=model_dump_chat_response_with_routed_experts(generator)
+                    content=model_dump_chat_response_with_dynamic_message_fields(
+                        generator
+                    )
                 )
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
@@ -954,10 +1010,20 @@ class VllmAsyncGenerationWorkerImpl(
                 [per_sample_stop_strings] if per_sample_stop_strings else None
             )
 
-            remaining_ctx = (
-                self.cfg["vllm_cfg"]["max_model_len"] - current_input_actual_length
-            )
+            max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+            remaining_ctx = max_model_len - current_input_actual_length
             allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
+
+            spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
+            spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
+            if allowed_new_tokens > 0 and spec_lookahead > 0:
+                allowed_new_tokens = self._request_max_new_tokens(
+                    configured_max_new_tokens=allowed_new_tokens,
+                    input_length=current_input_actual_length,
+                    max_model_len=max_model_len,
+                    cap_to_context=False,
+                    spec_lookahead=spec_lookahead,
+                )
 
             # Handle case where no tokens can be generated due to length constraints
             if allowed_new_tokens == 0:
@@ -1167,17 +1233,15 @@ class VllmAsyncGenerationWorkerImpl(
         ]
 
         # Yield results as they become available
-        for completed_task in asyncio.as_completed(sample_tasks):
-            try:
+        try:
+            for completed_task in asyncio.as_completed(sample_tasks):
                 result = await completed_task
                 yield result
-            except Exception as e:
-                # Cancel remaining tasks
-                for task in sample_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*sample_tasks, return_exceptions=True)
-                raise e
+        finally:
+            for task in sample_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*sample_tasks, return_exceptions=True)
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -1268,17 +1332,15 @@ class VllmAsyncGenerationWorkerImpl(
         ]
 
         # Yield results as they become available
-        for completed_task in asyncio.as_completed(prompt_tasks):
-            try:
+        try:
+            for completed_task in asyncio.as_completed(prompt_tasks):
                 result = await completed_task
                 yield result
-            except Exception as e:
-                # Cancel remaining tasks
-                for task in prompt_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*prompt_tasks, return_exceptions=True)
-                raise e
+        finally:
+            for task in prompt_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*prompt_tasks, return_exceptions=True)
 
     async def report_device_id_async(self) -> list[str]:
         """Async version of report_device_id."""

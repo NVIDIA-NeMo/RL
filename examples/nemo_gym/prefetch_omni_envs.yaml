@@ -1,0 +1,31 @@
+# Prefetch config for the NeMo Gym environments used by Omni recipes. Pass this file to the
+# Docker build to bake the required Gym server venvs into the image:
+#   docker buildx build -f docker/Dockerfile \
+#     --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_omni_envs.yaml" .
+# Only env.nemo_gym is read (dry-run NemoGym._spinup); the dummy policy values below satisfy
+# the bundled configs' interpolations during the dry run.
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+
+    policy_model_name: dummy-model
+    policy_base_url: http://localhost:8000/v1
+    policy_api_key: dummy
+
+    invalid_tool_call_patterns:
+      - "<tool_call>"
+      - "</tool_call>"
+      - "<function_call>"
+      - "</function_call>"
+    thinking_tags:
+      - "<think>"
+      - "</think>"
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml
+      - resources_servers/mcqa/configs/mcqa.yaml
+      - resources_servers/gui_coordinate/configs/gui_coordinate.yaml
+      - resources_servers/string_match/configs/string_match.yaml

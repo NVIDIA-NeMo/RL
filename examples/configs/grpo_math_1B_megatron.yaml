@@ -16,6 +16,7 @@ grpo:
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
+    max_generation_failures: 0
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -72,6 +73,7 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
 
   max_grad_norm: 1.0

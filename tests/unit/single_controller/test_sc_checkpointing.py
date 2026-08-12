@@ -56,6 +56,7 @@ from nemo_rl.algorithms.grpo import (
     _initial_grpo_save_state,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
@@ -385,7 +386,7 @@ def _run_train_pump(
     """
 
     async def _main():
-        actor = _ACTOR_CLS(mc, actor_args)
+        actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
         actor._sampler = _FakeSampler()
         # In-process runs have no Ray runtime; the pump only reads the GPU
         # count for a throughput metric.
@@ -408,7 +409,7 @@ def _run_actor_run(mc: MasterConfig, actor_args: SingleControllerActorArgs):
     """
 
     async def _main():
-        actor = _ACTOR_CLS(mc, actor_args)
+        actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
         result = await asyncio.wait_for(actor.run(), timeout=60.0)
         return actor, result
 
@@ -426,7 +427,7 @@ def _run_restore_then_train_pump(
     """
 
     async def _main():
-        actor = _ACTOR_CLS(mc, actor_args)
+        actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
         await actor._maybe_restore_replay_buffer()
         actor._sampler = _FakeSampler()
         with patch("ray.cluster_resources", return_value={"GPU": 0}):
@@ -462,7 +463,9 @@ class TestCounterRestore:
         save_state.total_valid_tokens = 1234
 
         actor = _ACTOR_CLS(
-            _actor_master_config(tmp_path), _make_actor_args(save_state=save_state)
+            _actor_master_config(tmp_path),
+            _make_actor_args(save_state=save_state),
+            SetupTimingMetrics(),
         )
 
         assert actor._train_steps == 7
@@ -475,7 +478,9 @@ class TestCounterRestore:
         assert actor._total_valid_tokens == 1234
 
     def test_fresh_start_defaults(self, tmp_path):
-        actor = _ACTOR_CLS(_actor_master_config(tmp_path), _make_actor_args())
+        actor = _ACTOR_CLS(
+            _actor_master_config(tmp_path), _make_actor_args(), SetupTimingMetrics()
+        )
 
         assert actor._train_steps == 0
         assert actor._trainer_version == 0
@@ -497,7 +502,9 @@ class TestCounterRestore:
         )
 
         actor = _ACTOR_CLS(
-            _actor_master_config(tmp_path), _make_actor_args(save_state=save_state)
+            _actor_master_config(tmp_path),
+            _make_actor_args(save_state=save_state),
+            SetupTimingMetrics(),
         )
 
         assert actor._train_steps == 5
@@ -861,7 +868,7 @@ class TestSetupResumeWiring:
         )
         mc = _setup_master_config(str(ckpt_dir))
 
-        actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         # Latest checkpoint (step_3) wins; its paths reach the trainer factory.
         trainer_kwargs = patched_factories["_build_trainer"].call_args.kwargs
@@ -881,7 +888,7 @@ class TestSetupResumeWiring:
         ckpt_dir.mkdir()
         mc = _setup_master_config(str(ckpt_dir))
 
-        actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         trainer_kwargs = patched_factories["_build_trainer"].call_args.kwargs
         assert trainer_kwargs["weights_path"] is None

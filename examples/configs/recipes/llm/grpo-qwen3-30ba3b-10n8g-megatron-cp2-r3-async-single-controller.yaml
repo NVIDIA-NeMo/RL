@@ -6,6 +6,9 @@ defaults: ./grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async.yaml
 
 # SC does not support validation and checkpointing yet.
 grpo:
+  # Null out the legacy async_grpo block inherited from grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async.yaml:
+  # SC reads async_rl instead, and the entrypoint raises if this block is set.
+  async_grpo: null
   val_period: 0
 
 checkpointing:

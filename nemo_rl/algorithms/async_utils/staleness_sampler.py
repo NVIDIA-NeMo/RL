@@ -95,6 +95,15 @@ class PromptGroupSampler(Protocol):
         """Drop groups that can no longer be selected; clear their DP rows."""
         ...
 
+    def should_abort_inflight(
+        self,
+        *,
+        start_weight_version: int,
+        current_train_weight: int,
+    ) -> bool:
+        """Return whether an unfinished rollout can no longer be selected."""
+        ...
+
     @property
     def is_on_policy(self) -> bool:
         """True when the policy admits zero staleness (sync mode)."""
@@ -175,6 +184,14 @@ class BaseSampler(abc.ABC):
         return await self._buffer.remove(stale_idxs, remove_in_dp=True)
 
     # ── derived facts ────────────────────────────────────────────────────
+    def should_abort_inflight(
+        self,
+        *,
+        start_weight_version: int,
+        current_train_weight: int,
+    ) -> bool:
+        return False
+
     @property
     def is_on_policy(self) -> bool:
         return self._eviction_window() == 0
@@ -248,6 +265,18 @@ class WindowedSampler(BaseSampler):
 
     def _eviction_window(self) -> int:
         return self.max_staleness_versions
+
+    def should_abort_inflight(
+        self,
+        *,
+        start_weight_version: int,
+        current_train_weight: int,
+    ) -> bool:
+        min_valid_version = max(
+            0,
+            current_train_weight - self.max_staleness_versions,
+        )
+        return start_weight_version < min_valid_version
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
         # Over-sampled: dispatch is bounded by buffer capacity, not by version.
@@ -500,8 +529,8 @@ def create_sampler(
         if not isinstance(sampler, PromptGroupSampler):
             raise TypeError(
                 f"{cfg.target} does not implement the PromptGroupSampler "
-                f"interface (needs admit/select/evict, set_dispatch_index, "
-                f"is_on_policy, required_buffer_capacity)"
+                f"interface (needs admit/select/evict/should_abort_inflight, "
+                f"set_dispatch_index, is_on_policy, required_buffer_capacity)"
             )
         return sampler
     raise ValueError(f"unknown sampler config {type(cfg).__name__}")
