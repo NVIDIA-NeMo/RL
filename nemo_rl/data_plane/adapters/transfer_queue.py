@@ -73,14 +73,25 @@ def _get_local_node_ip() -> str:
         return ""
 
 
-def roce_device() -> str:
-    """Return this host's RoCE-capable mlx5 device, or ``""`` if none.
+def _link_layer(device: str) -> str:
+    """Return ``device``'s port-1 link layer — ``InfiniBand``, ``Ethernet``, ``""``."""
+    try:
+        return (
+            Path(f"/sys/class/infiniband/{device}/ports/1/link_layer")
+            .read_text()
+            .strip()
+        )
+    except OSError:
+        return ""
 
-    ``MC_MOONCAKE_DEVICE`` names one explicitly and wins. Otherwise the first
-    mlx5 device whose port-1 link layer is Ethernet is selected — InfiniBand
-    devices are deliberately not auto-selected, since RoCE is the fabric this
-    path has been validated on (the NIXL checkpoint path uses the IB rails
-    instead; see docs/design-docs/checkpoint-engines.md).
+
+def rdma_device() -> str:
+    """Return this host's RDMA device, preferring InfiniBand, or ``""`` if none.
+
+    ``MC_MOONCAKE_DEVICE`` names one explicitly and wins. Otherwise InfiniBand
+    is chosen ahead of RoCE: on a host carrying both, the IB rails are the
+    faster fabric and the one the NIXL checkpoint path already uses (see
+    docs/design-docs/checkpoint-engines.md). RoCE is the fallback.
 
     Also the skip predicate for the mooncake tests, which cannot run without a
     device now that ``mooncake_cpu`` is RDMA-only.
@@ -94,33 +105,37 @@ def roce_device() -> str:
     # well after setup has begun — so treat a missing verbs node as no device.
     if not glob.glob("/dev/infiniband/uverbs*"):
         return ""
-    for link_layer in sorted(
-        glob.glob("/sys/class/infiniband/mlx5_*/ports/1/link_layer")
-    ):
-        try:
-            if Path(link_layer).read_text().strip() == "Ethernet":
-                return Path(link_layer).parents[2].name
-        except OSError:
-            continue
-    return ""
+    roce = ""
+    for path in sorted(glob.glob("/sys/class/infiniband/mlx5_*/ports/1/link_layer")):
+        name = Path(path).parents[2].name
+        layer = _link_layer(name)
+        if layer == "InfiniBand":
+            return name
+        if layer == "Ethernet" and not roce:
+            roce = name
+    return roce
 
 
 def _mooncake_transport_config() -> dict:
     # mooncake_cpu exists for the zero-copy RDMA MooncakeStore path (TQ v0.1.8),
     # so RDMA is the only transport it runs: there is no TCP fallback, and a
-    # host without a RoCE device fails here rather than quietly degrading.
+    # host without an RDMA device fails here rather than quietly degrading.
     # Runs on the driver only, so it assumes homogeneous nodes — the device it
     # finds is broadcast to every client.
-    device = roce_device()
+    device = rdma_device()
     if not device:
         raise RuntimeError(
-            "data_plane.backend='mooncake_cpu' requires RDMA, but no mlx5 "
-            "device with an Ethernet link layer was found under "
-            "/sys/class/infiniband. InfiniBand devices are present on some "
-            "clusters but are not auto-selected — name one with "
+            "data_plane.backend='mooncake_cpu' requires RDMA, but no usable "
+            "mlx5 device was found. Check that /dev/infiniband/uverbs* exists "
+            "(a container does not inherit it from the host even though it "
+            "does see /sys/class/infiniband) — name a device with "
             "MC_MOONCAKE_DEVICE=<dev>, or use data_plane.backend='simple'."
         )
-    os.environ.setdefault("MC_GID_INDEX", "3")
+    if _link_layer(device) == "Ethernet":
+        # GID index 3 is a RoCEv2 convention. InfiniBand numbers GIDs
+        # differently, so leave it unset there and let mooncake's own
+        # findBestGidIndex choose.
+        os.environ.setdefault("MC_GID_INDEX", "3")
     return {"protocol": "rdma", "device_name": device}
 
 
