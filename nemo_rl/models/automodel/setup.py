@@ -73,6 +73,7 @@ from nemo_rl.models.automodel.config import (
 )
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
+from nemo_rl.models.value.config import ValueConfig
 
 STRING_TO_DTYPE = {
     "float32": torch.float32,
@@ -237,17 +238,18 @@ def get_tokenizer(
 
 
 def validate_and_prepare_config(
-    config: PolicyConfig,
+    config: PolicyConfig | ValueConfig,
     processor: Optional[AutoProcessor],
     rank: int,
 ) -> RuntimeConfig:
     """Validate configuration and prepare runtime settings.
 
-    This function validates the policy configuration, sets environment variables,
-    determines model configuration, and returns runtime settings as a named tuple.
+    This function validates the shared policy or value-model configuration, sets
+    environment variables, determines model configuration, and returns runtime
+    settings as a named tuple.
 
     Args:
-        config: Policy configuration dictionary
+        config: Policy or PPO value-model configuration dictionary
         processor: Optional processor for multimodal models
         rank: Current process rank
 
@@ -294,6 +296,9 @@ def validate_and_prepare_config(
     max_grad_norm = config["max_grad_norm"]
     enable_seq_packing = config["sequence_packing"]["enabled"]
     model_name = config["model_name"]
+    # Determine which head the shared Automodel setup should instantiate. PPO
+    # value models use the token-level regression reward-model path even though
+    # they are not standalone reward models trained by examples/run_rm.py.
     reward_model_cfg = config.get("reward_model_cfg", {})
     is_reward_model = reward_model_cfg.get("enabled", False)
     is_regression_reward_model = (
@@ -328,6 +333,9 @@ def validate_and_prepare_config(
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
     cp_size_cfg = config["dtensor_cfg"]["context_parallel_size"]
+    # Policies may fall back to ring-efficient attention for CP, including in
+    # float32. Token-level regression value models require ring-flash for GQA,
+    # so validate the value-model precision constraint here.
     if (
         is_regression_reward_model
         and cp_size_cfg > 1
@@ -728,6 +736,8 @@ def setup_model_and_optimizer(
             and config["reward_model_cfg"]["reward_model_type"] == "regression"
         )
         if is_regression_reward_model:
+            # The different kernel is selected by the token-level regression
+            # path used by PPO values, not by a difference in model backbone.
             # PyTorch's ring-efficient CP kernel cannot merge GQA outputs when
             # num_attention_heads != num_key_value_heads (for example Qwen2):
             # its output and logsumexp head dimensions diverge. Force ring-flash
