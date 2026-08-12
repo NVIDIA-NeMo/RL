@@ -58,6 +58,13 @@ nccl-reshard-refit implementation:
   `.weight`, dense MLP and MoE experts alike; see `is_nccl_reshard_param()`). These are
   resharded shard-to-shard with `xferdtensor` over dedicated NCCL communicators. For
   large models this covers the vast majority of the refit bytes. For the current version of implementation, it only detects `(experts).N.{gate_proj|up_proj|down_proj}` as the subject of this performant transportation path. The coverage will be expanded via future updates.
+  Two FFN-named groups are explicitly excluded and ride the misc path instead:
+  shared-expert weights (`*.shared_expert.*`, which fuse differently on the vLLM
+  side) and co-trained MTP drafter weights (`mtp.*`, which vLLM keeps in a separate
+  drafter module updated through `load_weights`). The MTP exclusion matches the
+  bare-`mtp.`-prefix HF naming (NemotronH, Qwen3.5); DeepSeek-style MTP exported as
+  trailing `model.layers.N` indices is not yet gated, and nccl-reshard-refit does
+  not support it.
 * **Misc path** — everything else (embeddings, attention projections, layernorms, the
   MoE router, `lm_head`, FP8 `_scale_inv` siblings, FP8 KV-cache scales, …). These ride
   a packed broadcast (conventional `packed_tensor.py` implementation) over the shared
@@ -87,7 +94,11 @@ training starts:
    builds a backend-agnostic description** of every bulk parameter
    (`build_nccl_reshard_refit_info()` in `nemo_rl/weight_sync/nccl_reshard_utils.py`),
    keyed strictly by **HuggingFace parameter names**, and ships it to the generation
-   side.
+   side. Before shipping, `make_nccl_reshard_refit_info_wire_safe()` converts the
+   `MeshInfo` rank tensors and `Shard`/`Replicate` placements into plain dicts/lists —
+   Megatron patches torch's storage unpickler, so raw tensor pickles would require
+   `import megatron` inside the vLLM worker. The generation side rebuilds the objects
+   with `restore_refit_info_placements()`.
 
 The derived metadata (`nccl_reshard_refit_info`) contains, per parameter:
 

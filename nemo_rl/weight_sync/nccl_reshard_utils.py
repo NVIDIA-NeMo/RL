@@ -19,6 +19,8 @@ This module provides:
   shared torch.distributed process group (needed for cross-world transfers)
 - Placement rules: mapping param names to TP/EP sharding strategies
 - build_nccl_reshard_refit_info: compute per-layer param metadata for refit
+- make_nccl_reshard_refit_info_wire_safe: convert placements and meshes into
+  plain dicts/lists before the refit metadata crosses a process boundary
 - restore_refit_info_placements: undo msgspec dict-flattening of placements
   and meshes on the receiving side
 
@@ -279,9 +281,11 @@ def make_nccl_reshard_refit_info_wire_safe(refit_info: dict) -> dict:
         for param_info in params:
             wire_param = dict(param_info)
             for key in ("src_mesh_info", "dst_mesh_info"):
-                wire_param[key] = _wire_mesh(wire_param.get(key))
+                if key in wire_param:
+                    wire_param[key] = _wire_mesh(wire_param[key])
             for key in ("src_placements", "dst_placements"):
-                wire_param[key] = [_wire_placement(p) for p in wire_param.get(key, [])]
+                if key in wire_param:
+                    wire_param[key] = [_wire_placement(p) for p in wire_param[key]]
             wire_params.append(wire_param)
         wire_layers[layer_name] = wire_params
     wire_info["per_layer_params"] = wire_layers
