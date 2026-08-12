@@ -50,6 +50,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         ),
         async_rl=AsyncRLConfig(min_groups_for_streaming_train=1),
         logger={},
+        env={},
     )
     actor_args = SimpleNamespace(
         partition_id="rollout_data",
@@ -102,6 +103,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
             max_buffered_rollouts=4,
         ),
         logger={},
+        env={},
     )
     actor_args = SimpleNamespace(
         partition_id="rollout_data",
@@ -150,6 +152,7 @@ def test_logs_setup_timing_metrics(monkeypatch) -> None:
             max_buffered_rollouts=4,
         ),
         logger={},
+        env={},
     )
     setup_metrics = SetupTimingMetrics(
         generation_init_time_s=1.5, policy_init_time_s=2.5

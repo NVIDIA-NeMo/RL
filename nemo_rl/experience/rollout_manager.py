@@ -81,9 +81,9 @@ class RolloutRetryPolicy:
     max_data_attempts: int = 1
     backoff_base_s: float = 1.0
     max_backoff_s: float = 30.0
-    # On exhausting max_data_attempts: skip the prompt, or let the failure propagate.
-    skip_on_data_exhausted: bool = False
-    # Run-wide cap on skipped prompts, enforced across every generate_and_push call.
+    # Run-wide cap on prompts that may exhaust their data budget and be dropped,
+    # enforced across every generate_and_push call. 0 means none may be: the first
+    # exhaustion propagates the original failure.
     max_skipped_prompts: int = 0
     # Attempts to re-dispatch only the NeMo-Gym rows that never arrived, before the
     # whole prompt group is retried. 1 means no row-level retry.
@@ -1153,15 +1153,20 @@ class RolloutManager:
                 data_attempts += 1
                 if data_attempts >= policy.max_data_attempts:
                     self._stats.record_data_failure(reason)
-                    if not policy.skip_on_data_exhausted:
-                        raise
-                    self._skipped_prompts += 1
-                    if self._skipped_prompts > policy.max_skipped_prompts:
+                    if self._skipped_prompts >= policy.max_skipped_prompts:
+                        # At the default of 0 this fires on the first exhaustion and the
+                        # original failure propagates unchanged -- one knob, and its
+                        # zero value is the old "fail_fast" without a second key to
+                        # contradict it.
+                        if policy.max_skipped_prompts == 0:
+                            raise
                         raise RolloutDataFailure(
-                            f"skipped {self._skipped_prompts} prompts, exceeding "
-                            f"max_skipped_prompts={policy.max_skipped_prompts}; the "
-                            "dataset or sequence-length configuration is likely wrong"
+                            f"skipped {self._skipped_prompts} prompts and this one also "
+                            f"exhausted its data budget, exceeding max_skipped_prompts="
+                            f"{policy.max_skipped_prompts}; the dataset or "
+                            "sequence-length configuration is likely wrong"
                         ) from error
+                    self._skipped_prompts += 1
                     print(
                         f"skipping prompt idx={input_sample['idx']} after "
                         f"{data_attempts} deterministic failure(s) ({reason}: {error})",
