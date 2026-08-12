@@ -31,6 +31,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
+from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
 from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
@@ -202,10 +203,14 @@ def apply_fp8_patches(self, fp8_config):
             patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
             fp8_state.vllm_patches.extend([patcher2, patcher3, patcher4])
 
-        # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
-        func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
-        patcher5 = patch(func5_path, process_weights_after_loading_kv)
-        fp8_state.vllm_patches.append(patcher5)
+        # Preserve separately refittable static KV scales.
+        if global_fp8_config.kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
+            func5_path = (
+                "vllm.model_executor.layers.quantization.kv_cache."
+                "BaseKVCacheMethod.process_weights_after_loading"
+            )
+            patcher5 = patch(func5_path, process_weights_after_loading_kv)
+            fp8_state.vllm_patches.append(patcher5)
 
     for p in fp8_state.vllm_patches:
         p.start()
