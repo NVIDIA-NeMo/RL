@@ -28,6 +28,7 @@
 #   VAL_DATA_PATH (=TRAIN_DATA_PATH), CONFIG_FILE (yaml next to this script)
 #   TP/EP/CP/PP/VLLM_TP, SEQLEN, PPS/GPP/GBS, LR, MAX_NUM_STEPS
 #   SC_MODE (1), MIN_PROMPT_GROUPS (=PPS), MIP (=PPS; async_rl.max_inflight_prompts)
+#   MBR (=PPS*(MAX_TRAJECTORY_AGE_STEPS+1); async_rl.max_buffered_rollouts)
 #   OVER_SAMPLING (false), FORCE_IN_ORDER (true)
 #       streaming-1 (default): OVER_SAMPLING=false FORCE_IN_ORDER=true
 #           — no over-generation, each step consumes the groups dispatched
@@ -149,6 +150,10 @@ MIN_PROMPT_GROUPS="${MIN_PROMPT_GROUPS:-${PPS}}"
 # the semaphore bounding how many prompt rollouts the rollout pump runs at once.
 # Default = PPS (one step's worth in flight). Larger values overlap more generation.
 MIP="${MIP:-${PPS}}"
+# Cap on committed rollouts held in the replay buffer (SC only): async_rl.max_buffered_rollouts.
+# Default = PPS * (MAX_TRAJECTORY_AGE_STEPS + 1): one step's groups per in-window
+# weight version (the current one plus MAX_TRAJECTORY_AGE_STEPS stale ones).
+MBR="${MBR:-$((PPS * (MAX_TRAJECTORY_AGE_STEPS + 1)))}"
 NORMALIZE_REWARDS=True
 OVERLONG_FILTERING=True
 VAL_PERIOD="${VAL_PERIOD:-1000}"
@@ -191,8 +196,8 @@ WANDB_PROJ="${WANDB_PROJ:-nemo-rl-swe-bench}"
 LOG_GYM_RESPONSES=true
 
 # ========================= Experiment naming =========================
-SYNC_MODE="async-age${MAX_TRAJECTORY_AGE_STEPS}"
-EXP_SUFFIX="${EXP_SUFFIX:-swe-sc@${RUN_COMMIT}-${SYNC_MODE}-pps${PPS}-mip${MIP}-gpp${GPP}-gbs${GBS}-lr${LR}-tp${TP}}"
+SYNC_MODE="sc-mode${SC_MODE}-async-age${MAX_TRAJECTORY_AGE_STEPS}"
+EXP_SUFFIX="${EXP_SUFFIX:-swe-sc@${RUN_COMMIT}-${SYNC_MODE}-gennode${NUM_GEN_NODES}-pps${PPS}-mip${MIP}-mbr${MBR}-gpp${GPP}-gbs${GBS}-lr${LR}-tp${TP}}"
 WANDB_NAME="${EXP_SUFFIX}"
 EXP_NAME="${EXP_SUFFIX}"
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${RUN_DIR}/results}"
@@ -376,7 +381,7 @@ if [ "${SC_MODE}" = "1" ]; then
   ++async_rl.max_weight_staleness_versions=${MAX_TRAJECTORY_AGE_STEPS} \
   ++async_rl.min_prompt_groups_per_batch=${MIN_PROMPT_GROUPS} \
   ++async_rl.max_inflight_prompts=${MIP} \
-  ++async_rl.max_buffered_rollouts=$((PPS * (MAX_TRAJECTORY_AGE_STEPS + 1))) \
+  ++async_rl.max_buffered_rollouts=${MBR} \
   ++async_rl.batch_selection_strategy=${BATCH_SELECTION_STRATEGY} \
   ++async_rl.over_sampling=${OVER_SAMPLING} \
   ++async_rl.force_in_order=${FORCE_IN_ORDER}"
@@ -527,7 +532,7 @@ echo "Nodes: ${NUM_NODES} total (generation carves out ${NUM_GEN_NODES})    Time
 echo "Container:  ${CONTAINER}"
 echo "Parallelism: TP=${TP}, EP=${EP}, CP=${CP}, PP=${PP}, vLLM_TP=${VLLM_TP}, pad=${MAKE_SEQ_DIVISIBLE_BY}"
 echo "Training: PPS=${PPS}, GPP=${GPP}, GBS=${GBS}, LR=${LR}, seqlen=${SEQLEN}, max_steps=${MAX_NUM_STEPS:-<yaml>}, min_prompt_groups=${MIN_PROMPT_GROUPS}, max_inflight_prompts=${MIP}"
-echo "Streaming: over_sampling=${OVER_SAMPLING}, force_in_order=${FORCE_IN_ORDER}, age=${MAX_TRAJECTORY_AGE_STEPS}"
+echo "Streaming: over_sampling=${OVER_SAMPLING}, force_in_order=${FORCE_IN_ORDER}, age=${MAX_TRAJECTORY_AGE_STEPS}, max_buffered_rollouts=${MBR}"
 echo "Model: ${MODEL_PATH}"
 echo "Checkpoint: ${CHECKPOINT_DIR}"
 echo "WandB: ${WANDB_PROJ}/${WANDB_NAME}"
