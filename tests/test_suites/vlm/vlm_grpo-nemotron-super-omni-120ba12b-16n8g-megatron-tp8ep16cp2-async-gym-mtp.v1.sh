@@ -17,10 +17,6 @@ exit_if_max_steps_reached
 # mtp_loss_scaling_factor 0.0, so it stays available for speculative decoding
 # without contributing to the objective.
 #
-# Requires patches/mtp-sp-scatter.patch applied to the pinned Megatron-LM. Without
-# it the MTP embedding is never scattered for sequence parallelism and the run
-# dies in _concat_embeddings with a size mismatch. See patches/README.md.
-#
 # The checkpoint and multimodal Gym blend are too large to ship with the repo, so
 # this driver is parameterized and listed in disabled.txt rather than a nightly
 # suite. examples/nemo_gym/nemotron-3-super-omni/super_omni_launch.sh is the

@@ -21,9 +21,6 @@ exit_if_max_steps_reached
 # tagged parameters from the main norm), so a grad_norm excursion here is not
 # explained by MTP clipping and needs a different cause.
 #
-# Requires patches/mtp-sp-scatter.patch applied to the pinned Megatron-LM. See
-# patches/README.md.
-#
 # The checkpoint and multimodal Gym blend are too large to ship with the repo, so
 # this driver is parameterized and listed in disabled.txt rather than a nightly
 # suite. examples/nemo_gym/nemotron-3-super-omni/super_omni_launch.sh is the
