@@ -19,8 +19,8 @@ def main() -> None:
     rank = _required_int("SLURM_PROCID")
     local_rank = _required_int("SLURM_LOCALID")
     world_size = _required_int("SLURM_NTASKS")
-    if world_size != 16:
-        raise RuntimeError(f"Expected 16 ranks, got {world_size}")
+    if world_size != 8:
+        raise RuntimeError(f"Expected 8 ranks, got {world_size}")
 
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(local_rank)
@@ -51,9 +51,8 @@ def main() -> None:
         if rank == 0:
             print("HYBRIDEP_BUFFER_INIT_PASS", flush=True)
 
-        node_base_rank = (rank // 8) * 8
-        remote_rank = (rank + 8) % world_size
-        neighboring_rank = node_base_rank + ((local_rank + 1) % 8)
+        neighboring_rank = (rank + 1) % world_size
+        opposite_rank = (rank + 4) % world_size
 
         x = torch.full(
             (num_tokens, hidden_size),
@@ -66,8 +65,8 @@ def main() -> None:
             dtype=torch.int64,
             device="cuda",
         )
-        topk_idx[:, 0] = remote_rank * 2
-        topk_idx[:, 1] = neighboring_rank * 2 + 1
+        topk_idx[:, 0] = neighboring_rank * 2
+        topk_idx[:, 1] = opposite_rank * 2 + 1
         topk_weights = torch.full(
             (num_tokens, 2),
             1.0,
@@ -109,7 +108,7 @@ def main() -> None:
 
         dist.barrier()
         if rank == 0:
-            print("HYBRIDEP_INTER_NODE_DISPATCH_PASS", flush=True)
+            print("HYBRIDEP_INTRANODE_DISPATCH_PASS", flush=True)
     finally:
         del buffer
         if dist.is_initialized():

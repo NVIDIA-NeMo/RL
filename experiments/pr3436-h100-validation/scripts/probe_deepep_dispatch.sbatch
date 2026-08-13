@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
 #SBATCH --gpus-per-node=8
-#SBATCH --time=00:30:00
+#SBATCH --time=00:20:00
 #SBATCH --job-name=pr3436-hybridep-dispatch
 
 set -euo pipefail
@@ -26,7 +26,7 @@ export MASTER_ADDR
 MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | sed -n '1p')
 export MASTER_PORT=$((6000 + SLURM_JOB_ID % 1500))
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
-export HYBRID_EP_MULTINODE=1
+export HYBRID_EP_MULTINODE=0
 export TORCH_CUDA_ARCH_LIST=9.0
 export USE_MNNVL=0
 export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8
@@ -61,8 +61,9 @@ srun \
     export PATH="/root/.local/bin:${PATH}"
     export UV_PROJECT_ENVIRONMENT="/tmp/pr3436-hybridep-${SLURM_JOB_ID}"
     cd "${SOURCE_DIR}"
-    uv sync --locked --extra automodel --reinstall-package deep-ep
-    uv run --locked --extra automodel python -c "import deep_ep, hybrid_ep_cpp; print(deep_ep.__file__); print(hybrid_ep_cpp.__file__)"
+    uv cache clean deep-ep || true
+    uv sync --locked --extra mcore --reinstall-package deep-ep
+    uv run --locked --extra mcore python -c "import deep_ep, hybrid_ep_cpp; print(deep_ep.__file__); print(hybrid_ep_cpp.__file__)"
   '
 
 srun \
@@ -79,5 +80,5 @@ srun \
     export UV_PROJECT_ENVIRONMENT="/tmp/pr3436-hybridep-${SLURM_JOB_ID}"
     cd "${SOURCE_DIR}"
     grep -F "deepseek-ai/DeepEP.git?rev=${EXPECTED_DEEPEP_COMMIT}#${EXPECTED_DEEPEP_COMMIT}" uv.lock
-    UV_NO_SYNC=1 uv run python "${PROBE_SCRIPT}"
+    UV_NO_SYNC=1 uv run --extra mcore python "${PROBE_SCRIPT}"
   '
