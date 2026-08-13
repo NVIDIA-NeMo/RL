@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
     message_log_to_flat_messages,
 )
+from nemo_rl.data.multimodal_utils import PackedTensor
 
 
 @pytest.fixture
@@ -723,6 +724,34 @@ def test_message_log_to_flat_messages_with_packed_images() -> None:
     assert torch.equal(flat["token_ids"], torch.tensor([1, 2, 3]))
 
 
+@pytest.mark.parametrize("batched", [False, True])
+def test_flatten_rejects_mixed_packed_and_raw_media_values(batched: bool) -> None:
+    packed_log = [
+        {
+            "role": "user",
+            "content": "packed",
+            "token_ids": torch.tensor([1]),
+            "pixel_values": PackedTensor(torch.ones(1, 2), dim_to_pack=0),
+        }
+    ]
+    raw_log = [
+        {
+            "role": "user",
+            "content": "raw",
+            "token_ids": torch.tensor([2]),
+            "pixel_values": torch.ones(1, 2),
+        }
+    ]
+
+    with pytest.raises(TypeError, match="also contains non-packed values"):
+        if batched:
+            batched_message_log_to_flat_message(
+                [packed_log, raw_log], pad_value_dict={"token_ids": 0}
+            )
+        else:
+            message_log_to_flat_messages(packed_log + raw_log)
+
+
 def test_batched_message_log_to_flat_message_with_packed_images() -> None:
     from nemo_rl.data.multimodal_utils import PackedTensor
 
@@ -770,6 +799,39 @@ def test_batched_message_log_to_flat_message_with_packed_images() -> None:
     # total packed along dim 0 = 1 + (2 + 1) = 4
     assert tuple(batched["images"].as_tensor().shape) == (4, 3, 4, 4)
     assert torch.equal(input_lengths, torch.tensor([4, 5], dtype=torch.int32))
+
+
+def test_batched_message_log_rejects_mixed_multiturn_media() -> None:
+    compact_image = PackedTensor(
+        torch.randn(1, 3, 4, 4), dim_to_pack=0
+    ).enable_deduplication()
+    batch_logs: list[LLMMessageLogType] = [
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([1]),
+                "images": compact_image,
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([2]),
+                "images": PackedTensor(torch.randn(1, 3, 4, 4), dim_to_pack=0),
+            },
+            {
+                "role": "user",
+                "token_ids": torch.tensor([3]),
+                "images": PackedTensor(torch.randn(1, 3, 4, 4), dim_to_pack=0),
+            },
+        ],
+    ]
+
+    with pytest.raises(
+        AssertionError,
+        match="flattened_concat requires one logical row per input",
+    ):
+        batched_message_log_to_flat_message(batch_logs, pad_value_dict={"token_ids": 0})
 
 
 @pytest.mark.parametrize("image_first", [True, False])
@@ -920,6 +982,53 @@ def test_get_formatted_message_log_debug_off_by_default(
 
     captured = capsys.readouterr()
     assert "DEBUG: Individual message turns" not in captured.out
+
+
+@pytest.mark.parametrize("visual_first", [False, True])
+def test_batched_flatten_aligns_nested_sparse_multimodal_rows(visual_first):
+    media = PackedTensor(torch.ones(1, 3, 2, 2), dim_to_pack=0).enable_deduplication()
+    visual_log = [
+        {
+            "role": "user",
+            "content": "look",
+            "token_ids": torch.tensor([1]),
+            "pixel_values": media,
+        },
+        {
+            "role": "assistant",
+            "content": "seen",
+            "token_ids": torch.tensor([2]),
+        },
+    ]
+    text_log = [
+        {
+            "role": "user",
+            "content": "text only",
+            "token_ids": torch.tensor([3]),
+        },
+        {
+            "role": "assistant",
+            "content": "answer",
+            "token_ids": torch.tensor([4]),
+        },
+    ]
+    message_logs = [visual_log, text_log] if visual_first else [text_log, visual_log]
+
+    flat, _ = batched_message_log_to_flat_message(
+        message_logs, pad_value_dict={"token_ids": 0}
+    )
+    packed = flat["pixel_values"]
+
+    assert isinstance(packed, PackedTensor)
+    assert len(packed) == 2
+    assert packed.logical_segment_counts_by_row() == (
+        [1, 0] if visual_first else [0, 1]
+    )
+    assert len(packed.tensors) == 1
+    torch.testing.assert_close(
+        flat.get_multimodal_dict(as_tensors=True)["pixel_values"],
+        torch.ones(1, 3, 2, 2),
+    )
 
 
 def test_get_formatted_message_log_debug_enabled(
