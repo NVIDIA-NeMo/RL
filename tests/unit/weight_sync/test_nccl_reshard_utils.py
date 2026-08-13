@@ -557,3 +557,31 @@ def test_wire_safe_then_restore_reproduces_placements_and_meshes():
                 assert torch.equal(p[key].mesh, o[key].mesh)
             for key in ("src_placements", "dst_placements"):
                 assert p[key] == o[key]
+
+
+def test_wire_safe_pickle_is_independent_of_a_patched_storage_loader(monkeypatch):
+    # megatron.core replaces torch.storage._load_from_bytes at import time; a
+    # tensor pickled under the patch records the patcher's module path and
+    # cannot be unpickled without it. Mimic the patch with a dummy module and
+    # assert only the raw form references it — the invariant the wire-safe
+    # conversion exists to guarantee.
+    import io
+    import sys
+    import types
+
+    dummy = types.ModuleType("dummy_unpickler_module")
+
+    def _dummy_load_from_bytes(b):
+        return torch.load(io.BytesIO(b), weights_only=True)
+
+    _dummy_load_from_bytes.__module__ = "dummy_unpickler_module"
+    _dummy_load_from_bytes.__qualname__ = "_dummy_load_from_bytes"
+    dummy._dummy_load_from_bytes = _dummy_load_from_bytes
+    monkeypatch.setitem(sys.modules, "dummy_unpickler_module", dummy)
+    monkeypatch.setattr(torch.storage, "_load_from_bytes", _dummy_load_from_bytes)
+
+    info = _refit_info_for_wire()
+    wire = make_nccl_reshard_refit_info_wire_safe(info)
+
+    assert b"dummy_unpickler_module" in pickle.dumps(info)
+    assert b"dummy_unpickler_module" not in pickle.dumps(wire)
