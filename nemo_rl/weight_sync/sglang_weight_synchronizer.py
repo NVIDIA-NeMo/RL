@@ -149,27 +149,35 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         # still-valid in-place state.
         pause_mode = self._generation.pause_generation_mode
         self._generation.pause_generation(mode=pause_mode)
-        if pause_mode != "in_place":
-            self._generation.invalidate_kv_cache()
-
-        self._generation.begin_weight_update()
+        # Each acquired state gets its own guard: anything that raises between
+        # pausing and the transfer -- invalidate_kv_cache or begin_weight_update
+        # -- must still resume generation, or every engine stays paused for the
+        # rest of the run with no error pointing at why.
         try:
-            # The per-worker actor method awaits each chunk itself, but the
-            # policy-group dispatch still returns one Ray future per worker;
-            # await those here to wait for all trainer ranks.
-            ray.get(
-                self._send_buckets(
-                    rollout_engines=rollout_engines,
-                    rollout_engine_lock=rollout_engine_lock,
-                    buffer_size_bytes=buffer_size_bytes,
-                    target_precision=target_precision,
-                    sglang_quantization_cfg=sglang_quantization_cfg,
+            if pause_mode != "in_place":
+                self._generation.invalidate_kv_cache()
+
+            self._generation.begin_weight_update()
+            try:
+                # The per-worker actor method awaits each chunk itself, but the
+                # policy-group dispatch still returns one Ray future per worker;
+                # await those here to wait for all trainer ranks.
+                ray.get(
+                    self._send_buckets(
+                        rollout_engines=rollout_engines,
+                        rollout_engine_lock=rollout_engine_lock,
+                        buffer_size_bytes=buffer_size_bytes,
+                        target_precision=target_precision,
+                        sglang_quantization_cfg=sglang_quantization_cfg,
+                    )
                 )
-            )
+            finally:
+                # Only closes a session that actually opened: if
+                # begin_weight_update raised, this inner block never ran.
+                self._generation.end_weight_update()
         finally:
-            # Close the session and resume on every path, so a failed refit
-            # leaves the engine usable instead of wedged in the update state.
-            self._generation.end_weight_update()
+            # Resume on every path, so a failed refit leaves the engine usable
+            # instead of wedged in the update state.
             self._generation.continue_generation()
 
     def _timed_refit(self, timer: Optional[Timer]) -> None:

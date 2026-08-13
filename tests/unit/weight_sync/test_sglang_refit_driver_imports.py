@@ -68,12 +68,19 @@ def test_refit_path_never_imports_a_policy_worker(relative_path: str) -> None:
     """The refit must reach the workers through the policy facade, not directly."""
     tree = ast.parse((REPO_ROOT / relative_path).read_text())
 
-    imported = {
-        alias.name.split(".")[-1]
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.Import, ast.ImportFrom))
-        for alias in node.names
-    }
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[-1] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            # ``from ...workers.megatron_policy_worker import X`` puts the
+            # module on ``node.module`` and only the symbol on ``alias.name``,
+            # so collecting aliases alone never sees the offending module.
+            # ``from . import megatron_policy_worker`` is the opposite: the
+            # module arrives as an alias. Collect both.
+            if node.module:
+                imported.add(node.module.split(".")[-1])
+            imported.update(alias.name.split(".")[-1] for alias in node.names)
 
     offenders = sorted(imported & POLICY_WORKER_MODULES)
     assert not offenders, (
