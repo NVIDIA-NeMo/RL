@@ -267,6 +267,50 @@ class RawRewardAdvantageEstimator:
         return adv, None
 
 
+def raw_advantage_metrics(
+    advantages: torch.Tensor,
+    mask: torch.Tensor,
+    normalize_advantages: bool,
+) -> dict[str, float]:
+    """Stats on the PRE-whitening advantages, over valid tokens.
+
+    ``normalize_advantages`` rescales advantages to unit std every step, so the
+    post-whitening spread is 1.0 by construction and carries no information.
+    The pre-whitening spread does: with lambda=1 the advantage is ``R - V(s)``,
+    so ``adv_raw/std`` is the critic's residual scale and should SHRINK as the
+    critic improves.  A flat ``adv_raw/std`` alongside a flat
+    ``critic/explained_var`` is independent confirmation that the critic is not
+    learning.  ``whiten_gain`` is the amplification whitening applies (1/std); a
+    large and growing value means the loss is being scaled up to compensate for
+    a shrinking signal.
+
+    Shared by the token-level and turn-level estimators so the two arms report
+    the same diagnostic on the same axis.  Both call it on the TOKEN-level
+    advantages under the same ``mask`` the whitening uses -- in turn mode the
+    per-turn advantage has already been broadcast to every token of its turn
+    (``scatter_turns_to_tokens``), so the two are directly comparable, and
+    ``whiten_gain`` describes the rescaling that is actually applied.
+
+    Note: under :class:`ResidualBaselineEstimator` the inner estimator is fed
+    ``V~ = B_LOO + C``, so this measures the residual scale of the combined
+    group baseline plus critic, not of the critic alone.
+    """
+    m = mask.bool()
+    if int(m.sum()) < 2:
+        return {}
+    a = advantages[m].float()
+    std = a.std(unbiased=False)
+    metrics = {
+        "adv_raw/mean": a.mean().item(),
+        "adv_raw/std": std.item(),
+        "adv_raw/abs_mean": a.abs().mean().item(),
+        "adv_raw/max_abs": a.abs().max().item(),
+    }
+    if normalize_advantages:
+        metrics["adv_raw/whiten_gain"] = (1.0 / (std + 1e-8)).item()
+    return metrics
+
+
 class GeneralizedAdvantageEstimator:
     """Generalized Advantage Estimation (GAE) with temporal bootstrapping.
 
@@ -312,38 +356,6 @@ class GeneralizedAdvantageEstimator:
 
         # Populated by compute_advantage; surfaced by ppo.py into rollout metrics.
         self.last_metrics: dict[str, float] = {}
-
-    def _compute_raw_advantage_metrics(
-        self,
-        advantages: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> dict[str, float]:
-        """Stats on the PRE-whitening advantages, over valid tokens.
-
-        ``normalize_advantages`` rescales advantages to unit std every step, so
-        the post-whitening spread is 1.0 by construction and carries no
-        information.  The pre-whitening spread does: with lambda=1 the advantage
-        is ``R - V(s_t)``, so ``adv_raw/std`` is the critic's residual scale and
-        should SHRINK as the critic improves.  A flat ``adv_raw/std`` alongside a
-        flat ``critic/explained_var`` is independent confirmation that the critic
-        is not learning.  ``whiten_gain`` is the amplification whitening applies
-        (1/std); a large and growing value means the loss is being scaled up to
-        compensate for a shrinking signal.
-        """
-        m = mask.bool()
-        if int(m.sum()) < 2:
-            return {}
-        a = advantages[m].float()
-        std = a.std(unbiased=False)
-        metrics = {
-            "adv_raw/mean": a.mean().item(),
-            "adv_raw/std": std.item(),
-            "adv_raw/abs_mean": a.abs().mean().item(),
-            "adv_raw/max_abs": a.abs().max().item(),
-        }
-        if self.normalize_advantages:
-            metrics["adv_raw/whiten_gain"] = (1.0 / (std + 1e-8)).item()
-        return metrics
 
     def _reward_whiten(
         self,
@@ -494,7 +506,9 @@ class GeneralizedAdvantageEstimator:
 
         # Capture the pre-whitening advantage scale (critic-quality diagnostic)
         # BEFORE normalize_advantages pins the std to 1.0.
-        self.last_metrics = self._compute_raw_advantage_metrics(advantages, mask)
+        self.last_metrics = raw_advantage_metrics(
+            advantages, mask, self.normalize_advantages
+        )
 
         # Whiten advantages (optional) and zero out masked positions (always)
         if self.normalize_advantages:
@@ -701,15 +715,24 @@ class TurnLevelGeneralizedAdvantageEstimator:
         # the critic's mask does not cover are silently discarded.
         returns = scatter_turns_to_anchors(turn_returns, turn_spans, seq_len)
 
+        # Pre-whitening advantage scale, on the same token-level mask the
+        # whitening below uses -- captured BEFORE normalize_advantages pins the
+        # std to 1.0, exactly as the token-level estimator does.
+        raw_metrics = raw_advantage_metrics(advantages, mask, self.normalize_advantages)
+
         if self.normalize_advantages:
             adv_mean = masked_mean(advantages, mask)
             adv_var = masked_var(advantages, mask, adv_mean)
             advantages = (advantages - adv_mean) * torch.rsqrt(adv_var + 1e-8)
         advantages = torch.masked_fill(advantages, ~(mask.bool()), 0)
 
-        self.last_metrics = turn_level_metrics(
-            turn_values, turn_advantages, turn_spans, sample_mask
-        )
+        # Merge rather than assign: turn_level_metrics() would otherwise drop
+        # adv_raw/*, leaving the rollout dump unable to reconstruct unwhitened
+        # advantages on turn-level runs.
+        self.last_metrics = {
+            **raw_metrics,
+            **turn_level_metrics(turn_values, turn_advantages, turn_spans, sample_mask),
+        }
         return advantages, returns
 
 

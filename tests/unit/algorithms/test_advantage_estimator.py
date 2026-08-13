@@ -474,3 +474,71 @@ def test_ev_res_mixed_group_absent_without_group_info():
         )
         == {}
     )
+
+
+def _turn_cfg(normalize):
+    return {
+        "turn_gae_gamma": 1.0,
+        "turn_gae_lambda_value": 1.0,
+        "turn_gae_lambda_policy": 1.0,
+        "normalize_advantages": normalize,
+    }
+
+
+def test_turn_level_reports_raw_advantage_metrics():
+    """adv_raw/* must survive on the turn-level path, not just token-level.
+
+    turn_level_metrics() used to REPLACE last_metrics wholesale, so adv_raw/*
+    never reached the rollout dump under turn_gae -- and the dump reconstructs
+    unwhitened advantages as ``advantages * adv_raw_std + adv_raw_mean``, so it
+    was silently degraded to "absent" for exactly the runs the turn estimator
+    exists for. advantage/turn_std_prenorm is not a substitute: it is computed
+    over the ``[B, K]`` turn tensor, whereas the whitening applied here is a
+    token-level masked statistic.
+    """
+    prompt_ids, rewards, mask = _one_group([1.0, 0.0, 0.0, 0.0])
+    spans = _turn_spans()
+    values = torch.zeros_like(mask)
+
+    est = TurnLevelGeneralizedAdvantageEstimator(_turn_cfg(False), _LossCfg())
+    raw_adv, _ = est.compute_advantage(
+        prompt_ids, rewards, mask, values, turn_spans=spans
+    )
+    unnormalized = est.last_metrics
+
+    # Both families are present; neither clobbers the other.
+    assert {"adv_raw/mean", "adv_raw/std", "adv_raw/abs_mean", "adv_raw/max_abs"} <= (
+        unnormalized.keys()
+    )
+    assert "turn/total_turns" in unnormalized
+    # normalize_advantages off => no whitening is applied, so no gain is reported.
+    assert "adv_raw/whiten_gain" not in unnormalized
+
+    # With whitening off the returned advantages ARE the raw ones.
+    m = mask.bool()
+    torch.testing.assert_close(
+        unnormalized["adv_raw/std"], raw_adv[m].float().std(unbiased=False).item()
+    )
+    torch.testing.assert_close(
+        unnormalized["adv_raw/mean"], raw_adv[m].float().mean().item()
+    )
+
+    # Same inputs with whitening ON: adv_raw/* is captured BEFORE the rescale, so
+    # it is unchanged, while the returned advantages are now unit-std.
+    est_norm = TurnLevelGeneralizedAdvantageEstimator(_turn_cfg(True), _LossCfg())
+    white_adv, _ = est_norm.compute_advantage(
+        prompt_ids, rewards, mask, values, turn_spans=spans
+    )
+    normalized = est_norm.last_metrics
+    for key in ("adv_raw/mean", "adv_raw/std", "adv_raw/abs_mean", "adv_raw/max_abs"):
+        assert normalized[key] == pytest.approx(unnormalized[key])
+    assert normalized["adv_raw/whiten_gain"] == pytest.approx(
+        1.0 / (unnormalized["adv_raw/std"] + 1e-8)
+    )
+    # The whitening divides by sqrt(masked_var(...)), which is UNBIASED, so the
+    # post-whitening unbiased std is 1.0 while the biased one sits at
+    # sqrt((n-1)/n). Assert the convention the estimator actually applies.
+    assert white_adv[m].float().std(unbiased=True).item() == pytest.approx(
+        1.0, abs=1e-4
+    )
+    assert unnormalized["adv_raw/std"] != pytest.approx(1.0)
