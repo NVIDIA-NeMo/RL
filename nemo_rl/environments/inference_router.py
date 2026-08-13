@@ -15,25 +15,76 @@
 import subprocess
 import sys
 import time
+from typing import Literal
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
+
+RouterBackend = Literal["vllm_router", "smg"]
+RouterPolicy = Literal[
+    "random",
+    "round_robin",
+    "cache_aware",
+    "power_of_two",
+    "consistent_hash",
+    "rendezvous_hash",
+    "passthrough",
+    "least_load",
+    "manual",
+    "prefix_hash",
+]
+
+_BACKEND_POLICIES = {
+    "vllm_router": frozenset(
+        {
+            "random",
+            "round_robin",
+            "cache_aware",
+            "power_of_two",
+            "consistent_hash",
+        }
+    ),
+    "smg": frozenset(
+        {
+            "random",
+            "round_robin",
+            "cache_aware",
+            "power_of_two",
+            "consistent_hash",
+            "passthrough",
+            "least_load",
+            "manual",
+            "prefix_hash",
+        }
+    ),
+}
 
 
-class VllmRouterConfig(BaseModel, extra="forbid"):
+class InferenceRouterConfig(BaseModel, extra="forbid"):
     enabled: bool = False
-    policy: str = "consistent_hash"
+    backend: RouterBackend = "vllm_router"
+    policy: RouterPolicy = "consistent_hash"
+
+    @model_validator(mode="after")
+    def validate_backend_policy(self) -> "InferenceRouterConfig":
+        if self.policy not in _BACKEND_POLICIES[self.backend]:
+            supported = ", ".join(sorted(_BACKEND_POLICIES[self.backend]))
+            raise ValueError(
+                f"Router backend {self.backend!r} does not support policy "
+                f"{self.policy!r}; supported policies: {supported}"
+            )
+        return self
 
 
-class VllmRouterProcess:
+class InferenceRouterProcess:
     def __init__(
         self,
         worker_base_urls: list[str],
         host: str,
         port: int,
         prometheus_port: int,
-        config: VllmRouterConfig,
+        config: InferenceRouterConfig,
     ) -> None:
         self.worker_base_urls = [
             base_url.rstrip("/").removesuffix("/v1") for base_url in worker_base_urls
@@ -45,15 +96,36 @@ class VllmRouterProcess:
         self._process: subprocess.Popen | None = None
 
     @property
+    def name(self) -> str:
+        return "vLLM Router" if self.config.backend == "vllm_router" else "SMG"
+
+    @property
+    def session_affinity_header(self) -> str:
+        if self.config.backend == "vllm_router":
+            return "X-Session-ID"
+        return "X-SMG-Routing-Key"
+
+    @property
     def command(self) -> list[str]:
+        if self.config.backend == "vllm_router":
+            module = "vllm_router.launch_router"
+            policy = self.config.policy
+        else:
+            module = "smg.launch_router"
+            policy = (
+                "consistent_hashing"
+                if self.config.policy == "consistent_hash"
+                else self.config.policy
+            )
+
         return [
             sys.executable,
             "-m",
-            "vllm_router.launch_router",
+            module,
             "--worker-urls",
             *self.worker_base_urls,
             "--policy",
-            self.config.policy,
+            policy,
             "--host",
             self.host,
             "--port",
@@ -72,7 +144,7 @@ class VllmRouterProcess:
 
     def start(self) -> None:
         if self._process is not None:
-            raise RuntimeError("vLLM Router process has already been started")
+            raise RuntimeError(f"{self.name} process has already been started")
         self._process = subprocess.Popen(self.command)
 
     def wait_until_ready(
@@ -82,7 +154,7 @@ class VllmRouterProcess:
     ) -> None:
         process = self._process
         if process is None:
-            raise RuntimeError("vLLM Router process has not been started")
+            raise RuntimeError(f"{self.name} process has not been started")
 
         deadline = time.monotonic() + timeout
         while True:
@@ -90,7 +162,7 @@ class VllmRouterProcess:
             if return_code is not None:
                 self._process = None
                 raise RuntimeError(
-                    f"vLLM Router process exited with code {return_code} "
+                    f"{self.name} process exited with code {return_code} "
                     "before becoming ready"
                 )
 
@@ -106,12 +178,12 @@ class VllmRouterProcess:
 
             if time.monotonic() >= deadline:
                 raise TimeoutError(
-                    f"vLLM Router did not become ready within {timeout} seconds"
+                    f"{self.name} did not become ready within {timeout} seconds"
                 )
 
             time.sleep(poll_interval)
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: float = 10.0) -> None:
         process = self._process
         if process is None:
             return

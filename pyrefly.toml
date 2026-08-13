@@ -139,7 +139,7 @@ project-includes = [
   "nemo_rl/environments/metrics.py",
   "nemo_rl/environments/rewards.py",
   "nemo_rl/environments/utils.py",
-  "nemo_rl/environments/vllm_router.py",
+  "nemo_rl/environments/inference_router.py",
   "nemo_rl/environments/vlm_environment.py",
   "nemo_rl/evals/__init__.py",
   "nemo_rl/evals/answer_parsing.py",

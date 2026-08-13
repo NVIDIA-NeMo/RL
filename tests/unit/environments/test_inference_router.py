@@ -19,14 +19,14 @@ from urllib.error import URLError
 
 import pytest
 
-from nemo_rl.environments.vllm_router import (
-    VllmRouterConfig,
-    VllmRouterProcess,
+from nemo_rl.environments.inference_router import (
+    InferenceRouterConfig,
+    InferenceRouterProcess,
 )
 
 
-def test_builds_static_router_command_and_openai_base_url() -> None:
-    router = VllmRouterProcess(
+def test_builds_vllm_router_command_and_openai_base_url() -> None:
+    router = InferenceRouterProcess(
         worker_base_urls=[
             "http://worker-0:8000/v1",
             "http://worker-1:8001/v1/",
@@ -34,7 +34,7 @@ def test_builds_static_router_command_and_openai_base_url() -> None:
         host="10.0.0.5",
         port=6100,
         prometheus_port=6600,
-        config=VllmRouterConfig(enabled=True),
+        config=InferenceRouterConfig(enabled=True),
     )
 
     assert router.command == [
@@ -55,41 +55,86 @@ def test_builds_static_router_command_and_openai_base_url() -> None:
     ]
     assert router.openai_base_url == "http://10.0.0.5:6100/v1"
     assert router.readiness_url == "http://10.0.0.5:6100/readiness"
+    assert router.session_affinity_header == "X-Session-ID"
 
 
-def test_starts_and_stops_owned_router_process() -> None:
-    router = VllmRouterProcess(
+def test_builds_smg_command_and_maps_session_affinity() -> None:
+    router = InferenceRouterProcess(
         worker_base_urls=["http://worker-0:8000/v1"],
         host="10.0.0.5",
         port=6100,
         prometheus_port=6600,
-        config=VllmRouterConfig(enabled=True),
+        config=InferenceRouterConfig(
+            enabled=True,
+            backend="smg",
+            policy="consistent_hash",
+        ),
+    )
+
+    assert router.command == [
+        sys.executable,
+        "-m",
+        "smg.launch_router",
+        "--worker-urls",
+        "http://worker-0:8000",
+        "--policy",
+        "consistent_hashing",
+        "--host",
+        "10.0.0.5",
+        "--port",
+        "6100",
+        "--prometheus-port",
+        "6600",
+    ]
+    assert router.session_affinity_header == "X-SMG-Routing-Key"
+
+
+@pytest.mark.parametrize(
+    ("backend", "policy"),
+    [
+        ("vllm_router", "least_load"),
+        ("vllm_router", "rendezvous_hash"),
+        ("smg", "rendezvous_hash"),
+    ],
+)
+def test_rejects_policy_not_supported_by_backend(backend: str, policy: str) -> None:
+    with pytest.raises(ValueError, match="does not support policy"):
+        InferenceRouterConfig(backend=backend, policy=policy)
+
+
+def test_starts_and_stops_owned_router_process() -> None:
+    router = InferenceRouterProcess(
+        worker_base_urls=["http://worker-0:8000/v1"],
+        host="10.0.0.5",
+        port=6100,
+        prometheus_port=6600,
+        config=InferenceRouterConfig(enabled=True),
     )
     process = MagicMock()
     process.poll.return_value = None
 
     with patch(
-        "nemo_rl.environments.vllm_router.subprocess.Popen",
+        "nemo_rl.environments.inference_router.subprocess.Popen",
         return_value=process,
     ) as popen:
         router.start()
         popen.assert_called_once_with(router.command)
 
-        router.stop(timeout=2.0)
-        router.stop(timeout=2.0)
+        router.stop()
+        router.stop()
 
     process.terminate.assert_called_once_with()
-    process.wait.assert_called_once_with(timeout=2.0)
+    process.wait.assert_called_once_with(timeout=10.0)
     process.kill.assert_not_called()
 
 
 def test_force_kills_router_process_when_shutdown_times_out() -> None:
-    router = VllmRouterProcess(
+    router = InferenceRouterProcess(
         worker_base_urls=["http://worker-0:8000/v1"],
         host="10.0.0.5",
         port=6100,
         prometheus_port=6600,
-        config=VllmRouterConfig(enabled=True),
+        config=InferenceRouterConfig(enabled=True),
     )
     process = MagicMock()
     process.poll.return_value = None
@@ -99,7 +144,7 @@ def test_force_kills_router_process_when_shutdown_times_out() -> None:
     ]
 
     with patch(
-        "nemo_rl.environments.vllm_router.subprocess.Popen",
+        "nemo_rl.environments.inference_router.subprocess.Popen",
         return_value=process,
     ):
         router.start()
@@ -114,12 +159,12 @@ def test_force_kills_router_process_when_shutdown_times_out() -> None:
 
 
 def test_waits_until_router_is_ready() -> None:
-    router = VllmRouterProcess(
+    router = InferenceRouterProcess(
         worker_base_urls=["http://worker-0:8000/v1"],
         host="10.0.0.5",
         port=6100,
         prometheus_port=6600,
-        config=VllmRouterConfig(enabled=True),
+        config=InferenceRouterConfig(enabled=True),
     )
     process = MagicMock()
     process.poll.return_value = None
@@ -130,14 +175,14 @@ def test_waits_until_router_is_ready() -> None:
 
     with (
         patch(
-            "nemo_rl.environments.vllm_router.subprocess.Popen",
+            "nemo_rl.environments.inference_router.subprocess.Popen",
             return_value=process,
         ),
         patch(
-            "nemo_rl.environments.vllm_router.urlopen",
+            "nemo_rl.environments.inference_router.urlopen",
             side_effect=[URLError("not ready"), ready_response],
         ) as urlopen,
-        patch("nemo_rl.environments.vllm_router.time.sleep") as sleep,
+        patch("nemo_rl.environments.inference_router.time.sleep") as sleep,
     ):
         router.start()
         router.wait_until_ready(timeout=10.0, poll_interval=0.25)
@@ -150,22 +195,22 @@ def test_waits_until_router_is_ready() -> None:
 
 
 def test_readiness_fails_when_router_process_exits() -> None:
-    router = VllmRouterProcess(
+    router = InferenceRouterProcess(
         worker_base_urls=["http://worker-0:8000/v1"],
         host="10.0.0.5",
         port=6100,
         prometheus_port=6600,
-        config=VllmRouterConfig(enabled=True),
+        config=InferenceRouterConfig(enabled=True),
     )
     process = MagicMock()
     process.poll.return_value = 17
 
     with (
         patch(
-            "nemo_rl.environments.vllm_router.subprocess.Popen",
+            "nemo_rl.environments.inference_router.subprocess.Popen",
             return_value=process,
         ),
-        patch("nemo_rl.environments.vllm_router.urlopen") as urlopen,
+        patch("nemo_rl.environments.inference_router.urlopen") as urlopen,
     ):
         router.start()
         with pytest.raises(RuntimeError, match="exited with code 17"):
@@ -175,26 +220,26 @@ def test_readiness_fails_when_router_process_exits() -> None:
 
 
 def test_readiness_times_out() -> None:
-    router = VllmRouterProcess(
+    router = InferenceRouterProcess(
         worker_base_urls=["http://worker-0:8000/v1"],
         host="10.0.0.5",
         port=6100,
         prometheus_port=6600,
-        config=VllmRouterConfig(enabled=True),
+        config=InferenceRouterConfig(enabled=True),
     )
     process = MagicMock()
     process.poll.return_value = None
 
     with (
         patch(
-            "nemo_rl.environments.vllm_router.subprocess.Popen",
+            "nemo_rl.environments.inference_router.subprocess.Popen",
             return_value=process,
         ),
         patch(
-            "nemo_rl.environments.vllm_router.urlopen",
+            "nemo_rl.environments.inference_router.urlopen",
             side_effect=URLError("not ready"),
         ),
-        patch("nemo_rl.environments.vllm_router.time.sleep") as sleep,
+        patch("nemo_rl.environments.inference_router.time.sleep") as sleep,
     ):
         router.start()
         with pytest.raises(TimeoutError, match="did not become ready"):
