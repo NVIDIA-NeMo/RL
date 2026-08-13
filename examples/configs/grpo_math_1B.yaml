@@ -302,8 +302,59 @@ policy:
     loss_weight: 0.1
     num_layers: null
     aux_layer_indices: null
+    # Optional draft-only optimizer group: lr/min_lr/weight_decay apply to
+    # `draft_model.*` params only, so the draft can train much faster than the
+    # policy (FastGRPO uses ~50x the policy LR). The schedule shape (warmup
+    # iters, decay style) is shared with the policy; min_lr defaults to lr when
+    # unset. All null = draft shares megatron_cfg.optimizer settings.
+    # When set, the draft (lr, min_lr) pair must differ from the policy's —
+    # it identifies the draft param group when a resumed run maps checkpointed
+    # optimizer state back onto param groups (setup rejects an identical pair,
+    # and changing draft lr between save and resume fails at checkpoint load).
+    lr: null
+    min_lr: null
+    weight_decay: null
+    # Multi-pass TTT draft training. 1 (default) = stock single-pass path;
+    # >1 runs that many sequential draft passes with the trunk+branch
+    # two-part attention (pass-d RoPE positions are offset by d-1,
+    # inference-aligned). Requires context_parallel_size=1,
+    # sequence_parallel=false, sequence_packing off, and
+    # use_fused_linear_logprobs off.
+    ttt_steps: 1
+    # Per-pass loss weights alpha_d (list of length ttt_steps);
+    # null = uniform 1.0.
+    ttt_pass_weights: null
+    # Draft algorithm: "eagle3" (default; the keys above), or the block
+    # drafters "dflash"/"dspark" (vLLM >= 0.26 serving). Block drafters plant
+    # N anchor blocks per sequence (anchor token + mask tokens, bidirectional
+    # inside the block, trunk truncated at the anchor) instead of a full-seq
+    # causal pass; they additionally require pipeline_model_parallel_size=1.
+    method: "eagle3"
+    # ---- dflash/dspark only ----
+    # Speculated tokens per block (vLLM num_speculative_tokens).
+    gamma: 8
+    # Anchors sampled per sequence (static shape; short sequences pad with
+    # masked dummy blocks).
+    anchors_per_seq: 64
+    # Restrict anchors to generation segments (token_loss_mask==1 labels);
+    # tool/user spans are prefill at serving time and never drafted.
+    anchor_from_generation_only: true
+    # REQUIRED for dflash/dspark: a reserved, unused-in-data token id. Mask
+    # slots embed via the target's FROZEN embedding row at this id (official
+    # DFlash contract — never trained; serving reads the same row from the
+    # shared target embedding).
+    mask_token_id: null
+    # DFlash exponential position-decay for slot j: weight = loss_decay^j.
+    # null/1.0 = uniform.
+    loss_decay: null
+    # DSpark Markov-head rank (low-rank vocab->vocab transition bias).
+    markov_rank: 64
+    # Trunk-attention bucketing granularity (tokens); correctness-neutral.
+    trunk_chunk: 1024
+    # Draft attention uses per-head q/k RMSNorm (Qwen3 style).
+    qk_layernorm: true
 
-  # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
+  # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.
   dynamic_batching:
     enabled: False
