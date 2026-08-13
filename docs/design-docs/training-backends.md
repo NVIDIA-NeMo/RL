@@ -57,6 +57,33 @@ dictionaries follow the hierarchy of nested model-config objects. NeMo
 RL-specific settings such as optimizer, scheduler, checkpointing, and
 environment variables remain under their existing `megatron_cfg` sections.
 
+#### Optimizer CPU Offload
+
+The Megatron backend can use Megatron Core's `HybridDeviceOptimizer` to keep a
+fraction of optimizer state and optimizer computation on CPU:
+
+```yaml
+policy:
+  megatron_cfg:
+    optimizer:
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 0.5
+      overlap_cpu_optimizer_d2h_h2d: true
+```
+
+`optimizer_offload_fraction` must be greater than `0` and at most `1`. A value
+of `1.0` fully offloads the optimizer; smaller values trade less GPU memory
+savings for more GPU-resident optimizer work. Enabling
+`overlap_cpu_optimizer_d2h_h2d` lets Megatron Core overlap optimizer state
+transfers with CPU optimizer updates.
+
+Megatron Core owns optimizer state placement while this mode is enabled, so
+NeMo RL does not run its generic per-phase optimizer move during colocated
+training and generation. With fractional offload, the non-offloaded optimizer
+state remains GPU resident; choose a fraction that leaves enough GPU memory for
+the colocated generation backend. Optimizer CPU offload is independent of
+activation CPU offload.
+
 ### DTensor Backend
 To enable DTensor (FSDP2) training:
 

@@ -1111,11 +1111,9 @@ def _validate_optimizer_config(config: PolicyConfig) -> None:
         "optimizer_offload_fraction"
     ]
 
-    if optimizer_cpu_offload:
-        # Currently, hybrid optimizer (partly on GPU and partly on CPU) is not supported because it conflicts with the way
-        # Nemo-rl handles the optimizer offload/onload between generation and training. So if using CPU optimizer the offload_fraction should be 1.0.
-        assert optimizer_offload_fraction == 1.0, (
-            "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
+    if optimizer_cpu_offload and not 0 < optimizer_offload_fraction <= 1:
+        raise ValueError(
+            "optimizer_cpu_offload=True requires 0 < optimizer_offload_fraction <= 1"
         )
 
 
