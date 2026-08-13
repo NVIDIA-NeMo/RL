@@ -2688,7 +2688,7 @@ def _validation_early_stop_message(
     )
 
 
-def grpo_train(
+def _grpo_train_impl(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
@@ -3800,13 +3800,11 @@ def grpo_train(
                 return
             if should_save_by_timeout:
                 checkpointer.shutdown()
-                shutdown_environments(task_to_env, val_task_to_env)
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
                 checkpointer.shutdown()
-                shutdown_environments(task_to_env, val_task_to_env)
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
                     "Max number of steps has been reached, stopping training early",
@@ -3823,10 +3821,42 @@ def grpo_train(
     # so without this the daemon finalization thread would be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
-    # Environments own long-lived server subprocesses (NeMo-Gym runs ~60 per
-    # actor), so they have to be stopped on every exit from the synchronous
-    # trainer too, not just the async one.
-    shutdown_environments(task_to_env, val_task_to_env)
+
+
+def grpo_train(
+    policy: ColocatablePolicyInterface,
+    policy_generation: Optional[GenerationInterface],
+    wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: LossFunction,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    grpo_save_state: GRPOSaveState,
+    master_config: MasterConfig,
+    processor: Optional[AutoProcessor] = None,
+) -> None:
+    """Run GRPO training and always tear down its environments."""
+    try:
+        _grpo_train_impl(
+            policy,
+            policy_generation,
+            wrapped_dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            grpo_save_state,
+            master_config,
+            processor,
+        )
+    finally:
+        shutdown_environments(task_to_env, val_task_to_env)
 
 
 def validate(

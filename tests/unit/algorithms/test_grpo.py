@@ -4651,3 +4651,33 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+def test_grpo_train_shuts_down_environments_after_failure():
+    task_to_env = {"nemo_gym": MagicMock()}
+    val_task_to_env = task_to_env
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo._grpo_train_impl",
+            side_effect=RuntimeError("rollout failed"),
+        ),
+        patch("nemo_rl.algorithms.grpo.shutdown_environments") as shutdown,
+        pytest.raises(RuntimeError, match="rollout failed"),
+    ):
+        grpo_train(
+            policy=MagicMock(),
+            policy_generation=MagicMock(),
+            wrapped_dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            grpo_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, val_task_to_env)
