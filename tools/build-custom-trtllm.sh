@@ -171,14 +171,20 @@ sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND
     cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt
 
 # nvshmem doesn't accept the 'f' suffix CMake >= 3.31 generates for Blackwell /
-# Rubin ('100f-real', '107f-real'). Hardcode the bare arch for the nvshmem cmake
+# Rubin ('100f-real', '107f-real'). Substitute bare archs for the nvshmem cmake
 # call only; DeepEP kernels keep the full arch string for FP4 support.
-# NOTE: this is pinned to Rubin (107) to match _DEFAULT_ARCH below. Overriding
-# BUILD_CUSTOM_TRTLLM_ARCH for a Blackwell build does NOT change this line --
-# building for Blackwell also requires changing 107 back to 100 here.
+#
+# The semicolon MUST stay backslash-escaped. This lands inside the
+# CMAKE_CACHE_ARGS list of an ExternalProject_Add, where ';' is CMake's list
+# separator: an unescaped '100;107' would split into two arguments
+# ('-D...STRING=100' plus a stray '107') instead of one cache entry holding a
+# two-element list. In the sed replacement below '\\;' emits a literal '\;'.
+#
+# NOTE: this list does not track BUILD_CUSTOM_TRTLLM_ARCH -- it is hardcoded and
+# must be edited by hand to stay consistent with _DEFAULT_ARCH in _backend.py.
 assert_patch_target cpp/tensorrt_llm/deep_ep/CMakeLists.txt \
     '-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}'
-sed -i 's|-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}|-DCMAKE_CUDA_ARCHITECTURES:STRING=107|' \
+sed -i 's|-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}|-DCMAKE_CUDA_ARCHITECTURES:STRING=100\\;107|' \
     cpp/tensorrt_llm/deep_ep/CMakeLists.txt
 
 # SM arch list. Sourced from BUILD_CUSTOM_TRTLLM_ARCH so it stays in sync with
@@ -190,8 +196,8 @@ sed -i 's|-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}|-DCMAK
 #             sm_103, H100 sm_90, A100 sm_80, L40 sm_89, RTX 50-series sm_120)
 #             need this list extended via BUILD_CUSTOM_TRTLLM_ARCH -- and, for
 #             non-Rubin targets, the nvshmem arch patch above changed to match.
-ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-107-real}"
-JOBS="${TRTLLM_BUILD_JOBS:-24}"
+ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-100-real;107-real}"
+JOBS="${TRTLLM_BUILD_JOBS:-64}"
 NPROC=$(nproc 2>/dev/null || echo "$JOBS")
 if (( JOBS > NPROC )); then
     JOBS=$NPROC
