@@ -34,6 +34,15 @@ srun \
       command -v ibdev2netdev >/dev/null && ibdev2netdev || true
       echo "ibstat"
       command -v ibstat >/dev/null && ibstat || true
+      echo "rdma_gids"
+      if command -v show_gids >/dev/null; then
+        show_gids
+      else
+        for gid_file in /sys/class/infiniband/mlx5_*/ports/1/gids/*; do
+          printf "%s=" "${gid_file}"
+          cat "${gid_file}"
+        done
+      fi
       echo "gdrcopy"
       ls -l /dev/gdrdrv 2>/dev/null || true
       lsmod | grep -E "^gdrdrv" || true
