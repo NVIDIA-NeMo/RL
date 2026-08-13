@@ -75,7 +75,9 @@ policy:
 of `1.0` fully offloads the optimizer; smaller values trade less GPU memory
 savings for more GPU-resident optimizer work. Enabling
 `overlap_cpu_optimizer_d2h_h2d` lets Megatron Core overlap optimizer state
-transfers with CPU optimizer updates.
+transfers with CPU optimizer updates. At high offload fractions, CPU Adam can
+dominate iteration time; enable this overlap to hide D2H and H2D transfers
+behind the CPU optimizer step.
 
 Megatron Core owns optimizer state placement while this mode is enabled, so
 NeMo RL does not run its generic per-phase optimizer move during colocated

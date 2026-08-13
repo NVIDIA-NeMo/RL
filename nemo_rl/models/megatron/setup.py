@@ -1106,14 +1106,19 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
     """Validate optimizer configuration."""
-    optimizer_cpu_offload = config["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
-    optimizer_offload_fraction = config["megatron_cfg"]["optimizer"][
-        "optimizer_offload_fraction"
-    ]
+    optimizer_config = config["megatron_cfg"]["optimizer"]
+    optimizer_cpu_offload = optimizer_config["optimizer_cpu_offload"]
+    optimizer_offload_fraction = optimizer_config["optimizer_offload_fraction"]
 
     if optimizer_cpu_offload and not 0 < optimizer_offload_fraction <= 1:
         raise ValueError(
             "optimizer_cpu_offload=True requires 0 < optimizer_offload_fraction <= 1"
+        )
+    if not optimizer_cpu_offload and optimizer_config.get(
+        "overlap_cpu_optimizer_d2h_h2d", False
+    ):
+        raise ValueError(
+            "overlap_cpu_optimizer_d2h_h2d=True requires optimizer_cpu_offload=True"
         )
 
 
