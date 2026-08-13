@@ -35,6 +35,10 @@ import ray
 
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.refit_transaction import (
+    shutdown_refit_participants,
+    wait_for_real_quant_refit,
+)
 
 
 class IPCWeightSynchronizer(WeightSynchronizer):
@@ -62,6 +66,7 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         self._generation = generation
         self._refit_buffer_size_gb = refit_buffer_size_gb
         self._stale = True
+        self._fatal_refit_error: Exception | None = None
 
     def sync_weights(
         self,
@@ -69,6 +74,14 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        if self._fatal_refit_error is not None:
+            raise RuntimeError(
+                "Real-quant refit is unusable after a prior failed transaction"
+            ) from self._fatal_refit_error
+
+        # A repeated refit must become stale before transfer starts; otherwise
+        # an exception can leave a previously successful synchronizer fresh.
+        self._stale = True
         self._policy.offload_before_refit()
         self._generation.prepare_for_generation(tags=["weights"])
 
@@ -88,8 +101,13 @@ class IPCWeightSynchronizer(WeightSynchronizer):
                 )
                 futures_inference = self._generation.update_weights_via_ipc_zmq()
 
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
+                if self._generation.cfg.get("real_quant"):
+                    results = wait_for_real_quant_refit(
+                        futures_train, futures_inference
+                    )
+                else:
+                    ray.get(futures_train)
+                    results = ray.get(futures_inference)
                 update_success = all(result for result in results if result is not None)
 
                 if not update_success:
@@ -98,9 +116,18 @@ class IPCWeightSynchronizer(WeightSynchronizer):
                         "This often indicates an issue with cuda-ipc or the vLLM worker."
                     )
             sync_succeeded = True
+            if self._generation.cfg.get("real_quant"):
+                print("ModelOpt real-quant refit transaction completed", flush=True)
+        except Exception as error:
+            if self._generation.cfg.get("real_quant"):
+                self._fatal_refit_error = error
+                shutdown_refit_participants(self._policy, self._generation, error)
+            raise
         finally:
-            self._policy.offload_after_refit()
-            self._generation.prepare_for_generation(tags=["kv_cache"])
+            if self._fatal_refit_error is None:
+                self._policy.offload_after_refit()
+            if sync_succeeded:
+                self._generation.prepare_for_generation(tags=["kv_cache"])
 
         self._stale = not sync_succeeded
 

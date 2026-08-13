@@ -30,6 +30,18 @@ assert_not_grep() {
     fi
 }
 
+assert_grep_count_at_least() {
+    local pattern=$1
+    local expected=$2
+    local file=$3
+    local actual
+    actual=$(grep -c "$pattern" "$file" || true)
+    if (( actual < expected )); then
+        echo "[FAIL] expected at least $expected matches for '$pattern' in $file, found $actual"
+        exit 1
+    fi
+}
+
 run_quant_rollout_case() {
     local case_name=$1
     local quant_cfg=$2
@@ -37,6 +49,7 @@ run_quant_rollout_case() {
     local gen_kl_error_step1_max=$4
     local token_mult_prob_error_max=$5
     local model_name=$6
+    local max_num_steps=1
     local log_dir="$EXP_DIR/$case_name/logs"
     local metrics_json="$EXP_DIR/$case_name/metrics.json"
     local run_log="$EXP_DIR/$case_name/run.log"
@@ -49,10 +62,13 @@ run_quant_rollout_case() {
     fi
     local megatron_cache_dir="$megatron_cache_root/$case_name-$quant_cfg_hash"
     local real_quant_override=()
+    local generation_quant_cfg=$quant_cfg
     shift 6
 
     if [[ "$real_quant" == "true" ]]; then
         real_quant_override+=(++policy.generation.real_quant=true)
+        generation_quant_cfg=null
+        max_num_steps=2
     fi
 
     rm -rf "$EXP_DIR/$case_name"
@@ -67,7 +83,7 @@ run_quant_rollout_case() {
         policy.model_name=$model_name \
         policy.tokenizer.name=$model_name \
         policy.quant_cfg=$quant_cfg \
-        policy.generation.quant_cfg=$quant_cfg \
+        policy.generation.quant_cfg=$generation_quant_cfg \
         policy.quant_calib_size=4 \
         policy.quant_batch_size=1 \
         policy.quant_sequence_length=128 \
@@ -81,7 +97,7 @@ run_quant_rollout_case() {
         policy.generation.vllm_cfg.enforce_eager=true \
         grpo.num_prompts_per_step=2 \
         grpo.num_generations_per_prompt=2 \
-        grpo.max_num_steps=1 \
+        grpo.max_num_steps=$max_num_steps \
         grpo.val_period=1 \
         grpo.max_val_samples=8 \
         grpo.val_batch_size=8 \
@@ -107,6 +123,11 @@ run_quant_rollout_case() {
         assert_grep "Detected ModelOpt NVFP4 checkpoint" "$run_log"
         assert_not_grep "FakeQuantWorker" "$run_log"
         assert_not_grep "VLLM_QUANT_CFG" "$run_log"
+        assert_grep_count_at_least \
+            "ModelOpt real-quant refit transaction completed" 2 "$run_log"
+        uv run --no-sync --extra modelopt --group test tests/check_metrics.py "$metrics_json" \
+            'len(data["train/gen_kl_error"]) == 2' \
+            'len(data["train/token_mult_prob_error"]) == 2'
     else
         assert_grep "FakeQuantWorker" "$run_log"
         assert_grep "VllmQuantGenerationWorker.*Inserted [1-9][0-9]* quantizers" "$run_log"
@@ -115,6 +136,7 @@ run_quant_rollout_case() {
 }
 
 run_quant_rollout_case w4a16_real_quant examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml true 0.003 1.05 Qwen/Qwen2.5-0.5B "$@"
+run_quant_rollout_case w4a4_real_quant NVFP4_DEFAULT_CFG true 0.02 1.15 Qwen/Qwen2.5-0.5B "$@"
 run_quant_rollout_case w4a8_fake_quant examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml false 0.02 1.15 Qwen/Qwen2.5-0.5B "$@"
 
-echo "[PASS] ModelOpt W4A16 real-quant and W4A8 fake-quant rollout functional test"
+echo "[PASS] ModelOpt W4A16/W4A4 real-quant and W4A8 fake-quant rollout functional test"

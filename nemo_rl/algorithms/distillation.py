@@ -240,6 +240,10 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
+    if generation_config.get("real_quant"):
+        from nemo_rl.modelopt.utils import validate_modelopt_real_quant_policy_config
+
+        validate_modelopt_real_quant_policy_config(policy_config, generation_config)
     checkpoint_engine_config = None
     if generation_config["backend"] == "vllm":
         vllm_config = cast(VllmConfig, generation_config)
@@ -504,6 +508,35 @@ def setup(
     # ==========================
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
+        total_train_iters = min(
+            distillation_config.max_num_steps,
+            distillation_config.max_num_epochs * len(dataloader),
+        )
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+
+    def init_student_policy():
+        return Policy(
+            name_prefix="student",
+            cluster=train_cluster,
+            config=policy_config,
+            tokenizer=tokenizer,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+            init_optimizer=True,
+            init_reference_model=False,
+        )
+
+    student_policy = None
+    real_quant_vllm = backend == "vllm" and bool(generation_config.get("real_quant"))
+    if real_quant_vllm:
+        student_policy = init_student_policy()
+        generation_config["_modelopt_quantization_config"] = (
+            student_policy.get_modelopt_quantization_config()
+        )
+        if colocated_inference:
+            student_policy.offload_after_refit()
 
     if backend == "megatron":
         student_generation = None
@@ -586,6 +619,9 @@ def setup(
                 cluster=inference_cluster, config=generation_config
             )
             student_generation.finish_generation()
+        if real_quant_vllm and colocated_inference:
+            assert student_policy is not None
+            student_policy.prepare_for_training()
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
             flush=True,
@@ -596,29 +632,21 @@ def setup(
     # ==========================
     print("\n▶ Setting up student policy...", flush=True)
 
-    # Checkpoint paths
-    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    if student_policy is None:
+        student_policy = init_student_policy()
 
-    if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
-        ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
-            distillation_config.max_num_steps,
-            distillation_config.max_num_epochs * len(dataloader),
+    if real_quant_vllm:
+        assert isinstance(student_generation, VllmGeneration)
+        student_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=student_policy,
+            generation=student_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
         )
-        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
-
-    student_policy = Policy(
-        name_prefix="student",
-        cluster=train_cluster,
-        config=policy_config,
-        tokenizer=tokenizer,
-        weights_path=weights_path,
-        optimizer_path=optimizer_path,
-        init_optimizer=True,
-        init_reference_model=False,
-    )
-
-    if checkpoint_engine_config is not None:
+        student_generation.weight_synchronizer.init_communicator()
+    elif checkpoint_engine_config is not None:
         assert isinstance(student_generation, VllmGeneration)
         student_generation.weight_synchronizer = create_weight_synchronizer(
             policy=student_policy,
@@ -634,7 +662,11 @@ def setup(
         student_generation.prepare_refit_info(state_dict_info)
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference and checkpoint_engine_config is None:
+    if (
+        not colocated_inference
+        and checkpoint_engine_config is None
+        and not real_quant_vllm
+    ):
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         train_world_size = train_cluster.world_size()

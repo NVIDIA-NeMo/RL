@@ -441,6 +441,12 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for GRPO"
     )
+    if generation_config.get("real_quant"):
+        from nemo_rl.modelopt.utils import (
+            validate_modelopt_real_quant_policy_config,
+        )
+
+        validate_modelopt_real_quant_policy_config(policy_config, generation_config)
     if generation_config["backend"] == "vllm":
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
     _validate_multimodal_dedup_capability(master_config)
@@ -1036,6 +1042,7 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
+    real_quant_vllm = backend == "vllm" and bool(generation_config.get("real_quant"))
     gen_init_time_key = (
         "megatron_generation_init_time_s"
         if backend == "megatron"
@@ -1283,9 +1290,15 @@ def setup(
 
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
-
         ## make vllm hf overrides match the training policy
         vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+        if real_quant_vllm:
+            policy, policy_time = init_policy()
+            generation_config["_modelopt_quantization_config"] = (
+                policy.get_modelopt_quantization_config()
+            )
+            if colocated_inference:
+                policy.offload_after_refit()
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
@@ -1321,9 +1334,12 @@ def setup(
                     generation_config["model_name"],
                 )
 
-            # Colocated: vLLM + policy share GPUs -> sequential; otherwise parallel.
+            # The real-quant deployment descriptor comes from the initialized
+            # policy, so only vLLM and NeMo Gym remain to overlap here.
             init_tasks = {}
-            if colocated_inference:
+            if real_quant_vllm:
+                init_tasks["vllm"] = init_vllm_deferred
+            elif colocated_inference:
 
                 def init_vllm_then_policy():
                     pg, vllm_t = init_vllm_deferred()
@@ -1344,7 +1360,11 @@ def setup(
                 submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
                 results = {k: f.result() for k, f in submitted.items()}
 
-            if colocated_inference:
+            if real_quant_vllm:
+                policy_generation, vllm_load_time = results["vllm"]
+                if colocated_inference:
+                    policy.prepare_for_training()
+            elif colocated_inference:
                 policy_generation, vllm_load_time, policy, policy_time = results[
                     "vllm_policy"
                 ]
@@ -1355,6 +1375,13 @@ def setup(
             setup_timing_metrics.vllm_init_time_s = vllm_reserve_time + vllm_load_time
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
+        elif real_quant_vllm:
+            policy_generation, generation_time = init_vllm()
+            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
+            setup_timing_metrics.policy_init_time_s = policy_time
+            setup_timing_metrics.parallel_init_enabled = 0.0
+            if colocated_inference:
+                policy.prepare_for_training()
         else:
             policy_generation, policy = initialize_generation_with_policy(
                 init_generation_fn=init_vllm,
@@ -1475,6 +1502,16 @@ def setup(
                 refit_backend=refit_backend,
             )
             ray.get(futures_train + futures_inference)
+        elif real_quant_vllm:
+            policy_generation.weight_synchronizer = create_weight_synchronizer(
+                policy=policy,
+                generation=policy_generation,
+                generation_backend=backend,
+                colocated=False,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
+            )
+            policy_generation.weight_synchronizer.init_communicator()
         elif nccl_reshard_refit_enabled:
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
@@ -1535,7 +1572,18 @@ def setup(
             flush=True,
         )
     else:
-        if not (nccl_reshard_refit_enabled and not colocated_inference):
+        if real_quant_vllm:
+            if colocated_inference:
+                policy_generation.weight_synchronizer = create_weight_synchronizer(
+                    policy=policy,
+                    generation=policy_generation,
+                    generation_backend=backend,
+                    colocated=True,
+                    train_cluster=train_cluster,
+                    inference_cluster=inference_cluster,
+                )
+                policy_generation.weight_synchronizer.init_communicator()
+        elif not (nccl_reshard_refit_enabled and not colocated_inference):
             state_dict_info = policy.prepare_refit_info()
             if policy_generation is not None:
                 policy_generation.prepare_refit_info(state_dict_info)
@@ -2314,6 +2362,12 @@ def refit_policy_generation(
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
+    if isinstance(policy_generation, VllmGeneration) and policy_generation.cfg.get(
+        "real_quant"
+    ):
+        raise RuntimeError(
+            "ModelOpt real-quant refit requires an initialized weight synchronizer"
+        )
 
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):

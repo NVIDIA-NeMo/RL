@@ -101,18 +101,19 @@ and peak memory before downstream integration.
    checkpoint normally and capture deterministic outputs and runtime tensor
    metadata.
 2. Construct the same model with dummy weights and send the canonical tensor
-   stream through vLLM 0.25.1's public `init/start/update/finish`
-   weight-transfer transaction.
+   stream through the public vLLM layerwise lifecycle and normal checkpoint
+   loader used by NeMo RL.
 3. Repeat after a controlled source-weight change and verify output change plus
    stable runtime tensor addresses.
-4. Run the transaction tests with both IPC and NCCL transports. Test dense,
+4. Run the refit tests with both NeMo IPC and NCCL transports. Separately
+   characterize vLLM's complete public weight-transfer transaction. Test dense,
    routed-MoE, and Mamba/hybrid alias-buffer behavior. Keep full
    expert ownership on every vLLM rollout rank in this first landing; native
    vLLM rollout EP refit is a separate follow-up.
 5. Fix failures behind vLLM's public weight-transfer update API. Do not call
    private reload helpers or add a copied quantization method in NeMo RL.
 
-Gate: disk load and public IPC/NCCL online refit are equivalent, and a second
+Gate: disk load and NeMo IPC/NCCL online refit are equivalent, and a second
 refit is correct for every format/model class claimed by the capability matrix.
 Inject an update failure after `start_weight_update`; the current engine must
 be discarded, and a reconstructed engine must accept a complete successful
@@ -134,8 +135,9 @@ pinned vLLM dependency before Phase 5 deletes that adapter.
    allocate against the policy-free GPU, then restore the policy before the
    initial refit or training operation.
 4. Let vLLM select its native ModelOpt quantization method.
-5. Send the canonical iterator through vLLM's public
-   `start_weight_update`/`update_weights`/`finish_weight_update` transaction.
+5. Send the canonical iterator through NeMo RL's existing transport, bracketed
+   by vLLM's public `start_weight_update`/`finish_weight_update` lifecycle. The
+   normal vLLM checkpoint loader consumes each received batch.
 6. Remove each W4A4/W4A16 mode resolver, hand-built vLLM config, custom ModelOpt
    vLLM quantization class, or fused-MoE payload rewrite only after its Phase 4
    replacement gate passes against the pinned vLLM dependency.
@@ -147,10 +149,10 @@ pinned vLLM dependency before Phase 5 deletes that adapter.
 
 Gate: focused unit tests cover startup ordering, descriptor propagation,
 manifest mismatch, and delegation to native vLLM loading without asserting
-format-specific details. A failed transaction marks the engine unusable and
-forces reconstruction before the next operation. Source checks verify that
-NeMo RL does not import vLLM's private layerwise-reload modules, cache reload
-roots, or manipulate quantization-method kernel state.
+format-specific details. A failed transaction marks the engine unusable; it
+must not process another generation or refit. Source checks verify that NeMo RL
+does not import vLLM's private layerwise-reload modules, cache reload roots, or
+manipulate quantization-method kernel state.
 
 Review checkpoint: re-review the aggregate deletion and ensure NeMo RL owns
 only orchestration, transport selection, and validation.

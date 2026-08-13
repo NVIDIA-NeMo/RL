@@ -31,19 +31,19 @@ weight updates continue to use their existing paths.
 
 | Component | Responsibility |
 |---|---|
-| ModelOpt | Quantization configuration, calibration, QAT state, NVFP4 packing, and scale derivation |
-| Megatron-Bridge | Megatron-to-Hugging-Face conversion, distributed TP/PP/EP handling, and NVFP4 export |
-| NeMo RL | Mode validation, refit scheduling, named-tensor transport, and vLLM reload orchestration |
+| ModelOpt | Quantization configuration, calibration, QAT state, quantized-weight packing, scale derivation, and deployment config generation |
+| Megatron-Bridge | Megatron-to-Hugging-Face conversion, distributed TP/PP/EP handling, and canonical ModelOpt export |
+| NeMo RL | Policy-first initialization, refit scheduling, named-tensor transport, and public vLLM lifecycle orchestration |
 | vLLM | Checkpoint loading, runtime-layout conversion, kernel selection, stable tensor placement, and KV-cache scale processing |
 
 NeMo RL delegates quantization math and runtime-kernel conversion to ModelOpt,
-Megatron-Bridge, and vLLM. Its vLLM integration is limited to the
-format-specific adapters required to connect their public interfaces.
+Megatron-Bridge, and vLLM. It passes the policy-derived ModelOpt deployment
+config and canonical checkpoint tensors without a second format resolver.
 
 ```mermaid
 flowchart LR
     A[RL algorithm controller] --> B[ModelOpt QAT policy worker]
-    B --> C[Megatron-Bridge NVFP4 export]
+    B --> C[Megatron-Bridge canonical ModelOpt export]
     C --> D[NeMo RL named-tensor transport]
     D --> E[vLLM generation worker]
     E --> F[Rollouts]
@@ -59,8 +59,9 @@ Both modes use block-16 E2M1 NVFP4 weights with E4M3 block scales.
 | W4A4 | `NVFP4` | NVFP4 | NVFP4 with per-projection input scales |
 | W4A16 | `W4A16_NVFP4` | NVFP4 | Native model dtype |
 
-The policy and generation workers must use quantization recipes that resolve
-to the same mode. Unsupported or mismatched formats fail during setup.
+The policy quantizer graph is the source of truth. NeMo RL derives the vLLM
+deployment config from that initialized graph; a duplicate generation recipe
+is not required for real quantization.
 
 Example routed-expert recipes are provided at:
 
@@ -71,43 +72,35 @@ Example routed-expert recipes are provided at:
 
 Every real-quant refit follows the same lifecycle:
 
-1. NeMo RL validates the policy and generation quantization modes.
-2. Megatron-Bridge exports named NVFP4 weights and scale tensors.
-3. NeMo RL starts vLLM's layerwise reload lifecycle for the affected
-   quantized modules.
-4. The normal vLLM model loader consumes the exported tensors.
-5. vLLM performs post-load conversion and copies the converted tensors into
+1. NeMo RL initializes the policy and obtains its ModelOpt deployment config.
+2. vLLM initializes its native ModelOpt loader from that config.
+3. Megatron-Bridge exports canonical named weights and scale tensors.
+4. NeMo RL starts vLLM's public layerwise reload lifecycle.
+5. The normal vLLM model loader consumes the exported tensors.
+6. vLLM performs post-load conversion and copies the converted tensors into
    the existing runtime storage.
-6. NeMo RL finalizes the reload and synchronizes the device before the
+7. NeMo RL finalizes the reload and synchronizes the device before the
    transport buffer can be reused.
 
 This lifecycle is shared by collective and CUDA IPC transports. vLLM retains
 ownership of runtime tensor layouts and preserves tensor addresses referenced
 by CUDA graphs.
 
-## vLLM compatibility adapters
+## Native vLLM integration
 
-NeMo RL registers ModelOpt NVFP4 extensions through vLLM's quantization
-registry. The adapters cover:
-
-- W4A16 dense and fused-MoE execution;
-- fused-MoE input-scale loading for W4A4;
-- rank-local padding required by W4A16 MoE kernels; and
-- preservation of runtime kernel references during repeated refits.
-
-Native vLLM processing remains responsible for checkpoint-layout restoration,
-post-load conversion, kernel construction, and stable-storage copy-back. The
-adapters do not define a separate reload implementation.
+NeMo RL supplies ModelOpt's canonical `quantization_config` through vLLM's HF
+overrides and lets vLLM select its native W4A4 or W4A16 implementation. It uses
+vLLM's public `start_weight_update` and `finish_weight_update` methods around
+the existing NeMo RL IPC/NCCL tensor stream. NeMo RL does not register custom
+quantization methods or call private layerwise-reload helpers.
 
 ## Fused-MoE transport
 
-Megatron-Bridge exports fused expert projections as expert-batched W13 and W2
-tensors. Each family contains the packed weight, block scale, and global scale.
-W4A4 additionally includes one input scale for each projection.
-
-The receiving adapter validates that each tensor family is complete and maps
-it to the checkpoint names accepted by the vLLM model loader. Gated experts
-use two W13 shards; non-gated experts use one.
+Megatron-Bridge converts experts to the same canonical Hugging Face checkpoint
+names and layouts that ModelOpt's offline exporter produces. Each projection
+contains the packed weight, block scale, and global scale; W4A4 additionally
+contains its input scale. vLLM consumes those names directly, with no NeMo-only
+MoE payload rewrite.
 
 Fused-MoE refit currently requires every vLLM rank to own the full expert set.
 Megatron expert parallelism remains supported because Megatron-Bridge gathers
@@ -115,11 +108,11 @@ the exported payload before the vLLM refit.
 
 ## CUDA IPC buffer lifetime
 
-Layerwise loading may temporarily retain a view of an incoming tensor until a
-layer has received its complete payload. NeMo RL ensures that no retained view
-aliases a reusable CUDA IPC staging buffer before acknowledging that buffer.
-The final acknowledgment is sent only after vLLM finalization and device
-synchronization.
+Layerwise loading may temporarily retain an incoming tensor until a layer has
+received its complete payload. Real-quant refit gives vLLM-owned storage to
+each received batch so retained tensors cannot alias a reusable NeMo RL
+transport buffer. The final acknowledgment is sent only after vLLM
+finalization and device synchronization.
 
 ## KV-cache behavior
 
@@ -132,15 +125,13 @@ vLLM KV-cache processing method or process an attention layer a second time.
 
 ## Configuration
 
-Set the same quantization recipe for the policy and generation worker, and
-enable real-quant generation:
+Set the policy quantization recipe and enable real-quant generation:
 
 ```yaml
 policy:
   quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
 
   generation:
-    quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
     real_quant: true
 ```
 

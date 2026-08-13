@@ -271,6 +271,10 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
+    if generation_config.get("real_quant"):
+        raise NotImplementedError(
+            "generation.real_quant is currently supported only by GRPO and distillation"
+        )
     if generation_config["backend"] == "vllm":
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)

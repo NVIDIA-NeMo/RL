@@ -35,6 +35,10 @@ import ray
 
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.refit_transaction import (
+    shutdown_refit_participants,
+    wait_for_real_quant_refit,
+)
 
 
 class CollectiveWeightSynchronizer(WeightSynchronizer):
@@ -63,6 +67,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
         self._stale = True
+        self._fatal_refit_error: Exception | None = None
 
     def sync_weights(
         self,
@@ -70,27 +75,50 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        if self._fatal_refit_error is not None:
+            raise RuntimeError(
+                "Real-quant refit is unusable after a prior failed transaction"
+            ) from self._fatal_refit_error
+
+        self._stale = True
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
             else nullcontext()
         )
         with timer_context:
-            futures_train = self._policy.broadcast_weights_for_collective(
-                kv_scales=kv_scales
-            )
-            futures_inference = self._generation.update_weights_from_collective()
-
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
-
-            if not update_success:
-                raise RuntimeError(
-                    "Weight transfer failed during NCCL collective sync. "
-                    "This often indicates an issue with the NCCL process group "
-                    "or the generation backend worker."
+            try:
+                futures_train = self._policy.broadcast_weights_for_collective(
+                    kv_scales=kv_scales
                 )
+                futures_inference = self._generation.update_weights_from_collective()
+                if self._generation.cfg.get("real_quant"):
+                    results = wait_for_real_quant_refit(
+                        futures_train, futures_inference
+                    )
+                else:
+                    ray.get(futures_train)
+                    results = ray.get(futures_inference)
+                update_success = all(
+                    result for result in results if result is not None
+                )
+                if not update_success:
+                    raise RuntimeError(
+                        "Weight transfer failed during NCCL collective sync. "
+                        "This often indicates an issue with the NCCL process group "
+                        "or the generation backend worker."
+                    )
+                if self._generation.cfg.get("real_quant"):
+                    print(
+                        "ModelOpt real-quant refit transaction completed", flush=True
+                    )
+            except Exception as error:
+                if self._generation.cfg.get("real_quant"):
+                    self._fatal_refit_error = error
+                    shutdown_refit_participants(
+                        self._policy, self._generation, error
+                    )
+                raise
 
         self._stale = False
 

@@ -398,6 +398,10 @@ def setup_single_controller(
     assert generation_config is not None, (
         "single_controller_utils.setup requires policy.generation in master_config"
     )
+    if generation_config.get("real_quant"):
+        raise NotImplementedError(
+            "SingleController does not support generation.real_quant"
+        )
 
     if data_config["use_multiple_dataloader"]:
         raise NotImplementedError(

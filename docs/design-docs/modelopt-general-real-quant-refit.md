@@ -237,17 +237,23 @@ path. Colocated startup must preserve the current memory contract: vLLM still
 observes a policy-free GPU when it sizes its cache, and restoring the policy
 must fit under the configured vLLM memory limit.
 
-NeMo RL owns orchestration, transport selection, timeout policy, manifest
-validation, and calls that delimit a refit transaction. The selected vLLM
-engine owns transport execution and model loading. NeMo RL does not own
-packing, scale names, MoE checkpoint rewrites, quantization classes, or
+NeMo RL owns orchestration, its existing IPC/NCCL tensor transport, timeout
+policy, manifest validation, and calls that delimit a refit transaction. vLLM
+owns checkpoint loading and the native layerwise reload lifecycle. NeMo RL does
+not own packing, scale names, MoE checkpoint rewrites, quantization classes, or
 format-specific runtime state.
 
 vLLM 0.25.1 has no public abort operation that restores a partially processed
 checkpoint update. Any exception after `start_weight_update` is therefore
-fatal to that engine instance: NeMo RL tears it down and reconstructs it before
-another generation or refit. It must not attempt to reuse or repair private
-reload state.
+fatal to that engine instance. NeMo RL must not attempt to reuse or repair its
+private reload state. The quantized generation worker shuts down that instance
+and propagates the failure; a new worker construction is required before a
+later refit can run.
+
+This first implementation supports only NeMo RL's default colocated IPC or
+non-colocated collective refit path. Sparse, checkpoint-engine, and
+`nccl_reshard` transports do not consume the canonical packed ModelOpt stream
+and are rejected during configuration.
 
 The deployment descriptor is initially just the canonical ModelOpt HF
 `quantization_config`. Do not introduce a parallel NeMo-specific schema: the
@@ -267,23 +273,30 @@ vLLM owns:
 - post-load conversion into runtime layouts; and
 - preserving runtime tensor addresses across repeated refits.
 
-NeMo RL calls vLLM 0.25.1's public weight-transfer transaction:
-`init_weight_transfer_engine`, `start_weight_update`, one or more
-`update_weights` calls, and `finish_weight_update`. The configured IPC or NCCL
-engine owns checkpoint loading, layerwise processing, and reload finalization.
+NeMo RL keeps its established IPC/NCCL tensor transport and calls vLLM
+0.25.1's public `start_weight_update` and `finish_weight_update` methods around
+that stream. Between those boundaries, the normal vLLM checkpoint loader
+consumes each canonical named-tensor batch. The configured vLLM weight-transfer
+engine supplies the native layerwise setup and finalization; NeMo RL does not
+use that engine's transport receive method. This limited integration avoids
+replacing NeMo RL's transport in the same change while still removing all
+private layerwise-reload calls.
+
 NeMo RL must not import vLLM's layerwise-reload helpers, inspect reload metadata
 or roots, or retain method-owned kernel objects. The current custom W4A4 and
 W4A16 quantization registrations should be retired only after their native
 vLLM replacements pass the gates below.
 
 Before deleting an adapter, add focused vLLM characterization tests through
-the public four-phase transaction for both IPC and NCCL. If the native ModelOpt
-loader fails repeated refit, fix it behind that API in vLLM rather than copying
-the loader or calling private reload APIs from NeMo RL. Delete the NeMo adapter
-only after the equivalent vLLM fix is merged, the NeMo vLLM dependency includes
-it, and the characterization tests pass against that dependency. A vLLM gap
-that cannot be fixed cleanly leaves that model or format unsupported in the
-first landing.
+the public lifecycle and normal checkpoint loader for both NeMo IPC and NCCL
+transports. Separately characterize vLLM's complete public weight-transfer API
+to detect native defects, but do not replace NeMo RL's transport as part of
+this refactor. If the native ModelOpt loader fails repeated refit, fix it behind
+vLLM's public API rather than copying the loader or calling private reload APIs
+from NeMo RL. Delete the NeMo adapter only after the equivalent vLLM fix is
+merged, the NeMo vLLM dependency includes it, and the characterization tests
+pass against that dependency. A vLLM gap that cannot be fixed cleanly leaves
+that model or format unsupported in the first landing.
 
 Megatron policy EP greater than one remains required: MBridge must produce a
 topology-independent canonical HF stream from an EP-sharded policy. vLLM

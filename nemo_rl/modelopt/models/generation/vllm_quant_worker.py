@@ -56,29 +56,21 @@ def _configure_quant_engine_kwargs(
     )
     real_quant = bool(cfg.get("real_quant"))
     if real_quant:
-        from nemo_rl.modelopt.models.generation.vllm_modelopt import (
-            quantization_method_for_mode,
-            register_nemo_modelopt_nvfp4,
-        )
-        from nemo_rl.modelopt.utils import (
-            build_vllm_modelopt_nvfp4_config,
-            resolve_nvfp4_real_quant_mode,
-        )
-
-        quant_cfg = cfg.get("quant_cfg")
-        if not quant_cfg:
-            raise ValueError("NVFP4 real quantization requires a non-empty quant_cfg.")
-        mode = resolve_nvfp4_real_quant_mode(quant_cfg)
-        register_nemo_modelopt_nvfp4()
+        quantization_config = cfg.get("_modelopt_quantization_config")
+        if not quantization_config:
+            raise ValueError(
+                "ModelOpt real quantization requires a deployment descriptor "
+                "from the initialized policy."
+            )
         os.environ.pop("VLLM_QUANT_CFG", None)
         os.environ["VLLM_MODELOPT_REAL_QUANT"] = "1"
 
-        hf_overrides = llm_kwargs.setdefault("hf_overrides", {})
-        hf_overrides["quantization_config"] = build_vllm_modelopt_nvfp4_config(
-            mode=mode,
-            ignore=cfg.get("real_quant_ignore"),
-        )
-        llm_kwargs["quantization"] = quantization_method_for_mode(mode)
+        hf_overrides = dict(llm_kwargs.get("hf_overrides") or {})
+        hf_overrides["quantization_config"] = quantization_config
+        llm_kwargs["hf_overrides"] = hf_overrides
+        llm_kwargs["weight_transfer_config"] = {
+            "backend": "ipc" if cfg["colocated"]["enabled"] else "nccl"
+        }
     else:
         llm_kwargs["worker_cls"] = (
             "nemo_rl.modelopt.models.generation.vllm_quant_patch.FakeQuantWorker"
@@ -98,10 +90,40 @@ class VllmQuantGenerationWorker(VllmGenerationWorkerImpl):
     def __init__(self, *args, **kwargs):
         kwargs["extra_env_vars"] = _EXTRA_ENV_VARS
         super().__init__(*args, **kwargs)
+        self._real_quant_refit_failed = False
 
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         _configure_quant_engine_kwargs(self.cfg, llm_kwargs)
         super()._create_engine(llm_kwargs)
+
+    def _require_successful_refit(self, success: bool) -> bool:
+        if success or not self.cfg.get("real_quant"):
+            return success
+        self._real_quant_refit_failed = True
+        # Surface the failure immediately. The synchronizer owns bounded teardown
+        # of both Ray worker groups; cleanup RPCs can themselves block.
+        self.llm = None
+        self.tokenizer = None
+        raise RuntimeError(
+            "ModelOpt real-quant refit failed; the vLLM engine is unusable "
+            "because a partial layerwise update cannot be reused"
+        )
+
+    def _require_usable_real_quant_engine(self) -> None:
+        if self.cfg.get("real_quant") and getattr(
+            self, "_real_quant_refit_failed", False
+        ):
+            raise RuntimeError(
+                "ModelOpt real-quant engine is unusable after a failed refit"
+            )
+
+    def update_weights_via_ipc_zmq(self) -> bool:
+        self._require_usable_real_quant_engine()
+        return self._require_successful_refit(super().update_weights_via_ipc_zmq())
+
+    def update_weights_from_collective(self) -> bool:
+        self._require_usable_real_quant_engine()
+        return self._require_successful_refit(super().update_weights_from_collective())
 
     def get_quantizer_stats(self) -> dict[str, Any]:
         """Return quantizer statistics. Mirrors MegatronQuantPolicyWorker.get_quantizer_stats()."""
@@ -121,10 +143,45 @@ class VllmQuantAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
     def __init__(self, *args, **kwargs):
         kwargs["extra_env_vars"] = _EXTRA_ENV_VARS
         super().__init__(*args, **kwargs)
+        self._real_quant_refit_failed = False
 
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         _configure_quant_engine_kwargs(self.cfg, llm_kwargs)
         super()._create_engine(llm_kwargs)
+
+    async def _require_successful_refit(self, success: bool) -> bool:
+        if success or not self.cfg.get("real_quant"):
+            return success
+        self._real_quant_refit_failed = True
+        # Stop accepting HTTP requests before owner-side worker-group teardown.
+        if self.server_thread is not None:
+            self.http_server.should_exit = True
+        self.llm = None
+        self.tokenizer = None
+        raise RuntimeError(
+            "ModelOpt real-quant refit failed; the vLLM engine is unusable "
+            "because a partial layerwise update cannot be reused"
+        )
+
+    def _require_usable_real_quant_engine(self) -> None:
+        if self.cfg.get("real_quant") and getattr(
+            self, "_real_quant_refit_failed", False
+        ):
+            raise RuntimeError(
+                "ModelOpt real-quant engine is unusable after a failed refit"
+            )
+
+    async def update_weights_via_ipc_zmq_async(self) -> bool:
+        self._require_usable_real_quant_engine()
+        return await self._require_successful_refit(
+            await super().update_weights_via_ipc_zmq_async()
+        )
+
+    async def update_weights_from_collective_async(self) -> bool:
+        self._require_usable_real_quant_engine()
+        return await self._require_successful_refit(
+            await super().update_weights_from_collective_async()
+        )
 
     async def get_quantizer_stats(self) -> dict[str, Any]:
         """Return quantizer statistics. Mirrors MegatronQuantPolicyWorker.get_quantizer_stats()."""

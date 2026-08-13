@@ -105,6 +105,31 @@ class VllmGeneration(GenerationInterface):
             workers_per_node: Workers per node override
             defer_model_load: If True, defer model loading for overlapped init
         """
+        if config.get("real_quant"):
+            if config.get("refit_transport") is not None:
+                raise ValueError(
+                    "generation.real_quant currently supports only NeMo-RL's "
+                    "default IPC or collective refit path; refit_transport must "
+                    "be null"
+                )
+            if not config.get("_modelopt_quantization_config"):
+                raise ValueError(
+                    "generation.real_quant requires a deployment descriptor "
+                    "from the initialized policy"
+                )
+            export_cpu_offload = config.setdefault(
+                "real_quant_export_cpu_offload", True
+            )
+            if not isinstance(export_cpu_offload, bool):
+                raise ValueError(
+                    "generation.real_quant_export_cpu_offload must be a boolean"
+                )
+            if not export_cpu_offload and not config["colocated"]["enabled"]:
+                raise ValueError(
+                    "generation.real_quant_export_cpu_offload=false requires "
+                    "colocated CUDA-IPC refit"
+                )
+
         # Store config
         self.cfg = config
         self._defer_model_load = defer_model_load

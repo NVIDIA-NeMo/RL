@@ -14,9 +14,11 @@
 
 """Unit tests for the WeightSynchronizer abstraction and its implementations."""
 
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+import ray
 
 from nemo_rl.models.generation.constants import (
     MEGATRON_BACKEND,
@@ -34,6 +36,7 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.ipc_weight_synchronizer import (
     IPCWeightSynchronizer,
 )
+from nemo_rl.weight_sync import refit_transaction
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -75,6 +78,106 @@ def _mock_cluster(world_size=4, ip="127.0.0.1", port=29500):
     cluster.world_size.return_value = world_size
     cluster.get_master_address_and_port.return_value = (ip, port)
     return cluster
+
+
+def _real_quant_synchronizer(kind, policy, generation):
+    generation.cfg = {"real_quant": True}
+    if kind == "ipc":
+        return IPCWeightSynchronizer(policy, generation)
+    return CollectiveWeightSynchronizer(
+        policy, generation, _mock_cluster(), _mock_cluster()
+    )
+
+
+def test_real_quant_refit_wait_cancels_blocked_peer_and_accepts_fresh_tasks():
+    @ray.remote(num_cpus=0)
+    def blocked_producer():
+        time.sleep(60)
+
+    @ray.remote(num_cpus=0)
+    def failed_consumer():
+        raise RuntimeError("consumer loader failed")
+
+    @ray.remote(num_cpus=0)
+    def completed(value):
+        return value
+
+    producer = blocked_producer.remote()
+    consumer = failed_consumer.remote()
+    started = time.monotonic()
+    with pytest.raises(ray.exceptions.RayTaskError, match="consumer loader failed"):
+        refit_transaction.wait_for_real_quant_refit([producer], [consumer])
+    assert time.monotonic() - started < 10
+
+    assert refit_transaction.wait_for_real_quant_refit(
+        [completed.remote(None)], [completed.remote(True)]
+    ) == [True]
+
+
+@pytest.mark.parametrize("kind", ["ipc", "collective"])
+def test_real_quant_transaction_failure_is_terminal_and_reconstructable(
+    monkeypatch, kind
+):
+    producer = object()
+    consumer = object()
+    policy = _mock_policy()
+    generation = _mock_generation()
+    if kind == "ipc":
+        policy.stream_weights_via_ipc_zmq.return_value = [producer]
+        generation.update_weights_via_ipc_zmq.return_value = [consumer]
+        producer_method = policy.stream_weights_via_ipc_zmq
+    else:
+        policy.broadcast_weights_for_collective.return_value = [producer]
+        generation.update_weights_from_collective.return_value = [consumer]
+        producer_method = policy.broadcast_weights_for_collective
+    synchronizer = _real_quant_synchronizer(kind, policy, generation)
+
+    monkeypatch.setattr(
+        refit_transaction.ray,
+        "wait",
+        MagicMock(return_value=([consumer], [producer])),
+    )
+    monkeypatch.setattr(
+        refit_transaction.ray,
+        "get",
+        MagicMock(side_effect=RuntimeError("consumer loader failed")),
+    )
+    cancel = MagicMock()
+    monkeypatch.setattr(refit_transaction.ray, "cancel", cancel)
+
+    with pytest.raises(RuntimeError, match="consumer loader failed"):
+        synchronizer.sync_weights()
+    assert synchronizer.is_stale
+    cancel.assert_called_once_with(producer)
+    generation.shutdown.assert_called_once()
+    policy.shutdown.assert_called_once()
+
+    producer_calls = producer_method.call_count
+    with pytest.raises(RuntimeError, match="prior failed transaction"):
+        synchronizer.sync_weights()
+    assert producer_method.call_count == producer_calls
+
+    fresh_producer = object()
+    fresh_consumer = object()
+    fresh_policy = _mock_policy()
+    fresh_generation = _mock_generation()
+    if kind == "ipc":
+        fresh_policy.stream_weights_via_ipc_zmq.return_value = [fresh_producer]
+        fresh_generation.update_weights_via_ipc_zmq.return_value = [fresh_consumer]
+    else:
+        fresh_policy.broadcast_weights_for_collective.return_value = [fresh_producer]
+        fresh_generation.update_weights_from_collective.return_value = [fresh_consumer]
+    fresh_synchronizer = _real_quant_synchronizer(
+        kind, fresh_policy, fresh_generation
+    )
+    refit_transaction.ray.wait.side_effect = [
+        ([fresh_consumer], [fresh_producer]),
+        ([fresh_producer], []),
+    ]
+    refit_transaction.ray.get.side_effect = [True, None]
+
+    fresh_synchronizer.sync_weights()
+    assert not fresh_synchronizer.is_stale
 
 
 # ---------------------------------------------------------------------------
@@ -134,16 +237,21 @@ class TestIPCWeightSynchronizer:
 
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
     def test_sync_weights_raises_on_failure(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = IPCWeightSynchronizer(policy, gen)
+        sync.sync_weights()
+        assert not sync.is_stale
+
         mock_ray.get.side_effect = [
             None,  # futures_train
             [False],  # futures_inference -- update failed
         ]
-        policy = _mock_policy()
-        gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
 
         with pytest.raises(RuntimeError, match="Weight transfer failed"):
             sync.sync_weights()
+        assert sync.is_stale
 
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
     def test_fixed_buffer_size(self, mock_ray):
@@ -191,7 +299,7 @@ class TestIPCWeightSynchronizer:
 
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
     def test_phase_restoration_on_transfer_failure(self, mock_ray):
-        """offload_after_refit and kv_cache prep run even when transfer raises."""
+        """Policy offload runs, but a failed engine is not prepared for generation."""
         mock_ray.get.side_effect = RuntimeError("IPC transfer exploded")
         policy = _mock_policy()
         gen = _mock_generation()
@@ -201,7 +309,7 @@ class TestIPCWeightSynchronizer:
             sync.sync_weights()
 
         policy.offload_after_refit.assert_called_once()
-        gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
+        gen.prepare_for_generation.assert_called_once_with(tags=["weights"])
         assert sync.is_stale
 
     def test_negative_buffer_size_raises(self):
@@ -380,18 +488,23 @@ class TestCollectiveWeightSynchronizer:
 
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_sync_weights_raises_on_failure(self, mock_ray):
-        mock_ray.get.side_effect = [
-            None,  # futures_train
-            [False],  # futures_inference -- update failed
-        ]
+        mock_ray.get.return_value = [True]
         policy = _mock_policy()
         gen = _mock_generation()
         sync = CollectiveWeightSynchronizer(
             policy, gen, _mock_cluster(), _mock_cluster()
         )
+        sync.sync_weights()
+        assert not sync.is_stale
+
+        mock_ray.get.side_effect = [
+            None,  # futures_train
+            [False],  # futures_inference -- update failed
+        ]
 
         with pytest.raises(RuntimeError, match="Weight transfer failed"):
             sync.sync_weights()
+        assert sync.is_stale
 
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_init_communicator_sets_up_collective(self, mock_ray):

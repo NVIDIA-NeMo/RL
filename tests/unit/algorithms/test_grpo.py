@@ -72,6 +72,7 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
     create_mock_batch,
@@ -127,6 +128,15 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
     )
+
+
+def test_refit_policy_generation_rejects_real_quant_without_synchronizer():
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = {"real_quant": True}
+    generation.weight_synchronizer = None
+
+    with pytest.raises(RuntimeError, match="requires an initialized"):
+        refit_policy_generation(MagicMock(), generation, colocated_inference=True)
 
 
 class TestMaskSampleFilter:

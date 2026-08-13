@@ -32,6 +32,9 @@ def configure_generation_config(
     trains_mtp: bool = False,
 ) -> GenerationConfig:
     """Apply specific configurations to generation config."""
+    if config.get("real_quant") and config["backend"] != "vllm":
+        raise ValueError("generation.real_quant is supported only by vLLM")
+
     # tokenizer setting
     if "_pad_token_id" in config:
         warnings.warn(
@@ -47,20 +50,26 @@ def configure_generation_config(
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
         if config.get("real_quant"):
-            export_cpu_offload = config.get("real_quant_export_cpu_offload")
+            if config.get("refit_transport") is not None:
+                raise ValueError(
+                    "generation.real_quant currently supports only NeMo-RL's "
+                    "default IPC or collective refit path; refit_transport must "
+                    "be null"
+                )
+            export_cpu_offload = config.setdefault(
+                "real_quant_export_cpu_offload", True
+            )
             if not isinstance(export_cpu_offload, bool):
                 raise ValueError(
                     "generation.real_quant_export_cpu_offload must be a boolean"
                 )
             colocated = config.get("colocated")
             if not export_cpu_offload and (
-                colocated is None
-                or not colocated["enabled"]
-                or config.get("refit_transport") is not None
+                colocated is None or not colocated["enabled"]
             ):
                 raise ValueError(
                     "generation.real_quant_export_cpu_offload=false requires "
-                    "colocated CUDA-IPC refit with no explicit refit_transport"
+                    "colocated CUDA-IPC refit"
                 )
 
         # set load_format

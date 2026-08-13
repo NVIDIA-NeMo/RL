@@ -917,8 +917,13 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         setup(master_config, tokenizer, dataset, None)
 
 
-@pytest.mark.parametrize("refit_transport", [None, "nixl"])
-def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
+@pytest.mark.parametrize(
+    ("refit_transport", "real_quant"),
+    [(None, False), ("nixl", False), (None, True)],
+)
+def test_distillation_setup_non_colocated_smoke(
+    monkeypatch, refit_transport, real_quant
+):
     """Smoke test: calling setup with a non-colocated config should succeed."""
     from unittest.mock import MagicMock, patch
 
@@ -936,6 +941,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
                     "val_top_p": 1.0,
                     "val_top_k": None,
                     "backend": "vllm",
+                    "real_quant": real_quant,
                     "refit_transport": refit_transport,
                     "refit_cfg": None,
                     "colocated": {
@@ -950,6 +956,8 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
                     "enabled": False,
                 },
                 "model_name": "test-policy",
+                "megatron_cfg": {"enabled": real_quant},
+                "quant_cfg": "NVFP4_DEFAULT_CFG" if real_quant else None,
             },
             "teacher": {
                 "model_name": "test-teacher",
@@ -1010,6 +1018,9 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         def offload_after_refit(self):
             return None
 
+        def get_modelopt_quantization_config(self):
+            return {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+
         def init_collective(self, *args, **kwargs):
             self.collective_calls.append((args, kwargs))
             return [MagicMock()]
@@ -1057,7 +1068,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         assert result[3] is None
         mock_uv_cache_dir.assert_not_called()
         mock_uv_venv_dir.assert_not_called()
-        if refit_transport == "nixl":
+        if refit_transport == "nixl" or real_quant:
             mock_create_synchronizer.assert_called_once()
             mock_create_synchronizer.return_value.init_communicator.assert_called_once()
             assert not DummyPolicy.collective_calls
