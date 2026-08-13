@@ -286,7 +286,9 @@ def _build_trainer(
     return trainer, time.perf_counter() - t0
 
 
-def _spinup_gym(master_config: MasterConfig, base_urls: list[str]) -> tuple[Any, float]:
+def _spinup_gym(
+    master_config: MasterConfig, base_urls: list[Optional[str]]
+) -> tuple[Any, float]:
     """Spin up the NeMo-Gym actor against the reserved vLLM URLs.
 
     Args:
