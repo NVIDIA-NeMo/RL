@@ -78,7 +78,18 @@ def _make_master_config(
                 "colocated": {"enabled": colocated, "resources": {}},
             },
         },
-        checkpointing={"enabled": False},
+        # Full block: setup builds a CheckpointManager unconditionally (resume
+        # lookup), which indexes these keys directly. Nothing is written while
+        # enabled=False and the dir doesn't exist.
+        checkpointing={
+            "enabled": False,
+            "checkpoint_dir": "results/_sc_setup_test_ckpt",
+            "metric_name": None,
+            "higher_is_better": False,
+            "keep_top_k": None,
+            "save_period": 10,
+            "save_optimizer": False,
+        },
         loss_fn=ClippedPGLossConfig(),
         env=env if env is not None else {},
         async_rl=AsyncRLConfig(
