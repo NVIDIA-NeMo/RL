@@ -1725,7 +1725,6 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
     os.environ.setdefault("CUBLASLT_WORKSPACE_SIZE", "0")
     os.environ.setdefault("MAMBA_DETERMINISTIC", "1")
-    # Force fixed-order MoE unpermute to eliminate scatter_add nondeterminism.
 
 
 _BRIDGE_SIGNAL_HANDLER_PATCHED = False

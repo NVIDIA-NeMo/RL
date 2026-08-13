@@ -51,7 +51,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
     materialize_only_last_token_logits: bool
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
-    static_kv_memory_pointers: NotRequired[bool]
 
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
     num_speculative_tokens: int
