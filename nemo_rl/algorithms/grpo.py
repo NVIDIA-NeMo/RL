@@ -1283,28 +1283,13 @@ def setup(
     # Handle generation-specific setup
     if backend == "megatron":
         mcore_generation_config = generation_config["mcore_generation_config"]
-        http_port_range_low = mcore_generation_config.get("http_server_port_range_low")
-        http_port_range_high = mcore_generation_config.get(
-            "http_server_port_range_high"
-        )
-        if (http_port_range_low is None) != (http_port_range_high is None):
-            raise ValueError(
-                "Set both policy.generation.mcore_generation_config."
-                "http_server_port_range_low and http_server_port_range_high "
-                f"(or neither); got low={http_port_range_low}, "
-                f"high={http_port_range_high}."
-            )
-        overlap_nemo_gym_spinup = enable_nemo_gym and http_port_range_low is not None
 
-        if overlap_nemo_gym_spinup:
-            # ---- NeMo Gym: probe the rank-0 node for a free server port so the
-            # URL is known before any worker exists, then spin up NeMo Gym while
-            # the policy loads and the inference engine warms up.
+        if enable_nemo_gym and mcore_generation_config["expose_http_server"]:
             print(
                 "  ⚡ Reserving the Megatron server address for overlapped NeMo Gym init",
                 flush=True,
             )
-            reserved_url, reserved_http_server_port = (
+            reserved_url, reserved_http_server_port, port_holder = (
                 MegatronGeneration.reserve_http_server_address(
                     train_cluster if colocated_inference else inference_cluster,
                     policy_config,
@@ -1336,9 +1321,12 @@ def setup(
                 "nemo_gym": init_nemo_gym,
             }
             print(f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}", flush=True)
-            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
-                submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
-                results = {k: f.result() for k, f in submitted.items()}
+            try:
+                with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                    submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                    results = {k: f.result() for k, f in submitted.items()}
+            finally:
+                ray.kill(port_holder)
 
             policy, policy_time, policy_generation, megatron_gen_time = results[
                 "megatron"

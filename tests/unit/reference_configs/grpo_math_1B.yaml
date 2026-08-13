@@ -394,9 +394,6 @@ policy:
       refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nccl"
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
-      # Reserve the server port up-front so NeMo-Gym spinup overlaps all of Megatron init.
-      http_server_port_range_low: 3000
-      http_server_port_range_high: 4999
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}

@@ -13,10 +13,8 @@
 # limitations under the License.
 
 import asyncio
-import errno
 import gc
 import os
-import socket
 import threading
 import time
 import warnings
@@ -58,33 +56,6 @@ from nemo_rl.models.megatron.memory_saver import (
     resume_inference_weights,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-
-
-def bind_reserved_http_server_socket(port: int) -> socket.socket:
-    """Bind and hold the driver-reserved OpenAI server port.
-
-    Args:
-        port: The port reserved by the driver for this node.
-
-    Returns:
-        The bound, listening socket, to be given to `start_text_gen_server` when the server starts.
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(("", port))
-    except OSError as e:
-        sock.close()
-        if e.errno == errno.EADDRINUSE:
-            raise RuntimeError(
-                f"Reserved OpenAI server port {port} is already in use on this "
-                "node; the URL pre-published to NeMo Gym would be unreachable. "
-                "Configure a less contended "
-                "generation.mcore_generation_config.http_server_port_range_low/high."
-            ) from e
-        raise
-    sock.listen(128)
-    return sock
 
 
 class MegatronGenerationMixin:
