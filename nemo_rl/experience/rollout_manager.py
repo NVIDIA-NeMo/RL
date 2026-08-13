@@ -727,13 +727,19 @@ class RolloutManager:
         return await self._impl.run_rollout(input_sample)
 
     async def generate_and_push(
-        self, input_sample: DatumSpec, *, target_step: Optional[int] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        target_step: Optional[int] = None,
+        inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
     ) -> None:
         """Reserve a buffer slot, run one prompt's rollout, then commit the slot.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
             target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
+            inflight_registry: Optional controller-owned mapping from group ID to
+                its dispatch task and start weight version.
         """
         assert self._tq_buffer is not None, (
             "generate_and_push requires tq_buffer to be set at __init__"
@@ -743,7 +749,16 @@ class RolloutManager:
             weight_version=start_version, target_step=target_step
         )
         try:
-            record = await self.run_rollout(input_sample)
+            if inflight_registry is not None:
+                current_task = asyncio.current_task()
+                assert current_task is not None
+                inflight_registry[group_id] = (current_task, start_version)
+            # Unregister before commit so cancellation cannot interrupt it.
+            try:
+                record = await self.run_rollout(input_sample)
+            finally:
+                if inflight_registry is not None:
+                    inflight_registry.pop(group_id, None)
             end_version = self._weight_version
             await self._tq_buffer.commit(
                 group_id,
@@ -754,5 +769,11 @@ class RolloutManager:
         except BaseException:
             # A failed rollout must not leave an unready slot that can block an
             # in-order sampler. commit() rolls back any DataPlane rows it wrote.
-            await self._tq_buffer.remove_group(group_id)
+            try:
+                await self._tq_buffer.remove_group(group_id)
+            except Exception as cleanup_exc:
+                print(
+                    f"  warn: remove_group({group_id}) cleanup failed: {cleanup_exc!r}",
+                    flush=True,
+                )
             raise

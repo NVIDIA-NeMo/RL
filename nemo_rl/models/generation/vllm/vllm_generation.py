@@ -802,34 +802,40 @@ class VllmGeneration(GenerationInterface):
             os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "900")
         )  # Default 15 minutes
 
+        # Propagate cancellation to the Ray worker and its vLLM request.
         try:
-            sample_result_ref = await anext(worker_gen_proxy)
-        except StopAsyncIteration:
-            raise RuntimeError(
-                f"Worker produced no output for the given sample {data}."
-            )
+            try:
+                sample_result_ref = await anext(worker_gen_proxy)
+            except StopAsyncIteration:
+                raise RuntimeError(
+                    f"Worker produced no output for the given sample {data}."
+                )
 
-        # Materialize the result from Ray's object store. ``anext`` above
-        # resolves when the worker yields, but the object bytes have not yet
-        # crossed the network to the driver — this is where that happens, and
-        # where a Ray deadlock / unreachable worker would manifest, hence the
-        # timeout.
-        try:
-            sample_result = await asyncio.wait_for(
-                sample_result_ref, timeout=timeout_seconds
-            )
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"Timeout waiting for worker results after {timeout_seconds}s. "
-                f"For longer sequences, increase timeout by setting: "
-                f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
-                f"{int(timeout_seconds * 2)}"
-            )
+            # Materialize the result from Ray's object store. ``anext`` above
+            # resolves when the worker yields, but the object bytes have not yet
+            # crossed the network to the driver — this is where that happens, and
+            # where a Ray deadlock / unreachable worker would manifest, hence the
+            # timeout.
+            try:
+                sample_result = await asyncio.wait_for(
+                    sample_result_ref, timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                ray.cancel(worker_gen_proxy)
+                raise RuntimeError(
+                    f"Timeout waiting for worker results after {timeout_seconds}s. "
+                    f"For longer sequences, increase timeout by setting: "
+                    f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
+                    f"{int(timeout_seconds * 2)}"
+                )
 
-        # sample_result is a tuple: (original_idx, BatchedDataDict).
-        original_idx, result_batch = sample_result
-        result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
-        yield (original_idx, result_batch)
+            # sample_result is a tuple: (original_idx, BatchedDataDict).
+            original_idx, result_batch = sample_result
+            result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
+            yield (original_idx, result_batch)
+        except (asyncio.CancelledError, GeneratorExit):
+            ray.cancel(worker_gen_proxy)
+            raise
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
