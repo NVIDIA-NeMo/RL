@@ -769,6 +769,106 @@ class TestMegatronForwardBackward:
         call_kwargs = mock_fb_func.call_args[1]
         assert call_kwargs["forward_only"] is True
 
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_forward_only_preserves_activation_offload_warmup(self, mock_get_fb):
+        """Forward-only RL stages must not consume activation-offload warmup."""
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            megatron_forward_backward,
+        )
+
+        model_config = SimpleNamespace(fine_grained_activation_offloading=True)
+        model = SimpleNamespace(config=model_config)
+
+        def run_forward_only(**kwargs):
+            assert kwargs["forward_only"] is True
+            assert model_config.fine_grained_activation_offloading is False
+            return {"logprobs": torch.tensor(0.0)}
+
+        mock_get_fb.return_value = run_forward_only
+        post_processor = LossPostProcessor(
+            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        megatron_forward_backward(
+            model=model,
+            data_iterator=iter([]),
+            num_microbatches=1,
+            seq_length=64,
+            mbs=1,
+            post_processing_fn=post_processor,
+            forward_only=True,
+        )
+
+        assert model_config.fine_grained_activation_offloading is True
+
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_forward_only_restores_activation_offload_after_error(self, mock_get_fb):
+        """A failed forward-only stage must restore activation offload for training."""
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            megatron_forward_backward,
+        )
+
+        model_config = SimpleNamespace(fine_grained_activation_offloading=True)
+        model = SimpleNamespace(config=model_config)
+
+        def fail_forward_only(**kwargs):
+            assert kwargs["forward_only"] is True
+            assert model_config.fine_grained_activation_offloading is False
+            raise RuntimeError("forward-only failure")
+
+        mock_get_fb.return_value = fail_forward_only
+        post_processor = LossPostProcessor(
+            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        with pytest.raises(RuntimeError, match="forward-only failure"):
+            megatron_forward_backward(
+                model=model,
+                data_iterator=iter([]),
+                num_microbatches=1,
+                seq_length=64,
+                mbs=1,
+                post_processing_fn=post_processor,
+                forward_only=True,
+            )
+
+        assert model_config.fine_grained_activation_offloading is True
+
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_training_keeps_activation_offload_enabled(self, mock_get_fb):
+        """Training must retain activation offload so MCore can warm up and run it."""
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            megatron_forward_backward,
+        )
+
+        model_config = SimpleNamespace(fine_grained_activation_offloading=True)
+        model = SimpleNamespace(config=model_config)
+
+        def run_training(**kwargs):
+            assert kwargs["forward_only"] is False
+            assert model_config.fine_grained_activation_offloading is True
+            return {"loss": torch.tensor(0.5)}
+
+        mock_get_fb.return_value = run_training
+        post_processor = LossPostProcessor(
+            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        megatron_forward_backward(
+            model=model,
+            data_iterator=iter([]),
+            num_microbatches=1,
+            seq_length=64,
+            mbs=1,
+            post_processing_fn=post_processor,
+            forward_only=False,
+        )
+
+        assert model_config.fine_grained_activation_offloading is True
+
 
 class TestLossPostProcessor:
     """Tests for LossPostProcessor class."""
