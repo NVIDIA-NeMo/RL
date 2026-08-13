@@ -53,6 +53,15 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 
+# The three server-type keys Gym nests under a top-level config entry. Gym has
+# no exported constant for these -- it repeats the same literal list internally
+# (global_config.py, config_types.py, cli/eval.py) -- so it is restated here.
+GYM_SERVER_TYPE_KEYS = (
+    "responses_api_agents",
+    "responses_api_models",
+    "resources_servers",
+)
+
 # Kept local (not imported from models.generation) so the gym actor stays free of
 # generation-module imports. Must cover every name resolve_routed_experts_dtype
 # can produce.
@@ -557,6 +566,39 @@ Depending on your data shape, you may want to change these values."""
             port=self.head_server_port,
         )
         self.rch = RolloutCollectionHelper()
+
+    def list_entries(self) -> Dict[str, List[str]]:
+        """Report which config entries this actor actually spawned.
+
+        Returns ``{entry_name: [server_type_keys]}`` read from Gym's *resolved*
+        config, so entries that arrived via ``config_paths`` are included. The
+        config NeMo RL passed in is not a substitute: it still holds
+        ``config_paths`` as file paths and none of the entries they expand
+        into, so reading it would miss every agent and judge loaded from a
+        path.
+
+        Callers compare these names across actors to build the agent->shard map
+        and to catch an entry duplicated across shards. Names are all that is
+        interpreted; what an entry *means* is Gym's business.
+        """
+        if self.rh is None:
+            raise RuntimeError(
+                "list_entries() needs a running Gym stack; call _spinup() first."
+            )
+
+        from nemo_gym.global_config import get_global_config_dict
+        from omegaconf import DictConfig
+
+        resolved = get_global_config_dict()
+        entries: Dict[str, List[str]] = {}
+        for name, entry in resolved.items():
+            if not isinstance(entry, (dict, DictConfig)):
+                continue
+            # Fixed key order so the map is stable across actors and runs.
+            types = [key for key in GYM_SERVER_TYPE_KEYS if key in entry]
+            if types:
+                entries[str(name)] = types
+        return entries
 
     async def run_rollouts(
         self,
