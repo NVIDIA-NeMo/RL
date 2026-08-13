@@ -522,8 +522,8 @@ data_plane:
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
   global_segment_size: 549755813888  # 512 GiB — used when backend == "mooncake_cpu"
   local_buffer_size:   68719476736   # 64 GiB  — used when backend == "mooncake_cpu"
-  # observability:                    # NotRequired
-  #   enabled: false
+  observability:                      # per-op data-plane timing/volume
+    enabled: false                    # true => wrap client in MetricsDataPlaneClient
 
 # Multi-Teacher On-Policy Distillation (MOPD): distills from one or more teacher
 # models into the policy via token-level teacher-minus-student logprob advantages,
