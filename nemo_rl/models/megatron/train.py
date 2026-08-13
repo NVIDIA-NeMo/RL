@@ -27,6 +27,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    PipelineOffloadManager,
+)
 from megatron.core.utils import StragglerDetector, get_model_config
 
 from nemo_rl.algorithms.logits_sampling_utils import (
@@ -92,13 +95,25 @@ def _suspend_activation_offload_for_forward_only(
         )
         if original_value:
             original_values.append((model_config, original_value))
-            model_config.fine_grained_activation_offloading = False
+
+    offload_manager = PipelineOffloadManager.OFFLOAD_MGR
+    suspend_manager = bool(
+        original_values and offload_manager is not None and offload_manager.do_offload
+    )
 
     try:
+        for model_config, _ in original_values:
+            model_config.fine_grained_activation_offloading = False
+        if suspend_manager and offload_manager is not None:
+            offload_manager.disable_offload()
         yield
     finally:
-        for model_config, original_value in original_values:
-            model_config.fine_grained_activation_offloading = original_value
+        try:
+            if suspend_manager and offload_manager is not None:
+                offload_manager.enable_offload()
+        finally:
+            for model_config, original_value in original_values:
+                model_config.fine_grained_activation_offloading = original_value
 
 
 def model_forward(
