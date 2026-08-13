@@ -56,7 +56,6 @@ policy:
       weight_decay: 0.0
       optimizer_cpu_offload: true
       optimizer_offload_fraction: 1.0
-      overlap_cpu_optimizer_d2h_h2d: false
     scheduler:
       lr_decay_iters: null
       lr_warmup_iters: 0
