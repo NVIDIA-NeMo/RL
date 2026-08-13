@@ -1308,6 +1308,7 @@ class TestValidateOptimizerConfig:
                 "optimizer": {
                     "optimizer_cpu_offload": True,
                     "optimizer_offload_fraction": 0.5,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
                 }
             }
         }
@@ -1324,6 +1325,7 @@ class TestValidateOptimizerConfig:
                 "optimizer": {
                     "optimizer_cpu_offload": True,
                     "optimizer_offload_fraction": fraction,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
                 }
             }
         }
@@ -1340,6 +1342,7 @@ class TestValidateOptimizerConfig:
                 "optimizer": {
                     "optimizer_cpu_offload": True,
                     "optimizer_offload_fraction": 1.0,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
                 }
             }
         }
@@ -1356,6 +1359,7 @@ class TestValidateOptimizerConfig:
                 "optimizer": {
                     "optimizer_cpu_offload": False,
                     "optimizer_offload_fraction": 0.5,  # Should be ignored
+                    "overlap_cpu_optimizer_d2h_h2d": False,
                 }
             }
         }

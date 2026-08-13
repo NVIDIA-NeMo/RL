@@ -1114,9 +1114,7 @@ def _validate_optimizer_config(config: PolicyConfig) -> None:
         raise ValueError(
             "optimizer_cpu_offload=True requires 0 < optimizer_offload_fraction <= 1"
         )
-    if not optimizer_cpu_offload and optimizer_config.get(
-        "overlap_cpu_optimizer_d2h_h2d", False
-    ):
+    if not optimizer_cpu_offload and optimizer_config["overlap_cpu_optimizer_d2h_h2d"]:
         raise ValueError(
             "overlap_cpu_optimizer_d2h_h2d=True requires optimizer_cpu_offload=True"
         )
