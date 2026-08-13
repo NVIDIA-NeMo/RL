@@ -217,7 +217,9 @@ class MegatronGenerationMixin:
             ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
-            logprobs_mode="processed_logprobs",
+            logprobs_mode=mcore_generation_config.get(
+                "logprobs_mode", "processed_logprobs"
+            ),
             max_requests=max_requests,
         )
 
