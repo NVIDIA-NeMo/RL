@@ -266,7 +266,7 @@ class MegatronOptimizerConfig(TypedDict):
     # knob to set the fraction of optimizer state and work to keep on CPU
     optimizer_offload_fraction: float
     # overlap optimizer state transfers with CPU optimizer updates
-    overlap_cpu_optimizer_d2h_h2d: bool
+    overlap_cpu_optimizer_d2h_h2d: NotRequired[bool]
 
 
 class MegatronSchedulerConfig(TypedDict):
