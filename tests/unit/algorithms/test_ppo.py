@@ -1207,7 +1207,11 @@ def test_resolve_critic_ppo_epochs_rejects_zero_ppo_epochs():
 
 def test_pooled_explained_var_pre_update():
     """Pre-update EV: perfect prediction -> 1, mean prediction -> 0, and both
-    masks are respected (values at masked positions must not leak in)."""
+    masks are respected (values at masked positions must not leak in).
+
+    Returns ``(ev_abs, ev_res)``. With no residual offsets the two spaces are
+    the same number, so every case here asserts both.
+    """
     from nemo_rl.algorithms.ppo import _pooled_explained_var
 
     token_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0]])
@@ -1219,19 +1223,24 @@ def test_pooled_explained_var_pre_update():
     values[0, 3] = 7.0
     values[1, 2] = 7.0
     assert _pooled_explained_var(values, returns, token_mask, sample_mask) == (
-        pytest.approx(1.0)
+        pytest.approx(1.0),
+        pytest.approx(1.0),
     )
 
     # Constant prediction at the valid-token mean explains nothing.
     mean_pred = torch.full_like(returns, 0.6)  # mean of [1,1,1,0,0]
     assert _pooled_explained_var(mean_pred, returns, token_mask, sample_mask) == (
-        pytest.approx(0.0, abs=1e-6)
+        pytest.approx(0.0, abs=1e-6),
+        pytest.approx(0.0, abs=1e-6),
     )
 
     # sample_mask knocks out the second sequence; the survivor has constant
     # returns (zero variance), which reports 0.0 rather than dividing by ~0.
     solo = torch.tensor([1.0, 0.0])
-    assert _pooled_explained_var(returns.clone(), returns, token_mask, solo) == 0.0
+    assert _pooled_explained_var(returns.clone(), returns, token_mask, solo) == (
+        0.0,
+        0.0,
+    )
 
     # Matches the sufficient-statistics form used by the loss-side metrics.
     mask = (token_mask * sample_mask.unsqueeze(-1)).bool()
@@ -1243,8 +1252,51 @@ def test_pooled_explained_var_pre_update():
     r_sq, res_sq = (r**2).mean(), ((r - v) ** 2).mean()
     ev_suff = 1.0 - (res_sq - (r_mean - v_mean) ** 2) / (r_sq - r_mean**2)
     assert _pooled_explained_var(noisy, returns, token_mask, sample_mask) == (
-        pytest.approx(ev_suff.item(), abs=1e-6)
+        pytest.approx(ev_suff.item(), abs=1e-6),
+        pytest.approx(ev_suff.item(), abs=1e-6),
     )
+
+
+def test_pooled_explained_var_residual_offsets():
+    """The two return spaces share one numerator and differ only in denominator.
+
+    This is what keeps critic/explained_var absolute-space in BOTH arms of the
+    residual A/B: without it the same key would carry Var(Y)-normalised EV under
+    residual_baseline and Var(R)-normalised EV without it.
+    """
+    from nemo_rl.algorithms.ppo import _pooled_explained_var
+
+    token_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0]])
+    sample_mask = torch.tensor([1.0, 1.0])
+    returns = torch.tensor([[1.0, 1.0, 1.0, 9.0], [0.0, 0.0, 9.0, 9.0]])
+    noisy = returns + 0.25 * torch.tensor(
+        [[1.0, -1.0, 0.5, 0.0], [-0.5, 1.0, 0.0, 0.0]]
+    )
+    base_abs, base_res = _pooled_explained_var(noisy, returns, token_mask, sample_mask)
+
+    # A per-sample offset that is CONSTANT across samples shifts both targets
+    # without changing either variance, so neither EV moves.
+    const = torch.tensor([2.0, 2.0])
+    ev_abs, ev_res = _pooled_explained_var(
+        noisy, returns, token_mask, sample_mask, const, const
+    )
+    assert ev_abs == pytest.approx(base_abs, abs=1e-6)
+    assert ev_res == pytest.approx(base_res, abs=1e-6)
+
+    # A spreading offset applied to the ABSOLUTE space only: Var(R) grows while
+    # the shared error does not, so ev_abs rises and ev_res is left untouched.
+    spread = torch.tensor([2.0, -2.0])
+    ev_abs, ev_res = _pooled_explained_var(
+        noisy, returns, token_mask, sample_mask, spread, None
+    )
+    assert ev_abs > base_abs
+    assert ev_res == pytest.approx(base_res, abs=1e-6)
+
+    # Offsets never touch the numerator: a perfect predictor stays at 1.0 in
+    # both spaces however the targets are shifted.
+    assert _pooled_explained_var(
+        returns.clone(), returns, token_mask, sample_mask, spread, const
+    ) == (pytest.approx(1.0), pytest.approx(1.0))
 
 
 # NeMo-Gym IS supported for async PPO: the AsyncTrajectoryCollector runs the gym
