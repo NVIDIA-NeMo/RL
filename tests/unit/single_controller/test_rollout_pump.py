@@ -31,7 +31,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSampler,
     WindowedSamplerConfig,
 )
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
@@ -62,6 +62,34 @@ from tests.unit.single_controller._dp_fakes import (
 )
 
 
+class _RecordingBuffer:
+    """TQReplayBuffer stand-in recording the target_step of each reserve."""
+
+    def __init__(self, target_step_list: list[int | None] | None = None) -> None:
+        self.target_step_list: list[int | None] = list(target_step_list or [])
+
+    def reserve(self, *, target_step: int | None) -> None:
+        self.target_step_list.append(target_step)
+
+    def count_for_target_step(self, target_step: int) -> int:
+        return sum(1 for target in self.target_step_list if target == target_step)
+
+
+class _RecordingRolloutManager:
+    def __init__(self, buffer: _RecordingBuffer) -> None:
+        self._buffer = buffer
+
+    async def generate_and_push(
+        self,
+        prompt: Any,
+        *,
+        target_step: int | None = None,
+        inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+    ) -> None:
+        del prompt, inflight_registry
+        self._buffer.reserve(target_step=target_step)
+
+
 @pytest.mark.parametrize(
     ("make_sampler", "expected_target_steps"),
     [
@@ -75,30 +103,10 @@ def test_rollout_pump_stamps_target_steps(
     make_sampler,
     expected_target_steps: list[int | None],
 ) -> None:
-    class _RecordingBuffer:
-        def __init__(self) -> None:
-            self.target_step_list: list[int | None] = []
-
-        def reserve(self, *, target_step: int | None) -> None:
-            self.target_step_list.append(target_step)
-
-    class _RecordingRolloutManager:
-        def __init__(self, buffer: _RecordingBuffer) -> None:
-            self._buffer = buffer
-
-        async def generate_and_push(
-            self,
-            prompt: Any,
-            *,
-            target_step: int | None = None,
-            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
-        ) -> None:
-            del prompt, inflight_registry
-            self._buffer.reserve(target_step=target_step)
-
     buffer = _RecordingBuffer()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(
         max_inflight_prompts=2,
         diagnostics=False,
@@ -127,6 +135,69 @@ def test_rollout_pump_stamps_target_steps(
     asyncio.run(ctrl._rollout_pump())
 
     assert buffer.target_step_list == expected_target_steps
+    assert ctrl._rollout_exhausted.is_set()
+
+
+@pytest.mark.parametrize(
+    ("restored", "expected_new_dispatches"),
+    [
+        # Room left for a partial top-up.
+        (1, 1),
+        # Target step already full: the whole batch is dropped.
+        (2, 0),
+        # More restored than a batch: still zero, never negative.
+        (3, 0),
+    ],
+)
+def test_rollout_pump_tops_up_restored_target_step(
+    restored: int,
+    expected_new_dispatches: int,
+) -> None:
+    # On resume the buffer holds groups still stamped for the next target
+    # step. In-order selection consumes a target step as one fixed-size batch,
+    # so the pump must dispatch only the shortfall — a full batch on top would
+    # leave surplus groups that are never selected and whose capacity permits
+    # are held until evict.
+    buffer = _RecordingBuffer([0] * restored)
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._buffer = buffer
+    ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
+    ctrl._rollout_manager = _RecordingRolloutManager(buffer)
+    # lookahead=0 keeps the single batch on target_step 0.
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
+    ctrl._dataloader = [
+        BatchedDataDict(
+            {
+                "message_log": [
+                    [{"role": "user", "content": "p0"}],
+                    [{"role": "user", "content": "p1"}],
+                ]
+            }
+        )
+    ]
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(4)
+    ctrl._inflight_rollouts = 0
+    ctrl._inflight_by_group_id = {}
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+
+    asyncio.run(ctrl._rollout_pump())
+
+    # Only the shortfall was dispatched on top of the restored groups.
+    assert buffer.target_step_list == [0] * (restored + expected_new_dispatches)
+    # A dispatched prompt keeps its permit (the train pump releases it after
+    # consuming the group), so exactly one permit per dispatch is held and the
+    # dropped prompts consume none.
+    assert ctrl._buffer_capacity._value == 4 - expected_new_dispatches
+    assert ctrl._inflight_rollouts == 0
     assert ctrl._rollout_exhausted.is_set()
 
 
@@ -382,6 +453,18 @@ def test_rollout_pump_writes_expected_tq_data(
             "mlflow_enabled": False,
             "monitor_gpus": False,
         },
+        # Actor __init__ builds a CheckpointManager + TimeoutChecker from
+        # this block; enabled=False keeps the run write-free.
+        checkpointing={
+            "enabled": False,
+            "checkpoint_dir": str(tmp_path / "checkpoints"),
+            "metric_name": None,
+            "higher_is_better": False,
+            "keep_top_k": None,
+            "save_period": 10_000,
+            "save_optimizer": False,
+            "checkpoint_must_save_by": None,
+        },
     )
     # Wrap each value in a single-element list so size==1 and v[0] returns the original field.
     batched_sample = BatchedDataDict({k: [v] for k, v in input_sample.items()})
@@ -416,6 +499,8 @@ def test_rollout_pump_writes_expected_tq_data(
         rollout_manager=rollout_manager,
         tq_buffer=tq_buffer,
         partition_id=_PARTITION_ID,
+        save_state=_initial_grpo_save_state(),
+        last_checkpoint_path=None,
     )
     ctrl = SingleControllerActor.remote(
         master_config=master_config,
