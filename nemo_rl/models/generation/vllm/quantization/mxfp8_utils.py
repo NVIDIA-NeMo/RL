@@ -41,9 +41,9 @@ def flashinfer_mxfp8_moe_padding_plan(
 ) -> tuple[int, int]:
     if hidden_size <= 0:
         raise ValueError("MXFP8 MoE hidden_size must be positive")
-    if hidden_size % 128 != 0:
+    if hidden_size % 32 != 0:
         raise ValueError(
-            "FlashInfer TRTLLM MXFP8 MoE requires hidden_size divisible by 128, "
+            "FlashInfer TRTLLM MXFP8 MoE requires hidden_size divisible by 32, "
             f"got {hidden_size}."
         )
     if intermediate_size <= 0:
