@@ -18,11 +18,25 @@ import sys
 import tempfile
 from unittest.mock import patch
 
+import pytest
+
 from nemo_rl import patch_transformers_module_dir
 
 
 class TestPatchTransformersModuleDir:
     """Test cases for the patch_transformers_module_dir function."""
+
+    @pytest.fixture(autouse=True)
+    def _no_ambient_modules_cache(self, monkeypatch):
+        """Drop an inherited HF_MODULES_CACHE for every test in this class.
+
+        These tests set HF_HOME and assert on the directory derived from it,
+        but HF_MODULES_CACHE outranks HF_HOME, so a value in the developer's
+        environment silently decides the result. Clearing it here rather than
+        passing clear=True to each patch.dict keeps unrelated ambient
+        variables intact.
+        """
+        monkeypatch.delenv("HF_MODULES_CACHE", raising=False)
 
     def test_no_patching_when_hf_home_not_set(self):
         """Test that patching is skipped when HF_HOME is not set."""
