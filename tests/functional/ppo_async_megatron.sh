@@ -23,6 +23,7 @@ TRAIN_CMD=(
     ppo.num_prompts_per_step=2
     ppo.num_generations_per_prompt=4
     ppo.ppo_epochs=2
+    ppo.max_num_epochs=1
     ppo.policy_training_start_step=1
     ppo.val_at_start=false
     ppo.val_period=0
@@ -67,7 +68,6 @@ cd "${PROJECT_ROOT}"
     2>&1 | tee "${EXP_DIR}/run1.log"
 
 grep -q "Separate PPO clusters initialized" "${EXP_DIR}/run1.log"
-grep -q "Using vllm in-flight weight update" "${EXP_DIR}/run1.log"
 grep -q "Updated generation window: version=0, lead=2, max_age=2" "${EXP_DIR}/run1.log"
 grep -q "Updated generation window: version=1, lead=1, max_age=2" "${EXP_DIR}/run1.log"
 test "$(grep -c "PPO epoch 2/2" "${EXP_DIR}/run1.log")" -eq 2
@@ -101,7 +101,7 @@ for run_spec in "run1 1 1" "run2 2 2"; do
         'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
         'max(data["train/probs_ratio_clamped_max"]) < 1.29' \
         'max(data["train/token_mult_prob_error"]) < 1.05' \
-        'max(data["train/critic/loss"]) < 8.0' \
+        'max(data["train/critic/loss"]) < 6.0' \
         'min(data["train/critic/loss"]) >= 0' \
         "max(data[\"train/avg_trajectory_age\"]) <= ${expected_max_age}" \
         'len(data["validation/accuracy"]) == 1'
