@@ -3755,7 +3755,7 @@ def grpo_train(
                 master_config,
                 num_prompts_per_step=master_config.grpo.num_prompts_per_step,
                 num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
-                include_training_worker_idle_ratio=master_config.grpo.async_grpo.enabled,
+                is_async_rl=master_config.grpo.async_grpo.enabled,
             )
 
             if payload_metrics:
@@ -5295,7 +5295,7 @@ def async_grpo_train(
                 master_config,
                 num_prompts_per_step=master_config.grpo.num_prompts_per_step,
                 num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
-                include_training_worker_idle_ratio=master_config.grpo.async_grpo.enabled,
+                is_async_rl=master_config.grpo.async_grpo.enabled,
             )
 
             collector_efficiency = ray.get(

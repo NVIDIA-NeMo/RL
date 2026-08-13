@@ -1352,7 +1352,7 @@ def grpo_train_sync(
                 master_config,
                 num_prompts_per_step=master_config.grpo.num_prompts_per_step,
                 num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
-                include_training_worker_idle_ratio=False,
+                is_async_rl=False,
             )
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")

@@ -524,7 +524,7 @@ def print_performance_metrics(
     *,
     num_prompts_per_step: int,
     num_generations_per_prompt: int,
-    include_training_worker_idle_ratio: bool,
+    is_async_rl: bool,
 ) -> dict[str, float]:
     """Print performance metrics for an RL training step."""
 
@@ -743,10 +743,10 @@ def print_performance_metrics(
     total_num_gpus = num_nodes * gpus_per_node
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
-    # Idle Time from Training Worker (Async GRPO only)
+    # Idle time from the training worker in async RL.
     if (
         "exposed_generation" in timing_metrics
-        and include_training_worker_idle_ratio
+        and is_async_rl
         and not colocated_inference
     ):
         exposed_generation_time = timing_metrics["exposed_generation"]

@@ -122,22 +122,14 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     # None keeps the normal trajectory-age limit throughout warmup.
     warmup_max_trajectory_age_steps: int | None = Field(default=None, ge=1)
     # Allows weight updates while rollout requests are still in flight.
-    in_flight_weight_updates: bool = True
-    # Invalidates and rebuilds the generation KV cache after an in-flight update.
+    in_flight_weight_updates: bool = False
+    # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: bool = False
     # Regenerates a partial replay-buffer frontier after resume.
     drop_incomplete_targets_on_restore: bool = True
 
     @model_validator(mode="after")
     def validate_settings(self) -> "AsyncPPOConfig":
-        if (
-            self.recompute_kv_cache_after_weight_updates
-            and not self.in_flight_weight_updates
-        ):
-            raise ValueError(
-                "recompute_kv_cache_after_weight_updates requires "
-                "in_flight_weight_updates=true"
-            )
         if (
             self.warmup_max_trajectory_age_steps is not None
             and self.warmup_max_trajectory_age_steps < self.max_trajectory_age_steps
@@ -149,8 +141,8 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
         return self
 
     @property
-    def effective_warmup_max_trajectory_age_steps(self) -> int:
-        """Return the configured warmup age or the normal training age."""
+    def resolved_warmup_max_trajectory_age_steps(self) -> int:
+        """Resolve the warmup override, falling back to the training age."""
         if self.warmup_max_trajectory_age_steps is None:
             return self.max_trajectory_age_steps
         return self.warmup_max_trajectory_age_steps
@@ -1986,7 +1978,7 @@ def ppo_train(
                 num_generations_per_prompt=(
                     master_config.ppo.num_generations_per_prompt
                 ),
-                include_training_worker_idle_ratio=False,
+                is_async_rl=master_config.ppo.async_ppo.enabled,
             )
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
@@ -2112,47 +2104,15 @@ def async_ppo_train(
     master_config: MasterConfig,
 ) -> None:
     """Run PPO while a background collector fills a replay buffer."""
-    # ------------------------------------------------------------------
-    # Entry guards (fail loud at startup, not deep in the loop)
-    # ------------------------------------------------------------------
-    generation_config = master_config.policy["generation"]
-    backend = generation_config.get("backend", "") if generation_config else ""
-    if backend != "vllm" or not _should_use_async_rollouts(master_config):
-        raise ValueError(
-            "Async PPO requires policy.generation.backend=vllm and "
-            "policy.generation.vllm_cfg.async_engine=true"
-        )
-    if not master_config.loss_fn.use_importance_sampling_correction:
-        raise ValueError(
-            "Async PPO requires loss_fn.use_importance_sampling_correction=true"
-        )
-    if master_config.loss_fn.force_on_policy_ratio:
-        raise ValueError("Async PPO does not support force_on_policy_ratio=true")
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
-    if colocated_inference:
-        raise ValueError("Async PPO requires non-colocated generation")
-
     async_config = master_config.ppo.async_ppo
     max_trajectory_age_steps = async_config.max_trajectory_age_steps
     warmup_max_trajectory_age_steps = (
-        async_config.effective_warmup_max_trajectory_age_steps
+        async_config.resolved_warmup_max_trajectory_age_steps
     )
     policy_training_start_step = master_config.ppo.policy_training_start_step
     if master_config.ppo.ppo_epochs < 1:
         raise ValueError("ppo.ppo_epochs must be at least 1")
-    # Keep launcher restrictions here as defensive checks for direct callers.
-    if master_config.env.get("should_use_nemo_gym"):
-        raise NotImplementedError("NeMo Gym rollout is not supported for async PPO")
-    if master_config.ppo.use_dynamic_sampling:
-        raise NotImplementedError("Dynamic sampling is not supported for async PPO")
-    if master_config.ppo.reward_scaling.enabled:
-        raise NotImplementedError("Reward scaling is not supported for async PPO")
-    if master_config.ppo.reward_shaping.enabled:
-        raise NotImplementedError("Reward shaping is not supported for async PPO")
-    if master_config.data["use_multiple_dataloader"]:
-        raise NotImplementedError(
-            "Multiple dataloaders are not supported for async PPO"
-        )
     if max_trajectory_age_steps > 1:
         print(
             "⚠️ WARNING: max_trajectory_age_steps > 1 increases off-policy "
@@ -2173,8 +2133,6 @@ def async_ppo_train(
     # PPO async always uses non-colocated vLLM generation, so a refit is always
     # required and the generation engine is a real (non-None) actor.
     assert policy_generation is not None
-    if getattr(policy_generation, "requires_kv_scale_sync", False):
-        raise NotImplementedError("FP8 KV-scale synchronization is not supported yet")
 
     if master_config.ppo.skip_reference_policy_logprobs_calculation:
         if master_config.loss_fn.reference_policy_kl_penalty != 0:
@@ -3045,7 +3003,7 @@ def async_ppo_train(
                 num_generations_per_prompt=(
                     master_config.ppo.num_generations_per_prompt
                 ),
-                include_training_worker_idle_ratio=False,
+                is_async_rl=master_config.ppo.async_ppo.enabled,
             )
 
             collector_efficiency = ray.get(
