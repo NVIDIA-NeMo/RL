@@ -100,11 +100,6 @@ def test_patch_ray_executor_v2_applies_fp8_before_worker_init(fp8_module, monkey
     events = []
 
     class FakeRayWorkerProc:
-        def __init__(self, fp8_config):
-            self._init_kwargs = {
-                "vllm_config": types.SimpleNamespace(nrl_fp8_cfg=fp8_config)
-            }
-
         def initialize_worker(self, *args, **kwargs):
             events.append(("initialize", args, kwargs))
             return "initialized"
@@ -116,11 +111,14 @@ def test_patch_ray_executor_v2_applies_fp8_before_worker_init(fp8_module, monkey
         lambda _worker, config: events.append(("patch", config)),
     )
 
-    fp8._patch_vllm_ray_executor_v2()
     first_config = object()
     second_config = object()
-    first_worker = ray_executor_v2.RayWorkerProc(first_config)
-    second_worker = ray_executor_v2.RayWorkerProc(second_config)
+    fp8._patch_vllm_ray_executor_v2(first_config)
+    first_worker_cls = ray_executor_v2.RayWorkerProc
+    fp8._patch_vllm_ray_executor_v2(second_config)
+    second_worker_cls = ray_executor_v2.RayWorkerProc
+    first_worker = first_worker_cls()
+    second_worker = second_worker_cls()
     first_result = first_worker.initialize_worker(1, {"A": "B"})
     second_result = second_worker.initialize_worker(2, {"C": "D"})
 
@@ -132,12 +130,12 @@ def test_patch_ray_executor_v2_applies_fp8_before_worker_init(fp8_module, monkey
         ("patch", second_config),
         ("initialize", (2, {"C": "D"}), {}),
     ]
-    assert not hasattr(first_worker._init_kwargs["vllm_config"], "nrl_fp8_cfg")
-    assert not hasattr(second_worker._init_kwargs["vllm_config"], "nrl_fp8_cfg")
+    assert first_worker_cls.__bases__ == (FakeRayWorkerProc,)
+    assert second_worker_cls.__bases__ == (FakeRayWorkerProc,)
 
 
 @pytest.mark.parametrize("model_parallel_size", [1, 2])
-def test_run_engine_core_retains_fp8_config_for_ray_workers(
+def test_run_engine_core_removes_serialized_fp8_config(
     fp8_module, monkeypatch, model_parallel_size
 ):
     fp8 = fp8_module
@@ -160,7 +158,7 @@ def test_run_engine_core_retains_fp8_config_for_ray_workers(
 
     assert result is vllm_config
     assert applied_configs == [fp8_config]
-    assert hasattr(vllm_config, "nrl_fp8_cfg") is (model_parallel_size > 1)
+    assert not hasattr(vllm_config, "nrl_fp8_cfg")
 
 
 @pytest.mark.parametrize("hidden_size", [32, 64])

@@ -89,27 +89,24 @@ def my_init(*args, **kwargs):
 
 def my_run_engine_core(*args, **kwargs):
     fp8_cfg = kwargs["vllm_config"].nrl_fp8_cfg
-    if fp8_cfg.model_parallel_size == 1:
-        del kwargs["vllm_config"].nrl_fp8_cfg
+    del kwargs["vllm_config"].nrl_fp8_cfg
     monkey_patch_vllm_ray_executor(fp8_cfg)
     return original_run_engine_core(*args, **kwargs)
 
 
-def _patch_vllm_ray_executor_v2() -> None:
+def _patch_vllm_ray_executor_v2(fp8_config) -> None:
     """Install FP8 patches before each RayExecutorV2 worker loads its model."""
     from vllm.v1.executor import ray_executor_v2
 
-    base_worker_proc = ray_executor_v2.RayWorkerProc
-    if getattr(base_worker_proc, "_nrl_fp8_patched", False):
-        return
+    current_worker_proc = ray_executor_v2.RayWorkerProc
+    base_worker_proc = getattr(
+        current_worker_proc, "_nrl_fp8_base_worker_proc", current_worker_proc
+    )
 
     class NrlFp8RayWorkerProc(base_worker_proc):
-        _nrl_fp8_patched = True
+        _nrl_fp8_base_worker_proc = base_worker_proc
 
         def initialize_worker(self, *args, **kwargs):
-            vllm_config = self._init_kwargs["vllm_config"]
-            fp8_config = vllm_config.nrl_fp8_cfg
-            del vllm_config.nrl_fp8_cfg
             apply_fp8_patches(None, fp8_config)
             return super().initialize_worker(*args, **kwargs)
 
@@ -118,7 +115,7 @@ def _patch_vllm_ray_executor_v2() -> None:
 
 def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
-        _patch_vllm_ray_executor_v2()
+        _patch_vllm_ray_executor_v2(fp8_config)
         # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
         # a ray remote that patches each worker with the required fp8 vllm patches
         from vllm.v1.executor.ray_executor import RayDistributedExecutor
