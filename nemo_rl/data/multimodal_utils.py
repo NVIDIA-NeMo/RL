@@ -924,17 +924,31 @@ def _materialize_ragged_pixel_values(
     padding happens afterwards so downstream sees the single tensor its
     torch.Tensor contract expects.
     """
-    pixel_values = processed.get("pixel_values")
-    if not isinstance(pixel_values, list):
-        return processed
-
-    tiles = [torch.as_tensor(item) for item in pixel_values]
-    if not tiles or any(item.ndim != 3 for item in tiles):
-        raise ValueError("Ragged pixel_values must contain one CHW tensor per image.")
-    if len({item.shape[0] for item in tiles}) != 1:
-        raise ValueError("Ragged pixel_values must use the same channel count.")
-
     processed = dict(processed)
+    pixel_values = processed.get("pixel_values")
+
+    # pixel_values is only ragged when the images genuinely differ in size; two
+    # images of equal resolution come back already stacked. Either way the rest
+    # of the batch still needs restoring to tensors, so that runs below rather
+    # than behind this branch.
+    if isinstance(pixel_values, list):
+        tiles = [torch.as_tensor(item) for item in pixel_values]
+        if not tiles or any(item.ndim != 3 for item in tiles):
+            raise ValueError(
+                "Ragged pixel_values must contain one CHW tensor per image."
+            )
+        if len({item.shape[0] for item in tiles}) != 1:
+            raise ValueError("Ragged pixel_values must use the same channel count.")
+        _stack_ragged_pixel_values(processed, tiles, processor)
+
+    _restore_tensors(processed)
+    return processed
+
+
+def _stack_ragged_pixel_values(
+    processed: dict[str, Any], tiles: list[torch.Tensor], processor: Any
+) -> None:
+    """Derive imgs_sizes from unpadded shapes, then pad into one tensor."""
     if uses_image_placeholder(processor) and "imgs_sizes" not in processed:
         processed["imgs_sizes"] = torch.tensor(
             [[int(item.shape[-2]), int(item.shape[-1])] for item in tiles],
@@ -947,7 +961,26 @@ def _materialize_ragged_pixel_values(
     ).as_tensor()
     assert stacked is not None
     processed["pixel_values"] = stacked
-    return processed
+
+
+def _restore_tensors(processed: dict[str, Any]) -> None:
+    """Convert a processor's list outputs back to tensors, in place.
+
+    ``return_tensors=None`` makes the processor hand back *every* output as
+    plain Python lists, not only the ragged ``pixel_values`` that mode was
+    requested for. Downstream expects tensors -- ``input_ids`` in particular is
+    rank-checked -- so restore the rest of the batch to what
+    ``return_tensors="pt"`` would have produced. Values that resist conversion
+    (genuinely ragged per-image metadata) are left for their own handling.
+    """
+    for key, value in processed.items():
+        if key == "pixel_values" or isinstance(value, torch.Tensor):
+            continue
+        if isinstance(value, (list, tuple)):
+            try:
+                processed[key] = torch.as_tensor(value)
+            except (TypeError, ValueError, RuntimeError):
+                continue
 
 
 def attach_image_model_inputs_to_message(
