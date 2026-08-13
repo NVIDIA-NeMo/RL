@@ -1,0 +1,38 @@
+# Nemotron-3-Nano-30B-A3B DAPO — colocated Megatron inference with zero train/gen KL
+defaults: grpo-nanov3-30BA3B-2n8g-megatron_generation.yaml
+
+grpo:
+  val_at_start: false
+  val_at_end: false
+  val_period: 10
+
+
+policy:
+  router_replay:
+    enabled: true
+  megatron_cfg:
+    zero_train_gen_mismatch: true
+    tensor_model_parallel_size: 1
+    moe_token_dispatcher_type: alltoall
+    moe_router_dtype: fp32
+    moe_permute_fusion: false
+    moe_pad_experts_for_cuda_graph_inference: true
+    use_mamba_mem_eff_path: false
+  generation:
+    backend: megatron
+    colocated:
+      enabled: true
+    mcore_generation_config:
+      async_engine: false
+      transformer_impl: transformer_engine
+      tensor_model_parallel_size: 1
+      static_kv_memory_pointers: false
+      buffer_size_gb: 16
+      enable_chunked_prefill: false
+      mamba_inference_ssm_states_dtype: float32
+      use_cuda_graphs_for_non_decode_steps: true
+      cuda_graph_impl: local
+      num_cuda_graphs: 4
+      inference_cuda_graph_scope: block
+      kv_cache_management_mode: persist
+

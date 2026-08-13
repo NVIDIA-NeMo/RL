@@ -2,7 +2,6 @@
 
 True on-policy RL training using Megatron-Inference to minimize training-generation mismatch (`gen_kl_error` -> 0).
 
-
 ## Setup
 
 ```bash
@@ -12,8 +11,6 @@ cd RL && git submodule update --init --recursive
 
 # 2. Download the container (one-time)
 enroot import --output nemo_rl_v0.7.0.sqsh 'docker://nvcr.io#nvidia/nemo-rl:v0.7.0'
-# This creates nemo_rl_v0.7.0.sqsh in the current directory.
-# Move it to your preferred location and update CONTAINER_IMAGE in the scripts.
 
 # 3. Create .env with your config
 cp .env.template .env
@@ -22,25 +19,26 @@ cp .env.template .env
 
 ## Run
 
+Single launcher for all three study models. Zero-KL knobs live in the recipe yaml; the script only handles runtime sweeps (`MODEL`, `PRECISION`, ablations).
+
 ```bash
-# Qwen2.5-1.5B (1 node, 8GPU, TP=1)
-# ZERO_TRAIN_GEN_MISMATCH is set to true by default
-sbatch --export=PRECISION=bf16  run_qwen1.5b_zero_kl_precision.sh
-sbatch --export=PRECISION=bf16,ZERO_TRAIN_GEN_MISMATCH=false run_qwen1.5b_zero_kl_precision.sh
-sbatch --export=PRECISION=mxfp8 run_qwen1.5b_zero_kl_precision.sh
-sbatch --export=PRECISION=mxfp8,ZERO_TRAIN_GEN_MISMATCH=false run_qwen1.5b_zero_kl_precision.sh
+# Qwen2.5-1.5B (default 1×8)
+sbatch --export=MODEL=qwen1.5b,PRECISION=bf16  run_zero_kl_precision.sh
 
+# Qwen3-30B-A3B DAPO (default 1×8; scale with SLURM --nodes)
+sbatch --export=MODEL=qwen30ba3b,PRECISION=bf16  run_zero_kl_precision.sh
+sbatch --export=MODEL=qwen30ba3b,PRECISION=mxfp8 run_zero_kl_precision.sh
 
-# Qwen3-30B-A3B (1 node, 8GPU, TP=1)
-sbatch --export=PRECISION=bf16  run_qwen30ba3b_zero_kl_precision.sh
-sbatch --export=PRECISION=mxfp8 run_qwen30ba3b_zero_kl_precision.sh
-sbatch --export=PRECISION=bf16,ZERO_TRAIN_GEN_MISMATCH=false run_qwen30ba3b_zero_kl_precision.sh
-sbatch --export=PRECISION=mxfp8,ZERO_TRAIN_GEN_MISMATCH=false run_qwen30ba3b_zero_kl_precision.sh
+# Nemotron-3-Nano-30B-A3B DAPO (default 2×8)
+sbatch --export=MODEL=nanov3,PRECISION=bf16  run_zero_kl_precision.sh
+sbatch --export=MODEL=nanov3,PRECISION=mxfp8 run_zero_kl_precision.sh
 
-# Nano3-30B-A3B (1node, 8GPU, TP=1)
-sbatch --export=PRECISION=bf16  run_nanov3_30ba3b_zero_kl_precision.sh
-sbatch --export=PRECISION=mxfp8 run_nanov3_30ba3b_zero_kl_precision.sh
-sbatch --export=PRECISION=bf16,ZERO_TRAIN_GEN_MISMATCH=false run_nanov3_30ba3b_zero_kl_precision.sh
-sbatch --export=PRECISION=mxfp8,ZERO_TRAIN_GEN_MISMATCH=false run_nanov3_30ba3b_zero_kl_precision.sh
+# Ablations
+sbatch --export=MODEL=qwen30ba3b,ZERO_TRAIN_GEN_MISMATCH=false run_zero_kl_precision.sh
 ```
+
+Recipes:
+- `examples/configs/recipes/llm/grpo-qwen1.5b-megatron-zero-train-gen-kl.yaml`
+- `examples/configs/recipes/llm/grpo-dapomath17k-qwen-30ba3b-megatron-zero-train-gen-kl.yaml`
+- `examples/configs/recipes/llm/grpo-nanov3-30ba3b-megatron-zero-train-gen-kl.yaml`
 
