@@ -726,6 +726,123 @@ def test_prepare_for_generation_disables_param_gather_hook_before_wake(
     assert model.config.flash_decode is False
 
 
+def test_prepare_for_generation_resets_te_quantized_weight_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    cache_resets = []
+    model = SimpleNamespace(
+        config=SimpleNamespace(flash_decode=True),
+        eval=lambda: None,
+        is_first_microbatch=False,
+        set_is_first_microbatch=lambda: cache_resets.append("api"),
+    )
+    model.modules = lambda: [model]
+    worker = object.__new__(megatron_worker.MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {"mcore_generation_config": {"cuda_graph_impl": "none"}}
+    }
+    worker.model = model
+    worker.is_generation_colocated = True
+    worker.should_disable_forward_pre_hook = False
+    worker._inference_engine_initialized = True
+    worker._wake = lambda: None
+
+    monkeypatch.setattr(megatron_worker, "log_gpu_memory", lambda *_: None)
+    monkeypatch.setattr(megatron_worker, "unwrap_model", lambda model: model)
+
+    worker.prepare_for_generation()
+
+    assert cache_resets == ["api"]
+    assert model.is_first_microbatch is True
+
+
+def test_sync_te_extra_state_after_reshard_applies_train_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    applied = []
+    worker = object.__new__(megatron_worker.MegatronGenerationMixin)
+    worker.refit_pg = SimpleNamespace(size=lambda: 2, rank=lambda: 1)
+    worker.refit_dst_rank_offset = 1
+    worker._get_model_extra_state_dict = lambda: {}
+    worker._apply_state_dict_to_model = lambda extra, raise_if_key_missing=False: (
+        applied.append(extra)
+    )
+
+    def fake_all_gather_object(gathered, payload, group=None):
+        gathered[0] = {"layer._extra_state": torch.tensor([1.0])}
+        gathered[1] = payload
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
+
+    worker._sync_te_extra_state_after_reshard(is_source=False)
+
+    assert len(applied) == 1
+    assert "layer._extra_state" in applied[0]
+
+
+def test_prepare_fp8_inference_linears_wraps_unwrapped_model_when_fp8_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    unwrapped = object()
+    wrapped = []
+
+    worker = object.__new__(megatron_worker.MegatronGenerationMixin)
+    worker.cfg = {
+        "megatron_cfg": {
+            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8", "fp8": "e4m3"}
+        }
+    }
+    worker.model = object()
+    worker.rank = 0
+
+    monkeypatch.setattr(megatron_worker, "unwrap_model", lambda model: unwrapped)
+    monkeypatch.setattr(
+        "megatron.core.fp8_utils.prepare_model_for_fp8_inference",
+        lambda model: wrapped.append(model) or model,
+    )
+
+    worker._prepare_fp8_inference_linears()
+
+    assert wrapped == [unwrapped]
+
+
+def test_prepare_fp8_inference_linears_skips_when_fp8_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    worker = object.__new__(megatron_worker.MegatronGenerationMixin)
+    worker.cfg = {"megatron_cfg": {"fp8_cfg": {"enabled": False, "fp8_recipe": "mxfp8"}}}
+    worker.model = object()
+    worker.rank = 0
+
+    def fail_if_called(model):
+        raise AssertionError("prepare_model_for_fp8_inference should not run")
+
+    monkeypatch.setattr(
+        "megatron.core.fp8_utils.prepare_model_for_fp8_inference", fail_if_called
+    )
+
+    worker._prepare_fp8_inference_linears()
+
+
+def test_prepare_fp8_inference_linears_skips_when_fp8_cfg_missing() -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    worker = object.__new__(megatron_worker.MegatronGenerationMixin)
+    worker.cfg = {"megatron_cfg": {}}
+    worker.model = object()
+    worker.rank = 0
+
+    worker._prepare_fp8_inference_linears()
+
+
 def create_megatron_test_config(
     model_name: str,
     tp: int = 1,
