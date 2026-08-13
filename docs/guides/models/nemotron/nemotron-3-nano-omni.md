@@ -27,7 +27,7 @@ Both share the same checkpoint, model code, and reward pipeline; they differ onl
 
 ### Recipe 1 — CLEVR-CoGenT (single-node)
 
-The CLEVR-CoGenT recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml). It expects 8 GPUs on a single node, EP=8 across the experts, and TP=8 in vLLM.
+The CLEVR-CoGenT recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml). It expects 8 GPUs on a single node, EP=8 across the experts, and TP=8 in vLLM.
 
 Key knobs in the config:
 
@@ -65,7 +65,7 @@ uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-n
 
 ### Recipe 2 — MMPR-Tiny (4-node Slurm)
 
-The MMPR-Tiny recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml). Differences vs. the CLEVR recipe:
+The MMPR-Tiny recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml). Differences vs. the CLEVR recipe:
 
 | Field | Value |
 |---|---|
@@ -142,8 +142,8 @@ Use the `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` Hugging Face checkp
 
 | Workload | Recipe | Topology |
 |---|---|---|
-| CLEVR-CoGenT | [`vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml) | 1 node, 8 GPUs, TP=8, EP=8 |
-| MMPR-Tiny | [`vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml) | 4 nodes, 8 GPUs per node, TP=8, EP=16, vLLM TP=2 |
+| CLEVR-CoGenT | [`vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml) | 1 node, 8 GPUs, TP=8, EP=8 |
+| MMPR-Tiny | [`vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml) | 4 nodes, 8 GPUs per node, TP=8, EP=16, vLLM TP=2 |
 
 Launch the single-node Megatron recipe from inside the container on an 8-GPU node:
 
