@@ -143,7 +143,7 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
         load_time = 0.0
         start_time = time.time()
 
-        with self._weight_update_lifecycle("collective") as finalize:
+        with self._weight_update_lifecycle("checkpoint_engine") as finalize:
             async for weight_batch in self.checkpoint_engine.receive_weight_batches():
                 loaded_batches += 1
                 loaded_tensors += len(weight_batch)

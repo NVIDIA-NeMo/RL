@@ -20,7 +20,7 @@ import pytest
 
 def _load_mxfp8_utils():
     module_path = (
-        Path(__file__).parents[1]
+        Path(__file__).parents[4]
         / "nemo_rl/models/generation/vllm/quantization/mxfp8_utils.py"
     )
     spec = importlib.util.spec_from_file_location("mxfp8_utils", module_path)

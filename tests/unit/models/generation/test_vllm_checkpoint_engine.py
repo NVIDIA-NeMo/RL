@@ -98,8 +98,8 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
     )
 
     @contextmanager
-    def lifecycle(_transport):
-        events.append(("lifecycle_enter",))
+    def lifecycle(transport):
+        events.append(("lifecycle_enter", transport))
         yield lambda: events.append(("finalize",))
         events.append(("lifecycle_exit",))
 
@@ -112,7 +112,7 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
 
     assert asyncio.run(worker._update_weights_from_checkpoint_engine_async()) is True
     assert events == [
-        ("lifecycle_enter",),
+        ("lifecycle_enter", "checkpoint_engine"),
         ("load", ["a"]),
         ("sync",),
         ("load", ["b", "c"]),
