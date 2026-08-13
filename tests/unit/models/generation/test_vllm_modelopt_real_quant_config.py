@@ -2391,6 +2391,92 @@ def test_resolve_quant_cfg_resolves_repo_relative_recipe_from_remote_cwd(
     assert captured["config_file"] == str((repo_root / quant_cfg).resolve())
 
 
+def test_resolve_quant_cfg_probes_suffix_for_repo_relative_recipe(
+    monkeypatch, tmp_path
+):
+    modelopt_recipe = pytest.importorskip("modelopt.recipe")
+    captured = {}
+
+    def fake_load_config(config_file):
+        captured["config_file"] = config_file
+        return {"quant_cfg": [{"name": "mock"}], "algorithm": "max"}
+
+    monkeypatch.setattr(modelopt_recipe, "load_config", fake_load_config)
+    monkeypatch.chdir(tmp_path)
+
+    quant_cfg = "examples/modelopt/quant_configs/nvfp4_a16"
+    resolve_quant_cfg(quant_cfg)
+
+    repo_root = Path(modelopt_utils.__file__).resolve().parents[2]
+    assert captured["config_file"] == str((repo_root / f"{quant_cfg}.yaml").resolve())
+
+
+def test_resolve_quant_cfg_prefers_current_cwd_relative_recipe(monkeypatch, tmp_path):
+    modelopt_recipe = pytest.importorskip("modelopt.recipe")
+    captured = {}
+
+    def fake_load_config(config_file):
+        captured["config_file"] = config_file
+        return {"quant_cfg": [{"name": "mock"}], "algorithm": "max"}
+
+    monkeypatch.setattr(modelopt_recipe, "load_config", fake_load_config)
+    quant_cfg = Path("examples/modelopt/quant_configs/nvfp4_a16.yaml")
+    cwd_recipe = tmp_path / quant_cfg
+    cwd_recipe.parent.mkdir(parents=True)
+    cwd_recipe.touch()
+    monkeypatch.chdir(tmp_path)
+
+    resolve_quant_cfg(str(quant_cfg))
+
+    assert captured["config_file"] == str(quant_cfg)
+
+
+def test_resolve_quant_cfg_preserves_current_cwd_suffix_probe(monkeypatch, tmp_path):
+    modelopt_recipe = pytest.importorskip("modelopt.recipe")
+    captured = {}
+
+    def fake_load_config(config_file):
+        captured["config_file"] = config_file
+        return {"quant_cfg": [{"name": "mock"}], "algorithm": "max"}
+
+    monkeypatch.setattr(modelopt_recipe, "load_config", fake_load_config)
+    quant_cfg = Path("custom/recipe")
+    cwd_recipe = tmp_path / f"{quant_cfg}.yaml"
+    cwd_recipe.parent.mkdir(parents=True)
+    cwd_recipe.touch()
+    monkeypatch.chdir(tmp_path)
+
+    resolve_quant_cfg(str(quant_cfg))
+
+    assert captured["config_file"] == str(quant_cfg)
+
+
+def test_resolve_quant_cfg_does_not_resolve_path_outside_checkout(
+    monkeypatch, tmp_path
+):
+    modelopt_recipe = pytest.importorskip("modelopt.recipe")
+    captured = {}
+
+    def fake_load_config(config_file):
+        captured["config_file"] = config_file
+        return {"quant_cfg": [{"name": "mock"}], "algorithm": "max"}
+
+    monkeypatch.setattr(modelopt_recipe, "load_config", fake_load_config)
+    repo_module = tmp_path / "repo/nemo_rl/modelopt/utils.py"
+    repo_module.parent.mkdir(parents=True)
+    repo_module.touch()
+    monkeypatch.setattr(modelopt_utils, "__file__", str(repo_module))
+    (tmp_path / "outside.yaml").touch()
+    remote_cwd = tmp_path / "workers/remote"
+    remote_cwd.mkdir(parents=True)
+    monkeypatch.chdir(remote_cwd)
+
+    quant_cfg = "../outside.yaml"
+    resolve_quant_cfg(quant_cfg)
+
+    assert captured["config_file"] == quant_cfg
+
+
 def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):
     mtq = pytest.importorskip("modelopt.torch.quantization")
     sentinel = {"quant_cfg": [{"name": "builtin"}], "algorithm": "max"}
@@ -2442,7 +2528,10 @@ def test_resolve_quant_cfg_rejects_unknown_config(monkeypatch):
 
     monkeypatch.setattr(modelopt_recipe, "load_config", fake_load_config)
 
-    with pytest.raises(ValueError, match="Unknown quant_cfg"):
+    with pytest.raises(
+        ValueError,
+        match="absolute, relative to the current working directory, or relative to the NeMo-RL checkout",
+    ):
         resolve_quant_cfg("does-not-exist")
 
 
