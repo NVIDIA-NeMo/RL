@@ -642,7 +642,7 @@ def _build_value(
 
 def _spinup_gym(
     master_config: MasterConfig,
-    base_urls: list[str],
+    base_urls: list[Optional[str]],
     tokenizer: PreTrainedTokenizerBase,
 ) -> tuple[Any, float]:
     """Spin up the NeMo-Gym actor against the reserved vLLM URLs.
