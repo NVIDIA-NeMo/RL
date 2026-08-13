@@ -786,11 +786,15 @@ class TestMegatronForwardBackward:
 
         model_config = SimpleNamespace(fine_grained_activation_offloading=True)
         model = SimpleNamespace(config=model_config)
+        empty_manager = SimpleNamespace(
+            _is_warmup=True,
+            _cached_chunks_forward=[],
+        )
 
         def run_forward_only(**kwargs: Any) -> dict[str, torch.Tensor]:
             assert kwargs["forward_only"] is True
             assert model_config.fine_grained_activation_offloading is False
-            assert PipelineOffloadManager.OFFLOAD_MGR is None
+            PipelineOffloadManager.OFFLOAD_MGR = empty_manager
             return {"logprobs": torch.tensor(0.0)}
 
         mock_get_fb.return_value = run_forward_only
@@ -809,7 +813,9 @@ class TestMegatronForwardBackward:
                 forward_only=True,
             )
 
-            assert PipelineOffloadManager.OFFLOAD_MGR is None
+            assert PipelineOffloadManager.OFFLOAD_MGR is empty_manager
+            assert empty_manager._is_warmup is True
+            assert empty_manager._cached_chunks_forward == []
 
         assert model_config.fine_grained_activation_offloading is True
 
