@@ -21,6 +21,7 @@ mesh construction, placement rules, expert grouping, and the top-level
 torch.distributed, no model object — so this module runs on CPU with no extras.
 """
 
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -38,6 +39,8 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     group_expert_params_in_metadata,
     is_expert_param,
     is_nccl_reshard_param,
+    make_nccl_reshard_refit_info_wire_safe,
+    restore_refit_info_placements,
 )
 
 
@@ -476,3 +479,81 @@ def test_build_refit_info_groups_experts_and_tags_them():
         for layer in info["layer_names"]
         for p in info["per_layer_params"][layer]
     )
+
+
+# --------------------------------------------------------------------------
+# make_nccl_reshard_refit_info_wire_safe / restore_refit_info_placements
+# --------------------------------------------------------------------------
+def _contains_tensor(obj) -> bool:
+    if isinstance(obj, torch.Tensor):
+        return True
+    if isinstance(obj, dict):
+        return any(_contains_tensor(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_contains_tensor(v) for v in obj)
+    if hasattr(obj, "__dict__"):  # e.g. MeshInfo wrapping its rank tensor
+        return any(_contains_tensor(v) for v in vars(obj).values())
+    return False
+
+
+def _refit_info_for_wire() -> dict:
+    return build_nccl_reshard_refit_info(
+        _dense_metadata(),
+        train_parallelism={"tp_size": 2, "ep_size": 1, "pp_size": 1},
+        gen_parallelism={"tp_size": 4, "ep_size": 1, "pp_size": 1},
+        train_world_size=2,
+        gen_world_size=4,
+    )
+
+
+def test_wire_safe_refit_info_carries_no_tensors_and_pickles_plainly():
+    # MeshInfo holds a rank tensor; a tensor pickled in a megatron-importing
+    # process needs `import megatron` at unpickle time, so the wire form must
+    # be tensor-free end to end (the invariant this function exists for).
+    info = _refit_info_for_wire()
+    assert _contains_tensor(info)
+
+    wire = make_nccl_reshard_refit_info_wire_safe(info)
+
+    assert not _contains_tensor(wire)
+    # Placements are encoded exactly as restore expects: Shard -> {"dim": d},
+    # Replicate -> {}.
+    for params in wire["per_layer_params"].values():
+        for p in params:
+            assert isinstance(p["src_mesh_info"], dict)
+            assert isinstance(p["dst_mesh_info"], dict)
+            for placement in p["src_placements"] + p["dst_placements"]:
+                assert isinstance(placement, dict)
+    pickle.loads(pickle.dumps(wire))
+
+
+def test_wire_safe_does_not_mutate_the_train_side_refit_info():
+    info = _refit_info_for_wire()
+
+    make_nccl_reshard_refit_info_wire_safe(info)
+
+    for layer in info["layer_names"]:
+        for p in info["per_layer_params"][layer]:
+            assert isinstance(p["src_mesh_info"], MeshInfo)
+            assert isinstance(p["dst_mesh_info"], MeshInfo)
+            for placement in p["src_placements"] + p["dst_placements"]:
+                assert isinstance(placement, (Shard, Replicate))
+
+
+def test_wire_safe_then_restore_reproduces_placements_and_meshes():
+    info = _refit_info_for_wire()
+
+    wire = pickle.loads(pickle.dumps(make_nccl_reshard_refit_info_wire_safe(info)))
+    restored = restore_refit_info_placements(wire)
+
+    assert restored["layer_names"] == info["layer_names"]
+    for layer in info["layer_names"]:
+        original = {p["name"]: p for p in info["per_layer_params"][layer]}
+        assert len(restored["per_layer_params"][layer]) == len(original)
+        for p in restored["per_layer_params"][layer]:
+            o = original[p["name"]]
+            for key in ("src_mesh_info", "dst_mesh_info"):
+                assert isinstance(p[key], MeshInfo)
+                assert torch.equal(p[key].mesh, o[key].mesh)
+            for key in ("src_placements", "dst_placements"):
+                assert p[key] == o[key]

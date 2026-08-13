@@ -19,6 +19,8 @@ This module provides:
   shared torch.distributed process group (needed for cross-world transfers)
 - Placement rules: mapping param names to TP/EP sharding strategies
 - build_nccl_reshard_refit_info: compute per-layer param metadata for refit
+- make_nccl_reshard_refit_info_wire_safe: convert placements and meshes into
+  plain dicts/lists before the refit metadata crosses a process boundary
 - restore_refit_info_placements: undo msgspec dict-flattening of placements
   and meshes on the receiving side
 
@@ -245,6 +247,45 @@ def _restore_placement(p):
             return Shard(p["dim"])
         return Replicate()
     return Replicate()
+
+
+def make_nccl_reshard_refit_info_wire_safe(refit_info: dict) -> dict:
+    """Copy refit metadata into types safe for vLLM's subprocess RPC.
+
+    Importing ``megatron.core`` replaces ``torch.storage._load_from_bytes`` with
+    a Megatron function, so Tensor pickles require Megatron at unpickle time.
+    vLLM subprocesses may not have it importable; convert the metadata to the
+    plain representation accepted by ``restore_refit_info_placements``.
+    """
+
+    def _wire_mesh(mesh):
+        if isinstance(mesh, MeshInfo):
+            return {"mesh": mesh.mesh.tolist()}
+        return mesh
+
+    def _wire_placement(placement):
+        if isinstance(placement, Shard):
+            return {"dim": placement.dim}
+        if isinstance(placement, Replicate):
+            return {}
+        return placement
+
+    wire_info = dict(refit_info)
+    wire_layers = {}
+    for layer_name, params in refit_info.get("per_layer_params", {}).items():
+        wire_params = []
+        for param_info in params:
+            wire_param = dict(param_info)
+            for key in ("src_mesh_info", "dst_mesh_info"):
+                if key in wire_param:
+                    wire_param[key] = _wire_mesh(wire_param[key])
+            for key in ("src_placements", "dst_placements"):
+                if key in wire_param:
+                    wire_param[key] = [_wire_placement(p) for p in wire_param[key]]
+            wire_params.append(wire_param)
+        wire_layers[layer_name] = wire_params
+    wire_info["per_layer_params"] = wire_layers
+    return wire_info
 
 
 def restore_refit_info_placements(refit_info: dict) -> dict:

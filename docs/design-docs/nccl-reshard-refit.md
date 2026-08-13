@@ -87,7 +87,11 @@ training starts:
    builds a backend-agnostic description** of every bulk parameter
    (`build_nccl_reshard_refit_info()` in `nemo_rl/weight_sync/nccl_reshard_utils.py`),
    keyed strictly by **HuggingFace parameter names**, and ships it to the generation
-   side.
+   side. Before shipping, `make_nccl_reshard_refit_info_wire_safe()` converts the
+   `MeshInfo` rank tensors and `Shard`/`Replicate` placements into plain dicts/lists —
+   Megatron patches torch's storage unpickler, so raw tensor pickles would require
+   `import megatron` inside the vLLM worker. The generation side rebuilds the objects
+   with `restore_refit_info_placements()`.
 
 The derived metadata (`nccl_reshard_refit_info`) contains, per parameter:
 
