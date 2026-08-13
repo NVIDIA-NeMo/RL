@@ -124,6 +124,191 @@ def model_forward(
         # GPTModel.forward signatures do not accept it.
         additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
+    # PATCH(golden score-checksum): timeline of which theta the train model holds.
+    # Hashes a marker param (layer-0 router weight) on every forward; prints only on
+    # value CHANGE so the log shows exactly when weights transition across
+    # gen/score/train phases. Compare against [NRL_REFIT_CHECKSUM] swap-time hashes.
+    import os as _os_sc
+    if _os_sc.environ.get("NRL_SCORE_CHECKSUM", "0") == "1":
+        import hashlib as _hl
+        _st = getattr(model_forward, "_nrl_sc", None)
+        if _st is None:
+            # router.weight is bitwise-frozen under routing replay (no grads) —
+            # use a param guaranteed to be in the loss path.
+            _mark = None
+            for _n, _p in model.named_parameters():
+                if "layers.0." in _n and "linear_qkv" in _n and _n.endswith("weight"):
+                    _mark = (_n, _p)
+                    break
+            if _mark is None:
+                _mark = next(iter(model.named_parameters()))
+            model_forward._nrl_sc = _st = {"n": 0, "last": None, "mark": _mark}
+        _st["n"] += 1
+        _mn, _mp = _st["mark"]
+        _h = _hl.md5(
+            _mp.data.detach().float().cpu().contiguous().numpy().tobytes()
+        ).hexdigest()[:12]
+        if _h != _st["last"]:
+            import torch.distributed as _dist_sc
+            _r = _dist_sc.get_rank() if _dist_sc.is_initialized() else -1
+            print(
+                f"[NRL_SCORE_CHECKSUM] rank={_r} call={_st['n']} {_mn} md5={_h} (CHANGED)",
+                flush=True,
+            )
+            _st["last"] = _h
+
+    # PATCH(NRL_SCORE_LAYERDUMP): in-situ per-layer residual-stream dump of the
+    # SCORING forward — one-shot hooks on every decoder layer's pre-attn norm input
+    # (the exact residual the engine's gdump records). Faithful localization of the
+    # infopt-vs-TE-scoring logit gap: diff engine gdump vs this per (position,layer).
+    import os as _os_sld
+    if _os_sld.environ.get("NRL_SCORE_LAYERDUMP", "") and not getattr(model_forward, "_nrl_sld", False):
+        model_forward._nrl_sld = True
+        _mm = model
+        while hasattr(_mm, "module"):
+            _mm = _mm.module
+        _dec = getattr(_mm, "decoder", None)
+        if _dec is not None and hasattr(_dec, "layers"):
+            import torch as _t_sld
+            _buf = {}
+            builtins_sld = __import__("builtins")
+            builtins_sld._NRL_SLD_BUF = _buf
+            # capture ALL rows of the first-token dim so offline we can pick any seq;
+            # residual is [S,B,H] (megatron) — keep [S,B,H] transposed to [B,S,H]
+            builtins_sld._NRL_SLD_FIRES = [0, None]
+            def _mk(li):
+                def hook(mod, args, kwargs, out):
+                    x = None
+                    if args and _t_sld.is_tensor(args[0]):
+                        x = args[0]
+                    elif isinstance(kwargs, dict) and _t_sld.is_tensor(kwargs.get("hidden_states")):
+                        x = kwargs["hidden_states"]
+                    builtins_sld._NRL_SLD_FIRES[0] += 1
+                    if x is None:
+                        builtins_sld._NRL_SLD_FIRES[1] = f"no-tensor args={len(args)} kw={list(kwargs)[:4]}"
+                        return
+                    if x.dim() != 3:
+                        builtins_sld._NRL_SLD_FIRES[1] = f"dim={x.dim()} shape={tuple(x.shape)}"
+                        return
+                    # [S,B,H] -> [B,S,H]; store first 16 microbatches (all local seqs)
+                    _mb = getattr(builtins_sld, "_NRL_SLD_MB", 0)
+                    if _mb < 16:
+                        _buf[(_mb, li)] = x.transpose(0, 1).detach().float().cpu().clone()
+                return hook
+            for _li, _lyr in enumerate(_dec.layers):
+                _lyr.register_forward_hook(_mk(_li), with_kwargs=True)
+            # save the batch input_ids so offline we can map batch-row -> jsonl seq
+            builtins_sld._NRL_SLD_IDS = []
+            def _save_sld(*_a):
+                try:
+                    import torch.distributed as _d_sld
+                    _rk = _d_sld.get_rank() if _d_sld.is_initialized() else 0
+                    _t_sld.save({"layers": {k: v for k, v in _buf.items()},
+                                 "ids": getattr(builtins_sld, "_NRL_SLD_IDS", None)},
+                                _os_sld.environ["NRL_SCORE_LAYERDUMP"] + f"/score_layers_rank{_rk}.pt")
+                    print(f"[NRL_SCORE_LAYERDUMP] saved {len(_buf)} layers rank{_rk} "
+                          f"fires={getattr(builtins_sld, '_NRL_SLD_FIRES', None)}", flush=True)
+                except Exception as _e:
+                    print(f"[NRL_SCORE_LAYERDUMP] save failed: {_e}", flush=True)
+            import atexit as _ax_sld
+            _ax_sld.register(_save_sld)
+
+    # PATCH(NRL_MOE_DUMP, K2v3): scoring-side counterpart of the engine's moeA dump —
+    # per-layer MoE INPUT (post-norm hidden, = engine vllm_fused_moe `hs`) and router
+    # output (probs + routing map) for layers 0..3, first 4 scoring fires, all ranks.
+    # Matched-point bracket: MoE-in matches + next-layer-in differs => MoE block
+    # convicted; MoE-in differs => attention path upstream.
+    if _os_sld.environ.get("NRL_MOE_DUMP_DEADPATH", "") and not getattr(model_forward, "_nrl_moedump", False):
+        model_forward._nrl_moedump = True
+        _mm2 = model
+        while hasattr(_mm2, "module"):
+            _mm2 = _mm2.module
+        _dec2 = getattr(_mm2, "decoder", None)
+        if _dec2 is not None and hasattr(_dec2, "layers"):
+            import torch as _t_md
+            _mdst = {"fires": {}}
+            def _mk_moein(li):
+                def hook(mod, args, kwargs):
+                    x = args[0] if args and _t_md.is_tensor(args[0]) else kwargs.get("hidden_states")
+                    if x is None or x.dim() != 3:
+                        return
+                    f = _mdst["fires"].setdefault(li, 0)
+                    if f < 4:
+                        _mdst["fires"][li] = f + 1
+                        _mdst[("in", f, li)] = x.transpose(0, 1).reshape(-1, x.shape[-1])[:512].detach().float().cpu().clone()
+                return hook
+            def _mk_router(li):
+                def hook(mod, args, kwargs, out):
+                    f = _mdst["fires"].get(li, 1) - 1
+                    if f < 0 or f >= 4 or ("rt", f, li) in _mdst:
+                        pass
+                    try:
+                        probs, rmap = out[0], out[1]
+                        if ("rt", f, li) not in _mdst and 0 <= f < 4:
+                            _mdst[("rt", f, li)] = (probs.reshape(-1, probs.shape[-1])[:512].detach().float().cpu().clone(),
+                                                    rmap.reshape(-1, rmap.shape[-1])[:512].detach().cpu().clone())
+                    except Exception:
+                        pass
+                return hook
+            # module hooks do NOT fire here (megatron calls submodule.forward directly,
+            # bypassing __call__) -> wrap the BOUND forward methods instead.
+            _nmlp, _nrtr = 0, 0
+            def _wrap_mlp(li, mod):
+                _orig = mod.forward
+                def fwd(*args, **kwargs):
+                    x = args[0] if args and _t_md.is_tensor(args[0]) else kwargs.get("hidden_states")
+                    _dbg = _mdst.setdefault("dbg", [])
+                    if len(_dbg) < 8:
+                        _dbg.append((li, None if x is None else tuple(x.shape), len(args), sorted(kwargs)[:3]))
+                    if x is not None and x.dim() >= 2:
+                        f = _mdst["fires"].setdefault(li, 0)
+                        if f < 4:
+                            _mdst["fires"][li] = f + 1
+                            _mdst[("in", f, li)] = x.reshape(-1, x.shape[-1])[:512].detach().float().cpu().clone()
+                    return _orig(*args, **kwargs)
+                mod.forward = fwd
+            def _wrap_router(li, mod):
+                _orig = mod.forward
+                def fwd(*args, **kwargs):
+                    out = _orig(*args, **kwargs)
+                    try:
+                        f = max(_mdst["fires"].get(li, 1) - 1, 0)
+                        if f < 4 and ("rt", f, li) not in _mdst:
+                            probs, rmap = out[0], out[1]
+                            _mdst[("rt", f, li)] = (probs.reshape(-1, probs.shape[-1])[:512].detach().float().cpu().clone(),
+                                                    rmap.reshape(-1, rmap.shape[-1])[:512].detach().cpu().clone())
+                    except Exception:
+                        pass
+                    return out
+                mod.forward = fwd
+            for _li2, _lyr2 in enumerate(_dec2.layers):
+                if _li2 >= 4:
+                    break
+                _mlp = getattr(_lyr2, "mlp", None)
+                if _mlp is not None:
+                    _wrap_mlp(_li2, _mlp)
+                    _nmlp += 1
+                    _rtr = getattr(_mlp, "router", None)
+                    if _rtr is not None:
+                        _wrap_router(_li2, _rtr)
+                        _nrtr += 1
+            print(f"[NRL_MOE_DUMP:B] method-wrapped mlp={_nmlp} router={_nrtr} "
+                  f"n_layers={len(_dec2.layers)}", flush=True)
+            def _save_md(*_a):
+                try:
+                    import torch.distributed as _d_md
+                    _rk2 = _d_md.get_rank() if _d_md.is_initialized() else 0
+                    payload = {k: v for k, v in _mdst.items() if k != "fires"}
+                    payload["_dbg"] = _mdst.get("dbg", [])
+                    _t_md.save(payload, _os_sld.environ["NRL_MOE_DUMP"] + f"/moeB_rank{_rk2}.pt")
+                    print(f"[NRL_MOE_DUMP:B] saved {len(payload)} entries rank{_rk2}", flush=True)
+                except Exception as _e:
+                    print(f"[NRL_MOE_DUMP:B] save failed: {_e}", flush=True)
+            import atexit as _ax_md
+            _ax_md.register(_save_md)
+            builtins_sld._NRL_SLD_SAVE = _save_sld
+            print(f"[NRL_SCORE_LAYERDUMP] hooked {len(_dec.layers)} decoder layers", flush=True)
+
     with straggler_timer() if straggler_timer is not None else nullcontext():
         output_tensor = model(
             input_ids=input_ids_cp_sharded,
@@ -132,6 +317,19 @@ def model_forward(
             **additional_kwargs,
             **multimodal_data,
         )
+
+    # dump the scoring residuals after the FIRST scoring forward (one-shot) so the
+    # save happens even without atexit (SIGTERM/ray teardown races)
+    if _os_sld.environ.get("NRL_SCORE_LAYERDUMP", "") and getattr(model_forward, "_nrl_sld", False):
+        _bi2 = __import__("builtins")
+        _mb = getattr(_bi2, "_NRL_SLD_MB", 0)
+        if _mb < 16:
+            _bi2._NRL_SLD_IDS.append(input_ids_cp_sharded.detach().cpu().clone())
+        _bi2._NRL_SLD_MB = _mb + 1
+        _sv = getattr(_bi2, "_NRL_SLD_SAVE", None)
+        if _sv is not None and _bi2._NRL_SLD_MB == 16 and not getattr(model_forward, "_nrl_sld_done", False):
+            model_forward._nrl_sld_done = True
+            _sv()
 
     return output_tensor
 
@@ -582,6 +780,40 @@ class LogprobsPostProcessor:
                     cp_group=get_context_parallel_group(),
                     chunk_size=logprob_chunk_size,
                     sampling_params=self.sampling_params,
+                )
+            elif (
+                __import__("os").environ.get("NRL_FUSED_TRAIN_LOGPROB", "off")
+                in ("1", "fused")
+                and torch.distributed.get_world_size(
+                    group=get_tensor_model_parallel_group()
+                )
+                == 1
+                and torch.distributed.get_world_size(
+                    group=get_context_parallel_group()
+                )
+                == 1
+            ):
+                # PATCH(S7 fused-logprob, ported from v0.5.0 train.py): match mcore
+                # generation's exact logprob op sequence (logits.float() -> fused
+                # F.log_softmax -> gather) instead of the hand-rolled distributed
+                # logsumexp. The two routines round differently (~1 fp32 ulp on
+                # ~30% of tokens) and are the residual train/gen logprob floor at
+                # TP=1. Only valid at TP=1 & CP=1 (full logit row on one rank).
+                if not getattr(LogprobsPostProcessor, "_nrl_s7_banner", False):
+                    LogprobsPostProcessor._nrl_s7_banner = True
+                    print("[NRL_FUSED_TRAIN_LOGPROB] fused log_softmax->gather logprob path ACTIVE", flush=True)
+                _full_lp = torch.nn.functional.log_softmax(
+                    output_tensor.float(), dim=-1
+                )
+                token_logprobs = (
+                    _full_lp[:, :-1]
+                    .gather(
+                        -1,
+                        unpacked_input_ids[:, 1:]
+                        .to(output_tensor.device)
+                        .unsqueeze(-1),
+                    )
+                    .squeeze(-1)
                 )
             else:
                 tp_grp = get_tensor_model_parallel_group()

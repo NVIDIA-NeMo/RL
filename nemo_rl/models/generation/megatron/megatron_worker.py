@@ -554,6 +554,46 @@ class MegatronGenerationMixin:
             "unpadded_sequence_lengths": unpadded_sequence_lengths,
         }
 
+        # PATCH(PR-4 router-replay-mcore): pack per-request routing indices
+        # recorded by the mcore engine (model_config.moe_enable_routing_replay)
+        # into GenerationOutputSpec["routed_experts"], mirroring the alignment
+        # contract of vllm/utils.pad_and_align_routed_expert_indices:
+        # row t = experts used when token t was processed as input; rows
+        # [0, seq_len-1) are real, missing rows in that range use the all--1
+        # sentinel (consumer falls back to fresh top-k), padding rows use
+        # arange(topk) (masked out downstream, must merely be valid ids).
+        # PATCH(det): route replay is proven redundant for the det stack (bitwise
+        # logits => identical routes; certificate 2322656). The harvest also crashes
+        # grpo message-log flattening when shards emit inconsistent shapes (job
+        # 2322767: [seq,48,8] vs [seq]). Pack ONLY when explicitly requested.
+        import os as _os_re
+        routing_arrays = [getattr(r, "routing_indices", None) for r in result]
+        if (_os_re.environ.get("NRL_PACK_ROUTED_EXPERTS", "0") == "1"
+                and any(ra is not None for ra in routing_arrays)):
+            template = next(ra for ra in routing_arrays if ra is not None)
+            num_moe_layers, topk = int(template.shape[1]), int(template.shape[2])
+            default_route = torch.arange(topk, dtype=torch.int32, device=input_ids.device)
+            routed_experts_padded = (
+                default_route.view(1, 1, 1, -1)
+                .expand(batch_size, max_seq_len, num_moe_layers, topk)
+                .clone()
+            )
+            for i in range(batch_size):
+                expected_routes = int(unpadded_sequence_lengths[i].item()) - 1
+                if expected_routes <= 0:
+                    continue
+                if routing_arrays[i] is None:
+                    routed_experts_padded[i, :expected_routes] = -1
+                    continue
+                routed = torch.as_tensor(
+                    routing_arrays[i], dtype=torch.int32, device=input_ids.device
+                )
+                routes_to_copy = min(expected_routes, routed.shape[0])
+                routed_experts_padded[i, :routes_to_copy] = routed[:routes_to_copy]
+                if routes_to_copy < expected_routes:
+                    routed_experts_padded[i, routes_to_copy:expected_routes] = -1
+            out_dict["routed_experts"] = routed_experts_padded
+
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")
@@ -634,6 +674,227 @@ class MegatronGenerationMixin:
         for result in asyncio.as_completed(tasks):
             yield await result
 
+        # PATCH(det quiesced probe, NRL_PROBE_QUIESCED=1): all generation for this call
+        # has drained; the engine is idle. Three-way attribution on stashed sequences:
+        #   P2  = decode-time generated_log_probs vs SOLO prefill score (quiet engine)
+        #   P1  = SOLO score vs GROUP score (same kernels/phase, only co-batch differs)
+        # plus route flips between solo and group scoring passes.
+        if (
+            os.environ.get("NRL_PROBE_QUIESCED", "0") == "1"
+            and getattr(self, "_nrl_probe_stash", None)
+        ):
+            stash = self._nrl_probe_stash
+            self._nrl_probe_stash = []
+            n_probe = int(os.environ.get("NRL_PROBE_QUIESCED_N", "16"))
+            probe_set = stash[:n_probe]
+
+            def _mk_sp():
+                sp = self._build_sampling_params(greedy=False, stop_words=None)
+                sp.num_tokens_to_generate = 1
+                sp.skip_prompt_log_probs = False
+                return sp
+
+            async def _score(tokens):
+                fut = self.inference_client.add_request(tokens, _mk_sp())
+                return await fut
+
+            def _p2_stats(r, s):
+                gen_lp = list(r.generated_log_probs)
+                plp = list(s.prompt_log_probs or [])
+                p_len = len(r.prompt_tokens)
+                d = [
+                    abs(gen_lp[j] - plp[p_len - 1 + j])
+                    for j in range(len(gen_lp))
+                    if p_len - 1 + j < len(plp)
+                ]
+                if not d:
+                    return None
+                return (sum(1 for x in d if x == 0.0), len(d), max(d))
+
+            # PATCH(det route-replay-into-scoring, probe v7, NRL_PROBE_REPLAY=1):
+            # after the solo pass, re-score each sequence with its generation-time
+            # routes REPLAYED into the scoring prefill (partial-replay hook in
+            # InferenceTopKRouter._forward, armed via
+            # router_replay.nrl_partial_target). Arming is engine-LOCAL to this
+            # rank-0 worker process, but the DP coordinator round-robins requests
+            # over all 8 engines — so retry the (idempotent, quiesced-solo) scoring
+            # request until the returned routing_indices verbatim-match the target
+            # (proof the request prefilled on THIS rank with replay engaged).
+            # Strictly one request in flight at a time; the pair phase is skipped.
+            def _routers_in_layer_order():
+                lang = unwrap_model(self.model)
+                return [
+                    m
+                    for _n, m in lang.named_modules()
+                    if getattr(m, "router_replay", None) is not None
+                ]
+
+            async def _replay_score_one(r, so, routers):
+                import numpy as _np
+
+                ri = getattr(r, "routing_indices", None)
+                if ri is None:
+                    print("[NRL_RPROBE] skip: request has no routing_indices", flush=True)
+                    return
+                ri = _np.asarray(ri)
+                n_rows, n_layers, _topk = ri.shape
+                if len(routers) != n_layers:
+                    print(
+                        f"[NRL_RPROBE] skip: {len(routers)} armed routers != "
+                        f"{n_layers} recorded layers",
+                        flush=True,
+                    )
+                    return
+                tgt = torch.from_numpy(_np.ascontiguousarray(ri)).to(
+                    device="cuda", dtype=torch.int64
+                )  # [T-1, L, K]
+                layer_tgts = [tgt[:, li, :].contiguous() for li in range(n_layers)]
+                full = r.prompt_tokens.tolist() + list(r.generated_tokens)
+                max_attempts = int(os.environ.get("NRL_RPROBE_MAX_ATTEMPTS", "10"))
+                res, engaged, attempts = None, False, 0
+                for _attempt in range(max_attempts):
+                    attempts = _attempt + 1
+                    for rt, lt in zip(routers, layer_tgts):
+                        rt.router_replay.nrl_partial_target = lt
+                    try:
+                        res = await _score(full)
+                    finally:
+                        for rt in routers:
+                            rt.router_replay.nrl_partial_target = None
+                    rs = getattr(res, "routing_indices", None)
+                    if (
+                        rs is not None
+                        and rs.shape[0] >= n_rows
+                        and _np.array_equal(
+                            _np.asarray(rs)[:n_rows].astype(_np.int64),
+                            ri.astype(_np.int64),
+                        )
+                    ):
+                        engaged = True
+                        break
+                # Route flips vs generation (top-k SET comparison, as in earlier probes).
+                rs = getattr(res, "routing_indices", None)
+                rflip, m = -1, 0
+                if rs is not None:
+                    rs = _np.asarray(rs)
+                    m = min(n_rows, rs.shape[0])
+                    neq = _np.sort(rs[:m], -1) != _np.sort(ri[:m], -1)
+                    rflip = int(neq.any(-1).any(-1).sum())
+                # Per-token |dlp| distribution: decode-time logprobs vs replay-scored prefill.
+                gen_lp = list(r.generated_log_probs)
+                plp = list(res.prompt_log_probs or [])
+                p_len = len(r.prompt_tokens)
+                d = [
+                    abs(gen_lp[j] - plp[p_len - 1 + j])
+                    for j in range(len(gen_lp))
+                    if p_len - 1 + j < len(plp)
+                ]
+                dist = ""
+                if d:
+                    ds = sorted(d)
+                    dist = (
+                        f" mean={sum(d) / len(d):.3e} p50={ds[len(ds) // 2]:.3e}"
+                        f" p90={ds[min(int(len(ds) * 0.9), len(ds) - 1)]:.3e}"
+                        f" p99={ds[min(int(len(ds) * 0.99), len(ds) - 1)]:.3e}"
+                    )
+                p2r = (
+                    (sum(1 for x in d if x == 0.0), len(d), max(d)) if d else None
+                )
+                # Solo(unarmed) score vs replay score — same phase/kernels, routes pinned.
+                so_lp = list(so.prompt_log_probs or [])
+                nn = min(len(so_lp), len(plp))
+                d1 = [abs(so_lp[j] - plp[j]) for j in range(nn)]
+                print(
+                    "[NRL_RPROBE] P2r(gen-vs-replayscore): "
+                    + (f"exact={p2r[0]}/{p2r[1]} max={p2r[2]:.3e}" if p2r else "n/a")
+                    + f" route_flips={rflip}/{m}{dist}"
+                    + f" engaged={int(engaged)} attempts={attempts}"
+                    + f" | P1r(solo-vs-replay): exact={sum(1 for x in d1 if x == 0.0)}/{nn}"
+                    + (f" max={max(d1):.3e}" if d1 else " max=n/a"),
+                    flush=True,
+                )
+
+            async def _quiesced_probe():
+                # Serialize probes: multiple generate_async calls can schedule
+                # probe coroutines on this loop; replay arming is engine-global
+                # state, and solo scoring must truly be one request at a time.
+                if not hasattr(self, "_nrl_probe_gate"):
+                    self._nrl_probe_gate = asyncio.Lock()
+                async with self._nrl_probe_gate:
+                    await _quiesced_probe_body()
+
+            async def _quiesced_probe_body():
+                solo_results = []
+                for r in probe_set:
+                    full = r.prompt_tokens.tolist() + list(r.generated_tokens)
+                    solo_results.append(await _score(full))  # strictly one at a time
+                if os.environ.get("NRL_PROBE_REPLAY", "0") == "1":
+                    routers = _routers_in_layer_order()
+                    for r, so in zip(probe_set, solo_results):
+                        try:
+                            await _replay_score_one(r, so, routers)
+                        except Exception:
+                            import traceback
+
+                            traceback.print_exc()
+                    return  # replay experiment: never submit pairs
+                # PATCH(probe v6): PAIR-WISE group submission — one pair in flight at a
+                # time, so any merged (~1024-row) dump pass between the pair markers is
+                # attributable to exactly these two sequences.
+                group_results = []
+                for _i in range(0, len(probe_set), 2):
+                    _chunk = probe_set[_i : _i + 2]
+                    print(f"[NRL_QPROBE_PAIR] indices={_i},{_i+1}", flush=True)
+                    _rs = await asyncio.gather(
+                        *[
+                            _score(r.prompt_tokens.tolist() + list(r.generated_tokens))
+                            for r in _chunk
+                        ]
+                    )
+                    group_results.extend(_rs)
+                for r, so, gr in zip(probe_set, solo_results, group_results):
+                    p2 = _p2_stats(r, so)
+                    so_lp = list(so.prompt_log_probs or [])
+                    gr_lp = list(gr.prompt_log_probs or [])
+                    n = min(len(so_lp), len(gr_lp))
+                    d1 = [abs(so_lp[j] - gr_lp[j]) for j in range(n)]
+                    p1_exact = sum(1 for x in d1 if x == 0.0)
+                    p1_max = max(d1) if d1 else -1.0
+                    rflip = -1
+                    layer_info = ""
+                    ri_s, ri_g = getattr(so, "routing_indices", None), getattr(
+                        gr, "routing_indices", None
+                    )
+                    if ri_s is not None and ri_g is not None:
+                        import numpy as _np
+
+                        m = min(ri_s.shape[0], ri_g.shape[0])
+                        neq = _np.sort(ri_s[:m], -1) != _np.sort(ri_g[:m], -1)
+                        per_layer = neq.any(-1).sum(axis=0)  # [L] tokens flipped per layer
+                        rflip = int(neq.any(-1).any(-1).sum())
+                        nz = _np.nonzero(per_layer)[0]
+                        first_l = int(nz[0]) if nz.size else -1
+                        L = per_layer.shape[0]
+                        q = max(L // 4, 1)
+                        buckets = [int(per_layer[i : i + q].sum()) for i in range(0, L, q)]
+                        layer_info = (
+                            f" first_flip_layer={first_l}"
+                            f" l0-3={[int(per_layer[i]) for i in range(min(4, L))]}"
+                            f" layer_buckets={buckets}"
+                        )
+                    print(
+                        f"[NRL_QPROBE] P2(gen-vs-solo): "
+                        + (f"exact={p2[0]}/{p2[1]} max={p2[2]:.3e}" if p2 else "n/a")
+                        + f" | P1(solo-vs-group): exact={p1_exact}/{n} max={p1_max:.3e}"
+                        f" route_flips={rflip}/{m if rflip >= 0 else 0}" + layer_info,
+                        flush=True,
+                    )
+
+            future = asyncio.run_coroutine_threadsafe(
+                _quiesced_probe(), self._inference_loop
+            )
+            await asyncio.wrap_future(future)
+
     async def _generate_with_persistent_engine(
         self,
         prompt_tokens_tensor: torch.Tensor,
@@ -663,6 +924,93 @@ class MegatronGenerationMixin:
 
         results: list[DynamicInferenceRequest] = await asyncio.gather(*futures)
         print(f"[Rank {dist_rank}] Completed {len(results)} requests")
+
+        # PATCH(det self-score probe, NRL_PROBE_SELF_SCORE=1): re-score each finished
+        # sequence through the SAME engine's prefill and diff against the decode-time
+        # generated_log_probs. Measures the engine's decode-vs-prefill self-consistency —
+        # the floor that engine-based logprob scoring (fused-logprob option A) can reach.
+        # Requires mcore_generation_config.materialize_only_last_token_logits=false
+        # (engine asserts otherwise). Alignment: scoring prompt_log_probs[j] = logprob of
+        # token j+1 given prefix; generated token P+j (0-based) -> prompt_log_probs[P-1+j].
+        if os.environ.get("NRL_PROBE_QUIESCED", "0") == "1":
+            # PATCH(det quiesced probe): defer scoring to the post-generation quiet
+            # window (see generate_async) instead of interleaving with live decode.
+            if not hasattr(self, "_nrl_probe_stash"):
+                self._nrl_probe_stash = []
+            self._nrl_probe_stash.extend(results)
+        elif os.environ.get("NRL_PROBE_SELF_SCORE", "0") == "1":
+            score_futures = []
+            for r in results:
+                full_tokens = r.prompt_tokens.tolist() + list(r.generated_tokens)
+                sp = self._build_sampling_params(greedy=False, stop_words=None)
+                sp.num_tokens_to_generate = 1
+                sp.skip_prompt_log_probs = False
+                score_futures.append(self.inference_client.add_request(full_tokens, sp))
+            score_results = await asyncio.gather(*score_futures)
+            for r, s in zip(results, score_results):
+                gen_lp = list(r.generated_log_probs)
+                plp = s.prompt_log_probs
+                if plp is None:
+                    print("[NRL_SELF_SCORE] prompt_log_probs is None — set "
+                          "materialize_only_last_token_logits=false", flush=True)
+                    break
+                plp = list(plp)
+                p_len = len(r.prompt_tokens)
+                diffs = [
+                    abs(gen_lp[j] - plp[p_len - 1 + j])
+                    for j in range(len(gen_lp))
+                    if p_len - 1 + j < len(plp)
+                ]
+                if diffs:
+                    n_exact = sum(1 for d in diffs if d == 0.0)
+                    print(
+                        f"[NRL_SELF_SCORE] G={len(diffs)} max={max(diffs):.3e} "
+                        f"mean={sum(diffs)/len(diffs):.3e} exact={n_exact}/{len(diffs)}",
+                        flush=True,
+                    )
+                # PATCH(det self-score probe v2): route-flip attribution. Both requests
+                # record routing (moe_enable_routing_replay); routing row i = experts
+                # used processing input token i, so generated token j uses row p_len-1+j
+                # (same row the logprob comes from). A token is "flipped" if ANY MoE
+                # layer's top-k SET differs between the decode-time and scoring passes.
+                ri_g = getattr(r, "routing_indices", None)
+                ri_s = getattr(s, "routing_indices", None)
+                if ri_g is not None and ri_s is not None and diffs:
+                    import numpy as _np
+
+                    n_rows = min(len(diffs), ri_g.shape[0] - (p_len - 1), ri_s.shape[0] - (p_len - 1))
+                    flip_d, same_d = [], []
+                    layer_flips = _np.zeros(ri_g.shape[1], dtype=_np.int64)
+                    for j in range(max(n_rows, 0)):
+                        rg = _np.sort(ri_g[p_len - 1 + j], axis=-1)
+                        rs = _np.sort(ri_s[p_len - 1 + j], axis=-1)
+                        per_layer = (rg != rs).any(axis=-1)
+                        if per_layer.any():
+                            flip_d.append(diffs[j])
+                            layer_flips += per_layer
+                        else:
+                            same_d.append(diffs[j])
+                    if flip_d or same_d:
+                        same_exact = sum(1 for d in same_d if d == 0.0)
+                        top_layers = _np.argsort(layer_flips)[::-1][:3]
+                        # v3: prompt-region control — positions 0..P-2 were computed in
+                        # PREFILL mode by BOTH passes; their flip rate is the
+                        # prefill-vs-prefill baseline (and a row-alignment sanity check:
+                        # if ~= generated-region rate, suspect misalignment or pure
+                        # batch-composition variance).
+                        n_prompt_rows = min(p_len - 1, ri_g.shape[0], ri_s.shape[0])
+                        pg = _np.sort(ri_g[:n_prompt_rows], axis=-1)
+                        ps = _np.sort(ri_s[:n_prompt_rows], axis=-1)
+                        prompt_flips = int((pg != ps).any(axis=-1).any(axis=-1).sum())
+                        print(
+                            f"[NRL_ROUTE_DIFF] flip={len(flip_d)}/{len(flip_d)+len(same_d)} "
+                            f"dlp_flip={sum(flip_d)/max(len(flip_d),1):.3e} "
+                            f"dlp_same={sum(same_d)/max(len(same_d),1):.3e} "
+                            f"exact_same={same_exact}/{max(len(same_d),1)} "
+                            f"prompt_flip={prompt_flips}/{n_prompt_rows} "
+                            f"top_flip_layers={[(int(l), int(layer_flips[l])) for l in top_layers if layer_flips[l] > 0]}",
+                            flush=True,
+                        )
         return results
 
 
@@ -816,6 +1164,29 @@ class MegatronGenerationRefitMixin:
         """
         from megatron.core.resharding.refit import swap_model_weights
 
+        # PATCH(golden refit-param-sync, upstream #13, ported from the det-TE golden
+        # worker): with distributed optimizer + overlap_param_gather, the post-step
+        # param all-gather completes lazily via TRAINING forward pre-hooks; refit can
+        # read param.data before they fire, shipping a bucket-wise MIX of theta_k and
+        # theta_{k-1} to the gen model (multi-step gen-KL drift). Force param-sync
+        # completion on the SRC before reading weights.
+        import os as _os_ps
+        if (
+            _os_ps.environ.get("NRL_REFIT_PARAM_SYNC", "0") == "1"
+            and is_source
+            and getattr(self, "should_disable_forward_pre_hook", False)
+        ):
+            _resync = self._forward_pre_hook_enabled()
+            if _resync:
+                self.disable_forward_pre_hook(param_sync=True)
+                self.enable_forward_pre_hook()
+            if not getattr(type(self), "_nrl_ps_banner", False):
+                type(self)._nrl_ps_banner = True
+                print(
+                    f"[NRL_REFIT_PARAM_SYNC] forced param-gather completion before refit (hook_was_enabled={_resync})",
+                    flush=True,
+                )
+
         src_model = self.model if is_source else None
         dst_model = None if is_source else self.model
 
@@ -827,6 +1198,32 @@ class MegatronGenerationRefitMixin:
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
         )
+
+        # PATCH(NRL_REFIT_CKSUM): after refit, print per-group checksums of params
+        # AND buffers on both sides — any src/dst mismatch = the refit gap that
+        # explains gen-vs-scoring logprob residuals with all shapes/kernels aligned.
+        import os as _os_ck
+        if _os_ck.environ.get("NRL_REFIT_CKSUM", "0") == "1":
+            _m = self.model
+            _mm = _m[0] if isinstance(_m, list) else _m
+            while hasattr(_mm, "module"):
+                _mm = _mm.module
+            import hashlib as _hl
+            _side = "SRC" if is_source else "DST"
+            _lines = []
+            for _kind, _iter in (("P", _mm.named_parameters()), ("B", _mm.named_buffers())):
+                for _n, _t in _iter:
+                    _h = _hl.md5(_t.detach().float().cpu().numpy().tobytes()).hexdigest()[:12]
+                    _lines.append(f"{_side} {_kind}:{_n} {tuple(_t.shape)} {_h}")
+            _dir = _os_ck.environ.get("NRL_REFIT_CKSUM_DIR", "/tmp")
+            _rank = _os_ck.environ.get("RANK", _os_ck.environ.get("RAY_RANK", "0"))
+            _step = getattr(type(self), "_nrl_ck_step", 0)
+            type(self)._nrl_ck_step = _step + 1
+            import socket as _sk
+            _fn = f"{_dir}/refit_cksum_{_side}_{_sk.gethostname()}_{_os_ck.getpid()}_s{_step}.txt"
+            with open(_fn, "w") as _f:
+                _f.write("\n".join(_lines))
+            print(f"[NRL_REFIT_CKSUM] wrote {len(_lines)} entries -> {_fn}", flush=True)
 
         return True
 
