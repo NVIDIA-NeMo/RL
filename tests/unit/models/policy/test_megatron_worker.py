@@ -515,18 +515,15 @@ def test_clear_rope_and_moe_dispatcher_caches_is_best_effort(monkeypatch):
     worker._clear_rope_and_moe_dispatcher_caches()
 
 
-@pytest.mark.parametrize(
-    ("selected", "dtype"),
-    [(False, torch.bfloat16), (True, torch.float8_e4m3fn)],
-)
-def test_maybe_prequantize_param_passthrough(selected, dtype):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_maybe_prequantize_param_passthrough_when_not_selected(dtype):
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     name = "model.weight"
-    worker._refit_prequant_names = {name} if selected else set()
+    worker._refit_prequant_names = set()
     tensor = torch.ones(2, 2, dtype=dtype)
 
     result = list(worker._maybe_prequantize_param(name, tensor))
@@ -534,6 +531,35 @@ def test_maybe_prequantize_param_passthrough(selected, dtype):
     assert len(result) == 1
     assert result[0][0] == name
     assert result[0][1] is tensor
+
+
+def test_maybe_prequantize_param_rejects_fp8_trainer_storage():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    name = "model.weight"
+    worker._refit_prequant_names = {name}
+    tensor = torch.ones(2, 2, dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="BF16 trainer-exported weights"):
+        list(worker._maybe_prequantize_param(name, tensor))
+
+
+def test_enable_refit_prequantize_rejects_blockwise_fp8_storage():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = {
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+
+    with pytest.raises(ValueError, match="BF16 trainer-exported weights"):
+        worker.enable_refit_prequantize(["model.weight"])
 
 
 @pytest.mark.parametrize("slim", [False, True])

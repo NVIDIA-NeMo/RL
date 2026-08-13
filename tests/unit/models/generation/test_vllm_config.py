@@ -90,6 +90,23 @@ def test_refit_prequantize_accepts_mxfp8() -> None:
     validate_vllm_quantization_config(generation_config)
 
 
+def test_refit_prequantize_rejects_nccl_reshard() -> None:
+    generation_config = cast(
+        VllmConfig,
+        {
+            "refit_transport": "nccl_reshard",
+            "vllm_cfg": {
+                "precision": "fp8",
+                "is_mx": True,
+                "refit_prequantize": True,
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="not supported with nccl_reshard"):
+        validate_vllm_quantization_config(generation_config)
+
+
 @pytest.mark.parametrize(
     "field",
     ["refit_cache_loader_routes"],

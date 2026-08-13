@@ -1973,6 +1973,12 @@ class MegatronPolicyWorkerImpl(
             Updated refit metadata: the listed params become float8_e4m3fn and
             each gains a *_scale_from_checkpoint uint8 entry.
         """
+        if self._is_fp8_export():
+            raise ValueError(
+                "vllm_cfg.refit_prequantize requires BF16 trainer-exported weights; "
+                "Megatron blockwise FP8 parameter storage uses a different scale layout."
+            )
+
         self._refit_prequant_names = set(param_names)
 
         refit_param_info_hf = {}
@@ -1983,12 +1989,14 @@ class MegatronPolicyWorkerImpl(
     def _maybe_prequantize_param(
         self, name: str, tensor: torch.Tensor
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        if (
-            name not in self._refit_prequant_names
-            or tensor.dtype == torch.float8_e4m3fn
-        ):
+        if name not in self._refit_prequant_names:
             yield name, tensor
             return
+        if tensor.dtype == torch.float8_e4m3fn:
+            raise ValueError(
+                "vllm_cfg.refit_prequantize requires BF16 trainer-exported weights; "
+                f"{name} is already stored as E4M3 with a non-MXFP8 scale layout."
+            )
 
         # Deferred: pulls in the heavy nemo_rl...generation.vllm package init,
         # which trainer workers only need when prequantized refit is enabled.

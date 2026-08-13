@@ -514,6 +514,8 @@ def _is_fp8_weight(name, model):
 
 def load_weights(weights, model_runner):
     global global_fp8_config
+    weights = list(weights)
+    weight_names = {name for name, _tensor in weights}
     weights_quantized = []
     model = model_runner.model
 
@@ -522,8 +524,18 @@ def load_weights(weights, model_runner):
             weights_quantized.append((k, v))
             continue
         if v.dtype == torch.float8_e4m3fn:
-            # Already quantized on the trainer (vllm_cfg.refit_prequantize); the
-            # matching *_scale_from_checkpoint entry arrives as its own weight.
+            if global_fp8_config.is_mx and not global_fp8_config.refit_prequantize:
+                raise ValueError(
+                    "MXFP8 E4M3 refit weights require refit_prequantize=true; "
+                    "other FP8 trainer scale layouts are not compatible."
+                )
+            scale_name = k + "_scale_from_checkpoint"
+            if global_fp8_config.is_mx and scale_name not in weight_names:
+                raise ValueError(
+                    f"Prequantized MXFP8 weight {k!r} is missing {scale_name!r}."
+                )
+            # Prequantized MXFP8 sends the matching *_scale_from_checkpoint
+            # entry separately. Non-MXFP8 blockwise FP8 sends *_scale_inv.
             weights_quantized.append([k, v])
             continue
         # Cast the weight into fp8 and its scale factor

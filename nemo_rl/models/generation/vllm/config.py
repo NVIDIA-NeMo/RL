@@ -186,6 +186,11 @@ def validate_vllm_quantization_config(config: VllmConfig) -> None:
             "policy.generation.vllm_cfg.refit_prequantize requires "
             "precision='fp8' and is_mx=true."
         )
+    if refit_prequantize and config.get("refit_transport") == "nccl_reshard":
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize is not supported with "
+            "nccl_reshard; that transport owns its weight-format conversion."
+        )
     for field in ("refit_cache_loader_routes",):
         value = vllm_cfg.get(field)
         if value is not None and not isinstance(value, bool):
