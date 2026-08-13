@@ -117,6 +117,51 @@ def test_quantize_mxfp8_weight_restores_grouped_logical_shape(
     assert torch.all(scale == 1)
 
 
+@pytest.mark.parametrize(
+    ("projection", "shape"),
+    [("up_proj", (2, 3, 64)), ("down_proj", (2, 4, 32))],
+)
+def test_load_weights_preserves_grouped_mxfp8_value_and_scale_shapes(
+    fp8_module, monkeypatch, projection, shape
+):
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    fp8_module.global_fp8_config = types.SimpleNamespace(is_mx=True)
+    monkeypatch.setattr(fp8_module, "_is_fp8_weight", lambda *_args: True)
+
+    def fake_quantize(weight):
+        flattened_rows = weight.numel() // weight.shape[-1]
+        return (
+            torch.zeros(
+                flattened_rows,
+                weight.shape[-1],
+                dtype=torch.float8_e4m3fn,
+            ),
+            torch.zeros(
+                flattened_rows,
+                weight.shape[-1] // 32,
+                dtype=torch.uint8,
+            ),
+        )
+
+    monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", fake_quantize)
+    loaded = []
+    model = types.SimpleNamespace(load_weights=lambda weights: loaded.extend(weights))
+    name = f"model.layers.0.mixer.experts.0.{projection}.weight"
+
+    fp8_module.load_weights(
+        [(name, torch.empty(shape, dtype=torch.bfloat16))],
+        types.SimpleNamespace(model=model),
+    )
+
+    assert [item[0] for item in loaded] == [
+        name,
+        f"{name}_scale_from_checkpoint",
+    ]
+    assert loaded[0][1].shape == shape
+    assert loaded[1][1].shape == (*shape[:-1], shape[-1] // 32)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("is_gated", "intermediate_size", "hidden_size"),
