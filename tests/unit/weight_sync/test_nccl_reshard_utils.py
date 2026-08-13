@@ -70,9 +70,9 @@ def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:
     check_nccl_reshard_refit_support(config)
 
 
-@pytest.mark.parametrize("trainer_precision", ["float16", "float32"])
+@pytest.mark.parametrize("trainer_precision", ["float16", "float32", "bf16", None])
 def test_check_nccl_reshard_refit_support_rejects_non_bf16_to_mxfp8(
-    trainer_precision: str,
+    trainer_precision: str | None,
 ) -> None:
     config = _valid_nccl_reshard_config()
     config.policy["precision"] = trainer_precision

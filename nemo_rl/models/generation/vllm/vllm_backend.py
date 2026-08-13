@@ -1185,8 +1185,6 @@ class VllmInternalWorkerExtension:
 
     def _receive_and_load_misc_params(self) -> None:
         """Receive misc params via packed_broadcast and load via vLLM."""
-        from nemo_rl.weight_sync.nccl_reshard_utils import _STR_TO_DTYPE
-
         misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
         if not misc_meta:
             return

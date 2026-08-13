@@ -648,6 +648,8 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
                         "don't produce export-ready scale_inv tensors."
                     )
             elif vllm_cfg.get("is_mx"):
+                # Policy precision uses the canonical NeMo-RL spelling; unlike
+                # vLLM precision, it does not accept "bf16", "auto", or None.
                 if trainer_precision != "bfloat16":
                     violations.append(
                         "policy.generation.vllm_cfg.is_mx=True with "
