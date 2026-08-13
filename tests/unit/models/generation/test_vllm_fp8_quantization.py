@@ -381,8 +381,9 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
 
 
 @pytest.mark.parametrize("is_gated", [False, True])
+@pytest.mark.parametrize("tp_size", [1, 2])
 def test_process_mxfp8_moe_padding_preserves_refit_tensors(
-    fp8_module, monkeypatch, is_gated
+    fp8_module, monkeypatch, is_gated, tp_size
 ):
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
@@ -419,10 +420,10 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(
         is_act_and_mul=is_gated,
         hidden_dim=128,
         hidden_dim_unpadded=128,
-        intermediate_size=32,
+        intermediate_size=32 * tp_size,
         intermediate_size_per_partition=32,
         intermediate_size_per_partition_unpadded=32,
-        moe_parallel_config=types.SimpleNamespace(tp_size=1),
+        moe_parallel_config=types.SimpleNamespace(tp_size=tp_size),
     )
     kernel = object()
     kernel_configs = []
@@ -480,6 +481,7 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(
     assert torch.all(layer.w2_weight_scale[:, :, 1:] == 127)
     assert kernel_configs[0].hidden_dim == 512
     assert kernel_configs[0].intermediate_size_per_partition == 128
+    assert kernel_configs[0].intermediate_size == 128 * tp_size
 
     apply_parameter_ids = {
         name: id(getattr(layer, name))
@@ -520,6 +522,7 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(
         assert torch.all(layer.w13_weight_for_apply[:, 128:160, :128] == 3)
         assert torch.count_nonzero(layer.w13_weight_for_apply[:, 160:, :]) == 0
         assert torch.all(layer.w13_weight_scale[:, 32:128, :] == 127)
+        assert torch.all(layer.w13_weight_scale[:, 128:160, :4] == 4)
         assert torch.all(layer.w13_weight_scale[:, 160:, :] == 127)
     else:
         assert torch.count_nonzero(layer.w13_weight_for_apply[:, 32:, :]) == 0
@@ -563,7 +566,10 @@ def test_process_mxfp8_moe_padding_rejects_modular_kernel(fp8_module, monkeypatc
         fp8.process_weights_after_loading_mxfp8_moe(method, layer)
 
 
-def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(fp8_module):
+@pytest.mark.parametrize("requires_padding", [False, True])
+def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(
+    fp8_module, requires_padding
+):
     fp8 = fp8_module
     calls = []
 
@@ -598,32 +604,55 @@ def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(fp8_module):
             return x + 1
 
     method = types.SimpleNamespace(is_monolithic=True, moe_kernel=Kernel())
-    layer = types.SimpleNamespace(
-        mxfp8_unpadded_hidden_size=2688,
-        mxfp8_padded_hidden_size=3072,
-        w13_weight_for_apply=torch.tensor([13]),
-        w2_weight_for_apply=torch.tensor([2]),
-        activation="relu2",
-        global_num_experts=4,
-        expert_map=None,
-        apply_router_weight_on_input=False,
-        num_expert_group=None,
-        topk_group=None,
-        e_score_correction_bias=None,
-        routed_scaling_factor=1.0,
-    )
+    layer_kwargs = {
+        "w13_weight": torch.tensor([130]),
+        "w2_weight": torch.tensor([20]),
+        "activation": "relu2",
+        "global_num_experts": 4,
+        "expert_map": "expert-map",
+        "apply_router_weight_on_input": True,
+        "num_expert_group": 8,
+        "topk_group": 2,
+        "e_score_correction_bias": "correction-bias",
+        "routed_scaling_factor": 1.25,
+    }
+    if requires_padding:
+        layer_kwargs.update(
+            {
+                "mxfp8_unpadded_hidden_size": 2688,
+                "mxfp8_padded_hidden_size": 3072,
+                "w13_weight_for_apply": torch.tensor([13]),
+                "w2_weight_for_apply": torch.tensor([2]),
+            }
+        )
+    layer = types.SimpleNamespace(**layer_kwargs)
     x = torch.arange(2 * 2688, dtype=torch.float32).reshape(2, 2688)
     router_logits = torch.ones(2, 4)
 
     output = fp8.apply_monolithic_mxfp8_moe(method, layer, x, router_logits)
 
     padded_x, w13, w2, actual_logits, _kwargs = calls[0]
-    assert tuple(padded_x.shape) == (2, 3072)
+    expected_hidden_size = 3072 if requires_padding else 2688
+    assert tuple(padded_x.shape) == (2, expected_hidden_size)
     torch.testing.assert_close(padded_x[:, :2688], x)
-    assert torch.count_nonzero(padded_x[:, 2688:]) == 0
-    assert w13 is layer.w13_weight_for_apply
-    assert w2 is layer.w2_weight_for_apply
+    if requires_padding:
+        assert torch.count_nonzero(padded_x[:, 2688:]) == 0
+        assert w13 is layer.w13_weight_for_apply
+        assert w2 is layer.w2_weight_for_apply
+    else:
+        assert w13 is layer.w13_weight
+        assert w2 is layer.w2_weight
     assert actual_logits is router_logits
+    assert _kwargs == {
+        "activation": "relu2",
+        "global_num_experts": 4,
+        "expert_map": "expert-map",
+        "apply_router_weight_on_input": True,
+        "num_expert_group": 8,
+        "topk_group": 2,
+        "e_score_correction_bias": "correction-bias",
+        "routed_scaling_factor": 1.25,
+    }
     assert tuple(output.shape) == (2, 2688)
     torch.testing.assert_close(output, x + 1)
 
@@ -663,7 +692,7 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     fp8_module, monkeypatch
 ):
     fp8 = fp8_module
-    patched_paths = []
+    patched_calls = []
 
     class FakePatch:
         def __init__(self, path):
@@ -673,8 +702,8 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
         def start(self):
             self.started = True
 
-    def fake_patch(path, _replacement):
-        patched_paths.append(path)
+    def fake_patch(path, replacement):
+        patched_calls.append((path, replacement))
         return FakePatch(path)
 
     monkeypatch.setattr(fp8, "patch", fake_patch)
@@ -683,12 +712,12 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
         None,
         fp8.FP8Config(use_fp8_weights=True, model_parallel_size=1, is_mx=False),
     )
-    assert not any("ModelOptMxFp8" in path for path in patched_paths)
+    assert not any("ModelOptMxFp8" in path for path, _replacement in patched_calls)
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
     fp8.fp8_state = fp8.FP8State()
     fp8.fp8_patches_applied = False
-    patched_paths.clear()
+    patched_calls.clear()
 
     fp8.apply_fp8_patches(
         None,
@@ -698,27 +727,44 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
             use_activation_pow2_scale=True,
         ),
     )
-    assert any("per_token_group_quant_fp8" in path for path in patched_paths)
+    assert any(
+        "per_token_group_quant_fp8" in path for path, _replacement in patched_calls
+    )
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
     fp8.fp8_state = fp8.FP8State()
     fp8.fp8_patches_applied = False
-    patched_paths.clear()
+    patched_calls.clear()
 
     fp8.apply_fp8_patches(
         None,
         fp8.FP8Config(use_fp8_weights=True, model_parallel_size=1, is_mx=True),
     )
 
-    assert any("ModelOptMxFp8LinearMethod" in path for path in patched_paths)
-    assert any("ModelOptMxFp8FusedMoE.create_weights" in path for path in patched_paths)
-    assert any(
-        "ModelOptMxFp8FusedMoE.process_weights_after_loading" in path
-        for path in patched_paths
-    )
-    assert any(
-        "ModelOptMxFp8FusedMoE.apply_monolithic" in path for path in patched_paths
-    )
+    expected_mxfp8_calls = [
+        (
+            "vllm.model_executor.layers.quantization.modelopt."
+            "ModelOptMxFp8LinearMethod.process_weights_after_loading",
+            fp8.process_weights_after_loading_mxfp8_linear,
+        ),
+        (
+            "vllm.model_executor.layers.quantization.modelopt."
+            "ModelOptMxFp8FusedMoE.create_weights",
+            fp8.create_weights_mxfp8_moe,
+        ),
+        (
+            "vllm.model_executor.layers.quantization.modelopt."
+            "ModelOptMxFp8FusedMoE.process_weights_after_loading",
+            fp8.process_weights_after_loading_mxfp8_moe,
+        ),
+        (
+            "vllm.model_executor.layers.quantization.modelopt."
+            "ModelOptMxFp8FusedMoE.apply_monolithic",
+            fp8.apply_monolithic_mxfp8_moe,
+        ),
+    ]
+    actual_mxfp8_calls = [call for call in patched_calls if "ModelOptMxFp8" in call[0]]
+    assert actual_mxfp8_calls == expected_mxfp8_calls
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
 
