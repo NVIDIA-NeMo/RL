@@ -46,6 +46,19 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
 
+# Metrics that are re-logged under the "core/" prefix so they appear in a
+# dedicated WandB section alongside their normal train/* location.
+_CORE_METRIC_KEYS: frozenset[str] = frozenset(
+    {
+        "total_reward/mean",
+        "mean_generation_length",
+        "gen_tokens_per_sample/mean",
+        "approx_entropy",
+        "kl_penalty",
+        "gen_kl_error",
+    }
+)
+
 
 class WandbConfig(TypedDict):
     project: NotRequired[str]
@@ -1051,6 +1064,13 @@ class Logger(LoggerInterface):
         """
         for logger in self.loggers:
             logger.log_metrics(metrics, step, prefix, step_metric, step_finished)
+
+        core_metrics = {k: v for k, v in metrics.items() if k in _CORE_METRIC_KEYS}
+        if core_metrics:
+            for logger in self.loggers:
+                logger.log_metrics(
+                    core_metrics, step, "core", step_metric, step_finished
+                )
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to all enabled backends.
