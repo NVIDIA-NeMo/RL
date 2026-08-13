@@ -71,13 +71,13 @@ def create_mock_state_dict_info(params):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_packed_broadcast_producer_consumer_roundtrip():
+@pytest.mark.parametrize("source_device", ["cpu", "cuda"])
+def test_packed_broadcast_producer_consumer_roundtrip(source_device):
     """Test that producer and consumer work together correctly."""
     # Create mock parameters
     params = create_mock_model_params()
 
-    # Move params to CUDA
-    params_cuda = [(name, tensor.cuda()) for name, tensor in params]
+    params_device = [(name, tensor.to(source_device)) for name, tensor in params]
 
     # Create mock communication group for producer
     producer_group = MockCommunicationGroup()
@@ -93,7 +93,7 @@ def test_packed_broadcast_producer_consumer_roundtrip():
 
         # Run producer
         packed_broadcast_producer(
-            iterator=iter(params_cuda),
+            iterator=iter(params_device),
             group=producer_group,
             src=0,
             post_iter_func=post_iter_func,
@@ -105,7 +105,7 @@ def test_packed_broadcast_producer_consumer_roundtrip():
         )
 
         # Create state dict info for consumer
-        state_dict_info = create_mock_state_dict_info(params_cuda)
+        state_dict_info = create_mock_state_dict_info(params_device)
         for name in ("kv_amax", "transposed.weight"):
             shape, dtype = state_dict_info[name]
             state_dict_info[name] = (list(shape), dtype)
@@ -130,7 +130,8 @@ def test_packed_broadcast_producer_consumer_roundtrip():
     assert len(unpacked_tensors) == len(params)
 
     # Verify each tensor matches the original
-    for name, original_tensor in params_cuda:
+    assert all(tensor.is_cuda for tensor in producer_group.broadcasted_tensors)
+    for name, original_tensor in params_device:
         assert name in unpacked_tensors
         unpacked = unpacked_tensors[name]
 
@@ -139,7 +140,9 @@ def test_packed_broadcast_producer_consumer_roundtrip():
         assert unpacked.dtype == original_tensor.dtype
 
         # Check values are close (accounting for floating point precision)
-        assert torch.allclose(unpacked, original_tensor, rtol=1e-5, atol=1e-7)
+        assert torch.allclose(
+            unpacked, original_tensor.to(unpacked.device), rtol=1e-5, atol=1e-7
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

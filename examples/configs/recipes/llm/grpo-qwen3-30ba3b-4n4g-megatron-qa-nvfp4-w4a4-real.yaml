@@ -16,7 +16,8 @@ policy:
     quant_cfg: null
     real_quant: true
     vllm_kwargs:
-      moe_backend: auto
+      # vLLM 0.25.1 FlashInfer NVFP4 MoE scales are not writable during refit.
+      moe_backend: cutlass
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real
   wandb:

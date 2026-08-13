@@ -6,6 +6,7 @@ checkpointing:
   checkpoint_dir: results/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  quant_cfg: ${oc.env:PWD}/examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml
   tokenizer:
     name: ${policy.model_name}
   generation:

@@ -75,11 +75,13 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                 # Pack the tensors
                 while True:
                     # Apply backend specific post processing and then convert to linearized uint8 tensor.
+                    # NCCL requires CUDA buffers, while real-quant export may
+                    # intentionally offload its source tensors to CPU.
                     # contiguous() is required because the upstream iterator may
                     # yield non-contiguous tensors that view(...) cannot handle.
+                    tensor = post_iter_func(next(iterator)).contiguous()
                     tensor = (
-                        post_iter_func(next(iterator))
-                        .contiguous()
+                        tensor.to(device="cuda", non_blocking=True)
                         .reshape(-1)
                         .view(torch.uint8)
                     )
