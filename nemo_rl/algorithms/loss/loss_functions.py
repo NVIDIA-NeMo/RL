@@ -1209,6 +1209,14 @@ class MseValueLossConfig(BaseModel, extra="forbid"):
     scale: float = 1.0
     # Clipping range for value predictions (PPO-style). Set to None to disable clipping.
     cliprange: Optional[float] = None
+    # Relative weight of homogeneous (all-fail / all-pass) groups in the value loss.
+    # Only meaningful with adv_estimator.residual_baseline: those groups have
+    # Y = 0 for every sibling and so contribute EXACTLY zero target variance,
+    # while still costing ~58% of critic FLOPs on the SWE pool. 1.0 (default)
+    # keeps every sample -- they are not dead weight, they are the shrinkage
+    # that enforces E[C | X] = 0 and suppresses between-task leakage. Lower it
+    # only to buy more mixed-group exposure per unit wall-clock.
+    homogeneous_group_weight: float = 1.0
 
 
 class MseValueLossFn(LossFunction):
@@ -1322,6 +1330,37 @@ class MseValueLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             ).item()
 
+            # Explained variance in BOTH return spaces. The numerator is shared:
+            # the prediction error is the same quantity either way, since
+            #     R - (B_LOO + C) = (R - B_LOO) - C = Y - C,
+            # so only the denominator (Var of the absolute vs residual return)
+            # differs. The estimator hands us the two per-sample offsets that
+            # convert `returns` into each space -- exactly one is zero -- which
+            # keeps this loss agnostic to which mode the run is in. Absent (an
+            # ordinary GAE run with no residual estimator), both are zero and
+            # both variances collapse to Var(returns), i.e. today's behaviour.
+            zeros = torch.zeros(
+                returns.shape[0], device=returns.device, dtype=returns.dtype
+            )
+            to_abs = data.get("returns_to_abs")
+            to_res = data.get("returns_to_res")
+            to_abs = zeros if to_abs is None else to_abs.to(returns.dtype)
+            to_res = zeros if to_res is None else to_res.to(returns.dtype)
+            abs_returns = returns + to_abs.unsqueeze(-1)
+            res_returns = returns + to_res.unsqueeze(-1)
+            abs_returns_mean = masked_mean(
+                abs_returns, mask, global_normalization_factor=global_valid_toks
+            ).item()
+            abs_returns_sq_mean = masked_mean(
+                abs_returns**2, mask, global_normalization_factor=global_valid_toks
+            ).item()
+            res_returns_mean = masked_mean(
+                res_returns, mask, global_normalization_factor=global_valid_toks
+            ).item()
+            res_returns_sq_mean = masked_mean(
+                res_returns**2, mask, global_normalization_factor=global_valid_toks
+            ).item()
+
         metrics = {
             "loss": float(loss.item()),
             "vf_clipfrac": vf_clipfrac,
@@ -1331,6 +1370,10 @@ class MseValueLossFn(LossFunction):
             "values_max": values_max,
             "returns_sq_mean": returns_sq_mean,
             "residual_sq_mean": residual_sq_mean,
+            "abs_returns_mean": abs_returns_mean,
+            "abs_returns_sq_mean": abs_returns_sq_mean,
+            "res_returns_mean": res_returns_mean,
+            "res_returns_sq_mean": res_returns_sq_mean,
             "num_valid_samples": int(values.shape[0]),
         }
 

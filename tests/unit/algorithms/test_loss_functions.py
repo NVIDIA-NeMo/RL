@@ -2834,3 +2834,119 @@ def test_split_rescale_matches_sync_normalization():
     assert raw_totals["num_valid_samples"] == pytest.approx(
         sync_totals["num_valid_samples"]
     )
+
+
+# ===============================================================================
+# Residual critic: dual-space explained variance
+# ===============================================================================
+def _value_loss_metrics(returns, values, to_abs=None, to_res=None):
+    """Run MseValueLossFn once and return its per-microbatch metrics."""
+    from nemo_rl.algorithms.loss.loss_functions import (
+        MseValueLossConfig,
+        MseValueLossFn,
+    )
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    b, s = returns.shape
+    data = BatchedDataDict(
+        {
+            "returns": returns,
+            "token_mask": torch.ones(b, s),
+            "sample_mask": torch.ones(b),
+            "values": values,
+        }
+    )
+    if to_abs is not None:
+        data["returns_to_abs"] = to_abs
+        data["returns_to_res"] = to_res
+    _, metrics = MseValueLossFn(MseValueLossConfig())(
+        values.unsqueeze(-1),
+        data,
+        global_valid_seqs=torch.tensor(float(b)),
+        global_valid_toks=torch.tensor(float(b * s)),
+    )
+    return metrics
+
+
+def _explained_variances(metrics):
+    """Drive ppo._compute_critic_metrics off a single microbatch's statistics."""
+    from nemo_rl.algorithms.ppo import _compute_critic_metrics
+
+    out = _compute_critic_metrics(
+        {
+            "grad_norm": torch.tensor(0.0),
+            "loss": torch.tensor(0.0),
+            "all_mb_metrics": {
+                k: [v]
+                for k, v in metrics.items()
+                if k
+                in {
+                    "returns_mean",
+                    "values_mean",
+                    "returns_sq_mean",
+                    "residual_sq_mean",
+                    "abs_returns_mean",
+                    "abs_returns_sq_mean",
+                    "res_returns_mean",
+                    "res_returns_sq_mean",
+                }
+            },
+        }
+    )
+    return out["critic/explained_var"], out["critic/ev_res"]
+
+
+def test_value_loss_dual_ev_without_offsets_is_todays_behaviour():
+    """No residual estimator => both explained variances collapse to the old one."""
+    torch.manual_seed(0)
+    returns, values = torch.rand(4, 5), torch.rand(4, 5)
+    ev_abs, ev_res = _explained_variances(_value_loss_metrics(returns, values))
+
+    direct = 1.0 - (returns - values).var(unbiased=False) / returns.var(unbiased=False)
+    assert ev_abs == pytest.approx(direct.item(), abs=1e-5)
+    assert ev_res == pytest.approx(direct.item(), abs=1e-5)
+
+
+def test_value_loss_dual_ev_uses_the_right_denominator_per_space():
+    """critic/explained_var stays absolute-space; critic/ev_res is residual-space.
+
+    The numerator is shared -- ``R - (B+C) == (R-B) - C`` -- so the two metrics
+    differ only by ``Var(R)`` vs ``Var(Y)``. This is what lets an absolute-critic
+    run and a residual-critic run be compared on one axis.
+    """
+    torch.manual_seed(1)
+    b_loo = torch.tensor([0.25, 0.5, 0.75, 0.0])
+    # Residual-space batch: returns = Y, values = C.
+    y, c = torch.rand(4, 5) - 0.5, torch.rand(4, 5) - 0.5
+    metrics = _value_loss_metrics(y, c, to_abs=b_loo, to_res=torch.zeros_like(b_loo))
+    ev_abs, ev_res = _explained_variances(metrics)
+
+    err = y - c
+    abs_returns = y + b_loo.unsqueeze(-1)
+    assert ev_abs == pytest.approx(
+        (1.0 - err.var(unbiased=False) / abs_returns.var(unbiased=False)).item(),
+        abs=1e-5,
+    )
+    assert ev_res == pytest.approx(
+        (1.0 - err.var(unbiased=False) / y.var(unbiased=False)).item(), abs=1e-5
+    )
+    assert ev_abs != pytest.approx(ev_res, abs=1e-3)
+
+
+def test_value_loss_absolute_arm_ev_res_matches_advantage_variance_ratio():
+    """For an absolute critic, ``1 - critic/ev_res`` is Var(R-V) / Var(R-B_LOO).
+
+    That is exactly the ratio the residual-critic report measures at 1.67-2.09x,
+    so logging it turns the report's headline diagnostic into a live metric.
+    """
+    torch.manual_seed(2)
+    b_loo = torch.tensor([0.25, 0.5, 0.75, 0.0])
+    r, v = torch.rand(4, 5), torch.rand(4, 5)
+    # Absolute-space batch: returns = R, values = V, so the residual offset is -B.
+    metrics = _value_loss_metrics(r, v, to_abs=torch.zeros_like(b_loo), to_res=-b_loo)
+    _, ev_res = _explained_variances(metrics)
+
+    ratio = (
+        (r - v).var(unbiased=False) / (r - b_loo.unsqueeze(-1)).var(unbiased=False)
+    ).item()
+    assert (1.0 - ev_res) == pytest.approx(ratio, abs=1e-5)

@@ -47,6 +47,15 @@ ppo:
     # Length-adaptive λ_policy = 1 - 1/(α·l).  0 = disabled.
     length_adaptive_alpha: 0.0  # VAPO: 0.05
 
+    # --- decomposed group baseline + residual critic ---
+    # research/ppo/residual_critic_report.md. true => the rollout group supplies
+    # the task baseline B(X) as a leave-one-out mean and the critic is trained
+    # only on the within-task residual C(s) = R - B_LOO; critic values/returns
+    # are then in RESIDUAL space and the go/no-go metric is critic/ev_res.
+    # Requires gae_gamma: 1. Orthogonal to token-vs-turn granularity.
+    # false still logs critic/ev_res + residual/* for the absolute critic.
+    residual_baseline: false
+
   reward_scaling:
     enabled: true
     source_min: 0.0
@@ -104,6 +113,9 @@ loss_fn:
 value_loss_fn:
   scale: 0.4
   cliprange: 0.2
+  # Weight of homogeneous (zero within-group reward variance) groups in the
+  # value loss; only meaningful with ppo.adv_estimator.residual_baseline.
+  homogeneous_group_weight: 1.0
 
 checkpointing:
   enabled: true

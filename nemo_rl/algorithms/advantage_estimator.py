@@ -21,6 +21,8 @@ This module provides different advantage estimation strategies:
 - RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
 - TurnLevelGeneralizedAdvantageEstimator: GAE over agent TURNS instead of tokens
+- ResidualBaselineEstimator: wraps a value-based estimator so the group supplies the
+  task baseline B(X) and the critic learns only the within-task residual C(s)
 - OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
@@ -28,6 +30,8 @@ Reference papers:
 - GAE: https://arxiv.org/abs/1506.02438 (High-Dimensional Continuous Control Using Generalized Advantage Estimation)
 - MOPD: https://arxiv.org/abs/2601.02780
 """
+
+from typing import Any, Optional
 
 import torch
 
@@ -552,7 +556,11 @@ class TurnLevelGeneralizedAdvantageEstimator:
     def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
         # No silent defaults: a λ that quietly falls back to 1.0 would make a
         # sweep look like it ran when it did not.
-        for key in ("turn_gae_gamma", "turn_gae_lambda_value", "turn_gae_lambda_policy"):
+        for key in (
+            "turn_gae_gamma",
+            "turn_gae_lambda_value",
+            "turn_gae_lambda_policy",
+        ):
             if estimator_config.get(key) is None:
                 raise ValueError(
                     f"adv_estimator.{key} must be set explicitly when "
@@ -664,6 +672,336 @@ class TurnLevelGeneralizedAdvantageEstimator:
             turn_values, turn_advantages, turn_spans, sample_mask
         )
         return advantages, returns
+
+
+class ResidualBaselineEstimator:
+    """Decomposed group baseline + residual critic (research/ppo/residual_critic_report.md).
+
+    The Bayes-optimal value splits exactly into a between-task and a within-task
+    part, ``V*(s) = B(X) + C(s)`` with ``E[C | X] = 0``.  An absolute critic has
+    to fit both.  On this SWE workload it overwhelmingly fits the first and fits
+    it badly: 88-93% of its output variance is between-task, yet its EV (~0.157)
+    is below even a two-value "all-fail vs rest" lookup (0.330) and far below the
+    free leave-one-out group baseline (~0.553).  Substituting the critic for that
+    baseline *raises* advantage variance 1.67-2.09x.
+
+    So hand ``B`` to the rollout group and let the critic learn only ``C``.  This
+    wrapper keeps the critic in RESIDUAL space end to end:
+
+        values  in the batch = C(s)
+        returns in the batch = the residual lambda-return (target for C)
+
+    and reconstructs the absolute value ``V~ = B_LOO + C`` only for the duration
+    of the inner GAE call.  Keeping the batch residual is what makes the PPO
+    value clip (``old_values`` vs ``returns``) self-consistent, and it is why
+    this is a wrapper rather than a post-hoc transform of the returns: the report
+    (S26.10) says "reconstruct V~ and feed the existing GAE", but ``returns``
+    flows straight into :class:`MseValueLossFn`, and at lambda=1 GAE returns are
+    ``R`` -- following that literally would train ``C`` against ``R``.
+
+    With gamma = 1 the group baseline cancels from every nonterminal TD error
+    (``delta_t = C_{t+1} - C_t``), and at lambda = 1 the advantage telescopes to
+    ``A_t = R - B_LOO - C_t``: the critic becomes a state-dependent control
+    variate on top of the known-good group advantage, and ``C = 0`` recovers it
+    exactly.  gamma < 1 breaks the cancellation, so it is rejected outright.
+
+    Wrapping (rather than subclassing) means both ``gae`` and ``turn_gae`` are
+    covered without duplicating the leave-one-out logic.
+
+    Args:
+        inner: the value-based estimator to wrap (``gae`` or ``turn_gae``).
+        residual_target: when False, ``B_LOO`` is still computed and exported for
+            metrics but the targets are left in absolute space.  That is what
+            lets an absolute-critic run log ``critic/ev_res`` on the same axis as
+            a residual run -- there ``1 - ev_res`` is exactly the report's
+            advantage-variance ratio.
+    """
+
+    def __init__(self, inner: Any, residual_target: bool):
+        self.inner = inner
+        self.residual_target = residual_target
+
+        # GeneralizedAdvantageEstimator names it gae_gamma; the turn-level one
+        # names it gamma. Neither has a default worth guessing at.
+        gamma = getattr(inner, "gae_gamma", getattr(inner, "gamma", None))
+        if gamma is None:
+            raise ValueError(
+                f"{type(inner).__name__} exposes no discount factor, so the "
+                "residual baseline cannot verify the gamma = 1 condition it "
+                "depends on."
+            )
+        self.gamma = float(gamma)
+        if residual_target and abs(self.gamma - 1.0) > 1e-8:
+            raise ValueError(
+                f"adv_estimator.residual_baseline requires gamma == 1, got {self.gamma}. "
+                "The task baseline only cancels from nonterminal TD errors at "
+                "gamma = 1; at gamma < 1 the residual value would silently pick "
+                "up a (gamma - 1) * B term (report S11.5)."
+            )
+
+        self.last_metrics: dict[str, float] = {}
+        # Per-sample offsets that move `returns` into each space. Exactly one is
+        # zero. Consumed by MseValueLossFn so it can report BOTH explained
+        # variances without knowing which mode it is in.
+        self.last_returns_to_abs: torch.Tensor | None = None
+        self.last_returns_to_res: torch.Tensor | None = None
+        # ``[B]`` float, 1.0 where the rollout's group is all-fail or all-pass.
+        self.last_group_homogeneous: torch.Tensor | None = None
+        # ``[B]`` long, sibling-group index. Exposed so within-group diagnostics
+        # partition trajectories exactly the way the baseline did.
+        self.last_group_ids: torch.Tensor | None = None
+
+        # NOTE: this ``last_*`` side-channel deliberately mirrors the existing
+        # ``last_metrics`` contract that ppo.py and critic_pretrain.py already
+        # read via getattr on the estimator; keeping one convention beats adding
+        # a second way to hand per-step tensors back to the caller.
+
+    def compute_advantage(
+        self,
+        prompt_ids: torch.Tensor,
+        rewards: torch.Tensor,
+        mask: torch.Tensor,
+        values: torch.Tensor,
+        turn_spans: Optional[Any] = None,
+        sample_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the inner estimator against ``V~ = B_LOO + C`` and return residual targets.
+
+        Returns:
+            ``(advantages, returns)``. ``advantages`` are byte-for-byte what the
+            inner estimator produces for a critic predicting ``V~`` -- only the
+            returns are moved back into residual space.
+        """
+        baseline = self._leave_one_out_baseline(prompt_ids, rewards)
+        b_col = baseline.unsqueeze(-1).to(values.dtype)
+
+        inner_values = values + b_col if self.residual_target else values
+        adv_kwargs = dict(
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            mask=mask,
+            values=inner_values,
+            sample_mask=sample_mask,
+            **kwargs,
+        )
+        if turn_spans is not None:
+            adv_kwargs["turn_spans"] = turn_spans
+        advantages, returns = self.inner.compute_advantage(**adv_kwargs)
+
+        # Turn-level returns live at ONE anchor per turn and are structurally
+        # zero elsewhere (scatter_turns_to_anchors), matched by token_mask =
+        # anchor_mask in the critic's batch. Subtracting the baseline unmasked
+        # would write -B into every non-anchor position.
+        return_mask = (
+            turn_spans.anchor_mask.to(returns.dtype)
+            if turn_spans is not None
+            else mask.to(returns.dtype)
+        )
+        if self.residual_target:
+            returns = returns - b_col * return_mask
+            self.last_returns_to_abs = baseline
+            self.last_returns_to_res = torch.zeros_like(baseline)
+        else:
+            self.last_returns_to_abs = torch.zeros_like(baseline)
+            self.last_returns_to_res = -baseline
+
+        self.last_metrics = dict(getattr(self.inner, "last_metrics", None) or {})
+        self.last_metrics.update(
+            self._group_metrics(
+                prompt_ids, rewards, baseline, returns, return_mask, sample_mask
+            )
+        )
+        return advantages, returns
+
+    def _leave_one_out_baseline(
+        self, prompt_ids: torch.Tensor, rewards: torch.Tensor
+    ) -> torch.Tensor:
+        """``B_LOO[i,j] = (sum_k R[i,k] - R[i,j]) / (G_i - 1)``, in fp32.
+
+        ``valid_mask`` is deliberately all-ones, matching
+        :class:`GRPOAdvantageEstimator` exactly: a rollout dropped from the
+        critic loss by ``sample_mask`` still feeds its siblings' baselines.  That
+        keeps the PPO actor A/B against the working DAPO/GRPO control on
+        identical group semantics, and keeps critic pretraining (stage B) aligned
+        with what PPO (stage C) will feed the same checkpoint.  The divergence is
+        made visible by ``residual/frac_traj_sample_masked`` rather than hidden.
+        """
+        rewards_f32 = rewards.float()
+        baseline, _ = calculate_baseline_and_std_per_prompt(
+            prompt_ids,
+            rewards_f32,
+            torch.ones_like(rewards_f32),
+            leave_one_out_baseline=True,
+        )
+        return baseline
+
+    @staticmethod
+    def _group_ids(prompt_ids: torch.Tensor) -> torch.Tensor:
+        """``[B]`` group index, using the same identity rule as the LOO baseline."""
+        _, inverse = torch.unique(prompt_ids, dim=0, return_inverse=True)
+        return inverse.reshape(-1)
+
+    def _group_metrics(
+        self,
+        prompt_ids: torch.Tensor,
+        rewards: torch.Tensor,
+        baseline: torch.Tensor,
+        returns: torch.Tensor,
+        return_mask: torch.Tensor,
+        sample_mask: Optional[torch.Tensor],
+    ) -> dict[str, float]:
+        """Group-composition diagnostics for the residual target.
+
+        ``frac_groups_mixed`` is the load-bearing one: homogeneous groups have
+        ``Y = 0`` for every sibling and therefore contribute EXACTLY zero target
+        variance, so this fraction -- not the dataset size -- bounds what the
+        residual critic can learn.  On the pi0 SWE pool it is 0.435.
+
+        "Homogeneous" is defined as ZERO WITHIN-GROUP REWARD VARIANCE, not as a
+        group sum of 0 or G. Rewards arriving here are post-scaling, post-shaping
+        and post-penalty: ``reward_scaling`` maps ``[0,1] -> [-1,1]`` in the math
+        configs, and judge rewards can be fractional. A sum-based test would then
+        call an all-fail group "mixed" and report ``frac_groups_mixed = 1.0`` on a
+        pool that is mostly homogeneous. Zero within-group variance is exactly the
+        ``Y = 0`` condition being claimed, under any reward scale.
+        """
+        with torch.no_grad():
+            group_ids = self._group_ids(prompt_ids).to(rewards.device)
+            self.last_group_ids = group_ids
+            rewards_f32 = rewards.float()
+            n_groups = int(group_ids.max().item()) + 1 if group_ids.numel() else 0
+            if n_groups == 0:
+                return {}
+
+            ones = torch.ones_like(rewards_f32)
+            counts = torch.zeros(n_groups, device=rewards.device).index_add_(
+                0, group_ids, ones
+            )
+            sums = torch.zeros(n_groups, device=rewards.device).index_add_(
+                0, group_ids, rewards_f32
+            )
+            means = sums / counts.clamp(min=1)
+            sq_dev = torch.zeros(n_groups, device=rewards.device).index_add_(
+                0, group_ids, (rewards_f32 - means[group_ids]) ** 2
+            )
+            homogeneous = (sq_dev <= 1e-12).float()
+            mixed = 1.0 - homogeneous
+            # all-fail / all-pass are only well defined for a binary reward; they
+            # are reported as "homogeneous at the group min / max reward" so they
+            # stay meaningful (and still sum to `homogeneous`) under any scaling.
+            r_min, r_max = rewards_f32.min(), rewards_f32.max()
+            all_fail = homogeneous * (means <= r_min + 1e-12).float()
+            all_pass = homogeneous * (means >= r_max - 1e-12).float()
+            self.last_group_homogeneous = homogeneous[group_ids]
+            # <2 valid siblings: calculate_baseline_and_std_per_prompt falls back
+            # to baseline = reward, i.e. a silent Y = 0. Surface it.
+            singletons = int((counts < 2).sum().item())
+
+            m = return_mask.bool()
+            target_var = (
+                returns[m].float().var(unbiased=False).item()
+                if int(m.sum()) > 1
+                else 0.0
+            )
+            metrics = {
+                "residual/b_loo_mean": baseline.mean().item(),
+                "residual/b_loo_std": baseline.std(unbiased=False).item(),
+                "residual/target_var": target_var,
+                "residual/frac_groups_mixed": mixed.mean().item(),
+                "residual/frac_groups_all_fail": all_fail.mean().item(),
+                "residual/frac_groups_all_pass": all_pass.mean().item(),
+                "residual/n_singleton_groups": float(singletons),
+                "residual/group_size_min": counts.min().item(),
+                "residual/group_size_max": counts.max().item(),
+            }
+            if sample_mask is not None:
+                metrics["residual/frac_traj_sample_masked"] = (
+                    1.0 - sample_mask.float().mean().item()
+                )
+        if singletons:
+            print(
+                f"  ⚠️ residual baseline: {singletons} group(s) have <2 rollouts; "
+                "their targets collapse to 0 (baseline = own reward)."
+            )
+        return metrics
+
+
+def attach_value_baseline_keys(batch: Any, adv_estimator: Any) -> None:
+    """Copy the estimator's per-sample return-space offsets onto a critic batch.
+
+    No-op unless a :class:`ResidualBaselineEstimator` produced them.  These let
+    :class:`MseValueLossFn` report explained variance in BOTH absolute and
+    residual space from one pass, without the loss needing to know which space
+    ``returns`` is in.
+    """
+    to_abs = getattr(adv_estimator, "last_returns_to_abs", None)
+    to_res = getattr(adv_estimator, "last_returns_to_res", None)
+    if to_abs is None or to_res is None:
+        return
+    n = batch["returns"].shape[0]
+    if to_abs.shape[0] != n:
+        raise ValueError(
+            f"Return-space offsets have batch size {to_abs.shape[0]} but the "
+            f"critic batch has {n}. These are per-sample and would misalign "
+            "silently, reporting explained variance against the wrong baseline."
+        )
+    batch["returns_to_abs"] = to_abs.to(batch["returns"].dtype)
+    batch["returns_to_res"] = to_res.to(batch["returns"].dtype)
+
+
+def homogeneous_group_sample_mask(
+    sample_mask: torch.Tensor, adv_estimator: Any, weight: float
+) -> torch.Tensor | None:
+    """``sample_mask`` rescaled so homogeneous groups carry ``weight``.
+
+    Returns None when there is nothing to do (weight 1.0, or no residual
+    estimator), so callers can skip building a separate critic batch entirely.
+
+    Under a residual target, all-fail and all-pass groups have ``Y = 0`` for every
+    sibling and so contribute exactly zero target variance -- on the pi0 SWE pool
+    that is 56.5% of groups and ~58% of critic FLOPs.  They are still worth
+    keeping at some weight: the shrinkage-toward-zero they impose is the
+    mechanism enforcing ``E[C | X] = 0``, i.e. the regulariser against the
+    between-task leakage this whole change exists to remove.
+
+    Rescaling ``sample_mask`` is a correctly renormalised weighted mean with no
+    effective-LR confound, because ``global_valid_toks`` is itself computed as
+    ``sum(token_mask * sample_mask)`` (nemo_rl/models/megatron/data.py) -- so the
+    denominator moves with the numerator.
+
+    The caller MUST apply this to a separate critic batch: in token-level mode
+    the actor shares ``train_data['sample_mask']``.
+    """
+    if weight == 1.0:
+        return None
+    if weight < 0.0:
+        raise ValueError(
+            f"value_loss_fn.homogeneous_group_weight must be >= 0, got {weight}."
+        )
+    homogeneous = getattr(adv_estimator, "last_group_homogeneous", None)
+    if homogeneous is None:
+        raise ValueError(
+            "value_loss_fn.homogeneous_group_weight != 1.0 requires the residual "
+            "baseline estimator (it is what identifies homogeneous groups), but "
+            f"{type(adv_estimator).__name__} exposes no group composition."
+        )
+    # The wrapper is installed even for an absolute-critic run (it computes
+    # B_LOO for metrics), so group composition is available there too -- but
+    # downweighting must NOT apply. Under an absolute target those groups have
+    # Y = R != 0 and do carry target variance, so silently reweighting them
+    # would change the objective of the control arm in an A/B that sets this
+    # knob in both arms to hold wall-clock fixed.
+    if not getattr(adv_estimator, "residual_target", False):
+        raise ValueError(
+            "value_loss_fn.homogeneous_group_weight != 1.0 is only meaningful "
+            "with ppo.adv_estimator.residual_baseline=true. Under an absolute "
+            "critic target, homogeneous groups still carry target variance "
+            "(Y = R != 0), so downweighting them would silently change the "
+            "objective rather than skip empty targets."
+        )
+    homogeneous = homogeneous.to(sample_mask.device, sample_mask.dtype)
+    return sample_mask * (1.0 - homogeneous * (1.0 - weight))
 
 
 class OPDAdvantageEstimator:

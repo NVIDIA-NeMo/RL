@@ -31,7 +31,10 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms.advantage_estimator import (
     GeneralizedAdvantageEstimator,
     RawRewardAdvantageEstimator,
+    ResidualBaselineEstimator,
     TurnLevelGeneralizedAdvantageEstimator,
+    attach_value_baseline_keys,
+    homogeneous_group_sample_mask,
 )
 from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
@@ -202,6 +205,14 @@ class AdvEstimatorConfig(TypedDict):
     turn_gae_gamma: NotRequired[Optional[float]]
     turn_gae_lambda_value: NotRequired[Optional[float]]
     turn_gae_lambda_policy: NotRequired[Optional[float]]
+    # Decomposed group baseline + residual critic
+    # (research/ppo/residual_critic_report.md). The rollout group supplies the
+    # task baseline B(X) via a leave-one-out mean and the critic is trained only
+    # on the within-task residual C(s) = V*(s) - B(X). Requires gamma = 1.
+    # Independent of token-vs-turn granularity: it wraps either estimator.
+    # Required for the value-model estimators ("gae"/"turn_gae"), which read it
+    # directly; "raw_reward" trains no critic and may omit it.
+    residual_baseline: NotRequired[bool]
 
 
 class PPOConfig(TypedDict):
@@ -1443,6 +1454,65 @@ def _create_advantage_estimator(master_config: MasterConfig):
             f"PPO only supports 'gae', 'turn_gae' or 'raw_reward'."
         )
 
+    if adv_estimator_name == "raw_reward":
+        # Read only as a presence check: raw_reward configs have no critic, so
+        # they are not expected to carry the key at all.
+        if adv_estimator_config.get("residual_baseline"):
+            raise ValueError(
+                "adv_estimator.residual_baseline requires a value model, but "
+                "adv_estimator.name='raw_reward' trains no critic."
+            )
+        return adv_estimator
+
+    # Explicit message rather than a bare KeyError, matching how the turn_gae
+    # lambdas reject a config that silently omits them.
+    if "residual_baseline" not in adv_estimator_config:
+        raise ValueError(
+            "adv_estimator.residual_baseline must be set explicitly when "
+            f"adv_estimator.name={adv_estimator_name!r} (no default is assumed). "
+            "Set it to false to keep the current absolute-critic behaviour. "
+            "See research/ppo/residual_critic_report.md."
+        )
+    residual_baseline = bool(adv_estimator_config["residual_baseline"])
+
+    # G = 1 makes the leave-one-out baseline degenerate: with a single sibling,
+    # calculate_baseline_and_std_per_prompt falls back to baseline = own reward,
+    # so B_LOO == R exactly. The advantage then telescopes to A_t = -C_t and the
+    # target to Y = 0 -- the reward drops out of the policy gradient entirely and
+    # the critic is trained to predict zero. That is silently wrong rather than
+    # merely degraded, so refuse it at setup.
+    if residual_baseline:
+        gens_per_prompt = ppo_config["num_generations_per_prompt"]
+        if gens_per_prompt < 2:
+            raise ValueError(
+                "adv_estimator.residual_baseline requires "
+                f"ppo.num_generations_per_prompt >= 2, got {gens_per_prompt}. "
+                "With one rollout per prompt the leave-one-out baseline "
+                "degenerates to the rollout's own reward (B_LOO == R), so every "
+                "advantage becomes -C(s) and every critic target becomes 0: the "
+                "reward would be dropped from the policy gradient without any "
+                "error."
+            )
+
+    # Always wrap the value-based estimators, even when residualization is OFF:
+    # the wrapper then computes B_LOO for metrics only, which is what lets an
+    # absolute-critic run report critic/ev_res on the same axis as a residual
+    # run (there, 1 - ev_res is exactly the advantage-variance ratio the report
+    # measured at 1.67-2.09x). It never touches the targets in that mode.
+    adv_estimator = ResidualBaselineEstimator(adv_estimator, residual_baseline)
+    if residual_baseline:
+        print(
+            "  ✓ RESIDUAL baseline ON: the rollout group supplies the task "
+            "baseline B_LOO and the critic is trained only on the within-task "
+            "residual C(s) = R - B_LOO. Critic values/returns are in RESIDUAL "
+            "space; go/no-go metric is critic/ev_res."
+        )
+    else:
+        print(
+            "  ✓ Residual baseline OFF (absolute critic targets); B_LOO is still "
+            "computed for critic/ev_res + residual/* diagnostics."
+        )
+
     return adv_estimator
 
 
@@ -1501,6 +1571,36 @@ def _value_metric_mask(
     return turn_spans.anchor_mask
 
 
+def _prepare_value_train_batch(
+    value_train_batch: BatchedDataDict[Any],
+    adv_estimator: Any,
+    master_config: MasterConfig,
+) -> BatchedDataDict[Any]:
+    """Attach residual bookkeeping to the batch the critic actually trains on.
+
+    Two things, both no-ops for a default run:
+
+    1. ``returns_to_abs`` / ``returns_to_res`` so :class:`MseValueLossFn` can
+       report explained variance in both return spaces.
+    2. ``value_loss_fn.homogeneous_group_weight``, applied by rescaling
+       ``sample_mask``.  This COPIES rather than mutates: in token-level mode the
+       critic trains on ``train_data`` itself, whose ``sample_mask`` the actor
+       also reads.
+
+    Called after the privileged-critic path re-assigns ``critic_batch['sample_mask']``,
+    so the weighting cannot be silently clobbered.
+    """
+    weight = master_config.value_loss_fn.homogeneous_group_weight
+    scaled = homogeneous_group_sample_mask(
+        value_train_batch["sample_mask"], adv_estimator, weight
+    )
+    if scaled is not None:
+        value_train_batch = BatchedDataDict({**value_train_batch})
+        value_train_batch["sample_mask"] = scaled
+    attach_value_baseline_keys(value_train_batch, adv_estimator)
+    return value_train_batch
+
+
 def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     """Build the ``critic/*`` metrics dict from a value model's train results.
 
@@ -1540,7 +1640,40 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     res_sq = critic_metrics.get("critic/residual_sq_mean", 0)
     var_returns = r_sq - r_mean**2
     var_residual = res_sq - (r_mean - v_mean) ** 2
-    critic_metrics["critic/explained_var"] = 1.0 - var_residual / max(var_returns, 1e-8)
+
+    # The prediction error is the SAME quantity in both return spaces --
+    # R - (B_LOO + C) = (R - B_LOO) - C -- so `var_residual` above serves as the
+    # numerator for both explained variances and only the denominator changes:
+    #
+    #   critic/explained_var = 1 - Var(R - V~) / Var(R)      absolute space
+    #   critic/ev_res        = 1 - Var(Y - C)  / Var(Y)      residual space
+    #
+    # Both are reported in BOTH arms so an absolute and a residual run are
+    # directly comparable on one axis. critic/explained_var keeps its historical
+    # meaning exactly; for an absolute critic 1 - critic/ev_res is the
+    # advantage-variance ratio against a group-only advantage (report S14.5
+    # measured 1.67-2.09x, i.e. ev_res well below zero). Runs predating these
+    # stats fall back to the single-space computation.
+    abs_mean = critic_metrics.get("critic/abs_returns_mean")
+    abs_sq = critic_metrics.get("critic/abs_returns_sq_mean")
+    res_r_mean = critic_metrics.get("critic/res_returns_mean")
+    res_r_sq = critic_metrics.get("critic/res_returns_sq_mean")
+    if abs_mean is None or res_r_mean is None:
+        var_abs_returns, var_res_returns = var_returns, var_returns
+    else:
+        var_abs_returns = abs_sq - abs_mean**2
+        var_res_returns = res_r_sq - res_r_mean**2
+
+    critic_metrics["critic/explained_var"] = 1.0 - var_residual / max(
+        var_abs_returns, 1e-8
+    )
+    # Unlike Var(R), Var(Y) legitimately hits zero when every group in a step is
+    # homogeneous (54% of groups are all-fail on the SWE pool), and 1e-8 would
+    # then emit ~-1e8 and destroy the panel's autoscale. Report 0.0 -- "the
+    # critic explains none of a target that has nothing to explain".
+    critic_metrics["critic/ev_res"] = (
+        1.0 - var_residual / var_res_returns if var_res_returns > 1e-8 else 0.0
+    )
     return critic_metrics
 
 
@@ -1571,9 +1704,12 @@ def _positional_value_metrics(
     returns: torch.Tensor,
     token_mask: torch.Tensor,
     n_bins: int = 3,
+    returns_to_abs: Optional[torch.Tensor] = None,
+    returns_to_res: Optional[torch.Tensor] = None,
 ) -> dict[str, float]:
-    """Critic-quality diagnostics bucketed by RELATIVE position within each response
-    (early / mid / late thirds): explained variance, calibration (ECE), and signed
+    """Critic-quality diagnostics bucketed by relative position within each response.
+
+    Early / mid / late thirds: explained variance, calibration (ECE), and signed
     bias of V(s_t) vs the GAE return.
 
     EV is expected to rise early->late (the outcome is nearly determined near the
@@ -1584,10 +1720,31 @@ def _positional_value_metrics(
     calibration axis: V should literally be P(success | prefix), and miscalibration
     distorts advantage magnitudes even when EV/ranking looks fine. Cheap:
     driver-side tensor ops on tensors already in ``train_data``.
+
+    ``returns_to_abs`` / ``returns_to_res`` are the per-sample ``[B]`` offsets
+    from :class:`ResidualBaselineEstimator` that shift the whole space (values
+    AND returns together), so each bucket reports explained variance in both:
+    ``critic/ev_*`` stays absolute-space and unchanged, ``critic/ev_res_*`` is
+    the residual-space counterpart.  ECE is scored in absolute space in both
+    arms, since it bins on ``[0,1]`` and only means anything for a predictor of
+    ``P(success)`` -- a residual value lives in ``[-1,1]`` around zero.
+
+    Because the numerator ``returns - values`` is offset-invariant, ``abs_err``
+    and ``bias`` are identical in both spaces and are reported once.
     """
     mask = token_mask.bool()
     if int(mask.sum()) < 2:
         return {}
+    zeros = torch.zeros(returns.shape[0], device=returns.device, dtype=returns.dtype)
+    to_abs = zeros if returns_to_abs is None else returns_to_abs.to(returns.dtype)
+    to_res = zeros if returns_to_res is None else returns_to_res.to(returns.dtype)
+    abs_values, abs_returns = (
+        values + to_abs.unsqueeze(-1),
+        returns + to_abs.unsqueeze(-1),
+    )
+    # Only the residual RETURNS are needed: the prediction error is
+    # offset-invariant, so the residual values never enter any statistic here.
+    res_returns = returns + to_res.unsqueeze(-1)
     # 0-based index of each response token within its sample's response, scaled to [0,1)
     resp_len = mask.sum(dim=1, keepdim=True).clamp(min=1)
     rel = (torch.cumsum(mask.long(), dim=1) - 1).float() / resp_len.float()
@@ -1604,17 +1761,124 @@ def _positional_value_metrics(
             continue
         v = values[bmask].float()
         r = returns[bmask].float()
-        var_r = r.var(unbiased=False)
-        ev = (1.0 - (r - v).var(unbiased=False) / var_r).item() if var_r > 1e-8 else 0.0
-        out[f"critic/ev_{names[i]}"] = ev
+        # Offset-invariant: (r - v) is the same in both spaces, so one numerator
+        # serves both explained variances.
+        err_var = (r - v).var(unbiased=False)
+        av, ar = abs_values[bmask].float(), abs_returns[bmask].float()
+        rr = res_returns[bmask].float()
+        var_abs, var_res = ar.var(unbiased=False), rr.var(unbiased=False)
+        out[f"critic/ev_{names[i]}"] = (
+            (1.0 - err_var / var_abs).item() if var_abs > 1e-8 else 0.0
+        )
+        out[f"critic/ev_res_{names[i]}"] = (
+            (1.0 - err_var / var_res).item() if var_res > 1e-8 else 0.0
+        )
         out[f"critic/abs_err_{names[i]}"] = (r - v).abs().mean().item()
+        # Raw head output, NOT reconstructed: in residual mode this is C(s), and
+        # whether it actually spans a signed range is the thing worth watching.
         out[f"critic/mean_v_{names[i]}"] = v.mean().item()
         out[f"critic/n_tokens_{names[i]}"] = float(n)
         # Calibration: ECE (magnitude of miscalibration across confidence bins) and
         # signed bias (direction: >0 = overconfident/optimistic, <0 = pessimistic).
-        out[f"critic/ece_{names[i]}"] = _calibration_ece(v, r)
+        # Scored in absolute space -- ECE bins on [0,1] and is only meaningful for
+        # a predictor of P(success).
+        out[f"critic/ece_{names[i]}"] = _calibration_ece(av, ar)
         out[f"critic/bias_{names[i]}"] = (v - r).mean().item()
     return out
+
+
+def _mixed_group_value_metrics(
+    values: torch.Tensor,
+    returns: torch.Tensor,
+    token_mask: torch.Tensor,
+    mixed_mask: Optional[torch.Tensor],
+    returns_to_res: Optional[torch.Tensor] = None,
+    n_bins: int = 3,
+) -> dict[str, float]:
+    """Residual explained variance restricted to MIXED-outcome groups.
+
+    ``critic/ev_res`` is computed over the whole batch, where homogeneous
+    (all-fail / all-pass) groups have ``Y = 0`` for every sibling.  Those groups
+    therefore contribute ZERO covariance but a positive ``Var(C)`` to
+
+        EV_res = [2 Cov(Y, C) - Var(C)] / Var(Y),
+
+    i.e. any nonzero prediction there is a pure penalty.  On this SWE pool they
+    are ~58% of groups, so a critic with real within-task signal on the mixed
+    groups can still show ``ev_res`` near zero once that tax is paid.
+
+    These keys isolate the other side of that split: how much residual variance
+    the critic explains where the target is actually nonzero.  Reading them
+    together separates two very different states of the world:
+
+        ev_res ~ 0, ev_res_mixed_group > 0   signal exists; homogeneous groups
+                                             are taxing it (consider gating the
+                                             critic to mixed groups in PPO)
+        ev_res ~ 0, ev_res_mixed_group ~ 0   no within-task signal to find
+
+    This is diagnostic only and deliberately does NOT change ``critic/ev_res``,
+    which remains the whole-batch go/no-go number: PPO applies the critic to
+    every group, so the untruncated version is what the actor actually sees.
+
+    Args:
+        values: ``[B, S]`` raw critic output (``C`` in residual mode, ``V`` in
+            absolute mode).
+        returns: ``[B, S]`` critic regression target, in whichever space the run
+            uses.
+        token_mask: ``[B, S]`` positions the critic is supervised at.
+        mixed_mask: ``[B]``, nonzero for rollouts whose sibling group contains
+            both a success and a failure. ``None`` -> no keys are emitted.
+        returns_to_res: ``[B]`` offset carrying ``returns`` into residual space
+            (zero in a residual run, ``-B_LOO`` in an absolute one).
+        n_bins: trajectory-progress buckets, matching _positional_value_metrics.
+    """
+    if mixed_mask is None:
+        return {}
+    mask = token_mask.bool() & mixed_mask.bool().unsqueeze(-1)
+    if int(mask.sum()) < 2:
+        return {}
+    zeros = torch.zeros(returns.shape[0], device=returns.device, dtype=returns.dtype)
+    to_res = zeros if returns_to_res is None else returns_to_res.to(returns.dtype)
+    res_returns = returns + to_res.unsqueeze(-1)
+
+    def _ev(m: torch.Tensor) -> Optional[float]:
+        if int(m.sum()) < 2:
+            return None
+        # The prediction error is offset-invariant, so the raw difference is
+        # already the residual-space error; only the denominator needs shifting.
+        err_var = (returns[m] - values[m]).float().var(unbiased=False)
+        var_t = res_returns[m].float().var(unbiased=False)
+        return (1.0 - err_var / var_t).item() if var_t > 1e-8 else 0.0
+
+    out: dict[str, float] = {}
+    overall = _ev(mask)
+    if overall is not None:
+        out["critic/ev_res_mixed_group"] = overall
+    out["critic/n_mixed_group_tokens"] = float(int(mask.sum()))
+
+    # Bucket by relative position within each response, using the FULL response
+    # mask for the denominator so bucket boundaries match _positional_value_metrics
+    # exactly (a trajectory's progress does not depend on its group's composition).
+    full = token_mask.bool()
+    rel = (torch.cumsum(full.long(), dim=1) - 1).float() / full.sum(
+        dim=1, keepdim=True
+    ).clamp(min=1).float()
+    names = (
+        ["early", "mid", "late"] if n_bins == 3 else [f"bin{i}" for i in range(n_bins)]
+    )
+    for i in range(n_bins):
+        lo, hi = i / n_bins, (i + 1) / n_bins
+        upper = (rel < hi) if i < n_bins - 1 else (rel <= 1.0)
+        ev = _ev(mask & (rel >= lo) & upper)
+        if ev is not None:
+            out[f"critic/ev_res_mixed_group_{names[i]}"] = ev
+    return out
+
+
+def _mixed_group_mask(adv_estimator: Any) -> Optional[torch.Tensor]:
+    """``[B]`` 1.0 for rollouts in a mixed-outcome group, or None if unavailable."""
+    homogeneous = getattr(adv_estimator, "last_group_homogeneous", None)
+    return None if homogeneous is None else 1.0 - homogeneous
 
 
 def _should_log_ppo_rollout_dump(master_config: MasterConfig, step: int) -> bool:
@@ -2116,6 +2380,7 @@ def ppo_train(
                         and not privileged_critic_cfg.get("enabled")
                     ):
                         privileged_critic_cfg = None
+
                     critic_batch = None
 
                     value_model.prepare_for_inference()
@@ -2128,6 +2393,7 @@ def ppo_train(
                                 "make_sequence_length_divisible_by"
                             ],
                         )
+
                         vals_aug = value_model.get_values(critic_batch)[
                             "values"
                         ].squeeze(-1)
@@ -2255,6 +2521,10 @@ def ppo_train(
                     train_data["advantages"] = advantages
                     if returns is not None:
                         train_data["returns"] = returns
+                        # Return-space offsets for the pre-update (fresh) critic
+                        # diagnostics below; the critic's own batch gets them in
+                        # _prepare_value_train_batch.
+                        attach_value_baseline_keys(train_data, adv_estimator)
                         # Turn-level: the critic trains on one anchor per turn,
                         # so it needs its own batch (same sequences, anchor mask).
                         if turn_spans is not None:
@@ -2319,6 +2589,12 @@ def ppo_train(
                             value_train_batch = critic_batch
                         else:
                             value_train_batch = train_data
+                        # Residual bookkeeping last, so the sample_mask
+                        # re-assignment above cannot clobber the homogeneous
+                        # group weighting.
+                        value_train_batch = _prepare_value_train_batch(
+                            value_train_batch, adv_estimator, master_config
+                        )
                         value_results = value_model.train(
                             value_train_batch,
                             value_loss_fn,
@@ -2457,12 +2733,27 @@ def ppo_train(
                                 train_data["values"],
                                 train_data["returns"],
                                 _value_metric_mask(train_data, turn_spans),
+                                returns_to_abs=train_data.get("returns_to_abs"),
+                                returns_to_res=train_data.get("returns_to_res"),
+                            )
+                        )
+                        # Residual EV where the target is actually nonzero: on a
+                        # homogeneous group Y = 0, so any prediction there is a
+                        # pure penalty to the whole-batch critic/ev_res.
+                        metrics.update(
+                            _mixed_group_value_metrics(
+                                train_data["values"],
+                                train_data["returns"],
+                                _value_metric_mask(train_data, turn_spans),
+                                _mixed_group_mask(adv_estimator),
+                                returns_to_res=train_data.get("returns_to_res"),
                             )
                         )
                     # Turn-level counterparts (per-turn EV/bias, last-turn AUC,
                     # turn counts). The token-level versions above are dominated
                     # by the longest turns; these weight every decision equally.
                     metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
+
                 metrics.update(
                     {
                         "reward": rewards.numpy(),
@@ -3352,6 +3643,7 @@ def async_ppo_train(
                         and not privileged_critic_cfg.get("enabled")
                     ):
                         privileged_critic_cfg = None
+
                     critic_batch = None
 
                     value_model.prepare_for_inference()
@@ -3364,6 +3656,7 @@ def async_ppo_train(
                                 "make_sequence_length_divisible_by"
                             ],
                         )
+
                         vals_aug = value_model.get_values(critic_batch)[
                             "values"
                         ].squeeze(-1)
@@ -3458,6 +3751,10 @@ def async_ppo_train(
                     train_data["advantages"] = advantages
                     if returns is not None:
                         train_data["returns"] = returns
+                        # Return-space offsets for the pre-update (fresh) critic
+                        # diagnostics below; the critic's own batch gets them in
+                        # _prepare_value_train_batch.
+                        attach_value_baseline_keys(train_data, adv_estimator)
                         # Turn-level: the critic trains on one anchor per turn,
                         # so it needs its own batch (same sequences, anchor mask).
                         if turn_spans is not None:
@@ -3501,6 +3798,12 @@ def async_ppo_train(
                             value_train_batch = critic_batch
                         else:
                             value_train_batch = train_data
+                        # Residual bookkeeping last, so the sample_mask
+                        # re-assignment above cannot clobber the homogeneous
+                        # group weighting.
+                        value_train_batch = _prepare_value_train_batch(
+                            value_train_batch, adv_estimator, master_config
+                        )
                         value_results = value_model.train(
                             value_train_batch,
                             value_loss_fn,
@@ -3675,6 +3978,20 @@ def async_ppo_train(
                                 train_data["values"],
                                 train_data["returns"],
                                 _value_metric_mask(train_data, turn_spans),
+                                returns_to_abs=train_data.get("returns_to_abs"),
+                                returns_to_res=train_data.get("returns_to_res"),
+                            )
+                        )
+                        # Residual EV where the target is actually nonzero: on a
+                        # homogeneous group Y = 0, so any prediction there is a
+                        # pure penalty to the whole-batch critic/ev_res.
+                        metrics.update(
+                            _mixed_group_value_metrics(
+                                train_data["values"],
+                                train_data["returns"],
+                                _value_metric_mask(train_data, turn_spans),
+                                _mixed_group_mask(adv_estimator),
+                                returns_to_res=train_data.get("returns_to_res"),
                             )
                         )
                     # Turn-level counterparts (per-turn EV/bias, last-turn AUC,

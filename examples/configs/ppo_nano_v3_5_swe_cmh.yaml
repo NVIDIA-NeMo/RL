@@ -117,6 +117,21 @@ ppo:
     # Length-adaptive lambda_policy = 1 - 1/(alpha*l). 0 = disabled.
     length_adaptive_alpha: null
 
+    # --- decomposed group baseline + residual critic ---
+    # research/ppo/residual_critic_report.md. true => the rollout group supplies
+    # the task baseline B(X) as a leave-one-out mean and the critic is trained
+    # only on the within-task residual C(s) = R - B_LOO; critic values/returns
+    # are then in RESIDUAL space and the go/no-go metric is critic/ev_res.
+    # Requires gae_gamma: 1. Orthogonal to token-vs-turn granularity.
+    #
+    # Motivation, measured on this exact workload: the absolute critic puts
+    # 88-93% of its output variance between tasks yet reaches EV 0.157 — below
+    # even a two-value "all-fail vs rest" lookup (0.330) and far below the free
+    # leave-one-out group baseline (0.553). Substituting it for that baseline
+    # RAISES advantage variance 1.67-2.09x. false still logs critic/ev_res and
+    # residual/* so an absolute run is comparable on the same axis.
+    residual_baseline: false
+
     # --- turn-level GAE (used only when name: "turn_gae") ---
     # All three lambdas/gamma are required in that mode and are never silently
     # defaulted, so a sweep cannot appear to have run when it did not.
@@ -200,6 +215,15 @@ loss_fn:
 value_loss_fn:
   scale: 1.0
   cliprange: 0.5
+  # Weight of homogeneous (all-fail / all-pass) groups in the value loss. Only
+  # meaningful with ppo.adv_estimator.residual_baseline: those groups have Y = 0
+  # for every sibling, so they contribute EXACTLY zero target variance while
+  # still costing ~58% of critic FLOPs on this pool (54.1% all-fail, 2.4%
+  # all-pass; only 43.5% of groups are mixed). Keep at 1.0 for the clean
+  # ablation — they are not dead weight, they are the shrinkage that enforces
+  # E[C | X] = 0 and suppresses between-task leakage. Lower it only to buy more
+  # mixed-group exposure per unit wall-clock.
+  homogeneous_group_weight: 1.0
 
 # =============================================================================
 # Policy

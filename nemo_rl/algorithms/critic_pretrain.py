@@ -147,6 +147,86 @@ def terminal_value_reward_auc(
     return float(auc)
 
 
+def _rank_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    """Mann-Whitney AUC with tie correction; nan on a single-class input."""
+    n_pos, n_neg = int(labels.sum()), int((1 - labels).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    order = torch.argsort(scores)
+    ranks = torch.empty_like(scores)
+    ranks[order] = torch.arange(1, scores.numel() + 1, dtype=scores.dtype)
+    for val in torch.unique(scores):
+        tie = scores == val
+        if int(tie.sum()) > 1:
+            ranks[tie] = ranks[tie].mean()
+    return float(
+        (ranks[labels.bool()].sum().item() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+    )
+
+
+def within_group_auc(
+    values: torch.Tensor,
+    rewards: torch.Tensor,
+    group_ids: torch.Tensor,
+    token_mask: torch.Tensor,
+    n_buckets: int = 4,
+    positive_threshold: float = 0.5,
+) -> dict[str, float]:
+    """Does the critic rank a group's WINNING siblings above its losing ones?
+
+    ``terminal_value_reward_auc`` pools every trajectory in the batch, so it is
+    dominated by between-task variation — a critic that only knows "this issue is
+    hopeless" scores well on it while carrying no within-task information at all.
+    That is exactly the failure mode the residual target is meant to remove, so
+    the go/no-go diagnostic has to hold the task fixed.
+
+    Restricted to MIXED-outcome groups (homogeneous ones are undefined: no
+    positive or no negative sibling). On the pi0 SWE pool only 43.5% of groups
+    qualify, and that fraction — not the dataset size — bounds what any critic
+    trained on terminal reward can learn about the within-task component.
+
+    Scores are per-trajectory means of ``values`` over each progress bucket, so
+    this is calibration-free: it survives the scale/offset errors that depress
+    explained variance.
+
+    Returns per-bucket mean AUC plus ``n_mixed_groups``. Buckets run earliest to
+    latest by relative position within each trajectory's own response.
+    """
+    mask = token_mask.bool()
+    rel = (torch.cumsum(mask.long(), dim=1) - 1).float() / mask.sum(
+        dim=1, keepdim=True
+    ).clamp(min=1).float()
+    labels = (rewards.float() >= positive_threshold).float()
+
+    out: dict[str, float] = {}
+    n_mixed = 0
+    for b in range(n_buckets):
+        lo, hi = b / n_buckets, (b + 1) / n_buckets
+        upper = (rel < hi) if b < n_buckets - 1 else (rel <= 1.0)
+        bmask = mask & (rel >= lo) & upper
+        counts = bmask.sum(dim=1)
+        # Per-trajectory mean value inside this progress bucket.
+        scores = (values * bmask).sum(dim=1) / counts.clamp(min=1)
+        aucs = []
+        for gid in torch.unique(group_ids):
+            sel = (group_ids == gid) & (counts > 0)
+            if int(sel.sum()) < 2:
+                continue
+            y = labels[sel]
+            if int(y.sum()) == 0 or int((1 - y).sum()) == 0:
+                continue  # homogeneous group: within-group AUC undefined
+            auc = _rank_auc(scores[sel].float(), y)
+            if auc == auc:  # not nan
+                aucs.append(auc)
+        if b == 0:
+            n_mixed = len(aucs)
+        out[f"critic/within_group_auc_q{b + 1}"] = (
+            sum(aucs) / len(aucs) if aucs else float("nan")
+        )
+    out["critic/n_mixed_groups"] = float(n_mixed)
+    return out
+
+
 def verify_shard_meta(
     shards_dir: str | Path, master_config: Any, tokenizer: Any
 ) -> None:
@@ -324,6 +404,7 @@ def _forward_values_and_returns(
     repeated_batch: BatchedDataDict,
     tokenizer: Any,
     master_config: Any,
+
 ) -> tuple[Optional[BatchedDataDict], Optional[Any]]:
     """Populate train_data['values'/'returns'] in place.
 
@@ -345,9 +426,11 @@ def _forward_values_and_returns(
         remap_by_response_mask,
     )
 
+
     privileged_critic_cfg = master_config.value.get("privileged_critic")
     if privileged_critic_cfg is not None and not privileged_critic_cfg.get("enabled"):
         privileged_critic_cfg = None
+
     critic_batch = None
 
     # Turn structure (None on the token-level path). Stage B must build this the
@@ -365,6 +448,7 @@ def _forward_values_and_returns(
                 "make_sequence_length_divisible_by"
             ],
         )
+
         vals_aug = value_model.get_values(critic_batch)["values"].squeeze(-1)
         critic_batch["values"] = vals_aug
         train_data["values"] = remap_by_response_mask(
@@ -427,12 +511,17 @@ def _heldout_metrics(
     ~270 structural zeros — and the per-turn metrics from the estimator are
     merged in.
     """
-    from nemo_rl.algorithms.ppo import _positional_value_metrics
+    from nemo_rl.algorithms.ppo import (
+        _mixed_group_mask,
+        _mixed_group_value_metrics,
+        _positional_value_metrics,
+    )
 
     groups = [load_group(p) for p in heldout_files]
     train_data, repeated_batch = build_value_train_data(
         groups, tokenizer, master_config
     )
+
     _, turn_spans = _forward_values_and_returns(
         value_model,
         adv_estimator,
@@ -440,6 +529,7 @@ def _heldout_metrics(
         repeated_batch,
         tokenizer,
         master_config,
+
     )
     values, returns = train_data["values"], train_data["returns"]
     scored_mask = (
@@ -447,20 +537,83 @@ def _heldout_metrics(
     )
     mask = scored_mask.bool()
     metrics: dict[str, float] = {}
+
+    # Per-sample offsets into each return space (both zero without a residual
+    # estimator, i.e. exactly today's numbers).
+    zeros = torch.zeros(returns.shape[0], device=returns.device)
+    raw_to_abs = getattr(adv_estimator, "last_returns_to_abs", None)
+    raw_to_res = getattr(adv_estimator, "last_returns_to_res", None)
+    to_abs = zeros if raw_to_abs is None else raw_to_abs.to(returns.device)
+    to_res = zeros if raw_to_res is None else raw_to_res.to(returns.device)
+
     if int(mask.sum()) >= 2:
         v, r = values[mask].float(), returns[mask].float()
-        var_r = r.var(unbiased=False)
-        metrics["critic/explained_var"] = (
-            (1.0 - (r - v).var(unbiased=False) / var_r).item() if var_r > 1e-8 else 0.0
-        )
+        # Both explained variances, on the same convention _compute_critic_metrics
+        # uses in PPO: critic/explained_var is ALWAYS absolute-space and
+        # critic/ev_res ALWAYS residual-space, whichever space `returns` is in.
+        # The prediction error is shared (R - (B+C) == (R-B) - C); only the
+        # denominator changes. Held-out ev_res is the go/no-go number.
+        err_var = (r - v).var(unbiased=False)
+        for key, offset in (("explained_var", to_abs), ("ev_res", to_res)):
+            target = (returns + offset.unsqueeze(-1).to(returns.dtype))[mask].float()
+            var_t = target.var(unbiased=False)
+            metrics[f"critic/{key}"] = (
+                (1.0 - err_var / var_t).item() if var_t > 1e-8 else 0.0
+            )
         metrics["critic/mse"] = ((r - v) ** 2).mean().item()
-    metrics.update(_positional_value_metrics(values, returns, scored_mask))
+    metrics.update(
+        _positional_value_metrics(
+            values,
+            returns,
+            scored_mask,
+            returns_to_abs=raw_to_abs,
+            returns_to_res=raw_to_res,
+        )
+    )
+    # Residual EV restricted to mixed-outcome groups. critic/ev_res stays the
+    # whole-batch go/no-go number; this says whether a near-zero ev_res means
+    # "no within-task signal" or "signal, taxed by the ~58% homogeneous groups
+    # where Y = 0 and any prediction is a pure penalty".
+    metrics.update(
+        _mixed_group_value_metrics(
+            values,
+            returns,
+            scored_mask,
+            _mixed_group_mask(adv_estimator),
+            returns_to_res=raw_to_res,
+        )
+    )
     # Scored on `scored_mask`: in turn mode the last RESPONSE token carries an
     # untrained value, while the last anchor is the supervised V(s_K).
+    #
+    # Scored on ABSOLUTE values (V~ = C + B_LOO), like every other metric here.
+    # This AUC pools all trajectories, so it is largely a between-task ranking;
+    # in residual space the values are C with E[C | X] = 0, which strips exactly
+    # that component out and would read as a large regression versus the
+    # absolute arm when nothing regressed.
+    abs_values = values + to_abs.unsqueeze(-1).to(values.dtype)
     metrics["critic/terminal_auc"] = terminal_value_reward_auc(
-        values, train_data["rewards"], scored_mask
+        abs_values, train_data["rewards"], scored_mask
     )
+    # Sibling ranking with the task held fixed — the calibration-free go/no-go
+    # complement to explained variance, and the only AUC that is not confounded
+    # by between-task difficulty.
+    #
+    # Deliberately scored on RAW values, unlike terminal_auc above. B_LOO is
+    # leave-one-out, so it is NOT constant within a group: adding it would fold
+    # each sibling's own reward into that sibling's score and leak the label,
+    # inflating this AUC. Raw values are already the right quantity in both arms
+    # (C in residual mode, V in absolute mode), since the task-level component is
+    # common to the group and cancels from a within-group ranking either way.
+    group_ids = getattr(adv_estimator, "last_group_ids", None)
+    if group_ids is not None:
+        metrics.update(
+            within_group_auc(
+                values, train_data["rewards"], group_ids.cpu(), scored_mask
+            )
+        )
     metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
+
     metrics["reward"] = train_data["rewards"].float().mean().item()
     metrics["num_heldout_samples"] = float(train_data["input_ids"].shape[0])
     return metrics
@@ -571,7 +724,10 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     from nemo_rl.algorithms.ppo import (
         _compute_critic_metrics,
         _create_advantage_estimator,
+        _mixed_group_mask,
+        _mixed_group_value_metrics,
         _positional_value_metrics,
+        _prepare_value_train_batch,
         _resolve_resume_optimizer_path,
     )
     from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -848,6 +1004,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             )
 
         print("▶ Computing values...")
+
         critic_batch, turn_spans = _forward_values_and_returns(
             value_model,
             adv_estimator,
@@ -855,11 +1012,19 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             repeated_batch,
             tokenizer,
             master_config,
+
         )
 
         print("▶ Training critic...")
         value_model.prepare_for_training()
         value_train_batch = critic_batch if critic_batch is not None else train_data
+        # Same residual bookkeeping the PPO loops apply: without it the value
+        # loss sees no return-space offsets and critic/ev_res silently
+        # duplicates critic/explained_var, and homogeneous_group_weight would be
+        # a no-op that the launcher nonetheless advertises.
+        value_train_batch = _prepare_value_train_batch(
+            value_train_batch, adv_estimator, master_config
+        )
         value_results = value_model.train(value_train_batch, value_loss_fn)
         value_model.finish_training()
 
@@ -877,9 +1042,23 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
                 turn_spans.anchor_mask
                 if turn_spans is not None
                 else train_data["token_mask"],
+                returns_to_abs=getattr(adv_estimator, "last_returns_to_abs", None),
+                returns_to_res=getattr(adv_estimator, "last_returns_to_res", None),
+            )
+        )
+        metrics.update(
+            _mixed_group_value_metrics(
+                train_data["values"],
+                train_data["returns"],
+                turn_spans.anchor_mask
+                if turn_spans is not None
+                else train_data["token_mask"],
+                _mixed_group_mask(adv_estimator),
+                returns_to_res=getattr(adv_estimator, "last_returns_to_res", None),
             )
         )
         metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
+
         metrics["reward"] = train_data["rewards"].float().mean().item()
         metrics["num_samples"] = float(train_data["input_ids"].shape[0])
         metrics["total_step_time"] = time.perf_counter() - step_start

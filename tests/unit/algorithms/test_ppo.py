@@ -51,6 +51,7 @@ def _make_gae_config(
     length_adaptive_alpha: float = 0.0,
     gae_lambda_value: float | None = None,
     gae_lambda_policy: float | None = None,
+    residual_baseline: bool = False,
     **overrides,
 ) -> dict:
     """Build an estimator_config dict with all GAE-required keys populated.
@@ -66,6 +67,7 @@ def _make_gae_config(
         "length_adaptive_alpha": length_adaptive_alpha,
         "gae_lambda_value": gae_lambda_value,
         "gae_lambda_policy": gae_lambda_policy,
+        "residual_baseline": residual_baseline,
         **overrides,
     }
 
@@ -644,7 +646,55 @@ def test_create_advantage_estimator_gae():
     )
 
     estimator = _create_advantage_estimator(master_config)
-    assert isinstance(estimator, GeneralizedAdvantageEstimator)
+    # Value-based estimators are always wrapped in ResidualBaselineEstimator so
+    # critic/ev_res and the residual/* group diagnostics are available in both
+    # arms; with residual_baseline=false the wrapper is a no-op on the targets.
+    from nemo_rl.algorithms.advantage_estimator import ResidualBaselineEstimator
+
+    assert isinstance(estimator, ResidualBaselineEstimator)
+    assert estimator.residual_target is False
+    assert isinstance(estimator.inner, GeneralizedAdvantageEstimator)
+
+
+def test_create_advantage_estimator_requires_explicit_residual_baseline():
+    """A PPO config that omits the key must fail loudly, not pick a default."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.ppo import _create_advantage_estimator
+
+    cfg = _make_gae_config()
+    del cfg["residual_baseline"]
+    master_config = SimpleNamespace(
+        ppo={"num_generations_per_prompt": 16, "adv_estimator": {"name": "gae", **cfg}},
+        loss_fn=_make_loss_config(kl_penalty=0.0),
+    )
+    with pytest.raises(ValueError, match="residual_baseline must be set explicitly"):
+        _create_advantage_estimator(master_config)
+
+
+def test_residual_baseline_rejects_single_generation_per_prompt():
+    """G=1 makes B_LOO == R, which silently drops the reward from the gradient.
+
+    With one rollout per prompt the leave-one-out baseline degenerates to the
+    rollout's own reward, so A_t = -C(s_t) and the critic target is identically
+    zero. Nothing errors downstream, so this has to be caught at setup.
+    """
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.ppo import _create_advantage_estimator
+
+    master_config = SimpleNamespace(
+        ppo={
+            "num_generations_per_prompt": 1,
+            "adv_estimator": {
+                "name": "gae",
+                **_make_gae_config(residual_baseline=True),
+            },
+        },
+        loss_fn=_make_loss_config(kl_penalty=0.0),
+    )
+    with pytest.raises(ValueError, match="num_generations_per_prompt >= 2"):
+        _create_advantage_estimator(master_config)
 
 
 def test_create_advantage_estimator_raw_reward():
@@ -1093,9 +1143,13 @@ def test_async_warmup_collector_lead_age_boundary_at_W():
     from nemo_rl.algorithms.ppo import _async_warmup_collector_lead_age
 
     W, train_age, warmup_age = 20, 1, 8
-    assert _async_warmup_collector_lead_age(W - 1, W, train_age, warmup_age) == warmup_age
+    assert (
+        _async_warmup_collector_lead_age(W - 1, W, train_age, warmup_age) == warmup_age
+    )
     assert _async_warmup_collector_lead_age(W, W, train_age, warmup_age) == warmup_age
-    assert _async_warmup_collector_lead_age(W + 1, W, train_age, warmup_age) == train_age
+    assert (
+        _async_warmup_collector_lead_age(W + 1, W, train_age, warmup_age) == train_age
+    )
 
 
 def test_async_warmup_sample_max_age_boundary_at_W_plus_train_age():
