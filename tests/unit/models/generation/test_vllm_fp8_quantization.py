@@ -98,9 +98,13 @@ def test_patch_ray_executor_v2_applies_fp8_before_worker_init(fp8_module, monkey
 
     fp8 = fp8_module
     events = []
-    fp8_config = object()
 
     class FakeRayWorkerProc:
+        def __init__(self, fp8_config):
+            self._init_kwargs = {
+                "vllm_config": types.SimpleNamespace(nrl_fp8_cfg=fp8_config)
+            }
+
         def initialize_worker(self, *args, **kwargs):
             events.append(("initialize", args, kwargs))
             return "initialized"
@@ -112,14 +116,51 @@ def test_patch_ray_executor_v2_applies_fp8_before_worker_init(fp8_module, monkey
         lambda _worker, config: events.append(("patch", config)),
     )
 
-    fp8._patch_vllm_ray_executor_v2(fp8_config)
-    result = ray_executor_v2.RayWorkerProc().initialize_worker(1, {"A": "B"})
+    fp8._patch_vllm_ray_executor_v2()
+    first_config = object()
+    second_config = object()
+    first_worker = ray_executor_v2.RayWorkerProc(first_config)
+    second_worker = ray_executor_v2.RayWorkerProc(second_config)
+    first_result = first_worker.initialize_worker(1, {"A": "B"})
+    second_result = second_worker.initialize_worker(2, {"C": "D"})
 
-    assert result == "initialized"
+    assert first_result == "initialized"
+    assert second_result == "initialized"
     assert events == [
-        ("patch", fp8_config),
+        ("patch", first_config),
         ("initialize", (1, {"A": "B"}), {}),
+        ("patch", second_config),
+        ("initialize", (2, {"C": "D"}), {}),
     ]
+    assert not hasattr(first_worker._init_kwargs["vllm_config"], "nrl_fp8_cfg")
+    assert not hasattr(second_worker._init_kwargs["vllm_config"], "nrl_fp8_cfg")
+
+
+@pytest.mark.parametrize("model_parallel_size", [1, 2])
+def test_run_engine_core_retains_fp8_config_for_ray_workers(
+    fp8_module, monkeypatch, model_parallel_size
+):
+    fp8 = fp8_module
+    fp8_config = types.SimpleNamespace(model_parallel_size=model_parallel_size)
+    vllm_config = types.SimpleNamespace(nrl_fp8_cfg=fp8_config)
+    applied_configs = []
+
+    monkeypatch.setattr(
+        fp8,
+        "monkey_patch_vllm_ray_executor",
+        lambda config: applied_configs.append(config),
+    )
+    monkeypatch.setattr(
+        fp8,
+        "original_run_engine_core",
+        lambda **kwargs: kwargs["vllm_config"],
+    )
+
+    result = fp8.my_run_engine_core(vllm_config=vllm_config)
+
+    assert result is vllm_config
+    assert applied_configs == [fp8_config]
+    assert hasattr(vllm_config, "nrl_fp8_cfg") is (model_parallel_size > 1)
 
 
 @pytest.mark.parametrize("hidden_size", [32, 64])
