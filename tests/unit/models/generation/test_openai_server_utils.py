@@ -50,6 +50,28 @@ class _CompleteTokenTokenizer:
         return token_ids
 
 
+class _GemmaStyleTokenizer(_CompleteTokenTokenizer):
+    eos_token = "<eos>"
+    eos_token_id = 1
+
+    def encode(self, text, add_special_tokens=False):
+        assert add_special_tokens is False
+        token_ids = []
+        while text:
+            if text.startswith("<end_of_turn>"):
+                token_ids.append(106)
+                text = text[len("<end_of_turn>") :]
+            elif text.startswith("next"):
+                token_ids.append(40)
+                text = text[len("next") :]
+            elif text.startswith("GEN"):
+                token_ids.append(99)
+                text = text[len("GEN") :]
+            else:
+                raise AssertionError(f"Unexpected text to encode: {text!r}")
+        return token_ids
+
+
 def _render_marked_conversation(conversation):
     rendered = ""
     for message in conversation:
@@ -104,6 +126,33 @@ def test_build_complete_prompt_token_ids_preserves_prefix_and_suffix() -> None:
 
     assert result == [10, 777, 2, 40, 31, 32, 2, 40, 99]
     assert conversation == original_conversation
+
+
+@pytest.mark.parametrize(
+    ("model_prefix_token_ids", "expected"),
+    [
+        pytest.param([31, 32, 106], [31, 32, 106, 40, 99], id="close_present"),
+        pytest.param([31, 32], [31, 32, 106, 40, 99], id="close_missing"),
+    ],
+)
+def test_complete_token_injection_uses_template_assistant_close(
+    model_prefix_token_ids, expected
+) -> None:
+    marker = "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E"
+
+    result = build_complete_prompt_token_ids(
+        tokenizer=_GemmaStyleTokenizer(),
+        conversation=[
+            {"role": "assistant", "content": "first"},
+            {"role": "user", "content": "next"},
+        ],
+        assistant_ordinal=0,
+        model_prefix_token_ids=model_prefix_token_ids,
+        render_prompt_text=lambda messages: (f"{marker} \n<end_of_turn>nextGEN"),
+        render_assistant_close_text=lambda messages: (f"{marker} \n<end_of_turn>"),
+    )
+
+    assert result == expected
 
 
 @pytest.mark.parametrize(
@@ -433,11 +482,15 @@ def test_complete_token_injection_wraps_encoding_failure() -> None:
         )
 
 
-def test_complete_token_injection_requires_encoded_suffix_eos() -> None:
+def test_complete_token_injection_requires_encoded_assistant_close() -> None:
     tokenizer = _CompleteTokenTokenizer()
-    tokenizer.encode = lambda text, add_special_tokens=False: [40]
+    tokenizer.encode = lambda text, add_special_tokens=False: (
+        [2] if text == "<eos>" else [40]
+    )
 
-    with pytest.raises(CompleteTokenInjectionError, match="did not begin with EOS"):
+    with pytest.raises(
+        CompleteTokenInjectionError, match="did not begin with the assistant-close"
+    ):
         build_complete_prompt_token_ids(
             tokenizer=tokenizer,
             conversation=[{"role": "assistant", "content": "first"}],

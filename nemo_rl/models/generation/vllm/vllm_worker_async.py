@@ -69,8 +69,20 @@ def _prefix_matches_tokenized_assistant(
     """Return whether a prefix is the exact token metadata from one message."""
     prompt_token_ids = message.get("prompt_token_ids")
     generation_token_ids = message.get("generation_token_ids")
-    if not isinstance(prompt_token_ids, list) or not isinstance(
-        generation_token_ids, list
+    if (
+        not isinstance(required_prefix_token_ids, list)
+        or not required_prefix_token_ids
+        or not isinstance(prompt_token_ids, list)
+        or not isinstance(generation_token_ids, list)
+        or any(
+            type(token_id) is not int
+            for token_ids in (
+                required_prefix_token_ids,
+                prompt_token_ids,
+                generation_token_ids,
+            )
+            for token_id in token_ids
+        )
     ):
         return False
 
@@ -89,6 +101,7 @@ def _complete_token_injection_eligibility(
     has_multimodal_config: bool,
     prompt_embeds_enabled: bool,
     renderer_supported: bool,
+    vllm_version_supported: bool = True,
 ) -> tuple[int | None, str | None]:
     """Return an assistant ordinal or a reason to use native preprocessing."""
     if request.stream:
@@ -111,11 +124,14 @@ def _complete_token_injection_eligibility(
         return None, "prompt embeddings enabled"
     if not renderer_supported:
         return None, "unsupported renderer"
+    if not vllm_version_supported:
+        return None, "unsupported vLLM version"
     for message in messages:
         if not isinstance(message, dict):
             return None, "non-object message"
-        # vLLM can consolidate developer and system messages, which can change
-        # the assistant ordinal and invalidate the splice boundary.
+        # vLLM rewrites messages only when a developer role is present. It
+        # converts that role to system and then merges systems to index 0,
+        # which would shift the assistant ordinal.
         if message.get("role") not in {"system", "user", "assistant", "tool"}:
             return None, "unsupported message role"
         content = message.get("content")
@@ -438,6 +454,7 @@ class VllmAsyncGenerationWorkerImpl(
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        import vllm
         from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
@@ -539,6 +556,30 @@ class VllmAsyncGenerationWorkerImpl(
                     )
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)
+
+            def _restore_max_tokens_after_error(
+                self, request, request_max_tokens: int, error: Exception
+            ) -> None:
+                """Restore caller state and preserve the real output count in errors."""
+                self._set_max_tokens(request, request_max_tokens)
+                if (
+                    isinstance(error, VLLMValidationError)
+                    and error.parameter == "input_tokens"
+                    and "maximum context length" in str(error)
+                ):
+                    token_count = error.value
+                    qualifier = "at least " if "contains at least" in str(error) else ""
+                    total = token_count + request_max_tokens
+                    raise VLLMValidationError(
+                        f"This model's maximum context length is "
+                        f"{self.model_config.max_model_len} tokens. However, you "
+                        f"requested {request_max_tokens} output tokens and your prompt "
+                        f"contains {qualifier}{token_count} input tokens, for a total "
+                        f"of {qualifier}{total} tokens. Please reduce the length of "
+                        f"the input prompt or the number of requested output tokens.",
+                        parameter=error.parameter,
+                        value=error.value,
+                    ) from error
 
             def _record_complete_token_injection_fallback(self, reason: str) -> None:
                 self._complete_token_injection_fallbacks[reason] += 1
@@ -645,6 +686,23 @@ class VllmAsyncGenerationWorkerImpl(
                         )
                     return rendered
 
+                def render_assistant_close_text(marked_conversation):
+                    close_template_kwargs = apply_chat_template_kwargs | {
+                        "add_generation_prompt": False
+                    }
+                    rendered = safe_apply_chat_template(
+                        self.model_config,
+                        tokenizer,
+                        marked_conversation,
+                        tokenize=False,
+                        **close_template_kwargs,
+                    )
+                    if not isinstance(rendered, str):
+                        raise CompleteTokenInjectionError(
+                            "The assistant-close probe did not render as text."
+                        )
+                    return rendered
+
                 # Do not use vLLM's one-worker renderer executor here. It would
                 # serialize the fast path and can remove the measured speedup.
                 prompt_token_ids = await asyncio.to_thread(
@@ -654,14 +712,18 @@ class VllmAsyncGenerationWorkerImpl(
                     assistant_ordinal=assistant_ordinal,
                     model_prefix_token_ids=list(request.required_prefix_token_ids),
                     render_prompt_text=render_prompt_text,
+                    render_assistant_close_text=render_assistant_close_text,
                 )
                 prompt = {"prompt_token_ids": prompt_token_ids}
                 tokenized_prompt = await renderer.tokenize_prompt_async(
                     prompt, tok_params
                 )
-                for key in ("mm_processor_kwargs", "cache_salt"):
-                    if (value := getattr(request, key, None)) is not None:
-                        tokenized_prompt[key] = value
+                if request.mm_processor_kwargs is not None:
+                    tokenized_prompt["mm_processor_kwargs"] = (
+                        request.mm_processor_kwargs
+                    )
+                if request.cache_salt is not None:
+                    tokenized_prompt["cache_salt"] = request.cache_salt
                 engine_prompt = await renderer.process_for_engine_async(
                     tokenized_prompt,
                     arrival_time,
@@ -670,7 +732,7 @@ class VllmAsyncGenerationWorkerImpl(
 
                 if parser is not None:
                     tool_parser = parser.tool_parser_cls
-                    tool_choice = getattr(request, "tool_choice", "none")
+                    tool_choice = request.tool_choice
                     is_mistral_grammar_eligible = (
                         tool_parser is not None
                         and is_mistral_tool_parser(tool_parser)
@@ -740,6 +802,7 @@ class VllmAsyncGenerationWorkerImpl(
                             ),
                             prompt_embeds_enabled=self.model_config.enable_prompt_embeds,
                             renderer_supported=isinstance(self.renderer, HfRenderer),
+                            vllm_version_supported=(vllm.__version__ == "0.25.1"),
                         )
                     )
                     if fallback_reason is not None:
@@ -764,15 +827,27 @@ class VllmAsyncGenerationWorkerImpl(
                         except CompleteTokenInjectionError as e:
                             self._record_complete_token_injection_fallback(str(e))
                             self._maybe_log_complete_token_injection_stats()
+                        except Exception as e:
+                            if actual_request_max_tokens is not None:
+                                self._restore_max_tokens_after_error(
+                                    request, actual_request_max_tokens, e
+                                )
+                            raise
                         else:
                             self._complete_token_injection_successes += 1
                             self._maybe_log_complete_token_injection_stats()
                             if actual_request_max_tokens is not None:
-                                self._clamp_max_tokens(
-                                    request,
-                                    actual_request_max_tokens,
-                                    res[1][0]["prompt_token_ids"],
-                                )
+                                try:
+                                    self._clamp_max_tokens(
+                                        request,
+                                        actual_request_max_tokens,
+                                        res[1][0]["prompt_token_ids"],
+                                    )
+                                except Exception as e:
+                                    self._restore_max_tokens_after_error(
+                                        request, actual_request_max_tokens, e
+                                    )
+                                    raise
                             return res
 
                 messages_for_replace_prefix_tokens = deepcopy(messages)
@@ -794,6 +869,16 @@ class VllmAsyncGenerationWorkerImpl(
 
                         logging.getLogger(__name__).warning(
                             "Prompt exceeds max_model_len: %s", e
+                        )
+                    if actual_request_max_tokens is not None:
+                        self._restore_max_tokens_after_error(
+                            request, actual_request_max_tokens, e
+                        )
+                    raise
+                except Exception as e:
+                    if actual_request_max_tokens is not None:
+                        self._restore_max_tokens_after_error(
+                            request, actual_request_max_tokens, e
                         )
                     raise
 
@@ -831,38 +916,60 @@ class VllmAsyncGenerationWorkerImpl(
                     update={"add_generation_prompt": False}
                 )
 
-                corresponding_res = await super().preprocess_chat(
-                    request=modified_request,
-                    messages=messages_to_last_assistant_message,
-                    default_template=default_template,
-                    default_template_content_format=default_template_content_format,
-                    default_template_kwargs=default_template_kwargs,
-                    tool_dicts=tool_dicts,
-                    parser=parser,
-                    skip_mm_cache=skip_mm_cache,
-                )
+                try:
+                    corresponding_res = await super().preprocess_chat(
+                        request=modified_request,
+                        messages=messages_to_last_assistant_message,
+                        default_template=default_template,
+                        default_template_content_format=(
+                            default_template_content_format
+                        ),
+                        default_template_kwargs=default_template_kwargs,
+                        tool_dicts=tool_dicts,
+                        parser=parser,
+                        skip_mm_cache=skip_mm_cache,
+                    )
+                except Exception as e:
+                    if actual_request_max_tokens is not None:
+                        self._restore_max_tokens_after_error(
+                            request, actual_request_max_tokens, e
+                        )
+                    raise
                 actual_corresponding_token_ids = corresponding_res[1][0][
                     "prompt_token_ids"
                 ]
 
                 engine_prompt = res[1][0]
 
-                final_prompt_token_ids = replace_prefix_tokens(
-                    tokenizer=self.renderer.tokenizer,
-                    model_prefix_token_ids=request.required_prefix_token_ids,
-                    template_prefix_token_ids=actual_corresponding_token_ids,
-                    template_token_ids=engine_prompt["prompt_token_ids"],
-                )
+                try:
+                    final_prompt_token_ids = replace_prefix_tokens(
+                        tokenizer=self.renderer.tokenizer,
+                        model_prefix_token_ids=request.required_prefix_token_ids,
+                        template_prefix_token_ids=actual_corresponding_token_ids,
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                    )
+                except Exception as e:
+                    if actual_request_max_tokens is not None:
+                        self._restore_max_tokens_after_error(
+                            request, actual_request_max_tokens, e
+                        )
+                    raise
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
                 # Clamp after prefix replacement since the prompt length may have changed.
                 if actual_request_max_tokens is not None:
-                    self._clamp_max_tokens(
-                        request,
-                        actual_request_max_tokens,
-                        final_prompt_token_ids,
-                    )
+                    try:
+                        self._clamp_max_tokens(
+                            request,
+                            actual_request_max_tokens,
+                            final_prompt_token_ids,
+                        )
+                    except Exception as e:
+                        self._restore_max_tokens_after_error(
+                            request, actual_request_max_tokens, e
+                        )
+                        raise
 
                 return res
 

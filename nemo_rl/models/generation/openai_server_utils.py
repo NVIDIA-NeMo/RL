@@ -85,6 +85,7 @@ def build_complete_prompt_token_ids(
     assistant_ordinal: int,
     model_prefix_token_ids: list[int],
     render_prompt_text: Callable[[list[Any]], str],
+    render_assistant_close_text: Callable[[list[Any]], str] | None = None,
 ) -> list[int]:
     """Join exact model-prefix tokens with a verified contextual suffix.
 
@@ -94,7 +95,9 @@ def build_complete_prompt_token_ids(
 
     The complete conversation is rendered with the tokenized assistant replaced
     by a marker. This preserves context-sensitive template behavior after that
-    assistant while making its closing EOS the exact splice boundary.
+    assistant while making its assistant-close sequence the exact splice
+    boundary. The close sequence can differ from the tokenizer EOS token, as it
+    does for Gemma chat templates.
     """
     try:
         marked_conversation = deepcopy(conversation)
@@ -142,32 +145,69 @@ def build_complete_prompt_token_ids(
             "The chat template did not preserve the complete-token boundary marker."
         )
 
-    eos_token = getattr(tokenizer, "eos_token", None)
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    if not isinstance(eos_token, str) or eos_token_id is None:
-        raise CompleteTokenInjectionError(
-            "Complete-token injection requires tokenizer EOS text and ID."
-        )
-
-    suffix_pos = marked_text.find(
-        eos_token, marker_pos + len(_COMPLETE_TOKEN_BOUNDARY_MARKER)
-    )
-    if suffix_pos < 0:
-        raise CompleteTokenInjectionError(
-            "The chat template did not close the tokenized assistant with EOS."
-        )
     marker_end = marker_pos + len(_COMPLETE_TOKEN_BOUNDARY_MARKER)
-    # The legacy prefix replacement also cuts at EOS, so dropping whitespace
-    # between the marker and EOS keeps both paths token-identical.
-    if marked_text[marker_end:suffix_pos].strip():
-        raise CompleteTokenInjectionError(
-            "The chat template did not close the tokenized assistant immediately; "
-            "the EOS boundary would skip intervening messages."
-        )
+
+    if render_assistant_close_text is None:
+        eos_token = getattr(tokenizer, "eos_token", None)
+        if not isinstance(eos_token, str):
+            raise CompleteTokenInjectionError(
+                "Complete-token injection requires tokenizer EOS text."
+            )
+        suffix_pos = marked_text.find(eos_token, marker_end)
+        if suffix_pos < 0:
+            raise CompleteTokenInjectionError(
+                "The chat template did not close the tokenized assistant with EOS."
+            )
+        if marked_text[marker_end:suffix_pos].strip():
+            raise CompleteTokenInjectionError(
+                "The chat template did not close the tokenized assistant immediately; "
+                "the EOS boundary would skip intervening messages."
+            )
+        assistant_close_text = eos_token
+        contextual_suffix_text = marked_text[suffix_pos:]
+    else:
+        try:
+            closed_assistant_text = render_assistant_close_text(
+                marked_conversation[: assistant_index + 1]
+            )
+        except CompleteTokenInjectionError:
+            raise
+        except Exception as e:
+            raise CompleteTokenInjectionError(
+                "The assistant-close probe could not be rendered."
+            ) from e
+        if not isinstance(closed_assistant_text, str):
+            raise CompleteTokenInjectionError(
+                "The assistant-close probe must render as text."
+            )
+        close_marker_pos = closed_assistant_text.find(_COMPLETE_TOKEN_BOUNDARY_MARKER)
+        if close_marker_pos < 0:
+            raise CompleteTokenInjectionError(
+                "The assistant-close probe did not preserve the boundary marker."
+            )
+        close_marker_end = close_marker_pos + len(_COMPLETE_TOKEN_BOUNDARY_MARKER)
+        raw_assistant_close_text = closed_assistant_text[close_marker_end:]
+        assistant_close_text = raw_assistant_close_text.lstrip()
+        if not assistant_close_text:
+            raise CompleteTokenInjectionError(
+                "The chat template did not emit an assistant-close sequence."
+            )
+        contextual_suffix_text = marked_text[marker_end:]
+        if not contextual_suffix_text.startswith(raw_assistant_close_text):
+            raise CompleteTokenInjectionError(
+                "The assistant-close sequence changed in the complete conversation."
+            )
+        contextual_suffix_text = contextual_suffix_text[
+            len(raw_assistant_close_text) - len(assistant_close_text) :
+        ]
 
     try:
+        assistant_close_token_ids = _coerce_token_id_list(
+            tokenizer.encode(assistant_close_text, add_special_tokens=False),
+            "Assistant-close token IDs",
+        )
         suffix_token_ids = _coerce_token_id_list(
-            tokenizer.encode(marked_text[suffix_pos:], add_special_tokens=False),
+            tokenizer.encode(contextual_suffix_text, add_special_tokens=False),
             "Contextual suffix token IDs",
         )
     except CompleteTokenInjectionError:
@@ -177,16 +217,30 @@ def build_complete_prompt_token_ids(
             "The contextual suffix could not be tokenized."
         ) from e
 
-    if not suffix_token_ids or suffix_token_ids[0] != eos_token_id:
+    if (
+        not assistant_close_token_ids
+        or suffix_token_ids[: len(assistant_close_token_ids)]
+        != assistant_close_token_ids
+    ):
         raise CompleteTokenInjectionError(
-            "The contextual suffix did not begin with EOS."
+            "The contextual suffix did not begin with the assistant-close sequence."
         )
+    model_prefix_token_ids = _coerce_token_id_list(
+        model_prefix_token_ids, "Model prefix token IDs"
+    )
     if not model_prefix_token_ids:
         raise CompleteTokenInjectionError("The model prefix token IDs were empty.")
-    model_cut_end = len(model_prefix_token_ids)
-    if model_prefix_token_ids[-1] == eos_token_id:
-        model_cut_end -= 1
-    return model_prefix_token_ids[:model_cut_end] + suffix_token_ids
+
+    max_overlap = min(len(model_prefix_token_ids), len(assistant_close_token_ids))
+    overlap = next(
+        (
+            overlap
+            for overlap in range(max_overlap, 0, -1)
+            if model_prefix_token_ids[-overlap:] == suffix_token_ids[:overlap]
+        ),
+        0,
+    )
+    return model_prefix_token_ids + suffix_token_ids[overlap:]
 
 
 def replace_prefix_tokens(
