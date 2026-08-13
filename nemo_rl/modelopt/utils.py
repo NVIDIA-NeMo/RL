@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping, Sequence
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -283,74 +281,6 @@ def resolve_nvfp4_real_quant_mode(quant_cfg: str) -> NVFP4RealQuantMode:
     return "w4a4"
 
 
-def _resolve_quant_cfg_file(quant_cfg: str) -> str:
-    """Return ModelOpt's loader input, including NeMo-RL checkout fallback."""
-    config_path = Path(quant_cfg)
-    config_candidates = (
-        (config_path,)
-        if quant_cfg.endswith((".yml", ".yaml"))
-        else (Path(f"{quant_cfg}.yml"), Path(f"{quant_cfg}.yaml"))
-    )
-    for candidate in config_candidates:
-        if candidate.is_file():
-            return quant_cfg
-
-    if config_path.is_absolute():
-        return quant_cfg
-
-    repo_root = Path(__file__).resolve().parents[2]
-    for candidate in config_candidates:
-        repo_path = (repo_root / candidate).resolve()
-        if repo_path.is_relative_to(repo_root) and repo_path.is_file():
-            return str(repo_path)
-
-    return quant_cfg
-
-
-def _canonicalize_cache_value(value: object) -> object:
-    """Convert ModelOpt config values into deterministic JSON-compatible data."""
-    if isinstance(value, Mapping):
-        return {
-            "__mapping__": [
-                [_canonicalize_cache_value(key), _canonicalize_cache_value(item)]
-                for key, item in value.items()
-            ]
-        }
-    if isinstance(value, tuple):
-        return {"__tuple__": [_canonicalize_cache_value(item) for item in value]}
-    if isinstance(value, list):
-        return [_canonicalize_cache_value(item) for item in value]
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    raise TypeError(
-        f"Unsupported ModelOpt cache-key value type: {type(value).__qualname__}"
-    )
-
-
-def _quant_checkpoint_cache_suffix(config: Mapping[str, object]) -> str:
-    """Build a short suffix for HF-to-Megatron checkpoints with ModelOpt state."""
-    keys = (
-        "quant_cfg",
-        "quant_calib_data",
-        "quant_calib_size",
-        "quant_batch_size",
-        "quant_sequence_length",
-        "disable_modelopt_layer_spec",
-    )
-    payload = {key: config.get(key) for key in keys}
-    quant_cfg = payload["quant_cfg"]
-    if isinstance(quant_cfg, str):
-        payload["quant_cfg"] = resolve_quant_cfg(quant_cfg)
-    digest = hashlib.sha256(
-        json.dumps(
-            _canonicalize_cache_value(payload),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()[:12]
-    return f"_modelopt_{digest}"
-
-
 def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
     """Resolve a quantization config string into a dict consumable by ``mtq.quantize``.
 
@@ -402,7 +332,13 @@ def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
     if builtin is not None:
         return _normalize_mtq_cfg(builtin)
 
-    config_file = _resolve_quant_cfg_file(quant_cfg)
+    config_file = quant_cfg
+    config_path = Path(quant_cfg)
+    if not config_path.is_absolute() and not config_path.is_file():
+        repo_root = Path(__file__).resolve().parents[2]
+        repo_path = (repo_root / config_path).resolve()
+        if repo_path.is_relative_to(repo_root) and repo_path.is_file():
+            config_file = str(repo_path)
 
     try:
         loaded = load_config(config_file)
@@ -411,9 +347,8 @@ def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
             f"Unknown quant_cfg '{quant_cfg}'. Must be either a built-in "
             f"ModelOpt config name (e.g. 'NVFP4_DEFAULT_CFG'), a built-in "
             f"ModelOpt PTQ recipe name (e.g. "
-            f"'general/ptq/nvfp4_default-fp8_kv'), or a path to a YAML "
-            f"quantization recipe (absolute, relative to the current working "
-            f"directory, or relative to the NeMo-RL checkout)."
+            f"'general/ptq/nvfp4_default-fp8_kv'), or an absolute path to a "
+            f"YAML quantization recipe."
         ) from e
 
     return _normalize_mtq_cfg(loaded)
