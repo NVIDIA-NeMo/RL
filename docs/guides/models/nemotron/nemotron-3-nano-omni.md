@@ -2,6 +2,20 @@
 
 This guide explains how to post-train the Nemotron 3 Nano Omni vision-language model with GRPO using NeMo RL. Both the AutoModel and Megatron backends are supported for image-and-text training.
 
+## Multimodal payload deduplication
+
+The maintained Nemotron recipes enable `grpo.deduplicate_multimodal_data` to
+share immutable model-ready media segments across logical GRPO generations and
+re-intern them after batching, replay, and sharding. The representation supports
+image, video, and audio payload keys, although the maintained recipes currently
+qualify image inputs only. Deduplication currently requires the vLLM generation
+backend and `data_plane.enabled=false`.
+
+`grpo.debug_payload_metrics` emits logical, physical, and protocol-5 serialized
+payload sizes for the exact Ray boundaries used by generation, replay, logprobs,
+and training. It is disabled by default because measuring serialized size adds
+work and is intended for qualification and debugging rather than production.
+
 ## AutoModel backend
 
 It covers two recipes:
@@ -13,7 +27,7 @@ Both share the same checkpoint, model code, and reward pipeline; they differ onl
 
 ### Recipe 1 — CLEVR-CoGenT (single-node)
 
-The CLEVR-CoGenT recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml). It expects 8 GPUs on a single node, EP=8 across the experts, and TP=8 in vLLM.
+The CLEVR-CoGenT recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml). It expects 8 GPUs on a single node, EP=8 across the experts, and TP=8 in vLLM.
 
 Key knobs in the config:
 
@@ -51,7 +65,7 @@ uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-n
 
 ### Recipe 2 — MMPR-Tiny (4-node Slurm)
 
-The MMPR-Tiny recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml). Differences vs. the CLEVR recipe:
+The MMPR-Tiny recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml). Differences vs. the CLEVR recipe:
 
 | Field | Value |
 |---|---|
@@ -128,8 +142,8 @@ Use the `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` Hugging Face checkp
 
 | Workload | Recipe | Topology |
 |---|---|---|
-| CLEVR-CoGenT | [`vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml) | 1 node, 8 GPUs, TP=8, EP=8 |
-| MMPR-Tiny | [`vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml) | 4 nodes, 8 GPUs per node, TP=8, EP=16, vLLM TP=2 |
+| CLEVR-CoGenT | [`vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml) | 1 node, 8 GPUs, TP=8, EP=8 |
+| MMPR-Tiny | [`vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml) | 4 nodes, 8 GPUs per node, TP=8, EP=16, vLLM TP=2 |
 
 Launch the single-node Megatron recipe from inside the container on an 8-GPU node:
 

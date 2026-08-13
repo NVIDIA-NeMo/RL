@@ -213,6 +213,150 @@ def _forward(model):
     return loss, output, logprobs, processed
 
 
+def _deduplicated_expanded_fixture(device: torch.device):
+    """Build equivalent flag-off/on media for two repeated logical rows."""
+    input_ids = torch.tensor(
+        [
+            [7, 21, 18, 18, 22, 9, 10, 0],
+            [7, 21, 18, 18, 22, 9, 10, 0],
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+    lengths = torch.tensor([7, 7], dtype=torch.long, device=device)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(2026)
+    image = torch.randn(1, 3, 32, 64, generator=generator, device=device)
+    image_size = torch.tensor([[32, 64]], dtype=torch.int32, device=device)
+
+    flag_off = BatchedDataDict(
+        {
+            "pixel_values": PackedTensor(
+                [image.clone(), image.clone()],
+                dim_to_pack=0,
+                pad_to_max_shape=True,
+            ),
+            "imgs_sizes": PackedTensor(
+                [image_size.clone(), image_size.clone()],
+                dim_to_pack=0,
+            ),
+        }
+    )
+    pixel_row = PackedTensor(
+        image,
+        dim_to_pack=0,
+        pad_to_max_shape=True,
+    ).enable_deduplication()
+    image_size_row = PackedTensor(
+        image_size,
+        dim_to_pack=0,
+    ).enable_deduplication()
+    flag_on = BatchedDataDict(
+        {
+            "pixel_values": PackedTensor.concat([pixel_row] * 2),
+            "imgs_sizes": PackedTensor.concat([image_size_row] * 2),
+        }
+    )
+    return input_ids, lengths, flag_off, flag_on
+
+
+def _forward_dedup_fixture(model, data: BatchedDataDict):
+    device = torch.device("cuda", torch.cuda.current_device())
+    input_ids, lengths, _, _ = _deduplicated_expanded_fixture(device)
+    processed = process_microbatch(
+        {"input_ids": input_ids, "input_lengths": lengths},
+        seq_length_key="input_lengths",
+        pad_individual_seqs_to_multiple_of=4,
+        pack_sequences=True,
+        model_slices_context_parallel_inputs=True,
+    )
+    multimodal_data = data.get_multimodal_dict(
+        as_tensors=True,
+        device=device,
+    )
+    output = model(
+        input_ids=processed.input_ids_cp_sharded,
+        attention_mask=processed.attention_mask,
+        packed_seq_params=processed.packed_seq_params,
+        **multimodal_data,
+    )
+    logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+        output,
+        target=processed.input_ids,
+        cu_seqlens_padded=processed.cu_seqlens_padded,
+        unpacked_seqlen=input_ids.shape[1],
+        vocab_start_index=0,
+        vocab_end_index=output.shape[-1],
+        group=parallel_state.get_tensor_model_parallel_group(),
+        inference_only=False,
+        cp_group=parallel_state.get_context_parallel_group(),
+    )
+    prediction_mask = torch.arange(input_ids.shape[1] - 1, device=device).unsqueeze(
+        0
+    ) < (lengths - 1).unsqueeze(1)
+    loss = -(logprobs * prediction_mask).sum() / prediction_mask.sum()
+    return loss, logprobs, multimodal_data
+
+
+def _run_cp2_dedup_parity(rank: int, world_size: int) -> None:
+    assert world_size == 2
+    model = _build_distributed_model()
+    model.eval()
+    device = torch.device("cuda", torch.cuda.current_device())
+    _, _, flag_off, flag_on = _deduplicated_expanded_fixture(device)
+
+    assert len(flag_off["pixel_values"].tensors) == 2
+    assert len(flag_on["pixel_values"].tensors) == 1
+    assert len(flag_on["pixel_values"]) == 2
+
+    model.zero_grad_buffer()
+    off_loss, off_logprobs, off_media = _forward_dedup_fixture(model, flag_off)
+    off_loss.backward()
+    model.finish_grad_sync()
+    off_gradients = {
+        name: parameter.main_grad.detach().clone()
+        for name, parameter in model.module.named_parameters()
+        if parameter.requires_grad
+    }
+
+    model.zero_grad_buffer()
+    on_loss, on_logprobs, on_media = _forward_dedup_fixture(model, flag_on)
+    on_loss.backward()
+    model.finish_grad_sync()
+    on_gradients = {
+        name: parameter.main_grad.detach().clone()
+        for name, parameter in model.module.named_parameters()
+        if parameter.requires_grad
+    }
+
+    assert off_media.keys() == on_media.keys()
+    for key in off_media:
+        torch.testing.assert_close(off_media[key], on_media[key], rtol=0, atol=0)
+    torch.testing.assert_close(off_logprobs, on_logprobs, rtol=0, atol=0)
+    torch.testing.assert_close(off_loss, on_loss, rtol=0, atol=0)
+    assert off_gradients.keys() == on_gradients.keys()
+    for name in off_gradients:
+        torch.testing.assert_close(
+            off_gradients[name],
+            on_gradients[name],
+            rtol=0,
+            atol=0,
+        )
+
+    if rank == 0:
+        print(
+            "NEMOTRON_OMNI_CP2_MULTIMODAL_DEDUP_PARITY "
+            f"loss={on_loss.item():.8f} physical_rows=1 logical_rows=2",
+            flush=True,
+        )
+
+    del model, off_loss, on_loss, off_logprobs, on_logprobs
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.distributed.barrier()
+    parallel_state.destroy_model_parallel()
+
+
 def _run_training_checkpoint_roundtrip(
     rank: int,
     world_size: int,
@@ -325,6 +469,10 @@ def test_nemotron_omni_cp2_training_and_checkpoint_roundtrip(
         checkpoint_dir=str(tmp_path / "nemotron_omni_cp2_dcp"),
     )
     distributed_test_runner(test_fn, world_size=2)
+
+
+def test_nemotron_omni_cp2_multimodal_dedup_parity(distributed_test_runner):
+    distributed_test_runner(_run_cp2_dedup_parity, world_size=2)
 
 
 def _run_parallel_forward_contract(
