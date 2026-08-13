@@ -565,6 +565,16 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             "dynamic expert load balancing can change ownership afterwards)."
         )
 
+    # ModelOpt real-quant rollout holds NVFP4-packed vLLM params and refits
+    # through vLLM's layerwise-reload weight loaders; the bulk xferdtensor
+    # path writes directly into param storage, bypassing both.
+    if generation.get("real_quant"):
+        violations.append(
+            "policy.generation.real_quant must be False "
+            "(nccl_reshard_refit's bulk xferdtensor writes bypass the "
+            "layerwise-reload weight loaders that ModelOpt real quant requires)."
+        )
+
     # This initial version supports only the Megatron train + vLLM gen
     # combination; the DTensor train backend refit path is intentionally
     # dropped (Megatron is the path validated end-to-end).
