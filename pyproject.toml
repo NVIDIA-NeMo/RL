@@ -578,6 +578,36 @@ name = "nv-grouped-gemm"
 version = "v1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 
+# TensorRT: wheel_stub packages download multi-GB binaries when built from source.
+# Providing static metadata here lets `uv lock` resolve the dep graph without
+# triggering the download. At `uv sync --extra trtllm` time (inside Docker where
+# there is sufficient disk space), uv installs them normally via wheel_stub.
+# Metadata sourced from https://pypi.org/pypi/tensorrt*/10.16.1.11/json.
+[[tool.uv.dependency-metadata]]
+name = "tensorrt"
+version = "10.16.1.11"
+requires-dist = ["tensorrt-cu13==10.16.1.11"]
+
+[[tool.uv.dependency-metadata]]
+name = "tensorrt-cu13"
+version = "10.16.1.11"
+requires-dist = [
+  "tensorrt-cu13-libs==10.16.1.11",
+  "tensorrt-cu13-bindings==10.16.1.11",
+]
+
+# wheel_stub — downloads the actual C++ library binary at install time.
+[[tool.uv.dependency-metadata]]
+name = "tensorrt-cu13-libs"
+version = "10.16.1.11"
+requires-dist = []
+
+# wheel_stub — downloads the Python bindings binary at install time.
+[[tool.uv.dependency-metadata]]
+name = "tensorrt-cu13-bindings"
+version = "10.16.1.11"
+requires-dist = []
+
 # Override logsage metadata to:
 # 1. Remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
 #    (numpy cap conflicts with onnx>=1.21.0rc4 CVE fix via nvidia-resiliency-ext)
