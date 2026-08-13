@@ -43,11 +43,28 @@ class RolloutHealthMonitor:
         self._thread = None
         self._stop_event = None
         self._pause_event = None  # When set, health checking is paused
-        self._check_interval = sglang_cfg["sglang_cfg"]["rollout_health_check_interval"]
-        self._check_timeout = sglang_cfg["sglang_cfg"]["rollout_health_check_timeout"]
-        self._check_first_wait = sglang_cfg["sglang_cfg"][
-            "rollout_health_check_first_wait"
+        # The three knobs are NotRequired because they only matter when
+        # ``use_fault_tolerance`` is on, and the recipes that ship with it off
+        # do not carry them. Reaching this constructor means it is on, so name
+        # the missing keys rather than raising a bare KeyError from a thread.
+        ft_cfg = sglang_cfg["sglang_cfg"]
+        missing = [
+            key
+            for key in (
+                "rollout_health_check_interval",
+                "rollout_health_check_timeout",
+                "rollout_health_check_first_wait",
+            )
+            if key not in ft_cfg
         ]
+        assert not missing, (
+            f"{', '.join(missing)} must be set under policy.generation.sglang_cfg "
+            "when use_fault_tolerance is True; see examples/configs/"
+            "grpo_math_1B_sglang.yaml for the documented values."
+        )
+        self._check_interval = ft_cfg["rollout_health_check_interval"]
+        self._check_timeout = ft_cfg["rollout_health_check_timeout"]
+        self._check_first_wait = ft_cfg["rollout_health_check_first_wait"]
         # Absolute monotonic deadline before which no probe may run, giving a
         # booting engine time to become ready. It is a DEADLINE rather than a
         # "wait once" flag so that a pause part-way through cannot restart the

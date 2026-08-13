@@ -88,6 +88,9 @@ class _RecordingMonitor:
     def __init__(self):
         self.events = []
 
+    def arm_first_wait(self):
+        self.events.append("arm_first_wait")
+
     def pause(self):
         self.events.append("pause")
 
@@ -212,7 +215,7 @@ def test_pause_waits_for_in_flight_check(monitor_factory):
         waiter.join(WAIT_TIMEOUT)
 
 
-def test_first_wait_delays_checks_after_resume(monitor_factory):
+def test_first_wait_delays_the_initial_checks(monitor_factory):
     engine = _FakeEngine()
     monitor = monitor_factory(_FakeGeneration([engine]), first_wait=2.0)
 
@@ -221,6 +224,26 @@ def test_first_wait_delays_checks_after_resume(monitor_factory):
     time.sleep(0.3)
     assert engine.health_check_count == 0
     assert _wait_until(lambda: engine.health_check_count > 0, timeout=10.0)
+
+
+def test_first_wait_is_not_restarted_by_every_resume(monitor_factory):
+    """``resume`` runs once per training step. Re-arming the grace period there
+    meant any generation phase shorter than ``first_wait`` left the monitor
+    permanently inside it, so an enabled monitor never probed anything.
+    """
+    engine = _FakeEngine()
+    monitor = monitor_factory(_FakeGeneration([engine]), first_wait=0.3)
+    monitor.start()
+
+    # Six training steps whose generation phases are all shorter than the
+    # grace period, separated by paused (training) gaps.
+    for _ in range(6):
+        monitor.resume()
+        time.sleep(0.1)
+        monitor.pause()
+        time.sleep(0.1)
+
+    assert engine.health_check_count > 0
 
 
 def test_stop_terminates_the_thread(monitor_factory):
@@ -376,9 +399,64 @@ def test_recover_updatable_engines_reports_engine_state():
     assert gpu_offsets == []
 
 
+def test_recover_leaves_num_new_engines_alone_when_nothing_died():
+    """The common case: a refit runs, no engine died. ``_start_engines``
+    rewrites ``num_new_engines`` unconditionally, and that count is the only
+    gate on building the trainer-side weight transport, so a no-op recovery
+    must not run at all -- otherwise the first refit clears the count and
+    every later weight send silently no-ops.
+    """
+    gen = _make_generation(_RecordingMonitor())
+    gen.all_engines = [_FakeEngine(), _FakeEngine()]
+    gen.num_new_engines = 4
+
+    def _explode(port_cursors):
+        raise AssertionError("_start_engines must not run when nothing died")
+
+    gen._start_engines = _explode
+
+    SGLangGeneration._recover(gen)
+
+    assert gen.num_new_engines == 4
+
+
+def test_recover_rearms_the_grace_period_for_restarted_engines():
+    monitor = _RecordingMonitor()
+    gen = _make_generation(monitor)
+    gen.all_engines = [None]
+    gen.num_new_engines = 1
+    gen.needs_offload = False
+    gen._start_engines = lambda port_cursors: ([], {})
+
+    SGLangGeneration._recover(gen)
+
+    assert monitor.events == ["arm_first_wait"]
+
+
 def test_generation_lifecycle_is_a_noop_without_fault_tolerance():
     gen = _make_generation(None)
 
     gen.prepare_for_generation()
     gen.finish_generation()
     assert gen.shutdown() is True
+
+
+def test_monitor_names_the_missing_tuning_keys():
+    """Every sglang recipe inherits ``grpo_math_1B.yaml``, which carries no
+    sglang keys, so flipping ``use_fault_tolerance: true`` in one of them
+    reaches this constructor with none of the three knobs set.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        RolloutHealthMonitor(
+            _FakeGeneration([_FakeEngine()]),
+            {"sglang_cfg": {"use_fault_tolerance": True}},
+        )
+
+    message = str(excinfo.value)
+    for key in (
+        "rollout_health_check_interval",
+        "rollout_health_check_timeout",
+        "rollout_health_check_first_wait",
+    ):
+        assert key in message
+    assert "use_fault_tolerance" in message
