@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -20,7 +21,7 @@ import types
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -36,7 +37,10 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
-from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.models.generation.openai_server_utils import (
+    CompleteTokenInjectionError,
+    replace_prefix_tokens,
+)
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
@@ -470,7 +474,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     class OnlineRenderer:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.model_config = kwargs["model_config"]
             self.renderer = kwargs["renderer"]
+
+        async def preprocess_chat(self, request, messages, **kwargs):
+            request.required_prefix_token_ids = None
+            return messages, [{"prompt_token_ids": [7]}]
 
     class OpenAIServingChat:
         instances = []
@@ -537,9 +546,10 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         OnlineRenderer=OnlineRenderer,
     )
     sys.modules["vllm.renderers"].merge_kwargs = MagicMock()
+    hf_renderer = type("HfRenderer", (), {})
     make_module(
         "vllm.renderers.hf",
-        HfRenderer=type("HfRenderer", (), {}),
+        HfRenderer=hf_renderer,
         resolve_chat_template_content_format=MagicMock(),
         safe_apply_chat_template=MagicMock(),
     )
@@ -562,7 +572,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         is_mistral_tool_parser=MagicMock(return_value=False),
     )
     make_module("vllm.v1.engine.async_llm", logger=MagicMock())
-    return ToolParserManager, ReasoningParserManager, OpenAIServingChat
+    return ToolParserManager, ReasoningParserManager, OpenAIServingChat, hf_renderer
 
 
 class _FakeFastAPIApp:
@@ -577,11 +587,12 @@ class _FakeFastAPIApp:
         return decorator
 
 
-def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
+def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplog):
     (
         tool_parser_manager,
         reasoning_parser_manager,
         openai_serving_chat,
+        hf_renderer,
     ) = _install_fake_vllm_openai_modules(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -596,8 +607,21 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
             },
         },
     }
-    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
-    model_config = MagicMock(served_model_name="served-model", model="model-path")
+    worker._online_renderer = None
+    assert worker._get_complete_token_injection_stats() == {
+        "attempts": 0,
+        "successes": 0,
+        "fallbacks": {},
+    }
+
+    model_config = MagicMock(
+        served_model_name="served-model",
+        model="model-path",
+        max_model_len=128,
+        multimodal_config=None,
+        enable_prompt_embeds=False,
+    )
+    worker.llm = MagicMock(model_config=model_config, renderer=hf_renderer())
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = model_config
 
@@ -613,6 +637,80 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
+
+    renderer = worker._online_renderer
+    renderer._record_complete_token_injection_fallback("test fallback")
+    renderer._record_complete_token_injection_fallback("test fallback")
+    assert (
+        caplog.messages.count(
+            "Complete-token injection fell back to native preprocessing: test fallback"
+        )
+        == 1
+    )
+
+    chat_route = dict(app.routes)["/v1/chat/completions"]
+    request_type = chat_route.__annotations__["request"]
+
+    def make_request(**updates):
+        request = request_type()
+        for name, value in vars(_complete_token_request(**updates)).items():
+            setattr(request, name, value)
+        request.max_completion_tokens = 10
+        request.max_tokens = None
+        return request
+
+    request = make_request()
+    renderer._preprocess_chat_with_complete_token_ids = AsyncMock(
+        return_value=(
+            _tokenized_assistant_messages(),
+            [{"prompt_token_ids": [3, 4, 5]}],
+        )
+    )
+
+    result = asyncio.run(
+        renderer.preprocess_chat(
+            request=request,
+            messages=_tokenized_assistant_messages(),
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={},
+        )
+    )
+
+    assert result[1][0]["prompt_token_ids"] == [3, 4, 5]
+    renderer._preprocess_chat_with_complete_token_ids.assert_awaited_once()
+
+    asyncio.run(
+        renderer.preprocess_chat(
+            request=make_request(stream=True),
+            messages=_tokenized_assistant_messages(),
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={},
+        )
+    )
+    renderer._preprocess_chat_with_complete_token_ids = AsyncMock(
+        side_effect=CompleteTokenInjectionError("test injection error")
+    )
+    asyncio.run(
+        renderer.preprocess_chat(
+            request=make_request(),
+            messages=_tokenized_assistant_messages(),
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={},
+        )
+    )
+
+    assert worker._get_complete_token_injection_stats() == {
+        "attempts": 3,
+        "successes": 1,
+        "fallbacks": {
+            "streaming request": 1,
+            "test fallback": 2,
+            "test injection error": 1,
+        },
+    }
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
