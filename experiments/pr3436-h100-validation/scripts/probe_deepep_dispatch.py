@@ -62,7 +62,7 @@ def main() -> None:
         )
         topk_idx = torch.empty(
             (num_tokens, 2),
-            dtype=deep_ep.topk_idx_t,
+            dtype=torch.int64,
             device="cuda",
         )
         topk_idx[:, 0] = remote_rank * 2
