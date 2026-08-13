@@ -60,7 +60,6 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     refit_policy_generation,
     setup,
-    shutdown_environments,
     validate,
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
@@ -1952,35 +1951,6 @@ def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> N
             _initial_grpo_save_state(),
             master_config,
         )
-
-
-def test_shutdown_environments_drains_unique_actors_before_kill() -> None:
-    shared_environment = MagicMock()
-    failing_environment = MagicMock()
-    shared_shutdown_ref = object()
-    failing_shutdown_ref = object()
-    shared_environment.shutdown.remote.return_value = shared_shutdown_ref
-    failing_environment.shutdown.remote.return_value = failing_shutdown_ref
-
-    def get_or_fail(ref, timeout=None):
-        assert timeout == 10
-        if ref is failing_shutdown_ref:
-            raise RuntimeError("environment shutdown failed")
-        assert ref is shared_shutdown_ref
-        return True
-
-    with (
-        patch("nemo_rl.algorithms.grpo.ray.get", side_effect=get_or_fail),
-        patch("nemo_rl.algorithms.grpo.ray.kill") as ray_kill,
-    ):
-        shutdown_environments(
-            {"train": shared_environment, "failing": failing_environment},
-            {"validation": shared_environment},
-        )
-
-    shared_environment.shutdown.remote.assert_called_once_with()
-    failing_environment.shutdown.remote.assert_called_once_with()
-    ray_kill.assert_called_once_with(failing_environment)
 
 
 def test_should_use_nemo_gym_requires_dynamo_token_wrapper() -> None:
@@ -6076,3 +6046,58 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+def test_grpo_train_shuts_down_environments_after_failure():
+    task_to_env = {"nemo_gym": MagicMock()}
+    val_task_to_env = task_to_env
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo._grpo_train_impl",
+            side_effect=RuntimeError("rollout failed"),
+        ),
+        patch("nemo_rl.algorithms.grpo.shutdown_environments") as shutdown,
+        pytest.raises(RuntimeError, match="rollout failed"),
+    ):
+        grpo_train(
+            policy=MagicMock(),
+            policy_generation=MagicMock(),
+            wrapped_dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            grpo_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, val_task_to_env)
+
+
+def test_grpo_train_shuts_down_environments_after_success():
+    task_to_env = {"nemo_gym": MagicMock()}
+
+    with (
+        patch("nemo_rl.algorithms.grpo._grpo_train_impl"),
+        patch("nemo_rl.algorithms.grpo.shutdown_environments") as shutdown,
+    ):
+        grpo_train(
+            policy=MagicMock(),
+            policy_generation=MagicMock(),
+            wrapped_dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            grpo_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, task_to_env)

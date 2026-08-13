@@ -65,11 +65,7 @@ def _fake_env(name):
 
 
 def test_shutdown_environments_dedupes_shared_handles():
-    """Runners bind the same actor to train and val; it must be stopped once.
-
-    Shutting an already-stopped NeMo-Gym actor down a second time raises and
-    would escalate a graceful teardown into a ray.kill.
-    """
+    """Runners can bind one actor to train and val; it must be stopped once."""
     env = _fake_env("gym")
     task_to_env = {"nemo_gym": env}
     val_task_to_env = task_to_env  # the aliasing real runners use
@@ -94,8 +90,8 @@ def test_shutdown_environments_stops_each_distinct_actor():
     mock_ray.kill.assert_not_called()
 
 
-def test_shutdown_environments_kills_only_on_failure():
-    healthy, wedged = _fake_env("healthy"), _fake_env("wedged")
+def test_shutdown_environments_continues_after_a_failure():
+    wedged, healthy = _fake_env("wedged"), _fake_env("healthy")
 
     with patch("nemo_rl.environments.utils.ray") as mock_ray:
         mock_ray.get.side_effect = (
@@ -103,9 +99,26 @@ def test_shutdown_environments_kills_only_on_failure():
             if ref == "healthy-ref"
             else (_ for _ in ()).throw(TimeoutError("no response"))
         )
-        shutdown_environments({"healthy": healthy, "wedged": wedged})
+        shutdown_environments({"wedged": wedged, "healthy": healthy})
 
     mock_ray.kill.assert_called_once_with(wedged)
+    healthy.shutdown.remote.assert_called_once_with()
+
+
+def test_shutdown_environments_continues_after_a_failed_kill():
+    wedged, healthy = _fake_env("wedged"), _fake_env("healthy")
+
+    with patch("nemo_rl.environments.utils.ray") as mock_ray:
+        mock_ray.get.side_effect = (
+            lambda ref, timeout: None
+            if ref == "healthy-ref"
+            else (_ for _ in ()).throw(TimeoutError("no response"))
+        )
+        mock_ray.kill.side_effect = RuntimeError("already gone")
+        shutdown_environments({"wedged": wedged, "healthy": healthy})
+
+    mock_ray.kill.assert_called_once_with(wedged)
+    healthy.shutdown.remote.assert_called_once_with()
 
 
 def test_shutdown_environments_tolerates_empty_input():

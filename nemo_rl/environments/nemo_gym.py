@@ -309,7 +309,7 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
 
 # Fail fast rather than restart. The servers this actor owns are started in
 # _spinup, which Ray does not re-run after a restart, so a restarted actor is
-# permanently broken: every later call raises AttributeError on self.rch and
+# permanently broken: _require_spinup() rejects every later rollout call, and
 # the caller never sees the RayActorError it is waiting for.
 @ray.remote(max_restarts=0, max_task_retries=0)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
@@ -853,13 +853,10 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
     def shutdown(self) -> None:
         """Stop the Gym servers. Safe to call more than once, and before spinup.
 
-        Callers routinely hold the same actor under both the train and the
-        validation environment map, so this is reached twice on a normal exit.
-        The underlying RunHelper.shutdown() raises on a second call, which used
-        to escalate an otherwise graceful teardown into a ray.kill(). Teardown
-        also runs in a finally block, so it must not turn a real training error
-        into a confusing AttributeError from a never-spun-up (e.g. restarted)
-        actor.
+        Teardown runs in a finally block and may be requested more than once.
+        RunHelper.shutdown() is not idempotent, so the handle is cleared before
+        it is used. A failure therefore cannot leave a live handle that a later
+        cleanup attempt invokes again.
         """
         rh, self.rh = self.rh, None
         if rh is not None:

@@ -273,8 +273,8 @@ def test_nemo_gym_fails_fast_instead_of_restarting():
     """A restarted actor would be permanently broken.
 
     __init__ only stores cfg; the Gym servers are created in _spinup, which Ray
-    does not re-run after a restart. Restarting would raise AttributeError on
-    every later call instead of surfacing RayActorError to the caller.
+    does not re-run after a restart. _require_spinup() would reject every later
+    call instead of surfacing RayActorError to the caller.
     """
     metadata = nemo_gym_mod.NemoGym.__ray_metadata__
     assert metadata.max_restarts == 0

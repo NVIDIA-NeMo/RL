@@ -36,7 +36,6 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     refit_policy_generation,
     setup,
-    shutdown_environments,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
@@ -46,6 +45,7 @@ from nemo_rl.environments.nemo_gym import (
     setup_nemo_gym_config,
     should_use_nemo_gym,
 )
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
@@ -274,6 +274,7 @@ The validation set you pass in will directly be used for validation with no addi
     task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
 
+    trainer_owns_environment_shutdown = False
     try:
         if is_trajectory_collection:
             collect_trajectories(
@@ -312,6 +313,7 @@ The validation set you pass in will directly be used for validation with no addi
             print("🚀 Running async GRPO training")
 
             # Run async GRPO training
+            trainer_owns_environment_shutdown = True
             async_grpo_train(
                 policy=policy,
                 policy_generation=policy_generation,
@@ -334,6 +336,7 @@ The validation set you pass in will directly be used for validation with no addi
             print("🚀 Running synchronous GRPO training")
 
             # Run standard GRPO training
+            trainer_owns_environment_shutdown = True
             grpo_train(
                 policy,
                 policy_generation,
@@ -350,7 +353,8 @@ The validation set you pass in will directly be used for validation with no addi
                 processor=processor,
             )
     finally:
-        shutdown_environments(task_to_env, val_task_to_env)
+        if not trainer_owns_environment_shutdown:
+            shutdown_environments(task_to_env, val_task_to_env)
         try:
             policy_generation.shutdown()
         except Exception as error:
