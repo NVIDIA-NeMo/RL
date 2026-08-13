@@ -6,7 +6,7 @@ logger:
   wandb:
     name: grpo-llama3.1-8b-instruct-2n8g-async-1off-sc
 
-# SC does not support validation and checkpointing yet.
+# SC does not support validation yet.
 grpo:
   val_period: 0
 

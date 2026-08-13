@@ -6,7 +6,7 @@ logger:
   wandb:
     name: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-sc
 
-# SC does not support validation and checkpointing yet.
+# SC does not support validation yet.
 grpo:
   val_period: 0
 
