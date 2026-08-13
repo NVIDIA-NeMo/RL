@@ -533,8 +533,8 @@ data_plane:
     local_buffer_size:    4294967296 # 4 GiB/process
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
     staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
-  # observability:                    # NotRequired
-  #   enabled: false
+  observability:                      # per-op data-plane timing/volume
+    enabled: false                    # true => wrap client in MetricsDataPlaneClient
 
 # Multi-Teacher On-Policy Distillation (MOPD); null = disabled (default). Mirrors
 # the field on the GRPO MasterConfig added for MOPD support.
