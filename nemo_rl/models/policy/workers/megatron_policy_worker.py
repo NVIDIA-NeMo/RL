@@ -203,7 +203,8 @@ def _estimate_refit_tensor_size_in_bytes(
 
 def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
     """Return HF layer names whose weights originate from Megatron's MTP module.
-    This is required because, in some casees, only the Megatron-side name contains
+
+    This is required because, in some cases, only the Megatron-side name contains
     the `mtp` string, while the HF-side name does not.
 
     Args:
