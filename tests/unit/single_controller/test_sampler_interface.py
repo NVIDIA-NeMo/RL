@@ -96,11 +96,7 @@ class TestBuiltinsImplementInterface:
         "sampler",
         [
             WindowedSampler(FakeBuffer(), max_staleness_versions=1),
-            ReadyFirstSampler(
-                FakeBuffer(),
-                max_staleness_versions=1,
-                evict_stale_samples=False,
-            ),
+            ReadyFirstSampler(FakeBuffer(), max_staleness_versions=1),
             WeightFifoSampler(FakeBuffer(), max_staleness_versions=1),
             InOrderSampler(FakeBuffer(), max_lookahead_versions=1),
         ],
@@ -133,11 +129,7 @@ class TestAdmission:
 
     def test_ready_first_opens_one_more_batch_after_trainer_advances(self):
         trainer_version = 0
-        s = ReadyFirstSampler(
-            FakeBuffer(),
-            max_staleness_versions=1,
-            evict_stale_samples=False,
-        )
+        s = ReadyFirstSampler(FakeBuffer(), max_staleness_versions=1)
 
         # eta=1 admits the live batch and one lookahead batch without stamping.
         assert _run(s.admit(trainer_version_fn=lambda: trainer_version)) is None
@@ -202,10 +194,6 @@ class TestFactory:
         assert s.max_lookahead_versions == 2
 
     def test_weight_fifo_config_builds_weight_fifo(self):
-        from nemo_rl.algorithms.async_utils.staleness_sampler import (
-            WeightFifoSamplerConfig,
-        )
-
         s = create_sampler(
             FakeBuffer(), WeightFifoSamplerConfig(max_staleness_versions=4)
         )
@@ -215,18 +203,14 @@ class TestFactory:
     def test_ready_first_config_builds_ready_first_sampler(self):
         s = create_sampler(
             FakeBuffer(),
-            ReadyFirstSamplerConfig(
-                max_staleness_versions=3,
-                evict_stale_samples=True,
-            ),
+            ReadyFirstSamplerConfig(max_staleness_versions=3),
         )
         assert isinstance(s, ReadyFirstSampler)
         assert s.max_staleness_versions == 3
-        assert s.evict_stale_samples is True
 
 
 class TestReadyFirstConfig:
-    def test_discriminated_union_parses_ready_first_and_defaults_to_no_eviction(self):
+    def test_discriminated_union_parses_ready_first(self):
         cfg = TypeAdapter(SamplerConfig).validate_python(
             {
                 "name": "ready_first",
@@ -235,7 +219,7 @@ class TestReadyFirstConfig:
         )
 
         assert isinstance(cfg, ReadyFirstSamplerConfig)
-        assert cfg.evict_stale_samples is False
+        assert cfg.max_staleness_versions == 2
 
     def test_negative_staleness_is_rejected(self):
         with pytest.raises(ValidationError):
@@ -347,11 +331,7 @@ class TestReadyFirstSelect:
         buf.add("current", weight=3)
         buf.add("middle", weight=2)
         buf.add("future", weight=4)
-        s = ReadyFirstSampler(
-            buf,
-            max_staleness_versions=1,
-            evict_stale_samples=False,
-        )
+        s = ReadyFirstSampler(buf, max_staleness_versions=1)
 
         meta, n = _run(
             s.select(current_train_weight=3, min_prompt_groups=3, max_prompt_groups=3)
@@ -365,11 +345,7 @@ class TestReadyFirstSelect:
     def test_no_eviction_keeps_late_straggler_selectable(self):
         buf = FakeBuffer()
         buf.add("late", weight=0)
-        s = ReadyFirstSampler(
-            buf,
-            max_staleness_versions=1,
-            evict_stale_samples=False,
-        )
+        s = ReadyFirstSampler(buf, max_staleness_versions=1)
 
         assert _run(s.evict(current_train_weight=5)) == 0
         meta, n = _run(
@@ -380,68 +356,6 @@ class TestReadyFirstSelect:
         assert meta is not None
         assert meta.sample_ids == ["late_g0"]
         assert buf.remove_calls == [([0], False)]
-
-    def test_hard_window_selects_only_in_window_groups(self):
-        buf = FakeBuffer()
-        buf.add("stale", weight=1)
-        buf.add("edge", weight=3)
-        buf.add("current", weight=5)
-        s = ReadyFirstSampler(
-            buf,
-            max_staleness_versions=2,
-            evict_stale_samples=True,
-        )
-
-        meta, n = _run(
-            s.select(current_train_weight=5, min_prompt_groups=2, max_prompt_groups=2)
-        )
-
-        assert n == 2
-        assert meta is not None
-        assert meta.sample_ids == ["edge_g0", "current_g0"]
-        assert buf.start_weight_list == [1]
-
-    def test_hard_window_evicts_ready_stale_groups_from_data_plane(self):
-        buf = FakeBuffer()
-        buf.add("stale", weight=1)
-        buf.add("edge", weight=3)
-        s = ReadyFirstSampler(
-            buf,
-            max_staleness_versions=2,
-            evict_stale_samples=True,
-        )
-
-        removed = _run(s.evict(current_train_weight=5))
-
-        assert removed == 1
-        assert buf.start_weight_list == [3]
-        assert buf.remove_calls == [([0], True)]
-
-    def test_hard_window_does_not_evict_unready_stale_group(self):
-        buf = FakeBuffer()
-        buf.add("stale", weight=0, ready=False)
-        s = ReadyFirstSampler(
-            buf,
-            max_staleness_versions=1,
-            evict_stale_samples=True,
-        )
-
-        assert _run(s.evict(current_train_weight=5)) == 0
-        assert buf.start_weight_list == [0]
-        assert buf.remove_calls == []
-
-        # Once the concurrent commit marks the same slot ready, the next
-        # eviction pass removes it and clears its DataPlane row.
-        buf.meta_list[0] = KVBatchMeta(
-            partition_id="rollout_data",
-            task_name=None,
-            sample_ids=["stale_g0"],
-            tags=[{"weight_version": 0, "group_id": "stale"}],
-        )
-        buf.ready_list[0] = True
-        assert _run(s.evict(current_train_weight=5)) == 1
-        assert buf.start_weight_list == []
-        assert buf.remove_calls == [([0], True)]
 
 
 class TestInOrderSelect:
