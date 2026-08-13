@@ -94,6 +94,9 @@ run_test env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true uv run --no-syn
 # Cheap to add: the serving path fails in seconds, so this is dominated by startup.
 run_test env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
 
+# Checkpoint save/restore (upstream #3429).
+run_test uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
+
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
     coverage combine .coverage*
