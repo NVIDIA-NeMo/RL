@@ -35,6 +35,7 @@ Data flow:
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from functools import partial
 from typing import Any, Optional, Union, cast
@@ -43,6 +44,7 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
+from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -65,8 +67,9 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
 from nemo_rl.utils.logger import Logger
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
 
@@ -133,15 +136,31 @@ class SingleControllerActor:
         )
         self._timer = Timer()
 
+        # Also built here, not on the driver: TimeoutChecker must capture
+        # wall-clock start times inside the actor, not at driver setup time.
+        # actor_args only carries the driver-side restore products
+        # (save_state, last_checkpoint_path).
+        self._checkpointer = CheckpointManager(master_config.checkpointing)
+        self._timeout = TimeoutChecker(
+            timeout=master_config.checkpointing["checkpoint_must_save_by"],
+            fit_last_save_time=True,
+        )
+        self._timeout.start_iterations()
+
+        # Loaded (or initial) GRPOSaveState from setup; _get_grpo_save_state
+        # already defaulted any fields missing from older checkpoints.
+        self._save_state: GRPOSaveState = actor_args.save_state
+        self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
+        self._consumed_samples: int = actor_args.save_state.consumed_samples
+        self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens
+
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
         self._inference_cluster = actor_args.inference_cluster
 
         num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
-        self._sampler = create_sampler(
-            self._buffer,
-            self._async_cfg.sampler,
-        )
+        self._sampler = create_sampler(self._buffer, self._async_cfg.sampler)
+        self._sampler.set_dispatch_index(actor_args.save_state.current_step)
         required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
         validate_sampler_buffer_capacity(
             self._async_cfg,
@@ -174,9 +193,9 @@ class SingleControllerActor:
             self._async_cfg.max_buffered_rollouts
         )
 
-        self._trainer_version: int = 0
-        self._train_steps: int = 0
-        self._current_epoch: int = 0
+        self._trainer_version: int = actor_args.save_state.current_step
+        self._train_steps: int = actor_args.save_state.current_step
+        self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
             "masked_advantages": [],
@@ -199,6 +218,8 @@ class SingleControllerActor:
         # Synchronize weights before starting the pumps
         await self._sync_weights()
 
+        await self._maybe_restore_replay_buffer()
+
         # Start the rollout and train pumps
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
@@ -216,6 +237,8 @@ class SingleControllerActor:
             train_task.cancel()
             await asyncio.gather(rollout_task, train_task, return_exceptions=True)
             self._logger.finish()
+            # Flush the last checkpoint's background finalization before exit.
+            await asyncio.to_thread(self._checkpointer.shutdown)
 
         return {
             "train_steps": self._train_steps,
@@ -234,6 +257,51 @@ class SingleControllerActor:
         }
 
     # ── internal helpers ───────────────────────────────────────────────────
+
+    async def _maybe_restore_replay_buffer(self) -> None:
+        """Restore replay-buffer groups from the previous run's checkpoint.
+
+        Skipped with a warning when the checkpoint was written under a
+        different sampler: restored groups carry the saving sampler's
+        weight/target-step stamps, which another policy may never select.
+        """
+        if self._last_checkpoint_path is None:
+            return
+        buffer_path = os.path.join(self._last_checkpoint_path, "replay_buffer.pt")
+        if not os.path.exists(buffer_path):
+            print(
+                f"⚠️ No replay buffer checkpoint found at {buffer_path}. "
+                "Starting with an empty replay buffer.",
+                flush=True,
+            )
+            return
+        saved_sampler_name = self._save_state.sampler_name
+        current_sampler_name = self._async_cfg.sampler.name
+        if saved_sampler_name != current_sampler_name:
+            print(
+                f"⚠️ Replay buffer checkpoint was saved with sampler "
+                f"{saved_sampler_name!r} but this run uses "
+                f"{current_sampler_name!r}; skipping the buffer restore.",
+                flush=True,
+            )
+            return
+        print(f"📦 Restoring replay buffer from checkpoint: {buffer_path}")
+        # weights_only=False: groups hold pickled KVBatchMeta/TensorDicts,
+        # not plain tensors. The checkpoint is a trusted same-job artifact.
+        buffer_state = await asyncio.to_thread(
+            torch.load, buffer_path, weights_only=False
+        )
+        restored = await self._buffer.load_state_dict(
+            buffer_state,
+            max_groups=self._async_cfg.max_buffered_rollouts,
+            expected_partition_id=self._partition_id,
+            expected_group_size=self._master_config.grpo.num_generations_per_prompt,
+        )
+        # Each buffered group holds one _buffer_capacity permit; the load
+        # truncation guarantees restored <= capacity, so this never blocks.
+        assert restored <= self._async_cfg.max_buffered_rollouts
+        for _ in range(restored):
+            await self._buffer_capacity.acquire()
 
     async def _ray_get(self, obj_ref: Any) -> Any:
         """Await a Ray ObjectRef without blocking the asyncio event loop."""
@@ -319,7 +387,19 @@ class SingleControllerActor:
                         trainer_version_fn=lambda: self._trainer_version
                     )
 
-                    for prompt_idx in range(prompt_batch.size):
+                    num_prompts = prompt_batch.size
+                    if target_step is not None:
+                        buffered = self._buffer.count_for_target_step(target_step)
+                        if buffered:
+                            num_prompts = max(0, prompt_batch.size - buffered)
+                            print(
+                                f"  target_step={target_step}: {buffered} group(s) "
+                                f"already buffered; dispatching {num_prompts} of "
+                                f"{prompt_batch.size} prompt(s), dropping the rest",
+                                flush=True,
+                            )
+
+                    for prompt_idx in range(num_prompts):
                         prompt: DatumSpec = {  # type: ignore
                             k: v[prompt_idx] for k, v in prompt_batch.items()
                         }
@@ -545,6 +625,35 @@ class SingleControllerActor:
                         }
                     )
 
+                # Checkpointing (mirrors async_grpo_train's save block).
+                self._consumed_samples += grpo_cfg.num_prompts_per_step
+                self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
+                self._timeout.mark_iteration()
+
+                is_last_step = self._train_steps >= grpo_cfg.max_num_steps or (
+                    self._rollout_exhausted.is_set() and len(self._buffer) == 0
+                )
+                ft_save_period = self._master_config.checkpointing.get("ft_save_period")
+                # _train_steps was already incremented above, so it equals
+                # the legacy loop's 1-indexed `step + 1`.
+                should_save_by_step = (
+                    is_last_step
+                    or self._train_steps
+                    % self._master_config.checkpointing["save_period"]
+                    == 0
+                    or (
+                        ft_save_period is not None
+                        and self._train_steps % ft_save_period == 0
+                    )
+                )
+                should_save_by_timeout = self._timeout.check_save()
+
+                if self._master_config.checkpointing["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
+                ):
+                    with self._timer.time("checkpointing"):
+                        await self._save_checkpoint(step_metrics)
+
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
             )  # type: ignore
@@ -570,8 +679,6 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            # TODO: checkpointing (save_period/top-k metric_name,
-            #   policy.save_checkpoint, dataloader state, TQReplayBuffer state).
             # TODO: per-step train_data jsonl dump, vllm metrics logger,
             #   histogram log, rollout_metrics, seq_logprob_error_metrics,
             #   pretty-print "Training Results" block, print_performance_metrics.
@@ -593,6 +700,10 @@ class SingleControllerActor:
                 f"lag={lag}  ",
                 flush=True,
             )
+
+            if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
+                break
 
     async def _abort_stale_inflight(self) -> int:
         """Abort in-flight rollouts that the sampler can no longer select."""
@@ -628,6 +739,85 @@ class SingleControllerActor:
             flush=True,
         )
         return len(stale_tasks)
+
+    async def _save_checkpoint(self, step_metrics: dict[str, Any]) -> None:
+        """Write a full checkpoint for the just-finished train step.
+
+        Everything except the (possibly async) policy weight write must be
+        on disk before begin_finalization; rollouts keep running throughout.
+        """
+        save_state = self._save_state
+        save_state.current_step = self._train_steps
+        save_state.total_steps = self._train_steps
+        save_state.current_epoch = self._current_epoch
+        save_state.consumed_samples = self._consumed_samples
+        save_state.total_valid_tokens = self._total_valid_tokens
+        # The restore skips the replay buffer when the resuming run uses a
+        # different sampler (its stamps may never be selectable there).
+        save_state.sampler_name = self._async_cfg.sampler.name
+        # Snapshot before any await so it can't interleave with
+        # _rollout_pump iterating this same dataloader.
+        dataloader_state = self._dataloader.state_dict()
+        # SC has no validation loop yet; drop the default sentinel instead of
+        # persisting a bogus val_reward.
+        if hasattr(save_state, "val_reward"):
+            delattr(save_state, "val_reward")
+
+        # validate_single_controller_config already rejected anything but a
+        # "train:" prefix, so step_metrics is the only source to consult.
+        full_metric_name = self._master_config.checkpointing["metric_name"]
+        if full_metric_name is not None:
+            metric_name = full_metric_name.split(":", 1)[1]
+            if metric_name not in step_metrics:
+                raise ValueError(f"Metric {metric_name} not found in train metrics")
+            setattr(save_state, full_metric_name, step_metrics[metric_name])
+
+        # Flush the previous checkpoint's background finalization first;
+        # re-raises a failure from it.
+        await asyncio.to_thread(self._checkpointer.finalize_pending)
+
+        print(f"Saving checkpoint for step {self._train_steps}...")
+        checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
+            self._checkpointer.init_tmp_checkpoint,
+            self._train_steps,
+            vars(save_state),
+            self._master_config,
+        )
+        # With async_save this returns after D2H staging; disk writes finish
+        # in the background.
+        await asyncio.to_thread(
+            self._trainer.save_checkpoint,
+            weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+            optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer")
+            if self._checkpointer.save_optimizer
+            else None,
+            tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
+            checkpointing_cfg=self._master_config.checkpointing,
+        )
+        await asyncio.to_thread(
+            torch.save,
+            dataloader_state,
+            os.path.join(checkpoint_path, "train_dataloader.pt"),
+        )
+        buffer_state = await self._buffer.state_dict(
+            saved_capacity=self._async_cfg.max_buffered_rollouts
+        )
+        await asyncio.to_thread(
+            torch.save,
+            buffer_state,
+            os.path.join(checkpoint_path, "replay_buffer.pt"),
+        )
+        # Rename happens in the background once the async weight writes
+        # finish; flushed at the next save or on exit.
+        self._checkpointer.begin_finalization(
+            checkpoint_path,
+            wait_fn=self._trainer.finalize_async_save,
+        )
+        await asyncio.to_thread(
+            _write_latest_checkpoint_status,
+            self._checkpointer,
+            last_checkpoint_step=self._train_steps,
+        )
 
     async def _sync_weights(
         self,
