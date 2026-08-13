@@ -23,28 +23,38 @@ fi
 
 megatron_lm_dir="$1"
 megatron_lm_commit="${2,,}"
-protected_repository="https://github.com/NVIDIA/Megatron-LM.git"
-protected_ref_namespace="refs/remotes/nvidia-protected"
+trusted_repository="https://github.com/NVIDIA/Megatron-LM.git"
+trusted_ref_namespace="refs/remotes/nvidia-branches"
 
 if [[ ! "$megatron_lm_commit" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Megatron-LM commit must be a full 40-character hexadecimal SHA." >&2
   exit 1
 fi
 
-fetch_args=(--no-tags --force --filter=blob:none)
+fetch_args=(--no-tags --force --prune --filter=blob:none)
 if [[ "$(git -C "$megatron_lm_dir" rev-parse --is-shallow-repository)" == "true" ]]; then
   fetch_args+=(--unshallow)
 fi
 
-# Fetch the protected branches directly from NVIDIA/Megatron-LM. Do not fetch
-# the requested SHA: its object must arrive through one of these trusted refs.
-git -C "$megatron_lm_dir" fetch "${fetch_args[@]}" "$protected_repository" \
-  "+refs/heads/main:$protected_ref_namespace/main" \
-  "+refs/heads/dev:$protected_ref_namespace/dev"
+# Fetch every branch directly from NVIDIA/Megatron-LM. Do not fetch the
+# requested SHA: its object must arrive through a branch advertised by the
+# trusted repository.
+git -C "$megatron_lm_dir" fetch "${fetch_args[@]}" "$trusted_repository" \
+  "+refs/heads/*:$trusted_ref_namespace/*"
 
-if ! git -C "$megatron_lm_dir" merge-base --is-ancestor "$megatron_lm_commit" "$protected_ref_namespace/main" && \
-  ! git -C "$megatron_lm_dir" merge-base --is-ancestor "$megatron_lm_commit" "$protected_ref_namespace/dev"; then
-  echo "Megatron-LM commit is not reachable from protected main or dev." >&2
+if ! git -C "$megatron_lm_dir" cat-file -e "$megatron_lm_commit^{commit}" 2>/dev/null; then
+  echo "Megatron-LM commit is not reachable from an NVIDIA/Megatron-LM branch." >&2
+  exit 1
+fi
+
+containing_refs="$(
+  git -C "$megatron_lm_dir" for-each-ref \
+    --format='%(refname)' \
+    --contains="$megatron_lm_commit" \
+    "$trusted_ref_namespace/"
+)"
+if [[ -z "$containing_refs" ]]; then
+  echo "Megatron-LM commit is not reachable from an NVIDIA/Megatron-LM branch." >&2
   exit 1
 fi
 
