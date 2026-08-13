@@ -609,14 +609,9 @@ class AsyncTrajectoryCollector:
         """
         with self._pending_lock:
             dataloader_snapshot = self.get_checkpoint_dataloader_state(frontier_ordinal)
-            rollouts_state: dict[str, Any] = {
-                NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index
-            }
-            if (
-                not dataloader_snapshot["frontier_aligned"]
-                and self._pending_batch is not None
-            ):
-                rollouts_state[PENDING_PROMPTS_KEY] = self._pending_batch
+            rollouts_state = self._build_rollouts_state(
+                include_pending=not dataloader_snapshot["frontier_aligned"]
+            )
         return {"dataloader": dataloader_snapshot, "rollouts": rollouts_state}
 
     def _process_batch(
@@ -926,25 +921,33 @@ class AsyncTrajectoryCollector:
         """
         return drain_multimodal_payload_metrics()
 
-    def get_rollouts_state(self) -> dict[str, Any]:
-        """Get collector-side rollout state for checkpointing.
+    def _build_rollouts_state(self, *, include_pending: bool) -> dict[str, Any]:
+        """Build the rollout-state mapping. Caller must hold ``_pending_lock``.
 
-        Returns:
-            Mapping with the next NeMo-Gym task index and, when a gap-fill
-            remainder is waiting, the pending prompt batch under
-            ``PENDING_PROMPTS_KEY``. Serializing the remainder keeps yielded
-            prompts recoverable: the dataloader cursor has already advanced
-            past them, so a checkpoint that dropped them would skip those
-            prompts for the rest of the run.
+        The mapping carries the next task index and, when requested and
+        present, the pending prompt batch under ``PENDING_PROMPTS_KEY``.
+        Serializing the remainder keeps yielded prompts recoverable on
+        live-cursor checkpoints: the dataloader cursor has already advanced
+        past them, so a checkpoint that dropped them would skip those prompts
+        for the rest of the run.
         """
         state: dict[str, Any] = {
             NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index
         }
-        with self._pending_lock:
-            pending = self._pending_batch
-        if pending is not None:
-            state[PENDING_PROMPTS_KEY] = pending
+        if include_pending and self._pending_batch is not None:
+            state[PENDING_PROMPTS_KEY] = self._pending_batch
         return state
+
+    def get_rollouts_state(self) -> dict[str, Any]:
+        """Get collector-side rollout state (always including any pending batch).
+
+        The driver's save path reads this through
+        :meth:`get_checkpoint_state`, which pairs it with the dataloader
+        snapshot under one lock; this standalone accessor serves tests and
+        diagnostics.
+        """
+        with self._pending_lock:
+            return self._build_rollouts_state(include_pending=True)
 
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
