@@ -52,7 +52,7 @@ print(f"visible_gpus={torch.cuda.device_count()}")
 assert torch.cuda.is_available()
 assert torch.cuda.device_count() == 1
 PY
-    UV_NO_SYNC=1 uv run python - <<"PY"
+    uv run --locked --extra automodel python - <<"PY"
 import importlib.metadata
 
 import deep_ep
