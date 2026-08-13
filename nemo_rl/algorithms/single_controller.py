@@ -14,9 +14,9 @@
 
 """SingleController: asyncio orchestrator for the RL training loop.
 
-CPU-only Ray actor that runs two concurrent pumps and coordinates the
-other actors via lightweight RPCs. SC sends control signals and reads
-metadata only — model tensors still move through DataPlane or NCCL.
+CPU-only Ray actor that runs two concurrent pumps plus a watchdog, and
+coordinates the other actors via lightweight RPCs. SC sends control signals
+and reads metadata only — model tensors still move through DataPlane or NCCL.
 
 Data flow:
   _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
@@ -42,6 +42,7 @@ from typing import Any, Optional, Union, cast
 
 import ray
 import torch
+from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
@@ -64,6 +65,11 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.refit_watchdog import RefitAborted
+from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.rollout_manager import RolloutOutcome
+from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
+from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -78,11 +84,17 @@ Generation = Union[VllmGeneration, SGLangGeneration]
 class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
 
-    Owns two concurrent asyncio tasks:
-      - _rollout_pump: dispatches prompts to GenerationWorkerActor
-      - _train_pump:   claims DataPlane meta, trains, clears consumed rows,
-                       then runs _sync_weights (drain gate + weight
-                       synchronization) inline after each optimizer step
+    Owns three concurrent asyncio tasks:
+      - _rollout_pump:  dispatches prompts to GenerationWorkerActor
+      - _train_pump:    claims DataPlane meta, trains, clears consumed rows,
+                        then runs _sync_weights (drain gate + weight
+                        synchronization) inline after each optimizer step
+      - _watchdog_pump: publishes rollout counters and reports stalls or
+                        unhealthy environments, which are the failures that
+                        otherwise produce no signal at all
+
+    Plus _fleet_probe_pump when fleet health is enabled, which probes generation
+    shard liveness on its own, much shorter clock.
 
     All other actors are passive — they expose methods and wait to be called.
     """
@@ -123,6 +135,28 @@ class SingleControllerActor:
         self._loss_fn = actor_args.loss_fn
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
+        # Direct access, deliberately. A getattr default here reads as defensive but
+        # buys a silent failure mode: rename or drop the field and
+        # watchdog.gym_subprocess_check: true degrades to a health check that iterates
+        # nothing and reports nothing -- the exact class of silent failure this work
+        # exists to remove. A missing field should break loudly at construction, where
+        # it costs five minutes, not quietly at hour three of a run.
+        self._env_handles = actor_args.env_handles
+        # These two keep the getattr for a genuinely different reason: None is a
+        # meaningful value meaning "feature off", and it is also their default. Absence
+        # therefore degrades to the documented off state rather than to a broken one.
+        self._fleet_monitor = getattr(actor_args, "fleet_monitor", None)
+        self._policy_router = getattr(actor_args, "policy_router", None)
+        # Only with fleet health: without a monitor nothing ever reaches DEAD, so there
+        # is nothing for a supervisor to restart.
+        self._engine_supervisor = (
+            EngineSupervisor(generation=self._gen, monitor=self._fleet_monitor)
+            if self._fleet_monitor is not None
+            and master_config.async_rl.fleet_health.restart_dead_shards
+            else None
+        )
+        # Forces the first reconcile: the router starts believing every backend serves.
+        self._pushed_membership_epoch: int = -1
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -220,22 +254,42 @@ class SingleControllerActor:
 
         await self._maybe_restore_replay_buffer()
 
-        # Start the rollout and train pumps
+        # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
+        watchdog_task = asyncio.create_task(self._watchdog_pump())
+        tasks = [rollout_task, train_task, watchdog_task]
+        # Only with fleet health on. Created unconditionally it would be a timer firing
+        # every probe_interval_s for every run that does not use the feature, which is
+        # the default.
+        probe_task = (
+            asyncio.create_task(self._fleet_probe_pump())
+            if self._fleet_monitor is not None
+            else None
+        )
+        if probe_task is not None:
+            tasks.append(probe_task)
         try:
             done, _ = await asyncio.wait(
-                {rollout_task, train_task}, return_when=asyncio.FIRST_COMPLETED
+                set(tasks), return_when=asyncio.FIRST_COMPLETED
             )
+            if probe_task is not None and probe_task in done:
+                # Loops forever like the watchdog, so finishing at all means it raised.
+                await probe_task
+            if watchdog_task in done:
+                # The watchdog loops forever, so finishing at all means it raised --
+                # a stall or an unhealthy environment. Surface that ahead of the
+                # pumps, whose own symptom would just be "waiting".
+                await watchdog_task
             if rollout_task in done:
                 # Propagate rollout failures immediately. A normally exhausted
                 # rollout pump leaves the train pump to drain committed groups.
                 await rollout_task
             await train_task
         finally:
-            rollout_task.cancel()
-            train_task.cancel()
-            await asyncio.gather(rollout_task, train_task, return_exceptions=True)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             self._logger.finish()
             # Flush the last checkpoint's background finalization before exit.
             await asyncio.to_thread(self._checkpointer.shutdown)
@@ -348,7 +402,7 @@ class SingleControllerActor:
             task_started_event.set()
             self._inflight_rollouts += 1
             try:
-                await self._rollout_manager.generate_and_push(
+                outcome = await self._rollout_manager.generate_and_push(
                     prompt,
                     target_step=target_step,
                     inflight_registry=self._inflight_by_group_id,
@@ -361,6 +415,12 @@ class SingleControllerActor:
             finally:
                 self._inflight_rollouts -= 1
                 sem.release()
+
+            if outcome is RolloutOutcome.SKIPPED:
+                # Nothing was committed, so the train pump will never see this group
+                # and never release its permit on our behalf.
+                self._buffer_capacity.release()
+                return
 
             if self._async_cfg.diagnostics:
                 content = ""
@@ -705,6 +765,330 @@ class SingleControllerActor:
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
 
+    async def _watchdog_pump(self) -> None:
+        """Report rollout health, and detect stalls nothing else catches.
+
+        Progress is the pair (committed groups, completed train steps) rather than a
+        timestamp: both counters already exist, and "neither has moved" is the property
+        that actually matters.
+
+        Deliberately *not* conditioned on rollouts being in flight. An earlier version
+        required that, on the reasoning that an idle controller has legitimately no
+        work -- and a fault-injection run walked straight through the gap. Killing a
+        generation worker wedged the loop with zero rollouts in flight and zero
+        failures recorded: the rollout pump was blocked on backpressure behind a train
+        pump that could no longer finish a step, so nothing was in flight to count.
+        The watchdog observed six minutes of idleness and said nothing.
+
+        What separates a real stall from an idle gap is whether work remains, so that
+        is what is checked instead.
+        """
+        watchdog_cfg = self._async_cfg.watchdog
+        max_num_steps = self._master_config.grpo.max_num_steps
+        last_progress = (-1, -1)
+        last_progress_at = time.monotonic()
+
+        while True:
+            await asyncio.sleep(watchdog_cfg.interval_s)
+            now = time.monotonic()
+
+            stats = self._rollout_manager.stats
+            progress = (stats.committed, self._train_steps)
+            if progress != last_progress:
+                last_progress = progress
+                last_progress_at = now
+            idle_s = now - last_progress_at
+
+            metrics = dict(stats.as_metrics())
+            metrics["rollout/inflight"] = float(self._inflight_rollouts)
+            metrics["rollout/idle_s"] = idle_s
+            metrics["rollout/train_steps"] = float(self._train_steps)
+            if self._fleet_monitor is not None:
+                metrics.update(self._fleet_monitor.as_metrics())
+            if self._engine_supervisor is not None:
+                metrics.update(self._engine_supervisor.metrics())
+            self._logger.log_metrics(metrics, step=self._train_steps)
+
+            if watchdog_cfg.gym_subprocess_check:
+                # Bounded by one tick so a wedged environment cannot stop the pump, and
+                # routed through stall_action so "warn" means warn -- see
+                # _check_env_health.
+                problems = await self._check_env_health(watchdog_cfg.interval_s)
+                if problems:
+                    detail = "; ".join(problems)
+                    if watchdog_cfg.stall_action == "abort":
+                        raise RuntimeError(
+                            f"environment health check failed -- {detail}"
+                        )
+                    print(f"WARNING: environment health -- {detail}", flush=True)
+
+            if self._fleet_monitor is not None:
+                # Raises once too few shards remain for the run to be worth continuing.
+                # Checked after publishing so the final state is on record.
+                self._fleet_monitor.raise_if_exhausted()
+
+            work_remains = self._train_steps < max_num_steps
+            if work_remains and idle_s > watchdog_cfg.stall_timeout_s:
+                message = (
+                    f"no rollout committed and no train step completed in "
+                    f"{idle_s:.0f}s ({self._inflight_rollouts} rollouts in flight, "
+                    f"{stats.committed} groups committed, step "
+                    f"{self._train_steps}/{max_num_steps}, "
+                    f"stall_timeout_s={watchdog_cfg.stall_timeout_s})"
+                )
+                if watchdog_cfg.stall_action == "abort":
+                    raise RolloutStall(message)
+                print(f"WARNING: rollout stall -- {message}", flush=True)
+
+    async def _fleet_probe_pump(self) -> None:
+        """Probe the generation fleet on its own clock.
+
+        Separate from the watchdog because the two cadences answer different questions.
+        The watchdog publishes counters and notices a stalled run, which is a
+        minutes-scale concern; liveness detection is the input to every recovery
+        decision and has to be seconds-scale.
+
+        Sharing the watchdog's loop made ``probe_interval_s`` decorative -- probes ran at
+        ``watchdog.interval_s`` and nothing read the configured value. With the shipped
+        defaults that put detection at ``30s * unhealthy_threshold``, i.e. 60-90s, which
+        is *longer* than the refit deadline: by the time a hung refit aborted, the monitor
+        still had the dead shard as SUSPECT, so the rebuild that abort exists to trigger
+        saw an empty absent set and did nothing. Arithmetic, not a race -- it could never
+        have worked. Job 5925668.
+        """
+        interval_s = self._async_cfg.fleet_health.probe_interval_s
+        while True:
+            await asyncio.sleep(interval_s)
+            await self._probe_generation_fleet()
+            # Between probing and publishing: a shard condemned by the probe above starts
+            # restarting on this tick rather than the next, and moving to RESTARTING
+            # before the router push keeps a shard that is coming back out of the
+            # serving set.
+            if self._engine_supervisor is not None:
+                self._engine_supervisor.tick()
+            # Pushed here rather than on the watchdog's clock so a membership change
+            # reaches the router at detection speed. Epoch-gated, so an unchanged
+            # serving set costs nothing.
+            await self._push_router_membership()
+
+    async def _probe_generation_fleet(self) -> None:
+        """Ask every serving generation shard whether it is still alive.
+
+        Ray actor liveness is the cheap authoritative signal for "the process is gone",
+        and it is what the probe uses. It does not catch every failure -- a vLLM engine
+        core can die while the worker process and its HTTP thread survive -- which is
+        why the routing adapters also report the failures they observe. The two signals
+        feed the same counters.
+
+        Only serving shards are probed: a quarantined shard answering again says nothing
+        about whether its weights are current, and the monitor ignores such probes
+        anyway.
+
+        Shards are probed concurrently. Sequentially, a tick costs up to
+        ``probe_timeout_s`` per shard, so a fleet of four would take 8s to complete a
+        round the config promises every 5s -- and config validation only checks
+        ``probe_timeout_s < probe_interval_s``, which silently assumes one probe per
+        tick. Concurrent, a round is bounded by ``probe_timeout_s`` at any fleet size.
+        """
+        if self._fleet_monitor is None:
+            return
+
+        fleet_cfg = self._async_cfg.fleet_health
+        worker_group = self._gen.worker_group
+
+        async def probe(shard_idx: int) -> None:
+            worker_idx = worker_group.get_dp_leader_worker_idx(shard_idx)
+            try:
+                await asyncio.wait_for(
+                    self._ray_get(worker_group.workers[worker_idx].is_alive.remote()),
+                    timeout=fleet_cfg.probe_timeout_s,
+                )
+            except RayActorError as error:
+                # Conclusive, unlike a timeout: Ray only reports this once the actor
+                # process is actually gone. Counting it as one more ambiguous failure
+                # would delay the verdict by unhealthy_threshold intervals for no gain,
+                # and the refit deadline can expire inside that delay.
+                self._fleet_monitor.record_actor_death(
+                    shard_idx, error=f"{type(error).__name__}: {error}"
+                )
+            except (Exception, asyncio.TimeoutError) as error:
+                self._fleet_monitor.record_probe(
+                    shard_idx, ok=False, error=f"{type(error).__name__}: {error}"
+                )
+            else:
+                self._fleet_monitor.record_probe(shard_idx, ok=True)
+
+        await asyncio.gather(
+            *(probe(idx) for idx in self._fleet_monitor.serving_shards())
+        )
+
+    async def _push_router_membership(self) -> None:
+        """Tell the NeMo-Gym router which backends are currently serving.
+
+        Pushed as the full set rather than a delta, so a dropped or reordered update --
+        or a restarted router, which comes up believing every backend serves -- converges
+        on the next tick without sequence numbers or replay.
+
+        Re-pushed whenever the membership epoch has moved. The epoch tracks the serving
+        set, not per-shard state, so a shard merely going SUSPECT does not churn the
+        router.
+        """
+        if self._policy_router is None or self._fleet_monitor is None:
+            return
+        epoch = self._fleet_monitor.membership_epoch
+        if epoch == self._pushed_membership_epoch:
+            return
+        await self._ray_get(
+            self._policy_router.set_serving_backends.remote(
+                self._fleet_monitor.serving_base_urls()
+            )
+        )
+        self._pushed_membership_epoch = epoch
+
+    async def _reconcile_refit_membership(self) -> bool:
+        """Ask the weight transport to match the live fleet before the refit runs.
+
+        A no-op without fleet health: with no monitor there is no notion of a shard being
+        gone, so the transport keeps the membership it was built with -- which is the
+        pre-existing behaviour, and why this is inert by default.
+
+        Returns whether the communicator was actually rebuilt. The recovery path needs
+        that answer: after an abort the old communicator is gone, so "nothing to
+        reconcile" means there is nothing to retry with either.
+        """
+        if self._fleet_monitor is None:
+            return False
+        absent = self._fleet_monitor.absent_shards()
+        # to_thread like every other call that reaches the workers: this can rebuild
+        # communicators via blocking Ray calls, and running it on the loop would freeze
+        # the watchdog, which is an asyncio task on that same loop.
+        rebuilt = await asyncio.to_thread(
+            self._weight_synchronizer.reconcile_communicator, absent
+        )
+        # Log unconditionally, not just on a rebuild.
+        #
+        # Job 5898311 wedged with both policy workers stuck in the refit broadcast and no
+        # rebuild logged, and "no rebuild logged" could not distinguish two causes needing
+        # opposite fixes: reconcile ran BEFORE the death was recorded (absent empty, so
+        # correctly did nothing, and the race is the problem), or it ran after and
+        # reconcile_communicator wrongly returned False. The absent set is the whole
+        # difference and it was not being printed.
+        print(
+            f"  _sync_weights: refit membership absent={sorted(absent)} rebuilt={rebuilt}",
+            flush=True,
+        )
+        return rebuilt
+
+    async def _recover_from_failed_refit(self, failure: BaseException) -> None:
+        """Drop whatever stopped participating, rebuild the communicator, allow a retry.
+
+        Two failures arrive here and they are not the same event:
+
+        ``RefitAborted`` -- a rank went silent *inside* the collective and a worker's
+        watchdog broke it. Every engine that was receiving is left holding a mix of old
+        and new weights, so none of them may serve until a refit completes.
+
+        ``RayActorError`` -- the collective finished and a shard died in the epilogue,
+        before its RPC returned. Nothing is partial; the survivors have complete weights.
+        Left uncaught this killed a run whose data transfer had *already succeeded*.
+
+        Both need the same repair, because both leave a communicator that no longer
+        matches the fleet, and in the abort case no communicator at all.
+
+        The probe here is the point. Waiting for the health monitor to reach its own
+        conclusion is what failed before: its verdict is paced by probe rounds while this
+        is an event, so the abort arrived first and the rebuild saw an empty absent set
+        and did nothing. Asking now, on this thread, turns a race into a lookup.
+        """
+        print(f"  _sync_weights: {failure}; rebuilding and retrying once", flush=True)
+        if self._fleet_monitor is None:
+            # Without fleet health there is no notion of a shard being gone and nothing
+            # to rebuild against. Failing here is the pre-existing behaviour.
+            raise failure
+
+        # 1. Establish who is actually gone, now, rather than on the probe's clock.
+        await self._probe_generation_fleet()
+
+        # 2. Only an abort leaves partial weights behind. Marking survivors stale after
+        #    a completed broadcast would pull a healthy fleet out of service over a
+        #    transfer that succeeded.
+        if isinstance(failure, RefitAborted):
+            for shard_idx in self._fleet_monitor.serving_shards():
+                self._fleet_monitor.mark_weights_partial(shard_idx)
+
+        # 3. Rebuild without the dead.
+        rebuilt = await self._reconcile_refit_membership()
+        if not rebuilt:
+            # Nothing was identified as absent, so there is no smaller membership to
+            # rebuild over. Retrying would either die on the aborted communicator or --
+            # worse -- rebuild over the full fleet and hang on the same silent rank,
+            # which is the wedge this whole path exists to remove. Fail attributably.
+            raise RuntimeError(
+                "refit failed and no generation shard could be identified as absent, so "
+                "the communicator cannot be safely rebuilt; the run cannot continue. A "
+                "rank that is alive but not participating would produce this."
+            ) from failure
+
+    def _promote_refit_shards(self) -> None:
+        """Return shards holding current weights to the serving set.
+
+        The exit from STALE, and the reason marking partial weights is safe rather than
+        terminal. An aborted refit leaves every engine that was receiving with a mix of
+        old and new weights, so they are pulled out of service -- but nothing else moves
+        a shard out of STALE, so without this the recovery would succeed and then leave
+        the fleet empty, which ``raise_if_exhausted`` would end the run over. A worse
+        failure than the one being recovered from, and reached only on the recovery path.
+
+        Only STALE shards are promoted. A SUSPECT shard also took part in the refit, but
+        it is failing probes for its own reasons and promoting it here would reset the
+        failure count that is supposed to condemn it.
+        """
+        if self._fleet_monitor is None:
+            return
+        for health in self._fleet_monitor.snapshot():
+            if health.state is ShardState.STALE:
+                self._fleet_monitor.report_refit(
+                    health.dp_shard_idx, weight_version=self._trainer_version
+                )
+
+    async def _check_env_health(self, timeout_s: float) -> list[str]:
+        """Ask each environment actor that exposes a health check whether it is whole.
+
+        Returns the problems found, empty when everything is well. It *reports* rather
+        than raises so the caller can route the verdict through ``stall_action``, the
+        same way the stall path does. Raising here bypassed ``stall_action`` entirely:
+        under the documented default (``"warn"``, which promises to "only report"), and
+        with ``gym_subprocess_check`` defaulting to true, an unhealthy environment killed
+        the run -- a run-ending path switched on by default, in a feature whose whole
+        posture is inert-by-default.
+
+        Each probe is bounded. ``NemoGym`` is an asyncio actor, so a *wedged* environment
+        -- precisely the case this check exists to catch -- left the await hanging
+        forever, the pump never ticked again, and stall detection was dead exactly when
+        it was needed. A probe that does not answer within one tick IS the unhealthy
+        signal; it is not a reason to stop watching.
+
+        Environments without the method are skipped rather than treated as unhealthy;
+        only NeMo-Gym has subprocess servers to lose.
+        """
+        problems: list[str] = []
+        for env_name, handle in self._env_handles.items():
+            health_check = getattr(handle, "health_check", None)
+            if health_check is None:
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._ray_get(health_check.remote()), timeout=timeout_s
+                )
+            except asyncio.TimeoutError:
+                problems.append(
+                    f"environment {env_name!r} did not answer its health check within "
+                    f"{timeout_s}s"
+                )
+            except Exception as error:
+                problems.append(f"environment {env_name!r} reported unhealthy: {error}")
+        return problems
+
     async def _abort_stale_inflight(self) -> int:
         """Abort in-flight rollouts that the sampler can no longer select."""
         stale_tasks = [
@@ -860,6 +1244,13 @@ class SingleControllerActor:
 
         # TODO(#2625): Add drain-gate support during refit.
 
+        # Reconcile before the refit, not on a death event. The refit group is provably
+        # idle here and every rank is synchronized, which is required because the
+        # operations that change membership are themselves collectives. Doing it every
+        # time is also idempotent, so a missed or reordered health update converges on
+        # the next step instead of needing replay.
+        await self._reconcile_refit_membership()
+
         t0 = time.monotonic()
         kv_scales = None
         if (
@@ -874,12 +1265,36 @@ class SingleControllerActor:
             )
             kv_scales = calibration_result["layers"]
 
-        await asyncio.to_thread(
-            self._weight_synchronizer.sync_weights,
-            kv_scales=kv_scales,
-        )
+        # Reconcile once more, immediately before the collective.
+        #
+        # The reconcile above runs before calibration and two to_thread hops; a death
+        # recorded in that gap would otherwise be ignored until the NEXT step, by which
+        # time this broadcast is already hanging on the missing rank. Idempotent, so the
+        # common case is a no-op.
+        await self._reconcile_refit_membership()
+
+        try:
+            await asyncio.to_thread(
+                self._weight_synchronizer.sync_weights,
+                kv_scales=kv_scales,
+            )
+        except (RefitAborted, RayActorError) as failure:
+            await self._recover_from_failed_refit(failure)
+            # Once only: a second failure is a real fault, not a membership problem, and
+            # retrying forever would recreate the wedge this exists to remove.
+            await asyncio.to_thread(
+                self._weight_synchronizer.sync_weights,
+                kv_scales=kv_scales,
+            )
+        # A completed refit is what makes an engine's weights current, so this is where a
+        # shard pulled out of service for holding partial ones earns its way back.
+        self._promote_refit_shards()
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
-            self._gen.invalidate_kv_cache()
+            # to_thread, like every other call into the workers here. Run directly on
+            # the loop this is a blocking Ray call, and a wedged generation worker would
+            # freeze the event loop itself -- taking the watchdog, which is an asyncio
+            # task on that same loop, down with it.
+            await asyncio.to_thread(self._gen.invalidate_kv_cache)
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
