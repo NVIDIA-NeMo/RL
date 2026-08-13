@@ -777,7 +777,7 @@ class SingleControllerActor:
         await asyncio.to_thread(self._checkpointer.finalize_pending)
 
         print(f"Saving checkpoint for step {self._train_steps}...")
-        checkpoint_path: PathLike = await asyncio.to_thread(
+        checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
             self._checkpointer.init_tmp_checkpoint,
             self._train_steps,
             vars(save_state),
