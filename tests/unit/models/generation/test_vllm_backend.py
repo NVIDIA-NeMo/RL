@@ -33,7 +33,14 @@ def _make_collective_update_extension(backend):
     state_info = object()
     ext.state_dict_info = {"model.weight": state_info}
     ext.model_update_group = object()
-    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    ext.model_runner = SimpleNamespace(
+        model=object(),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=[]),
+            speculative_config=None,
+        ),
+        drafter=None,
+    )
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
@@ -120,16 +127,61 @@ def _make_mtp_refit_extension(
 
 
 @pytest.mark.vllm
-@pytest.mark.parametrize("with_mtp", [False, True])
-def test_update_weights_from_collective_processes_weights_after_loading(
-    monkeypatch, with_mtp
-):
+def test_update_weights_from_collective_uses_native_reload(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    call_order = []
+    ext, expected_state_info = _make_collective_update_extension(vllm_backend)
+
+    def packed_broadcast_consumer(
+        iterator, group, src, post_unpack_func, return_iterator=False
+    ):
+        call_order.append("broadcast")
+        assert list(iterator) == [("model.weight", expected_state_info)]
+        assert group is ext.model_update_group
+        assert src == 0
+        assert post_unpack_func is None
+        assert return_iterator is True
+        return iter([("model.weight", "weight-value")])
+
+    def reload_weights(*, weights_iterator):
+        call_order.append("reload")
+        assert list(weights_iterator) == [("model.weight", "weight-value")]
+
+    ext.model_runner.reload_weights = reload_weights
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: call_order.append("gc"))
+    monkeypatch.setattr(
+        vllm_backend.torch.cuda,
+        "empty_cache",
+        lambda: call_order.append("empty_cache"),
+    )
+
+    assert ext.update_weights_from_collective() is True
+    assert call_order == ["broadcast", "reload", "gc", "empty_cache"]
+
+
+@pytest.mark.vllm
+def test_collective_preserves_batched_loading_for_fp8(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext, _ = _make_collective_update_extension(vllm_backend)
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+
+    assert ext._collective_requires_batched_loading() is True
+
+
+@pytest.mark.vllm
+def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     call_order = []
     process_calls = []
-    draft_model = object() if with_mtp else None
-    draft_model_config = object() if with_mtp else None
+    draft_model = object()
+    draft_model_config = object()
 
     def process_weights_after_loading(model, model_config, device):
         call_order.append("process_mtp" if model is draft_model else "process_main")
@@ -140,14 +192,13 @@ def test_update_weights_from_collective_processes_weights_after_loading(
         process_weights_after_loading,
     )
     ext, expected_state_info = _make_collective_update_extension(vllm_backend)
-    if with_mtp:
-        ext._mtp_drafter_from_disk = False
-        ext.model_runner.drafter = SimpleNamespace(model=draft_model)
-        ext.model_runner.vllm_config = SimpleNamespace(
-            speculative_config=SimpleNamespace(
-                method="mtp", draft_model_config=draft_model_config
-            )
+    ext._mtp_drafter_from_disk = False
+    ext.model_runner.drafter = SimpleNamespace(model=draft_model)
+    ext.model_runner.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="mtp", draft_model_config=draft_model_config
         )
+    )
 
     @contextlib.contextmanager
     def set_current_vllm_config(config):
@@ -192,11 +243,14 @@ def test_update_weights_from_collective_processes_weights_after_loading(
         "config_enter",
         "process_main",
         "config_exit",
+        "config_enter",
+        "process_mtp",
+        "config_exit",
+        "kv",
+        "gc",
+        "empty_cache",
     ]
-    if with_mtp:
-        expected_process_calls.append((draft_model, draft_model_config, ext.device))
-        expected_call_order.extend(["config_enter", "process_mtp", "config_exit"])
-    expected_call_order.extend(["kv", "gc", "empty_cache"])
+    expected_process_calls.append((draft_model, draft_model_config, ext.device))
 
     assert process_calls == expected_process_calls
     assert call_order == expected_call_order
