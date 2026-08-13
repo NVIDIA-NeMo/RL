@@ -123,9 +123,11 @@ _METADATA_WHEEL_TAG = "py3-none-any"
 # with tools/build-custom-trtllm.sh, which reads BUILD_CUSTOM_TRTLLM_ARCH and
 # falls back to this same default. Folded into the wheel cache key below so
 # editing the arch list forces a rebuild instead of reusing a stale wheel.
-# Blackwell (sm_100) + Rubin (sm_107). Note the nvshmem arch patch in
-# build-custom-trtllm.sh takes a single bare arch and does NOT follow this list.
-_DEFAULT_ARCH = "100-real;107-real"
+# Blackwell (sm_100), Blackwell-Ultra (sm_103) and Rubin (sm_107).
+# NOTE the nvshmem arch patch in build-custom-trtllm.sh carries its own copy of
+# this list in BARE form (100;103;107) -- nvshmem rejects the suffixed names
+# CMake generates, so the two lists are written differently on purpose.
+_DEFAULT_ARCH = "100-real;103-real;107-real"
 
 
 def _build_input_tag(arch: str) -> str:
