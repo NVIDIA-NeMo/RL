@@ -726,7 +726,9 @@ def test_create_advantage_estimator_rejects_unsupported_name():
         loss_fn={"reference_policy_kl_penalty": 0.0},
     )
 
-    with pytest.raises(ValueError, match="only supports 'gae' or 'raw_reward'"):
+    with pytest.raises(
+        ValueError, match="only supports 'gae', 'turn_gae' or 'raw_reward'"
+    ):
         _create_advantage_estimator(master_config)
 
 
