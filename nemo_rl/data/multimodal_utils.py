@@ -18,6 +18,7 @@ import logging
 import re
 import uuid
 from collections import defaultdict
+from collections.abc import Sequence
 from copy import deepcopy
 from io import BytesIO
 from typing import Any, Optional, Union
@@ -1151,3 +1152,60 @@ def load_media_from_message(
                 loaded_media["video"].append(vid)
 
     return loaded_media
+
+
+def build_media_token_validity_mask(
+    input_ids: torch.Tensor,
+    media_token_id: int,
+    media_counts_by_row: Sequence[int],
+    base_mask: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Mark media-token positions in rows that carry no media of that modality.
+
+    A media token is an ordinary vocabulary entry with its own embedding row.
+    It only means "a projected feature belongs here" when media is attached;
+    in a text-only row the same id is whatever the author wrote, and counting
+    it as a placeholder makes the model demand a feature that does not exist.
+
+    Rows that do carry media keep every position valid, so a real
+    placeholder/feature disagreement there is still reported rather than
+    silently masked away.
+
+    Args:
+        input_ids: ``[B, S]`` token ids, one row per sample.
+        media_token_id: Vocabulary id the model treats as a media placeholder.
+        media_counts_by_row: Attached media items per row, e.g. from
+            :meth:`PackedTensor.logical_segment_counts_by_row`.
+        base_mask: Optional ``[B, S]`` validity mask to refine, so masks for
+            several modalities can be combined.
+
+    Returns:
+        A ``[B, S]`` bool mask, or ``None`` when nothing needs masking and the
+        caller should leave the model's own derivation untouched.
+    """
+    if input_ids.ndim != 2:
+        raise ValueError(f"input_ids must be [B, S], got {tuple(input_ids.shape)}")
+    if len(media_counts_by_row) != input_ids.shape[0]:
+        raise ValueError(
+            "media_counts_by_row must have one entry per row: got "
+            f"{len(media_counts_by_row)} for {input_ids.shape[0]} rows"
+        )
+
+    empty_rows = [row for row, count in enumerate(media_counts_by_row) if count == 0]
+    if not empty_rows:
+        return base_mask
+
+    is_media_token = input_ids == media_token_id
+    if not bool(is_media_token[empty_rows].any()):
+        # Text-only rows exist but none of them spell the token, so the
+        # model's own derivation is already correct.
+        return base_mask
+
+    mask = (
+        torch.ones_like(input_ids, dtype=torch.bool)
+        if base_mask is None
+        else base_mask.clone()
+    )
+    for row in empty_rows:
+        mask[row] &= ~is_media_token[row]
+    return mask
