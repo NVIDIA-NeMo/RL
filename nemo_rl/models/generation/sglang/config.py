@@ -99,8 +99,10 @@ class SglangSpecificArgs(TypedDict):
     quantization: SglangQuantizationConfig
 
     # Fault tolerance (RolloutHealthMonitor). When True, a daemon thread health-checks
-    # each engine and restarts hung/dead actors; the three fields below are then required.
-    use_fault_tolerance: bool
+    # each engine and restarts hung/dead actors. Absent is equivalent to False, which
+    # is what the recipes that predate this feature rely on; the three fields below
+    # are required iff it is True, and ``RolloutHealthMonitor`` asserts on them.
+    use_fault_tolerance: NotRequired[bool]
     rollout_health_check_interval: NotRequired[int]
     rollout_health_check_timeout: NotRequired[int]
     rollout_health_check_first_wait: NotRequired[int]
