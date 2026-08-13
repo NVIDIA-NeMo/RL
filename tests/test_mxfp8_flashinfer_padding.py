@@ -70,12 +70,20 @@ def test_flashinfer_mxfp8_moe_padding_plan(
 ) -> None:
     padding_plan = _load_mxfp8_utils().flashinfer_mxfp8_moe_padding_plan
 
-    assert padding_plan(hidden_size, intermediate_size) == expected
+    padded_hidden_size, padded_intermediate_size = padding_plan(
+        hidden_size, intermediate_size
+    )
+
+    assert (padded_hidden_size, padded_intermediate_size) == expected
+    assert padded_hidden_size % 512 == 0
+    assert padded_hidden_size // 32 % 4 == 0
+    assert padded_intermediate_size % 128 == 0
+    assert padded_intermediate_size // 32 % 4 == 0
 
 
 @pytest.mark.parametrize(
     ("hidden_size", "intermediate_size"),
-    [(0, 128), (128, 0), (127, 128)],
+    [(0, 128), (128, 0), (127, 128), (128, 127)],
 )
 def test_flashinfer_mxfp8_moe_padding_plan_rejects_invalid_sizes(
     hidden_size: int, intermediate_size: int

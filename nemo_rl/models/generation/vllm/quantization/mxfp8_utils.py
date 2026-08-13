@@ -48,5 +48,10 @@ def flashinfer_mxfp8_moe_padding_plan(
         )
     if intermediate_size <= 0:
         raise ValueError("MXFP8 MoE intermediate_size must be positive")
+    if intermediate_size % 32 != 0:
+        raise ValueError(
+            "FlashInfer TRTLLM MXFP8 MoE requires intermediate_size divisible "
+            f"by 32, got {intermediate_size}."
+        )
 
     return _round_up(hidden_size, 512), _round_up(intermediate_size, 128)
