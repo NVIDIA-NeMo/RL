@@ -513,8 +513,12 @@ MXFP8_GEN_EXTRA_ARGS="++policy.generation.vllm_cfg.precision=fp8 \
 # ++policy.generation.vllm_kwargs.moe_backend=triton"
 
 
-# do not quantize linear layers
-IGNORED_LAYER_KWS="\"conv1d\",\"mtp\""
+# do not quantize these linear layers
+# mtp excluded: vLLM skips MTP weights entirely (skip_prefixes=["mtp"] in
+# AutoWeightsLoader), so those modules are never quantized and need no entry here.
+# fc1/2_latent_proj and lm_head are handled by fp8.py's _VLLM_ONLY_MODULES
+# special-case (they exist in vLLM but not in AutoModel.named_parameters()).
+IGNORED_LAYER_KWS="\"conv1d\""
 IGNORED_LAYER_KWS="$IGNORED_LAYER_KWS,\"in_proj\",\"out_proj\",\"q_proj\",\"k_proj\",\"v_proj\",\"o_proj\",\"fc1_latent_proj\",\"fc2_latent_proj\",\"shared_experts\",\"lm_head\""
 MXFP8_GEN_EXTRA_ARGS="$MXFP8_GEN_EXTRA_ARGS ++policy.generation.vllm_cfg.quantization_ignored_layer_kws=[$IGNORED_LAYER_KWS]"
 

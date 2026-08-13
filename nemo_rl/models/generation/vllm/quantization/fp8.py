@@ -296,18 +296,27 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             for n in param_names
             if any(p in n for p in quantization_ignored_layer_kws)
         ]
-        # AutoModel does not include the causal LM head, but vLLM exposes it as
-        # a top-level module that must be named explicitly in the ignore list.
-        if (
-            "lm_head" in quantization_ignored_layer_kws
-            and "lm_head" not in ignored_layers
-        ):
-            ignored_layers.append("lm_head")
+        # Some modules are present in vLLM's model graph but are not exposed by
+        # AutoModel.from_config's named_parameters(), so keyword matching above
+        # never finds them.  Add them explicitly when requested:
+        #   lm_head     — causal LM head (top-level vLLM module)
+        #   fc1/2_latent_proj — latent MoE projections (ReplicatedLinear, used
+        #                       when use_latent_moe=True in NemotronH)
+        _VLLM_ONLY_MODULES = {"lm_head", "fc1_latent_proj", "fc2_latent_proj"}
+        for _kw in quantization_ignored_layer_kws:
+            if _kw in _VLLM_ONLY_MODULES and not any(
+                _kw in n for n in ignored_layers
+            ):
+                ignored_layers.append(_kw)
         unmatched_ignored_layer_kws = [
             keyword
             for keyword in quantization_ignored_layer_kws
             if not any(keyword in layer_name for layer_name in ignored_layers)
         ]
+        assert not unmatched_ignored_layer_kws, (
+            "quantization_ignored_layer_kws contains entries that do not match "
+            f"any model layer: {unmatched_ignored_layer_kws}"
+        )
         if "ignored_layers" not in fp8_block_quant_kwargs:
             fp8_block_quant_kwargs["ignored_layers"] = ignored_layers
         else:
