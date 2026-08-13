@@ -289,7 +289,6 @@ guides/sft-openmathinstruct2.md
 ```{toctree}
 :caption: Guides
 
-guides/nemotron-3-super-omni.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
