@@ -304,6 +304,53 @@ class TestDefaultEvictSkipsUnready:
         assert _run(s.evict(current_train_weight=5)) == 0
 
 
+class TestDispatchCursorRestore:
+    """Checkpoint resume calls set_dispatch_index(current_step), restoring the
+    fresh-start invariant _dispatch_index == trainer_version - 1. Without it,
+    a restored InOrderSampler would stamp target_steps starting at 0 and every
+    dispatched batch would be instantly evicted (target < trainer_version)."""
+
+    def test_resumed_in_order_stamps_from_trainer_version(self):
+        s = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+        s.set_dispatch_index(7)
+        assert _run(s.admit(trainer_version_fn=lambda: 7)) == 7
+        assert _run(s.admit(trainer_version_fn=lambda: 8)) == 8
+
+    def test_resumed_gate_admits_window_then_blocks(self):
+        s = WeightFifoSampler(FakeBuffer(), max_staleness_versions=0)
+        s.set_dispatch_index(7)
+        # Resumed at step 7, window 0: one batch admitted, then the gate
+        # closes exactly as it would on a fresh run at step 0.
+        assert _run(s.admit(trainer_version_fn=lambda: 7)) is None
+        with pytest.raises(asyncio.TimeoutError):
+            _run(asyncio.wait_for(s.admit(trainer_version_fn=lambda: 7), timeout=0.05))
+
+    def test_fresh_start_is_a_noop_seed(self):
+        s = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+        s.set_dispatch_index(0)
+        assert _run(s.admit(trainer_version_fn=lambda: 0)) == 0
+
+    def test_negative_resume_step_rejected(self):
+        with pytest.raises(ValueError, match="resume_from_step"):
+            WindowedSampler(FakeBuffer(), max_staleness_versions=1).set_dispatch_index(
+                -1
+            )
+
+    def test_custom_fqn_sampler_supports_seeding(self):
+        from nemo_rl.algorithms.async_utils.staleness_sampler import (
+            CustomSamplerConfig,
+        )
+
+        s = create_sampler(
+            FakeBuffer(),
+            CustomSamplerConfig(
+                target=f"{__name__}:EchoSampler", max_lookahead_versions=1
+            ),
+        )
+        s.set_dispatch_index(6)
+        assert _run(s.admit(trainer_version_fn=lambda: 6)) == 6
+
+
 class TestInflightAbortPolicy:
     def test_windowed_aborts_only_below_weight_window(self):
         sampler = WindowedSampler(
