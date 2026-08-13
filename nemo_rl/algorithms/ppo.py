@@ -452,7 +452,10 @@ def setup(
         # the length above does not propagate to them. Without this the packer
         # raises "Sequence length N exceeds bin capacity" on the long tail --
         # minutes-to-hours into the run, not at startup.
-        _mbs = int(value_config.get("train_micro_batch_size", 1) or 1)
+        # Required field of ValueConfig; a call-site fallback here would
+        # silently under-size the packing bins to _needed * 1 and resurface as
+        # "Sequence length N exceeds bin capacity" deep into a run.
+        _mbs = int(value_config["train_micro_batch_size"])
         for _bcfg_key in ("sequence_packing", "dynamic_batching"):
             _bcfg = value_config.get(_bcfg_key) or {}
             if not _bcfg.get("enabled"):
