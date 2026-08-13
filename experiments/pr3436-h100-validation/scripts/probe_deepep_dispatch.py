@@ -35,21 +35,22 @@ def main() -> None:
         timeout=timedelta(minutes=5),
     )
 
-    buffer: deep_ep.Buffer | None = None
+    buffer: deep_ep.HybridEPBuffer | None = None
     try:
-        buffer = deep_ep.Buffer(
-            dist.group.WORLD,
-            int(2e9),
-            int(1e9),
-            num_qps_per_rank=24,
-            explicitly_destroy=True,
-        )
-        if rank == 0:
-            print("DEEPEP_BUFFER_INIT_PASS", flush=True)
-
         num_tokens = 256
         hidden_size = 7168
-        num_experts = world_size * 2
+        num_local_experts = 2
+        num_experts = world_size * num_local_experts
+        buffer = deep_ep.HybridEPBuffer(
+            group=dist.group.WORLD,
+            hidden_dim=hidden_size,
+            max_num_of_tokens_per_rank=num_tokens,
+            num_local_experts=num_local_experts,
+            use_fp8=False,
+        )
+        if rank == 0:
+            print("HYBRIDEP_BUFFER_INIT_PASS", flush=True)
+
         node_base_rank = (rank // 8) * 8
         remote_rank = (rank + 8) % world_size
         neighboring_rank = node_base_rank + ((local_rank + 1) % 8)
@@ -69,43 +70,35 @@ def main() -> None:
         topk_idx[:, 1] = neighboring_rank * 2 + 1
         topk_weights = torch.full(
             (num_tokens, 2),
-            0.5,
+            1.0,
             dtype=torch.float32,
             device="cuda",
         )
 
         (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-            is_token_in_rank,
-            _,
-        ) = buffer.get_dispatch_layout(topk_idx, num_experts)
-
-        (
             recv_x,
-            _,
             recv_topk_weights,
             _,
             handle,
-            _,
         ) = buffer.dispatch(
-            x=x,
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            is_token_in_rank=is_token_in_rank,
-            num_tokens_per_expert=num_tokens_per_expert,
+            hidden=x,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
+            num_of_experts=num_experts,
         )
         torch.cuda.synchronize()
         if recv_topk_weights is None:
-            raise RuntimeError("DeepEP dispatch did not return top-k weights")
+            raise RuntimeError("HybridEP dispatch did not return top-k weights")
 
-        combined_x, _, _ = buffer.combine(
-            x=recv_x,
+        num_dispatched_tokens = int(handle[3].item())
+        local_expert_routing_map = handle[4][:num_dispatched_tokens]
+        copy_times = local_expert_routing_map.sum(dim=1)
+        hidden_to_combine = recv_x * copy_times.unsqueeze(1)
+
+        combined_x, _ = buffer.combine(
+            hidden=hidden_to_combine,
             handle=handle,
-            topk_weights=recv_topk_weights,
+            probs=recv_topk_weights,
         )
         torch.cuda.synchronize()
 
@@ -116,10 +109,9 @@ def main() -> None:
 
         dist.barrier()
         if rank == 0:
-            print("DEEPEP_INTER_NODE_DISPATCH_PASS", flush=True)
+            print("HYBRIDEP_INTER_NODE_DISPATCH_PASS", flush=True)
     finally:
-        if buffer is not None:
-            buffer.destroy()
+        del buffer
         if dist.is_initialized():
             dist.destroy_process_group()
 

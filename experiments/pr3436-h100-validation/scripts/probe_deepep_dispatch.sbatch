@@ -2,8 +2,8 @@
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=8
 #SBATCH --gpus-per-node=8
-#SBATCH --time=00:15:00
-#SBATCH --job-name=pr3436-deepep-dispatch
+#SBATCH --time=00:30:00
+#SBATCH --job-name=pr3436-hybridep-dispatch
 
 set -euo pipefail
 
@@ -25,15 +25,17 @@ git -C "${SOURCE_DIR}" diff --cached --quiet
 export MASTER_ADDR
 MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | sed -n '1p')
 export MASTER_PORT=$((6000 + SLURM_JOB_ID % 1500))
-export NVSHMEM_DEBUG=${NVSHMEM_DEBUG:-INFO}
-export NVSHMEM_ENABLE_NIC_PE_MAPPING=1
-export NVSHMEM_HCA_PE_MAPPING=${NVSHMEM_HCA_PE_MAPPING:-mlx5_0:1:1,mlx5_3:1:1,mlx5_5:1:1,mlx5_7:1:1,mlx5_9:1:1,mlx5_12:1:1,mlx5_14:1:1,mlx5_16:1:1}
-export NVSHMEM_IB_GID_INDEX=${NVSHMEM_IB_GID_INDEX:-3}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+export HYBRID_EP_MULTINODE=1
+export TORCH_CUDA_ARCH_LIST=9.0
+export USE_MNNVL=0
+export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8
 
 echo "master=${MASTER_ADDR}:${MASTER_PORT}"
-echo "nvshmem_hca_pe_mapping=${NVSHMEM_HCA_PE_MAPPING}"
-echo "nvshmem_ib_gid_index=${NVSHMEM_IB_GID_INDEX}"
+echo "hybrid_ep_multinode=${HYBRID_EP_MULTINODE}"
+echo "torch_cuda_arch_list=${TORCH_CUDA_ARCH_LIST}"
+echo "use_mnnvl=${USE_MNNVL}"
+echo "nvlink_domain_size=${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN}"
 
 container_name="pr3436-deepep-${SLURM_JOB_ID}"
 cleanup() {
@@ -57,8 +59,10 @@ srun \
   bash -lc '
     set -euo pipefail
     export PATH="/root/.local/bin:${PATH}"
+    export UV_PROJECT_ENVIRONMENT="/tmp/pr3436-hybridep-${SLURM_JOB_ID}"
     cd "${SOURCE_DIR}"
-    uv run --locked --extra automodel python -c "import deep_ep; print(deep_ep.__file__)"
+    uv sync --locked --extra automodel --reinstall-package deep-ep
+    uv run --locked --extra automodel python -c "import deep_ep, hybrid_ep_cpp; print(deep_ep.__file__); print(hybrid_ep_cpp.__file__)"
   '
 
 srun \
@@ -72,6 +76,7 @@ srun \
   bash -lc '
     set -euo pipefail
     export PATH="/root/.local/bin:${PATH}"
+    export UV_PROJECT_ENVIRONMENT="/tmp/pr3436-hybridep-${SLURM_JOB_ID}"
     cd "${SOURCE_DIR}"
     grep -F "deepseek-ai/DeepEP.git?rev=${EXPECTED_DEEPEP_COMMIT}#${EXPECTED_DEEPEP_COMMIT}" uv.lock
     UV_NO_SYNC=1 uv run python "${PROBE_SCRIPT}"
