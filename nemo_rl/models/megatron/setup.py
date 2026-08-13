@@ -702,8 +702,20 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.moe_flex_dispatcher_backend = config["megatron_cfg"][
             "moe_flex_dispatcher_backend"
         ]
+    # moe_hybridep_num_sms is deprecated in newer mcore (NCCL 2.30.4 image),
+    # which hard-errors when more than one deprecated SM-count knob is set:
+    #   ValueError: Conflicting deprecated SM-count knobs
+    #   {'moe_deepep_num_sms': 20, 'moe_hybridep_num_sms': 32};
+    #   set a single moe_flex_dispatcher_num_sms instead.
+    # mcore supplies moe_deepep_num_sms itself, so setting the hybridep one here
+    # is what triggers it. Route the value to the replacement knob when this
+    # mcore has it, and fall back to the deprecated one on older builds.
     if "moe_hybridep_num_sms" in config["megatron_cfg"]:
-        model_cfg.moe_hybridep_num_sms = config["megatron_cfg"]["moe_hybridep_num_sms"]
+        num_sms = config["megatron_cfg"]["moe_hybridep_num_sms"]
+        if hasattr(TransformerConfig, "moe_flex_dispatcher_num_sms"):
+            model_cfg.moe_flex_dispatcher_num_sms = num_sms
+        else:
+            model_cfg.moe_hybridep_num_sms = num_sms
 
     # HybridEP environment variables
     # These are required by DeepEP's hybrid-ep branch for NVLink domain configuration.
