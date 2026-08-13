@@ -149,16 +149,16 @@ def shutdown_environments(
     """Gracefully shut down every distinct environment actor in the given maps.
 
     Runners commonly bind the same actor — often the very same mapping — to
-    both training and validation, so handles are deduped before teardown.
-    Without that, the second shutdown of an already-stopped actor fails and
-    escalates a graceful exit into a ``ray.kill``.
+    both training and validation, so each handle is asked to stop once no
+    matter how many maps contain it.
 
     Environments must be torn down before generation workers: they may have
     in-flight HTTP requests to the vLLM endpoints, and killing generation first
     leaves them retrying dead connections.
 
     Args:
-        env_maps: Task-name to environment mappings. ``None`` entries are skipped.
+        env_maps: Task-name to environment mappings. ``None`` and empty
+            mappings are skipped.
         timeout: Seconds to wait for each actor's ``shutdown()`` before killing it.
     """
     seen: set[int] = set()
