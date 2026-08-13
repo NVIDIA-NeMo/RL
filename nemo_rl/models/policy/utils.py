@@ -58,16 +58,19 @@ from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_
 
 # an automodel factory for loading the huggingface models from correct class
 
-AUTOMODEL_FACTORY: Dict[str, Any] = {
-    # Add an entry here when a model (1) uses HF's standard loading path
-    # (no custom NeMo automodel impl) AND (2) its architecture isn't
-    # loadable via AutoModelForCausalLM (e.g. VLMs using
-    # ForConditionalGeneration / ForImageTextToText). Models with a
-    # custom NeMo automodel impl (e.g. qwen3_5_moe) don't need an entry
-    # — the custom impl intercepts from_pretrained regardless of the
-    # parent AutoModel class. Check MODEL_ARCH_MAPPING in the NeMo
-    # automodel registry to see which architectures have custom impls:
-    # https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
+# Plain Hugging Face classes, kept separate from the NeMo AutoModel wrappers so a caller
+# that manages model loading + distribution itself (e.g. the legacy DTensorPolicyWorker) can
+# request the vanilla Transformers class even when nemo_automodel is installed.
+# Add an entry here when a model (1) uses HF's standard loading path
+# (no custom NeMo automodel impl) AND (2) its architecture isn't
+# loadable via AutoModelForCausalLM (e.g. VLMs using
+# ForConditionalGeneration / ForImageTextToText). Models with a
+# custom NeMo automodel impl (e.g. qwen3_5_moe) don't need an entry
+# — the custom impl intercepts from_pretrained regardless of the
+# parent AutoModel class. Check MODEL_ARCH_MAPPING in the NeMo
+# automodel registry to see which architectures have custom impls:
+# https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
+HF_AUTOMODEL_FACTORY: Dict[str, Any] = {
     "qwen2_5_vl": AutoModelForImageTextToText,
     "qwen2_vl": AutoModelForImageTextToText,
     "qwen2_5_omni": AutoModelForTextToWaveform,
@@ -80,6 +83,9 @@ AUTOMODEL_FACTORY: Dict[str, Any] = {
     "mistral3": AutoModelForImageTextToText,
     "llama4": AutoModelForImageTextToText,
 }
+
+# Default to the vanilla HF classes; overridden with the NeMo AutoModel wrappers below when available.
+AUTOMODEL_FACTORY: Dict[str, Any] = HF_AUTOMODEL_FACTORY
 
 if NEMO_AUTOMODEL_AVAILABLE:
     AUTOMODEL_FACTORY = {
@@ -129,11 +135,24 @@ def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
 
 
-def resolve_model_class(model_name: str) -> Any:
-    """Resolve the appropriate model class for a given model name."""
-    if NEMO_AUTOMODEL_AVAILABLE:
+def resolve_model_class(
+    model_name: str,
+    *,
+    use_nemo_automodel: bool = True,
+) -> Any:
+    """Resolve the appropriate model class for a given model name.
+
+    Args:
+        model_name: The model's ``model_type`` used to look up the factory.
+        use_nemo_automodel: When True (default), prefer the NeMo AutoModel
+            wrappers if installed. Callers that own model loading and
+            distribution themselves (e.g. the legacy DTensorPolicyWorker) should
+            pass False to get the plain Hugging Face class and avoid triggering
+            AutoModel's distributed-checkpoint collectives.
+    """
+    if use_nemo_automodel and NEMO_AUTOMODEL_AVAILABLE:
         return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
-    return AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
+    return HF_AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
 
 
 def is_vllm_v1_engine_enabled() -> bool:
