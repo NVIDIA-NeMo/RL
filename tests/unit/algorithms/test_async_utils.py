@@ -39,7 +39,7 @@ from nemo_rl.algorithms.async_utils import (
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
 from nemo_rl.algorithms.async_utils.trajectory_collector import (
-    _group_task_index_from_batch,
+    _unanimous_task_index,
 )
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
@@ -57,6 +57,7 @@ from nemo_rl.environments.interfaces import (
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
+    NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
     RETAINED_TASK_INDICES_KEY,
 )
@@ -1170,6 +1171,9 @@ class TestAsyncTrajectoryCollector:
         next_nemo_gym_task_index: int = 0,
         max_generation_failures: int = 0,
         pending_batch=None,
+        ordinals_frontier_aligned: bool = True,
+        resume_frontier_ordinal=None,
+        resume_covered_task_indices=None,
     ):
         """Create a non-Ray collector instance for unit-testing local state."""
         collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
@@ -1190,6 +1194,9 @@ class TestAsyncTrajectoryCollector:
             start_step=0,
             next_nemo_gym_task_index=next_nemo_gym_task_index,
             pending_batch=pending_batch,
+            ordinals_frontier_aligned=ordinals_frontier_aligned,
+            resume_frontier_ordinal=resume_frontier_ordinal,
+            resume_covered_task_indices=resume_covered_task_indices,
         )
 
     def _prime_collection_loop(self, collector):
@@ -1445,6 +1452,38 @@ class TestAsyncTrajectoryCollector:
         assert fallback["frontier_aligned"] is False
         assert fallback["base_ordinal"] is None
 
+    def test_checkpoint_falls_back_when_ring_has_no_snapshot_at_frontier(self):
+        """Aligned ordinals but an evicted/empty ring still degrade cleanly."""
+        collector = self.create_local_collector()
+        assert collector._ordinals_frontier_aligned is True
+
+        # Empty ring: nothing to select from.
+        empty = collector.get_checkpoint_dataloader_state(5)
+        assert empty["frontier_aligned"] is False
+        assert empty["base_ordinal"] is None
+
+        # Every retained base sits above the frontier (older entries evicted).
+        collector._dataloader_snapshots.extend([(8, {"pos": 2}), (12, {"pos": 3})])
+        evicted = collector.get_checkpoint_dataloader_state(5)
+        assert evicted["frontier_aligned"] is False
+        assert evicted["base_ordinal"] is None
+
+    def test_get_checkpoint_state_omits_pending_on_frontier_snapshots(self):
+        """One call returns the cursor/pending pair; pending only on fallback."""
+        collector = self.create_local_collector(next_nemo_gym_task_index=4)
+        collector._dataloader_snapshots.append((0, {"pos": 0}))
+        collector._pending_batch = self.create_mock_batch(2)
+
+        aligned = collector.get_checkpoint_state(4)
+        assert aligned["dataloader"]["frontier_aligned"] is True
+        assert aligned["rollouts"] == {NEXT_NEMO_GYM_TASK_INDEX_KEY: 4}
+
+        collector._ordinals_frontier_aligned = False
+        fallback = collector.get_checkpoint_state(4)
+        assert fallback["dataloader"]["frontier_aligned"] is False
+        assert fallback["rollouts"][NEXT_NEMO_GYM_TASK_INDEX_KEY] == 4
+        assert fallback["rollouts"][PENDING_PROMPTS_KEY] is collector._pending_batch
+
     def test_stamping_falls_back_when_rows_cannot_carry_ordinals(self):
         """Un-stampable batches disable frontier alignment instead of crashing."""
         collector = self.create_local_collector()
@@ -1473,12 +1512,11 @@ class TestAsyncTrajectoryCollector:
         assert snapshot["frontier_aligned"] is True
         assert snapshot["base_ordinal"] == 4
 
-        phase_b = self.create_local_collector()
-        phase_b._next_nemo_gym_task_index = snapshot["base_ordinal"]
-        phase_b._ordinals_frontier_aligned = True
-        phase_b._resume_frontier_ordinal = 5
-        phase_b._covered_task_indices = {6, 7, 10}
-        phase_b._skip_horizon = 10
+        phase_b = self.create_local_collector(
+            next_nemo_gym_task_index=snapshot["base_ordinal"],
+            resume_frontier_ordinal=5,
+            resume_covered_task_indices=[6, 7, 10],
+        )
         loader_b = self._FakeStatefulLoader(
             batches, start=snapshot["dataloader_state"]["pos"]
         )
@@ -1544,12 +1582,11 @@ class TestAsyncTrajectoryCollector:
         assert sorted(legacy_skipped) == [5, 8, 9, 11]
 
         # Frontier semantics: rewind to the saved snapshot, drop covered rows.
-        frontier = self.create_local_collector()
-        frontier._next_nemo_gym_task_index = snapshot["base_ordinal"]
-        frontier._ordinals_frontier_aligned = True
-        frontier._resume_frontier_ordinal = 5
-        frontier._covered_task_indices = set(retained)
-        frontier._skip_horizon = max(retained)
+        frontier = self.create_local_collector(
+            next_nemo_gym_task_index=snapshot["base_ordinal"],
+            resume_frontier_ordinal=5,
+            resume_covered_task_indices=sorted(retained),
+        )
         frontier_stream = resume_stream(
             frontier,
             self._FakeStatefulLoader(
@@ -1565,23 +1602,15 @@ class TestAsyncTrajectoryCollector:
         assert not frontier_skipped
         assert not duplicates
 
-    def test_group_task_index_from_batch(self):
-        unanimous = BatchedDataDict[DatumSpec](
-            {"extra_env_info": [{NEMO_GYM_TASK_INDEX_KEY: 7}] * 3}
-        )
-        mixed = BatchedDataDict[DatumSpec](
-            {
-                "extra_env_info": [
-                    {NEMO_GYM_TASK_INDEX_KEY: 7},
-                    {NEMO_GYM_TASK_INDEX_KEY: 8},
-                ]
-            }
-        )
-        unstamped = BatchedDataDict[DatumSpec]({"extra_env_info": [{}, {}]})
+    def test_unanimous_task_index(self):
+        unanimous = [{NEMO_GYM_TASK_INDEX_KEY: 7}] * 3
+        mixed = [{NEMO_GYM_TASK_INDEX_KEY: 7}, {NEMO_GYM_TASK_INDEX_KEY: 8}]
+        unstamped = [{}, {}]
 
-        assert _group_task_index_from_batch(unanimous) == 7
-        assert _group_task_index_from_batch(mixed) is None
-        assert _group_task_index_from_batch(unstamped) is None
+        assert _unanimous_task_index(unanimous) == 7
+        assert _unanimous_task_index(mixed) is None
+        assert _unanimous_task_index(unstamped) is None
+        assert _unanimous_task_index([]) is None
 
     def test_rollouts_state_roundtrips_pending_batch(self, tmp_path):
         """The pending remainder survives torch.save/load and collector restore."""

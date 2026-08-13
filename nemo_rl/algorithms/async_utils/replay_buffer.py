@@ -368,10 +368,13 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         Returns:
             Mapping with ``num_trajectories`` (pre-filter count),
             ``NEXT_NEMO_GYM_TASK_INDEX_KEY`` (one past the highest saved task
-            index, computed before age/step filtering so a used index is never
-            re-issued), and ``RETAINED_TASK_INDICES_KEY`` (the sorted task
-            indices of the groups that survived filtering — what a
-            frontier-aligned resume must not regenerate).
+            index, computed before age/step filtering; on a legacy resume this
+            keeps used indices from being re-issued, while a frontier-aligned
+            resume deliberately rewinds the counter to the saved base ordinal
+            so the covered window re-yields under its original indices), and
+            ``RETAINED_TASK_INDICES_KEY`` (the sorted task indices of the
+            groups that survived filtering — what a frontier-aligned resume
+            must not regenerate).
         """
         state = torch.load(path, weights_only=False)
         saved_task_indices = [

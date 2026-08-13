@@ -172,7 +172,15 @@ On resume, the buffer is restored before the trajectory collector starts, then c
 3. **Incomplete targets kept** — target steps that still lack a full batch are kept in the buffer. The collector will *gap-fill* only the missing trajectories for those targets before moving on.
 4. **Buffer truncated** — if the restored count exceeds `max_size`, the buffer is truncated, prioritising entries closest to the resume step.
 
-The dataloader then re-yields the window between the trained frontier and the old cursor. Prompts already trained or retained in the restored buffer are dropped; everything else — in-flight work lost at the save, groups evicted during cleanup — is regenerated in order, so **no prompt is skipped and none is duplicated** across a save/restore cycle. (Resumes from checkpoints written before frontier alignment keep the previous live-cursor behaviour.)
+The dataloader then re-yields the window between the trained frontier and the old cursor. Prompts already trained or retained in the restored buffer are dropped; everything else — in-flight work lost at the save, groups evicted during cleanup — is regenerated in order, so **no prompt is skipped and none is duplicated as a result of the save/restore itself**.
+
+The guarantee is scoped to frontier-aligned checkpoints. A run falls back to the previous live-cursor checkpoints — which can skip prompts that were in flight at the save — under any of these conditions, each of which is logged when it occurs:
+
+- **Legacy checkpoints.** Resuming from a checkpoint written before frontier alignment disables it for the run, and because that run's checkpoints then carry no frontier metadata, for every run descended from them. A run only regains frontier alignment by starting fresh.
+- **Unstampable batches.** Prompts whose `extra_env_info` rows are not dicts cannot carry stream ordinals; the first such batch permanently disables frontier alignment for the run.
+- **Snapshot-ring eviction.** If no retained dataloader snapshot sits at or below the trained frontier, that checkpoint alone falls back to the live cursor.
+
+Independently of checkpointing, prompt groups whose generation fails a tolerated number of times (`max_generation_failures > 0`) are dropped during normal operation and are not recovered by a resume.
 
 ### Gap-filling after restore
 

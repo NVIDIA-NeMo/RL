@@ -234,7 +234,7 @@ This pattern maximizes throughput by keeping the CPU busy while waiting for netw
 The async GRPO collector uses the same prompt-group contract for Gym and native environments:
 
 - One batch worker owns each reserved target weight until all expected prompt groups are buffered or the batch fails.
-- Gym prompts receive a monotonic `_ng_task_index`. The counter is checkpointed, restored, and cross-checked against buffered trajectories so task identities are not reused after restart.
+- Every yielded prompt (Gym and native) receives a monotonic `_ng_task_index` equal to its position in the dataloader stream. The counter is checkpointed, restored, and cross-checked against buffered trajectories. On a legacy resume, task identities are never reused after restart; on a frontier-aligned resume, the counter is deliberately rewound to the saved base ordinal so the covered window re-yields under its original indices (rows already trained or retained are dropped before dispatch, and per-batch uniqueness is still enforced).
 - A partial Gym stream can be retried without duplicating groups that were already accepted by the replay buffer.
 - Native rollouts still execute as one batch. Their per-sample metrics are aggregated separately for each prompt group before buffering, so batch-level metrics are not duplicated across groups.
 - Gym rows are validated for range, uniqueness, completeness, and single-agent grouping. Results are restored to input order within a prompt group before post-processing.

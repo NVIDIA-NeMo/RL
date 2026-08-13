@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from contextlib import ExitStack, contextmanager
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -70,7 +71,14 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
-from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
+from nemo_rl.experience.interfaces import (
+    FRONTIER_ORDINAL_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+    NEXT_NEMO_GYM_TASK_INDEX_KEY,
+    PENDING_PROMPTS_KEY,
+    RESUME_BASE_ORDINAL_KEY,
+    RETAINED_TASK_INDICES_KEY,
+)
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.timer import Timer
@@ -877,11 +885,18 @@ class StubReplayBuffer:
     Each method returns a MagicMock with a 'remote' attribute that can be called.
     """
 
-    def __init__(self, initial_size=10, mock_batch=None, mock_rollout_metrics=None):
+    def __init__(
+        self,
+        initial_size=10,
+        mock_batch=None,
+        mock_rollout_metrics=None,
+        retained_task_indices=None,
+    ):
         self._size = initial_size
         self._trajectories = []
         self._mock_batch = mock_batch
         self._mock_rollout_metrics = mock_rollout_metrics or {}
+        self._retained_task_indices = list(retained_task_indices or [])
 
     @property
     def size(self):
@@ -895,13 +910,16 @@ class StubReplayBuffer:
         """Return a mock that returns sample result when .remote() is called"""
 
         def _sample(num_prompt_groups, current_weight_version, max_age_steps):
-            # Return proper trajectory structure expected by async GRPO
+            # Return proper trajectory structure expected by async GRPO. Each
+            # group carries its stream ordinal, like real buffered groups, so
+            # the driver's trained-frontier tracker is exercised.
             trajectories = [
                 {
                     "batch": self._mock_batch,
                     "rollout_metrics": self._mock_rollout_metrics,
+                    NEMO_GYM_TASK_INDEX_KEY: group_index,
                 }
-                for _ in range(num_prompt_groups)
+                for group_index in range(num_prompt_groups)
             ]
             return {
                 "trajectories": trajectories,
@@ -977,6 +995,7 @@ class StubReplayBuffer:
             return_value={
                 "num_trajectories": self._size,
                 "next_ng_task_index": 0,
+                RETAINED_TASK_INDICES_KEY: list(self._retained_task_indices),
             }
         )
         return mock
@@ -1010,11 +1029,12 @@ class StubAsyncTrajectoryCollector:
     Actor methods expose MagicMocks with a ``remote`` attribute.
     """
 
-    def __init__(self, health_side_effect=None):
+    def __init__(self, health_side_effect=None, checkpoint_frontier_aligned=False):
         self.check_health = MagicMock()
         self.check_health.remote = MagicMock(
             return_value=None, side_effect=health_side_effect
         )
+        self._checkpoint_frontier_aligned = checkpoint_frontier_aligned
 
     @property
     def start_collection(self):
@@ -1095,25 +1115,23 @@ class StubAsyncTrajectoryCollector:
         return mock
 
     @property
-    def get_rollouts_state(self):
-        """Return a remote-callable mock yielding collector rollout state."""
-        mock = MagicMock()
-        mock.remote = MagicMock(return_value={NEXT_NEMO_GYM_TASK_INDEX_KEY: 0})
-        return mock
+    def get_checkpoint_state(self):
+        """Return a remote-callable mock yielding the checkpoint pair.
 
-    @property
-    def get_checkpoint_dataloader_state(self):
-        """Return a remote-callable mock yielding a frontier snapshot result.
-
-        Mirrors the fallback shape (not frontier-aligned) so the checkpoint
-        path persists the plain dataloader state without frontier metadata.
+        Mirrors both snapshot shapes: the frontier-aligned one (ring snapshot
+        found at the frontier) and the live-cursor fallback, selected by the
+        ``checkpoint_frontier_aligned`` constructor flag.
         """
+        aligned = self._checkpoint_frontier_aligned
         mock = MagicMock()
         mock.remote = MagicMock(
             return_value={
-                "dataloader_state": {},
-                "base_ordinal": None,
-                "frontier_aligned": False,
+                "dataloader": {
+                    "dataloader_state": {},
+                    "base_ordinal": 0 if aligned else None,
+                    "frontier_aligned": aligned,
+                },
+                "rollouts": {NEXT_NEMO_GYM_TASK_INDEX_KEY: 0},
             }
         )
         return mock
@@ -1124,6 +1142,8 @@ def mock_async_grpo_infrastructure(
     mock_rollout_metrics,
     seq_logprob_error_result=None,
     collector_health_side_effect=None,
+    checkpoint_frontier_aligned=False,
+    retained_task_indices=None,
 ):
     """
     Context manager that mocks all async GRPO infrastructure (Ray actors, venv, etc).
@@ -1139,9 +1159,11 @@ def mock_async_grpo_infrastructure(
         initial_size=10,
         mock_batch=mock_batch,
         mock_rollout_metrics=mock_rollout_metrics,
+        retained_task_indices=retained_task_indices,
     )
     stub_collector = StubAsyncTrajectoryCollector(
-        health_side_effect=collector_health_side_effect
+        health_side_effect=collector_health_side_effect,
+        checkpoint_frontier_aligned=checkpoint_frontier_aligned,
     )
 
     # Patch venv creation
@@ -1358,6 +1380,146 @@ def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components)
 
     mock_grpo_components["checkpointer"].shutdown.assert_called_once()
     mock_grpo_components["policy"].shutdown.assert_called_once()
+
+
+@pytest.mark.parametrize("frontier_aligned", [True, False])
+def test_async_checkpoint_rollouts_state_frontier_key_contract(
+    mock_grpo_components, tmp_path, frontier_aligned
+):
+    """rollouts.pt carries the frontier keys iff the snapshot is aligned.
+
+    Pins both halves of the checkpoint-file contract at the driver level: the
+    frontier ordinal written under FRONTIER_ORDINAL_KEY comes from the trained
+    groups' own ordinals (max + 1), and RESUME_BASE_ORDINAL_KEY mirrors the
+    snapshot's base; a fallback snapshot writes neither key.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["save_period"] = 1
+    master_config.checkpointing["metric_name"] = None
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    checkpointer.checkpoint_dir = tmp_path
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    with (
+        mock_async_grpo_infrastructure(
+            mock_batch,
+            mock_rollout_metrics,
+            checkpoint_frontier_aligned=frontier_aligned,
+        ),
+        patch("nemo_rl.algorithms.grpo.torch.save") as mock_torch_save,
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    saved_by_name = {
+        os.path.basename(call.args[1]): call.args[0]
+        for call in mock_torch_save.call_args_list
+    }
+    assert "rollouts.pt" in saved_by_name
+    assert "train_dataloader.pt" in saved_by_name
+    rollouts_state = saved_by_name["rollouts.pt"]
+    assert rollouts_state[NEXT_NEMO_GYM_TASK_INDEX_KEY] == 0
+    if frontier_aligned:
+        # StubReplayBuffer stamps sampled groups 0..P-1, so the trained
+        # frontier is P; the stub snapshot reports base_ordinal 0.
+        expected_frontier = master_config.grpo.num_prompts_per_step
+        assert rollouts_state[FRONTIER_ORDINAL_KEY] == expected_frontier
+        assert rollouts_state[RESUME_BASE_ORDINAL_KEY] == 0
+    else:
+        assert FRONTIER_ORDINAL_KEY not in rollouts_state
+        assert RESUME_BASE_ORDINAL_KEY not in rollouts_state
+
+
+def test_async_resume_plumbs_frontier_metadata_into_collector(
+    mock_grpo_components, tmp_path
+):
+    """rollouts.pt frontier keys drive the collector's resume kwargs.
+
+    The read-back half of the checkpoint-file contract: base_ordinal feeds
+    next_nemo_gym_task_index, the frontier and the buffer's retained indices
+    feed the row filter, and the pending batch is dropped (the rewound
+    dataloader re-yields it).
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.get_latest_checkpoint_path.return_value = str(tmp_path)
+    checkpointer.checkpoint_dir = tmp_path
+
+    torch.save(
+        {
+            NEXT_NEMO_GYM_TASK_INDEX_KEY: 12,
+            FRONTIER_ORDINAL_KEY: 8,
+            RESUME_BASE_ORDINAL_KEY: 4,
+            PENDING_PROMPTS_KEY: {"should": "be dropped"},
+        },
+        tmp_path / "rollouts.pt",
+    )
+    torch.save({}, tmp_path / "replay_buffer.pt")  # existence gates the restore
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    collector_cls = MagicMock()
+    collector_cls.options.return_value.remote.return_value = (
+        StubAsyncTrajectoryCollector()
+    )
+    with (
+        mock_async_grpo_infrastructure(
+            mock_batch,
+            mock_rollout_metrics,
+            retained_task_indices=[9, 10],
+        ),
+        patch("nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector", collector_cls),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    collector_kwargs = collector_cls.options.return_value.remote.call_args.kwargs
+    assert collector_kwargs["next_nemo_gym_task_index"] == 4
+    assert collector_kwargs["resume_frontier_ordinal"] == 8
+    assert collector_kwargs["resume_covered_task_indices"] == [9, 10]
+    assert collector_kwargs["pending_batch"] is None
+    assert collector_kwargs["ordinals_frontier_aligned"] is True
 
 
 @pytest.mark.parametrize(

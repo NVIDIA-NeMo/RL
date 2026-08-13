@@ -57,17 +57,14 @@ _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
 
 
-def _group_task_index_from_batch(
-    batch: BatchedDataDict[DatumSpec],
-) -> Optional[int]:
-    """Return the group's task index when every row agrees on one.
+def _unanimous_task_index(rows: list[Any]) -> Optional[int]:
+    """Return the task index every row agrees on, or ``None``.
 
     A prompt group is one prompt repeated ``num_generations`` times, so its
     stamped rows all carry the same ordinal. Returns ``None`` for unstamped
-    batches (legacy runs) rather than guessing.
+    rows (legacy runs) rather than guessing.
     """
-    rows = batch.get("extra_env_info") if hasattr(batch, "get") else None
-    if not isinstance(rows, list) or not rows:
+    if not rows:
         return None
     ordinals = {
         row.get(NEMO_GYM_TASK_INDEX_KEY) if isinstance(row, dict) else None
@@ -184,8 +181,7 @@ class AsyncTrajectoryCollector:
         self._resume_frontier_ordinal = resume_frontier_ordinal
         self._covered_task_indices: set[int] = set(resume_covered_task_indices or [])
         self._skip_horizon = max(
-            self._covered_task_indices,
-            default=(resume_frontier_ordinal or 0) - 1,
+            [*self._covered_task_indices, (resume_frontier_ordinal or 0) - 1]
         )
 
         # Timer for efficiency metrics
@@ -460,7 +456,7 @@ class AsyncTrajectoryCollector:
         Returns:
             Whether the batch was stamped.
         """
-        rows = batch.get("extra_env_info") if hasattr(batch, "get") else None
+        rows = batch.get("extra_env_info")
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             if self._ordinals_frontier_aligned:
                 self._ordinals_frontier_aligned = False
@@ -505,16 +501,22 @@ class AsyncTrajectoryCollector:
         if self._resume_frontier_ordinal is None:
             return batch
 
-        rows = batch.get("extra_env_info") if hasattr(batch, "get") else None
-        ordinals = [
+        rows = batch.get("extra_env_info")
+        raw_ordinals = [
             row.get(NEMO_GYM_TASK_INDEX_KEY) if isinstance(row, dict) else None
             for row in (rows if isinstance(rows, list) else [])
         ]
-        if not ordinals or any(ordinal is None for ordinal in ordinals):
+        if not raw_ordinals or any(ordinal is None for ordinal in raw_ordinals):
             raise ValueError(
                 "Frontier-aligned resume requires task indices on every row, "
-                "but a re-yielded batch is missing them."
+                "but a re-yielded batch is missing them. The checkpoint was "
+                "written by a run whose batches carried task indices, so this "
+                "indicates the dataset or task-data processor changed since "
+                "the checkpoint was written; silently continuing could "
+                "re-train retained prompts. Resume with the original data "
+                "configuration, or start a fresh run."
             )
+        ordinals = cast(list[int], raw_ordinals)
 
         if min(ordinals) > self._skip_horizon:
             # The covered window has been fully re-yielded; stop filtering.
@@ -559,6 +561,7 @@ class AsyncTrajectoryCollector:
         if self._ordinals_frontier_aligned:
             best: Optional[tuple[int, dict]] = None
             with self._snapshot_lock:
+                ring_bases = [base for base, _ in self._dataloader_snapshots]
                 for base_ordinal, state in self._dataloader_snapshots:
                     if base_ordinal <= frontier_ordinal and (
                         best is None or base_ordinal > best[0]
@@ -570,11 +573,51 @@ class AsyncTrajectoryCollector:
                     "base_ordinal": best[0],
                     "frontier_aligned": True,
                 }
+            print(
+                "⚠️ No dataloader snapshot at or below frontier ordinal "
+                f"{frontier_ordinal} (snapshot ring covers "
+                f"{f'[{min(ring_bases)}, {max(ring_bases)}]' if ring_bases else 'nothing'}); "
+                "this checkpoint falls back to the live cursor and a resume "
+                "from it may skip in-flight prompts."
+            )
         return {
             "dataloader_state": self.get_dataloader_state(),
             "base_ordinal": None,
             "frontier_aligned": False,
         }
+
+    def get_checkpoint_state(self, frontier_ordinal: int) -> dict[str, Any]:
+        """Return the dataloader snapshot and rollout state as one consistent pair.
+
+        Reading them in separate actor calls lets the collection loop consume
+        the pending remainder and pull the next batch in between, so a
+        fallback (live-cursor) checkpoint could pair a cursor already past
+        batch K+1 with a pending suffix of batch K+1 — duplicating those
+        prompts on resume. Holding the pending lock across both reads keeps
+        the pair consistent: the loop cannot take or store the pending batch
+        while it is held.
+
+        The pending remainder is only included on fallback snapshots. On a
+        frontier-aligned snapshot the rewound dataloader re-yields it (the
+        restore path forces ``pending_batch=None``), so persisting it would
+        be dead weight in every frontier checkpoint.
+
+        Returns:
+            Mapping with ``dataloader`` (same shape as
+            :meth:`get_checkpoint_dataloader_state`) and ``rollouts`` (same
+            shape as :meth:`get_rollouts_state`).
+        """
+        with self._pending_lock:
+            dataloader_snapshot = self.get_checkpoint_dataloader_state(frontier_ordinal)
+            rollouts_state: dict[str, Any] = {
+                NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index
+            }
+            if (
+                not dataloader_snapshot["frontier_aligned"]
+                and self._pending_batch is not None
+            ):
+                rollouts_state[PENDING_PROMPTS_KEY] = self._pending_batch
+        return {"dataloader": dataloader_snapshot, "rollouts": rollouts_state}
 
     def _process_batch(
         self, batch: BatchedDataDict[DatumSpec]
@@ -719,7 +762,9 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
-            return leftover
+            # No worker was started, so nothing in `batch` was consumed: hand
+            # the whole batch back rather than only the gap-fill tail.
+            return batch if not worker_started else leftover
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
@@ -1212,6 +1257,7 @@ class AsyncTrajectoryCollector:
         expected_prompt_groups: int,
         buffered_group_indices: set[int],
         collection_started_at: float,
+        input_task_index: Optional[int] = None,
     ) -> None:
         """Push one prompt group to the replay buffer with bounded backoff."""
         final_batch_cpu = rollout_result.final_batch.to("cpu")
@@ -1256,10 +1302,11 @@ class AsyncTrajectoryCollector:
         }
         group_task_index = rollout_result.task_index
         if group_task_index is None:
-            # Native groups carry their ordinal in the stamped extra_env_info
-            # rows; recording it on the group lets a frontier restore report
-            # which prompts the retained buffer already covers.
-            group_task_index = _group_task_index_from_batch(final_batch_cpu)
+            # Native groups carry their ordinal on the stamped *input* rows,
+            # captured before the rollout ran; recording it on the group lets
+            # a frontier restore report which prompts the retained buffer
+            # already covers.
+            group_task_index = input_task_index
         if group_task_index is not None:
             trajectory_group[NEMO_GYM_TASK_INDEX_KEY] = group_task_index
         backoff_delay = 0.01
@@ -1337,6 +1384,21 @@ class AsyncTrajectoryCollector:
             if use_nemo_gym
             else {}
         )
+        # Capture each group's ordinal from the *input* rows up front: the
+        # rollout may replace extra_env_info wholesale (multi-turn envs can
+        # build fresh metadata dicts), so the output rows are not a reliable
+        # carrier for the stamp.
+        input_rows = repeated_batch.get("extra_env_info")
+        group_input_task_indices: list[Optional[int]] = [
+            _unanimous_task_index(
+                input_rows[
+                    group_index * num_generations : (group_index + 1) * num_generations
+                ]
+                if isinstance(input_rows, list)
+                else []
+            )
+            for group_index in range(expected_prompt_groups)
+        ]
         buffered_group_indices: set[int] = set()
         last_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
@@ -1376,6 +1438,7 @@ class AsyncTrajectoryCollector:
                                 expected_prompt_groups=expected_prompt_groups,
                                 buffered_group_indices=buffered_group_indices,
                                 collection_started_at=collection_started_at,
+                                input_task_index=group_input_task_indices[group_index],
                             )
                         )
                     )

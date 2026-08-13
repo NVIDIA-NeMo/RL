@@ -88,6 +88,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
     RESUME_BASE_ORDINAL_KEY,
@@ -4277,7 +4278,7 @@ def async_grpo_train(
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    replay_buffer_restore_metadata: dict[str, int] | None = None
+    replay_buffer_restore_metadata: dict[str, Any] | None = None
     rollouts_state = None
     if last_checkpoint_path is not None:
         replay_buffer_restore_metadata = _maybe_restore_async_replay_buffer_checkpoint(
@@ -4335,6 +4336,24 @@ def async_grpo_train(
             # keeps live-cursor checkpoints.
             "ordinals_frontier_aligned": last_checkpoint_path is None,
         }
+        if last_checkpoint_path is not None:
+            print(
+                "⚠️ Legacy checkpoint resume: frontier-aligned checkpointing "
+                "is disabled for this run and every checkpoint descended from "
+                "it. Checkpoints will save the live dataloader cursor, so a "
+                "resume may skip prompts that were in flight at the save."
+            )
+
+    # High-water mark of trained group ordinals, exclusive: the checkpoint
+    # frontier. consumed_samples counts prompts per step, but tolerated
+    # generation failures (max_generation_failures > 0) leave holes in the
+    # stream that the counter never sees, so it lags the true stream position
+    # — a frontier derived from it would re-train the lag window and treat
+    # dropped prompts as covered on resume. The trained rows' own ordinals
+    # have no such drift.
+    trained_frontier_ordinal = (
+        int(frontier_ordinal) if frontier_ordinal is not None else consumed_samples
+    )
 
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
@@ -4689,6 +4708,22 @@ def async_grpo_train(
                     # Extract trajectories and metadata from sample result
                     trajectories = sample_result["trajectories"]
                     avg_trajectory_age = sample_result["avg_trajectory_age"]
+
+                    # Advance the trained frontier from the sampled groups'
+                    # own stream ordinals (see the tracker's definition for
+                    # why consumed_samples cannot serve as the frontier).
+                    sampled_ordinals = [
+                        trajectory.get(NEMO_GYM_TASK_INDEX_KEY)
+                        for trajectory in trajectories
+                        if isinstance(trajectory, dict)
+                    ]
+                    if sampled_ordinals and all(
+                        ordinal is not None for ordinal in sampled_ordinals
+                    ):
+                        trained_frontier_ordinal = max(
+                            trained_frontier_ordinal,
+                            max(int(ordinal) for ordinal in sampled_ordinals) + 1,
+                        )
 
                     print(
                         f"✅ Sampled {len(trajectories)} trajectory groups from buffer (avg age: {avg_trajectory_age:.2f} steps)"
@@ -5230,18 +5265,22 @@ def async_grpo_train(
                             checkpointing_cfg=master_config.checkpointing,
                         )
                         # Save the dataloader state aligned with the trained
-                        # frontier (consumed_samples) rather than the live
-                        # cursor, which has already advanced past prompts that
-                        # are still in flight or buffered. A resume re-yields
-                        # the covered window and regenerates whatever the
-                        # restored buffer does not retain, so no prompt is
-                        # skipped. Falls back to the live cursor for runs
-                        # whose ordinals are not frontier-aligned.
-                        dataloader_snapshot = ray.get(
-                            trajectory_collector.get_checkpoint_dataloader_state.remote(
-                                grpo_save_state.consumed_samples
+                        # frontier rather than the live cursor, which has
+                        # already advanced past prompts that are still in
+                        # flight or buffered. A resume re-yields the covered
+                        # window and regenerates whatever the restored buffer
+                        # does not retain, so no prompt is skipped. Falls back
+                        # to the live cursor for runs whose ordinals are not
+                        # frontier-aligned. One actor call returns the
+                        # snapshot and the rollout state as a consistent
+                        # pair — separate reads would race the collection loop.
+                        collector_checkpoint = ray.get(
+                            trajectory_collector.get_checkpoint_state.remote(
+                                trained_frontier_ordinal
                             )
                         )
+                        dataloader_snapshot = collector_checkpoint["dataloader"]
+                        rollouts_state = collector_checkpoint["rollouts"]
                         torch.save(
                             dataloader_snapshot["dataloader_state"],
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
@@ -5250,12 +5289,9 @@ def async_grpo_train(
                             replay_buffer,
                             checkpoint_path,
                         )
-                        rollouts_state = ray.get(
-                            trajectory_collector.get_rollouts_state.remote()
-                        )
                         if dataloader_snapshot["frontier_aligned"]:
                             rollouts_state[FRONTIER_ORDINAL_KEY] = (
-                                grpo_save_state.consumed_samples
+                                trained_frontier_ordinal
                             )
                             rollouts_state[RESUME_BASE_ORDINAL_KEY] = (
                                 dataloader_snapshot["base_ordinal"]
