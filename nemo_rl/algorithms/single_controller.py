@@ -630,7 +630,11 @@ class SingleControllerActor:
                 self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
                 self._timeout.mark_iteration()
 
-                is_last_step = self._train_steps >= grpo_cfg.max_num_steps
+
+                is_last_step = self._train_steps >= grpo_cfg.max_num_steps or (
+                    self._rollout_exhausted.is_set() and len(self._buffer) == 0
+                )
+                ft_save_period = self._master_config.checkpointing.get("ft_save_period")
                 # _train_steps was already incremented above, so it equals
                 # the legacy loop's 1-indexed `step + 1`.
                 should_save_by_step = (
@@ -638,6 +642,10 @@ class SingleControllerActor:
                     or self._train_steps
                     % self._master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and self._train_steps % ft_save_period == 0
+                    )
                 )
                 should_save_by_timeout = self._timeout.check_save()
 
@@ -806,8 +814,10 @@ class SingleControllerActor:
             checkpoint_path,
             wait_fn=self._trainer.finalize_async_save,
         )
-        _write_latest_checkpoint_status(
-            self._checkpointer, last_checkpoint_step=self._train_steps
+        await asyncio.to_thread(
+            _write_latest_checkpoint_status,
+            self._checkpointer,
+            last_checkpoint_step=self._train_steps,
         )
 
     async def _sync_weights(

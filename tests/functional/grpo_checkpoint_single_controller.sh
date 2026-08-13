@@ -1,5 +1,10 @@
 #!/bin/bash
-# Verifies that the SingleController (SC) path saves and restores a full
+# Verifies checkpoint save/restore MECHANICS only. Metric equivalence across
+# resume is not well-defined here: prompts in flight at save time are dropped
+# while the dataloader cursor has already advanced past them (not exact-once),
+# so a resumed run does not consume the same prompts as an uninterrupted one.
+#
+# Covered: the SingleController (SC) path saves and restores a full
 # checkpoint across a training restart: model weights/optimizer + training
 # state, dataloader position, and the replay buffer. Two runs share one
 # checkpoint_dir and one config (same max_num_steps, so Megatron train_iters

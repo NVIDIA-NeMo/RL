@@ -198,6 +198,20 @@ class _FakeSampler:
         pass
 
 
+class _ExhaustingSampler(_FakeSampler):
+    """Serves exactly ``steps`` full batches, then reports no data forever."""
+
+    def __init__(self, steps: int) -> None:
+        super().__init__()
+        self._remaining = steps
+
+    async def select(self, **kwargs) -> tuple[Optional[KVBatchMeta], int]:
+        if self._remaining == 0:
+            return None, 0
+        self._remaining -= 1
+        return await super().select(**kwargs)
+
+
 class _FakeDPClient:
     def __init__(self) -> None:
         self.clear_calls: list[tuple[list[str], str]] = []
@@ -231,6 +245,8 @@ class _FakeTQBuffer:
         state: Optional[dict[str, Any]] = None,
         load_return: int = 0,
     ) -> None:
+        # Empty like a drained buffer; the pump's exhaustion checks len() it.
+        self._num_groups = 0
         self._state = state if state is not None else {"fake_buffer_envelope": 1}
         self.load_return = load_return
         self.state_dict_calls: list[int] = []
@@ -257,6 +273,9 @@ class _FakeTQBuffer:
             }
         )
         return self.load_return
+
+    def __len__(self) -> int:
+        return self._num_groups
 
 
 # Default position sentinel the fake dataloader reports via state_dict().
@@ -291,6 +310,7 @@ def _actor_master_config(
     metric_name: Optional[str] = None,
     save_optimizer: bool = True,
     checkpoint_must_save_by: Optional[str] = None,
+    ft_save_period: Optional[int] = None,
     num_prompts_per_step: int = 2,
     max_num_epochs: int = 1,
 ) -> MasterConfig:
@@ -333,6 +353,7 @@ def _actor_master_config(
             "save_period": save_period,
             "save_optimizer": save_optimizer,
             "checkpoint_must_save_by": checkpoint_must_save_by,
+            "ft_save_period": ft_save_period,
         },
         data_plane={"enabled": True, "impl": "transfer_queue"},
         async_rl=AsyncRLConfig(
@@ -636,6 +657,46 @@ class TestSaveTrigger:
         assert actor._train_steps == 1
         assert len(trainer.save_calls) == 1
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
+
+    def test_rollout_exhaustion_saves_final_checkpoint(self, tmp_path):
+        # A resumed run can exhaust its data before max_num_steps:
+        # _clamp_max_num_steps budgets against the full per-epoch batch count,
+        # but the restored loader holds only the remaining batches. Once
+        # rollout is exhausted and the buffer is drained, every completed step
+        # is potentially the last one, so it must save — previously the pump
+        # exited right after it with nothing written and exit code 0.
+        mc = _actor_master_config(tmp_path, max_num_steps=4, save_period=100)
+        trainer = _FakeTrainer()
+
+        async def _main():
+            actor = _ACTOR_CLS(
+                mc, _make_actor_args(trainer=trainer), SetupTimingMetrics()
+            )
+            actor._sampler = _ExhaustingSampler(steps=2)
+            actor._rollout_exhausted.set()
+            with patch("ray.cluster_resources", return_value={"GPU": 0}):
+                await actor._train_pump()
+            actor._checkpointer.shutdown()
+            return actor
+
+        actor = asyncio.run(_main())
+
+        # Stopped short of max_num_steps=4, but the completed steps saved.
+        assert actor._train_steps == 2
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_1", "step_2"}
+
+    def test_ft_save_period_triggers_saves(self, tmp_path):
+        # checkpointing.ft_save_period ORs into the save trigger like on
+        # every other algorithm; silently ignoring it would break crash
+        # recovery for users who configured it.
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=3, save_period=100, ft_save_period=2
+        )
+
+        _run_train_pump(mc, _make_actor_args())
+
+        # step_2 from ft_save_period, step_3 from last-step.
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_2", "step_3"}
 
 
 # ── async-save finalization ──────────────────────────────────────────────────
