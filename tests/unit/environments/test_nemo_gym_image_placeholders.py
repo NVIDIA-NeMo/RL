@@ -18,7 +18,6 @@ from PIL import Image
 
 from nemo_rl.environments.nemo_gym import _attach_multimodal_data_to_user_message
 
-
 # --------------------------------------------------------------------------
 # ragged pixel_values path in _attach_multimodal_data_to_user_message
 # --------------------------------------------------------------------------
