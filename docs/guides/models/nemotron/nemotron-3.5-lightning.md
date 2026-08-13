@@ -1,9 +1,20 @@
 # Nemotron 3.5 Lightning
 
-This guide explains how to reproduce the Nemotron 3.5 Lightning RLVR recipe
+This guide covers two ways to post-train Nemotron 3.5 Lightning with NeMo RL:
+
+- [RLVR with NeMo Gym (GB200 reference run)](#rlvr-with-nemo-gym-gb200-reference-run) —
+  the full 86-node asynchronous GRPO + NeMo Gym recipe used for the reference
+  RLVR stage on GB200 NVL72 (ARM64 / aarch64) hardware.
+- [DAPO math RL with the automodel backend](#dapo-math-rl-with-the-automodel-backend) —
+  a compact 4-node DAPO recipe on the DTensor (automodel) training backend,
+  useful as a smaller-footprint starting point on x86 H100 clusters.
+
+## RLVR with NeMo Gym (GB200 reference run)
+
+This section explains how to reproduce the Nemotron 3.5 Lightning RLVR recipe
 with NeMo RL on **GB200 NVL72** (ARM64 / aarch64) hardware.
 
-## Overview
+### Overview
 
 Nemotron 3.5 Lightning is post-trained in a single Reinforcement Learning with
 Verifiable Rewards (RLVR) stage using asynchronous Group Relative Policy
@@ -33,7 +44,7 @@ The reference run uses the following training configuration:
 | Policy-generation parallelism | TP=4, PP=1 |
 | Training precision | BF16 |
 
-### Topology
+#### Topology
 
 The recipe uses four GPUs per GB200 node:
 
@@ -46,7 +57,7 @@ The recipe uses four GPUs per GB200 node:
 | NL2Bash judge | 4 independent TP=4 vLLM servers | 4 | 16 |
 | **Total** |  | **86** | **344** |
 
-## Prepare the code
+### Prepare the code
 
 Clone NeMo RL and its submodules on a filesystem visible to every allocated
 node:
@@ -61,7 +72,7 @@ and Gym checkout into the training container. With `USE_SNAPSHOT=1` (the
 default), it first snapshots tracked source files so the submitted job uses a
 stable copy.
 
-## Container
+### Container
 
 Nemotron 3.5 Lightning uses vLLM and requires an **aarch64 (arm64)** image for
 GB200 NVL72 nodes. Prebake the NeMo Gym virtual environments used by the recipe
@@ -107,7 +118,7 @@ used instead on clusters that do not require a local squashfs image. The same
 image is used for training, policy generation, and the external judge pools by
 default.
 
-## Download and prepare the data
+### Download and prepare the data
 
 The RLVR blend is published as
 [`nvidia/Nemotron-RL-Lightning-Training-Blend`](https://huggingface.co/datasets/nvidia/Nemotron-RL-Lightning-Training-Blend).
@@ -150,7 +161,7 @@ in `rlvr.yaml`.
 For each external dataset you elect to use, you are responsible for confirming
 that its license is appropriate for your intended use.
 
-## Build the sandbox container
+### Build the sandbox container
 
 Several Gym environments used by the Lightning blend, including `ns_tools`
 and `math_formal_lean`, execute verification tools in a sandbox container.
@@ -173,7 +184,7 @@ enroot import -o nemo-skills-sandbox.sqsh \
 
 Pass this image as `SANDBOX_CONTAINER` when launching training.
 
-## Prepare the policy and judge models
+### Prepare the policy and judge models
 
 Set `MODEL_PATH` to the Transformers-compatible Nemotron 3.5 Lightning SFT
 checkpoint from which RLVR should start.
@@ -190,7 +201,7 @@ The recipe uses three judge roles:
 | `NL2BASH_JUDGE_MODEL` | [`Qwen/Qwen3-235B-A22B-Instruct-2507-FP8`](https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8) | 4 external TP=4 servers |
 | `SAFETY_JUDGE_MODEL` | [`nvidia/Nemotron-Content-Safety-Reasoning-4B`](https://huggingface.co/nvidia/Nemotron-Content-Safety-Reasoning-4B) | Gym TP=4, DP=2 |
 
-## Launch script
+### Launch script
 
 Run `examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh` from the
 repository root. The launcher handles Slurm submission, source snapshots,
@@ -208,7 +219,7 @@ Optional knobs:
 | `WANDB_PROJ` | `nemotron-3.5-lightning` | W&B project name |
 | `DRY_RUN` | `0` | Set to `1` to print the resolved training command without submitting |
 
-## Launch RLVR
+### Launch RLVR
 
 The following command launches the complete 86-node reference topology. Run it
 from a NeMo RL checkout located under the shared filesystem root:
@@ -236,3 +247,56 @@ SLURM_PARTITION=your-partition \
 SLURM_ACCOUNT=your-account \
 bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh
 ```
+
+## DAPO math RL with the automodel backend
+
+The recipe `examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel.yaml`
+trains [`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16)
+with DAPO on math data using the DTensor (automodel) training backend and
+colocated vLLM generation. It runs on 4 nodes of 8x H100 80GB and is also
+exercised as a nightly test
+(`tests/test_suites/llm/dapo-nanov3.5-30BA3B-4n8g-automodel.sh`).
+
+### Overview
+
+| Setting | Value |
+|---|---:|
+| Algorithm | GRPO with DAPO (dynamic sampling, overlong filtering, reward scaling/shaping, TIS) |
+| Data | `DAPOMath17K` train / `DAPOMathAIME2024` validation |
+| Maximum sequence length | 9,216 tokens (8,192 generated) |
+| Rollouts per step | 32 prompts x 16 generations (global batch size 512) |
+| Training parallelism | DTensor FSDP with EP=8, TP=1, activation checkpointing |
+| Policy generation | Colocated vLLM TP=4 |
+| Optimizer | TransformerEngine `FusedAdam`, lr 1e-6, wd 0.1, 10-step warmup |
+| Training precision | BF16 |
+
+The Lightning checkpoint ships a Multi-Token Prediction (MTP) module
+(`mtp.*` weights, `num_nextn_predict_layers=1`). The recipe ignores MTP
+end-to-end without code changes: the automodel custom NemotronH
+implementation builds only the backbone and LM head, the DCP loader never
+reads the `mtp.*` tensors, and vLLM skips them at load and refit. Keep
+`dtensor_cfg.automodel_kwargs.force_hf` and generation `speculative_config`
+unset, otherwise the MTP module is instantiated.
+
+### Launch training
+
+From the repository root:
+
+```bash
+uv run examples/run_grpo.py \
+    --config examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel.yaml \
+    logger.wandb_enabled=True
+```
+
+For launching on a multi-node Slurm or Kubernetes cluster, see the
+[cluster guide](../../../cluster.md). Interrupted runs resume automatically
+from the latest checkpoint in `checkpointing.checkpoint_dir`.
+
+### Results
+
+Over roughly 210 steps, training reward climbs
+from -0.7 to about 0.5 and AIME-2024 validation accuracy improves from 0.33
+to about 0.75. The truncation rate drops from ~0.5 to ~0.1 as responses
+shorten from ~5,500 to ~3,000 generated tokens per sample.
+
+![Nemotron 3.5 Lightning DAPO automodel training curves](../../../assets/nemotron/nemotron-3.5-lightning-automodel.png)
