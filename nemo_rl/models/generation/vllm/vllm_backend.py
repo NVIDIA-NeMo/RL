@@ -205,6 +205,32 @@ class VllmInternalWorkerExtension:
             return
         self._load_full_hf_weights(policy_weights)
 
+    def _prepare_reload_weight_iterator(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Prepare checkpoint-format weights for vLLM's native reload API."""
+        if (
+            "Gemma3ForConditionalGeneration"
+            in self.model_runner.vllm_config.model_config.architectures
+        ):
+            weights = (
+                (fix_gemma3_vision_weight_name(name), weight)
+                for name, weight in weights
+            )
+        return weights
+
+    def _collective_requires_batched_loading(self) -> bool:
+        """Return whether refit requires the existing batched loading lifecycle."""
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            return True
+        if any(name.startswith("draft.") for name in self.state_dict_info):
+            return True
+        if self._get_drafter_model() is None:
+            return False
+        return self._mtp_drafter_refit_enabled()
+
     def bind_numa(self) -> bool:
         """Pin this TP worker to its GPU's NUMA-local CPUs/memory.
 
@@ -755,14 +781,31 @@ class VllmInternalWorkerExtension:
         )
 
         try:
-            with self._weight_update_lifecycle("collective") as finalize:
-                packed_broadcast_consumer(
+            if self._collective_requires_batched_loading():
+                # Eagle/MTP drafters consume parts of the same stream. Preserve
+                # their existing batched loading and explicit finalization path.
+                with self._weight_update_lifecycle("collective") as finalize:
+                    packed_broadcast_consumer(
+                        iterator=iter(self.state_dict_info.items()),
+                        group=self.model_update_group,
+                        src=0,
+                        post_unpack_func=self._load_weights,
+                    )
+                    finalize()
+            else:
+                weight_iterator = packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,
                     src=0,
-                    post_unpack_func=self._load_weights,
+                    post_unpack_func=None,
+                    return_iterator=True,
                 )
-                finalize()
+                assert weight_iterator is not None
+                self.model_runner.reload_weights(
+                    weights_iterator=self._prepare_reload_weight_iterator(
+                        weight_iterator
+                    )
+                )
 
         except Exception as e:
             if self._weight_update_errors_are_fatal():
