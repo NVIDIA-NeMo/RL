@@ -449,6 +449,20 @@ def _is_fp8_weight(name, model):
     return name in fp8_state.fp8_param_names
 
 
+def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a checkpoint-layout weight while preserving its logical shape."""
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        MXFP8_BLOCK_SIZE,
+        mxfp8_e4m3_quantize,
+    )
+
+    value, scale = mxfp8_e4m3_quantize(weight)
+    value = value.reshape(weight.shape)
+    scale = scale.reshape(*weight.shape[:-1], weight.shape[-1] // MXFP8_BLOCK_SIZE)
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    return value, scale
+
+
 def load_weights(weights, model_runner):
     global global_fp8_config
     weights_quantized = []
@@ -460,17 +474,13 @@ def load_weights(weights, model_runner):
             continue
         # Cast the weight into fp8 and its scale factor
         if global_fp8_config.is_mx:
-            from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-                mxfp8_e4m3_quantize,
-            )
-
-            param_lp, param_scale = mxfp8_e4m3_quantize(v)
+            param_lp, param_scale = quantize_mxfp8_weight(v)
         else:
             param_lp, param_scale = cast_tensor_to_fp8_blockwise(
                 v.to(torch.float),
                 weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
             )
-        param_scale = torch.squeeze(param_scale, dim=-1)
+            param_scale = torch.squeeze(param_scale, dim=-1)
         if global_fp8_config.is_mx:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
