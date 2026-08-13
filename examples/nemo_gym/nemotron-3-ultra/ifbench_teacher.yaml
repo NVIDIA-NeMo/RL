@@ -47,7 +47,7 @@ checkpointing:
 grpo:
   num_prompts_per_step: 128
   num_generations_per_prompt: 16
-  num_val_generations_per_prompt: 2
+  val_num_generations_per_prompt: 2
   max_rollout_turns: 1
   max_num_epochs: 1
   max_num_steps: 1000000
@@ -61,6 +61,10 @@ grpo:
   val_at_end: false
   overlong_filtering: false
   max_val_samples: null
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
 
@@ -87,6 +91,7 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
+    max_generation_failures: 3
     in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: false
 
@@ -301,6 +306,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     # TP=8 EP=8: EP=TP so vllm_dp_size=1, async_engine=true works with NeMo Gym.
@@ -330,6 +338,7 @@ policy:
         reasoning_parser: nano_v3
 
     vllm_kwargs:
+      moe_backend: flashinfer_cutlass
       attention_backend: FLASH_ATTN
       mamba_ssm_cache_dtype: "float32"
       # Hybrid Mamba: one state slot per running seq; the vLLM default (1024) can

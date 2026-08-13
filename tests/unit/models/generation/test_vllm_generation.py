@@ -38,6 +38,8 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    VllmGenerationWorkerImpl,
+    _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -65,11 +67,13 @@ basic_vllm_test_config: VllmConfig = {
     "temperature": 1.0,
     "top_p": 1.0,
     "top_k": None,
+    "val_temperature": 1.0,
+    "val_top_p": 1.0,
+    "val_top_k": None,
     "stop_token_ids": None,
     "stop_strings": None,
     "vllm_cfg": {
         "precision": "bfloat16",
-        "refit_batched_moe_shuffle": True,
         "refit_cache_loader_routes": False,
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
@@ -147,6 +151,52 @@ def test_prepare_refit_info_skips_missing_metadata():
 
     assert generation.prepare_refit_info(None) is None
     generation.worker_group.run_all_workers_single_data.assert_not_called()
+
+
+def test_context_capped_max_new_tokens():
+    assert (
+        _context_capped_max_new_tokens(
+            configured_max_new_tokens=8192,
+            input_length=3058,
+            max_model_len=8192,
+        )
+        == 5134
+    )
+    assert (
+        _context_capped_max_new_tokens(
+            configured_max_new_tokens=256,
+            input_length=3058,
+            max_model_len=8192,
+        )
+        == 256
+    )
+    with pytest.raises(ValueError, match="exhausts the model context"):
+        _context_capped_max_new_tokens(
+            configured_max_new_tokens=8192,
+            input_length=8192,
+            max_model_len=8192,
+        )
+
+
+def test_sampling_params_preserve_bad_words():
+    worker = object.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {
+        "top_k": None,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 128,
+        "stop_token_ids": None,
+        "bad_words": ["<image>", "<img>"],
+        "ignore_eos": False,
+    }
+    worker.SamplingParams = lambda **kwargs: kwargs
+
+    sampling_params = worker._build_sampling_params(
+        greedy=False,
+        stop_strings=None,
+    )
+
+    assert sampling_params["bad_words"] == ["<image>", "<img>"]
 
 
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
@@ -1656,7 +1706,6 @@ def test_vllm_http_server(cluster, tokenizer):
         top_p=generation_config["top_p"],
         # We want to test the actual train flow and how this is used. So we need to get logprobs here.
         logprobs=True,
-        return_tokens_as_token_ids=True,
         max_tokens=1,
     )
 
@@ -1665,6 +1714,21 @@ def test_vllm_http_server(cluster, tokenizer):
     # Generate and check result
     response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body)
     actual_result = response.json()
+
+    expected_prompt_token_ids = [
+        151644,
+        872,
+        198,
+        1830,
+        311,
+        220,
+        20,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+    ]
 
     # This result assumes this exact model. The expected result here is what the full result looks like before we standardize.
     expected_result = {
@@ -1685,6 +1749,8 @@ def test_vllm_http_server(cluster, tokenizer):
                     # vLLM 0.25 omits tool_calls when empty and dropped
                     # reasoning_content in favor of reasoning.
                     "reasoning": None,
+                    "prompt_token_ids": expected_prompt_token_ids,
+                    "generation_token_ids": [151667],
                 },
                 "logprobs": {
                     "content": [
@@ -1731,10 +1797,25 @@ def test_vllm_http_server(cluster, tokenizer):
         message = d["choices"][0]["message"]
         for key in ("reasoning", "reasoning_content"):
             message.pop(key, None)
+        message.pop("generation_log_probs", None)
 
         return d
 
+    assert actual_result["choices"][0]["message"]["generation_log_probs"] == [
+        actual_result["choices"][0]["logprobs"]["content"][0]["logprob"]
+    ]
     assert _standardize(expected_result) == _standardize(actual_result)
+
+    # The server default requests token IDs, so top_logprobs=None cannot provide
+    # the log probabilities required by the training response contract.
+    response = requests.post(
+        url=f"{base_urls[0]}/chat/completions",
+        json=body | {"top_logprobs": None},
+    )
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == 400
+    assert "top_logprobs" in error["message"]
 
     # Check that tokenization route works
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
@@ -1742,20 +1823,7 @@ def test_vllm_http_server(cluster, tokenizer):
     expected_result = {
         "count": 12,
         "max_model_len": 1024,
-        "tokens": [
-            151644,
-            872,
-            198,
-            1830,
-            311,
-            220,
-            20,
-            151645,
-            198,
-            151644,
-            77091,
-            198,
-        ],
+        "tokens": expected_prompt_token_ids,
         "token_strs": None,
     }
     assert expected_result == actual_result
@@ -2061,6 +2129,10 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
         url=f"{base_urls[0]}/chat/completions", json=body_with_reference_token_ids
     )
     vllm_http_server_result = response.json()
+    assert (
+        vllm_http_server_result["choices"][0]["message"]["prompt_token_ids"]
+        == initial_tokenized_query_ids
+    )
     vllm_http_server_generated_token = vllm_http_server_result["choices"][0][
         "logprobs"
     ]["content"][0]

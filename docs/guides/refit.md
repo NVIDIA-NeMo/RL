@@ -40,7 +40,6 @@ GRPO and distillation setup paths; PPO currently requires colocated generation.
 | Option | Scope | Effect |
 |---|---|---|
 | `policy.generation.vllm_cfg.refit_prequantize` | Megatron training with MXFP8 vLLM rollout | Quantizes eligible weights on the trainer and transfers E4M3 values plus E8M0 scales. Requires `precision: fp8` and `is_mx: true`; sparse delta and NCCL Reshard do not support it. |
-| `policy.generation.vllm_cfg.refit_batched_moe_shuffle` | MXFP8 vLLM rollout | Batches MoE weight-layout transforms across experts. Enabled by default. |
 | `policy.generation.vllm_cfg.refit_cache_loader_routes` | vLLM refit | Replays identity-validated weight-loader routes after the first refit. Disabled by default because loader behavior is model-dependent. |
 | `policy.refit_buffer_size_gb` | Colocated IPC/HTTP or non-colocated NCCL broadcast | Sets the packing threshold explicitly. For NCCL broadcast, the same byte value is sent to producer and consumer so their collective chunk boundaries match. |
 | `policy.refit_persistent_ipc_buffers` | Colocated CUDA-IPC refit | Reuses the two trainer staging buffers across refits. A fixed `refit_buffer_size_gb` gives stable memory use. |

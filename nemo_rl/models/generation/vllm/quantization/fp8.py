@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import weakref
 from dataclasses import asdict, dataclass, field
 from typing import Any
 from unittest.mock import patch
@@ -65,7 +64,6 @@ class FP8Config:
     # Weights arrive from the trainer already MXFP8-quantized (E4M3 data plus
     # *_scale_from_checkpoint entries), so load_weights skips re-quantization.
     refit_prequantize: bool = False
-    refit_batched_moe_shuffle: bool = True
 
 
 @dataclass()
@@ -282,7 +280,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "model_parallel_size": model_parallel_size,
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
-        "refit_batched_moe_shuffle": vllm_cfg.get("refit_batched_moe_shuffle", True),
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
@@ -1058,10 +1055,6 @@ mxfp8_shuffle_scratch_buffers: dict[
     tuple[str, tuple[int, ...], torch.device], torch.Tensor
 ] = {}
 
-# Layers already checked by NRL_MXFP8_SHUFFLE_VERIFY. Weak references avoid
-# retaining model modules after a worker shuts down.
-mxfp8_shuffle_verified_layers: weakref.WeakSet[object] = weakref.WeakSet()
-
 
 def _mxfp8_scratch(tag: str, shape: torch.Size, device: torch.device) -> torch.Tensor:
     key = (tag, tuple(shape), device)
@@ -1241,38 +1234,6 @@ def _shuffle_mxfp8_moe_per_expert(
     )
 
 
-def _verify_mxfp8_moe_shuffle(
-    layer,
-    w13_weight: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w13_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    is_gated: bool,
-    epilogue_tile_m: int,
-    batched: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-) -> None:
-    if (
-        os.getenv("NRL_MXFP8_SHUFFLE_VERIFY") != "1"
-        or layer in mxfp8_shuffle_verified_layers
-    ):
-        return
-
-    reference = _shuffle_mxfp8_moe_per_expert(
-        w13_weight, w2_weight, w13_scale, w2_scale, is_gated, epilogue_tile_m
-    )
-    for got, want, tensor_name in zip(
-        batched, reference, ("w13_weight", "w2_weight", "w13_scale", "w2_scale")
-    ):
-        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8)), (
-            f"Batched MXFP8 shuffle mismatch vs per-expert reference: {tensor_name}"
-        )
-    mxfp8_shuffle_verified_layers.add(layer)
-    print(
-        "[NRL_MXFP8_SHUFFLE_VERIFY] batched MoE shuffle matches the "
-        "per-expert reference bit-exactly"
-    )
-
-
 def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
     """Shuffle weights and scales into FlashInfer TRTLLM MXFP8 layout.
 
@@ -1360,43 +1321,14 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
         w13_weight = swap_w13_to_w31(w13_weight)
         w13_scale = swap_w13_to_w31(w13_scale)
 
-    assert global_fp8_config is not None
-    use_batched_shuffle = global_fp8_config.refit_batched_moe_shuffle
-    if use_batched_shuffle:
-        (
-            w13_weight_shuffled,
-            w2_weight_shuffled,
-            w13_scale_shuffled,
-            w2_scale_shuffled,
-        ) = _shuffle_mxfp8_moe_batched(
-            layer, w13_weight, w2_weight, w13_scale, w2_scale, is_gated, epilogue_tile_m
-        )
-    else:
-        (
-            w13_weight_shuffled,
-            w2_weight_shuffled,
-            w13_scale_shuffled,
-            w2_scale_shuffled,
-        ) = _shuffle_mxfp8_moe_per_expert(
-            w13_weight, w2_weight, w13_scale, w2_scale, is_gated, epilogue_tile_m
-        )
-
-    if use_batched_shuffle:
-        _verify_mxfp8_moe_shuffle(
-            layer,
-            w13_weight,
-            w2_weight,
-            w13_scale,
-            w2_scale,
-            is_gated,
-            epilogue_tile_m,
-            (
-                w13_weight_shuffled,
-                w2_weight_shuffled,
-                w13_scale_shuffled,
-                w2_scale_shuffled,
-            ),
-        )
+    (
+        w13_weight_shuffled,
+        w2_weight_shuffled,
+        w13_scale_shuffled,
+        w2_scale_shuffled,
+    ) = _shuffle_mxfp8_moe_batched(
+        layer, w13_weight, w2_weight, w13_scale, w2_scale, is_gated, epilogue_tile_m
+    )
 
     if first_load:
         layer.w13_weight_scale_from_checkpoint = ModelWeightParameter(

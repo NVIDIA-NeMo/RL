@@ -129,7 +129,6 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     assert vllm_cfg["precision"] == "fp8"
     assert vllm_cfg["is_mx"] is True
     assert vllm_cfg["refit_prequantize"] is True
-    assert vllm_cfg["refit_batched_moe_shuffle"] is True
     assert vllm_cfg["refit_cache_loader_routes"] is True
     assert config["policy"]["megatron_cfg"]["enabled"] is True
     expected_ignored = [
@@ -166,7 +165,6 @@ def test_all_mxfp8_rollout_recipes_enable_refit_optimizations(
     config = _load_resolved_yaml(config_path)
     vllm_cfg = config["policy"]["generation"]["vllm_cfg"]
 
-    assert vllm_cfg["refit_batched_moe_shuffle"] is True
     assert vllm_cfg["refit_cache_loader_routes"] is True
 
 

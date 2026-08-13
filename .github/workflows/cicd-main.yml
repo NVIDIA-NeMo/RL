@@ -177,7 +177,7 @@ jobs:
           echo "image_tag=$IMAGE_TAG" | tee -a "$GITHUB_OUTPUT"
 
   org-member-pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d241fcfa92900f804cd425c7abc11855e5532064 # v0.80.1
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
     with:
       default_runner_prefix: ${{ vars.DEFAULT_H100_RUNNER }}
       non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_H100_RUNNER }}
@@ -590,9 +590,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: main
-        # Lfast reuses the main image. Until TRT-LLM lands on main, running this
-        # shard would make prefetch_venvs compile the cp313 wheel from source.
-        if: ${{ needs.pre-flight.outputs.test_level != 'Lfast' || matrix.script != 'L0_Unit_Tests_Trtllm' }}
         uses: ./.github/actions/test-template
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -790,6 +787,8 @@ jobs:
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_SGLang
             runner: ${{ vars.GB200_RUNNER }}
+          - script: L1_Functional_Tests_Trtllm
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Gym
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_GRPO_1
@@ -864,6 +863,8 @@ jobs:
           - script: L1_Functional_Tests_AutoModel
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_SGLang
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_Trtllm
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Gym
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}

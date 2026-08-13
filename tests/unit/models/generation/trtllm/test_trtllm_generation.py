@@ -43,6 +43,9 @@ def _config(**trtllm_overrides):
         "temperature": 1.0,
         "top_p": 1.0,
         "top_k": None,
+        "val_temperature": 1.0,
+        "val_top_p": 1.0,
+        "val_top_k": None,
         "stop_token_ids": None,
         "stop_strings": None,
         "_pad_token_id": 0,
@@ -182,8 +185,8 @@ async def test_generate_async_dispatches_round_robin_and_returns_leader_index():
             }
         )
 
-    generation.worker_group.run_single_worker_single_data.side_effect = (
-        lambda **_: worker_result()
+    generation.worker_group.run_single_worker_single_data.side_effect = lambda **_: (
+        worker_result()
     )
     data = BatchedDataDict(
         {

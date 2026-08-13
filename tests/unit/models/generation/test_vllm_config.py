@@ -92,7 +92,7 @@ def test_refit_prequantize_accepts_mxfp8() -> None:
 
 @pytest.mark.parametrize(
     "field",
-    ["refit_batched_moe_shuffle", "refit_cache_loader_routes"],
+    ["refit_cache_loader_routes"],
 )
 def test_refit_optimization_flags_must_be_boolean(field: str) -> None:
     generation_config = cast(

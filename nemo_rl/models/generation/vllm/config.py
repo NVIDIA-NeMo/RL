@@ -34,6 +34,15 @@ class VllmSpecificArgs(TypedDict):
     async_engine: bool
     load_format: NotRequired[str]
     precision: NotRequired[str]
+    # Whether vLLM returns logprobs before or after generation-time logit
+    # processors. RL policy recomputation uses raw model logits, so recipes
+    # with generation-time processors should request ``raw_logprobs`` when
+    # comparing generation and policy logprobs.
+    logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
+    # Cap each request's generated tokens so the training prompt plus response
+    # fits within max_model_len. This is needed when multimodal processing makes
+    # the training prompt longer than its text-only representation.
+    cap_max_tokens_to_context: NotRequired[bool]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
     # With is_mx, quantize weights to MXFP8 on the trainer during refit and
@@ -41,8 +50,6 @@ class VllmSpecificArgs(TypedDict):
     # the vLLM worker then skips its per-refit re-quantization. Requires the
     # Megatron policy backend.
     refit_prequantize: NotRequired[bool]
-    # Batch MoE weight-layout transforms across experts during MXFP8 refit.
-    refit_batched_moe_shuffle: NotRequired[bool]
     # Cache and replay stable vLLM weight-loader routes across refits.
     refit_cache_loader_routes: NotRequired[bool]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
@@ -179,7 +186,7 @@ def validate_vllm_quantization_config(config: VllmConfig) -> None:
             "policy.generation.vllm_cfg.refit_prequantize requires "
             "precision='fp8' and is_mx=true."
         )
-    for field in ("refit_batched_moe_shuffle", "refit_cache_loader_routes"):
+    for field in ("refit_cache_loader_routes",):
         value = vllm_cfg.get(field)
         if value is not None and not isinstance(value, bool):
             raise ValueError(f"policy.generation.vllm_cfg.{field} must be a boolean.")

@@ -22,7 +22,6 @@ policy:
       precision: "fp8"
       is_mx: true
       refit_prequantize: true
-      refit_batched_moe_shuffle: true
       refit_cache_loader_routes: true
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout
