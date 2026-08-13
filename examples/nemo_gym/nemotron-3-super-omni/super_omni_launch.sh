@@ -42,7 +42,18 @@ SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:0:0}"
 # `defaults:` the same way the driver does. Fall back to the raw scrape if the
 # resolver is unavailable (no venv on the submit host), so submission keeps
 # working in that case for recipes that do carry a literal cluster block.
-_expanded_cfg="$(uv run --no-sync python tools/config_cli.py expand "${CONFIG_PATH}" 2>/dev/null || true)"
+_expand_config() {
+    # Prefer the project venv: it already has omegaconf and needs no resolution.
+    # `uv run` is the documented entry point but fails when the environment is
+    # not materialized on this host, and the raw scrape below cannot resolve
+    # `defaults:`, so try both before giving up.
+    if [[ -x .venv/bin/python ]]; then
+        .venv/bin/python tools/config_cli.py expand "${CONFIG_PATH}" 2>/dev/null && return 0
+    fi
+    uv run --no-sync python tools/config_cli.py expand "${CONFIG_PATH}" 2>/dev/null && return 0
+    return 1
+}
+_expanded_cfg="$(_expand_config || true)"
 _read_cluster_key() {
     if [[ -n "${_expanded_cfg}" ]]; then
         awk -v k="$1" '/^cluster:/{f=1} f && $1==k":"{print $2; exit}' <<<"${_expanded_cfg}"
