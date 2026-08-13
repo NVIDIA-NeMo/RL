@@ -1766,7 +1766,7 @@ def setup(
         # Only exchanges refit metadata. SGLang's own weight-update group is
         # established lazily on the first refit.
         policy_generation.weight_synchronizer.init_communicator()
-        worker_init_timing_metrics["sglang_weight_sync_init_time_s"] = (
+        setup_timing_metrics.extras["sglang_weight_sync_init_time_s"] = (
             time.perf_counter() - t0
         )
     else:
