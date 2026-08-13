@@ -545,6 +545,7 @@ class SingleControllerActor:
             groups_dispatched = 0
             min_sample_version = None
             step_open = False
+            chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
 
             # Prompts dropped from this step's batch are never coming, so
@@ -649,8 +650,15 @@ class SingleControllerActor:
                         or self._reference_logprobs_required
                     ):
                         with self._timer.time("logprob_inference_prep"):
+                            # Once the step is open, gradients are accumulating
+                            # in the trainer's grad buffers across chunks. The
+                            # Megatron buffer offload frees that storage outright
+                            # and its reload zeroes it, so offloading here would
+                            # discard every chunk but the last while the 1/N
+                            # normalizer still counts all of them.
                             await asyncio.to_thread(
-                                self._trainer.prepare_for_lp_inference
+                                self._trainer.prepare_for_lp_inference,
+                                keep_train_buffers=step_open,
                             )
                         with self._timer.time("policy_and_reference_logprobs"):
                             if self._policy_logprobs_required:
@@ -721,6 +729,16 @@ class SingleControllerActor:
                     )
 
                     groups_dispatched += num_groups
+                    chunks_dispatched += 1
+                    # How many chunks a step is split into decides how many times
+                    # gradients accumulate before the single reduce, so record it
+                    # rather than leaving it to be inferred from phase timings.
+                    print(
+                        f"train_pump: step {version_during_step} chunk "
+                        f"{chunks_dispatched}: {num_groups} group(s), "
+                        f"{groups_dispatched}/{groups_wanted} dispatched",
+                        flush=True,
+                    )
                     last_progress = time.monotonic()
                     stall_warnings = 0
 
@@ -734,6 +752,12 @@ class SingleControllerActor:
                         f"rollout failures; nothing to train on"
                     )
 
+                print(
+                    f"train_pump: step {version_during_step} closing on "
+                    f"{chunks_dispatched} chunk(s), "
+                    f"{groups_dispatched} group(s)",
+                    flush=True,
+                )
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
 

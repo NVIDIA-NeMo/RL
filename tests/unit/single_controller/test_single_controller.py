@@ -220,8 +220,8 @@ class _EmptyBuffer:
 
 
 class _NoOpTrainer:
-    def prepare_for_lp_inference(self) -> None:
-        pass
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        del keep_train_buffers
 
     def prepare_for_training(self) -> None:
         pass
