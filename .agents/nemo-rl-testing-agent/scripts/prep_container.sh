@@ -26,6 +26,11 @@
 
 set -euo pipefail
 
+# Ray worker setup on L2 has been observed with a PATH that cannot resolve
+# common /usr/bin tools (awk). Keep system dirs first so prep never depends on
+# whatever the launcher left in PATH.
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
 : "${CONTAINER_ROOT:=/opt/nemo-rl}"
 : "${CONTAINER_MCORE_DIR:?CONTAINER_MCORE_DIR must be set}"
 : "${MCORE_FETCH_REF:?MCORE_FETCH_REF must be set (e.g. refs/pull/1234/head)}"
@@ -288,7 +293,15 @@ print("BRIDGE_IMPORT_OK")
     exit 1
   fi
 
-  bridge_file="$(printf '%s\n' "${smoke_out}" | awk '/^BRIDGE_FILE /{print $2}')"
+  # Prefer bash over awk: some L2 Ray worker containers have a PATH that
+  # cannot resolve awk (seen as `awk: command not found` mid-prep while the
+  # head node already printed earlier bridge_venv lines).
+  bridge_file=""
+  while IFS= read -r _nrlta_line || [ -n "${_nrlta_line}" ]; do
+    case "${_nrlta_line}" in
+      BRIDGE_FILE\ *) bridge_file="${_nrlta_line#BRIDGE_FILE }" ;;
+    esac
+  done <<< "${smoke_out}"
   if [ -n "${bridge_file}" ]; then
     echo "bridge_venv=${venv_name} resolves=${bridge_file}"
     if [ -n "${CONTAINER_BRIDGE_DIR:-}" ]; then

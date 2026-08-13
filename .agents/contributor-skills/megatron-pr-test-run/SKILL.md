@@ -197,21 +197,24 @@ serialising keeps the failure attribution clean.
 ### 2. Collect results
 
 The run writes to shared scratch (`ARTIFACT_DIR` in the submit output):
-`results.tsv` plus one `<test>.log` per sub-test. The markers are also in the
-Slurm log, which is what `cog.log` captures.
+`results.tsv` plus one `<test>.log` per sub-test. The `NRLTA_TEST_*` markers
+live in the Slurm job `.out`. Do **not** treat `cog.log` as that log by
+default: on oci-hsg it often only holds the submission JSON plus a short
+stderr (exit code), so `parse_results.py` on `COG_LOG` reports 0 tests and
+looks like a prep death even when the suite finished.
 
-```bash
-COG_LOG=~/.nemo-rl-testing-agent/runs/nrlta-pr5700-l1-a1/cog.log
-uv run --script .agents/nemo-rl-testing-agent/scripts/parse_results.py \
-  "$COG_LOG" --artifact-dir <ARTIFACT_DIR> \
-  --out ~/.nemo-rl-testing-agent/pr-5700/l1.results.json
-```
-
-If the Slurm log is truncated in `cog.log`, read it from the cluster instead:
+Always parse the Slurm `.out` (fetch it if needed):
 
 ```bash
 ssh oci 'cat <SLURM_LOG_DIR>/<JOBID>.out' > /tmp/l1.out
+uv run --script .agents/nemo-rl-testing-agent/scripts/parse_results.py \
+  /tmp/l1.out --artifact-dir <ARTIFACT_DIR> \
+  --out ~/.nemo-rl-testing-agent/pr-5700/l1.results.json
 ```
+
+If you already pointed `parse_results.py` at `COG_LOG` and got 0 tests,
+immediately fetch the cluster `.out` and re-parse before calling it a prep
+failure. Only use `cog.log` when it actually contains the `NRLTA_*` markers.
 
 Each entry gets `status` (`pass` / `fail` / `incomplete` / `not run`), `rc`,
 `secs`, an `error_signature`, and the tail of the output. `comment` is left
@@ -249,6 +252,11 @@ from a failing command substitution):
 ```bash
 bash .agents/nemo-rl-testing-agent/tests/test_import_guard.sh
 ```
+
+Prep must also stay runnable on L2 Ray workers whose `PATH` may omit `/usr/bin`
+(one failure was `awk: command not found` mid-prep while the head node was
+fine). Keep system dirs first on `PATH` at the top of prep, and prefer bash
+builtins over tools like `awk` when parsing smoke-test output.
 
 Whenever you abandon or park a run for infra reasons — including a prep failure
 that never reached a test — post it to the PR immediately rather than waiting
