@@ -13,11 +13,9 @@
 # limitations under the License.
 
 
-import hashlib
-import json
 import os
 import warnings
-from collections.abc import Generator, Mapping
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -42,36 +40,13 @@ from nemo_rl.modelopt.models.policy.workers.utils import (
 )
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
+    _quant_checkpoint_cache_suffix,
     resolve_nvfp4_real_quant_mode,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
-
-
-def _quant_checkpoint_cache_suffix(config: Mapping[str, object]) -> str:
-    """Build a short suffix for HF->Megatron checkpoints with ModelOpt state."""
-    keys = (
-        "quant_cfg",
-        "quant_calib_data",
-        "quant_calib_size",
-        "quant_batch_size",
-        "quant_sequence_length",
-        "disable_modelopt_layer_spec",
-    )
-    payload = {key: config.get(key) for key in keys}
-    quant_cfg = payload["quant_cfg"]
-    path = Path(quant_cfg).expanduser() if isinstance(quant_cfg, str) else None
-    if path is not None and path.is_file():
-        payload["quant_cfg"] = {
-            "path": path.resolve().as_posix(),
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        }
-    digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()[:12]
-    return f"_modelopt_{digest}"
 
 
 def _find_other_quant_checkpoint_caches(
