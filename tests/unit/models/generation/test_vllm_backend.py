@@ -225,8 +225,9 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
 
 @pytest.mark.vllm
 def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypatch):
-    from nemo_rl.models.generation.vllm import vllm_backend
     from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+
+    from nemo_rl.models.generation.vllm import vllm_backend
 
     model = _DeferredReloadModel()
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
