@@ -33,13 +33,13 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _create_advantage_estimator,
     _get_grpo_save_state,
     _should_use_nemo_gym,
 )
+from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (

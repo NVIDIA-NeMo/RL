@@ -67,7 +67,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
 from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
@@ -630,7 +630,6 @@ class SingleControllerActor:
                 self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
                 self._timeout.mark_iteration()
 
-
                 is_last_step = self._train_steps >= grpo_cfg.max_num_steps or (
                     self._rollout_exhausted.is_set() and len(self._buffer) == 0
                 )
@@ -778,7 +777,7 @@ class SingleControllerActor:
         await asyncio.to_thread(self._checkpointer.finalize_pending)
 
         print(f"Saving checkpoint for step {self._train_steps}...")
-        checkpoint_path = await asyncio.to_thread(
+        checkpoint_path: PathLike = await asyncio.to_thread(
             self._checkpointer.init_tmp_checkpoint,
             self._train_steps,
             vars(save_state),
