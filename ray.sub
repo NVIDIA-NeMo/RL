@@ -26,6 +26,9 @@ set -eoux pipefail
 
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
+# Preserve the allocation ID under a non-SLURM name before the Ray container
+# startup clears SLURM_* variables for clean MPI initialization.
+export NRL_SLURM_JOB_ID="${NRL_SLURM_JOB_ID:-${SLURM_JOB_ID:-default}}"
 
 # Log a timestamped, seconds-since-job-start marker at each phase boundary.
 log_phase() {

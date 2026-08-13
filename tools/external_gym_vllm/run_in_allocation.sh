@@ -346,6 +346,11 @@ pool_value() {
 MODEL=$(pool_value MODEL)
 VLLM_PYTHON=$(pool_value VLLM_PYTHON)
 VLLM_PORT=$(pool_value VLLM_PORT)
+# The NeMo-RL vLLM TCPStore and MessageQueue patches read this from the
+# environment to keep their rendezvous sockets inside the replica's reserved
+# port band. Without the export, vLLM falls back to a random port that can
+# collide with Ray's worker-port range.
+export VLLM_PORT
 TENSOR_PARALLEL_SIZE=$(pool_value TENSOR_PARALLEL_SIZE)
 SERVED_MODEL_NAME=$(pool_value SERVED_MODEL_NAME)
 DISPLAY_NAME=$(pool_value DISPLAY_NAME)

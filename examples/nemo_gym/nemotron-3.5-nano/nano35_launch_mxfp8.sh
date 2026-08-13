@@ -61,7 +61,11 @@ set -euo pipefail
 #   ENABLE_MTP_INFERENCE=0                 1 to enable MTP speculative decoding
 #   NUM_SPECULATIVE_TOKENS=5               MTP speculative tokens
 #   MAX_NUM_BATCHED_TOKENS=8480            vLLM max batched tokens (MTP)
+#   VLLM_TP=2                              Policy-generation tensor parallelism
 #   NRL_MAX_STEPS=                         Override grpo.max_num_steps
+#   NRL_DRIVER_UV_NO_SYNC=1                Skip the driver's uv environment sync;
+#                                          set to 0 to restore normal uv syncing
+#   NEMO_GYM_SERIALIZE_VENV_SETUP=1        Serialize setup when Gym configs share a server venv
 #   EXTRA_MOUNTS=                          Comma-separated host:container pairs
 #   USE_SNAPSHOT=1                         Snapshot source tree at submission
 #   USE_CUSTOM_VLLM=0                      1 to source a custom vLLM checkout
@@ -448,6 +452,15 @@ fi
 # Training overrides
 # =============================================================================
 NRL_MAX_STEPS="${NRL_MAX_STEPS:-}"
+NRL_DRIVER_UV_NO_SYNC="${NRL_DRIVER_UV_NO_SYNC:-1}"
+case "${NRL_DRIVER_UV_NO_SYNC}" in
+  1) DRIVER_UV_RUN="uv run --no-sync" ;;
+  0) DRIVER_UV_RUN="uv run" ;;
+  *)
+    echo "ERROR: NRL_DRIVER_UV_NO_SYNC must be 0 or 1, got: ${NRL_DRIVER_UV_NO_SYNC}" >&2
+    exit 1
+    ;;
+esac
 
 # =============================================================================
 # MTP speculative decoding (optional)
@@ -455,9 +468,10 @@ NRL_MAX_STEPS="${NRL_MAX_STEPS:-}"
 ENABLE_MTP_INFERENCE="${ENABLE_MTP_INFERENCE:-0}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8480}"
-MTP_EXTRA_ARGS=""
+MTP_EXTRA_ARGS="${MTP_EXTRA_ARGS:-""}"
+
 if [[ "${ENABLE_MTP_INFERENCE}" == "1" ]]; then
-  MTP_EXTRA_ARGS="\
+  MTP_EXTRA_ARGS="${MTP_EXTRA_ARGS} \
 ++policy.generation.vllm_cfg.enable_prefix_caching=true \
 ++policy.generation.vllm_kwargs.enable_chunked_prefill=true \
 ++policy.generation.vllm_kwargs.max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS} \
@@ -467,6 +481,77 @@ if [[ "${ENABLE_MTP_INFERENCE}" == "1" ]]; then
 ++policy.generation.vllm_kwargs.speculative_config.method=mtp"
   echo "MTP speculative decoding ENABLED (num_speculative_tokens=${NUM_SPECULATIVE_TOKENS})"
 fi
+
+
+# -------------------- MXFP8 rollouts --------------------
+
+# Nano 3.5's MoE intermediate size is 1856. ModelOpt MXFP8 requires each
+# tensor-parallel partition to be divisible by 32, so the rlvr.yaml default of
+# TP=4 (1856 / 4 = 464) is invalid. TP=2 yields 928 elements per partition.
+# FlashInfer TRTLLM additionally requires its shuffled scale-row dimension to
+# be divisible by 128; neither 1856 nor 928 satisfies that constraint. Use
+# vLLM's Triton MXFP8 fallback, which dequantizes expert weights to BF16 and
+# supports Nano's non-gated ReLU2 activation. Keep expert parallelism disabled:
+# fused ModelOpt MoE refits require all experts to remain local.
+VLLM_TP="${VLLM_TP:-2}"
+VLLM_EP="${VLLM_EP:-1}"
+
+VLLM_GPU_MEM_USAGE="${VLLM_GPU_MEM_USAGE:-0.85}"
+
+# enable VLLM MXFP8
+MXFP8_GEN_EXTRA_ARGS="++policy.generation.vllm_cfg.precision=fp8 \
+++policy.generation.vllm_cfg.is_mx=true \
+++policy.generation.vllm_cfg.tensor_parallel_size=${VLLM_TP} \
+++policy.generation.vllm_cfg.expert_parallel_size=${VLLM_EP} \
+++policy.generation.vllm_cfg.gpu_memory_utilization=${VLLM_GPU_MEM_USAGE} \
+++policy.generation.vllm_kwargs.moe_backend=flashinfer_trtllm"
+
+#++policy.generation.vllm_cfg.expert_parallel_size=${VLLM_EP}"
+
+# does not work: weight-layout mismatch during the first vLLM refit
+# Attempted to load weight ([131072, 2688]) into parameter ([2688, 65536])
+# ++policy.generation.vllm_kwargs.moe_backend=triton"
+
+
+# do not quantize linear layers
+IGNORED_LAYER_KWS="\"conv1d\",\"mtp\""
+IGNORED_LAYER_KWS="$IGNORED_LAYER_KWS,\"in_proj\",\"out_proj\",\"q_proj\",\"k_proj\",\"v_proj\",\"o_proj\",\"fc1_latent_proj\",\"fc2_latent_proj\",\"shared_experts\",\"lm_head\""
+MXFP8_GEN_EXTRA_ARGS="$MXFP8_GEN_EXTRA_ARGS ++policy.generation.vllm_cfg.quantization_ignored_layer_kws=[$IGNORED_LAYER_KWS]"
+
+# keep N layers in bf16
+NUM_FIRST_LAYERS_IN_BF16=0
+NUM_LAST_LAYERS_IN_BF16=8
+MXFP8_GEN_EXTRA_ARGS="$MXFP8_GEN_EXTRA_ARGS \
+++policy.generation.vllm_cfg.num_first_layers_in_bf16=${NUM_FIRST_LAYERS_IN_BF16} \
+++policy.generation.vllm_cfg.num_last_layers_in_bf16=${NUM_LAST_LAYERS_IN_BF16}"
+
+# -------------------- MXFP8 train (QAT) --------------------
+
+# enable Mcore TE MXFP8
+NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG="${NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG:-0}"
+MXFP8_TRAIN_EXTRA_ARGS="++policy.megatron_cfg.fp8_cfg.enabled=true \
+++policy.megatron_cfg.fp8_cfg.fp8=e4m3 \
+++policy.megatron_cfg.fp8_cfg.fp8_recipe=mxfp8 \
+++policy.megatron_cfg.fp8_cfg.fp8_param=false \
+++policy.megatron_cfg.moe_router_dtype=fp32"
+if [[ "${NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG}" == "1" ]]; then
+  MXFP8_TRAIN_EXTRA_ARGS="${MXFP8_TRAIN_EXTRA_ARGS} \
+++policy.megatron_cfg.te_precision_config_file=examples/nemo_gym/nemotron-3.5-nano/te_mxfp8_nano_v2.yaml"
+fi
+#policy.megatron_cfg.expert_model_parallel_size=${EP}"
+
+# keep N layers in bf16
+MXFP8_TRAIN_EXTRA_ARGS="$MXFP8_TRAIN_EXTRA_ARGS \
+++policy.megatron_cfg.first_last_layers_bf16=true \
+++policy.megatron_cfg.num_layers_at_start_in_bf16=${NUM_FIRST_LAYERS_IN_BF16} \
+++policy.megatron_cfg.num_layers_at_end_in_bf16=${NUM_LAST_LAYERS_IN_BF16}"
+
+
+
+
+# Combine MXFP8 rollouts with MXFP8 train (QAT)
+FP8_EXTRA_ARGS="$MXFP8_GEN_EXTRA_ARGS $MXFP8_TRAIN_EXTRA_ARGS"
+
 
 # =============================================================================
 # Job shape. Recipe-specific defaults are selected above and can be overridden
@@ -764,6 +849,7 @@ if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
   echo "  Extra mounts: ${EXTRA_MOUNTS}"
 fi
 
+
 export MOUNTS
 
 # =============================================================================
@@ -867,6 +953,14 @@ export SETUP_COMMAND
 # learning rate, etc.) live in CONFIG_PATH. The launcher only passes the
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
+
+# 
+# VLLM_USE_FLASHINFER_MOE_FP8=1 \
+# VLLM_FLASHINFER_MOE_BACKEND=latency \
+
+# RayExecutorV2 workers derive MXFP8 refit mode and scale names from the live model.
+# Keep the BF16 FlashInfer MoE runtime-layout refit workaround opt-in.
+# Keep NeMo-RL's programmatic TE precision-recipe loader opt-in as well.
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 ${VLLM_ENV_SOURCE}\
 OMP_NUM_THREADS=16 \
@@ -877,18 +971,23 @@ NRL_VLLM_CACHE_SEED_DIR=${NRL_VLLM_CACHE_SEED_DIR} \
 DG_JIT_CACHE_DIR=${NRL_VLLM_LOCAL_CACHE_DIR}/deep_gemm \
 TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
 TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
-UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default} \
+UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-\${NRL_SLURM_JOB_ID:-default} \
 UV_LOCK_TIMEOUT=1800 \
+NRL_DRIVER_UV_NO_SYNC=${NRL_DRIVER_UV_NO_SYNC} \
+NEMO_GYM_ISOLATE_SERVER_VENVS=0 \
+NEMO_GYM_SERIALIZE_VENV_SETUP=${NEMO_GYM_SERIALIZE_VENV_SETUP:-1} \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
-VLLM_USE_FLASHINFER_MOE_FP8=1 \
-VLLM_FLASHINFER_MOE_BACKEND=latency \
+NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG=1 \
+VLLM_FLASHINFER_TRTLLM_BF16_MOE_REFIT=${VLLM_FLASHINFER_TRTLLM_BF16_MOE_REFIT:-0} \
+NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG=${NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG} \
+VLLM_USE_FLASHINFER_MOE_FP8=0 \
 NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 \
 NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=\${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+${DRIVER_UV_RUN} ./examples/nemo_gym/run_grpo_nemo_gym.py \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
@@ -910,6 +1009,7 @@ logger.wandb.name=${WANDB_NAME} \
 logger.wandb.project=${WANDB_PROJ} \
 ${NRL_MAX_STEPS:+grpo.max_num_steps=${NRL_MAX_STEPS}} \
 ${MTP_EXTRA_ARGS} \
+${FP8_EXTRA_ARGS} \
 ${*}"
 
 export COMMAND="${TRAIN_CMD}"

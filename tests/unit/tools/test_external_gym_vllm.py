@@ -587,6 +587,8 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert "${preflight_labels[${preflight_index}]}" in source
     assert 'export "${pool}_ENV_VARS=$(pool_value "${pool}" ENV_VARS)"' in source
     assert 'export "${pool}_VLLM_ARGS=$(pool_value "${pool}" VLLM_ARGS)"' in source
+    assert "VLLM_PORT=$(pool_value VLLM_PORT)\n" in source
+    assert "export VLLM_PORT" in source
     assert 'SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
     assert 'scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_1}"' in source
     assert 'for pool in "${pool_names[@]}"' in source

@@ -46,6 +46,10 @@ MXFP8_BLOCK_QUANT_KWARGS = {
     "quant_algo": "MXFP8",
 }
 
+NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG = (
+    "NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG"
+)
+
 
 @dataclass(frozen=True)
 class FP8Config:
@@ -292,11 +296,22 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             for n in param_names
             if any(p in n for p in quantization_ignored_layer_kws)
         ]
+        # AutoModel does not include the causal LM head, but vLLM exposes it as
+        # a top-level module that must be named explicitly in the ignore list.
+        if (
+            "lm_head" in quantization_ignored_layer_kws
+            and "lm_head" not in ignored_layers
+        ):
+            ignored_layers.append("lm_head")
+        unmatched_ignored_layer_kws = [
+            keyword
+            for keyword in quantization_ignored_layer_kws
+            if not any(keyword in layer_name for layer_name in ignored_layers)
+        ]
         if "ignored_layers" not in fp8_block_quant_kwargs:
             fp8_block_quant_kwargs["ignored_layers"] = ignored_layers
         else:
             fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
-        print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
     if "ignored_layers" in fp8_block_quant_kwargs:
         fp8_block_quant_kwargs["ignore"] = fp8_block_quant_kwargs["ignored_layers"]
 
@@ -332,6 +347,34 @@ def is_fp8_model(vllm_config):
         return True
 
     return False
+
+
+def is_mxfp8_model(vllm_config):
+    try:
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptMxFp8Config,
+        )
+    except ImportError:
+        return False
+
+    return isinstance(
+        getattr(vllm_config, "quant_config", None), ModelOptMxFp8Config
+    )
+
+
+def _get_refit_is_mx(model_runner):
+    if os.environ.get(NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG, "0") == "1":
+        return is_mxfp8_model(model_runner.vllm_config)
+
+    if global_fp8_config is None:
+        raise RuntimeError(
+            "The process-local FP8 configuration is unavailable in this vLLM "
+            "refit worker. Set "
+            f"{NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG}=1 to derive the "
+            "quantization mode from the worker's resolved vLLM config."
+        )
+
+    return global_fp8_config.is_mx
 
 
 def _get_params_in_layers(param_names, layers):
@@ -441,21 +484,70 @@ def _is_fp8_weight(name, model):
     return name in fp8_state.fp8_param_names
 
 
+def _get_mxfp8_scale_name(name: str, model: torch.nn.Module) -> str:
+    """Return the MXFP8 scale parameter registered for ``name``.
+
+    The NeMo-RL v1 Ray executor patches preserve a canonical scale under
+    ``*_scale_from_checkpoint``. RayExecutorV2 workers do not receive those
+    process-local patches, and vLLM's refit-aware ModelOpt MoE path instead
+    keeps the canonical scale in ``*_scale``. Select from the live module so
+    refit sends a parameter name that its loader can resolve.
+    """
+    module = _get_module_from_param_name(model, name)
+    parameter_name = name.rsplit(".", 1)[-1]
+    if isinstance(module, RoutedExperts) and not isinstance(
+        getattr(module, parameter_name, None), torch.nn.Parameter
+    ):
+        # Policy checkpoints carry one tensor per expert (for example,
+        # ``experts.0.up_proj.weight``), while vLLM stores those tensors in the
+        # fused ``w13_weight``/``w2_weight`` parameters. Reuse vLLM's own expert
+        # mapping so custom projection names and non-gated MoEs resolve exactly
+        # as they do in RoutedExperts.load_weights(). The returned name must
+        # remain checkpoint-style; the loader applies this mapping again.
+        mapped_parameter_names = {
+            name.replace(weight_name, fused_prefix, 1).rsplit(".", 1)[-1]
+            for fused_prefix, weight_name, _expert_id, _shard_id in (
+                module.get_expert_mapping()
+            )
+            if weight_name and weight_name in name
+        }
+        if len(mapped_parameter_names) != 1:
+            raise RuntimeError(
+                f"Could not map MXFP8 expert weight '{name}' to exactly one "
+                f"parameter on the resolved {type(module).__name__} module; "
+                f"candidates: {sorted(mapped_parameter_names)}."
+            )
+        parameter_name = mapped_parameter_names.pop()
+
+    for suffix in ("_scale_from_checkpoint", "_scale"):
+        scale_parameter = getattr(module, parameter_name + suffix, None)
+        if isinstance(scale_parameter, torch.nn.Parameter):
+            return name + suffix
+
+    raise RuntimeError(
+        f"Could not find an MXFP8 scale parameter for '{name}'. Expected the "
+        f"resolved {type(module).__name__} module to register either "
+        f"'{parameter_name}_scale_from_checkpoint' or "
+        f"'{parameter_name}_scale'."
+    )
+
+
 def load_weights(weights, model_runner):
-    global global_fp8_config
     weights_quantized = []
     model = model_runner.model
+    is_mx = _get_refit_is_mx(model_runner)
+
+    if is_mx:
+        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+            mxfp8_e4m3_quantize,
+        )
 
     for k, v in weights:
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k, v))
             continue
         # Cast the weight into fp8 and its scale factor
-        if global_fp8_config.is_mx:
-            from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-                mxfp8_e4m3_quantize,
-            )
-
+        if is_mx:
             param_lp, param_scale = mxfp8_e4m3_quantize(v)
         else:
             param_lp, param_scale = cast_tensor_to_fp8_blockwise(
@@ -463,12 +555,9 @@ def load_weights(weights, model_runner):
                 weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
             )
         param_scale = torch.squeeze(param_scale, dim=-1)
-        if global_fp8_config.is_mx:
-            weights_quantized.append([k, param_lp])
-            weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
-        else:
-            weights_quantized.append([k, param_lp])
-            weights_quantized.append([k + "_scale_inv", param_scale])
+        weights_quantized.append([k, param_lp])
+        scale_key = _get_mxfp8_scale_name(k, model) if is_mx else k + "_scale_inv"
+        weights_quantized.append([scale_key, param_scale])
     # Finally load the weights into vllm
     model.load_weights(weights_quantized)
 

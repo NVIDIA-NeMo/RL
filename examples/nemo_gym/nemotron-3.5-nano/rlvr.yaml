@@ -24,7 +24,7 @@
 # Cluster (training + generation actors; Gym nodes are allocated separately)
 # =============================================================================
 cluster:
-  gpus_per_node: 4
+  gpus_per_node: 8
   num_nodes: 64
   segment_size: 2
 
@@ -308,7 +308,7 @@ policy:
       kv_cache_dtype: "auto"
       tensor_parallel_size: 4
       pipeline_parallel_size: 1
-      expert_parallel_size: 1
+      expert_parallel_size: 4
       gpu_memory_utilization: 0.85
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: false
@@ -341,7 +341,7 @@ policy:
     colocated:
       enabled: false
       resources:
-        gpus_per_node: 4
+        gpus_per_node: 8
         num_nodes: 32
 
 # =============================================================================
