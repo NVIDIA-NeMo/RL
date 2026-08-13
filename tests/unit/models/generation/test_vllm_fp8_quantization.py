@@ -100,12 +100,15 @@ def test_quantize_mxfp8_weight_restores_grouped_logical_shape(
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 
     weight = torch.empty(2, 3, hidden_size, dtype=torch.bfloat16)
+    quantized_scale = torch.arange(6 * hidden_size // 32, dtype=torch.uint8).reshape(
+        6, hidden_size // 32
+    )
 
     def fake_quantize(tensor):
         assert tensor is weight
         return (
             torch.zeros(6, hidden_size, dtype=torch.float8_e4m3fn),
-            torch.zeros(6, hidden_size // 32, dtype=torch.uint8),
+            quantized_scale,
         )
 
     monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", fake_quantize)
@@ -114,7 +117,7 @@ def test_quantize_mxfp8_weight_restores_grouped_logical_shape(
 
     assert value.shape == (2, 3, hidden_size)
     assert scale.shape == (2, 3, hidden_size // 32)
-    assert torch.all(scale == 1)
+    torch.testing.assert_close(scale, quantized_scale.reshape(scale.shape))
 
 
 @pytest.mark.parametrize(
