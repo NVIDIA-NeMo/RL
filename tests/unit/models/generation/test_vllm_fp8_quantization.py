@@ -444,6 +444,13 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(
         make_kernel,
     )
     monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
         fp8,
         "_shuffle_mxfp8_moe_batched",
         lambda _layer, w13, w2, s13, s2, _gated, _tile: (w13, w2, s13, s2),
