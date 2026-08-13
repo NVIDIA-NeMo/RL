@@ -1,0 +1,109 @@
+defaults: ../../grpo_math_1B.yaml
+# Nano v3.5 (NemotronH + MTP) DAPO-512 on the automodel (DTensor v2) backend.
+# The checkpoint's mtp.* tensors / num_nextn_predict_layers=1 are ignored
+# end-to-end with no code changes, provided:
+#   - dtensor_cfg.automodel_kwargs.force_hf is NOT set
+#   - generation speculative_config is NOT set
+#   - Automodel stays pinned at 24b47e85 (1f13c9aa+ auto-builds MTP)
+# moe_parallelizer.ignore_router_for_ac is required with activation
+# checkpointing: bf16 router top-k is nondeterministic, and recomputed expert
+# permutation buffers can change shape and crash backward (CheckpointError).
+grpo:
+  max_num_epochs: 2
+  val_at_start: true
+  use_dynamic_sampling: true
+  batch_multiplier: 3
+  overlong_filtering: true
+  use_leave_one_out_baseline: false
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: ${policy.generation.max_new_tokens}
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/dapo-nanov3.5-30BA3B-4n8g-automodel
+  checkpoint_must_save_by: 00:03:45:00
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 9216
+  make_sequence_length_divisible_by: 8
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  dtensor_cfg:
+    expert_parallel_size: 8
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: torch_fp32
+        experts: gmm
+        dispatcher: deepep
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.5
+      enforce_eager: true
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-nano-3.5
+    name: dapo-nanov3.5-30BA3B-4n8g-automodel
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4
