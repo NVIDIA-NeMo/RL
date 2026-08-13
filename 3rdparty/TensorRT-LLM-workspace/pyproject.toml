@@ -53,6 +53,11 @@ dependencies = [
   "xdsl>=0.59.0",
   "cuda-tile>=1.0.1",
   "nvidia-cuda-tileiras>=13.1,<13.2",
+  # Matches the ref's requirements.txt and the base image's TRT 10.16.1.11.
+  # Resolvable only because the root pyproject supplies static
+  # [[tool.uv.dependency-metadata]] for tensorrt / tensorrt-cu13{,-libs,-bindings};
+  # without it `uv lock` builds the wheel_stub sdist and pulls multi-GB binaries.
+  "tensorrt~=10.16.1",
   # NOTE: the ref's requirements.txt adds nvidia-modelopt[torch]~=0.39.0, but it
   # is intentionally not mirrored here: the root pyproject already pins modelopt
   # to a git rev via [tool.uv.sources] and forces >=0.44.0a0 via
