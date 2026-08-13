@@ -52,3 +52,34 @@ def test_flashinfer_scale_k_pad_width_rejects_negative_k() -> None:
     flashinfer_scale_k_pad_width = _load_mxfp8_utils().flashinfer_scale_k_pad_width
     with pytest.raises(ValueError, match="non-negative"):
         flashinfer_scale_k_pad_width(-1)
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "intermediate_size", "expected"),
+    [
+        (2688, 1856, (3072, 1920)),
+        (2688, 928, (3072, 1024)),
+        (4096, 2048, (4096, 2048)),
+    ],
+)
+def test_flashinfer_mxfp8_moe_padding_plan(
+    hidden_size: int,
+    intermediate_size: int,
+    expected: tuple[int, int],
+) -> None:
+    padding_plan = _load_mxfp8_utils().flashinfer_mxfp8_moe_padding_plan
+
+    assert padding_plan(hidden_size, intermediate_size) == expected
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "intermediate_size"),
+    [(0, 128), (128, 0), (127, 128)],
+)
+def test_flashinfer_mxfp8_moe_padding_plan_rejects_invalid_sizes(
+    hidden_size: int, intermediate_size: int
+) -> None:
+    padding_plan = _load_mxfp8_utils().flashinfer_mxfp8_moe_padding_plan
+
+    with pytest.raises(ValueError):
+        padding_plan(hidden_size, intermediate_size)
