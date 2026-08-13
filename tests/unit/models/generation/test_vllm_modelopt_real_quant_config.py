@@ -2577,38 +2577,26 @@ def test_resolve_quant_cfg_cache_suffix_handles_mixed_mapping_keys(monkeypatch):
 
 def test_resolve_quant_cfg_cache_suffix_preserves_legacy_quant_cfg_order(monkeypatch):
     mtq = sys.modules["modelopt.torch.quantization"]
-    monkeypatch.setattr(
-        mtq,
-        "TEST_LEGACY_ORDER_A",
-        {
-            "algorithm": "max",
-            "quant_cfg": {
-                "*": {"enable": False},
-                "*weight_quantizer": {"enable": True},
-            },
+    resolved = {
+        "algorithm": "max",
+        "quant_cfg": {
+            "*": {"enable": False},
+            "*weight_quantizer": {"enable": True},
         },
-        raising=False,
-    )
-    monkeypatch.setattr(
-        mtq,
-        "TEST_LEGACY_ORDER_B",
-        {
-            "algorithm": "max",
-            "quant_cfg": {
-                "*weight_quantizer": {"enable": True},
-                "*": {"enable": False},
-            },
-        },
-        raising=False,
-    )
+    }
+    monkeypatch.setattr(mtq, "TEST_LEGACY_ORDER", resolved, raising=False)
 
     first_suffix = modelopt_utils._quant_checkpoint_cache_suffix(
-        {"quant_cfg": "TEST_LEGACY_ORDER_A"}
+        {"quant_cfg": "TEST_LEGACY_ORDER"}
     )
+    resolved["quant_cfg"] = {
+        "*weight_quantizer": {"enable": True},
+        "*": {"enable": False},
+    }
 
     assert (
         modelopt_utils._quant_checkpoint_cache_suffix(
-            {"quant_cfg": "TEST_LEGACY_ORDER_B"}
+            {"quant_cfg": "TEST_LEGACY_ORDER"}
         )
         != first_suffix
     )
