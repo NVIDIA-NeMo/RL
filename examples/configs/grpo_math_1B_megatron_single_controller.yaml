@@ -24,6 +24,48 @@ async_rl:
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
 
+  # ── Resiliency ─────────────────────────────────────────────────────────────
+  # What happens to a prompt whose rollout fails. Infrastructure failures are
+  # re-dispatched (the retry re-enters shard selection, so it lands elsewhere);
+  # deterministic per-prompt failures get a much smaller budget because another
+  # shard would fail identically.
+  #
+  # The budgets here govern BOTH rollout paths -- the retry loop sits above the
+  # native/NeMo-Gym split. Anything path-specific lives in the sub-blocks below,
+  # so the structure says which knob applies where. Filling in the block for the
+  # path a run is not taking is rejected at setup rather than silently ignored.
+  rollout_failure:
+    max_infra_attempts_per_prompt: 5  # infra budget; exhausting it fails the run
+    max_data_attempts_per_prompt: 2   # data budget; 1 retry separates transient from deterministic
+    backoff_base_s: 1.0
+    max_backoff_s: 30.0
+    # Prompts allowed to exhaust their data budget and be dropped. 0 fails the run
+    # on the first one, propagating the original error. The two budgets above are
+    # INDEPENDENT counters, so one prompt can consume up to their sum minus one.
+    max_skipped_prompts: 0
+
+    # Deadlines. null disables, which is the default and reproduces the historical
+    # behaviour of waiting forever. Set them in any run that matters: without one a
+    # wedged generation engine parks a rollout permanently, holding a
+    # max_inflight_prompts slot for the rest of the job.
+    native:                           # AsyncRolloutImpl only
+      generation_timeout_s: null      # one generate_async turn
+      env_timeout_s: null             # one environment step
+    nemo_gym:                         # AsyncNemoGymRolloutImpl only
+      rollout_timeout_s: null         # the whole prompt-group rollout, retries included
+      # Re-send just the rows that never arrived before retrying the whole group.
+      # Gym's stream dies on its first failing row, so one bad row loses every later
+      # one; recovering those individually beats redoing all N.
+      max_row_attempts: 3
+
+  # Last-resort stall detection. stall_timeout_s must exceed interval_s and every
+  # deadline above, so a merely-slow rollout is not reported as a stall.
+  watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 600.0
+    stall_action: warn                # warn | abort
+    gym_subprocess_check: true        # polls NeMo-Gym's RunHelper for dead servers
+
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-single-controller
