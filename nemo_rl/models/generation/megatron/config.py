@@ -28,12 +28,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
 
     expose_http_server: bool
     parsers: list[str]
-    # Port window for the OpenAI-compatible HTTP server.
-    # When both are set (and NeMo Gym is enabled), the driver reserves a port from this window.
-    # When unset, the server picks a port at start time and NeMo Gym waits for its spinup.
-    http_server_port_range_low: NotRequired[int]
-    http_server_port_range_high: NotRequired[int]
-
     buffer_size_gb: int
     block_size_tokens: int
     max_tokens: int
