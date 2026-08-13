@@ -93,6 +93,21 @@ def test_check_nccl_reshard_refit_support_keeps_matching_blockwise_fp8() -> None
     check_nccl_reshard_refit_support(config)
 
 
+@pytest.mark.parametrize("fp8_recipe", ["tensorwise", "mxfp8", None])
+def test_check_nccl_reshard_refit_support_rejects_non_blockwise_fp8_storage(
+    fp8_recipe: str | None,
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "fp8_param": True,
+        "fp8_recipe": fp8_recipe,
+    }
+
+    with pytest.raises(ValueError, match="fp8_recipe must be 'blockwise'"):
+        check_nccl_reshard_refit_support(config)
+
+
 def test_check_nccl_reshard_refit_support_rejects_bf16_to_blockwise_fp8() -> None:
     config = _valid_nccl_reshard_config()
     config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"

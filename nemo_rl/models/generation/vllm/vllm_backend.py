@@ -926,6 +926,11 @@ class VllmInternalWorkerExtension:
                 specs[hf_name] = _mxfp8_receiver_quant_spec(
                     vllm_param, scale_param, merged_slice
                 )
+            elif wire_dtype != vllm_param.dtype:
+                raise ValueError(
+                    f"build_hf_to_local_param_map: wire dtype {wire_dtype} does not "
+                    f"match target dtype {vllm_param.dtype} for {hf_name!r}"
+                )
             else:
                 specs[hf_name] = (
                     LocalParamSpec(base=vllm_param.data)

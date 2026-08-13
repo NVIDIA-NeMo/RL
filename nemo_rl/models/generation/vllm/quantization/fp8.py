@@ -442,11 +442,12 @@ def _is_fp8_weight(name, model):
 
 
 def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a checkpoint-layout weight to E4M3 values and E8M0 scales.
+    """Quantize a checkpoint-layout weight for MXFP8 weight loading and refit.
 
-    All-zero blocks produce E8M0 byte 0, which destabilizes the TRTLLM kernel.
-    Replacing it with byte 1 is numerically equivalent because the FP8 values
-    in those blocks remain zero.
+    FlashInfer represents all-zero blocks with E8M0 scale byte 0. Replace those
+    scale entries with byte 1 because the TRTLLM kernel does not accept byte 0;
+    the represented values remain zero because every quantized value in each
+    affected block is zero.
     """
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         mxfp8_e4m3_quantize,

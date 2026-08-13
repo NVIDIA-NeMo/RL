@@ -393,6 +393,69 @@ def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):
     assert torch.all(w2_scale == 7)
 
 
+def test_build_hf_to_local_param_map_quantizes_dense_gate_and_up_for_mxfp8(
+    monkeypatch,
+):
+    hidden_size, intermediate_size = 32, 64
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": "model.layers.0.mlp.gate_proj.weight",
+                    "global_shape": [intermediate_size, hidden_size],
+                    "dtype": "torch.bfloat16",
+                },
+                {
+                    "name": "model.layers.0.mlp.up_proj.weight",
+                    "global_shape": [intermediate_size, hidden_size],
+                    "dtype": "torch.bfloat16",
+                },
+            ]
+        },
+    }
+    gate_up = torch.zeros(2 * intermediate_size, hidden_size, dtype=torch.float8_e4m3fn)
+    gate_up_scale = torch.zeros(
+        2 * intermediate_size, hidden_size // 32, dtype=torch.uint8
+    )
+    ext = _make_ext(
+        {
+            "model.layers.0.mlp.gate_up_proj.weight": gate_up,
+            "model.layers.0.mlp.gate_up_proj.weight_scale_from_checkpoint": gate_up_scale,
+        }
+    )
+
+    def fake_quantize(weight):
+        fill_value = int(weight[0, 0].item())
+        return (
+            torch.full_like(weight, fill_value, dtype=torch.float8_e4m3fn),
+            torch.full(
+                (*weight.shape[:-1], weight.shape[-1] // 32),
+                fill_value + 4,
+                dtype=torch.uint8,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.quantization.fp8.quantize_mxfp8_weight",
+        fake_quantize,
+    )
+
+    pmap = ext.build_hf_to_local_param_map(refit_info)
+    for name, fill_value in (("gate_proj", 1), ("up_proj", 2)):
+        spec = pmap.get(f"model.layers.0.mlp.{name}.weight")
+        assert spec is not None and spec.pre is not None and spec.post is not None
+        ctx = spec.pre(spec.base)
+        ctx.buf.fill_(fill_value)
+        spec.post(ctx)
+
+    assert torch.all(gate_up[:intermediate_size].float() == 1)
+    assert torch.all(gate_up[intermediate_size:].float() == 2)
+    assert torch.all(gate_up_scale[:intermediate_size] == 5)
+    assert torch.all(gate_up_scale[intermediate_size:] == 6)
+
+
 def test_build_hf_to_local_param_map_keeps_matching_blockwise_fp8_storage():
     H, E, P = 32, 2, 64
     refit_info = {
@@ -419,6 +482,29 @@ def test_build_hf_to_local_param_map_keeps_matching_blockwise_fp8_storage():
     assert spec is not None
     assert spec.base.data_ptr() == w2.data_ptr()
     assert spec.pre is None and spec.post is None
+
+
+def test_build_hf_to_local_param_map_rejects_wire_dtype_mismatch():
+    hidden_size, intermediate_size = 32, 64
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": "model.layers.0.mlp.down_proj.weight",
+                    "global_shape": [hidden_size, intermediate_size],
+                    "dtype": "torch.float32",
+                }
+            ]
+        },
+    }
+    down = torch.empty(hidden_size, intermediate_size, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="wire dtype torch.float32 does not match"):
+        _make_ext(
+            {"model.layers.0.mlp.down_proj.weight": down}
+        ).build_hf_to_local_param_map(refit_info)
 
 
 def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_scale_shape():
