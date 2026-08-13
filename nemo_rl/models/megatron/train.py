@@ -153,6 +153,72 @@ def apply_temperature_scaling(
     return logits
 
 
+def _run_block_draft_forward(
+    *,
+    model: MegatronModule,
+    draft_model: MegatronModule,
+    captured_states: Any,
+    data_dict: BatchedDataDict[Any],
+) -> torch.Tensor:
+    """Run the DFlash/DSpark block-draft forward for one microbatch.
+
+    Returns prediction-slot logits ``[B, N, gamma, V_local]`` aligned with
+    labels ``x_{p+1} .. x_{p+gamma}`` per anchor ``p`` (DFlash's bonus anchor
+    slot is dropped; DSpark's teacher-forced Markov bias is added).
+
+    Following the official DFlash contract the draft owns neither an LM head
+    nor a mask embedding: logits are projected through the policy's LIVE head
+    and mask slots embed via the policy's LIVE ``embed_tokens[mask_token_id]``
+    row — both passed DETACHED (the draft never trains them; serving matches
+    because vLLM shares the target's lm_head and embed_tokens with a
+    head-less/embedding-less drafter).
+    """
+    # Deferred imports mirror the worker: block-draft-path-only dependencies.
+    from nemo_rl.models.megatron.draft.dflash import count_map_to_anchors
+    from nemo_rl.models.megatron.draft.utils import (
+        get_policy_embedding_row,
+        get_policy_lm_head_weight,
+    )
+
+    # Anchors travel through the batch as a [B, S] count map (the only layout
+    # that survives dynamic batching's sequence-dim validation/truncation and
+    # length-bucket reorder); rebuild this microbatch's block list and stash
+    # it for the loss (slot mask + teacher gather read these keys).
+    anchors, anchor_valid = count_map_to_anchors(data_dict["draft_anchor_count_map"])
+    data_dict["draft_anchor_positions"] = anchors
+    data_dict["draft_anchor_valid"] = anchor_valid
+
+    base_logits = draft_model(
+        taps=captured_states.hidden_states,
+        input_embeds=captured_states.inputs_embeds,
+        anchors=anchors,
+        anchor_valid=anchor_valid,
+        lm_head_weight=get_policy_lm_head_weight(model).detach(),
+        mask_embedding=get_policy_embedding_row(
+            model, draft_model.mask_token_id
+        ).detach(),
+    )
+    if draft_model.method == "dflash":
+        # Slot 0 is the anchor bonus slot (condition only); the gamma mask
+        # slots align with labels x_{p+1} .. x_{p+gamma}.
+        return base_logits[:, :, 1:, :]
+
+    # DSpark: every slot predicts the next token; add the Markov transition
+    # bias of the ground-truth previous token (slot j predicts x_{p+1+j}, so
+    # its prev is x_{p+j}; slot 0's prev is the anchor token itself).
+    input_ids = data_dict["input_ids"]
+    batch_size, seq_len = input_ids.shape
+    gamma = draft_model.gamma
+    prev_pos = (
+        anchors.unsqueeze(-1)
+        + torch.arange(gamma, device=anchors.device).view(1, 1, -1)
+    ).clamp(max=seq_len - 1)
+    prev_ids = torch.gather(input_ids, 1, prev_pos.reshape(batch_size, -1)).reshape(
+        batch_size, anchors.shape[1], gamma
+    )
+    return base_logits + draft_model.markov_bias(prev_ids)
+
+
 def forward_with_post_processing_fn(
     data_iterator: Iterator[ProcessedMicrobatch],
     model: GPTModel,
@@ -160,10 +226,12 @@ def forward_with_post_processing_fn(
     defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    global_draft_pass_counts: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
+    draft_ttt_steps: int = 1,
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
@@ -212,8 +280,25 @@ def forward_with_post_processing_fn(
             )
         set_router_replay_forward(model, routed_experts_cp_sharded)
 
-    # Insert hook to capture hidden states and embeddings for draft model training if draft_model is provided
-    capture_context, capture = get_capture_context(model, enable_hidden_capture)
+    # Insert hook to capture hidden states and embeddings for draft model
+    # training. Capture the aux layers the DRAFT was built for (checkpoint
+    # target_layer_ids / policy.draft.aux_layer_indices, resolved onto
+    # draft_model.config at build time): the serving-side drafter taps exactly
+    # these policy layers, so capturing the hard-coded defaults instead would
+    # silently train on different features (or break the fc width when the
+    # counts differ).
+    aux_layer_indices = None
+    if draft_model is not None:
+        configured_aux_layers = getattr(
+            getattr(draft_model, "config", None),
+            "eagle_aux_hidden_state_layer_ids",
+            None,
+        )
+        if configured_aux_layers:
+            aux_layer_indices = tuple(int(i) for i in configured_aux_layers)
+    capture_context, capture = get_capture_context(
+        model, enable_hidden_capture, aux_layer_indices=aux_layer_indices
+    )
     try:
         with capture_context:
             output_tensor = model_forward(
@@ -243,20 +328,46 @@ def forward_with_post_processing_fn(
             clear_router_replay(model)
 
     if capture is not None:
-        from megatron.core.transformer.multi_token_prediction import roll_tensor
+        if use_fused_linear_logprobs:
+            # The fused path never materializes the policy's full logits, so
+            # there is no soft-CE teacher for the draft; the DRAFT loss prep
+            # would silently treat fused logprobs as logits.
+            raise RuntimeError(
+                "Draft-model training requires the policy's full logits; "
+                "disable megatron_cfg.use_fused_linear_logprobs."
+            )
 
         captured_states = capture.get_captured_states()
-        shifted_input_embeds = roll_tensor(
-            captured_states.inputs_embeds,
-            shifts=-1,
-            dims=0,
-            cp_group=get_context_parallel_group(),
-        )[0]
-        data_dict["student_logits"] = draft_model(
-            hidden_states=captured_states.hidden_states,
-            input_embeds=shifted_input_embeds,
-            attention_mask=attention_mask,
-        )
+        if getattr(draft_model, "method", "eagle3") in ("dflash", "dspark"):
+            data_dict["draft_block_logits"] = _run_block_draft_forward(
+                model=model,
+                draft_model=draft_model,
+                captured_states=captured_states,
+                data_dict=data_dict,
+            )
+        else:
+            from megatron.core.transformer.multi_token_prediction import roll_tensor
+
+            shifted_input_embeds = roll_tensor(
+                captured_states.inputs_embeds,
+                shifts=-1,
+                dims=0,
+                cp_group=get_context_parallel_group(),
+            )[0]
+            if draft_ttt_steps > 1:
+                data_dict["student_logits_by_pass"] = draft_model.forward_ttt(
+                    hidden_states=captured_states.hidden_states,
+                    input_embeds=shifted_input_embeds,
+                )
+            else:
+                data_dict["student_logits"] = draft_model(
+                    hidden_states=captured_states.hidden_states,
+                    input_embeds=shifted_input_embeds,
+                    # The draft decoder is forced onto the fused causal path
+                    # (see EagleModel); an explicit mask tensor would route TE
+                    # back to the unfused O(seq^2) backend.
+                    attention_mask=None,
+                )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
     # Loss computation should use unscaled logits.
@@ -276,6 +387,7 @@ def forward_with_post_processing_fn(
             packed_seq_params=packed_seq_params,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            global_draft_pass_counts=global_draft_pass_counts,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
@@ -307,10 +419,12 @@ def megatron_forward_backward(
     defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    global_draft_pass_counts: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
+    draft_ttt_steps: int = 1,
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
@@ -346,10 +460,12 @@ def megatron_forward_backward(
         defer_fp32_logits=defer_fp32_logits,
         global_valid_seqs=global_valid_seqs,
         global_valid_toks=global_valid_toks,
+        global_draft_pass_counts=global_draft_pass_counts,
         sampling_params=sampling_params,
         straggler_timer=straggler_timer,
         draft_model=draft_model,
         enable_hidden_capture=enable_hidden_capture,
+        draft_ttt_steps=draft_ttt_steps,
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         use_router_replay=use_router_replay,
         router_replay_train=router_replay_train,
@@ -406,9 +522,11 @@ class LossPostProcessor:
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
         self.prepare_fn = prepare_fn
-        if draft_model is not None and draft_model.eagle_module is not None:
-            self.d2t = getattr(draft_model.eagle_module, "d2t", None)
+        eagle_module = getattr(draft_model, "eagle_module", None)
+        if eagle_module is not None:
+            self.d2t = getattr(eagle_module, "d2t", None)
         else:
+            # Block drafts (DFlash/DSpark) train full-vocab in v1 (no d2t).
             self.d2t = None
 
     def __call__(
@@ -417,6 +535,7 @@ class LossPostProcessor:
         packed_seq_params: Optional[PackedSeqParams] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
+        global_draft_pass_counts: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -447,7 +566,19 @@ class LossPostProcessor:
 
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
+        has_draft_logits = (
+            "student_logits" in data_dict
+            or "student_logits_by_pass" in data_dict
+            or "draft_block_logits" in data_dict
+        )
         if pack_sequences and packed_seq_params is not None:
+            if has_draft_logits:
+                # Neither packing wrapper threads the draft hook, so the draft
+                # loss would silently never train; fail loudly instead.
+                raise NotImplementedError(
+                    "Draft-model training is not supported with sequence "
+                    "packing; disable policy.sequence_packing."
+                )
             fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
             if fuse_loss:
                 # The fused path prepares loss via prepare_packed_loss_input and
@@ -486,15 +617,28 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
-            if "student_logits" in data_dict:
+            if has_draft_logits:
+                draft_cfg = self.cfg["draft"]
+                draft_method = draft_cfg.get("method", "eagle3")
+                if draft_method in ("dflash", "dspark"):
+                    # Per-slot weights: DFlash's exponential position decay
+                    # (uniform when loss_decay is 1.0/None).
+                    gamma = int(draft_cfg["gamma"])
+                    loss_decay = float(draft_cfg.get("loss_decay") or 1.0)
+                    draft_weights = [loss_decay**j for j in range(gamma)]
+                else:
+                    draft_weights = draft_cfg.get("ttt_pass_weights")
                 loss_fn_wrapped = DraftLossWrapper(
                     loss_fn=loss_fn_wrapped,
                     prepare_fn=prepare_loss_input_wrapped,
                     data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    loss_weight=float(draft_cfg["loss_weight"]),
+                    ttt_pass_weights=draft_weights,
+                    global_draft_pass_counts=global_draft_pass_counts,
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=get_context_parallel_group(),
+                    draft_method=draft_method,
                 )
 
         loss_fn_wrapped = partial(
