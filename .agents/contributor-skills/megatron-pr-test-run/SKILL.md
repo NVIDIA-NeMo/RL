@@ -253,6 +253,11 @@ from a failing command substitution):
 bash .agents/nemo-rl-testing-agent/tests/test_import_guard.sh
 ```
 
+Prep must also stay runnable on L2 Ray workers whose `PATH` may omit `/usr/bin`
+(one failure was `awk: command not found` mid-prep while the head node was
+fine). Keep system dirs first on `PATH` at the top of prep, and prefer bash
+builtins over tools like `awk` when parsing smoke-test output.
+
 Whenever you abandon or park a run for infra reasons — including a prep failure
 that never reached a test — post it to the PR immediately rather than waiting
 for a later run to succeed:
