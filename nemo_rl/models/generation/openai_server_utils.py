@@ -38,7 +38,15 @@ class CompleteTokenInjectionError(ValueError):
 def find_latest_tokenized_assistant(
     messages: list[Any],
 ) -> tuple[int, Mapping[str, Any]] | None:
-    """Return the latest fully tokenized assistant and its assistant ordinal."""
+    """Return the ordinal and message for the latest tokenized assistant.
+
+    Args:
+        messages: Validated chat messages in conversation order.
+
+    Returns:
+        The assistant ordinal and message when an assistant contains both prompt
+        and generation token IDs, or ``None`` when no complete metadata exists.
+    """
     assistant_ordinal = -1
     latest_tokenized_assistant = None
     for message in messages:
@@ -98,6 +106,28 @@ def build_complete_prompt_token_ids(
     assistant while making its assistant-close sequence the exact splice
     boundary. The close sequence can differ from the tokenizer EOS token, as it
     does for Gemma chat templates.
+
+    Args:
+        tokenizer: Tokenizer used by the serving renderer.
+        conversation: Parsed text-only chat messages.
+        assistant_ordinal: Ordinal of the assistant covered by the model prefix.
+        model_prefix_token_ids: Non-empty
+            ``prompt_token_ids + generation_token_ids`` from that assistant.
+        render_prompt_text: Callback that renders the complete marked
+            conversation as text.
+        render_assistant_close_text: Optional callback that renders the marked
+            conversation through the selected assistant. It must expose an
+            unconditional assistant-close sequence after the marker. Templates
+            that gate the close on ``add_generation_prompt`` fall back to native
+            preprocessing.
+
+    Returns:
+        Exact model-prefix tokens followed by the tokenized contextual suffix.
+
+    Raises:
+        CompleteTokenInjectionError: The splice contract could not be verified.
+            Callers must use native preprocessing instead of rejecting the
+            request.
     """
     try:
         marked_conversation = deepcopy(conversation)
@@ -139,12 +169,17 @@ def build_complete_prompt_token_ids(
     if not isinstance(marked_text, str):
         raise CompleteTokenInjectionError("The marked prompt must render as text.")
 
-    marker_pos = marked_text.find(_COMPLETE_TOKEN_BOUNDARY_MARKER)
-    if marker_pos < 0:
+    marker_count = marked_text.count(_COMPLETE_TOKEN_BOUNDARY_MARKER)
+    if marker_count == 0:
         raise CompleteTokenInjectionError(
             "The chat template did not preserve the complete-token boundary marker."
         )
+    if marker_count > 1:
+        raise CompleteTokenInjectionError(
+            "The complete-token boundary marker collided with rendered request data."
+        )
 
+    marker_pos = marked_text.find(_COMPLETE_TOKEN_BOUNDARY_MARKER)
     marker_end = marker_pos + len(_COMPLETE_TOKEN_BOUNDARY_MARKER)
 
     if render_assistant_close_text is None:
@@ -187,6 +222,9 @@ def build_complete_prompt_token_ids(
             )
         close_marker_end = close_marker_pos + len(_COMPLETE_TOKEN_BOUNDARY_MARKER)
         raw_assistant_close_text = closed_assistant_text[close_marker_end:]
+        # Drop only leading whitespace before the close sequence. The guard below
+        # uses the raw text so the slice removes exactly that same whitespace;
+        # trailing whitespace remains part of the verified close sequence.
         assistant_close_text = raw_assistant_close_text.lstrip()
         if not assistant_close_text:
             raise CompleteTokenInjectionError(

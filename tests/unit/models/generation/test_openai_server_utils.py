@@ -61,6 +61,9 @@ class _GemmaStyleTokenizer(_CompleteTokenTokenizer):
             if text.startswith("<end_of_turn>"):
                 token_ids.append(106)
                 text = text[len("<end_of_turn>") :]
+            elif text.startswith("\n"):
+                token_ids.append(107)
+                text = text[1:]
             elif text.startswith("next"):
                 token_ids.append(40)
                 text = text[len("next") :]
@@ -131,8 +134,16 @@ def test_build_complete_prompt_token_ids_preserves_prefix_and_suffix() -> None:
 @pytest.mark.parametrize(
     ("model_prefix_token_ids", "expected"),
     [
-        pytest.param([31, 32, 106], [31, 32, 106, 40, 99], id="close_present"),
-        pytest.param([31, 32], [31, 32, 106, 40, 99], id="close_missing"),
+        pytest.param(
+            [31, 32, 106, 107],
+            [31, 32, 106, 107, 40, 99],
+            id="close_present",
+        ),
+        pytest.param(
+            [31, 32],
+            [31, 32, 106, 107, 40, 99],
+            id="close_missing",
+        ),
     ],
 )
 def test_complete_token_injection_uses_template_assistant_close(
@@ -148,8 +159,8 @@ def test_complete_token_injection_uses_template_assistant_close(
         ],
         assistant_ordinal=0,
         model_prefix_token_ids=model_prefix_token_ids,
-        render_prompt_text=lambda messages: (f"{marker} \n<end_of_turn>nextGEN"),
-        render_assistant_close_text=lambda messages: (f"{marker} \n<end_of_turn>"),
+        render_prompt_text=lambda messages: f"{marker}<end_of_turn>\nnextGEN",
+        render_assistant_close_text=lambda messages: f"{marker}<end_of_turn>\n",
     )
 
     assert result == expected
@@ -340,13 +351,32 @@ def test_complete_token_injection_rejects_marker_collision() -> None:
             tokenizer=_CompleteTokenTokenizer(),
             conversation=[
                 {
-                    "role": "assistant",
+                    "role": "user",
                     "content": "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E",
-                }
+                },
+                {
+                    "role": "assistant",
+                    "content": "first",
+                },
             ],
             assistant_ordinal=0,
             model_prefix_token_ids=[31, 32, 2],
             render_prompt_text=_render_marked_conversation,
+        )
+
+
+def test_complete_token_injection_rejects_rendered_marker_collision() -> None:
+    marker = "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E"
+
+    with pytest.raises(
+        CompleteTokenInjectionError, match="collided with rendered request data"
+    ):
+        build_complete_prompt_token_ids(
+            tokenizer=_CompleteTokenTokenizer(),
+            conversation=[{"role": "assistant", "content": "first"}],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 2],
+            render_prompt_text=lambda messages: f"{marker}{marker}<eos>nextGEN",
         )
 
 
@@ -423,6 +453,91 @@ def test_complete_token_injection_rejects_invalid_render_output(
             model_prefix_token_ids=[31, 32, 2],
             render_prompt_text=lambda messages: rendered,
         )
+
+
+@pytest.mark.parametrize(
+    ("render_assistant_close_text", "expected_error"),
+    [
+        pytest.param(
+            lambda messages: (_ for _ in ()).throw(
+                CompleteTokenInjectionError("probe requested native preprocessing")
+            ),
+            "probe requested native preprocessing",
+            id="native_fallback",
+        ),
+        pytest.param(
+            lambda messages: (_ for _ in ()).throw(RuntimeError("probe failed")),
+            "probe could not be rendered",
+            id="render_failure",
+        ),
+        pytest.param(lambda messages: [], "must render as text", id="non_text"),
+        pytest.param(
+            lambda messages: "missing marker<eos>",
+            "did not preserve the boundary marker",
+            id="missing_marker",
+        ),
+        pytest.param(
+            lambda messages: "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E \n\t",
+            "did not emit an assistant-close sequence",
+            id="empty_close",
+        ),
+        pytest.param(
+            lambda messages: "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E<eos>",
+            "assistant-close sequence changed",
+            id="changed_close",
+        ),
+    ],
+)
+def test_complete_token_injection_rejects_invalid_close_probe(
+    render_assistant_close_text, expected_error
+) -> None:
+    marker = "NEMO_RL_PREFIX_BOUNDARY_7F3A9C1E"
+
+    with pytest.raises(CompleteTokenInjectionError, match=expected_error):
+        build_complete_prompt_token_ids(
+            tokenizer=_GemmaStyleTokenizer(),
+            conversation=[
+                {"role": "assistant", "content": "first"},
+                {"role": "user", "content": "next"},
+            ],
+            assistant_ordinal=0,
+            model_prefix_token_ids=[31, 32, 106, 107],
+            render_prompt_text=lambda messages: f"{marker}<end_of_turn>\nnextGEN",
+            render_assistant_close_text=render_assistant_close_text,
+        )
+
+
+@pytest.mark.hf_gated
+def test_complete_token_injection_matches_real_gemma_template() -> None:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-1b-it")
+    prior_user = {"role": "user", "content": "hello"}
+    prior_assistant = {"role": "assistant", "content": "answer"}
+    next_user = {"role": "user", "content": "next"}
+    conversation = [prior_user, prior_assistant, next_user]
+    first_prompt_token_ids = tokenizer.apply_chat_template(
+        [prior_user], tokenize=True, add_generation_prompt=True
+    )
+    generation_token_ids = tokenizer.encode("answer", add_special_tokens=False)
+    native_token_ids = tokenizer.apply_chat_template(
+        conversation, tokenize=True, add_generation_prompt=True
+    )
+
+    injected_token_ids = build_complete_prompt_token_ids(
+        tokenizer=tokenizer,
+        conversation=conversation,
+        assistant_ordinal=0,
+        model_prefix_token_ids=first_prompt_token_ids + generation_token_ids,
+        render_prompt_text=lambda messages: tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        ),
+        render_assistant_close_text=lambda messages: tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        ),
+    )
+
+    assert injected_token_ids == native_token_ids
 
 
 def test_complete_token_injection_requires_tokenizer_eos() -> None:

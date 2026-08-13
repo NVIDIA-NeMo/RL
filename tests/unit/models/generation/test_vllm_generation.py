@@ -41,13 +41,14 @@ from nemo_rl.models.generation.openai_server_utils import (
     CompleteTokenInjectionError,
     replace_prefix_tokens,
 )
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration, vllm_worker_async
 from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    COMPLETE_TOKEN_INJECTION_VLLM_VERSION,
     VllmAsyncGenerationWorkerImpl,
     _complete_token_injection_eligibility,
 )
@@ -190,6 +191,7 @@ def test_complete_token_injection_eligibility_returns_latest_assistant() -> None
         has_multimodal_config=False,
         prompt_embeds_enabled=False,
         renderer_supported=True,
+        vllm_version_supported=True,
     )
 
     assert ordinal == 1
@@ -206,6 +208,7 @@ def test_complete_token_injection_eligibility_accepts_supported_roles(role) -> N
         has_multimodal_config=False,
         prompt_embeds_enabled=False,
         renderer_supported=True,
+        vllm_version_supported=True,
     )
 
     assert reason is None
@@ -252,6 +255,7 @@ def test_complete_token_injection_eligibility_rejects_request_options(
         has_multimodal_config=False,
         prompt_embeds_enabled=False,
         renderer_supported=True,
+        vllm_version_supported=True,
     )
 
     assert ordinal is None
@@ -345,19 +349,40 @@ def test_complete_token_injection_eligibility_rejects_messages(
         has_multimodal_config=False,
         prompt_embeds_enabled=False,
         renderer_supported=True,
+        vllm_version_supported=True,
     )
 
     assert ordinal is None
     assert reason == expected_reason
 
 
-def test_complete_token_injection_eligibility_rejects_mismatched_prefix() -> None:
+@pytest.mark.parametrize(
+    ("required_prefix_token_ids", "message_updates"),
+    [
+        pytest.param(None, {}, id="none"),
+        pytest.param([], {}, id="empty"),
+        pytest.param((10, 11, 12, 13, 14), {}, id="non_list"),
+        pytest.param([10, 11, 12, 13, True], {}, id="boolean_token"),
+        pytest.param(
+            [10, 11, 12, 13, 14],
+            {"generation_token_ids": [12, 13, "14"]},
+            id="invalid_message_token",
+        ),
+        pytest.param([1, 2], {}, id="different_tokens"),
+    ],
+)
+def test_complete_token_injection_eligibility_rejects_mismatched_prefix(
+    required_prefix_token_ids, message_updates
+) -> None:
+    messages = _tokenized_assistant_messages()
+    messages[-1].update(message_updates)
     ordinal, reason = _complete_token_injection_eligibility(
-        _complete_token_request(required_prefix_token_ids=[1, 2]),
-        _tokenized_assistant_messages(),
+        _complete_token_request(required_prefix_token_ids=required_prefix_token_ids),
+        messages,
         has_multimodal_config=False,
         prompt_embeds_enabled=False,
         renderer_supported=True,
+        vllm_version_supported=True,
     )
 
     assert ordinal is None
@@ -371,10 +396,18 @@ def test_complete_token_injection_eligibility_rejects_slot_swapped_prefix() -> N
         has_multimodal_config=False,
         prompt_embeds_enabled=False,
         renderer_supported=True,
+        vllm_version_supported=True,
     )
 
     assert ordinal is None
     assert reason == "client-supplied prefix does not match message token metadata"
+
+
+@pytest.mark.vllm
+def test_complete_token_injection_vllm_version_matches_installed_package() -> None:
+    import vllm
+
+    assert vllm.__version__ == COMPLETE_TOKEN_INJECTION_VLLM_VERSION
 
 
 def test_context_capped_max_new_tokens():
@@ -488,7 +521,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.utils",
     ):
         monkeypatch.setitem(sys.modules, module_name, types.ModuleType(module_name))
-    sys.modules["vllm"].__version__ = "0.25.1"
+    sys.modules["vllm"].__version__ = COMPLETE_TOKEN_INJECTION_VLLM_VERSION
 
     def make_module(name: str, **attrs):
         module = types.ModuleType(name)
@@ -505,6 +538,15 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.registry = "registry"
+
+    class ChatCompletionRequest:
+        def model_post_init(self, context):
+            return context
+
+        def model_copy(self, *, update):
+            copied_request = type(self)()
+            vars(copied_request).update(vars(self) | update)
+            return copied_request
 
     class OnlineRenderer:
         def __init__(self, **kwargs):
@@ -563,7 +605,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     )
     make_module(
         "vllm.entrypoints.openai.chat_completion.protocol",
-        ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
+        ChatCompletionRequest=ChatCompletionRequest,
         ChatCompletionResponse=type("ChatCompletionResponse", (), {}),
     )
     make_module(
@@ -635,6 +677,7 @@ class _FakeFastAPIApp:
 
 
 def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplog):
+    caplog.set_level("INFO", logger="nemo_rl.models.generation.vllm.vllm_worker_async")
     (
         tool_parser_manager,
         reasoning_parser_manager,
@@ -673,6 +716,8 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplo
     worker.llm_async_engine_args.create_model_config.return_value = model_config
 
     app = _FakeFastAPIApp()
+    # Ray may omit globals used only in annotations when it serializes the worker.
+    monkeypatch.delattr(vllm_worker_async, "Any")
     assert worker._setup_vllm_openai_api_server(app) is app
 
     tool_parser_manager.import_tool_parser.assert_called_once_with(
@@ -690,10 +735,29 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplo
     renderer._record_complete_token_injection_fallback("test fallback")
     assert (
         caplog.messages.count(
-            "Complete-token injection fell back to native preprocessing: test fallback"
+            "Complete-token injection fell back to native preprocessing: "
+            "test fallback; statistics: "
+            '{"attempts": 0, "fallbacks": {"test fallback": 1}, "successes": 0}'
         )
         == 1
     )
+    renderer._complete_token_injection_attempts = 1
+    renderer._maybe_log_complete_token_injection_stats()
+    renderer._complete_token_injection_attempts = 2
+    renderer._maybe_log_complete_token_injection_stats()
+    renderer._complete_token_injection_attempts = 1000
+    renderer._maybe_log_complete_token_injection_stats()
+    assert (
+        len(
+            [
+                message
+                for message in caplog.messages
+                if message.startswith("Complete-token injection statistics:")
+            ]
+        )
+        == 2
+    )
+    renderer._complete_token_injection_attempts = 0
 
     tokenizer = object()
     worker.llm.renderer.get_tokenizer = MagicMock(return_value=tokenizer)
@@ -770,9 +834,20 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplo
 
     assert direct_result[1][0]["prompt_token_ids"] == [3, 4, 5]
     parser.return_value.adjust_request.assert_called_once_with(request=direct_request)
+    close_render_call = sys.modules[
+        "vllm.renderers.hf"
+    ].safe_apply_chat_template.call_args_list[-1]
+    assert close_render_call.kwargs["add_generation_prompt"] is False
+    assert close_render_call.kwargs["tokenize"] is False
 
     chat_route = dict(app.routes)["/v1/chat/completions"]
     request_type = chat_route.__annotations__["request"]
+
+    auto_prefix_request = request_type()
+    auto_prefix_request.required_prefix_token_ids = None
+    auto_prefix_request.messages = _tokenized_assistant_messages()
+    assert auto_prefix_request.model_post_init("context") == "context"
+    assert auto_prefix_request.required_prefix_token_ids == [10, 11, 12, 13, 14]
 
     def make_request(**updates):
         request = request_type()
@@ -801,6 +876,7 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplo
     )
 
     assert result[1][0]["prompt_token_ids"] == [3, 4, 5]
+    assert request.max_completion_tokens == 10
     renderer._preprocess_chat_with_complete_token_ids.assert_awaited_once()
 
     error_request = make_request(
@@ -821,27 +897,31 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplo
         )
     assert error_request.max_completion_tokens == 10
 
+    streaming_request = make_request(stream=True)
     asyncio.run(
         renderer.preprocess_chat(
-            request=make_request(stream=True),
+            request=streaming_request,
             messages=_tokenized_assistant_messages(),
             default_template=None,
             default_template_content_format="auto",
             default_template_kwargs={},
         )
     )
+    assert streaming_request.max_completion_tokens == 10
     renderer._preprocess_chat_with_complete_token_ids = AsyncMock(
         side_effect=CompleteTokenInjectionError("test injection error")
     )
+    injection_fallback_request = make_request()
     asyncio.run(
         renderer.preprocess_chat(
-            request=make_request(),
+            request=injection_fallback_request,
             messages=_tokenized_assistant_messages(),
             default_template=None,
             default_template_content_format="auto",
             default_template_kwargs={},
         )
     )
+    assert injection_fallback_request.max_completion_tokens == 10
     renderer._preprocess_chat_with_complete_token_ids = AsyncMock(
         side_effect=RuntimeError("unexpected injection error")
     )
@@ -858,13 +938,33 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplo
         )
     assert unexpected_error_request.max_completion_tokens == 10
 
+    version_request = make_request()
+    sys.modules["vllm"].__version__ = "0.25.1+local"
+    asyncio.run(
+        renderer.preprocess_chat(
+            request=version_request,
+            messages=_tokenized_assistant_messages(),
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={},
+        )
+    )
+    assert version_request.max_completion_tokens == 10
+    sys.modules["vllm"].__version__ = COMPLETE_TOKEN_INJECTION_VLLM_VERSION
+    assert any(
+        "unsupported vLLM version "
+        "(detected '0.25.1+local', expected '0.25.1')" in message
+        for message in caplog.messages
+    )
+
     assert worker._get_complete_token_injection_stats() == {
-        "attempts": 4,
+        "attempts": 5,
         "successes": 1,
         "fallbacks": {
             "streaming request": 1,
             "test fallback": 2,
             "test injection error": 1,
+            "unsupported vLLM version": 1,
         },
     }
 

@@ -61,6 +61,7 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 LOGGER = logging.getLogger(__name__)
+COMPLETE_TOKEN_INJECTION_VLLM_VERSION = "0.25.1"
 
 
 def _prefix_matches_tokenized_assistant(
@@ -101,7 +102,7 @@ def _complete_token_injection_eligibility(
     has_multimodal_config: bool,
     prompt_embeds_enabled: bool,
     renderer_supported: bool,
-    vllm_version_supported: bool = True,
+    vllm_version_supported: bool,
 ) -> tuple[int | None, str | None]:
     """Return an assistant ordinal or a reason to use native preprocessing."""
     if request.stream:
@@ -450,7 +451,7 @@ class VllmAsyncGenerationWorkerImpl(
         from copy import deepcopy
         from logging import Filter as LoggingFilter
         from logging import LogRecord
-        from typing import List, Optional, Union
+        from typing import Any, List, Optional, Union
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -581,14 +582,21 @@ class VllmAsyncGenerationWorkerImpl(
                         value=error.value,
                     ) from error
 
-            def _record_complete_token_injection_fallback(self, reason: str) -> None:
+            def _record_complete_token_injection_fallback(
+                self, reason: str, detail: str | None = None
+            ) -> None:
                 self._complete_token_injection_fallbacks[reason] += 1
                 if reason in self._logged_complete_token_injection_fallbacks:
                     return
                 self._logged_complete_token_injection_fallbacks.add(reason)
+                rendered_reason = reason if detail is None else f"{reason} ({detail})"
                 LOGGER.warning(
-                    "Complete-token injection fell back to native preprocessing: %s",
-                    reason,
+                    "Complete-token injection fell back to native preprocessing: "
+                    "%s; statistics: %s",
+                    rendered_reason,
+                    json.dumps(
+                        self._get_complete_token_injection_stats(), sort_keys=True
+                    ),
                 )
 
             def _get_complete_token_injection_stats(self) -> dict[str, Any]:
@@ -793,6 +801,9 @@ class VllmAsyncGenerationWorkerImpl(
                     and request.required_prefix_token_ids is not None
                 ):
                     self._complete_token_injection_attempts += 1
+                    vllm_version_supported = (
+                        vllm.__version__ == COMPLETE_TOKEN_INJECTION_VLLM_VERSION
+                    )
                     assistant_ordinal, fallback_reason = (
                         _complete_token_injection_eligibility(
                             request,
@@ -802,11 +813,19 @@ class VllmAsyncGenerationWorkerImpl(
                             ),
                             prompt_embeds_enabled=self.model_config.enable_prompt_embeds,
                             renderer_supported=isinstance(self.renderer, HfRenderer),
-                            vllm_version_supported=(vllm.__version__ == "0.25.1"),
+                            vllm_version_supported=vllm_version_supported,
                         )
                     )
                     if fallback_reason is not None:
-                        self._record_complete_token_injection_fallback(fallback_reason)
+                        fallback_detail = None
+                        if fallback_reason == "unsupported vLLM version":
+                            fallback_detail = (
+                                f"detected {vllm.__version__!r}, expected "
+                                f"{COMPLETE_TOKEN_INJECTION_VLLM_VERSION!r}"
+                            )
+                        self._record_complete_token_injection_fallback(
+                            fallback_reason, fallback_detail
+                        )
                         self._maybe_log_complete_token_injection_stats()
                     else:
                         assert assistant_ordinal is not None
