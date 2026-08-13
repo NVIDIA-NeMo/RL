@@ -26,7 +26,6 @@ policy:
       async_engine: false
       transformer_impl: transformer_engine
       tensor_model_parallel_size: 1
-      static_kv_memory_pointers: false
       buffer_size_gb: 16
       enable_chunked_prefill: false
       mamba_inference_ssm_states_dtype: float32
