@@ -26,7 +26,7 @@ srun \
   --ntasks-per-node=1 \
   --gpus-per-task=1 \
   --gpu-bind=single:1 \
-  --export=ALL \
+  --no-container-mount-home \
   --container-image="${CONTAINER}" \
   --container-mounts=/lustre:/lustre \
   bash -lc '
