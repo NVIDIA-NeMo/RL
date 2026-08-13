@@ -187,10 +187,12 @@ def apply_fp8_patches(self, fp8_config):
 
 
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
-    config = AutoConfig.from_pretrained(model_name)
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
+    if vllm_cfg.get("is_mx") and not use_fp8_weights:
+        raise ValueError("is_mx=True requires precision='fp8'")
+    config = AutoConfig.from_pretrained(model_name)
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
     # Validate configuration: kv_cache_dtype

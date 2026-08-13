@@ -81,6 +81,29 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
 
 
+@pytest.mark.parametrize("precision", [None, "auto", "bf16", "bfloat16"])
+def test_init_fp8_rejects_mxfp8_without_fp8_precision(
+    fp8_module, monkeypatch, precision
+):
+    fp8 = fp8_module
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+
+    with pytest.raises(ValueError, match="is_mx=True requires precision='fp8'"):
+        fp8.init_fp8(
+            {
+                "precision": precision,
+                "kv_cache_dtype": "auto",
+                "is_mx": True,
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+
 def test_quantize_mxfp8_weight_restores_grouped_expert_shape(fp8_module, monkeypatch):
     fp8 = fp8_module
     weight = torch.zeros(2, 3, 32, dtype=torch.bfloat16)
