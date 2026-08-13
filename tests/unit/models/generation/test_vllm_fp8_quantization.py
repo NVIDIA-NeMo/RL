@@ -20,6 +20,18 @@ import torch
 pytestmark = pytest.mark.vllm
 
 
+@pytest.fixture(autouse=True)
+def mock_vllm_tp_metadata(monkeypatch):
+    pytest.importorskip("vllm")
+
+    from vllm.model_executor import parameter as vllm_parameter
+
+    monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vllm_parameter, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+
 @pytest.fixture()
 def fp8_module():
     pytest.importorskip("vllm")
@@ -327,13 +339,7 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
 
     monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", shuffle)
 
-    from vllm.model_executor import parameter as vllm_parameter
     from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
-
-    monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(
-        vllm_parameter, "get_tensor_model_parallel_world_size", lambda: 1
-    )
 
     def make_kernel(**kwargs):
         kernel_calls.append(kwargs)
@@ -442,13 +448,6 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.fp8.make_fp8_moe_kernel",
         make_kernel,
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
-        lambda: 1,
     )
     monkeypatch.setattr(
         fp8,
