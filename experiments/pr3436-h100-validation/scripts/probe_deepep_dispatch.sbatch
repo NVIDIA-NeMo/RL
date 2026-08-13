@@ -35,11 +35,22 @@ echo "master=${MASTER_ADDR}:${MASTER_PORT}"
 echo "nvshmem_hca_pe_mapping=${NVSHMEM_HCA_PE_MAPPING}"
 echo "nvshmem_ib_gid_index=${NVSHMEM_IB_GID_INDEX}"
 
+container_name="pr3436-deepep-${SLURM_JOB_ID}"
+cleanup() {
+  srun \
+    --nodes="${SLURM_NNODES}" \
+    --ntasks="${SLURM_NNODES}" \
+    --ntasks-per-node=1 \
+    enroot remove -f "${container_name}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
 srun \
   --nodes="${SLURM_NNODES}" \
-  --ntasks="${SLURM_NTASKS}" \
-  --ntasks-per-node=8 \
+  --ntasks="${SLURM_NNODES}" \
+  --ntasks-per-node=1 \
   --no-container-mount-home \
+  --container-name="${container_name}" \
   --container-image="${CONTAINER}" \
   --container-mounts=/lustre:/lustre \
   --container-workdir="${SOURCE_DIR}" \
@@ -47,6 +58,20 @@ srun \
     set -euo pipefail
     export PATH="/root/.local/bin:${PATH}"
     cd "${SOURCE_DIR}"
+    uv run --locked --extra automodel python -c "import deep_ep; print(deep_ep.__file__)"
+  '
+
+srun \
+  --nodes="${SLURM_NNODES}" \
+  --ntasks="${SLURM_NTASKS}" \
+  --ntasks-per-node=8 \
+  --no-container-mount-home \
+  --container-name="${container_name}" \
+  --container-workdir="${SOURCE_DIR}" \
+  bash -lc '
+    set -euo pipefail
+    export PATH="/root/.local/bin:${PATH}"
+    cd "${SOURCE_DIR}"
     grep -F "deepseek-ai/DeepEP.git?rev=${EXPECTED_DEEPEP_COMMIT}#${EXPECTED_DEEPEP_COMMIT}" uv.lock
-    uv run --locked --extra automodel python "${PROBE_SCRIPT}"
+    UV_NO_SYNC=1 uv run python "${PROBE_SCRIPT}"
   '
