@@ -1789,24 +1789,47 @@ def _pooled_explained_var(
     returns: torch.Tensor,
     token_mask: torch.Tensor,
     sample_mask: torch.Tensor,
-) -> float:
-    """Pooled EV = 1 - Var(returns - values) / Var(returns) over valid tokens.
+    returns_to_abs: Optional[torch.Tensor] = None,
+    returns_to_res: Optional[torch.Tensor] = None,
+) -> tuple[float, float]:
+    """Pooled pre-update EV in BOTH return spaces, as ``(absolute, residual)``.
 
     Computed driver-side from the rollout-time values -- the exact tensors GAE
     consumed -- so it describes the critic BEFORE any update this step,
     regardless of critic_ppo_epochs or gbs-vs-rollout microbatching. Masked like
     the value loss (token_mask * sample_mask) so it is directly comparable to
     critic/explained_var_post_update.
+
+    Both spaces are returned because :class:`ResidualBaselineEstimator` leaves
+    the batch in whichever space the run uses (``values = C``, ``returns = Y``
+    under residual_baseline; absolute otherwise). Pooling the batch as-is would
+    therefore put *absolute* EV in one arm of an A/B and *residual* EV in the
+    other under a single key. ``returns_to_abs`` / ``returns_to_res`` are that
+    estimator's per-sample ``[B]`` offsets -- exactly one is zero -- and both are
+    None without a residual estimator, which collapses this to the historical
+    number in both slots.
+
+    The prediction error is offset-invariant (``R - (B_LOO + C) == (R - B_LOO) - C``),
+    so one numerator serves both and only the denominator changes.
     """
     mask = (token_mask * sample_mask.unsqueeze(-1)).bool()
     if int(mask.sum()) < 2:
-        return 0.0
-    r = returns[mask].float()
-    v = values[mask].float()
-    var_returns = r.var(unbiased=False)
-    if var_returns <= 1e-8:
-        return 0.0
-    return (1.0 - (r - v).var(unbiased=False) / var_returns).item()
+        return 0.0, 0.0
+    err_var = (returns[mask].float() - values[mask].float()).var(unbiased=False)
+
+    zeros = torch.zeros(returns.shape[0], device=returns.device, dtype=returns.dtype)
+    to_abs = zeros if returns_to_abs is None else returns_to_abs.to(returns.dtype)
+    to_res = zeros if returns_to_res is None else returns_to_res.to(returns.dtype)
+
+    evs = []
+    for offset in (to_abs, to_res):
+        target = (returns + offset.unsqueeze(-1))[mask].float()
+        var_t = target.var(unbiased=False)
+        # Var(Y) legitimately hits zero when every group in the step is
+        # homogeneous (~54% all-fail on the SWE pool); report 0.0 rather than
+        # dividing by an epsilon and emitting ~-1e8.
+        evs.append((1.0 - err_var / var_t).item() if var_t > 1e-8 else 0.0)
+    return evs[0], evs[1]
 
 
 def _calibration_ece(v: torch.Tensor, r: torch.Tensor, n_conf_bins: int = 10) -> float:
@@ -2966,12 +2989,21 @@ def ppo_train(
                     # critic/loss and critic/grad_norm still describe the last
                     # training pass.
                     if "values" in train_data and "returns" in train_data:
-                        metrics["critic/explained_var"] = _pooled_explained_var(
+                        # Anchor mask in turn mode: turn-level returns are
+                        # structurally zero off-anchor (scatter_turns_to_anchors)
+                        # while values are dense, so pooling over the full
+                        # response mask would score ~270 structural zeros per
+                        # sample against a live critic output.
+                        ev_abs, ev_res = _pooled_explained_var(
                             train_data["values"],
                             train_data["returns"],
-                            train_data["token_mask"],
+                            _value_metric_mask(train_data, turn_spans),
                             train_data["sample_mask"],
+                            train_data.get("returns_to_abs"),
+                            train_data.get("returns_to_res"),
                         )
+                        metrics["critic/explained_var"] = ev_abs
+                        metrics["critic/ev_res"] = ev_res
                     # The other end of the bracket: the same batch re-scored AFTER
                     # every update this step (ppo.log_post_update_critic_metrics).
                     if post_value_results is not None:
@@ -4313,12 +4345,21 @@ def async_ppo_train(
                     # Overwrite critic/explained_var with the pre-update EV (the
                     # values GAE consumed); see the sync loop for why.
                     if "values" in train_data and "returns" in train_data:
-                        metrics["critic/explained_var"] = _pooled_explained_var(
+                        # Anchor mask in turn mode: turn-level returns are
+                        # structurally zero off-anchor (scatter_turns_to_anchors)
+                        # while values are dense, so pooling over the full
+                        # response mask would score ~270 structural zeros per
+                        # sample against a live critic output.
+                        ev_abs, ev_res = _pooled_explained_var(
                             train_data["values"],
                             train_data["returns"],
-                            train_data["token_mask"],
+                            _value_metric_mask(train_data, turn_spans),
                             train_data["sample_mask"],
+                            train_data.get("returns_to_abs"),
+                            train_data.get("returns_to_res"),
                         )
+                        metrics["critic/explained_var"] = ev_abs
+                        metrics["critic/ev_res"] = ev_res
                     # The other end of the bracket: re-scored AFTER every update
                     # this step (ppo.log_post_update_critic_metrics).
                     if post_value_results is not None:
