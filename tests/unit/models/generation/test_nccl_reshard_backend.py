@@ -242,25 +242,34 @@ def test_build_hf_to_local_param_map_specs_and_roundtrip():
                 {
                     "name": "model.layers.0.mlp.gate_proj.weight",
                     "global_shape": [256, H],
+                    "dtype": "torch.float32",
                 },
-                {"name": "model.layers.0.mlp.up_proj.weight", "global_shape": [256, H]},
+                {
+                    "name": "model.layers.0.mlp.up_proj.weight",
+                    "global_shape": [256, H],
+                    "dtype": "torch.float32",
+                },
                 {
                     "name": "model.layers.0.mlp.down_proj.weight",
                     "global_shape": [H, 256],
+                    "dtype": "torch.float32",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.gate_proj.weight",
                     "global_shape": [E, 128, H],
+                    "dtype": "torch.float32",
                     "grouped_expert_proj": "gate_proj",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.up_proj.weight",
                     "global_shape": [E, 128, H],
+                    "dtype": "torch.float32",
                     "grouped_expert_proj": "up_proj",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.down_proj.weight",
                     "global_shape": [E, H, 128],
+                    "dtype": "torch.float32",
                     "grouped_expert_proj": "down_proj",
                 },
             ]
@@ -439,3 +448,44 @@ def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_scale_shape():
 
     with pytest.raises(ValueError, match="has shape"):
         ext.build_hf_to_local_param_map(refit_info)
+
+
+@pytest.mark.parametrize(
+    ("case", "error"),
+    [
+        ("unknown_wire_dtype", "unsupported wire dtype"),
+        ("missing_scale", "has no scale parameter"),
+        ("invalid_scale_dtype", "expected torch.uint8"),
+        ("invalid_k", "must have K divisible by 32"),
+    ],
+)
+def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_metadata(
+    case: str, error: str
+) -> None:
+    H, E = 32, 2
+    P = 63 if case == "invalid_k" else 64
+    wire_dtype = "torch.unknown" if case == "unknown_wire_dtype" else "torch.bfloat16"
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": "model.layers.0.mlp.experts.down_proj.weight",
+                    "global_shape": [E, H, P],
+                    "dtype": wire_dtype,
+                    "grouped_expert_proj": "down_proj",
+                }
+            ]
+        },
+    }
+    w2 = torch.empty(E, H, P, dtype=torch.float8_e4m3fn)
+    vllm_params = {"model.layers.0.mlp.experts.w2_weight": w2}
+    if case != "missing_scale":
+        scale_dtype = torch.float32 if case == "invalid_scale_dtype" else torch.uint8
+        vllm_params["model.layers.0.mlp.experts.w2_weight_scale_from_checkpoint"] = (
+            torch.empty(E, H, max(P // 32, 1), dtype=scale_dtype)
+        )
+
+    with pytest.raises(ValueError, match=error):
+        _make_ext(vllm_params).build_hf_to_local_param_map(refit_info)

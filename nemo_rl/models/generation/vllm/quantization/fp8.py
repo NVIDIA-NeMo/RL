@@ -442,7 +442,12 @@ def _is_fp8_weight(name, model):
 
 
 def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a checkpoint-layout weight and sanitize zero E8M0 scales."""
+    """Quantize a checkpoint-layout weight to E4M3 values and E8M0 scales.
+
+    All-zero blocks produce E8M0 byte 0, which destabilizes the TRTLLM kernel.
+    Replacing it with byte 1 is numerically equivalent because the FP8 values
+    in those blocks remain zero.
+    """
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         mxfp8_e4m3_quantize,
     )

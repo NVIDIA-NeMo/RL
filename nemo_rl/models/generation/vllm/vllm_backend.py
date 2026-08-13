@@ -878,6 +878,11 @@ class VllmInternalWorkerExtension:
                 if isinstance(wire_dtype_value, torch.dtype)
                 else _STR_TO_DTYPE.get(wire_dtype_value)
             )
+            if wire_dtype is None:
+                raise ValueError(
+                    f"build_hf_to_local_param_map: unsupported wire dtype "
+                    f"{wire_dtype_value!r} for {hf_name!r}"
+                )
             if wire_dtype == torch.bfloat16 and vllm_param.dtype == torch.float8_e4m3fn:
                 vllm_name = vllm_names_by_id.get(id(vllm_param))
                 if vllm_name is None:
