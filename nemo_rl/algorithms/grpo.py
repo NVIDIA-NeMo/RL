@@ -4225,6 +4225,49 @@ def async_grpo_train(
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
+    def shutdown_async_resources(
+        trajectory_collector: Optional[ray.actor.ActorHandle] = None,
+        replay_buffer: Optional[ray.actor.ActorHandle] = None,
+    ) -> None:
+        try:
+            checkpointer.shutdown()
+        except Exception as error:
+            print(f"Error finalizing pending checkpoint: {error}")
+
+        for name, actor in (
+            ("trajectory collector", trajectory_collector),
+            ("replay buffer", replay_buffer),
+        ):
+            if actor is None:
+                continue
+            try:
+                ray.kill(actor)
+            except Exception as error:
+                print(f"Error stopping {name}: {error}")
+
+        # Environments can have in-flight HTTP requests to generation servers.
+        for env_dict in (task_to_env, val_task_to_env):
+            if env_dict is None:
+                continue
+            for task_name, env in env_dict.items():
+                try:
+                    ray.get(env.shutdown.remote(), timeout=10)
+                except Exception:
+                    try:
+                        ray.kill(env)
+                    except Exception as error:
+                        print(f"Error shutting down environment {task_name}: {error}")
+
+        try:
+            policy_generation.shutdown()
+        except Exception as error:
+            print(f"Error shutting down generation workers: {error}")
+        if policy is not policy_generation:
+            try:
+                policy.shutdown()
+            except Exception as error:
+                print(f"Error shutting down policy workers: {error}")
+
     assert not colocated_inference, (
         "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
     )
@@ -4244,6 +4287,21 @@ def async_grpo_train(
     print(f"   - samples_per_prompt_group: {samples_per_prompt_group}")
     print(f"   - train_global_batch_size: {train_gbs}")
     print(f"   - min_trajectories_needed: {min_trajectories_needed} (async mode)")
+
+    # Real-quant vLLM starts with dummy storage. Complete the first atomic refit
+    # before any collector can issue generation requests.
+    print("⏳ Preparing policy generation for training...", flush=True)
+    try:
+        if NEED_REFIT and POLICY_GENERATION_STALE:
+            print("🔄 Refitting policy generation with actual model weights...", flush=True)
+            refit_policy_generation(policy, policy_generation, colocated_inference)
+            POLICY_GENERATION_STALE = False
+        else:
+            if not policy_generation.prepare_for_generation():
+                raise RuntimeError("Policy generation preparation failed")
+    except Exception:
+        shutdown_async_resources()
+        raise
 
     _replay_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.ReplayBuffer"
@@ -4368,35 +4426,6 @@ def async_grpo_train(
         f"max_generation_failures={max_generation_failures}"
     )
 
-    print("⏳ Preparing policy generation for training...", flush=True)
-    if NEED_REFIT and POLICY_GENERATION_STALE:
-        print("🔄 Refitting policy generation with actual model weights...", flush=True)
-        try:
-            refit_policy_generation(
-                policy,
-                policy_generation,
-                colocated_inference,
-            )
-            print("✅ Policy generation refit completed successfully", flush=True)
-            POLICY_GENERATION_STALE = False
-        except Exception as e:
-            print(f"❌ Policy generation refit failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return
-    else:
-        print("🔄 Preparing policy generation for inference...")
-        try:
-            policy_generation.prepare_for_generation()
-            print("✅ Policy generation preparation completed successfully")
-        except Exception as e:
-            print(f"❌ Policy generation preparation failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return
-
     print("✅ Policy generation setup complete, proceeding to validation...")
 
     # Run validation at start if configured
@@ -4452,18 +4481,7 @@ def async_grpo_train(
         )
         if stop_message is not None:
             print(stop_message, flush=True)
-            # Flush pending checkpoint finalization and stop rollout
-            # generation; the remaining actors are reaped when the driver
-            # exits right after this return.
-            checkpointer.shutdown()
-            try:
-                ray.kill(trajectory_collector)
-            except Exception as e:
-                print(f"Error stopping trajectory collector: {e}")
-            try:
-                ray.kill(replay_buffer)
-            except Exception as e:
-                print(f"Error stopping replay buffer: {e}")
+            shutdown_async_resources(trajectory_collector, replay_buffer)
             return
 
     print("✅ All setup complete, starting buffer wait...")
@@ -5410,51 +5428,5 @@ def async_grpo_train(
         raise
 
     finally:
-        # Finalize any pending async checkpoint before tearing down workers.
-        try:
-            checkpointer.shutdown()
-        except Exception as e:
-            print(f"Error finalizing pending checkpoint: {e}")
-
-        # Clean up
-        print("🛑 Stopping trajectory collection...")
-        try:
-            ray.kill(trajectory_collector)
-        except Exception as e:
-            print(f"Error stopping trajectory collector: {e}")
-
-        try:
-            ray.kill(replay_buffer)
-        except Exception as e:
-            print(f"Error stopping replay buffer: {e}")
-
-        # Environments must be shut down before generation workers because
-        # they may have in-flight HTTP requests to vLLM HTTP endpoints.
-        # Killing generation first leaves environments retrying dead connections.
-        for env_dict in (task_to_env, val_task_to_env):
-            if env_dict is None:
-                continue
-            for task_name, env in env_dict.items():
-                print(f"🛑 Shutting down environment {task_name}...")
-                try:
-                    ray.get(env.shutdown.remote(), timeout=10)
-                except Exception:
-                    try:
-                        ray.kill(env)
-                    except Exception as e:
-                        print(f"Error shutting down environment {task_name}: {e}")
-
-        print("🛑 Shutting down generation workers...")
-        try:
-            policy_generation.shutdown()
-        except Exception as e:
-            print(f"Error shutting down generation workers: {e}")
-
-        if policy is not policy_generation:
-            print("🛑 Shutting down policy workers...")
-            try:
-                policy.shutdown()
-            except Exception as e:
-                print(f"Error shutting down policy workers: {e}")
-
+        shutdown_async_resources(trajectory_collector, replay_buffer)
         print("Async GRPO training complete!")

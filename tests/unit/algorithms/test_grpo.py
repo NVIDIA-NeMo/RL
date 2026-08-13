@@ -1291,6 +1291,44 @@ def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components)
     mock_grpo_components["policy"].shutdown.assert_called_once()
 
 
+def test_async_grpo_refits_before_collector_and_cleans_up_failure(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    generation = _mock_policy_generation()
+
+    with (
+        mock_async_grpo_infrastructure(mock_batch, {}),
+        patch(
+            "nemo_rl.algorithms.grpo.refit_policy_generation",
+            side_effect=RuntimeError("initial refit failed"),
+        ),
+        patch("nemo_rl.algorithms.grpo.get_actor_python_env") as actor_env,
+        pytest.raises(RuntimeError, match="initial refit failed"),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    actor_env.assert_not_called()
+    mock_grpo_components["checkpointer"].shutdown.assert_called_once()
+    generation.shutdown.assert_called_once()
+    mock_grpo_components["policy"].shutdown.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("generation_config", "expected"),
     [

@@ -235,6 +235,41 @@ class TestIPCWeightSynchronizer:
         call_kwargs = policy.stream_weights_via_ipc_zmq.call_args
         assert call_kwargs.kwargs["kv_scales"] == kv_scales
 
+    @pytest.mark.parametrize("failure_phase", ["wake", "restore", "kv_cache"])
+    @patch(
+        "nemo_rl.weight_sync.ipc_weight_synchronizer.wait_for_real_quant_refit",
+        return_value=[True],
+    )
+    @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+    def test_real_quant_failure_in_full_lifecycle_is_terminal(
+        self, mock_ray, mock_wait_for_real_quant_refit, failure_phase
+    ):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        generation = _mock_generation()
+        generation.cfg = {"real_quant": True}
+        if failure_phase == "wake":
+            generation.prepare_for_generation.return_value = False
+        elif failure_phase == "restore":
+            policy.offload_after_refit.side_effect = RuntimeError("restore failed")
+        else:
+            generation.prepare_for_generation.side_effect = [True, False]
+        synchronizer = IPCWeightSynchronizer(policy, generation)
+
+        with pytest.raises(RuntimeError):
+            synchronizer.sync_weights()
+        assert synchronizer.is_stale
+        generation.shutdown.assert_called_once()
+        policy.shutdown.assert_called_once()
+
+        stream_calls = policy.stream_weights_via_ipc_zmq.call_count
+        with pytest.raises(RuntimeError, match="prior failed transaction"):
+            synchronizer.sync_weights()
+        assert policy.stream_weights_via_ipc_zmq.call_count == stream_calls
+
+        if failure_phase != "wake":
+            mock_wait_for_real_quant_refit.assert_called_once()
+
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
     def test_sync_weights_raises_on_failure(self, mock_ray):
         mock_ray.get.return_value = [True]

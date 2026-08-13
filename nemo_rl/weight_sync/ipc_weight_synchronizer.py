@@ -82,11 +82,16 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         # A repeated refit must become stale before transfer starts; otherwise
         # an exception can leave a previously successful synchronizer fresh.
         self._stale = True
-        self._policy.offload_before_refit()
-        self._generation.prepare_for_generation(tags=["weights"])
-
         sync_succeeded = False
+        policy_needs_restore = False
         try:
+            self._policy.offload_before_refit()
+            policy_needs_restore = True
+            if not self._generation.prepare_for_generation(tags=["weights"]):
+                raise RuntimeError(
+                    "Generation workers failed to prepare for real-quant refit"
+                )
+
             timer_context = (
                 timer.time("prepare_for_generation/transfer_and_update_weights")
                 if timer is not None
@@ -115,6 +120,13 @@ class IPCWeightSynchronizer(WeightSynchronizer):
                         "Weight transfer failed during IPC/ZMQ sync. "
                         "This often indicates an issue with cuda-ipc or the vLLM worker."
                     )
+
+            policy_needs_restore = False
+            self._policy.offload_after_refit()
+            if not self._generation.prepare_for_generation(tags=["kv_cache"]):
+                raise RuntimeError(
+                    "Generation workers failed to restore the KV cache after refit"
+                )
             sync_succeeded = True
             if self._generation.cfg.get("real_quant"):
                 print("ModelOpt real-quant refit transaction completed", flush=True)
@@ -122,12 +134,11 @@ class IPCWeightSynchronizer(WeightSynchronizer):
             if self._generation.cfg.get("real_quant"):
                 self._fatal_refit_error = error
                 shutdown_refit_participants(self._policy, self._generation, error)
+                policy_needs_restore = False
             raise
         finally:
-            if self._fatal_refit_error is None:
+            if policy_needs_restore:
                 self._policy.offload_after_refit()
-            if sync_succeeded:
-                self._generation.prepare_for_generation(tags=["kv_cache"])
 
         self._stale = not sync_succeeded
 

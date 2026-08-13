@@ -1072,9 +1072,9 @@ class RayWorkerGroup:
 
         success = True
 
-        # First attempt graceful shutdown if cleanup method is provided and force=False
-        if cleanup_method is not None and not force:
-            try:
+        try:
+            # First attempt graceful shutdown if cleanup method is provided and force=False
+            if cleanup_method is not None and not force:
                 # Call cleanup method on all workers
                 futures = self.run_all_workers_single_data(cleanup_method)
 
@@ -1083,17 +1083,14 @@ class RayWorkerGroup:
                     ray.get(futures, timeout=timeout)
                 else:
                     ray.get(futures)
-
-            except (ray.exceptions.RayTaskError, ray.exceptions.GetTimeoutError) as e:
-                success = False
-                print(
-                    f"Error during graceful shutdown: {e}. Falling back to force termination."
-                )
-
-        # Always kill actors to release named actor registrations and resources.
-        # Even after successful graceful cleanup, actors remain alive in Ray's registry
-        # which prevents creating new actors with the same name.
-        if True:
+        except Exception as e:
+            success = False
+            print(
+                f"Error during graceful shutdown: {e}. Falling back to force termination."
+            )
+        finally:
+            # Always kill actors and clear local state, including when graceful
+            # cleanup raises before returning futures (for example, a dead actor).
             for worker in self._workers:
                 try:
                     ray.kill(worker)
@@ -1114,8 +1111,7 @@ class RayWorkerGroup:
                         )
                 self._initializer_pool = {}
 
-        # Clear worker lists
-        self._workers = []
-        self._worker_metadata = []
+            self._workers = []
+            self._worker_metadata = []
 
         return success

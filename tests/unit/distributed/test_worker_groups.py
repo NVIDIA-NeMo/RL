@@ -331,6 +331,33 @@ def test_shutdown_clears_initializer_pool(
     assert worker_group._initializer_pool == {}
 
 
+def test_shutdown_dead_actor_clears_state_and_allows_reconstruction(
+    register_test_actor, virtual_cluster
+):
+    builder = RayWorkerBuilder(register_test_actor)
+    sharding = NamedSharding(layout=[0, 1], names=["dp"])
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=builder,
+        workers_per_node=None,
+        sharding_annotations=sharding,
+    )
+    ray.kill(worker_group.workers[0])
+
+    assert worker_group.shutdown(cleanup_method="get_pid") is False
+    assert worker_group.workers == []
+    assert worker_group._initializer_pool == {}
+
+    replacement = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=builder,
+        workers_per_node=None,
+        sharding_annotations=sharding,
+    )
+    assert len(replacement.workers) == 2
+    assert replacement.shutdown(force=True) is True
+
+
 def test_actor_initialization_with_args_kwargs(register_test_actor, virtual_cluster):
     actor_fqn = register_test_actor
     init_args = ("arg1", 123)
