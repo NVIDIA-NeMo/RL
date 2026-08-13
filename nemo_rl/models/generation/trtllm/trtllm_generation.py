@@ -479,6 +479,7 @@ class TrtllmGeneration(GenerationInterface):
 
     def clear_logger_metrics(self) -> None:
         """Clear logger metrics for performance reporting."""
+        """Clear logger metrics for performance reporting."""
         if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger"):
             return
         if not self.worker_group or not self.worker_group.workers:
