@@ -93,6 +93,35 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
 
 
+def test_patch_ray_executor_v2_applies_fp8_before_worker_init(fp8_module, monkeypatch):
+    from vllm.v1.executor import ray_executor_v2
+
+    fp8 = fp8_module
+    events = []
+    fp8_config = object()
+
+    class FakeRayWorkerProc:
+        def initialize_worker(self, *args, **kwargs):
+            events.append(("initialize", args, kwargs))
+            return "initialized"
+
+    monkeypatch.setattr(ray_executor_v2, "RayWorkerProc", FakeRayWorkerProc)
+    monkeypatch.setattr(
+        fp8,
+        "apply_fp8_patches",
+        lambda _worker, config: events.append(("patch", config)),
+    )
+
+    fp8._patch_vllm_ray_executor_v2(fp8_config)
+    result = ray_executor_v2.RayWorkerProc().initialize_worker(1, {"A": "B"})
+
+    assert result == "initialized"
+    assert events == [
+        ("patch", fp8_config),
+        ("initialize", (1, {"A": "B"}), {}),
+    ]
+
+
 @pytest.mark.parametrize("hidden_size", [32, 64])
 def test_quantize_mxfp8_weight_restores_grouped_logical_shape(
     fp8_module, monkeypatch, hidden_size
