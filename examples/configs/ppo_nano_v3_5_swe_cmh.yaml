@@ -485,6 +485,34 @@ value:
   max_total_sequence_length: ${policy.max_total_sequence_length}
   precision: "bfloat16"
 
+  # --- privileged (asymmetric) critic for SWE ---
+  # research/ppo/privileged_residual_critic_plan.md. The critic sees the accepted
+  # fix and the grading tests; the policy never does. Audited over all 9262
+  # instances: golden patch + test patch are present for 100% of them, and none
+  # of them appear anywhere in the agent's context (verified against a real
+  # 408k-char rollout), so this is genuine information, not just a cheaper
+  # computation of something already visible.
+  #
+  # The block is prefixed BEFORE the first assistant token — mandatory, since the
+  # value head is causal and ~150 assistant turns are spread across the context;
+  # appending would be a silent no-op. It is byte-identical for all 16 siblings
+  # of a group, so it cannot introduce a within-task confound.
+  #
+  # Orthogonal to both other critic axes: composes with residual OR absolute
+  # targets, and with token-level OR turn_gae (anchors are remapped into the
+  # augmented layout). Enabling it raises value.max_total_sequence_length by the
+  # sum of the caps below automatically.
+  swe_privileged_critic:
+    enabled: false
+    # Single TOTAL token budget for the reference block, so the value model's
+    # sequence budget is exactly policy_len + this + slack. Measured over 400
+    # instances the untruncated block is median 5467 / p90 17683 / p99 77911
+    # tokens, so 32768 truncates ~4.8%. Budget is spent in priority order
+    # (fail_to_pass, golden_patch, test_patch, pass_to_pass) and anything cut is
+    # marked inline with "... [truncated]" plus a block-level note. Watch
+    # privilege/frac_truncated to see what the budget is discarding.
+    max_total_tokens: 32768
+
   reward_model_cfg:
     enabled: false  # only used for the DTensor V2 value worker
     reward_model_type: "regression"

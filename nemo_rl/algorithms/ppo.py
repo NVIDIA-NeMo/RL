@@ -390,6 +390,47 @@ def setup(
     # Privileged (answer-conditioned) critic — supported in BOTH the sync (ppo_train)
     # and async (async_ppo_train) loops; both build the answer-augmented value batch
     # at train time from message_log + extra_env_info.
+    _swe_privileged = value_config.get("swe_privileged_critic")
+    if _swe_privileged is not None and _swe_privileged.get("enabled"):
+        from nemo_rl.algorithms.swe_privileged_critic import (
+            privilege_budget_tokens as swe_privilege_budget_tokens,
+        )
+
+        # The critic scores [reference block + verbatim rollout], longer than the
+        # policy's [rollout] by at most the sum of the per-field caps. Every field
+        # is capped, so this is a true worst case, not an estimate. Only ever
+        # RAISES; a config that already has the headroom is untouched.
+        _needed = policy_config[
+            "max_total_sequence_length"
+        ] + swe_privilege_budget_tokens(_swe_privileged)
+        if value_config["max_total_sequence_length"] < _needed:
+            print(
+                "  ↑ SWE privileged critic: raising value.max_total_sequence_length "
+                f"{value_config['max_total_sequence_length']} -> {_needed}",
+                flush=True,
+            )
+            value_config["max_total_sequence_length"] = _needed
+        # The packing/dynamic-batching token budgets are OmegaConf interpolations
+        # of max_total_sequence_length, but the runner resolves the config
+        # (OmegaConf.to_container(resolve=True)) BEFORE setup() runs, so raising
+        # the length above does not propagate to them. Without this the packer
+        # raises "Sequence length N exceeds bin capacity" on the long tail --
+        # minutes-to-hours into the run, not at startup.
+        _mbs = int(value_config.get("train_micro_batch_size", 1) or 1)
+        for _bcfg_key in ("sequence_packing", "dynamic_batching"):
+            _bcfg = value_config.get(_bcfg_key) or {}
+            if not _bcfg.get("enabled"):
+                continue
+            for _tok_key in ("train_mb_tokens", "logprob_mb_tokens"):
+                _want = _needed * _mbs
+                if _bcfg.get(_tok_key) is not None and _bcfg[_tok_key] < _want:
+                    print(
+                        f"  ↑ SWE privileged critic: raising value.{_bcfg_key}.{_tok_key} "
+                        f"{_bcfg[_tok_key]} -> {_want}",
+                        flush=True,
+                    )
+                    _bcfg[_tok_key] = _want
+
     _privileged_critic = value_config.get("privileged_critic")
     if _privileged_critic is not None and _privileged_critic.get("enabled"):
         # The critic scores [prompt + answer + response], which is longer than the
@@ -1528,7 +1569,9 @@ def _raise_if_turn_gae_unsupported(master_config: MasterConfig) -> None:
             "is not supported: the privileged critic scores an answer-augmented "
             "sequence whose token layout differs from the policy's, so turn "
             "anchors computed on the policy layout would land on the wrong "
-            "positions. Disable one of the two."
+            "positions. Disable one of the two, or use "
+            "value.swe_privileged_critic, which remaps the turn anchors into "
+            "the augmented layout and therefore DOES support turn_gae."
         )
 
 
@@ -2380,11 +2423,34 @@ def ppo_train(
                         and not privileged_critic_cfg.get("enabled")
                     ):
                         privileged_critic_cfg = None
+                    from nemo_rl.algorithms.swe_privileged_critic import (
+                        build_swe_privileged_value_inputs,
+                        build_turn_value_batch_augmented,
+                    )
+                    from nemo_rl.algorithms.swe_privileged_critic import (
+                        resolve_config as swe_privileged_resolve_config,
+                    )
 
+                    swe_privileged_cfg = swe_privileged_resolve_config(master_config)
+                    privilege_metrics: dict[str, float] = {}
                     critic_batch = None
 
                     value_model.prepare_for_inference()
-                    if privileged_critic_cfg is not None:
+                    if swe_privileged_cfg is not None:
+                        # SWE variant: reference block prefixed to the VERBATIM
+                        # multi-turn rollout. Same augmented-layout contract as
+                        # the math one below, so everything downstream (remap,
+                        # residual offsets, turn anchors) is shared.
+                        critic_batch = build_swe_privileged_value_inputs(
+                            repeated_batch,
+                            tokenizer,
+                            swe_privileged_cfg,
+                            make_seq_len_divisible_by=master_config.policy[
+                                "make_sequence_length_divisible_by"
+                            ],
+                            metrics_out=privilege_metrics,
+                        )
+                    elif privileged_critic_cfg is not None:
                         critic_batch = build_privileged_value_inputs(
                             repeated_batch,
                             tokenizer,
@@ -2393,7 +2459,7 @@ def ppo_train(
                                 "make_sequence_length_divisible_by"
                             ],
                         )
-
+                    if critic_batch is not None:
                         vals_aug = value_model.get_values(critic_batch)[
                             "values"
                         ].squeeze(-1)
@@ -2527,7 +2593,15 @@ def ppo_train(
                         attach_value_baseline_keys(train_data, adv_estimator)
                         # Turn-level: the critic trains on one anchor per turn,
                         # so it needs its own batch (same sequences, anchor mask).
-                        if turn_spans is not None:
+                        if turn_spans is not None and critic_batch is not None:
+                            # Privileged AND turn-level: the anchor batch must be
+                            # expressed in the AUGMENTED layout, or the critic
+                            # would train on policy-layout sequences while its
+                            # values came from privileged ones.
+                            critic_batch = build_turn_value_batch_augmented(
+                                critic_batch, train_data, turn_spans
+                            )
+                        elif turn_spans is not None:
                             from nemo_rl.algorithms.turn_level import (
                                 build_turn_value_batch,
                             )
@@ -2753,7 +2827,7 @@ def ppo_train(
                     # turn counts). The token-level versions above are dominated
                     # by the longest turns; these weight every decision equally.
                     metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
-
+                    metrics.update(privilege_metrics)
                 metrics.update(
                     {
                         "reward": rewards.numpy(),
@@ -3643,11 +3717,34 @@ def async_ppo_train(
                         and not privileged_critic_cfg.get("enabled")
                     ):
                         privileged_critic_cfg = None
+                    from nemo_rl.algorithms.swe_privileged_critic import (
+                        build_swe_privileged_value_inputs,
+                        build_turn_value_batch_augmented,
+                    )
+                    from nemo_rl.algorithms.swe_privileged_critic import (
+                        resolve_config as swe_privileged_resolve_config,
+                    )
 
+                    swe_privileged_cfg = swe_privileged_resolve_config(master_config)
+                    privilege_metrics: dict[str, float] = {}
                     critic_batch = None
 
                     value_model.prepare_for_inference()
-                    if privileged_critic_cfg is not None:
+                    if swe_privileged_cfg is not None:
+                        # SWE variant: reference block prefixed to the VERBATIM
+                        # multi-turn rollout. Same augmented-layout contract as
+                        # the math one below, so everything downstream (remap,
+                        # residual offsets, turn anchors) is shared.
+                        critic_batch = build_swe_privileged_value_inputs(
+                            repeated_batch,
+                            tokenizer,
+                            swe_privileged_cfg,
+                            make_seq_len_divisible_by=master_config.policy[
+                                "make_sequence_length_divisible_by"
+                            ],
+                            metrics_out=privilege_metrics,
+                        )
+                    elif privileged_critic_cfg is not None:
                         critic_batch = build_privileged_value_inputs(
                             repeated_batch,
                             tokenizer,
@@ -3656,7 +3753,7 @@ def async_ppo_train(
                                 "make_sequence_length_divisible_by"
                             ],
                         )
-
+                    if critic_batch is not None:
                         vals_aug = value_model.get_values(critic_batch)[
                             "values"
                         ].squeeze(-1)
@@ -3757,7 +3854,15 @@ def async_ppo_train(
                         attach_value_baseline_keys(train_data, adv_estimator)
                         # Turn-level: the critic trains on one anchor per turn,
                         # so it needs its own batch (same sequences, anchor mask).
-                        if turn_spans is not None:
+                        if turn_spans is not None and critic_batch is not None:
+                            # Privileged AND turn-level: the anchor batch must be
+                            # expressed in the AUGMENTED layout, or the critic
+                            # would train on policy-layout sequences while its
+                            # values came from privileged ones.
+                            critic_batch = build_turn_value_batch_augmented(
+                                critic_batch, train_data, turn_spans
+                            )
+                        elif turn_spans is not None:
                             from nemo_rl.algorithms.turn_level import (
                                 build_turn_value_batch,
                             )
@@ -3998,6 +4103,7 @@ def async_ppo_train(
                     # turn counts). The token-level versions above are dominated
                     # by the longest turns; these weight every decision equally.
                     metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
+                    metrics.update(privilege_metrics)
 
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:

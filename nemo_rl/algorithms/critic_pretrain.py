@@ -404,7 +404,7 @@ def _forward_values_and_returns(
     repeated_batch: BatchedDataDict,
     tokenizer: Any,
     master_config: Any,
-
+    metrics_out: Optional[dict[str, float]] = None,
 ) -> tuple[Optional[BatchedDataDict], Optional[Any]]:
     """Populate train_data['values'/'returns'] in place.
 
@@ -425,12 +425,18 @@ def _forward_values_and_returns(
         build_privileged_value_inputs,
         remap_by_response_mask,
     )
-
+    from nemo_rl.algorithms.swe_privileged_critic import (
+        build_swe_privileged_value_inputs,
+        build_turn_value_batch_augmented,
+    )
+    from nemo_rl.algorithms.swe_privileged_critic import (
+        resolve_config as swe_privileged_resolve_config,
+    )
 
     privileged_critic_cfg = master_config.value.get("privileged_critic")
     if privileged_critic_cfg is not None and not privileged_critic_cfg.get("enabled"):
         privileged_critic_cfg = None
-
+    swe_privileged_cfg = swe_privileged_resolve_config(master_config)
     critic_batch = None
 
     # Turn structure (None on the token-level path). Stage B must build this the
@@ -439,7 +445,17 @@ def _forward_values_and_returns(
     turn_spans = build_turn_spans_for_batch(master_config, repeated_batch, train_data)
 
     value_model.prepare_for_inference()
-    if privileged_critic_cfg is not None:
+    if swe_privileged_cfg is not None:
+        critic_batch = build_swe_privileged_value_inputs(
+            repeated_batch,
+            tokenizer,
+            swe_privileged_cfg,
+            make_seq_len_divisible_by=master_config.policy[
+                "make_sequence_length_divisible_by"
+            ],
+            metrics_out=metrics_out,
+        )
+    elif privileged_critic_cfg is not None:
         critic_batch = build_privileged_value_inputs(
             repeated_batch,
             tokenizer,
@@ -448,7 +464,7 @@ def _forward_values_and_returns(
                 "make_sequence_length_divisible_by"
             ],
         )
-
+    if critic_batch is not None:
         vals_aug = value_model.get_values(critic_batch)["values"].squeeze(-1)
         critic_batch["values"] = vals_aug
         train_data["values"] = remap_by_response_mask(
@@ -482,7 +498,14 @@ def _forward_values_and_returns(
     advantages, returns = adv_estimator.compute_advantage(**adv_kwargs)
     del advantages  # critic pretraining has no actor; only returns are used
     train_data["returns"] = returns
-    if turn_spans is not None:
+    if turn_spans is not None and critic_batch is not None:
+        # Privileged AND turn-level: anchors must be remapped into the augmented
+        # layout, else the critic trains on policy-layout sequences while its
+        # values came from privileged ones.
+        critic_batch = build_turn_value_batch_augmented(
+            critic_batch, train_data, turn_spans
+        )
+    elif turn_spans is not None:
         # One supervised position per turn, equally weighted (swapping token_mask
         # for the anchor mask is what makes MseValueLossFn a per-turn mean).
         critic_batch = build_turn_value_batch(train_data, turn_spans)
@@ -521,7 +544,7 @@ def _heldout_metrics(
     train_data, repeated_batch = build_value_train_data(
         groups, tokenizer, master_config
     )
-
+    priv_metrics: dict[str, float] = {}
     _, turn_spans = _forward_values_and_returns(
         value_model,
         adv_estimator,
@@ -529,7 +552,7 @@ def _heldout_metrics(
         repeated_batch,
         tokenizer,
         master_config,
-
+        metrics_out=priv_metrics,
     )
     values, returns = train_data["values"], train_data["returns"]
     scored_mask = (
@@ -613,7 +636,7 @@ def _heldout_metrics(
             )
         )
     metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
-
+    metrics.update(priv_metrics)
     metrics["reward"] = train_data["rewards"].float().mean().item()
     metrics["num_heldout_samples"] = float(train_data["input_ids"].shape[0])
     return metrics
@@ -756,6 +779,41 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     # Privileged critic scores [prompt + answer + response]: raise the value
     # model's sequence/packing budgets exactly as ppo.setup() does, so
     # answer-augmented near-max-length samples fit the packing bins.
+    _swe_privileged = value_config.get("swe_privileged_critic")
+    if _swe_privileged is not None and _swe_privileged.get("enabled"):
+        from nemo_rl.algorithms.swe_privileged_critic import privilege_budget_tokens
+
+        _needed = master_config.policy[
+            "max_total_sequence_length"
+        ] + privilege_budget_tokens(_swe_privileged)
+        if value_config["max_total_sequence_length"] < _needed:
+            print(
+                "  ↑ SWE privileged critic: raising value.max_total_sequence_length "
+                f"{value_config['max_total_sequence_length']} -> {_needed}",
+                flush=True,
+            )
+            value_config["max_total_sequence_length"] = _needed
+        # The packing/dynamic-batching token budgets are OmegaConf interpolations
+        # of max_total_sequence_length, but the runner resolves the config
+        # (OmegaConf.to_container(resolve=True)) BEFORE setup() runs, so raising
+        # the length above does not propagate to them. Without this the packer
+        # raises "Sequence length N exceeds bin capacity" on the long tail --
+        # minutes-to-hours into the run, not at startup.
+        _mbs = int(value_config.get("train_micro_batch_size", 1) or 1)
+        for _bcfg_key in ("sequence_packing", "dynamic_batching"):
+            _bcfg = value_config.get(_bcfg_key) or {}
+            if not _bcfg.get("enabled"):
+                continue
+            for _tok_key in ("train_mb_tokens", "logprob_mb_tokens"):
+                _want = _needed * _mbs
+                if _bcfg.get(_tok_key) is not None and _bcfg[_tok_key] < _want:
+                    print(
+                        f"  ↑ SWE privileged critic: raising value.{_bcfg_key}.{_tok_key} "
+                        f"{_bcfg[_tok_key]} -> {_want}",
+                        flush=True,
+                    )
+                    _bcfg[_tok_key] = _want
+
     _privileged_critic = value_config.get("privileged_critic")
     if _privileged_critic is not None and _privileged_critic.get("enabled"):
         _needed = (
@@ -1004,7 +1062,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             )
 
         print("▶ Computing values...")
-
+        priv_metrics: dict[str, float] = {}
         critic_batch, turn_spans = _forward_values_and_returns(
             value_model,
             adv_estimator,
@@ -1012,7 +1070,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             repeated_batch,
             tokenizer,
             master_config,
-
+            metrics_out=priv_metrics,
         )
 
         print("▶ Training critic...")
@@ -1058,7 +1116,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             )
         )
         metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
-
+        metrics.update(priv_metrics)
         metrics["reward"] = train_data["rewards"].float().mean().item()
         metrics["num_samples"] = float(train_data["input_ids"].shape[0])
         metrics["total_step_time"] = time.perf_counter() - step_start
