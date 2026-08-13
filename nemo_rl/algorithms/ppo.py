@@ -982,9 +982,7 @@ def setup(
     def _spinup_nemo_gym(base_urls, model_name):
         """Spin up the NeMo-Gym actor against the given vLLM server URLs."""
         t0 = time.perf_counter()
-        nemo_gym_py_exec = get_actor_python_env(
-            "nemo_rl.environments.nemo_gym.NemoGym"
-        )
+        nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
         if nemo_gym_py_exec.startswith("uv"):
             nemo_gym_py_exec = create_local_venv_on_each_node(
                 nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
@@ -1206,9 +1204,7 @@ def setup(
             ip, port, world_size, train_world_size=train_world_size
         )
         ray.get(futures_train + futures_inference)
-        worker_init_timing_metrics["collective_init_time_s"] = (
-            time.perf_counter() - t0
-        )
+        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     # Reload policy weights to GPU before refit (they may have been offloaded
     # during setup to free GPU for value model initialization).
@@ -1548,9 +1544,7 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     return critic_metrics
 
 
-def _calibration_ece(
-    v: torch.Tensor, r: torch.Tensor, n_conf_bins: int = 10
-) -> float:
+def _calibration_ece(v: torch.Tensor, r: torch.Tensor, n_conf_bins: int = 10) -> float:
     """Expected Calibration Error of V as an estimate of P(success).
 
     With outcome returns in [0, 1], a well-calibrated critic satisfies
@@ -1597,7 +1591,9 @@ def _positional_value_metrics(
     # 0-based index of each response token within its sample's response, scaled to [0,1)
     resp_len = mask.sum(dim=1, keepdim=True).clamp(min=1)
     rel = (torch.cumsum(mask.long(), dim=1) - 1).float() / resp_len.float()
-    names = ["early", "mid", "late"] if n_bins == 3 else [f"bin{i}" for i in range(n_bins)]
+    names = (
+        ["early", "mid", "late"] if n_bins == 3 else [f"bin{i}" for i in range(n_bins)]
+    )
     out: dict[str, float] = {}
     for i in range(n_bins):
         lo, hi = i / n_bins, (i + 1) / n_bins
@@ -1736,9 +1732,7 @@ def _build_ppo_rollout_dump_payload(
     if "returns" in train_data:
         payload["returns"] = _pack_float("returns")
     if turn_spans is not None:
-        payload["is_anchor"] = (
-            turn_spans.anchor_mask.detach().bool().cpu()[token_mask]
-        )
+        payload["is_anchor"] = turn_spans.anchor_mask.detach().bool().cpu()[token_mask]
     if "reference_policy_logprobs" in train_data:
         payload["reference_policy_logprobs"] = _pack_float("reference_policy_logprobs")
 
@@ -2117,8 +2111,9 @@ def ppo_train(
                     # values are mapped back into the original layout. Policy/GAE/value
                     # workers are untouched. See nemo_rl/algorithms/privileged_critic.py.
                     privileged_critic_cfg = master_config.value.get("privileged_critic")
-                    if privileged_critic_cfg is not None and not privileged_critic_cfg.get(
-                        "enabled"
+                    if (
+                        privileged_critic_cfg is not None
+                        and not privileged_critic_cfg.get("enabled")
                     ):
                         privileged_critic_cfg = None
                     critic_batch = None
@@ -2133,9 +2128,9 @@ def ppo_train(
                                 "make_sequence_length_divisible_by"
                             ],
                         )
-                        vals_aug = value_model.get_values(critic_batch)["values"].squeeze(
-                            -1
-                        )
+                        vals_aug = value_model.get_values(critic_batch)[
+                            "values"
+                        ].squeeze(-1)
                         # keep aug-layout old values around for the (optional) value clip
                         critic_batch["values"] = vals_aug
                         train_data["values"] = remap_by_response_mask(
@@ -3352,8 +3347,9 @@ def async_ppo_train(
                     # trajectories carry message_log + extra_env_info, so the augmented
                     # batch is built at train time exactly as in sync.
                     privileged_critic_cfg = master_config.value.get("privileged_critic")
-                    if privileged_critic_cfg is not None and not privileged_critic_cfg.get(
-                        "enabled"
+                    if (
+                        privileged_critic_cfg is not None
+                        and not privileged_critic_cfg.get("enabled")
                     ):
                         privileged_critic_cfg = None
                     critic_batch = None
@@ -3368,9 +3364,9 @@ def async_ppo_train(
                                 "make_sequence_length_divisible_by"
                             ],
                         )
-                        vals_aug = value_model.get_values(critic_batch)["values"].squeeze(
-                            -1
-                        )
+                        vals_aug = value_model.get_values(critic_batch)[
+                            "values"
+                        ].squeeze(-1)
                         critic_batch["values"] = vals_aug
                         train_data["values"] = remap_by_response_mask(
                             vals_aug,

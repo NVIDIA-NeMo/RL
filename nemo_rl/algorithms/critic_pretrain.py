@@ -73,9 +73,7 @@ def list_group_files(shards_dir: str | Path) -> list[Path]:
     return [f for f in files if parse_group_index(f.name) is not None]
 
 
-def split_heldout(
-    files: list[Path], heldout_mod: int
-) -> tuple[list[Path], list[Path]]:
+def split_heldout(files: list[Path], heldout_mod: int) -> tuple[list[Path], list[Path]]:
     """Deterministic train/held-out split by dataset index.
 
     ``dataset_idx % heldout_mod == 0`` goes to held-out; ``heldout_mod <= 0``
@@ -162,11 +160,15 @@ def verify_shard_meta(
 
     metas = sorted(Path(shards_dir).glob("shard_*/meta.json"))
     if not metas:
-        print(f"⚠️ No shard meta.json found under {shards_dir}; skipping provenance check.")
+        print(
+            f"⚠️ No shard meta.json found under {shards_dir}; skipping provenance check."
+        )
         return
     expected = {
         "model_name": master_config.policy["model_name"],
-        "chat_template_sha256": _sha256(getattr(tokenizer, "chat_template", None) or ""),
+        "chat_template_sha256": _sha256(
+            getattr(tokenizer, "chat_template", None) or ""
+        ),
         "max_total_sequence_length": master_config.policy["max_total_sequence_length"],
     }
     for meta_path in metas:
@@ -371,9 +373,7 @@ def _forward_values_and_returns(
             train_data["token_mask"],
         )
     else:
-        train_data["values"] = value_model.get_values(train_data)["values"].squeeze(
-            -1
-        )
+        train_data["values"] = value_model.get_values(train_data)["values"].squeeze(-1)
     value_model.finish_inference()
 
     initial_prompt_message_logs = extract_initial_prompt_messages(
@@ -434,7 +434,11 @@ def _heldout_metrics(
         groups, tokenizer, master_config
     )
     _, turn_spans = _forward_values_and_returns(
-        value_model, adv_estimator, train_data, repeated_batch, tokenizer,
+        value_model,
+        adv_estimator,
+        train_data,
+        repeated_batch,
+        tokenizer,
         master_config,
     )
     values, returns = train_data["values"], train_data["returns"]
@@ -447,9 +451,7 @@ def _heldout_metrics(
         v, r = values[mask].float(), returns[mask].float()
         var_r = r.var(unbiased=False)
         metrics["critic/explained_var"] = (
-            (1.0 - (r - v).var(unbiased=False) / var_r).item()
-            if var_r > 1e-8
-            else 0.0
+            (1.0 - (r - v).var(unbiased=False) / var_r).item() if var_r > 1e-8 else 0.0
         )
         metrics["critic/mse"] = ((r - v) ** 2).mean().item()
     metrics.update(_positional_value_metrics(values, returns, scored_mask))
@@ -494,7 +496,11 @@ def _dump_heldout_values(
             [g], tokenizer, master_config
         )
         _, turn_spans = _forward_values_and_returns(
-            value_model, adv_estimator, train_data, repeated_batch, tokenizer,
+            value_model,
+            adv_estimator,
+            train_data,
+            repeated_batch,
+            tokenizer,
             master_config,
         )
         mask = train_data["token_mask"].bool()
@@ -509,7 +515,7 @@ def _dump_heldout_values(
             succ = [i for i in range(len(rew)) if rew[i] > 0.5]
             fail = [i for i in range(len(rew)) if rew[i] <= 0.5]
             half = max(1, dump_token_samples // 2)
-            render_samples = (succ[:half] + fail[: dump_token_samples - len(succ[:half])])
+            render_samples = succ[:half] + fail[: dump_token_samples - len(succ[:half])]
             render_samples = sorted(render_samples[:dump_token_samples])
         render_set = set(render_samples)
         samples_msgs = []
@@ -520,9 +526,7 @@ def _dump_heldout_values(
                 for m, s in zip(ml, spans):
                     s["text"] = tokenizer.decode(m["token_ids"])
                     if want_toks and m["role"] == "assistant":
-                        s["toks"] = [
-                            tokenizer.decode([int(t)]) for t in m["token_ids"]
-                        ]
+                        s["toks"] = [tokenizer.decode([int(t)]) for t in m["token_ids"]]
             samples_msgs.append(spans)
         anchor_mask = turn_spans.anchor_mask if turn_spans is not None else None
         payload = {
@@ -683,14 +687,14 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
                 "frozen; they are ignored this run (frozen-dataset semantics)."
             )
     else:
-        base_train, heldout_files = split_heldout(
-            all_files, cp_config["heldout_mod"]
-        )
+        base_train, heldout_files = split_heldout(all_files, cp_config["heldout_mod"])
         train_files = build_epoch_stream(base_train, num_epochs, cp_config["seed"])
     missing = [
         p for p in set(train_files) | set(heldout_files) if not os.path.exists(p)
     ]
-    assert not missing, f"{len(missing)} frozen group files are missing, e.g. {missing[:3]}"
+    assert not missing, (
+        f"{len(missing)} frozen group files are missing, e.g. {missing[:3]}"
+    )
 
     groups_per_step = cp_config["groups_per_step"]
     # drop-last within the whole multi-epoch stream
@@ -781,7 +785,9 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     if eval_only:
         dump_dir = _Path(
             cp_config.get("dump_dir")
-            or os.path.join(master_config.checkpointing["checkpoint_dir"], "value_dumps")
+            or os.path.join(
+                master_config.checkpointing["checkpoint_dir"], "value_dumps"
+            )
         )
         print(
             f"🔍 Eval-only: scoring {len(heldout_files)} held-out groups -> {dump_dir}"
@@ -843,16 +849,18 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
 
         print("▶ Computing values...")
         critic_batch, turn_spans = _forward_values_and_returns(
-            value_model, adv_estimator, train_data, repeated_batch, tokenizer,
+            value_model,
+            adv_estimator,
+            train_data,
+            repeated_batch,
+            tokenizer,
             master_config,
         )
 
         print("▶ Training critic...")
         value_model.prepare_for_training()
         value_train_batch = critic_batch if critic_batch is not None else train_data
-        value_results = value_model.train(
-            value_train_batch, value_loss_fn
-        )
+        value_results = value_model.train(value_train_batch, value_loss_fn)
         value_model.finish_training()
 
         # ---- Metrics ----
@@ -909,9 +917,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         save_state["consumed_samples"] = save_state.get("consumed_samples", 0) + int(
             train_data["input_ids"].shape[0]
         )
-        if checkpointing_enabled and (
-            is_last_step or step % save_period == 0
-        ):
+        if checkpointing_enabled and (is_last_step or step % save_period == 0):
             print(f"💾 Saving checkpoint for step {step}...")
             checkpoint_path = checkpointer.init_tmp_checkpoint(
                 step, save_state, master_config
