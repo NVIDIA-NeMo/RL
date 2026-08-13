@@ -3645,6 +3645,10 @@ def test_zero_train_gen_mismatch_forces_te_generation_spec():
         config["generation"]["mcore_generation_config"]["transformer_impl"]
         == "transformer_engine"
     )
+    assert (
+        config["generation"]["mcore_generation_config"]["logprobs_mode"]
+        == "raw_logprobs"
+    )
     assert config["megatron_cfg"]["flash_attention_version"] == 4
     apply_mamba_patch.assert_called_once_with(required=True)
     apply_moe_patches.assert_called_once_with()
