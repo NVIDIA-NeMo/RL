@@ -555,8 +555,8 @@ data_plane:
                                      # serialized groups and cost throughput;
                                      # higher buys little at linear HBM cost.
                                      # GDR needs that headroom to pay off.
-  # observability:                    # NotRequired
-  #   enabled: false
+  observability:                      # per-op data-plane timing/volume
+    enabled: false                    # true => wrap client in MetricsDataPlaneClient
 
 # Multi-Teacher On-Policy Distillation (MOPD); null = disabled (default). Mirrors
 # the field on the GRPO MasterConfig added for MOPD support.
