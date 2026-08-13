@@ -162,13 +162,9 @@ def test_process_mxfp8_moe_refit_uses_batched_flashinfer_shuffle(
     )
 
     w13_rows = 256 if is_gated else 128
-    w13_weight = torch.nn.Parameter(
-        torch.zeros(2, w13_rows, 512), requires_grad=False
-    )
+    w13_weight = torch.nn.Parameter(torch.zeros(2, w13_rows, 512), requires_grad=False)
     w2_weight = torch.nn.Parameter(torch.zeros(2, 512, 128), requires_grad=False)
-    w13_scale = torch.nn.Parameter(
-        torch.zeros(2, w13_rows, 16), requires_grad=False
-    )
+    w13_scale = torch.nn.Parameter(torch.zeros(2, w13_rows, 16), requires_grad=False)
     w2_scale = torch.nn.Parameter(torch.zeros(2, 512, 4), requires_grad=False)
     w13_scale_from_checkpoint = torch.ones_like(w13_scale)
     w2_scale_from_checkpoint = torch.ones_like(w2_scale)
@@ -293,12 +289,8 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     )
 
     layer = torch.nn.Module()
-    layer.w13_weight = torch.nn.Parameter(
-        torch.zeros(2, 128, 512), requires_grad=False
-    )
-    layer.w2_weight = torch.nn.Parameter(
-        torch.zeros(2, 512, 128), requires_grad=False
-    )
+    layer.w13_weight = torch.nn.Parameter(torch.zeros(2, 128, 512), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 512, 128), requires_grad=False)
     layer.w13_weight_scale = torch.nn.Parameter(
         torch.zeros(2, 128, 16), requires_grad=False
     )
@@ -388,7 +380,10 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     }
 
 
-def test_process_mxfp8_moe_padding_preserves_refit_tensors(fp8_module, monkeypatch):
+@pytest.mark.parametrize("is_gated", [False, True])
+def test_process_mxfp8_moe_padding_preserves_refit_tensors(
+    fp8_module, monkeypatch, is_gated
+):
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
     fp8 = fp8_module
@@ -404,13 +399,15 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(fp8_module, monkeypat
         return parameter
 
     layer = torch.nn.Module()
-    layer.register_parameter(
-        "w13_weight", make_parameter(torch.ones(1, 32, 128))
-    )
+    w13_rows = 64 if is_gated else 32
+    w13 = torch.ones(1, w13_rows, 128)
+    if is_gated:
+        w13[:, 32:].fill_(5)
+    layer.register_parameter("w13_weight", make_parameter(w13))
     layer.register_parameter("w2_weight", make_parameter(torch.ones(1, 128, 32)))
     layer.register_parameter(
         "w13_weight_scale",
-        make_parameter(torch.full((1, 32, 4), 2, dtype=torch.uint8)),
+        make_parameter(torch.full((1, w13_rows, 4), 2, dtype=torch.uint8)),
     )
     layer.register_parameter(
         "w2_weight_scale",
@@ -419,7 +416,7 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(fp8_module, monkeypat
     layer._expert_routing_tables = lambda: (None, None, None)
 
     moe_config = types.SimpleNamespace(
-        is_act_and_mul=False,
+        is_act_and_mul=is_gated,
         hidden_dim=128,
         hidden_dim_unpadded=128,
         intermediate_size=32,
@@ -433,7 +430,7 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(fp8_module, monkeypat
         moe=moe_config,
         moe_kernel=None,
         mxfp8_backend=Fp8MoeBackend.FLASHINFER_TRTLLM,
-        experts_cls=object(),
+        experts_cls=types.SimpleNamespace(is_monolithic=lambda: True),
         get_fused_moe_quant_config=lambda _layer: object(),
     )
 
@@ -450,21 +447,33 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(fp8_module, monkeypat
         "_shuffle_mxfp8_moe_batched",
         lambda _layer, w13, w2, s13, s2, _gated, _tile: (w13, w2, s13, s2),
     )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.utils.flashinfer_utils.swap_w13_to_w31",
+        lambda value: value,
+    )
 
     fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
 
-    assert tuple(layer.w13_weight.shape) == (1, 32, 128)
+    assert tuple(layer.w13_weight.shape) == (1, w13_rows, 128)
     assert tuple(layer.w2_weight.shape) == (1, 128, 32)
-    assert tuple(layer.w13_weight_scale_from_checkpoint.shape) == (1, 32, 4)
+    assert tuple(layer.w13_weight_scale_from_checkpoint.shape) == (1, w13_rows, 4)
     assert tuple(layer.w2_weight_scale_from_checkpoint.shape) == (1, 128, 1)
-    assert tuple(layer.w13_weight_for_apply.shape) == (1, 128, 512)
+    expected_w13_rows = 256 if is_gated else 128
+    assert tuple(layer.w13_weight_for_apply.shape) == (1, expected_w13_rows, 512)
     assert tuple(layer.w2_weight_for_apply.shape) == (1, 512, 128)
-    assert tuple(layer.w13_weight_scale.shape) == (1, 128, 16)
+    assert tuple(layer.w13_weight_scale.shape) == (1, expected_w13_rows, 16)
     assert tuple(layer.w2_weight_scale.shape) == (1, 512, 4)
-    assert torch.count_nonzero(layer.w13_weight_for_apply[:, 32:, :]) == 0
     assert torch.count_nonzero(layer.w13_weight_for_apply[:, :, 128:]) == 0
-    assert torch.all(layer.w13_weight_scale[:, 32:, :] == 127)
     assert torch.all(layer.w13_weight_scale[:, :, 4:] == 127)
+    if is_gated:
+        assert torch.count_nonzero(layer.w13_weight_for_apply[:, 32:128, :]) == 0
+        assert torch.all(layer.w13_weight_for_apply[:, 128:160, :128] == 5)
+        assert torch.count_nonzero(layer.w13_weight_for_apply[:, 160:, :]) == 0
+        assert torch.all(layer.w13_weight_scale[:, 32:128, :] == 127)
+        assert torch.all(layer.w13_weight_scale[:, 160:, :] == 127)
+    else:
+        assert torch.count_nonzero(layer.w13_weight_for_apply[:, 32:, :]) == 0
+        assert torch.all(layer.w13_weight_scale[:, 32:, :] == 127)
     assert torch.count_nonzero(layer.w2_weight_for_apply[:, 128:, :]) == 0
     assert torch.count_nonzero(layer.w2_weight_for_apply[:, :, 32:]) == 0
     assert torch.all(layer.w2_weight_scale[:, 128:, :] == 127)
@@ -504,16 +513,54 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(fp8_module, monkeypat
     assert torch.all(layer.w2_weight_for_apply[:, :128, :32] == 3)
     assert torch.all(layer.w13_weight_scale[:, :32, :4] == 4)
     assert torch.all(layer.w2_weight_scale[:, :128, :1] == 4)
-    assert torch.count_nonzero(layer.w13_weight_for_apply[:, 32:, :]) == 0
     assert torch.count_nonzero(layer.w13_weight_for_apply[:, :, 128:]) == 0
-    assert torch.all(layer.w13_weight_scale[:, 32:, :] == 127)
     assert torch.all(layer.w13_weight_scale[:, :, 4:] == 127)
+    if is_gated:
+        assert torch.count_nonzero(layer.w13_weight_for_apply[:, 32:128, :]) == 0
+        assert torch.all(layer.w13_weight_for_apply[:, 128:160, :128] == 3)
+        assert torch.count_nonzero(layer.w13_weight_for_apply[:, 160:, :]) == 0
+        assert torch.all(layer.w13_weight_scale[:, 32:128, :] == 127)
+        assert torch.all(layer.w13_weight_scale[:, 160:, :] == 127)
+    else:
+        assert torch.count_nonzero(layer.w13_weight_for_apply[:, 32:, :]) == 0
+        assert torch.all(layer.w13_weight_scale[:, 32:, :] == 127)
     assert torch.count_nonzero(layer.w2_weight_for_apply[:, 128:, :]) == 0
     assert torch.count_nonzero(layer.w2_weight_for_apply[:, :, 32:]) == 0
     assert torch.all(layer.w2_weight_scale[:, 128:, :] == 127)
     assert torch.all(layer.w2_weight_scale[:, :, 1:] == 127)
     assert quant_method.moe_kernel is kernel
     assert len(kernel_configs) == 1
+
+
+def test_process_mxfp8_moe_padding_rejects_modular_kernel(fp8_module, monkeypatch):
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
+    fp8 = fp8_module
+    layer = torch.nn.Module()
+    for name, value in (
+        ("w13_weight", torch.ones(1, 32, 128)),
+        ("w2_weight", torch.ones(1, 128, 32)),
+        ("w13_weight_scale", torch.ones(1, 32, 4, dtype=torch.uint8)),
+        ("w2_weight_scale", torch.ones(1, 128, 1, dtype=torch.uint8)),
+    ):
+        parameter = torch.nn.Parameter(value, requires_grad=False)
+        parameter.weight_loader = lambda *_args, **_kwargs: None
+        layer.register_parameter(name, parameter)
+
+    method = types.SimpleNamespace(
+        moe=types.SimpleNamespace(is_act_and_mul=False),
+        moe_kernel=None,
+        mxfp8_backend=Fp8MoeBackend.FLASHINFER_TRTLLM,
+        experts_cls=types.SimpleNamespace(is_monolithic=lambda: False),
+    )
+    monkeypatch.setattr(
+        fp8,
+        "_shuffle_mxfp8_moe_batched",
+        lambda _layer, w13, w2, s13, s2, _gated, _tile: (w13, w2, s13, s2),
+    )
+
+    with pytest.raises(NotImplementedError, match="requires a monolithic kernel"):
+        fp8.process_weights_after_loading_mxfp8_moe(method, layer)
 
 
 def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(fp8_module):
@@ -669,7 +716,9 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
         "ModelOptMxFp8FusedMoE.process_weights_after_loading" in path
         for path in patched_paths
     )
-    assert any("ModelOptMxFp8FusedMoE.apply_monolithic" in path for path in patched_paths)
+    assert any(
+        "ModelOptMxFp8FusedMoE.apply_monolithic" in path for path in patched_paths
+    )
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
 

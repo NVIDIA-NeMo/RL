@@ -1093,6 +1093,26 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
             return
         setattr(layer, name, torch.nn.Parameter(value, requires_grad=False))
 
+    def pad_w13_intermediate(
+        tensor: torch.Tensor,
+        padded_intermediate_size: int,
+        pad_value: int | float = 0,
+    ) -> torch.Tensor:
+        if not is_gated:
+            return pad_tensor_dim(tensor, 1, padded_intermediate_size, pad_value)
+
+        intermediate_size = tensor.shape[1] // 2
+        sharded = tensor.reshape(
+            tensor.shape[0], 2, intermediate_size, *tensor.shape[2:]
+        )
+        padded_shape = list(sharded.shape)
+        padded_shape[2] = padded_intermediate_size
+        padded = tensor.new_full(padded_shape, pad_value)
+        padded[:, :, :intermediate_size].copy_(sharded)
+        return padded.reshape(
+            tensor.shape[0], 2 * padded_intermediate_size, *tensor.shape[2:]
+        )
+
     first_load = not hasattr(layer, "w13_weight_scale_from_checkpoint")
     if first_load:
         layer.w13_weight_scale_from_checkpoint = ModelWeightParameter(
@@ -1131,22 +1151,23 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
     epilogue_tile_m = 128
     e8m0_unit_scale = 127
     is_gated = self.moe.is_act_and_mul
-    intermediate_size_factor = 2 if is_gated else 1
     w13_weight = layer.w13_weight.data
     w2_weight = layer.w2_weight.data
     w13_scale = layer.w13_weight_scale_from_checkpoint.data
     w2_scale = layer.w2_weight_scale_from_checkpoint.data
     unpadded_hidden_size = w13_weight.shape[2]
     unpadded_intermediate_size = w2_weight.shape[2]
-    padded_hidden_size, padded_intermediate_size = (
-        flashinfer_mxfp8_moe_padding_plan(
-            unpadded_hidden_size, unpadded_intermediate_size
-        )
+    padded_hidden_size, padded_intermediate_size = flashinfer_mxfp8_moe_padding_plan(
+        unpadded_hidden_size, unpadded_intermediate_size
     )
     requires_padding = (
         padded_hidden_size != unpadded_hidden_size
         or padded_intermediate_size != unpadded_intermediate_size
     )
+    if requires_padding and not self.experts_cls.is_monolithic():
+        raise NotImplementedError(
+            "Padded FlashInfer TRTLLM MXFP8 MoE requires a monolithic kernel."
+        )
 
     if requires_padding:
         from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
@@ -1160,19 +1181,12 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
         )
         layer.mxfp8_padded_intermediate_size_per_partition = padded_intermediate_size
 
-        w13_weight = pad_tensor_dim(
-            w13_weight,
-            1,
-            intermediate_size_factor * padded_intermediate_size,
-        )
+        w13_weight = pad_w13_intermediate(w13_weight, padded_intermediate_size)
         w13_weight = pad_tensor_dim(w13_weight, 2, padded_hidden_size)
         w2_weight = pad_tensor_dim(w2_weight, 1, padded_hidden_size)
         w2_weight = pad_tensor_dim(w2_weight, 2, padded_intermediate_size)
-        w13_scale = pad_tensor_dim(
-            w13_scale,
-            1,
-            intermediate_size_factor * padded_intermediate_size,
-            e8m0_unit_scale,
+        w13_scale = pad_w13_intermediate(
+            w13_scale, padded_intermediate_size, e8m0_unit_scale
         )
         w13_scale = pad_tensor_dim(
             w13_scale,
@@ -1180,9 +1194,7 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
             padded_hidden_size // MXFP8_BLOCK_SIZE,
             e8m0_unit_scale,
         )
-        w2_scale = pad_tensor_dim(
-            w2_scale, 1, padded_hidden_size, e8m0_unit_scale
-        )
+        w2_scale = pad_tensor_dim(w2_scale, 1, padded_hidden_size, e8m0_unit_scale)
         w2_scale = pad_tensor_dim(
             w2_scale,
             2,
@@ -1226,15 +1238,12 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
             kernel_moe_config = copy(self.moe)
             kernel_moe_config.hidden_dim = padded_hidden_size
             kernel_moe_config.hidden_dim_unpadded = unpadded_hidden_size
-            kernel_moe_config.intermediate_size_per_partition = (
-                padded_intermediate_size
-            )
+            kernel_moe_config.intermediate_size_per_partition = padded_intermediate_size
             kernel_moe_config.intermediate_size_per_partition_unpadded = (
                 unpadded_intermediate_size
             )
             kernel_moe_config.intermediate_size = (
-                padded_intermediate_size
-                * kernel_moe_config.moe_parallel_config.tp_size
+                padded_intermediate_size * kernel_moe_config.moe_parallel_config.tp_size
             )
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
