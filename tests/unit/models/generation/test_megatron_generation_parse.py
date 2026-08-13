@@ -38,9 +38,12 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
 )
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import (
+    _HeldPortReservation,
+    receive_held_socket,
+)
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
-    bind_reserved_http_server_socket,
 )
 
 PAD = 0
@@ -168,25 +171,32 @@ def test_handles_a_reply_with_no_generated_tokens(two_sample_batch):
 def test_http_server_port_reservation(monkeypatch):
     """The NeMo-Gym overlap contract, exercised back to back.
 
-    The server URL is published to NeMo Gym before any worker exists, so:
-    the reserved port must be held (listening) from bind time, a taken port
-    must fail fast rather than silently move (Gym already holds the URL), and
-    the server must adopt the held socket — falling back to a fresh port only
-    when nothing was reserved.
+    The server URL is published to NeMo Gym before any worker exists, so: the
+    reserved port is bound and listening from reservation time (early Gym
+    probes queue instead of being refused), the worker adopts that same socket
+    through the fd handoff — the port is never released in between — and the
+    server falls back to a fresh port only when nothing was reserved.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("", 0))
-        port = probe.getsockname()[1]
+    monkeypatch.setattr(
+        "nemo_rl.distributed.virtual_cluster._get_node_ip_local",
+        lambda: "10.0.0.5",
+    )
+    holder = _HeldPortReservation()
+    node_ip, port = holder.address()
+    assert node_ip == "10.0.0.5"
 
-    reserved = bind_reserved_http_server_socket(port)
+    # Held and listening from reservation time: early Gym probes queue
+    # instead of being refused.
+    with socket.create_connection(("127.0.0.1", port), timeout=5):
+        pass
+
+    # Worker-side adoption: the same live socket, duplicated across the
+    # process boundary; still the same port, still accepting.
+    reserved = receive_held_socket(port)
     try:
-        # Held and listening: early Gym probes queue instead of being refused.
         assert reserved.getsockname()[1] == port
         with socket.create_connection(("127.0.0.1", port), timeout=5):
             pass
-        # Fail-fast on a taken port (here: taken by the reservation itself).
-        with pytest.raises(RuntimeError, match=str(port)):
-            bind_reserved_http_server_socket(port)
 
         # Server start with the network and MLM server stubbed out.
         started = {}
@@ -194,10 +204,6 @@ def test_http_server_port_reservation(monkeypatch):
             mlm_text_gen_server,
             "start_text_gen_server",
             lambda **kwargs: started.update(kwargs),
-        )
-        monkeypatch.setattr(
-            "nemo_rl.distributed.virtual_cluster._get_node_ip_local",
-            lambda: "10.0.0.5",
         )
         monkeypatch.setattr(
             "nemo_rl.distributed.virtual_cluster._get_free_port_local",

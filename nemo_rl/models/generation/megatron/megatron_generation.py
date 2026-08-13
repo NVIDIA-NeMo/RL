@@ -21,8 +21,8 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
+    PortHolder,
     RayVirtualCluster,
-    _get_node_ip_and_free_port,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -99,7 +99,7 @@ class MegatronGeneration(GenerationInterface):
         cls,
         cluster: RayVirtualCluster,
         config: PolicyConfig,
-    ) -> tuple[str, int]:
+    ) -> tuple[str, int, ray.actor.ActorHandle]:
         """Reserve the OpenAI server address before any generation worker exists.
 
         Args:
@@ -107,16 +107,10 @@ class MegatronGeneration(GenerationInterface):
             config: The full `PolicyConfig`.
 
         Returns:
-            Tuple of (server base URL, reserved port).
+            Tuple of (server base URL, reserved port, port-holder actor handle).
+            The caller must keep the handle referenced until rank 0 has adopted
+            the socket (worker init complete), then `ray.kill` it.
         """
-        mcore_generation_config = config["generation"]["mcore_generation_config"]
-        port_range_low = mcore_generation_config["http_server_port_range_low"]
-        port_range_high = mcore_generation_config["http_server_port_range_high"]
-        assert port_range_low < port_range_high, (
-            f"http_server_port_range_low ({port_range_low}) must be < "
-            f"http_server_port_range_high ({port_range_high})."
-        )
-
         if config["generation"]["colocated"]["enabled"]:
             # Colocated generation shares the training policy's cluster; trigger
             # the same (idempotent) default placement-group init Policy would.
@@ -133,18 +127,18 @@ class MegatronGeneration(GenerationInterface):
             if cluster._sorted_bundle_indices is not None
             else 0
         )
-        node_ip, port = ray.get(
-            _get_node_ip_and_free_port.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=placement_groups[0],
-                    placement_group_bundle_index=rank0_bundle_index,
-                ),
-                # Explicitly 0 so the probe stays schedulable when all bundle
-                # CPUs are already claimed.
-                num_cpus=0,
-            ).remote(port_range_low, port_range_high)
-        )
-        return f"http://{node_ip}:{port}/v1", port
+        # Zero-gap reservation: a holder actor on the rank-0 node binds and
+        # HOLDS the socket (num_cpus=0, so it schedules even on a full bundle);
+        # rank 0 later adopts the live fd via receive_held_socket, so the port
+        # can never be stolen in between and any free port is safe.
+        holder = PortHolder.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=placement_groups[0],
+                placement_group_bundle_index=rank0_bundle_index,
+            ),
+        ).remote()
+        node_ip, port = ray.get(holder.address.remote())
+        return f"http://{node_ip}:{port}/v1", port, holder
 
     def __init__(
         self,
