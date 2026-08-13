@@ -3,24 +3,15 @@
 """Publish a live Megatron layout through ModelExpress `main`'s reshard seam.
 
 `mx_megatron_helpers.collect_megatron_publish_set` classifies each native
-Megatron parameter; MX `main` accepts that classification through
+Megatron parameter; ModelExpress accepts that classification through
 ``refit.reshard.megatron_aliases.build_hf_aliases``, which turns native storage
 into HF-canonical shard records without copying, and publishes it through
 ``publish_registered_shard_table``. This module is the translation between the
 two, plus the name resolution that neither side owns.
 
-It exists because MX `main` deliberately stops short of it. From
-``modelexpress/refit/README.md``:
-
-    This is an adapter contract, not a complete quick start. The repository does
-    not currently include the RL framework lifecycle hooks or a general trainer
-    publisher that derives ownership from arbitrary training backends.
-
-The predecessor of this path was ``MxV2TrainingPublisher``, which is not on MX
-`main` and is not coming: the incremental PRs behind it were closed unmerged and
-the surface self-describes as a prototype shim pending server-side RPCs, which
-landed as the Redis refit control plane. So the classification helper stays and
-only the publish call changes.
+ModelExpress owns alias construction and publication; NeMo-RL owns deriving
+Megatron's native parameter ownership and resolving Megatron-Bridge names. This
+module is the narrow adapter between those contracts.
 
 The two sides use the same role vocabulary (``qkv_column``,
 ``gated_mlp_column``, ``expert_column``, ...) and the same extras keys

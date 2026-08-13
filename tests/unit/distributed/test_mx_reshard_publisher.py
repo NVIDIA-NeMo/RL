@@ -14,6 +14,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+pytest.importorskip(
+    "modelexpress",
+    reason="ModelExpress is an optional integration dependency",
+)
+
 from nemo_rl.distributed.mx_megatron_helpers import (
     ROLE_EXPERT_COLUMN,
     ROLE_GATED_MLP_COLUMN,

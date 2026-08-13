@@ -5,7 +5,7 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Megatron-Core publisher helpers for the MX v2 path (Phase A).
+"""Classify native Megatron parameters for external reshard publishers.
 
 The DTensor MX path uses the generic MX publisher directly because DTensor's
 ``Placement`` enum gives sharding info in a uniform way. Megatron-Core has no
@@ -15,8 +15,7 @@ fused QKV/MLP, MoE expert layers).
 
 This module:
 
-* Classifies every parameter into one of seven Megatron roles
-  (see ``temp/NemoRL_Megatron_MX_Design.md`` §3) by walking the model
+* Classifies every parameter into a Megatron sharding role by walking the model
   graph and consulting **Megatron-Bridge's authoritative parallelism
   registry** (``megatron.bridge.models.conversion.param_mapping.AutoMapping
   ._MODULE_TYPE_REGISTRY``). Bridge's registry already classifies every
@@ -34,28 +33,10 @@ This module:
   base class names — sufficient for mainline Megatron-Core.
 * Extracts the local native shard (no allgather, no Megatron-Bridge
   ``export_hf_weights`` call — the param tensor IS the local shard).
-* Builds the ``extra_parameters`` dict the v2 publisher attaches so the
-  MX-side slice planner can find the right slices for each receiver.
+* Builds the descriptor extras consumed by ModelExpress's main-native
+  ``refit.reshard.megatron_aliases`` adapter.
 
-Receiver-side context (for cross-reference): the receiver translator
-(Phase C) is intended to be a thin adapter over Bridge's
-``MegatronParamMapping.megatron_to_hf`` calls. With ``mpu`` not
-initialised, Bridge's TP-gather / PP-broadcast collectives no-op
-(``tp_group / pp_group / ep_group = None``, ``tp_size / pp_size = 1``);
-feeding a pre-assembled global tensor (assembled from N trainer ranks
-by Phase B's slice planner) into ``mapping.megatron_to_hf(buffer,
-megatron_module=None)`` gives back HF-shaped ``{q_proj, k_proj, v_proj}``
-/ ``{gate_proj, up_proj}`` / etc. directly. No hand-rolled un-interleave
-needed on the receiver. See
-``temp/NemoRL_Megatron_MX_Design.md`` §10 for the integration shape.
-
-The downstream MX-side slice planner is implemented in
-``modelexpress.nemo_rl_v2`` (``MxV2RefitReceiver.pick_megatron_slice_plans``,
-seven Megatron role constants, ``MegatronSourceMeta``,
-``MegatronSlicePlan``). See ``ai-dynamo/modelexpress`` PR #421 commits
-``12c73a7`` + ``b26e80f``.
-
-Limitations of this Phase A:
+Limitations:
 
 * Fused QKV / fused gated MLP detection is currently keyed on common
   Megatron name patterns (``linear_qkv``, ``linear_fc1``). Mainline
@@ -79,7 +60,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("nemo_rl.distributed.mx_megatron_helpers")
 
 
-# Match modelexpress.nemo_rl_v2.ROLE_MEGATRON_* — keep in sync.
+# Match ModelExpress's main-native Megatron alias role vocabulary.
 ROLE_QKV_COLUMN = "qkv_column"
 ROLE_GATED_MLP_COLUMN = "gated_mlp_column"
 ROLE_COLUMN = "column"
@@ -106,11 +87,8 @@ _TP_SHARDED_ROLES = frozenset(
 class MegatronRoleSpec:
     """Per-parameter classification result.
 
-    ``role`` is one of the role string constants. ``descriptor_extras`` is
-    the per-tensor ``extra_parameters`` payload the publisher will merge
-    into MX's ``identity.extra_parameters`` (and the v2 sidecar JSON).
-    Keys here MUST match the names ``modelexpress.nemo_rl_v2._extract_megatron_meta``
-    reads.
+    ``role`` is one of the role string constants. ``descriptor_extras`` carries
+    the per-tensor metadata consumed by ModelExpress's Megatron alias builder.
     """
 
     role: str
@@ -199,8 +177,8 @@ def infer_megatron_tp_shard_geometry(
 
 
 # Heuristic name patterns for fused-QKV and fused-gate+up linears in
-# mainline Megatron-Core. Override via ``MxConfig.megatron_role_overrides``
-# if your fork uses different names.
+# mainline Megatron-Core. Callers can provide role overrides for forks that use
+# different names.
 _DEFAULT_FUSED_QKV_NAME_PATTERNS = ("linear_qkv", "qkv_proj", "fused_qkv")
 _DEFAULT_FUSED_GATED_MLP_PATTERNS = ("linear_fc1", "gate_up_proj")
 # Vocab / embedding name pattern.
@@ -330,35 +308,6 @@ def canonicalize_grouped_expert_name(
     )
 
 
-def publish_eagle_draft_weights(
-    *,
-    publisher: Any,
-    draft_model: Any,
-    dtype: Any,
-) -> int:
-    """Publish trainer-owned EAGLE draft weights as replicated MX tensors."""
-    if draft_model is None:
-        return 0
-
-    from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
-
-    count = 0
-    for name, tensor in export_eagle_weights_to_hf(draft_model):
-        if tensor.is_floating_point():
-            tensor = tensor.to(dtype, non_blocking=True)
-        publisher.add_tensor(
-            name=f"draft.{name}",
-            tensor=tensor.contiguous(),
-            is_expert=False,
-            expert_axis=0,
-            owned_expert_ids=set(),
-            megatron_role=ROLE_REPLICATED,
-            megatron_extras={},
-        )
-        count += 1
-    return count
-
-
 def _enclosing_module(name: str, model: "torch.nn.Module") -> "torch.nn.Module | None":
     """Walk down model attributes to find the module that owns ``name``.
 
@@ -426,8 +375,8 @@ def detect_megatron_role(
 ) -> MegatronRoleSpec:
     """Classify a Megatron parameter into one of seven roles.
 
-    Returns the role + per-tensor metadata that the publisher should attach
-    to ``extra_parameters``. The classifier is conservative: when we can't
+    Returns the role plus per-tensor metadata for the alias builder. The
+    classifier is conservative: when we can't
     determine sharding from the module class, we fall back to
     ``ROLE_REPLICATED`` (rank 0 publishes, others skip). That's a
     correctness-preserving default — replicated tensors round-trip via the
@@ -445,8 +394,9 @@ def detect_megatron_role(
             ``None`` if unknown — the role still classifies but the
             descriptor will be missing fields and the receiver will
             fall back to its default un-interleave assumptions.
-        expert_pattern: substring marker for MoE expert tensors; default
-            ``"experts"`` (matches ``MxConfig.NRL_MX_EXPERT_TENSOR_PATTERN``).
+        expert_pattern: substring marker for MoE expert tensors; defaults to
+            ``"experts"`` and can be overridden with
+            ``NRL_MX_EXPERT_TENSOR_PATTERN``.
         role_overrides: optional ``{param_name_substring: role}`` dict
             for forcing a role on a specific tensor (escape hatch for
             non-mainline Megatron forks).
@@ -602,12 +552,8 @@ def collect_megatron_publish_set(
     * Returns the parameter as-is — Megatron stores native shards, so
       the param tensor IS the local shard. No allgather, no Bridge call.
     * ``full_extras`` is the merged ``{megatron_role, tp_rank, tp_size,
-      pp_rank, pp_size, ep_rank, ep_size, ...}`` dict the publisher should
-      pass straight into ``MxV2TrainingPublisher.add_tensor``'s
-      ``extra_parameters`` arg.
-
-    Caller is responsible for invoking ``add_tensor`` and
-    ``publish(version=...)`` on the publisher.
+      pp_rank, pp_size, ep_rank, ep_size, ...}`` metadata consumed by
+      ``mx_reshard_publisher.build_megatron_alias_inputs``.
     """
     for raw_name, param in model.named_parameters():
         if not param.is_floating_point():
