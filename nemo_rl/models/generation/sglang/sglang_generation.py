@@ -326,6 +326,14 @@ class SGLangGeneration(GenerationInterface):
         dead_indices = [
             i for i, engine in enumerate(self.all_engines) if engine is None
         ]
+        if not dead_indices:
+            # ``_start_engines`` rewrites ``num_new_engines`` unconditionally, so
+            # calling it with nothing to restart would clear a count the refit
+            # dispatch has not consumed yet. That count is what gates ``_connect``
+            # in the weight synchronizer, and ``_connect`` is the only place the
+            # transport is ever built -- clearing it on the first refit leaves
+            # every rank silently no-oping the weight send for the rest of the run.
+            return
 
         port_cursors: dict[int, int] = {}
         handles, _ = self._start_engines(port_cursors)
@@ -335,6 +343,11 @@ class SGLangGeneration(GenerationInterface):
         assert self.num_new_engines == len(dead_indices), (
             "num_new_engines does not match dead_indices length"
         )
+
+        # Replacement engines are freshly booted and still loading weights, so
+        # give them the configured grace period before the monitor probes them.
+        if self._health_monitor is not None:
+            self._health_monitor.arm_first_wait()
 
         if self.needs_offload and dead_indices:
             new_engines = [self.all_engines[i] for i in dead_indices]

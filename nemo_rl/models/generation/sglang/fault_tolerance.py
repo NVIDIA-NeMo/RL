@@ -14,6 +14,8 @@
 
 import logging
 import threading
+import time
+from typing import Optional
 
 import ray
 
@@ -46,10 +48,28 @@ class RolloutHealthMonitor:
         self._check_first_wait = sglang_cfg["sglang_cfg"][
             "rollout_health_check_first_wait"
         ]
-        self._need_first_wait = True  # Need to wait after each resume
+        # Absolute monotonic deadline before which no probe may run, giving a
+        # booting engine time to become ready. It is a DEADLINE rather than a
+        # "wait once" flag so that a pause part-way through cannot restart the
+        # clock -- see ``arm_first_wait``.
+        self._first_check_after: Optional[float] = None
         self._is_checking_enabled = False  # Track if health checking should be active
         # Held for the duration of one check round so pause() can wait it out.
         self._check_lock = threading.Lock()
+
+    def arm_first_wait(self) -> None:
+        """Hold off probing until ``rollout_health_check_first_wait`` has elapsed.
+
+        Call this whenever an engine is about to boot -- at startup, and after
+        ``_recover`` restarts a dead one -- so a fresh engine is not killed for
+        being slow to load weights.
+
+        The deadline is absolute. It deliberately does NOT reset on
+        ``resume()``: resume runs once per training step, and re-arming there
+        meant that any generation phase shorter than the first-wait left the
+        monitor permanently in its grace period, so no probe ever ran.
+        """
+        self._first_check_after = time.monotonic() + self._check_first_wait
 
     def start(self) -> bool:
         """Start the health monitor thread. Called once during initialization.
@@ -65,6 +85,7 @@ class RolloutHealthMonitor:
             return True
 
         logger.info("Starting RolloutHealthMonitor...")
+        self.arm_first_wait()
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()  # Start in paused state until resume() is called
@@ -118,7 +139,8 @@ class RolloutHealthMonitor:
         if self._pause_event is None:
             return
         logger.info("Resuming health monitor...")
-        self._need_first_wait = True  # Need to wait after each resume
+        # The first-wait deadline is deliberately NOT re-armed here; see
+        # ``arm_first_wait``. It is armed at start() and after a recovery.
         self._pause_event.clear()
         self._is_checking_enabled = True
 
@@ -138,21 +160,27 @@ class RolloutHealthMonitor:
             if self._stop_event.is_set():
                 break
 
-            # Do first wait after each resume (for large MoE models to be ready)
-            if self._need_first_wait:
-                logger.info(
-                    f"Health monitor doing first wait after resume: {self._check_first_wait}s"
-                )
-                if self._stop_event.wait(self._check_first_wait):
-                    logger.info("Health monitor stopped during first wait.")
-                    break
-                if self._pause_event.is_set():
-                    # Got paused during first wait, skip this round and wait again next resume
+            # Hold off the first probe until the boot deadline passes, so a
+            # still-loading engine is not killed for answering slowly. The
+            # deadline is absolute, so time spent paused still counts and a
+            # pause part-way through cannot restart it.
+            if self._first_check_after is not None:
+                remaining = self._first_check_after - time.monotonic()
+                if remaining > 0:
                     logger.info(
-                        "Health monitor paused during first wait, will wait again next resume."
+                        f"Health monitor waiting {remaining:.1f}s before the first check."
                     )
-                    continue
-                self._need_first_wait = False
+                    if self._stop_event.wait(remaining):
+                        logger.info("Health monitor stopped during first wait.")
+                        break
+                    if self._pause_event.is_set():
+                        # Paused mid-wait: go back to the pause gate rather than
+                        # probing. The deadline is unchanged, so the elapsed
+                        # time is not lost and the next resume picks up where
+                        # this left off.
+                        logger.info("Health monitor paused during first wait.")
+                        continue
+                self._first_check_after = None
 
             # Run health checks
             if not self._pause_event.is_set() and not self._stop_event.is_set():
