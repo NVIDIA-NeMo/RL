@@ -94,6 +94,7 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
 
 
 def test_patch_ray_executor_v2_applies_fp8_before_worker_init(fp8_module, monkeypatch):
+    import cloudpickle
     from vllm.v1.executor import ray_executor_v2
 
     fp8 = fp8_module
@@ -111,27 +112,45 @@ def test_patch_ray_executor_v2_applies_fp8_before_worker_init(fp8_module, monkey
         lambda _worker, config: events.append(("patch", config)),
     )
 
-    first_config = object()
-    second_config = object()
+    first_config = "first-config"
+    second_config = "second-config"
     fp8._patch_vllm_ray_executor_v2(first_config)
-    first_worker_cls = ray_executor_v2.RayWorkerProc
-    fp8._patch_vllm_ray_executor_v2(second_config)
-    second_worker_cls = ray_executor_v2.RayWorkerProc
-    first_worker = first_worker_cls()
-    second_worker = second_worker_cls()
-    first_result = first_worker.initialize_worker(1, {"A": "B"})
-    second_result = second_worker.initialize_worker(2, {"C": "D"})
+    first_worker_cls_local = ray_executor_v2.RayWorkerProc
+    first_worker_local = first_worker_cls_local()
+    first_result_local = first_worker_local.initialize_worker(1, {"A": "B"})
 
-    assert first_result == "initialized"
-    assert second_result == "initialized"
+    fp8._patch_vllm_ray_executor_v2(second_config)
+    second_worker_cls_local = ray_executor_v2.RayWorkerProc
+    second_worker_local = second_worker_cls_local()
+    second_result_local = second_worker_local.initialize_worker(2, {"C": "D"})
+
+    assert first_result_local == "initialized"
+    assert second_result_local == "initialized"
     assert events == [
         ("patch", first_config),
         ("initialize", (1, {"A": "B"}), {}),
         ("patch", second_config),
         ("initialize", (2, {"C": "D"}), {}),
     ]
-    assert first_worker_cls.__bases__ == (FakeRayWorkerProc,)
-    assert second_worker_cls.__bases__ == (FakeRayWorkerProc,)
+    assert first_worker_cls_local.__bases__ == (FakeRayWorkerProc,)
+    assert second_worker_cls_local.__bases__ == (FakeRayWorkerProc,)
+
+    first_worker_cls = cloudpickle.loads(cloudpickle.dumps(first_worker_cls_local))
+    second_worker_cls = cloudpickle.loads(cloudpickle.dumps(second_worker_cls_local))
+    serialized_events = []
+    monkeypatch.setitem(
+        first_worker_cls.initialize_worker.__globals__,
+        "apply_fp8_patches",
+        lambda _worker, config: serialized_events.append(("first", config)),
+    )
+    assert first_worker_cls().initialize_worker() == "initialized"
+    monkeypatch.setitem(
+        second_worker_cls.initialize_worker.__globals__,
+        "apply_fp8_patches",
+        lambda _worker, config: serialized_events.append(("second", config)),
+    )
+    assert second_worker_cls().initialize_worker() == "initialized"
+    assert serialized_events == [("first", first_config), ("second", second_config)]
 
 
 @pytest.mark.parametrize("model_parallel_size", [1, 2])
