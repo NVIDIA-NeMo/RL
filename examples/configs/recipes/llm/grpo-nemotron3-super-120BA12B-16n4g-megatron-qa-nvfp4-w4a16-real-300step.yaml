@@ -5,7 +5,7 @@ checkpointing:
 
 policy:
   disable_modelopt_layer_spec: true
-  quant_cfg: examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml
+  quant_cfg: ${oc.env:PWD}/examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml
   generation:
     quant_cfg: null
     real_quant: true

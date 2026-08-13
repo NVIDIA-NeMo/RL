@@ -29,6 +29,7 @@ from megatron.bridge.training.post_training.checkpointing import (
     load_modelopt_state,
 )
 from megatron.core.utils import unwrap_model
+from modelopt.torch.quantization.nn import AnyQuantizer
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
@@ -304,7 +305,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     @contextmanager
     def hide_tensor_quantizers(self):
-        """Context manager that temporarily hides TensorQuantizer modules from module iteration."""
+        """Temporarily hide ModelOpt quantizers from DDP module iteration."""
         from megatron.core.distributed import DistributedDataParallel
 
         if not isinstance(self.model, DistributedDataParallel):
@@ -316,7 +317,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
         def filtered_named_modules(*args, **kwargs):
             for name, module in original_named_modules(*args, **kwargs):
-                if not isinstance(module, TensorQuantizer):
+                if not isinstance(module, AnyQuantizer):
                     yield name, module
 
         try:
@@ -326,12 +327,12 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             inner_module.named_modules = original_named_modules
 
     def enable_forward_pre_hook(self):
-        """Enable forward pre-hook, hiding TensorQuantizer modules."""
+        """Enable forward pre-hook while hiding ModelOpt quantizers."""
         with self.hide_tensor_quantizers():
             super().enable_forward_pre_hook()
 
     def disable_forward_pre_hook(self, param_sync=True):
-        """Disable forward pre-hook, hiding TensorQuantizer modules."""
+        """Disable forward pre-hook while hiding ModelOpt quantizers."""
         with self.hide_tensor_quantizers():
             super().disable_forward_pre_hook(param_sync=param_sync)
 

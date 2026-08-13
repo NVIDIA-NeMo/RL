@@ -5,7 +5,7 @@ checkpointing:
 
 policy:
   disable_modelopt_layer_spec: true
-  quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
+  quant_cfg: ${oc.env:PWD}/examples/modelopt/quant_configs/nvfp4_experts.yaml
   quant_calib_data: cnn_dailymail
   quant_calib_size: 16
   quant_batch_size: 1

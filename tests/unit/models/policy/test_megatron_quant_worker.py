@@ -44,6 +44,7 @@ except ImportError:
 _WORKER_IMPORTABLE = False
 if _MODELOPT_AVAILABLE:
     try:
+        from modelopt.torch.quantization.nn import GroupedQuantizer
         from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
         from modelopt.torch.quantization.nn.modules.tensor_quantizer import (
             TensorQuantizer,
@@ -111,6 +112,31 @@ def _make_real_quant_worker():
     worker.megatron_bridge = _FakeModelOptBridge()
     worker.rank = 0
     return worker
+
+
+@requires_weight_folding
+def test_hide_tensor_quantizers_hides_quantizer_containers(monkeypatch):
+    from megatron.core import distributed
+
+    class FakeDistributedDataParallel:
+        def __init__(self, module):
+            self.module = module
+
+    model = nn.Module()
+    model.quantizers = GroupedQuantizer(TensorQuantizer(), TensorQuantizer())
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.model = FakeDistributedDataParallel(model)
+    monkeypatch.setattr(
+        distributed,
+        "DistributedDataParallel",
+        FakeDistributedDataParallel,
+    )
+
+    assert "quantizers" in dict(model.named_modules())
+    with worker.hide_tensor_quantizers():
+        assert set(dict(model.named_modules())) == {""}
+    assert "quantizers" in dict(model.named_modules())
 
 
 @requires_weight_folding
