@@ -558,6 +558,23 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(
     assert kernel_configs[0].intermediate_size_per_partition == 128
     assert kernel_configs[0].intermediate_size == 128 * tp_size
 
+    x = torch.randn(2, 128)
+    padded_x = torch.nn.functional.pad(x, (0, 512 - x.shape[-1]))
+    if is_gated:
+        reference_hidden = torch.nn.functional.silu(x @ w13[0, :32].T) * (
+            x @ w13[0, 32:].T
+        )
+        padded_hidden = torch.nn.functional.silu(
+            padded_x @ layer.w13_weight_for_apply[0, :128].T
+        ) * (padded_x @ layer.w13_weight_for_apply[0, 128:].T)
+    else:
+        reference_hidden = torch.relu(x @ w13[0].T)
+        padded_hidden = torch.relu(padded_x @ layer.w13_weight_for_apply[0].T)
+    reference_output = reference_hidden @ layer.w2_weight[0].T
+    padded_output = padded_hidden @ layer.w2_weight_for_apply[0].T
+    torch.testing.assert_close(padded_output[:, :128], reference_output)
+    assert torch.count_nonzero(padded_output[:, 128:]) == 0
+
     apply_parameter_ids = {
         name: id(getattr(layer, name))
         for name in (
