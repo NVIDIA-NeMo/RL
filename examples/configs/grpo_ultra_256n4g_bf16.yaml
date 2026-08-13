@@ -119,6 +119,14 @@ loss_fn:
   kl_input_clamp_value: null
   kl_output_clamp_value: null
 
+  # KL(pi_gen || pi_curr) penalty toward the behaviour (rollout) policy.
+  # Bounds cumulative drift across async steps; clamps must stay set (k3
+  # blows up exponentially on bf16 logprob outliers).
+  behaviour_kl_penalty: 0.0
+  behaviour_kl_type: "k3"
+  behaviour_kl_input_clamp_value: 20.0
+  behaviour_kl_output_clamp_value: 10.0
+
   ratio_clip_min: 0.2
   ratio_clip_max: 0.28
   ratio_clip_c: null
@@ -189,7 +197,11 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_flex_dispatcher_backend: "hybridep"
-    moe_hybridep_num_sms: 32
+    # moe_hybridep_num_sms removed: Megatron in the NCCL-2.30.4 container deprecates
+    # both moe_hybridep_num_sms and moe_deepep_num_sms in favour of
+    # moe_flex_dispatcher_num_sms and errors out when both deprecated knobs are set
+    # ("Conflicting deprecated SM-count knobs"). nemo_rl on this branch does not plumb
+    # the new knob, so drop this and take Megatron's default SM count.
     moe_aux_loss_coeff: 0.0
     moe_shared_expert_overlap: false
 

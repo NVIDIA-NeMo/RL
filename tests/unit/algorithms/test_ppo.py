@@ -886,17 +886,12 @@ def test_ppo_noncolocated_rejects_sglang_backend():
         setup(master_config, tokenizer, dataset, None)
 
 
-@pytest.mark.parametrize("colocated", [True, False])
-def test_ppo_setup_cluster_split_matches_colocation_mode(monkeypatch, colocated):
-    """train_cluster/inference_cluster identity and worker-group budget by mode.
+def _patch_ppo_setup_deps(monkeypatch):
+    """Stub out every heavy dependency of setup() so it runs end to end in-process.
 
-    Colocated: train_cluster is inference_cluster (single shared pool of
-    generation+policy+value). Non-colocated: they are distinct clusters, and
-    train_cluster must budget for 2 co-timesharing worker groups (policy +
-    value) since generation now lives on its own inference_cluster.
+    Returns the DummyCluster class; its ``instances`` list records the clusters
+    setup() created, in order.
     """
-    from unittest.mock import MagicMock
-
     from nemo_rl.algorithms import ppo as ppo_mod
 
     class DummyLogger:
@@ -985,6 +980,23 @@ def test_ppo_setup_cluster_split_matches_colocation_mode(monkeypatch, colocated)
         ppo_mod, "VllmGeneration", lambda *_a, **_k: DummyVllmGeneration()
     )
     monkeypatch.setattr(ppo_mod.ray, "get", lambda x: x)
+    return DummyCluster
+
+
+@pytest.mark.parametrize("colocated", [True, False])
+def test_ppo_setup_cluster_split_matches_colocation_mode(monkeypatch, colocated):
+    """train_cluster/inference_cluster identity and worker-group budget by mode.
+
+    Colocated: train_cluster is inference_cluster (single shared pool of
+    generation+policy+value). Non-colocated: they are distinct clusters, and
+    train_cluster must budget for 2 co-timesharing worker groups (policy +
+    value) since generation now lives on its own inference_cluster.
+    """
+    from unittest.mock import MagicMock
+
+    from nemo_rl.algorithms import ppo as ppo_mod
+
+    _patch_ppo_setup_deps(monkeypatch)
 
     master_config = _build_ppo_master_config()
     if colocated:
@@ -1015,6 +1027,52 @@ def test_ppo_setup_cluster_split_matches_colocation_mode(monkeypatch, colocated)
         assert train_cluster is not inference_cluster
         assert train_cluster.max_colocated_worker_groups == 2
         assert inference_cluster.max_colocated_worker_groups == 1
+
+
+@pytest.mark.parametrize(
+    "critic_ppo_epochs,expected_value_iters",
+    [
+        pytest.param(None, 20, id="coupled_defaults_to_ppo_epochs"),
+        pytest.param(4, 40, id="decoupled_critic_gets_its_own_budget"),
+    ],
+)
+def test_ppo_setup_megatron_train_iters_per_model_epochs(
+    monkeypatch, critic_ppo_epochs, expected_value_iters
+):
+    """Each Megatron model's LR-schedule budget follows its own epoch count.
+
+    A Megatron worker ticks its scheduler once per train() call, so total ticks
+    are (outer steps) x (that model's inner epochs). With a longer critic loop
+    the value model must get a proportionally longer train_iters, or its decay
+    schedule ends before training does.
+    """
+    from unittest.mock import MagicMock
+
+    from nemo_rl.algorithms import ppo as ppo_mod
+
+    _patch_ppo_setup_deps(monkeypatch)
+
+    master_config = _build_ppo_master_config()
+    master_config.policy["megatron_cfg"] = {"enabled": True}
+    # context_parallel_size is read by setup()'s value-config validation before
+    # it ever reaches the train_iters computation.
+    master_config.value["megatron_cfg"] = {"enabled": True, "context_parallel_size": 1}
+    master_config.ppo["ppo_epochs"] = 2
+    master_config.ppo["critic_ppo_epochs"] = critic_ppo_epochs
+    # outer_steps = min(max_num_steps, max_num_epochs * len(dataloader)); the
+    # stubbed dataloader has length 1.
+    master_config.ppo["max_num_steps"] = 10
+    master_config.ppo["max_num_epochs"] = 10
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    ppo_mod.setup(master_config, tokenizer, dataset, None)
+
+    # 10 outer steps x 2 actor epochs; value uses critic_ppo_epochs (or 2 when null).
+    assert master_config.policy["megatron_cfg"]["train_iters"] == 20
+    assert master_config.value["megatron_cfg"]["train_iters"] == expected_value_iters
 
 
 # ===============================================================================
@@ -1110,6 +1168,83 @@ def test_async_ppo_requires_positive_ppo_epochs():
     master_config.ppo["ppo_epochs"] = 0
     with pytest.raises(AssertionError, match="ppo_epochs must be >= 1"):
         _call_async_ppo_train(master_config)
+
+
+# ---------------------------------------------------------------------------
+# Decoupled critic epochs (ppo.critic_ppo_epochs)
+# ---------------------------------------------------------------------------
+def test_critic_ppo_epochs_defaults_to_ppo_epochs():
+    """Unset or null keeps the critic coupled to the actor (legacy behavior)."""
+    from nemo_rl.algorithms.ppo import _resolve_critic_ppo_epochs
+
+    assert _resolve_critic_ppo_epochs({"ppo_epochs": 3}) == 3
+    assert _resolve_critic_ppo_epochs({"ppo_epochs": 3, "critic_ppo_epochs": None}) == 3
+
+
+def test_critic_ppo_epochs_decouples_from_ppo_epochs():
+    from nemo_rl.algorithms.ppo import _resolve_critic_ppo_epochs
+
+    assert _resolve_critic_ppo_epochs({"ppo_epochs": 1, "critic_ppo_epochs": 4}) == 4
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1])
+def test_critic_ppo_epochs_rejects_fewer_than_actor_epochs(bad):
+    """The critic trains once per shared epoch, so it can only be given more."""
+    from nemo_rl.algorithms.ppo import _resolve_critic_ppo_epochs
+
+    with pytest.raises(AssertionError, match="must be >= ppo.ppo_epochs"):
+        _resolve_critic_ppo_epochs({"ppo_epochs": 2, "critic_ppo_epochs": bad})
+
+
+def test_resolve_critic_ppo_epochs_rejects_zero_ppo_epochs():
+    """Guards sync ppo_train, which has no ppo_epochs assert of its own; 0 would
+    otherwise train neither model while still consuming the whole dataset."""
+    from nemo_rl.algorithms.ppo import _resolve_critic_ppo_epochs
+
+    with pytest.raises(AssertionError, match="ppo_epochs must be >= 1"):
+        _resolve_critic_ppo_epochs({"ppo_epochs": 0})
+
+
+def test_pooled_explained_var_pre_update():
+    """Pre-update EV: perfect prediction -> 1, mean prediction -> 0, and both
+    masks are respected (values at masked positions must not leak in)."""
+    from nemo_rl.algorithms.ppo import _pooled_explained_var
+
+    token_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0]])
+    sample_mask = torch.tensor([1.0, 1.0])
+    returns = torch.tensor([[1.0, 1.0, 1.0, 9.0], [0.0, 0.0, 9.0, 9.0]])
+
+    # Perfect prediction on valid tokens; garbage on masked tokens is ignored.
+    values = returns.clone()
+    values[0, 3] = 7.0
+    values[1, 2] = 7.0
+    assert _pooled_explained_var(values, returns, token_mask, sample_mask) == (
+        pytest.approx(1.0)
+    )
+
+    # Constant prediction at the valid-token mean explains nothing.
+    mean_pred = torch.full_like(returns, 0.6)  # mean of [1,1,1,0,0]
+    assert _pooled_explained_var(mean_pred, returns, token_mask, sample_mask) == (
+        pytest.approx(0.0, abs=1e-6)
+    )
+
+    # sample_mask knocks out the second sequence; the survivor has constant
+    # returns (zero variance), which reports 0.0 rather than dividing by ~0.
+    solo = torch.tensor([1.0, 0.0])
+    assert _pooled_explained_var(returns.clone(), returns, token_mask, solo) == 0.0
+
+    # Matches the sufficient-statistics form used by the loss-side metrics.
+    mask = (token_mask * sample_mask.unsqueeze(-1)).bool()
+    noisy = returns + 0.25 * torch.tensor(
+        [[1.0, -1.0, 0.5, 0.0], [-0.5, 1.0, 0.0, 0.0]]
+    )
+    r, v = returns[mask], noisy[mask]
+    r_mean, v_mean = r.mean(), v.mean()
+    r_sq, res_sq = (r**2).mean(), ((r - v) ** 2).mean()
+    ev_suff = 1.0 - (res_sq - (r_mean - v_mean) ** 2) / (r_sq - r_mean**2)
+    assert _pooled_explained_var(noisy, returns, token_mask, sample_mask) == (
+        pytest.approx(ev_suff.item(), abs=1e-6)
+    )
 
 
 # NeMo-Gym IS supported for async PPO: the AsyncTrajectoryCollector runs the gym

@@ -48,7 +48,7 @@ PPO also supports **non-colocated generation**, where the generation engine runs
 
 PPO supports an **asynchronous** training mode (`ppo.async_ppo.enabled: true`) that mirrors [async GRPO](grpo.md): a background `AsyncTrajectoryCollector` continuously generates trajectories into a replay buffer while the driver trains, so generation and training overlap instead of running in lockstep. Async PPO requires non-colocated vLLM generation (`policy.generation.colocated.enabled: false`, `vllm_cfg.async_engine: true`) and importance-sampling correction (`loss_fn.use_importance_sampling_correction: true`) — all enforced by asserts in `async_ppo_train`. Enable it via `examples/run_ppo.py`, which dispatches to `async_ppo_train` when `ppo.async_ppo.enabled` is set.
 
-Each async step: sample a fixed batch from the replay buffer → compute fresh critic **values** at train time → compute fresh policy/reference logprobs → compute GAE advantages → run the `ppo_epochs` inner loop (critic then actor) → perform a **single** weight refit to the generation engine and bump the replay-buffer weight version. Computing values at train time (rather than stashing them when the trajectory was generated) keeps the critic side as fresh as possible.
+Each async step: sample a fixed batch from the replay buffer → compute fresh critic **values** at train time → compute fresh policy/reference logprobs → compute GAE advantages → run the `ppo_epochs` inner loop (critic then actor), preceded by any extra `critic_ppo_epochs` critic-only passes → perform a **single** weight refit to the generation engine and bump the replay-buffer weight version. Computing values at train time (rather than stashing them when the trajectory was generated) keeps the critic side as fresh as possible.
 
 **Critic-staleness caveat.** Off-policy trajectories are corrected on the *actor* side by importance sampling (`exp(prev_logprobs - generation_logprobs)`), exactly as in async GRPO. PPO's GAE, however, recursively bootstraps value estimates across each trajectory, so bias from a stale trajectory's actions/rewards compounds along the sequence in a way GRPO's memoryless reward-only advantage does not, and there is **no** corresponding critic-side correction. This bias is *bounded* (not eliminated) by keeping `ppo.async_ppo.max_trajectory_age_steps: 1` (at most one policy version stale), which is the recommended and validated setting. Values above 1 are permitted but only warned about; a rigorous fix (folding importance ratios into the GAE recursion, V-trace style) is future work.
 
@@ -176,7 +176,7 @@ The PPO training loop, [ppo_train](../../nemo_rl/algorithms/ppo.py), follows thi
 6. **Value training**: the critic is updated first (critic-before-actor, following [veRL](https://arxiv.org/abs/2412.09613))
 7. **Policy training**: the actor is updated with the clipped surrogate objective
 
-Steps 6–7 repeat `ppo_epochs` times per rollout before generating new responses.
+Steps 6–7 repeat `ppo_epochs` times per rollout before generating new responses. Step 6 additionally runs `critic_ppo_epochs - ppo_epochs` extra critic-only passes up front.
 
 ### Multiple Training Steps per Rollout
 
@@ -184,10 +184,29 @@ Unlike GRPO, which performs one training update per rollout, PPO can perform mul
 
 ```yaml
 ppo:
-  ppo_epochs: 4   # Train 4 times on each rollout batch
+  ppo_epochs: 4   # Train the actor 4 times on each rollout batch
 ```
 
-Each step trains both the critic and the actor on the same advantage estimates computed from the initial rollout.
+Every pass trains on the same advantage estimates, computed once from the initial rollout.
+
+#### Training the critic for more epochs
+
+The critic often benefits from more passes over a rollout batch than the actor: extra actor epochs push the policy further off the data that produced the advantages, while extra critic epochs just fit a regression target harder. Set `critic_ppo_epochs` to give the critic its own epoch count:
+
+```yaml
+ppo:
+  ppo_epochs: 1          # one actor update per rollout batch
+  critic_ppo_epochs: 4   # four critic updates on the same batch
+```
+
+`critic_ppo_epochs: null` (or omitting it) keeps the critic coupled to `ppo_epochs`, which is the default behavior. It must be `>= ppo_epochs`: the critic already trains once per shared epoch, so the setting only adds passes.
+
+The extra critic-only passes run before the shared critic/actor loop, which is otherwise unchanged. This is safe because every pass consumes the same returns and advantages, computed once per step before any update — the critic never sees the actor's within-step updates, so the ordering does not change the result. For Megatron backends the LR-schedule budget (`train_iters`) is derived per model from its own epoch count, so a longer critic loop does not truncate the value model's decay schedule.
+
+Two caveats when reading the plots:
+
+- The critic's LR scheduler ticks once per pass, so with `critic_ppo_epochs: 4` it advances 4x faster per PPO step than the actor's. `lr_warmup_iters` on the value optimizer is counted in those ticks — multiply it by the same factor to keep warmup spanning the same number of PPO steps.
+- `critic/explained_var` is computed from the rollout-time values — the exact tensors GAE consumed — so it describes the critic **before any update that step**, regardless of `critic_ppo_epochs` (it will sit near the positional `critic/ev_early|mid|late` diagnostics, which use the same values). Setting `ppo.log_post_update_critic_metrics: true` adds `critic/explained_var_post_update` and `critic/loss_post_update`, which re-score the same batch **after** every update that step, at the cost of one extra forward-only critic pass per step. A large post-vs-pre gap that does not lift the pre-update curve over training means the critic is memorizing each batch rather than generalizing. `critic/loss` and `critic/grad_norm` come from the last training pass.
 
 ### Critic Warmup
 
@@ -235,6 +254,7 @@ ppo:
   max_num_epochs: 100000
   max_num_steps: 100000
   ppo_epochs: 4
+  critic_ppo_epochs: null
   policy_training_start_step: 0
   val_period: 20
   val_at_start: true
@@ -280,7 +300,8 @@ value_loss_fn:
 ```
 
 **PPO-specific parameters:**
-- **`ppo.ppo_epochs`**: Number of training updates per rollout batch
+- **`ppo.ppo_epochs`**: Number of actor updates per rollout batch
+- **`ppo.critic_ppo_epochs`**: Number of critic updates per rollout batch (`null` = same as `ppo.ppo_epochs`)
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
 - **`ppo.adv_estimator.name`**: Set to `"gae"` for GAE advantage estimation (PPO default)
 - **`ppo.adv_estimator.gae_lambda`**: GAE $\lambda$ parameter (bias-variance tradeoff, typically 0.95)

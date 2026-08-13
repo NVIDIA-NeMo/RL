@@ -8,7 +8,17 @@ ppo:
   max_rollout_turns: 1
   max_num_epochs: 100000
   max_num_steps: 100000
-  ppo_epochs: 4
+  ppo_epochs: 4  # actor passes over each rollout batch
+  # Critic passes over each rollout batch. null = same as ppo_epochs (coupled,
+  # the historical behavior); must be >= ppo_epochs. The surplus runs as extra
+  # critic-only passes, fitting the critic harder without over-training the actor.
+  critic_ppo_epochs: null
+  # Re-score the batch with a forward-only critic pass after the final update,
+  # adding critic/explained_var_post_update + critic/loss_post_update.
+  # critic/explained_var is always the PRE-update EV (from the rollout-time
+  # values GAE consumed); critic/loss is from the last training pass. Costs one
+  # extra critic forward per step.
+  log_post_update_critic_metrics: false
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
   val_period: 20
   val_at_start: true

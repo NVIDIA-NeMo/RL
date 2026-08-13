@@ -77,7 +77,7 @@ ppo:
   # critic/explained_var is always the PRE-update EV (from the rollout-time
   # values GAE consumed); critic/loss is from the last training pass. Costs one
   # extra critic forward per step.
-  log_post_update_critic_metrics: false
+  log_post_update_critic_metrics: true
   # Critic-only warmup: policy training is skipped for the first N steps while
   # the (fresh-head) value model trains on rollouts from the frozen policy.
   # Overridden by the launch script.
@@ -102,23 +102,15 @@ ppo:
   # automatically when a nonzero KL penalty is requested.
   skip_reference_policy_logprobs_calculation: true
   seq_logprob_error_threshold: 2
+  # Per-token rollout dump for offline analysis: writes packed token ids /
+  # critic values / GAE advantages / logprobs (plus decoded text and per-sample
+  # context) to {logger.log_dir}/ppo_rollout_dump_step{N}.pt. Tensors reflect
+  # the state entering the PPO-epoch loop (before any update this step).
+  log_rollout_dump: true
+  rollout_dump_period: 5  # dump every N PPO steps (when log_rollout_dump is true)
 
   # GAE with VAPO decoupled lambdas (defaults match the validated 7B math PPO
   # run: lambda_value=1.0, length-adaptive lambda_policy with alpha=0.05).
-  #
-  # name: "gae"      -> token-level GAE (the historical path, unchanged).
-  # name: "turn_gae" -> TURN-level GAE: one assistant message is one action,
-  #   V(s_k) is read at that turn's first token (the value head is right-shifted,
-  #   so that position has seen the whole preceding observation and none of the
-  #   action), the advantage is constant across the turn's tokens, and the critic
-  #   is supervised at one anchor per turn. Only the turn_gae_* keys apply.
-  #
-  #   Why it exists: at the token level lambda has effective horizon 1/(1-lambda)
-  #   TOKENS, so on a ~45k-token SWE rollout anything below 1 severs the terminal
-  #   reward — which is why length_adaptive_alpha pushes lambda to 1 - 1.5e-5 and
-  #   GAE degenerates to the pure baseline A_t = R - V(s_t) with no temporal
-  #   credit assignment at all. Over ~92 turns, lambda=0.97 is a 33-turn horizon.
-  #   See research/ppo/turn_level_critic_plan.md.
   adv_estimator:
     name: "gae"
     gae_lambda: 1.0
@@ -128,37 +120,6 @@ ppo:
     gae_lambda_policy: 1
     # Length-adaptive lambda_policy = 1 - 1/(alpha*l). 0 = disabled.
     length_adaptive_alpha: null
-
-    # --- decomposed group baseline + residual critic ---
-    # research/ppo/residual_critic_report.md. true => the rollout group supplies
-    # the task baseline B(X) as a leave-one-out mean and the critic is trained
-    # only on the within-task residual C(s) = R - B_LOO; critic values/returns
-    # are then in RESIDUAL space and the go/no-go metric is critic/ev_res.
-    # Requires gae_gamma: 1. Orthogonal to token-vs-turn granularity.
-    #
-    # Motivation, measured on this exact workload: the absolute critic puts
-    # 88-93% of its output variance between tasks yet reaches EV 0.157 — below
-    # even a two-value "all-fail vs rest" lookup (0.330) and far below the free
-    # leave-one-out group baseline (0.553). Substituting it for that baseline
-    # RAISES advantage variance 1.67-2.09x. false still logs critic/ev_res and
-    # residual/* so an absolute run is comparable on the same axis.
-    residual_baseline: false
-
-    # --- turn-level GAE (used only when name: "turn_gae") ---
-    # All three lambdas/gamma are required in that mode and are never silently
-    # defaulted, so a sweep cannot appear to have run when it did not.
-    turn_gae_gamma: 1.0
-    # lambda_value=1.0 keeps the critic's target Monte-Carlo (G_k == R): the same
-    # target it regresses on today, just at ~92 anchors instead of ~45k tokens.
-    # Lower it only deliberately — bootstrapped targets feed the critic's own
-    # (still weak) estimates back into its own supervision.
-    turn_gae_lambda_value: 1.0
-    # lambda_policy is THE knob. 1.0 reproduces today's A_k = R - V(s_k);
-    # 0.99 ~ 100-turn horizon, 0.97 ~ 33 turns, 0.95 ~ 20 turns.
-    turn_gae_lambda_policy: 1.0
-    # The critic is supervised at ONE anchor per turn, every turn weighted
-    # equally (under token weighting the longest decile of turns owns ~43% of
-    # the critic loss).
 
   reward_shaping:
     enabled: false
@@ -227,15 +188,6 @@ loss_fn:
 value_loss_fn:
   scale: 1.0
   cliprange: 0.5
-  # Weight of homogeneous (all-fail / all-pass) groups in the value loss. Only
-  # meaningful with ppo.adv_estimator.residual_baseline: those groups have Y = 0
-  # for every sibling, so they contribute EXACTLY zero target variance while
-  # still costing ~58% of critic FLOPs on this pool (54.1% all-fail, 2.4%
-  # all-pass; only 43.5% of groups are mixed). Keep at 1.0 for the clean
-  # ablation — they are not dead weight, they are the shrinkage that enforces
-  # E[C | X] = 0 and suppresses between-task leakage. Lower it only to buy more
-  # mixed-group exposure per unit wall-clock.
-  homogeneous_group_weight: 1.0
 
 # =============================================================================
 # Policy
@@ -292,7 +244,11 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_flex_dispatcher_backend: "hybridep"
-    moe_hybridep_num_sms: 32
+    # moe_hybridep_num_sms removed: Megatron in the NCCL-2.30.4 container deprecates
+    # both moe_hybridep_num_sms and moe_deepep_num_sms in favour of
+    # moe_flex_dispatcher_num_sms and errors out when both deprecated knobs are set
+    # ("Conflicting deprecated SM-count knobs"). nemo_rl on this branch does not plumb
+    # the new knob, so drop this and take Megatron's default SM count.
     moe_aux_loss_coeff: 0.0
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
@@ -497,34 +453,6 @@ value:
   max_total_sequence_length: ${policy.max_total_sequence_length}
   precision: "bfloat16"
 
-  # --- privileged (asymmetric) critic for SWE ---
-  # research/ppo/privileged_residual_critic_plan.md. The critic sees the accepted
-  # fix and the grading tests; the policy never does. Audited over all 9262
-  # instances: golden patch + test patch are present for 100% of them, and none
-  # of them appear anywhere in the agent's context (verified against a real
-  # 408k-char rollout), so this is genuine information, not just a cheaper
-  # computation of something already visible.
-  #
-  # The block is prefixed BEFORE the first assistant token — mandatory, since the
-  # value head is causal and ~150 assistant turns are spread across the context;
-  # appending would be a silent no-op. It is byte-identical for all 16 siblings
-  # of a group, so it cannot introduce a within-task confound.
-  #
-  # Orthogonal to both other critic axes: composes with residual OR absolute
-  # targets, and with token-level OR turn_gae (anchors are remapped into the
-  # augmented layout). Enabling it raises value.max_total_sequence_length by the
-  # sum of the caps below automatically.
-  swe_privileged_critic:
-    enabled: false
-    # Single TOTAL token budget for the reference block, so the value model's
-    # sequence budget is exactly policy_len + this + slack. Measured over 400
-    # instances the untruncated block is median 5467 / p90 17683 / p99 77911
-    # tokens, so 32768 truncates ~4.8%. Budget is spent in priority order
-    # (fail_to_pass, golden_patch, test_patch, pass_to_pass) and anything cut is
-    # marked inline with "... [truncated]" plus a block-level note. Watch
-    # privilege/frac_truncated to see what the budget is discarding.
-    max_total_tokens: 32768
-
   reward_model_cfg:
     enabled: false  # only used for the DTensor V2 value worker
     reward_model_type: "regression"
@@ -564,7 +492,11 @@ value:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_flex_dispatcher_backend: "hybridep"
-    moe_hybridep_num_sms: 32
+    # moe_hybridep_num_sms removed: Megatron in the NCCL-2.30.4 container deprecates
+    # both moe_hybridep_num_sms and moe_deepep_num_sms in favour of
+    # moe_flex_dispatcher_num_sms and errors out when both deprecated knobs are set
+    # ("Conflicting deprecated SM-count knobs"). nemo_rl on this branch does not plumb
+    # the new knob, so drop this and take Megatron's default SM count.
     moe_aux_loss_coeff: 0.0
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
@@ -725,13 +657,13 @@ env:
           dataset_path: ${data.train.data_path}
           apptainer_memory_limit_mb: 65536
           container_formatter:
-            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/swerebench/{instance_id}.sif"
-            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/nv_internal/{instance_id}.sif"
-            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/r2e_gym/{instance_id}.sif"
-            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/sweb.eval.arm64.{instance_id}.sif"
-            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/swebench/swe-bench.eval.arm64.{instance_id}.sif"
-            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/mercor/swebenchpro_ots/{instance_id}.sif"
-            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/swegym/sweb.eval.arm64.{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swerebench/{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/nv_internal/{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/r2e_gym/{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swegym/sweb.eval.arm64.{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swebench/swe-bench.eval.arm64.{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/mercor/swebenchpro_ots/{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/mercor/{instance_id}.sif"
     swe_agents_val:
       responses_api_agents:
         swe_agents:

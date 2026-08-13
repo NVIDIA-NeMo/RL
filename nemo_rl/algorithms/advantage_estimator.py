@@ -310,6 +310,41 @@ class GeneralizedAdvantageEstimator:
         self.kl_coef = loss_config.reference_policy_kl_penalty
         self.kl_type = loss_config.reference_policy_kl_type
 
+        # Populated by compute_advantage; surfaced by ppo.py into rollout metrics.
+        self.last_metrics: dict[str, float] = {}
+
+    def _compute_raw_advantage_metrics(
+        self,
+        advantages: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> dict[str, float]:
+        """Stats on the PRE-whitening advantages, over valid tokens.
+
+        ``normalize_advantages`` rescales advantages to unit std every step, so
+        the post-whitening spread is 1.0 by construction and carries no
+        information.  The pre-whitening spread does: with lambda=1 the advantage
+        is ``R - V(s_t)``, so ``adv_raw/std`` is the critic's residual scale and
+        should SHRINK as the critic improves.  A flat ``adv_raw/std`` alongside a
+        flat ``critic/explained_var`` is independent confirmation that the critic
+        is not learning.  ``whiten_gain`` is the amplification whitening applies
+        (1/std); a large and growing value means the loss is being scaled up to
+        compensate for a shrinking signal.
+        """
+        m = mask.bool()
+        if int(m.sum()) < 2:
+            return {}
+        a = advantages[m].float()
+        std = a.std(unbiased=False)
+        metrics = {
+            "adv_raw/mean": a.mean().item(),
+            "adv_raw/std": std.item(),
+            "adv_raw/abs_mean": a.abs().mean().item(),
+            "adv_raw/max_abs": a.abs().max().item(),
+        }
+        if self.normalize_advantages:
+            metrics["adv_raw/whiten_gain"] = (1.0 / (std + 1e-8)).item()
+        return metrics
+
     def _reward_whiten(
         self,
         rewards: torch.Tensor,
@@ -456,6 +491,10 @@ class GeneralizedAdvantageEstimator:
                 values,
                 mask,
             )
+
+        # Capture the pre-whitening advantage scale (critic-quality diagnostic)
+        # BEFORE normalize_advantages pins the std to 1.0.
+        self.last_metrics = self._compute_raw_advantage_metrics(advantages, mask)
 
         # Whiten advantages (optional) and zero out masked positions (always)
         if self.normalize_advantages:

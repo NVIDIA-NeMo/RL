@@ -240,7 +240,22 @@ class PPOConfig(TypedDict):
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: NotRequired[float]
+    # Number of actor (policy) passes over each rollout batch.
     ppo_epochs: int
+    # Number of critic (value) passes over each rollout batch. None/absent keeps
+    # the critic coupled to `ppo_epochs` (the historical behavior); set it higher
+    # (never lower) to fit the critic harder on the same rollout without
+    # over-training the actor. The surplus runs as critic-only passes before the
+    # shared inner loop; safe to reorder because every pass consumes the same
+    # returns/advantages, frozen before any update this step.
+    critic_ppo_epochs: NotRequired[Optional[int]]
+    # Re-score the rollout batch with a forward-only pass after the final critic
+    # update, emitting critic/explained_var_post_update and
+    # critic/loss_post_update. critic/explained_var is always the PRE-update EV,
+    # computed from the rollout-time values GAE consumed (critic/loss and
+    # critic/grad_norm come from the last training pass). Costs one extra critic
+    # forward over the batch per step, so this defaults to off.
+    log_post_update_critic_metrics: NotRequired[bool]
     reward_shaping: RewardShapingConfig
     reward_scaling: RewardScalingConfig
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
@@ -291,6 +306,27 @@ def _default_ppo_save_state() -> PPOSaveState:
         "total_valid_tokens": 0,
         "val_reward": -99999999.0,
     }
+
+
+def _resolve_critic_ppo_epochs(ppo_config: PPOConfig) -> int:
+    """Number of critic (value) passes over each rollout batch.
+
+    ``ppo.critic_ppo_epochs`` lets the critic train longer than the actor on the
+    same rollout. Unset/None keeps the two coupled, which is the historical
+    behavior.
+    """
+    ppo_epochs = ppo_config["ppo_epochs"]
+    assert ppo_epochs >= 1, f"ppo.ppo_epochs must be >= 1 (got {ppo_epochs})."
+    critic_ppo_epochs = ppo_config.get("critic_ppo_epochs")
+    if critic_ppo_epochs is None:
+        return ppo_epochs
+    # The critic trains once per shared epoch, so it can only be given MORE
+    # epochs than the actor, never fewer.
+    assert critic_ppo_epochs >= ppo_epochs, (
+        f"ppo.critic_ppo_epochs ({critic_ppo_epochs}) must be >= ppo.ppo_epochs "
+        f"({ppo_epochs})."
+    )
+    return critic_ppo_epochs
 
 
 class PPOLoggerConfig(LoggerConfig):
@@ -821,11 +857,14 @@ def setup(
 
     # train_iters is the total scheduler-tick budget. Each Megatron worker
     # ticks once per train() call (matching upstream main's per-rollout
-    # convention), and PPO calls each worker's train() `ppo_epochs` times
-    # per outer step. So total ticks = (outer steps) * ppo_epochs.
+    # convention), and PPO calls each worker's train() once per inner epoch per
+    # outer step. So total ticks = (outer steps) * (that model's epochs) -- the
+    # critic may run more than the actor (ppo.critic_ppo_epochs), so it gets its
+    # own budget, else its LR schedule would finish decaying early.
     # Scale train_iters accordingly so the configured warmup/decay horizon
     # matches the actual scheduler-step count.
     ppo_epochs = ppo_config["ppo_epochs"]
+    critic_ppo_epochs = _resolve_critic_ppo_epochs(ppo_config)
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         total_train_iters = (
             min(
@@ -842,7 +881,7 @@ def setup(
                 ppo_config["max_num_steps"],
                 ppo_config["max_num_epochs"] * len(dataloader),
             )
-            * ppo_epochs
+            * critic_ppo_epochs
         )
         value_config["megatron_cfg"]["train_iters"] = total_train_iters
 
@@ -875,6 +914,25 @@ def setup(
             value_optimizer_path = _resolve_resume_optimizer_path(
                 _value_optim, value_weights_path, value_config
             )
+            # Warm-start seed (prep_warm_start.sh): the critic weights come from a
+            # stage-B run whose expert-parallel layout may differ from this run's.
+            # Megatron's distributed optimizer state is sharded by (expert-)DP group
+            # index, so it cannot reshard across a changed EP -- the load dies with
+            # "Missing key in checkpoint state_dict: chained_1.optimizer.distributed.
+            # dp_group_idx_N...". Model weights DO reshard, so take those and rebuild
+            # Adam + the LR schedule fresh (value_lr_warmup_iters re-warms it).
+            # Self-limiting: only the fabricated seed carries the provenance file, so
+            # ordinary step_N resumes keep restoring the optimizer normally.
+            if (
+                value_optimizer_path is not None
+                and (Path(last_checkpoint_path) / "warm_start_provenance.txt").exists()
+            ):
+                print(
+                    "  ⚠ Warm-start seed detected: loading critic weights only "
+                    "(fresh optimizer + LR schedule).",
+                    flush=True,
+                )
+                value_optimizer_path = None
             if value_weights_path is None:
                 print(
                     f"  ⚠ Value weights not found in checkpoint {last_checkpoint_path} "
@@ -1677,6 +1735,12 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
 
     # Compute explained variance from sufficient statistics:
     # EV = 1 - Var(returns - values) / Var(returns)
+    # NOTE: these statistics come from a TRAINING pass's forward, so with
+    # critic_ppo_epochs > 1 they see a critic already fitted by the earlier
+    # passes. ppo_train/async_ppo_train overwrite critic/explained_var with the
+    # pre-update EV from the rollout-time values (_pooled_explained_var); this
+    # loss-derived one only survives as critic/explained_var_post_update, where
+    # the post-update timing is the point.
     r_mean = critic_metrics.get("critic/returns_mean", 0)
     v_mean = critic_metrics.get("critic/values_mean", 0)
     r_sq = critic_metrics.get("critic/returns_sq_mean", 0)
@@ -1718,6 +1782,31 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
         1.0 - var_residual / var_res_returns if var_res_returns > 1e-8 else 0.0
     )
     return critic_metrics
+
+
+def _pooled_explained_var(
+    values: torch.Tensor,
+    returns: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> float:
+    """Pooled EV = 1 - Var(returns - values) / Var(returns) over valid tokens.
+
+    Computed driver-side from the rollout-time values -- the exact tensors GAE
+    consumed -- so it describes the critic BEFORE any update this step,
+    regardless of critic_ppo_epochs or gbs-vs-rollout microbatching. Masked like
+    the value loss (token_mask * sample_mask) so it is directly comparable to
+    critic/explained_var_post_update.
+    """
+    mask = (token_mask * sample_mask.unsqueeze(-1)).bool()
+    if int(mask.sum()) < 2:
+        return 0.0
+    r = returns[mask].float()
+    v = values[mask].float()
+    var_returns = r.var(unbiased=False)
+    if var_returns <= 1e-8:
+        return 0.0
+    return (1.0 - (r - v).var(unbiased=False) / var_returns).item()
 
 
 def _calibration_ece(v: torch.Tensor, r: torch.Tensor, n_conf_bins: int = 10) -> float:
@@ -1947,6 +2036,7 @@ def _build_ppo_rollout_dump_payload(
     content: list[str],
     repeated_batch: BatchedDataDict[DatumSpec],
     turn_spans: Optional[Any] = None,
+    adv_raw_metrics: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Build the packed per-token rollout dump payload for torch.save.
 
@@ -2043,6 +2133,18 @@ def _build_ppo_rollout_dump_payload(
     if "reference_policy_logprobs" in train_data:
         payload["reference_policy_logprobs"] = _pack_float("reference_policy_logprobs")
 
+    # ``advantages`` above are POST-whitening (normalize_advantages pins their std
+    # to 1.0). Whitening is affine, so the pre-whitening advantages -- the critic's
+    # actual residual scale, R - V(s_t) at lambda=1 -- are recoverable exactly:
+    #     adv_raw = advantages * adv_raw_std + adv_raw_mean
+    # Stored as two scalars rather than a second packed tensor (same information,
+    # ~13MB/dump cheaper).
+    if adv_raw_metrics:
+        for key in ("mean", "std"):
+            value = adv_raw_metrics.get(f"adv_raw/{key}")
+            if value is not None:
+                payload[f"adv_raw_{key}"] = float(value)
+
     if num_generations_per_prompt > 0:
         payload["prompt_group_index"] = (
             sample_indices // num_generations_per_prompt
@@ -2090,7 +2192,8 @@ def ppo_train(
     Based on the grpo_train loop with PPO-specific modifications:
     - Value model inference and training (actor-critic)
     - GAE advantage estimation with value bootstrap
-    - Multiple training steps per rollout (ppo_epochs)
+    - Multiple training steps per rollout (ppo_epochs), plus optional extra
+      critic-only passes (critic_ppo_epochs)
     - Configurable policy training start epoch
     """
     timer = Timer()
@@ -2127,6 +2230,14 @@ def ppo_train(
     current_epoch = ppo_save_state["current_epoch"]
     max_num_epochs = master_config.ppo["max_num_epochs"]
     ppo_epochs = master_config.ppo["ppo_epochs"]
+    # Total critic epochs (ppo.critic_ppo_epochs; defaults to ppo_epochs). Any
+    # surplus over ppo_epochs runs as extra critic-only passes below.
+    critic_ppo_epochs = _resolve_critic_ppo_epochs(master_config.ppo)
+    # Optional forward-only pass after the final critic update (costs one extra
+    # critic forward per step); see log_post_update_critic_metrics in PPOConfig.
+    log_post_update_critic_metrics = master_config.ppo.get(
+        "log_post_update_critic_metrics", False
+    )
     # Number of PPO steps to train only the critic before starting policy
     # training.  Despite the legacy name, this is compared against total_steps
     # (not current_epoch) to match veRL's critic_warmup semantics.
@@ -2636,6 +2747,9 @@ def ppo_train(
                             content=flat_messages["content"],
                             repeated_batch=repeated_batch,
                             turn_spans=turn_spans,
+                            adv_raw_metrics=getattr(
+                                adv_estimator, "last_metrics", None
+                            ),
                         )
                         torch.save(rollout_dump_payload, rollout_dump_path)
                         print(f"  📝 Dumped rollout data to {rollout_dump_path}")
@@ -2643,6 +2757,49 @@ def ppo_train(
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
+
+                # Privileged critic: train on the answer-augmented batch
+                # (returns already scattered onto its response positions above;
+                # values=aug old-values for the optional value clip).
+                if critic_batch is not None:
+                    critic_batch["sample_mask"] = train_data["sample_mask"]
+                    value_train_batch = critic_batch
+                else:
+                    value_train_batch = train_data
+                # Residual bookkeeping last, so the sample_mask re-assignment
+                # above cannot clobber the homogeneous group weighting. Applied
+                # here rather than inside the epoch loop so the extra
+                # critic-only passes (critic_ppo_epochs > ppo_epochs) train on
+                # the same weighting as the shared loop.
+                value_train_batch = _prepare_value_train_batch(
+                    value_train_batch, adv_estimator, master_config
+                )
+
+                # Forward-only pass after the final critic update, for the
+                # post-update critic metrics (see below).
+                post_value_results = None
+
+                # Extra critic-only passes when ppo.critic_ppo_epochs exceeds
+                # ppo_epochs. They run before the shared loop below so that loop
+                # -- and the GPU state it leaves behind -- is untouched. Ordering
+                # is free: every pass consumes the same returns/advantages, frozen
+                # above for the whole step.
+                if critic_ppo_epochs > ppo_epochs:
+                    print(
+                        f"▶ Training value ({critic_ppo_epochs - ppo_epochs} extra "
+                        f"critic-only epochs)...",
+                        flush=True,
+                    )
+                    with timer.time("value_training_prep"):
+                        value_model.prepare_for_training()
+                    for _ in range(critic_ppo_epochs - ppo_epochs):
+                        with timer.time("value_training"):
+                            value_model.train(
+                                value_train_batch, value_loss_fn, timer=timer
+                            )
+                    with timer.time("value_training"):
+                        value_model.finish_training()
+
                 for step in range(ppo_epochs):
                     print(
                         f"▶ Step {step + 1}/{ppo_epochs}...",
@@ -2655,25 +2812,22 @@ def ppo_train(
 
                     with timer.time("value_training"):
                         print("▶ Training value...", flush=True)
-                        # Privileged critic: train on the answer-augmented batch
-                        # (returns already scattered onto its response positions above;
-                        # values=aug old-values for the optional value clip).
-                        if critic_batch is not None:
-                            critic_batch["sample_mask"] = train_data["sample_mask"]
-                            value_train_batch = critic_batch
-                        else:
-                            value_train_batch = train_data
-                        # Residual bookkeeping last, so the sample_mask
-                        # re-assignment above cannot clobber the homogeneous
-                        # group weighting.
-                        value_train_batch = _prepare_value_train_batch(
-                            value_train_batch, adv_estimator, master_config
-                        )
                         value_results = value_model.train(
                             value_train_batch,
                             value_loss_fn,
                             timer=timer,
                         )
+                        # After the LAST critic update: one forward-only pass to
+                        # score the updated critic on the same batch. Done here,
+                        # while the value model is still on GPU and the policy is
+                        # not, so it adds no co-residency.
+                        if log_post_update_critic_metrics and step == ppo_epochs - 1:
+                            post_value_results = value_model.train(
+                                value_train_batch,
+                                value_loss_fn,
+                                eval_mode=True,
+                                timer=timer,
+                            )
 
                         value_model.finish_training()
 
@@ -2773,6 +2927,12 @@ def ppo_train(
                 )
 
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
+                # Pre-whitening advantage scale (see
+                # GeneralizedAdvantageEstimator._compute_raw_advantage_metrics).
+                # normalize_advantages pins the post-whitening std to 1.0, so this
+                # is the only place the critic's residual scale is observable.
+                if getattr(adv_estimator, "last_metrics", None):
+                    metrics.update(adv_estimator.last_metrics)
                 if train_results is not None:
                     metrics = {
                         **metrics,
@@ -2798,6 +2958,30 @@ def ppo_train(
                 # Extract critic metrics from value training results
                 if value_results is not None:
                     metrics.update(_compute_critic_metrics(value_results))
+                    # critic/explained_var must describe the critic BEFORE any
+                    # update this step (the values GAE consumed). The loss-derived
+                    # EV from _compute_critic_metrics comes from the last training
+                    # pass's forward, which with critic_ppo_epochs > 1 has already
+                    # fit this batch -- overwrite it with the pre-update EV.
+                    # critic/loss and critic/grad_norm still describe the last
+                    # training pass.
+                    if "values" in train_data and "returns" in train_data:
+                        metrics["critic/explained_var"] = _pooled_explained_var(
+                            train_data["values"],
+                            train_data["returns"],
+                            train_data["token_mask"],
+                            train_data["sample_mask"],
+                        )
+                    # The other end of the bracket: the same batch re-scored AFTER
+                    # every update this step (ppo.log_post_update_critic_metrics).
+                    if post_value_results is not None:
+                        post_metrics = _compute_critic_metrics(post_value_results)
+                        metrics["critic/explained_var_post_update"] = post_metrics[
+                            "critic/explained_var"
+                        ]
+                        metrics["critic/loss_post_update"] = np.mean(
+                            post_metrics["critic/loss"]
+                        ).item()
                     # Positional critic-quality diagnostic (early/mid/late tokens): how
                     # well V predicts the return along the trajectory, and — for the
                     # privileged critic — where the golden answer sharpens it.
@@ -3208,6 +3392,7 @@ def async_ppo_train(
       3. computes fresh policy/reference logprobs,
       4. computes GAE advantages/returns using those values,
       5. runs the ``ppo_epochs`` inner loop (critic train, then actor train),
+         preceded by any extra ``critic_ppo_epochs`` critic-only passes,
       6. performs a single weight refit to the generation engine and bumps the
          replay-buffer weight version.
 
@@ -3301,6 +3486,14 @@ def async_ppo_train(
     total_valid_tokens = ppo_save_state.get("total_valid_tokens", 0)
     max_num_steps = master_config.ppo["max_num_steps"]
     ppo_epochs = master_config.ppo["ppo_epochs"]
+    # Total critic epochs (ppo.critic_ppo_epochs; defaults to ppo_epochs). Any
+    # surplus over ppo_epochs runs as extra critic-only passes below.
+    critic_ppo_epochs = _resolve_critic_ppo_epochs(master_config.ppo)
+    # Optional forward-only pass after the final critic update (costs one extra
+    # critic forward per step); see log_post_update_critic_metrics in PPOConfig.
+    log_post_update_critic_metrics = master_config.ppo.get(
+        "log_post_update_critic_metrics", False
+    )
     val_period = master_config.ppo["val_period"]
     val_at_start = master_config.ppo["val_at_start"]
     val_at_end = master_config.ppo["val_at_end"]
@@ -3890,30 +4083,66 @@ def async_ppo_train(
                 is_policy_training_step = step >= policy_training_start_step
                 train_results = None
                 value_results = None
+                # Forward-only pass after the final critic update, for the
+                # post-update critic metrics (see the sync loop).
+                post_value_results = None
+
+                # Privileged critic: train on the answer-augmented batch
+                # (returns already scattered onto its response positions above;
+                # values=aug old-values for the optional value clip).
+                if critic_batch is not None:
+                    critic_batch["sample_mask"] = train_data["sample_mask"]
+                    value_train_batch = critic_batch
+                else:
+                    value_train_batch = train_data
+                # Residual bookkeeping last, so the sample_mask re-assignment
+                # above cannot clobber the homogeneous group weighting. Applied
+                # here rather than inside the epoch loop so the extra
+                # critic-only passes (critic_ppo_epochs > ppo_epochs) train on
+                # the same weighting as the shared loop.
+                value_train_batch = _prepare_value_train_batch(
+                    value_train_batch, adv_estimator, master_config
+                )
+
+                # Extra critic-only passes when ppo.critic_ppo_epochs exceeds
+                # ppo_epochs. They run before the shared loop below so that loop
+                # -- and the GPU state it leaves behind -- is untouched. Ordering
+                # is free: every pass consumes the same returns/advantages, frozen
+                # above for the whole step.
+                if critic_ppo_epochs > ppo_epochs:
+                    print(
+                        f"▶ {critic_ppo_epochs - ppo_epochs} extra critic-only "
+                        "epochs..."
+                    )
+                    with timer.time("value_training_prep"):
+                        value_model.prepare_for_training()
+                    for _ in range(critic_ppo_epochs - ppo_epochs):
+                        with timer.time("value_training"):
+                            value_model.train(
+                                value_train_batch, value_loss_fn, timer=timer
+                            )
+                    with timer.time("value_training"):
+                        value_model.finish_training()
+
                 for epoch in range(ppo_epochs):
                     print(f"▶ PPO epoch {epoch + 1}/{ppo_epochs}...")
                     with timer.time("value_training_prep"):
                         value_model.prepare_for_training()
                     with timer.time("value_training"):
-                        # Privileged critic: train on the answer-augmented batch
-                        # (returns already scattered onto its response positions above;
-                        # values=aug old-values for the optional value clip).
-                        if critic_batch is not None:
-                            critic_batch["sample_mask"] = train_data["sample_mask"]
-                            value_train_batch = critic_batch
-                        else:
-                            value_train_batch = train_data
-                        # Residual bookkeeping last, so the sample_mask
-                        # re-assignment above cannot clobber the homogeneous
-                        # group weighting.
-                        value_train_batch = _prepare_value_train_batch(
-                            value_train_batch, adv_estimator, master_config
-                        )
                         value_results = value_model.train(
                             value_train_batch,
                             value_loss_fn,
                             timer=timer,
                         )
+                        # After the LAST critic update: forward-only pass to score
+                        # the updated critic (value still on GPU, policy not).
+                        if log_post_update_critic_metrics and epoch == ppo_epochs - 1:
+                            post_value_results = value_model.train(
+                                value_train_batch,
+                                value_loss_fn,
+                                eval_mode=True,
+                                timer=timer,
+                            )
                         value_model.finish_training()
 
                     if is_policy_training_step:
@@ -4034,6 +4263,13 @@ def async_ppo_train(
                     flat_advantages, flat_token_mask.bool()
                 )
 
+                # Pre-whitening advantage scale (see
+                # GeneralizedAdvantageEstimator._compute_raw_advantage_metrics).
+                # normalize_advantages pins the post-whitening std to 1.0, so this
+                # is the only place the critic's residual scale is observable.
+                if getattr(adv_estimator, "last_metrics", None):
+                    metrics.update(adv_estimator.last_metrics)
+
                 metrics.update(
                     {
                         "reward": rewards.numpy(),
@@ -4074,6 +4310,25 @@ def async_ppo_train(
                     metrics.update(train_results["all_mb_metrics"])
                 if value_results is not None:
                     metrics.update(_compute_critic_metrics(value_results))
+                    # Overwrite critic/explained_var with the pre-update EV (the
+                    # values GAE consumed); see the sync loop for why.
+                    if "values" in train_data and "returns" in train_data:
+                        metrics["critic/explained_var"] = _pooled_explained_var(
+                            train_data["values"],
+                            train_data["returns"],
+                            train_data["token_mask"],
+                            train_data["sample_mask"],
+                        )
+                    # The other end of the bracket: re-scored AFTER every update
+                    # this step (ppo.log_post_update_critic_metrics).
+                    if post_value_results is not None:
+                        post_metrics = _compute_critic_metrics(post_value_results)
+                        metrics["critic/explained_var_post_update"] = post_metrics[
+                            "critic/explained_var"
+                        ]
+                        metrics["critic/loss_post_update"] = np.mean(
+                            post_metrics["critic/loss"]
+                        ).item()
                     # Positional critic-quality diagnostic (early/mid/late tokens): how
                     # well V predicts the return along the trajectory, and — for the
                     # privileged critic — where the golden answer sharpens it.
@@ -4289,6 +4544,7 @@ def async_ppo_train(
                         content=flat_messages_content,
                         repeated_batch=repeated_batch,
                         turn_spans=turn_spans,
+                        adv_raw_metrics=getattr(adv_estimator, "last_metrics", None),
                     )
                     torch.save(rollout_dump_payload, rollout_dump_path)
                     print(f"  📝 Dumped rollout data to {rollout_dump_path}")
