@@ -121,6 +121,21 @@ ppo:
     # Length-adaptive lambda_policy = 1 - 1/(alpha*l). 0 = disabled.
     length_adaptive_alpha: null
 
+    # --- decomposed group baseline + residual critic ---
+    # research/ppo/residual_critic_report.md. true => the rollout group supplies
+    # the task baseline B(X) as a leave-one-out mean and the critic is trained
+    # only on the within-task residual C(s) = R - B_LOO; critic values/returns
+    # are then in RESIDUAL space and the go/no-go metric is critic/ev_res.
+    # Requires gae_gamma: 1. Orthogonal to token-vs-turn granularity.
+    #
+    # Motivation, measured on this exact workload: the absolute critic puts
+    # 88-93% of its output variance between tasks yet reaches EV 0.157 — below
+    # even a two-value "all-fail vs rest" lookup (0.330) and far below the free
+    # leave-one-out group baseline (0.553). Substituting it for that baseline
+    # RAISES advantage variance 1.67-2.09x. false still logs critic/ev_res and
+    # residual/* so an absolute run is comparable on the same axis.
+    residual_baseline: false
+
   reward_shaping:
     enabled: false
     overlong_buffer_length: 128
@@ -188,6 +203,15 @@ loss_fn:
 value_loss_fn:
   scale: 1.0
   cliprange: 0.5
+  # Weight of homogeneous (all-fail / all-pass) groups in the value loss. Only
+  # meaningful with ppo.adv_estimator.residual_baseline: those groups have Y = 0
+  # for every sibling, so they contribute EXACTLY zero target variance while
+  # still costing ~58% of critic FLOPs on this pool (54.1% all-fail, 2.4%
+  # all-pass; only 43.5% of groups are mixed). Keep at 1.0 for the clean
+  # ablation — they are not dead weight, they are the shrinkage that enforces
+  # E[C | X] = 0 and suppresses between-task leakage. Lower it only to buy more
+  # mixed-group exposure per unit wall-clock.
+  homogeneous_group_weight: 1.0
 
 # =============================================================================
 # Policy
@@ -452,6 +476,34 @@ value:
   logprob_batch_size: ${policy.logprob_batch_size}
   max_total_sequence_length: ${policy.max_total_sequence_length}
   precision: "bfloat16"
+
+  # --- privileged (asymmetric) critic for SWE ---
+  # research/ppo/privileged_residual_critic_plan.md. The critic sees the accepted
+  # fix and the grading tests; the policy never does. Audited over all 9262
+  # instances: golden patch + test patch are present for 100% of them, and none
+  # of them appear anywhere in the agent's context (verified against a real
+  # 408k-char rollout), so this is genuine information, not just a cheaper
+  # computation of something already visible.
+  #
+  # The block is prefixed BEFORE the first assistant token — mandatory, since the
+  # value head is causal and ~150 assistant turns are spread across the context;
+  # appending would be a silent no-op. It is byte-identical for all 16 siblings
+  # of a group, so it cannot introduce a within-task confound.
+  #
+  # Orthogonal to both other critic axes: composes with residual OR absolute
+  # targets, and with token-level OR turn_gae (anchors are remapped into the
+  # augmented layout). Enabling it raises value.max_total_sequence_length by the
+  # sum of the caps below automatically.
+  swe_privileged_critic:
+    enabled: false
+    # Single TOTAL token budget for the reference block, so the value model's
+    # sequence budget is exactly policy_len + this + slack. Measured over 400
+    # instances the untruncated block is median 5467 / p90 17683 / p99 77911
+    # tokens, so 32768 truncates ~4.8%. Budget is spent in priority order
+    # (fail_to_pass, golden_patch, test_patch, pass_to_pass) and anything cut is
+    # marked inline with "... [truncated]" plus a block-level note. Watch
+    # privilege/frac_truncated to see what the budget is discarding.
+    max_total_tokens: 32768
 
   reward_model_cfg:
     enabled: false  # only used for the DTensor V2 value worker
