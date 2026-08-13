@@ -97,6 +97,12 @@ def test_collect_mtp_hf_layer_names_covers_both_naming_schemes():
             "mtp.layers.0.mtp_model_layer.layers.0.mlp.linear_fc1.weight",
             "mtp.layers.0.mixer.up_proj.weight",
         ),
+        # Qwen3.5-VL / EXAONE-style: megatron name carries a language_model.
+        # prefix before the mtp. segment; the HF name stays bare mtp.*.
+        _conversion_task(
+            "language_model.mtp.layers.1.mtp_model_layer.mlp.linear_fc1.weight",
+            "mtp.layers.1.mlp.up_proj.weight",
+        ),
         # Main-model tasks must not contribute.
         _conversion_task(
             "decoder.layers.3.mlp.linear_fc1.weight",
@@ -107,7 +113,11 @@ def test_collect_mtp_hf_layer_names_covers_both_naming_schemes():
         ),
     ]
 
-    assert _collect_mtp_hf_layer_names(tasks) == {"model.layers.61", "mtp.layers.0"}
+    assert _collect_mtp_hf_layer_names(tasks) == {
+        "model.layers.61",
+        "mtp.layers.0",
+        "mtp.layers.1",
+    }
 
 
 def test_collect_mtp_hf_layer_names_empty_inputs():

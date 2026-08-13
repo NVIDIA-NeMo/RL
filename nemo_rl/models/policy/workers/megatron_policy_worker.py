@@ -203,20 +203,11 @@ def _estimate_refit_tensor_size_in_bytes(
 
 def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
     """Return HF layer names whose weights originate from Megatron's MTP module.
-
-    The Megatron-side parameter name is uniformly ``mtp.*`` for every model
-    family, but the HF-side name is not: DeepSeek-style bridges export MTP as
-    trailing main-model layer indices (``model.layers.{N + num_layers}.*``),
-    which ``is_nccl_reshard_param`` cannot recognize from the name shape alone.
-    Provenance — the Megatron name carried by the Bridge conversion task — is
-    the reliable signal. Results are keyed by ``_extract_layer_name`` so a
-    whole MTP layer is routed to the misc path together.
+    This is required because, in some casees, only the Megatron-side name contains
+    the `mtp` string, while the HF-side name does not.
 
     Args:
-        conversion_tasks: Megatron-Bridge ``WeightConversionTask`` list; only
-            ``global_param_name`` (resolved Megatron-side name) and
-            ``mapping.hf_param`` (str, or dict of str for compound mappings)
-            are consulted. ``None`` entries are tolerated.
+        conversion_tasks: Megatron-Bridge ``WeightConversionTask`` list
 
     Returns:
         Set of HF layer names, e.g. ``{"model.layers.61", "mtp.layers.0"}``.
@@ -225,9 +216,11 @@ def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
 
     mtp_layers: set[str] = set()
     for task in conversion_tasks or []:
-        # FP8 export can leave None placeholders in the task list (BF16 export
-        # pre-filters them; see _build_refit_conversion_tasks).
-        if task is not None and task.global_param_name.startswith("mtp."):
+        if task is None:
+            continue
+        if ".mtp." in task.global_param_name or task.global_param_name.startswith(
+            "mtp."
+        ):
             hf = task.mapping.hf_param
             for hf_name in hf.values() if isinstance(hf, dict) else [str(hf)]:
                 mtp_layers.add(_extract_layer_name(hf_name))
