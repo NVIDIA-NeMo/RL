@@ -174,29 +174,32 @@ sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND
 # Rubin ('100f-real', '107f-real'). Substitute bare archs for the nvshmem cmake
 # call only; DeepEP kernels keep the full arch string for FP4 support.
 #
-# The semicolon MUST stay backslash-escaped. This lands inside the
+# The semicolons MUST stay backslash-escaped. This lands inside the
 # CMAKE_CACHE_ARGS list of an ExternalProject_Add, where ';' is CMake's list
-# separator: an unescaped '100;107' would split into two arguments
-# ('-D...STRING=100' plus a stray '107') instead of one cache entry holding a
-# two-element list. In the sed replacement below '\\;' emits a literal '\;'.
+# separator: an unescaped '100;103;107' would split into three arguments
+# ('-D...STRING=100' plus stray '103' and '107') instead of one cache entry
+# holding a three-element list. In the sed replacement below '\\;' emits '\;'.
+#
+# Bare numbers on purpose: this mirrors _DEFAULT_ARCH in _backend.py
+# (100-real;103-real;107-real) but WITHOUT the suffixes, which nvshmem rejects.
 #
 # NOTE: this list does not track BUILD_CUSTOM_TRTLLM_ARCH -- it is hardcoded and
-# must be edited by hand to stay consistent with _DEFAULT_ARCH in _backend.py.
+# must be edited by hand to stay consistent with _DEFAULT_ARCH.
 assert_patch_target cpp/tensorrt_llm/deep_ep/CMakeLists.txt \
     '-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}'
-sed -i 's|-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}|-DCMAKE_CUDA_ARCHITECTURES:STRING=100\\;107|' \
+sed -i 's|-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}|-DCMAKE_CUDA_ARCHITECTURES:STRING=100\\;103\\;107|' \
     cpp/tensorrt_llm/deep_ep/CMakeLists.txt
 
 # SM arch list. Sourced from BUILD_CUSTOM_TRTLLM_ARCH so it stays in sync with
 # _backend.py, which folds the same value into the wheel cache key (a change to
 # the arch list must invalidate the cached wheel). The default below MUST match
 # _backend.py's _DEFAULT_ARCH.
-#   107-real: build Rubin (sm_107) kernels only, matching the Rubin-targeted
-#             [tool.trtllm] ref. Other SKUs (Blackwell sm_100, Blackwell-Ultra
-#             sm_103, H100 sm_90, A100 sm_80, L40 sm_89, RTX 50-series sm_120)
-#             need this list extended via BUILD_CUSTOM_TRTLLM_ARCH -- and, for
-#             non-Rubin targets, the nvshmem arch patch above changed to match.
-ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-100-real;107-real}"
+#   100-real;103-real;107-real: Blackwell (GB200/B200 sm_100), Blackwell-Ultra
+#             (GB300/B300 sm_103) and Rubin (sm_107). Other SKUs (H100 sm_90,
+#             A100 sm_80, L40 sm_89, RTX 50-series sm_120) need this list
+#             extended via BUILD_CUSTOM_TRTLLM_ARCH -- and the nvshmem arch
+#             patch above edited to match, since it does not follow this value.
+ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-100-real;103-real;107-real}"
 JOBS="${TRTLLM_BUILD_JOBS:-64}"
 NPROC=$(nproc 2>/dev/null || echo "$JOBS")
 if (( JOBS > NPROC )); then
