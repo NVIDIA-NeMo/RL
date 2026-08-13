@@ -9,17 +9,14 @@ set -euo pipefail
 
 : "${CONTAINER:?Set CONTAINER to an immutable nightly .sqsh path}"
 : "${SOURCE_DIR:?Set SOURCE_DIR to the NeMo-RL checkout}"
-: "${VENV_DIR:?Set VENV_DIR to a Lustre path}"
 : "${PROBE_DIR:?Set PROBE_DIR to a Lustre path}"
 : "${EXPECTED_HEAD:?Set EXPECTED_HEAD to the source commit}"
 : "${EXPECTED_DEEPEP_COMMIT:?Set EXPECTED_DEEPEP_COMMIT to the DeepEP pin}"
 
-mkdir -p "${PROBE_DIR}" "${VENV_DIR}"
+mkdir -p "${PROBE_DIR}"
 test -f "${CONTAINER}"
 test -d "${SOURCE_DIR}/.git"
 
-export UV_PROJECT_ENVIRONMENT="${VENV_DIR}"
-export UV_CACHE_DIR="${PROBE_DIR}/uv-cache"
 export TMPDIR="${PROBE_DIR}/tmp"
 mkdir -p "${TMPDIR}"
 
@@ -34,12 +31,16 @@ srun \
   --container-mounts=/lustre:/lustre \
   bash -lc '
     set -euo pipefail
+    export PATH="/root/.local/bin:${PATH}"
     cd "${SOURCE_DIR}"
     test "$(git rev-parse HEAD)" = "${EXPECTED_HEAD}"
     git diff --quiet
     git diff --cached --quiet
     uv lock --check
     grep -F "deepseek-ai/DeepEP.git?rev=${EXPECTED_DEEPEP_COMMIT}#${EXPECTED_DEEPEP_COMMIT}" uv.lock
+    command -v uv
+    command -v python
+    echo "uv_project_environment=${UV_PROJECT_ENVIRONMENT}"
     python -V
     nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
     python - <<"PY"
@@ -51,7 +52,6 @@ print(f"visible_gpus={torch.cuda.device_count()}")
 assert torch.cuda.is_available()
 assert torch.cuda.device_count() == 1
 PY
-    uv sync --locked --extra automodel
     UV_NO_SYNC=1 uv run python - <<"PY"
 import importlib.metadata
 
