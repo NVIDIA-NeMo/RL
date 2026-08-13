@@ -1299,8 +1299,8 @@ class TestApplyPerformanceConfig:
 class TestValidateOptimizerConfig:
     """Tests for _validate_optimizer_config function."""
 
-    def test_cpu_offload_requires_full_fraction(self):
-        """Test that CPU offload requires offload_fraction=1.0."""
+    def test_cpu_offload_accepts_fractional_offload(self):
+        """Fractional CPU offload is delegated to HybridDeviceOptimizer."""
         from nemo_rl.models.megatron.setup import _validate_optimizer_config
 
         config = {
@@ -1312,10 +1312,24 @@ class TestValidateOptimizerConfig:
             }
         }
 
-        with pytest.raises(AssertionError) as exc_info:
-            _validate_optimizer_config(config)
+        _validate_optimizer_config(config)
 
-        assert "optimizer_offload_fraction=1.0" in str(exc_info.value)
+    @pytest.mark.parametrize("fraction", [-0.1, 0.0, 1.1])
+    def test_cpu_offload_rejects_invalid_fraction(self, fraction):
+        """Enabled CPU offload requires a fraction in the interval (0, 1]."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "optimizer_cpu_offload": True,
+                    "optimizer_offload_fraction": fraction,
+                }
+            }
+        }
+
+        with pytest.raises(ValueError, match=r"0 < optimizer_offload_fraction <= 1"):
+            _validate_optimizer_config(config)
 
     def test_cpu_offload_with_full_fraction(self):
         """Test that CPU offload works with full fraction."""
