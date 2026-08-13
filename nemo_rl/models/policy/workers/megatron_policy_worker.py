@@ -2756,7 +2756,7 @@ class MegatronPolicyWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
-    def _maybe_build_colocated_inference_model(self, config) -> None:
+    def _maybe_build_colocated_inference_model(self, config: PolicyConfig) -> None:
         """Build a separate inference-layout model when the colocated layout differs."""
         # Resolve the inference layout the same way the non-colocated generation policy does:
         # overlay the sparse mcore_generation_config onto a copy of megatron_cfg.

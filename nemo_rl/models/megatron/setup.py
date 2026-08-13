@@ -1559,8 +1559,8 @@ def build_inference_model(
     inference_provider.recompute_num_layers = None
     if inference_provider.transformer_impl == "inference_optimized":
         inference_provider.moe_pad_experts_for_cuda_graph_inference = False
-    # Need to run __post__init__ with the correct config.
-    TransformerConfig.__post_init__(inference_provider)
+    # Re-run the deferred MCore post-init (virtual, idempotent).
+    inference_provider.finalize()
 
     world_size = torch.distributed.get_world_size()
     inference_pg_collection = build_inference_pg_collection(

@@ -35,6 +35,7 @@ from megatron.core.resharding.refit import (
     prepare_swap_model_weights,
     swap_model_weights,
 )
+from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.utils import unwrap_model
@@ -74,7 +75,7 @@ class MegatronGenerationMixin:
     # (see MegatronPolicyWorkerImpl._maybe_build_colocated_inference_model).
     inference_model = None
 
-    def _gen_model(self):
+    def _gen_model(self) -> MegatronModule:
         """The model the inference engine wraps.
 
         Returns the dedicated inference-layout model when one exists (colocated
@@ -871,7 +872,7 @@ class MegatronGenerationRefitMixin:
 
     def _onload_inference_model(self) -> None:
         """Restore the colocated inference weights to GPU before resharding / generation."""
-        if not getattr(self, "_inference_model_offloaded", False):
+        if not self._inference_model_offloaded:
             return
         resume_inference_weights()
         self._inference_model_offloaded = False
@@ -879,8 +880,8 @@ class MegatronGenerationRefitMixin:
     def _offload_inference_model(self) -> None:
         """Offload the colocated inference weights to CPU while training runs."""
         if (
-            getattr(self, "inference_model", None) is None
-            or getattr(self, "_inference_model_offloaded", False)
+            self.inference_model is None
+            or self._inference_model_offloaded
             or not HAVE_TORCH_MEMORY_SAVER
         ):
             return
@@ -889,7 +890,7 @@ class MegatronGenerationRefitMixin:
 
     def _reshard_into_inference_model(self) -> None:
         """Reshard current training weights into the colocated inference-layout model."""
-        inference_model = getattr(self, "inference_model", None)
+        inference_model = self.inference_model
         if inference_model is None:
             return
 
