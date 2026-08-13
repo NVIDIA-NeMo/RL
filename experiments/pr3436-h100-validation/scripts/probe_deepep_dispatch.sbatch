@@ -67,6 +67,7 @@ srun \
   --ntasks-per-node=8 \
   --no-container-mount-home \
   --container-name="${container_name}" \
+  --container-mounts=/lustre:/lustre \
   --container-workdir="${SOURCE_DIR}" \
   bash -lc '
     set -euo pipefail
