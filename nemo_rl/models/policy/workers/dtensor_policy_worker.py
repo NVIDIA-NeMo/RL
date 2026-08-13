@@ -335,7 +335,15 @@ class DTensorPolicyWorkerImpl(
                 raise ValueError(f"Unknown reward model type: {rm_type}")
         else:
             # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
-            model_class = resolve_model_class(model_config.model_type)
+            # This worker owns model loading and FSDP parallelization. Using the
+            # NeMo AutoModel wrappers here would also run their distributed
+            # checkpoint infrastructure, causing rank 0 to enter a different
+            # collective from the other ranks during the rank-0-only load (NCCL
+            # timeout/hang). Request the plain Hugging Face class instead.
+            model_class = resolve_model_class(
+                model_config.model_type,
+                use_nemo_automodel=False,
+            )
 
         full_state_dict = None
         if self.rank == 0:
