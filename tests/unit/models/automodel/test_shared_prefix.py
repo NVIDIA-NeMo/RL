@@ -482,6 +482,7 @@ def test_qwen3_moe_checkpoint_wrapper_compatibility_preserves_wrapper_call():
         block = object.__new__(Block)
         torch.nn.Module.__init__(block)
         dense = MLP(4, 8, "torch", dtype=torch.float32)
+        dense.init_weights(torch.device("cpu"))
         block.mlp = checkpoint_wrapper(dense)
         dense_input = torch.randn(2, 3, 4)
         torch.testing.assert_close(
@@ -490,6 +491,7 @@ def test_qwen3_moe_checkpoint_wrapper_compatibility_preserves_wrapper_call():
         )
 
         moe = MoE(config, backend)
+        moe.init_weights(torch.device("cpu"))
         block.mlp = checkpoint_wrapper(moe)
         moe_input = torch.randn(2, 3, 4)
         padding_mask = torch.zeros(2, 3, dtype=torch.bool)
