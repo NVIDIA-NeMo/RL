@@ -161,10 +161,15 @@ def test_process_mxfp8_moe_refit_uses_batched_flashinfer_shuffle(
         is_mx=True,
     )
 
-    w13_weight = torch.nn.Parameter(torch.zeros(2, 4, 3), requires_grad=False)
-    w2_weight = torch.nn.Parameter(torch.zeros(2, 3, 2), requires_grad=False)
-    w13_scale = torch.nn.Parameter(torch.zeros(2, 4, 1), requires_grad=False)
-    w2_scale = torch.nn.Parameter(torch.zeros(2, 3, 1), requires_grad=False)
+    w13_rows = 256 if is_gated else 128
+    w13_weight = torch.nn.Parameter(
+        torch.zeros(2, w13_rows, 512), requires_grad=False
+    )
+    w2_weight = torch.nn.Parameter(torch.zeros(2, 512, 128), requires_grad=False)
+    w13_scale = torch.nn.Parameter(
+        torch.zeros(2, w13_rows, 16), requires_grad=False
+    )
+    w2_scale = torch.nn.Parameter(torch.zeros(2, 512, 4), requires_grad=False)
     w13_scale_from_checkpoint = torch.ones_like(w13_scale)
     w2_scale_from_checkpoint = torch.ones_like(w2_scale)
     layer = types.SimpleNamespace(
@@ -288,13 +293,17 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     )
 
     layer = torch.nn.Module()
-    layer.w13_weight = torch.nn.Parameter(torch.zeros(2, 4, 3), requires_grad=False)
-    layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 3, 2), requires_grad=False)
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros(2, 128, 512), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros(2, 512, 128), requires_grad=False
+    )
     layer.w13_weight_scale = torch.nn.Parameter(
-        torch.zeros(2, 4, 1), requires_grad=False
+        torch.zeros(2, 128, 16), requires_grad=False
     )
     layer.w2_weight_scale = torch.nn.Parameter(
-        torch.zeros(2, 3, 1), requires_grad=False
+        torch.zeros(2, 512, 4), requires_grad=False
     )
     layer.w13_weight_scale.weight_loader = object()
     layer.w2_weight_scale.weight_loader = object()
@@ -472,6 +481,9 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(fp8_module, monkeypat
             "w2_weight_scale",
         )
     }
+    apply_storage_ptrs = {
+        name: getattr(layer, name).data_ptr() for name in apply_parameter_ids
+    }
     with torch.no_grad():
         layer.w13_weight.fill_(3)
         layer.w2_weight.fill_(3)
@@ -484,10 +496,22 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(fp8_module, monkeypat
         id(getattr(layer, name)) == parameter_id
         for name, parameter_id in apply_parameter_ids.items()
     )
+    assert all(
+        getattr(layer, name).data_ptr() == data_ptr
+        for name, data_ptr in apply_storage_ptrs.items()
+    )
     assert torch.all(layer.w13_weight_for_apply[:, :32, :128] == 3)
     assert torch.all(layer.w2_weight_for_apply[:, :128, :32] == 3)
     assert torch.all(layer.w13_weight_scale[:, :32, :4] == 4)
     assert torch.all(layer.w2_weight_scale[:, :128, :1] == 4)
+    assert torch.count_nonzero(layer.w13_weight_for_apply[:, 32:, :]) == 0
+    assert torch.count_nonzero(layer.w13_weight_for_apply[:, :, 128:]) == 0
+    assert torch.all(layer.w13_weight_scale[:, 32:, :] == 127)
+    assert torch.all(layer.w13_weight_scale[:, :, 4:] == 127)
+    assert torch.count_nonzero(layer.w2_weight_for_apply[:, 128:, :]) == 0
+    assert torch.count_nonzero(layer.w2_weight_for_apply[:, :, 32:]) == 0
+    assert torch.all(layer.w2_weight_scale[:, 128:, :] == 127)
+    assert torch.all(layer.w2_weight_scale[:, :, 1:] == 127)
     assert quant_method.moe_kernel is kernel
     assert len(kernel_configs) == 1
 
@@ -497,14 +521,39 @@ def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(fp8_module):
     calls = []
 
     class Kernel:
-        def apply_monolithic(self, x, w13, w2, router_logits, **kwargs):
+        def apply_monolithic(
+            self,
+            x,
+            w13,
+            w2,
+            router_logits,
+            *,
+            activation,
+            global_num_experts,
+            expert_map,
+            apply_router_weight_on_input,
+            num_expert_group,
+            topk_group,
+            e_score_correction_bias,
+            routed_scaling_factor,
+        ):
+            kwargs = {
+                "activation": activation,
+                "global_num_experts": global_num_experts,
+                "expert_map": expert_map,
+                "apply_router_weight_on_input": apply_router_weight_on_input,
+                "num_expert_group": num_expert_group,
+                "topk_group": topk_group,
+                "e_score_correction_bias": e_score_correction_bias,
+                "routed_scaling_factor": routed_scaling_factor,
+            }
             calls.append((x, w13, w2, router_logits, kwargs))
             return x + 1
 
     method = types.SimpleNamespace(is_monolithic=True, moe_kernel=Kernel())
     layer = types.SimpleNamespace(
-        mxfp8_unpadded_hidden_size=3,
-        mxfp8_padded_hidden_size=4,
+        mxfp8_unpadded_hidden_size=2688,
+        mxfp8_padded_hidden_size=3072,
         w13_weight_for_apply=torch.tensor([13]),
         w2_weight_for_apply=torch.tensor([2]),
         activation="relu2",
@@ -516,19 +565,19 @@ def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(fp8_module):
         e_score_correction_bias=None,
         routed_scaling_factor=1.0,
     )
-    x = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    x = torch.arange(2 * 2688, dtype=torch.float32).reshape(2, 2688)
     router_logits = torch.ones(2, 4)
 
     output = fp8.apply_monolithic_mxfp8_moe(method, layer, x, router_logits)
 
     padded_x, w13, w2, actual_logits, _kwargs = calls[0]
-    assert tuple(padded_x.shape) == (2, 4)
-    torch.testing.assert_close(padded_x[:, :3], x)
-    assert torch.count_nonzero(padded_x[:, 3:]) == 0
+    assert tuple(padded_x.shape) == (2, 3072)
+    torch.testing.assert_close(padded_x[:, :2688], x)
+    assert torch.count_nonzero(padded_x[:, 2688:]) == 0
     assert w13 is layer.w13_weight_for_apply
     assert w2 is layer.w2_weight_for_apply
     assert actual_logits is router_logits
-    assert tuple(output.shape) == (2, 3)
+    assert tuple(output.shape) == (2, 2688)
     torch.testing.assert_close(output, x + 1)
 
 
