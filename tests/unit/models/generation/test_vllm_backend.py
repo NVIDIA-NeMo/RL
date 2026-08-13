@@ -254,6 +254,30 @@ def test_layerwise_reload_preserves_weight_load_error(monkeypatch, caplog):
 
 
 @pytest.mark.vllm
+def test_layerwise_reload_propagates_detach_error_after_successful_load(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    detach_error = RuntimeError("detach failed")
+    model = SimpleNamespace(load_weights=MagicMock())
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model)
+    ext._nrl_layerwise_reload_active = True
+    monkeypatch.setattr(
+        vllm_backend,
+        "_detach_pending_layerwise_weights",
+        MagicMock(side_effect=detach_error),
+    )
+
+    with pytest.raises(RuntimeError, match="detach failed") as exc_info:
+        ext._load_full_hf_weights([("model.weight", torch.ones(1))])
+
+    assert exc_info.value is detach_error
+    model.load_weights.assert_called_once()
+
+
+@pytest.mark.vllm
 def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
@@ -348,6 +372,31 @@ def test_quantized_model_does_not_use_unquantized_refit_lifecycle():
     )
 
     assert ext._uses_unquantized_flashinfer_trtllm() is False
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("moe_backend", "quant_config", "expected"),
+    [
+        ("FlashInfer TRTLLM", None, True),
+        ("TRITON", None, False),
+        ("FlashInfer TRTLLM", object(), False),
+    ],
+)
+def test_weight_update_errors_are_fatal_only_for_native_trtllm_refit(
+    moe_backend, quant_config, expected
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model(moe_backend),
+        vllm_config=SimpleNamespace(quant_config=quant_config),
+    )
+
+    assert ext._weight_update_errors_are_fatal() is expected
 
 
 @pytest.mark.vllm

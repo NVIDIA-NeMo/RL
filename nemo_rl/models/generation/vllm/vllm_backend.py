@@ -225,6 +225,8 @@ class VllmInternalWorkerExtension:
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
     _nrl_layerwise_reload_active: bool = False
+    # Initialization detaches parameters, so any later failure leaves this
+    # worker unsafe to reuse. Keep the original failure for the worker lifetime.
     _nrl_layerwise_reload_failure: Exception | None = None
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
@@ -237,6 +239,7 @@ class VllmInternalWorkerExtension:
     def _load_full_hf_weights(
         self, policy_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
+        """Load HF weights and detach any deferred reload tensors from transport storage."""
         if not getattr(self, "_nrl_layerwise_reload_active", False):
             self.model_runner.model.load_weights(weights=policy_weights)
             return
@@ -690,9 +693,11 @@ class VllmInternalWorkerExtension:
         return self._sparse_delta_applier
 
     def _supports_unquantized_flashinfer_trtllm_refit(self) -> bool:
+        """Whether this worker supports native unquantized TRTLLM refits."""
         return True
 
     def _uses_unquantized_flashinfer_trtllm(self) -> bool:
+        """Detect a realized unquantized FlashInfer TRTLLM MoE backend."""
         if not self._supports_unquantized_flashinfer_trtllm_refit():
             return False
         model_runner = getattr(self, "model_runner", None)
@@ -705,6 +710,7 @@ class VllmInternalWorkerExtension:
         return _model_uses_unquantized_flashinfer_trtllm(self.model_runner.model)
 
     def _validate_weight_update_compatibility(self) -> None:
+        """Reject unsupported native layerwise refit combinations."""
         if (
             self._uses_unquantized_flashinfer_trtllm()
             and self._mtp_drafter_refit_enabled()
@@ -718,7 +724,11 @@ class VllmInternalWorkerExtension:
     def _weight_update_lifecycle(
         self, transport: WeightUpdateTransport
     ) -> Iterator[WeightUpdateFinalizer]:
-        """Provide setup/finalization around a transport-owned weight update."""
+        """Provide setup/finalization around a transport-owned weight update.
+
+        Native reload initialization invalidates the old runtime layout. Any
+        subsequent exception therefore marks this worker permanently unusable.
+        """
         del transport
         if self._uses_unquantized_flashinfer_trtllm():
             self._validate_weight_update_compatibility()
@@ -1224,9 +1234,14 @@ class VllmInternalWorkerExtension:
             process_weights_after_loading,
         )
 
-        # Finalize post-load weight processing: dense Linear + attention/MLA, and
-        # crucially the per-MoE-backend w13 layout (FlashInfer CUTLASS/TRTLLM) that
-        # the canonical [gate; up] bulk write above defers to here.
+        # This direct-buffer transport intentionally does not use the native
+        # layerwise lifecycle. Its mapping is cached against live parameter
+        # storage at setup, and every refit rewrites canonical fused-weight
+        # regions before this backend-specific repack. Rebuilding parameters
+        # would invalidate that mapping.
+        #
+        # Finalize dense Linear + attention/MLA state and the per-MoE-backend
+        # w13 layout (FlashInfer CUTLASS/TRTLLM).
         with set_current_vllm_config(self.model_runner.vllm_config):
             process_weights_after_loading(
                 self.model_runner.model, self.model_config, self.device
