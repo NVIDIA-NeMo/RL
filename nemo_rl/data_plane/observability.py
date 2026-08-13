@@ -101,7 +101,10 @@ def _estimate_encoded_bytes(obj: Any, budget: list[int]) -> int:
     modelled, so treat the result as a lower bound.
 
     ``budget`` is a single-element list used as a mutable counter that bounds
-    the walk: a pathological structure costs O(max_nodes), not O(size).
+    the walk to ``max_nodes`` visited nodes. Containers stop iterating once it
+    is exhausted -- summing a generator would otherwise keep walking every
+    element while each recursive call returned 0, making the cost O(size)
+    despite the budget.
     """
     if budget[0] <= 0:
         return 0
@@ -127,15 +130,21 @@ def _estimate_encoded_bytes(obj: Any, budget: list[int]) -> int:
         return n + (2 if n < 256 else 3 if n < 65536 else 5)
     if isinstance(obj, dict):
         n = len(obj)
-        return (1 if n < 16 else 3 if n < 65536 else 5) + sum(
-            _estimate_encoded_bytes(k, budget) + _estimate_encoded_bytes(v, budget)
-            for k, v in obj.items()
-        )
+        total = 1 if n < 16 else 3 if n < 65536 else 5
+        for k, v in obj.items():
+            if budget[0] <= 0:
+                break
+            total += _estimate_encoded_bytes(k, budget)
+            total += _estimate_encoded_bytes(v, budget)
+        return total
     if isinstance(obj, (list, tuple, set)):
         n = len(obj)
-        return (1 if n < 16 else 3 if n < 65536 else 5) + sum(
-            _estimate_encoded_bytes(v, budget) for v in obj
-        )
+        total = 1 if n < 16 else 3 if n < 65536 else 5
+        for v in obj:
+            if budget[0] <= 0:
+                break
+            total += _estimate_encoded_bytes(v, budget)
+        return total
     if isinstance(obj, torch.Tensor):
         return obj.numel() * obj.element_size()
     # Unknown type -> pickle/cloudpickle Ext. Cheap proxy; the real size
@@ -143,68 +152,56 @@ def _estimate_encoded_bytes(obj: Any, budget: list[int]) -> int:
     return 64
 
 
-def _td_nontensor(td: TensorDict | None, max_nodes: int = 10_000) -> tuple[int, int, bool]:
-    """``(estimated_bytes, leaf_count, truncated)`` over non-tensor leaves.
-
-    Complements :func:`_td_bytes`, which counts only tensor leaves. TQ ships
-    non-tensors over a separate path, so without this the communication
-    volume silently omits whatever metadata rides along.
-    """
-    if td is None:
-        return 0, 0, False
-    budget = [max_nodes]
-    total = 0
-    count = 0
-    # leaves_only=True omits non-tensor entries entirely -- NonTensorData is
-    # not treated as a leaf -- so this walk must use leaves_only=False and
-    # skip the intermediate TensorDict containers itself.
-    for k in td.keys(include_nested=True, leaves_only=False):
-        v = td.get(k)
-        if isinstance(v, (torch.Tensor, TensorDict)):
-            continue
-        # Order matters: NonTensorData exposes BOTH .data and .tolist(), and
-        # .tolist() broadcasts the single stored object across the batch dim
-        # (a 64-row batch reported 20x the real payload). .data is the object
-        # as actually stored, so it wins; .tolist() is only for NonTensorStack,
-        # which genuinely holds one distinct value per batch element.
-        if hasattr(v, "data"):
-            v = v.data
-        elif hasattr(v, "tolist"):
-            v = v.tolist()
-        count += 1
-        total += _estimate_encoded_bytes(v, budget)
-    return total, count, budget[0] <= 0
-
-
-def _td_bytes(td: TensorDict | None) -> int:
+def _td_bytes(td: TensorDict | None, max_nodes: int = 10_000) -> int:
     """Payload bytes of a TensorDict, as the wire will see them.
 
-    Counts ``numel * element_size`` per tensor leaf, which equals
+    Tensor leaves count ``numel * element_size``, which equals
     ``t.contiguous().nbytes`` -- the size mooncake registers and sends
     (``mooncake_client`` calls ``.contiguous()`` before taking the pointer).
     Verified equal for contiguous, sliced, transposed and stride-0 expanded
     views, and across bf16/bool/int64/fp8.
 
-    Two deliberate limits:
+    Non-tensor leaves are estimated with :func:`_estimate_encoded_bytes`,
+    since TQ ships them over a separate msgpack path -- omitting them would
+    undercount communication volume by whatever metadata rides along. Both
+    kinds are counted in a *single* pass: a second traversal would double the
+    per-put walk of a structure that can hold hundreds of keys.
 
-    * **Non-tensor leaves are not counted.** TQ transfers them via a
-      separate non-tensor path, so communication volume is undercounted by
-      whatever metadata rides along.
-    * **Aliased storage is counted per field.** Two keys viewing one buffer
-      count twice, which is right for volume (both are serialised) and is
-      what makes ``max_bytes_per_key_seen`` able to catch view-aliasing
-      regressions.
+    ``leaves_only=True`` would hide the non-tensor entries entirely
+    (``NonTensorData`` is not treated as a leaf), so this walks with
+    ``leaves_only=False`` and skips container ``TensorDict`` nodes itself.
+
+    Aliased storage is counted per field: two keys viewing one buffer count
+    twice, which is right for volume (both are serialised) and is what lets
+    ``max_bytes_per_key_seen`` catch view-aliasing regressions.
     """
     if td is None:
         return 0
+    budget = [max_nodes]
     total = 0
-    for k in td.keys(include_nested=True, leaves_only=True):
+    for k in td.keys(include_nested=True, leaves_only=False):
         v = td.get(k)
+        if isinstance(v, TensorDict):
+            continue  # container; its leaves are visited separately
         if not isinstance(v, torch.Tensor):
+            # Order matters: NonTensorData exposes BOTH .data and .tolist(),
+            # and .tolist() broadcasts the stored object across the batch dim
+            # (a 64-row batch reported 20x the real payload). .data is the
+            # object as stored, so it wins; .tolist() is for NonTensorStack,
+            # which genuinely holds one value per batch element.
+            if hasattr(v, "data"):
+                v = v.data
+            elif hasattr(v, "tolist"):
+                v = v.tolist()
+            total += _estimate_encoded_bytes(v, budget)
             continue
-        t = v.values() if v.is_nested else v
-        total += t.numel() * t.element_size()
+        total += _td_tensor_bytes(v)
     return total
+
+
+def _td_tensor_bytes(v: torch.Tensor) -> int:
+    t = v.values() if v.is_nested else v
+    return t.numel() * t.element_size()
 
 
 def fit_latency_bandwidth(s: dict[str, Any]) -> dict[str, Any]:
@@ -219,7 +216,8 @@ def fit_latency_bandwidth(s: dict[str, Any]) -> dict[str, Any]:
     than an arbitrary split. That case is common in RL, where a step's
     payloads are often uniform -- vary batch size to break the tie.
     """
-    n, sx, sy = s["ok_calls"], float(s["n_bytes"]), s["ok_wall_ms"]
+    n = s["calls"] - s["errors"]  # successful calls; bytes/time pair only on those
+    sx, sy = float(s["n_bytes"]), s["ok_wall_ms"]
     sxx, sxy = s["sum_bytes_sq"], s["sum_bytes_ms"]
     if n < 3 or sx <= 0:
         return {"regime": "insufficient-data"}
@@ -243,7 +241,7 @@ def fit_latency_bandwidth(s: dict[str, Any]) -> dict[str, Any]:
     transfer_ms_at_mean = slope * mean_x
     # R^2: does an affine model actually fit? Low R^2 means the split below
     # is not trustworthy regardless of how clean the numbers look.
-    syy = s.get("sum_ms_sq", 0.0)
+    syy = s["sum_ms_sq"]
     ss_tot = syy - sy * sy / n
     ss_res = syy - fixed_ms * sy - slope * sxy
     r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
@@ -259,7 +257,6 @@ def fit_latency_bandwidth(s: dict[str, Any]) -> dict[str, Any]:
         # (no request costs less than zero to issue) and catches exactly the
         # misspecification R^2 misses, so both must hold.
         "model_trustworthy": r_squared >= 0.8 and fixed_ms >= 0.0,
-        "negative_intercept": fixed_ms < 0.0,
         "regime": (
             "overhead-dominated"
             if fixed_ms > transfer_ms_at_mean
@@ -296,7 +293,6 @@ class OpStats:
     # Successful calls only, so bytes and time refer to the same events.
     # These are additive, so they can be summed across ranks and refit
     # globally -- no need to ship per-event samples off each process.
-    ok_calls: int = 0
     ok_wall_ms: float = 0.0
     sum_bytes_sq: float = 0.0
     sum_bytes_ms: float = 0.0
@@ -345,6 +341,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # successful ``put_samples``; popped on successful ``clear_samples``.
         # Bounded by the live key population, not cumulative traffic.
         self._bytes_by_partition: dict[str, dict[str, int]] = {}
+        # Previous snapshot, for per-step deltas. Owned here rather than by a
+        # caller: it is this client's prior reading, and keeping it here lets
+        # every trainer use get_step_metrics() without copying the
+        # differencing and unit-conversion logic.
+        self._prev_snapshot: dict[str, Any] = {}
 
     def snapshot(self) -> dict[str, Any]:
         """Return cumulative totals plus live byte / key outstanding counts.
@@ -388,6 +389,54 @@ class MetricsDataPlaneClient(DataPlaneClient):
         out["bytes_read"] = sum(by[o]["n_bytes"] for o in _READ_OPS if o in by)
         out["comm_volume_bytes"] = out["bytes_written"] + out["bytes_read"]
         return out
+
+    def get_step_metrics(self, step_time_s: float) -> dict[str, float]:
+        """Per-step data-plane metrics, as a ready-to-log flat dict.
+
+        Cumulative counters are differenced against the previous call, so this
+        reports what the data plane cost *this* step. Mirrors
+        ``VllmGeneration.get_step_metrics`` so trainers stay one line.
+
+        ``frac_of_step`` is the metric that decides whether optimising the
+        data plane is worth anything: per-op shares only say where data-plane
+        time went, never whether it mattered against compute.
+        """
+        snap = self.snapshot()
+        prev = self._prev_snapshot
+        self._prev_snapshot = snap
+
+        wall_ms = snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
+        vol = snap["comm_volume_bytes"] - prev.get("comm_volume_bytes", 0)
+        metrics: dict[str, float] = {
+            "wall_s": wall_ms / 1e3,
+            "frac_of_step": (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0,
+            "comm_volume_gb": vol / 1e9,
+            "bytes_written_gb": (
+                snap["bytes_written"] - prev.get("bytes_written", 0)
+            ) / 1e9,
+            "bytes_read_gb": (snap["bytes_read"] - prev.get("bytes_read", 0)) / 1e9,
+            "bytes_outstanding_gb": snap["bytes_outstanding"] / 1e9,
+        }
+        prev_ops = prev.get("by_op", {})
+        for op, st in snap["by_op"].items():
+            prev_op = prev_ops.get(op, {})
+            calls = st["calls"] - prev_op.get("calls", 0)
+            if calls <= 0:
+                continue
+            op_ms = st["wall_ms"] - prev_op.get("wall_ms", 0.0)
+            metrics[f"{op}/calls"] = calls
+            metrics[f"{op}/wall_s"] = op_ms / 1e3
+            metrics[f"{op}/mean_ms"] = op_ms / calls
+            # Percentiles and the overhead/bandwidth fit are cumulative by
+            # construction (histogram buckets, regression sums) -- as-is.
+            metrics[f"{op}/p50_ms"] = st["p50_ms"]
+            metrics[f"{op}/p99_ms"] = st["p99_ms"]
+            fit = st["fit"]
+            if fit.get("model_trustworthy"):
+                metrics[f"{op}/fixed_overhead_ms"] = fit["fixed_ms"]
+                metrics[f"{op}/bandwidth_mb_s"] = fit["bandwidth_mb_s"]
+                metrics[f"{op}/overhead_frac"] = fit["overhead_frac_at_mean"]
+        return metrics
 
     def bytes_outstanding_by_partition(self) -> dict[str, int]:
         """Per-partition breakdown of currently-held bytes."""
@@ -502,7 +551,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # Time is charged for every status: a timeout is often the single
         # largest contributor, so dropping it would understate the cost.
         self._stats.total_wall_ms += wall_ms
-        bucket = self._stats.by_op.setdefault(op, OpStats())
+        bucket = self._stats.by_op.get(op)
+        if bucket is None:
+            # Not setdefault(): its default is evaluated eagerly, building a
+            # throwaway OpStats (and its 16-bucket histogram) on every op.
+            bucket = self._stats.by_op[op] = OpStats()
         bucket.calls += 1
         bucket.wall_ms += wall_ms
         bucket.latency_hist[bisect_left(LATENCY_BUCKETS_MS, wall_ms)] += 1
@@ -514,7 +567,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
             self._stats.total_ops += 1
             bucket.n_bytes += n_bytes
             bucket.n_keys += n_keys
-            bucket.ok_calls += 1
             bucket.ok_wall_ms += wall_ms
             bucket.sum_bytes_sq += float(n_bytes) * float(n_bytes)
             bucket.sum_bytes_ms += float(n_bytes) * wall_ms

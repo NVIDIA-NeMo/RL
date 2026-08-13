@@ -74,6 +74,7 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -377,68 +378,24 @@ def _compute_seq_logprob_error_metrics(
     return masking_data["sample_mask"], seq_logprob_error_metrics
 
 
-# Previous data-plane snapshot, for per-step deltas. Module-level because
-# grpo_train_sync is a function, not a class, and one training loop runs per
-# driver process.
-_DP_PREV_SNAPSHOT: dict[str, Any] | None = None
-
-
 def _log_data_plane_metrics(
     policy: Any, logger: Logger, step: int, total_step_time: float
 ) -> None:
-    """Log this step's data-plane cost. No-op unless observability is on.
+    """Log this step's data-plane cost. No-op unless observability is enabled.
 
-    Only the driver's own client is visible here: each process builds its own
-    (``tq_policy`` bootstraps one, rollout actors and policy workers build
-    their own), so counters accumulate per process and this covers the
-    trainer's reads, not cluster-wide traffic.
+    Delta arithmetic, unit conversion and the per-op namespace live on
+    ``MetricsDataPlaneClient.get_step_metrics`` -- the same split as
+    ``VllmGeneration.get_step_metrics`` -- so the async trainer can log the
+    same metrics with one call against its own client.
 
-    Cumulative counters are differenced into per-step values. ``frac_of_step``
-    is the number that says whether the data plane is worth optimising at all
-    -- per-op shares only say where data-plane time went, not whether it
-    mattered against compute.
+    Only the driver's client is visible here: clients are built per process
+    (``tq_policy`` bootstraps one; rollout actors and policy workers build
+    their own), so this covers the trainer's reads, not cluster-wide traffic.
     """
-    global _DP_PREV_SNAPSHOT
     client = getattr(policy, "dp_client", None)
-    snap_fn = getattr(client, "snapshot", None)
-    if snap_fn is None:  # observability disabled -> plain adapter, no snapshot
-        return
-    snap = snap_fn()
-    prev = _DP_PREV_SNAPSHOT
-    _DP_PREV_SNAPSHOT = snap
-
-    wall_ms = snap.get("total_wall_ms", 0.0) - (
-        prev.get("total_wall_ms", 0.0) if prev else 0.0
-    )
-    vol = snap.get("comm_volume_bytes", 0) - (
-        prev.get("comm_volume_bytes", 0) if prev else 0
-    )
-    metrics: dict[str, float] = {
-        "wall_s": wall_ms / 1e3,
-        "frac_of_step": (wall_ms / 1e3 / total_step_time)
-        if total_step_time > 0
-        else 0.0,
-        "comm_volume_gb": vol / 1e9,
-        "bytes_outstanding_gb": snap.get("bytes_outstanding", 0) / 1e9,
-    }
-    for op, s in snap.get("by_op", {}).items():
-        prev_op = (prev or {}).get("by_op", {}).get(op, {})
-        calls = s["calls"] - prev_op.get("calls", 0)
-        if calls <= 0:
-            continue
-        op_ms = s["wall_ms"] - prev_op.get("wall_ms", 0.0)
-        metrics[f"{op}/calls"] = calls
-        metrics[f"{op}/wall_s"] = op_ms / 1e3
-        metrics[f"{op}/mean_ms"] = op_ms / calls
-        # Percentiles and the overhead/bandwidth fit are cumulative by
-        # construction (histogram buckets, regression sums) -- reported as-is.
-        metrics[f"{op}/p50_ms"] = s.get("p50_ms", 0.0)
-        metrics[f"{op}/p99_ms"] = s.get("p99_ms", 0.0)
-        fit = s.get("fit") or {}
-        if fit.get("model_trustworthy"):
-            metrics[f"{op}/fixed_overhead_ms"] = fit["fixed_ms"]
-            metrics[f"{op}/bandwidth_mb_s"] = fit["bandwidth_mb_s"]
-            metrics[f"{op}/overhead_frac"] = fit["overhead_frac_at_mean"]
+    if not isinstance(client, MetricsDataPlaneClient):
+        return  # observability disabled -> plain adapter
+    metrics = client.get_step_metrics(total_step_time)
     logger.log_metrics(metrics, step, prefix="data_plane")
     print(
         f"  • data plane: {metrics['wall_s']:.2f}s "
