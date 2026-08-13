@@ -154,8 +154,7 @@ def apply_te_gemm_cublas_pinned_patch(
             pass
     print(
         f"[zero_train_gen_mismatch] shrunk TE cuBLAS workspace to {target_bytes} bytes "
-        "(te_gemm_cublas_pinned via patches.py). "
-        "Set CUBLASLT_LOG_LEVEL=5 to verify cuBLASLt picks a stable algo across batch sizes."
+        "(te_gemm_cublas_pinned via patches.py)."
     )
 
 
