@@ -2336,6 +2336,7 @@ def async_ppo_train(
     )
 
     def _raise_if_collector_stopped(waiting_for: str) -> None:
+        ray.get(trajectory_collector.check_health.remote())
         status = ray.get(trajectory_collector.get_status.remote())
         if status["errored"]:
             raise RuntimeError(
