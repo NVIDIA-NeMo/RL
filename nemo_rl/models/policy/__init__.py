@@ -442,6 +442,15 @@ class MegatronConfig(TypedDict):
     # sequence lengths (rope cache) or for MoE models with activation recompute
     # (dispatcher reference cycles).
     clear_memory_caches_before_refit: NotRequired[bool]
+    # VALIDATION SWITCH, NOT A TUNABLE. When True, restore the pre-fix behaviour
+    # of the streaming SingleController train path: fire mcore's
+    # finalize_model_grads once per streaming chunk instead of once per optimizer
+    # step, and offload the grad buffers between chunks (which frees them, so
+    # every chunk but the last is discarded). Exists so a control arm can
+    # reproduce the defect on the same commit as the fixed arm instead of on a
+    # separate tree that has to be trusted to match. Absent or False means the
+    # correct once-per-step behaviour. Remove once the fix is validated.
+    reproduce_per_chunk_grad_bug: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
 

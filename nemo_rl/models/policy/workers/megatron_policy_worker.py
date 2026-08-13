@@ -1167,18 +1167,12 @@ class MegatronPolicyWorkerImpl(
         return state
 
     def _stream_grad_fix_enabled(self) -> bool:
-        """Whether the once-per-step gradient finalization is active.
+        """Whether gradients are finalized once per step rather than per chunk.
 
-        VALIDATION SWITCH, NOT A TUNABLE. Setting ``NRL_SC_STREAM_GRAD_FIX=0``
-        restores the pre-fix behaviour — a full ``finalize_model_grads`` per
-        streaming chunk, and grad buffers offloaded (which frees them) between
-        chunks — so that a control arm can reproduce the defect on exactly the
-        same code as the fixed arm, rather than on a different commit whose tree
-        has to be trusted to match. It exists to make the A/B interpretable and
-        should be deleted once the fix is validated; nothing in a real run should
-        ever set it.
+        False only when the recipe explicitly opts into reproducing the defect;
+        see ``reproduce_per_chunk_grad_bug`` in ``MegatronConfig``.
         """
-        return os.environ.get("NRL_SC_STREAM_GRAD_FIX", "1") != "0"
+        return not self.cfg["megatron_cfg"].get("reproduce_per_chunk_grad_bug")
 
     def _current_rank(self) -> int:
         """This rank's global id, or 0 before the process group is built."""
