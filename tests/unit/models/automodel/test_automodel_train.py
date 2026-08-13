@@ -64,6 +64,7 @@ def mock_tokenizer():
 @pytest.fixture
 def mock_model():
     model = MagicMock()
+    model._nemo_shared_prefix_custom_qwen3_moe = False
     model.return_value = MagicMock(logits=torch.randn(4, 64, 32000))
     return model
 
@@ -198,6 +199,28 @@ class TestModelForward:
         call_kwargs = mock_model.call_args.kwargs
         assert call_kwargs["shared_prefix_layout"] is layout
         assert torch.equal(call_kwargs["logits_to_keep"], layout.predictor_indices)
+
+    def test_native_qwen3_moe_forward_omits_hf_logits_to_keep(self, mock_model):
+        input_ids = torch.tensor([[1, 2, 3], [1, 2, 4]])
+        layout = build_shared_prefix_layout(
+            input_ids,
+            input_lengths=torch.tensor([3, 3]),
+            prompt_lengths=torch.tensor([2, 2]),
+            group_ids=torch.tensor([0, 0]),
+        )
+        processed_inputs = ProcessedInputs(
+            input_ids=layout.compact_input_ids,
+            position_ids=layout.compact_position_ids,
+            seq_len=layout.compact_tokens,
+            shared_prefix_layout=layout,
+        )
+        mock_model._nemo_shared_prefix_custom_qwen3_moe = True
+
+        model_forward(mock_model, processed_inputs)
+
+        call_kwargs = mock_model.call_args.kwargs
+        assert call_kwargs["shared_prefix_layout"] is layout
+        assert "logits_to_keep" not in call_kwargs
 
     def test_forward_with_multimodal(self, mock_model, processed_inputs_multimodal):
         result = model_forward(mock_model, processed_inputs_multimodal)

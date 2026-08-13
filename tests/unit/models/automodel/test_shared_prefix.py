@@ -14,7 +14,7 @@
 
 import copy
 import math
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -117,6 +117,23 @@ def test_build_shared_prefix_layout_exact_mapping():
     assert layout.compact_position_ids.tolist() == [
         [0, 1, 2, 3, 4, 3, 0, 1, 2, 3, 4, 2, 3]
     ]
+    assert layout.logical_token_weights.tolist() == [
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        2,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+    ]
+    assert layout.logical_token_weights.dtype == torch.long
+    assert layout.logical_token_weights.sum() == 18
     assert layout.prompt_token_indices.tolist() == [0, 1, 2, 6, 7]
     assert layout.response_token_indices.tolist() == [3, 4, 5, 8, 9, 10, 11, 12]
     assert layout.prompt_cu_seqlens.tolist() == [0, 3, 5]
@@ -126,6 +143,661 @@ def test_build_shared_prefix_layout_exact_mapping():
     assert layout.response_target_ids.tolist() == [21, 22, 31, 51, 52, 53, 61, 62]
     assert layout.loss_logprob_scatter_indices.tolist() == [2, 3, 10, 5, 6, 7, 13, 14]
     assert layout.compact_tokens == 13
+
+
+def test_shared_prefix_moe_router_matches_logical_dense_tokens():
+    pytest.importorskip("nemo_automodel")
+    from nemo_automodel.components.moe.config import MoEConfig
+    from nemo_automodel.components.moe.layers import Gate
+    from nemo_automodel.components.moe.megatron.moe_utils import (
+        MoEAuxLossAutoScaler,
+    )
+
+    from nemo_rl.models.automodel.shared_prefix_moe import (
+        _logical_router_forward,
+        shared_prefix_moe_context,
+    )
+
+    layout = build_shared_prefix_layout(*_interleaved_rollouts())
+    compact_x = (
+        torch.linspace(
+            -1.0,
+            1.0,
+            layout.compact_tokens * 3,
+            dtype=torch.float32,
+        )
+        .reshape(layout.compact_tokens, 3)
+        .requires_grad_()
+    )
+    dense_gather = torch.tensor(
+        [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 0, 1, 2, 5, 6, 7, 11, 12]
+    )
+    dense_x = compact_x.detach()[dense_gather].requires_grad_()
+
+    config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.03125,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=3,
+        inter_dim=8,
+        moe_inter_dim=8,
+        norm_topk_prob=False,
+        softmax_before_topk=True,
+        dtype=torch.float32,
+    )
+    dense_gate = Gate(config, gate_precision=torch.float32).train()
+    with torch.no_grad():
+        dense_gate.weight.copy_(
+            torch.tensor(
+                [
+                    [0.50, -0.20, 0.10],
+                    [-0.40, 0.30, 0.20],
+                    [0.20, 0.60, -0.50],
+                    [-0.10, -0.40, 0.70],
+                ]
+            )
+        )
+    compact_gate = copy.deepcopy(dense_gate)
+    dense_gate._track_load_balance = True
+    compact_gate._track_load_balance = True
+    compact_gate._nemo_shared_prefix_original_forward = compact_gate.forward
+    compact_gate.forward = MethodType(_logical_router_forward, compact_gate)
+
+    dense_weights, dense_indices, dense_aux_loss = dense_gate(
+        dense_x,
+        torch.ones(dense_x.shape[0], dtype=torch.bool),
+        None,
+    )
+    with shared_prefix_moe_context(compact_gate, layout, valid=True) as execution:
+        compact_weights, compact_indices, compact_aux_loss = compact_gate(
+            compact_x,
+            torch.ones(compact_x.shape[0], dtype=torch.bool),
+            None,
+        )
+        execution.commit()
+
+    assert torch.equal(compact_indices[dense_gather], dense_indices)
+    torch.testing.assert_close(compact_weights[dense_gather], dense_weights)
+    torch.testing.assert_close(compact_aux_loss, dense_aux_loss)
+    assert torch.equal(compact_gate._last_expert_load, dense_gate._last_expert_load)
+    # A non-unit scale catches aux-loss adapters that silently drop the main
+    # loss normalization used by AutoModel's forward/backward driver.
+    with patch.object(
+        MoEAuxLossAutoScaler,
+        "main_loss_backward_scale",
+        torch.tensor(0.375),
+    ):
+        dense_weights.sum().backward()
+        compact_weights[dense_gather].sum().backward()
+    torch.testing.assert_close(compact_gate.weight.grad, dense_gate.weight.grad)
+    expected_compact_input_grad = torch.zeros_like(compact_x)
+    expected_compact_input_grad.index_add_(0, dense_gather, dense_x.grad)
+    torch.testing.assert_close(compact_x.grad, expected_compact_input_grad)
+
+
+def test_shared_prefix_moe_context_is_module_scoped_and_restored():
+    pytest.importorskip("nemo_automodel")
+    from nemo_automodel.components.moe.config import MoEConfig
+    from nemo_automodel.components.moe.layers import Gate
+
+    from nemo_rl.models.automodel import shared_prefix_moe
+
+    config = MoEConfig(
+        n_routed_experts=2,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=2,
+        inter_dim=4,
+        moe_inter_dim=4,
+        norm_topk_prob=False,
+        softmax_before_topk=True,
+        dtype=torch.float32,
+    )
+    gate = Gate(config, gate_precision=torch.float32)
+    model = torch.nn.Sequential(gate)
+    outer_layout = SimpleNamespace(logical_token_weights=torch.tensor([2, 1]))
+    inner_layout = SimpleNamespace(logical_token_weights=torch.tensor([3, 4]))
+    attribute = shared_prefix_moe._ROUTER_EXECUTION_ATTR
+
+    assert not hasattr(gate, attribute)
+    with shared_prefix_moe.shared_prefix_moe_context(
+        model, outer_layout, valid=True
+    ) as outer_execution:
+        assert getattr(gate, attribute) is outer_execution
+        with shared_prefix_moe.shared_prefix_moe_context(
+            model, inner_layout, valid=False
+        ) as inner_execution:
+            assert getattr(gate, attribute) is inner_execution
+        assert getattr(gate, attribute) is outer_execution
+    assert not hasattr(gate, attribute)
+
+
+def test_logical_aux_autoscaler_uses_no_saved_tensors_and_preserves_gradient():
+    pytest.importorskip("nemo_automodel")
+    from nemo_automodel.components.moe.megatron.moe_utils import (
+        MoEAuxLossAutoScaler,
+    )
+
+    from nemo_rl.models.automodel.shared_prefix_moe import (
+        _LogicalAuxLossAutoScaler,
+    )
+
+    output = torch.tensor([1.0, -2.0], requires_grad=True)
+    aux_loss = torch.tensor(0.75, dtype=torch.float64, requires_grad=True)
+    saved_tensors = []
+
+    def pack(tensor):
+        saved_tensors.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        attached = _LogicalAuxLossAutoScaler.apply(output, aux_loss)
+
+    assert saved_tensors == []
+    with patch.object(
+        MoEAuxLossAutoScaler,
+        "main_loss_backward_scale",
+        torch.tensor(0.375),
+    ):
+        attached.sum().backward()
+
+    torch.testing.assert_close(output.grad, torch.ones_like(output))
+    torch.testing.assert_close(aux_loss.grad, torch.tensor(0.375, dtype=torch.float64))
+
+
+def test_router_execution_replay_does_not_double_commit_statistics():
+    from nemo_rl.models.automodel import shared_prefix_moe
+
+    gate = torch.nn.Module()
+    execution = shared_prefix_moe._RouterExecution(
+        logical_token_weights=torch.ones(2, dtype=torch.long),
+        valid=True,
+    )
+    first_load = torch.tensor([3.0, 1.0], requires_grad=True)
+    first_aux = torch.tensor(0.25, requires_grad=True)
+
+    with patch.object(
+        shared_prefix_moe,
+        "_detach_optional",
+        wraps=shared_prefix_moe._detach_optional,
+    ) as detach_optional:
+        execution.record(gate, first_load, first_aux)
+        execution.commit()
+
+        committed_load = gate._nemo_shared_prefix_logical_expert_load.clone()
+        committed_aux = gate._nemo_shared_prefix_aux_loss_sum.clone()
+        assert gate._nemo_shared_prefix_aux_loss_count == 1
+
+        # Model activation checkpointing replays Gate.forward after commit.
+        # Snapshot construction and the pending write stay isomorphic to the
+        # original forward, while commit remains one-shot.
+        replay_load = torch.tensor([1.0, 3.0], requires_grad=True)
+        replay_aux = torch.tensor(0.75, requires_grad=True)
+        execution.record(gate, replay_load, replay_aux)
+        assert detach_optional.call_count == 2
+        assert gate in execution.pending
+        assert execution.pending[gate][0].grad_fn is None
+        assert execution.pending[gate][1].grad_fn is None
+
+        execution.commit()
+
+    assert execution.pending == {}
+    torch.testing.assert_close(
+        gate._nemo_shared_prefix_logical_expert_load, committed_load
+    )
+    torch.testing.assert_close(gate._nemo_shared_prefix_aux_loss_sum, committed_aux)
+    assert gate._nemo_shared_prefix_aux_loss_count == 1
+
+
+@pytest.mark.parametrize(
+    ("n_experts", "world_size", "expected_ids"),
+    [
+        (7, 2, ((0, 1, 2, 3), (4, 5, 6))),
+        (7, 4, ((0, 1), (2, 3), (4, 5), (6,))),
+        (3, 4, ((0,), (1,), (2,), ())),
+    ],
+)
+def test_torch_chunk_expert_ownership(
+    n_experts: int,
+    world_size: int,
+    expected_ids: tuple[tuple[int, ...], ...],
+) -> None:
+    from nemo_rl.models.automodel.shared_prefix_moe import (
+        _torch_chunk_shard_size_and_offset,
+    )
+
+    actual_ids = []
+    for rank in range(world_size):
+        local_count, start = _torch_chunk_shard_size_and_offset(
+            n_experts, world_size, rank
+        )
+        actual_ids.append(tuple(range(start, start + local_count)))
+
+    assert tuple(actual_ids) == expected_ids
+
+
+def test_qwen3_moe_ep_router_gradient_backport_is_idempotent():
+    pytest.importorskip("nemo_automodel")
+    from nemo_automodel.components.moe.experts import GroupedExperts
+
+    from nemo_rl.models.automodel.shared_prefix_moe import (
+        enable_qwen3_moe_ep_router_gradients,
+    )
+
+    original_forward = GroupedExperts.forward
+    try:
+        enable_qwen3_moe_ep_router_gradients()
+        patched_forward = GroupedExperts.forward
+        assert patched_forward is not original_forward
+        assert patched_forward._nemo_ep_router_gradients is True
+        enable_qwen3_moe_ep_router_gradients()
+        assert GroupedExperts.forward is patched_forward
+    finally:
+        GroupedExperts.forward = original_forward
+
+
+def test_qwen3_moe_ep_router_gradient_backport_fails_closed():
+    pytest.importorskip("nemo_automodel")
+    from nemo_automodel.components.moe.experts import GroupedExperts
+
+    from nemo_rl.models.automodel.shared_prefix_moe import (
+        enable_qwen3_moe_ep_router_gradients,
+    )
+
+    original_forward = GroupedExperts.forward
+    with (
+        patch(
+            "nemo_rl.models.automodel.shared_prefix_moe.inspect.getsource",
+            return_value="def forward(self):\n    return None\n",
+        ),
+        pytest.raises(RuntimeError, match="detached EP routing-weight gather"),
+    ):
+        enable_qwen3_moe_ep_router_gradients()
+
+    assert GroupedExperts.forward is original_forward
+
+
+def test_qwen3_moe_checkpoint_wrapper_compatibility_preserves_wrapper_call():
+    pytest.importorskip("nemo_automodel")
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.qwen3_moe.model import Block
+    from nemo_automodel.components.moe.config import MoEConfig
+    from nemo_automodel.components.moe.layers import MLP, MoE
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+    )
+
+    from nemo_rl.models.automodel.shared_prefix_moe import (
+        enable_qwen3_moe_checkpoint_wrapper_compatibility,
+    )
+
+    config = MoEConfig(
+        n_routed_experts=2,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=4,
+        inter_dim=8,
+        moe_inter_dim=6,
+        norm_topk_prob=False,
+        softmax_before_topk=True,
+        dtype=torch.float32,
+    )
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
+    original = Block._mlp
+    try:
+        enable_qwen3_moe_checkpoint_wrapper_compatibility()
+        patched = Block._mlp
+        enable_qwen3_moe_checkpoint_wrapper_compatibility()
+        assert Block._mlp is patched
+
+        block = object.__new__(Block)
+        torch.nn.Module.__init__(block)
+        dense = MLP(4, 8, "torch", dtype=torch.float32)
+        block.mlp = checkpoint_wrapper(dense)
+        dense_input = torch.randn(2, 3, 4)
+        torch.testing.assert_close(
+            block._mlp(dense_input, None),
+            dense(dense_input),
+        )
+
+        moe = MoE(config, backend)
+        block.mlp = checkpoint_wrapper(moe)
+        moe_input = torch.randn(2, 3, 4)
+        padding_mask = torch.zeros(2, 3, dtype=torch.bool)
+        torch.testing.assert_close(
+            block._mlp(moe_input, padding_mask),
+            moe(moe_input, padding_mask),
+        )
+    finally:
+        Block._mlp = original
+
+
+def test_qwen3_moe_checkpoint_wrapper_compatibility_fails_closed():
+    pytest.importorskip("nemo_automodel")
+    from nemo_automodel.components.models.qwen3_moe.model import Block
+
+    from nemo_rl.models.automodel.shared_prefix_moe import (
+        enable_qwen3_moe_checkpoint_wrapper_compatibility,
+    )
+
+    original = Block._mlp
+    with (
+        patch(
+            "nemo_rl.models.automodel.shared_prefix_moe.inspect.getsource",
+            return_value="def _mlp(self, x, padding_mask):\n    return x\n",
+        ),
+        pytest.raises(RuntimeError, match="checkpoint-wrapper source"),
+    ):
+        enable_qwen3_moe_checkpoint_wrapper_compatibility()
+
+    assert Block._mlp is original
+
+
+def _qwen3_moe_dtype_backport_methods():
+    from nemo_automodel.components.models.qwen3_moe.layers import (
+        Qwen3MoeAttention,
+    )
+    from nemo_automodel.components.models.qwen3_moe.model import (
+        Block,
+        Qwen3MoeForCausalLM,
+        Qwen3MoeModel,
+    )
+
+    return (
+        (Qwen3MoeAttention, "__init__"),
+        (Block, "__init__"),
+        (Qwen3MoeModel, "__init__"),
+        (Qwen3MoeForCausalLM, "__init__"),
+        (Qwen3MoeForCausalLM, "initialize_weights"),
+    )
+
+
+def test_qwen3_moe_configured_dtype_backport_constructs_fp32_on_cpu():
+    pytest.importorskip("nemo_automodel")
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.qwen3_moe.model import (
+        Qwen3MoeForCausalLM,
+    )
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import (
+        Qwen3MoeConfig,
+    )
+
+    from nemo_rl.models.automodel.shared_prefix_moe import (
+        enable_qwen3_moe_configured_dtype,
+    )
+
+    targets = _qwen3_moe_dtype_backport_methods()
+    originals = tuple(getattr(owner, name) for owner, name in targets)
+    try:
+        enable_qwen3_moe_configured_dtype()
+        config = Qwen3MoeConfig(
+            vocab_size=64,
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            num_hidden_layers=2,
+            intermediate_size=32,
+            moe_intermediate_size=16,
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            mlp_only_layers=[0],
+            max_position_embeddings=32,
+            rms_norm_eps=1e-6,
+            rope_theta=5000.0,
+            router_aux_loss_coef=0.01,
+            use_sliding_window=False,
+        )
+        config.torch_dtype = torch.float32
+        backend = BackendConfig(
+            linear="torch",
+            attn="sdpa",
+            rms_norm="torch",
+            experts="torch",
+            dispatcher="torch",
+            fake_balanced_gate=False,
+            enable_hf_state_dict_adapter=False,
+        )
+
+        # The pinned model only stores this device in its RoPE helper during
+        # construction; avoid CUDA initialization so this remains a CPU test.
+        with patch.object(torch.cuda, "current_device", return_value=0):
+            model = Qwen3MoeForCausalLM(config, backend=backend)
+        assert model.model.moe_config.dtype == torch.float32
+        assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+
+        model.initialize_weights(buffer_device=torch.device("cpu"))
+        assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+    finally:
+        for (owner, name), original in zip(targets, originals):
+            setattr(owner, name, original)
+
+
+def test_qwen3_moe_configured_dtype_backport_is_idempotent():
+    pytest.importorskip("nemo_automodel")
+    from nemo_rl.models.automodel.shared_prefix_moe import (
+        enable_qwen3_moe_configured_dtype,
+    )
+
+    targets = _qwen3_moe_dtype_backport_methods()
+    originals = tuple(getattr(owner, name) for owner, name in targets)
+    try:
+        enable_qwen3_moe_configured_dtype()
+        patched = tuple(getattr(owner, name) for owner, name in targets)
+        assert patched != originals
+        assert all(
+            "__class__" not in method.__code__.co_freevars for method in patched[:4]
+        )
+        assert all(
+            method._nemo_qwen3_moe_configured_dtype is True for method in patched
+        )
+
+        enable_qwen3_moe_configured_dtype()
+        assert tuple(getattr(owner, name) for owner, name in targets) == patched
+    finally:
+        for (owner, name), original in zip(targets, originals):
+            setattr(owner, name, original)
+
+
+def test_qwen3_moe_configured_dtype_backport_fails_without_partial_mutation():
+    pytest.importorskip("nemo_automodel")
+    from nemo_rl.models.automodel import shared_prefix_moe
+
+    targets = _qwen3_moe_dtype_backport_methods()
+    originals = tuple(getattr(owner, name) for owner, name in targets)
+    real_getsource = shared_prefix_moe.inspect.getsource
+
+    def mismatched_third_method(method):
+        if method is originals[2]:
+            return "def __init__(self):\n    pass\n"
+        return real_getsource(method)
+
+    try:
+        with (
+            patch.object(
+                shared_prefix_moe.inspect,
+                "getsource",
+                side_effect=mismatched_third_method,
+            ),
+            pytest.raises(RuntimeError, match="no longer matches"),
+        ):
+            shared_prefix_moe.enable_qwen3_moe_configured_dtype()
+
+        assert tuple(getattr(owner, name) for owner, name in targets) == originals
+    finally:
+        for (owner, name), original in zip(targets, originals):
+            setattr(owner, name, original)
+
+
+def test_shared_prefix_moe_bf16_fp32_gate_aux_matches_expanded_tokens():
+    pytest.importorskip("nemo_automodel")
+    from nemo_automodel.components.moe.config import MoEConfig
+    from nemo_automodel.components.moe.layers import Gate
+    from nemo_automodel.components.moe.megatron.moe_utils import (
+        MoEAuxLossAutoScaler,
+    )
+
+    from nemo_rl.models.automodel.shared_prefix_moe import (
+        _logical_router_forward,
+        shared_prefix_moe_context,
+    )
+
+    # The logical total (515) is not exactly representable in BF16. This catches
+    # implementations that accidentally cast load/count normalization to the
+    # router-probability dtype instead of preserving the dense FP32 semantics.
+    multiplicity = torch.tensor([129, 128, 127, 66, 65], dtype=torch.long)
+    compact_x = torch.tensor(
+        [
+            [0.25, -0.50, 0.75],
+            [-0.80, 0.20, 0.45],
+            [0.60, 0.15, -0.35],
+            [-0.10, 0.90, 0.30],
+            [0.55, -0.25, -0.65],
+        ],
+        dtype=torch.bfloat16,
+    )
+    dense_x = compact_x.repeat_interleave(multiplicity, dim=0)
+    config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.125,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=3,
+        inter_dim=8,
+        moe_inter_dim=8,
+        norm_topk_prob=False,
+        softmax_before_topk=True,
+        dtype=torch.bfloat16,
+    )
+    dense_gate = Gate(config, gate_precision=torch.float32).train()
+    with torch.no_grad():
+        dense_gate.weight.copy_(
+            torch.tensor(
+                [
+                    [0.50, -0.20, 0.10],
+                    [-0.40, 0.30, 0.20],
+                    [0.20, 0.60, -0.50],
+                    [-0.10, -0.40, 0.70],
+                ],
+                dtype=torch.bfloat16,
+            )
+        )
+    compact_gate = copy.deepcopy(dense_gate)
+    compact_gate._nemo_shared_prefix_original_forward = compact_gate.forward
+    compact_gate.forward = MethodType(_logical_router_forward, compact_gate)
+    token_mask = torch.ones(compact_x.shape[0], dtype=torch.bool)
+    dense_mask = torch.ones(dense_x.shape[0], dtype=torch.bool)
+    layout = SimpleNamespace(logical_token_weights=multiplicity)
+
+    dense_weights, dense_indices, dense_aux = dense_gate(dense_x, dense_mask, None)
+    with shared_prefix_moe_context(compact_gate, layout, valid=True) as execution:
+        compact_weights, compact_indices, compact_aux = compact_gate(
+            compact_x, token_mask, None
+        )
+        execution.commit()
+
+    assert torch.equal(
+        compact_indices.repeat_interleave(multiplicity, dim=0), dense_indices
+    )
+    torch.testing.assert_close(
+        compact_weights.repeat_interleave(multiplicity, dim=0), dense_weights
+    )
+    torch.testing.assert_close(compact_aux, dense_aux, rtol=3e-3, atol=3e-4)
+    with patch.object(
+        MoEAuxLossAutoScaler,
+        "main_loss_backward_scale",
+        torch.tensor(1.0),
+    ):
+        (dense_weights.sum() * 0.0).backward()
+        (compact_weights.sum() * 0.0).backward()
+    torch.testing.assert_close(
+        compact_gate.weight.grad,
+        dense_gate.weight.grad,
+        rtol=2e-2,
+        atol=2e-3,
+    )
+
+
+def test_shared_prefix_moe_single_expert_statistics_are_finite():
+    pytest.importorskip("nemo_automodel")
+    from nemo_automodel.components.moe.config import MoEConfig
+    from nemo_automodel.components.moe.layers import Gate
+
+    from nemo_rl.models.automodel.shared_prefix_moe import (
+        collect_shared_prefix_moe_statistics,
+    )
+
+    config = MoEConfig(
+        n_routed_experts=1,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=2,
+        inter_dim=4,
+        moe_inter_dim=4,
+        norm_topk_prob=False,
+        softmax_before_topk=True,
+        dtype=torch.float32,
+    )
+    gate = Gate(config, gate_precision=torch.float32)
+    gate._nemo_shared_prefix_logical_expert_load = torch.tensor([7])
+    stats_model = torch.nn.Module()
+    stats_model.add_module("gate", gate)
+    stats_model._nemo_shared_prefix_custom_qwen3_moe = True
+
+    with patch("torch.distributed.all_reduce"):
+        stats = collect_shared_prefix_moe_statistics(stats_model, None)
+
+    assert math.isfinite(stats["logical_load_cv_mean"])
+    assert stats["logical_load_cv_mean"] == 0.0
+    assert stats["logical_expert_utilization_min"] == 1.0
+    assert stats["logical_expert_utilization_max"] == 1.0
+    assert stats["logical_dead_expert_fraction_mean"] == 0.0
+    assert stats["logical_expert_diversity_mean"] == 1.0
+    assert stats["logical_token_layer_events"] == 7.0
+    assert all(math.isfinite(value) for value in stats.values())
 
 
 def test_build_shared_prefix_layout_rejects_false_groups():
@@ -406,7 +1078,7 @@ def test_split_attention_matches_logical_dense_attention_and_gradients():
 
 @pytest.mark.automodel
 @pytest.mark.parametrize("activation_checkpointing", [False, True])
-@pytest.mark.parametrize("model_family", ["qwen3", "llama"])
+@pytest.mark.parametrize("model_family", ["qwen3", "llama", "qwen3_moe"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
 def test_tiny_causal_lm_fa2_logits_and_gradients_match_dense(
     activation_checkpointing,
@@ -417,12 +1089,15 @@ def test_tiny_causal_lm_fa2_logits_and_gradients_match_dense(
     if model_family == "qwen3":
         from transformers import Qwen3Config as ModelConfig
         from transformers import Qwen3ForCausalLM as ModelForCausalLM
-    else:
+    elif model_family == "llama":
         from transformers import LlamaConfig as ModelConfig
         from transformers import LlamaForCausalLM as ModelForCausalLM
+    else:
+        from transformers import Qwen3MoeConfig as ModelConfig
+        from transformers import Qwen3MoeForCausalLM as ModelForCausalLM
 
     register_shared_prefix_attention()
-    dense_config = ModelConfig(
+    config_kwargs = dict(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
@@ -437,6 +1112,18 @@ def test_tiny_causal_lm_fa2_logits_and_gradients_match_dense(
         eos_token_id=1,
         use_cache=False,
     )
+    if model_family == "qwen3_moe":
+        config_kwargs.update(
+            moe_intermediate_size=64,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            num_experts=2,
+            num_experts_per_tok=2,
+            norm_topk_prob=False,
+            use_sliding_window=False,
+            output_router_logits=False,
+        )
+    dense_config = ModelConfig(**config_kwargs)
     dense_config._attn_implementation = "flash_attention_2"
     shared_config = copy.deepcopy(dense_config)
     shared_config._attn_implementation = SHARED_PREFIX_ATTENTION
@@ -512,6 +1199,7 @@ def test_tiny_causal_lm_fa2_logits_and_gradients_match_dense(
     shared_loss.backward()
 
     torch.testing.assert_close(shared_loss, dense_loss, atol=5e-2, rtol=2e-3)
+    moe_gradients: dict[str, torch.Tensor] = {}
     for (dense_name, dense_parameter), (shared_name, shared_parameter) in zip(
         dense_model.named_parameters(),
         shared_model.named_parameters(),
@@ -525,6 +1213,16 @@ def test_tiny_causal_lm_fa2_logits_and_gradients_match_dense(
             atol=7e-2,
             rtol=7e-2,
             msg=lambda message, name=dense_name: f"{name}: {message}",
+        )
+        if ".mlp.gate.weight" in dense_name or ".mlp.experts." in dense_name:
+            moe_gradients[dense_name] = shared_parameter.grad
+
+    if model_family == "qwen3_moe":
+        assert any(".mlp.gate.weight" in name for name in moe_gradients)
+        assert any(".mlp.experts.gate_up_proj" in name for name in moe_gradients)
+        assert any(".mlp.experts.down_proj" in name for name in moe_gradients)
+        assert all(
+            gradient.abs().sum().item() > 0 for gradient in moe_gradients.values()
         )
 
     dense_optimizer = torch.optim.AdamW(dense_model.parameters(), lr=1e-4)

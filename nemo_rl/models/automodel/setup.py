@@ -16,6 +16,8 @@
 
 import importlib
 import inspect
+import math
+import numbers
 import os
 from functools import partial
 from typing import Any, Optional, Union
@@ -56,6 +58,7 @@ from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
+from nemo_automodel.shared.utils import dtype_from_str
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from transformers import (
     AutoConfig,
@@ -78,6 +81,13 @@ from nemo_rl.models.automodel.shared_prefix import (
     SHARED_PREFIX_ATTENTION,
     register_shared_prefix_attention,
 )
+from nemo_rl.models.automodel.shared_prefix_moe import (
+    enable_custom_qwen3_moe_shared_prefix,
+    enable_qwen3_moe_checkpoint_wrapper_compatibility,
+    enable_qwen3_moe_configured_dtype,
+    enable_qwen3_moe_ep_free_checkpoint_adapter,
+    enable_qwen3_moe_ep_router_gradients,
+)
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
 
@@ -86,6 +96,21 @@ STRING_TO_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
+
+
+def _prewarm_native_shared_prefix_moe_world(world_size: int) -> None:
+    """Initialize NCCL before AutoModel creates overlapping EP/FSDP groups.
+
+    With both EP and EP-shard dimensions, ranks can otherwise lazily initialize
+    overlapping communicators in different orders and block in the first expert
+    all-gather.  A default-process-group collective before device-mesh creation
+    establishes one common NCCL ordering without changing model state.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
+    token = torch.zeros(1, dtype=torch.int64, device=device)
+    gathered = torch.empty(world_size, dtype=torch.int64, device=device)
+    torch.distributed.all_gather_into_tensor(gathered, token)
+    torch.cuda.synchronize(device)
 
 
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
@@ -390,6 +415,7 @@ def validate_and_prepare_config(
     # Get parallelization sizes
     tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
     cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
+    ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
     sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
 
     if enable_shared_prefix_training:
@@ -404,25 +430,205 @@ def validate_and_prepare_config(
             raise ValueError(
                 "shared-prefix training currently requires CP=1 and sequence_parallel=false"
             )
-        if automodel_kwargs is None or automodel_kwargs.get("force_hf") is not True:
-            raise ValueError(
-                "shared-prefix training requires "
-                "policy.dtensor_cfg.automodel_kwargs.force_hf=true"
-            )
         if is_vlm or is_reward_model:
             raise ValueError(
                 "shared-prefix training currently supports text causal language models only"
             )
-        if model_config.model_type not in {"llama", "qwen3"}:
+        if model_config.model_type not in {"llama", "qwen3", "qwen3_moe"}:
             raise ValueError(
-                "shared-prefix training currently supports Qwen3 and Llama, "
+                "shared-prefix training currently supports Qwen3, Qwen3-MoE, "
+                "and Llama, "
                 f"got {model_config.model_type}"
             )
         layer_types = getattr(model_config, "layer_types", ["full_attention"])
         if any(layer_type != "full_attention" for layer_type in layer_types):
             raise ValueError(
                 "shared-prefix training currently supports full-attention "
-                "Qwen3 and Llama models only"
+                "Qwen3, Qwen3-MoE, and Llama models only"
+            )
+        if getattr(model_config, "sliding_window", None) is not None:
+            raise ValueError(
+                "shared-prefix training currently supports full attention only"
+            )
+        if model_config.model_type == "qwen3_moe":
+            if isinstance(ep_size, bool) or not isinstance(ep_size, int) or ep_size < 1:
+                raise ValueError("expert_parallel_size must be a positive integer")
+            if cpu_offload:
+                raise ValueError(
+                    "shared-prefix native Qwen3-MoE currently requires "
+                    "policy.dtensor_cfg.cpu_offload=false"
+                )
+            force_hf = (
+                None if automodel_kwargs is None else automodel_kwargs.get("force_hf")
+            )
+            if force_hf is True:
+                raise ValueError(
+                    "shared-prefix Qwen3-MoE requires force_hf=false so native "
+                    "Gate adapters can preserve logical router auxiliary loss "
+                    "and load statistics"
+                )
+            if force_hf is False:
+                backend = automodel_kwargs.get("backend")
+                if not isinstance(backend, dict) or "_target_" not in backend:
+                    raise ValueError(
+                        "shared-prefix native Qwen3-MoE requires an explicit "
+                        "automodel_kwargs.backend with _target_, dispatcher='torch', "
+                        "and experts='torch' or 'torch_mm'"
+                    )
+                if backend.get("dispatcher") != "torch":
+                    raise ValueError(
+                        "shared-prefix native Qwen3-MoE currently requires "
+                        "automodel_kwargs.backend.dispatcher='torch'"
+                    )
+                if backend.get("enable_deepep"):
+                    raise ValueError(
+                        "shared-prefix native Qwen3-MoE requires "
+                        "automodel_kwargs.backend.enable_deepep=false because "
+                        "the deprecated flag overrides dispatcher='torch'"
+                    )
+                if backend.get("experts") not in {"torch", "torch_mm"}:
+                    raise ValueError(
+                        "shared-prefix native Qwen3-MoE currently requires "
+                        "automodel_kwargs.backend.experts='torch' or 'torch_mm'"
+                    )
+                fake_balanced_gate = backend.get("fake_balanced_gate")
+                if fake_balanced_gate is not None and not isinstance(
+                    fake_balanced_gate, bool
+                ):
+                    raise ValueError(
+                        "automodel_kwargs.backend.fake_balanced_gate must be boolean"
+                    )
+                if fake_balanced_gate:
+                    raise ValueError(
+                        "shared-prefix native Qwen3-MoE requires "
+                        "automodel_kwargs.backend.fake_balanced_gate=false so "
+                        "logical router loss and load statistics use the learned Gate"
+                    )
+                if "enable_hf_state_dict_adapter" in backend:
+                    enable_hf_adapter = backend["enable_hf_state_dict_adapter"]
+                    if not isinstance(enable_hf_adapter, bool):
+                        raise ValueError(
+                            "automodel_kwargs.backend.enable_hf_state_dict_adapter "
+                            "must be boolean"
+                        )
+                    if not enable_hf_adapter:
+                        raise ValueError(
+                            "shared-prefix native Qwen3-MoE requires "
+                            "automodel_kwargs.backend.enable_hf_state_dict_adapter=true "
+                            "for rollout refit and checkpoint compatibility"
+                        )
+                if backend.get("te_fp8") is not None:
+                    raise ValueError(
+                        "shared-prefix native Qwen3-MoE currently requires "
+                        "automodel_kwargs.backend.te_fp8=null because the Policy "
+                        "train loop does not own a Transformer Engine FP8 autocast"
+                    )
+                gate_precision = backend.get("gate_precision")
+                if gate_precision is not None:
+                    try:
+                        resolved_gate_precision = dtype_from_str(gate_precision)
+                    except (AttributeError, KeyError, TypeError) as error:
+                        raise ValueError(
+                            "automodel_kwargs.backend.gate_precision must be a "
+                            "floating-point dtype"
+                        ) from error
+                    if resolved_gate_precision not in {
+                        torch.float16,
+                        torch.bfloat16,
+                        torch.float32,
+                        torch.float64,
+                    }:
+                        raise ValueError(
+                            "automodel_kwargs.backend.gate_precision must be a "
+                            "floating-point dtype"
+                        )
+            if force_hf is False and tp_size != 1:
+                raise ValueError(
+                    "shared-prefix native Qwen3-MoE currently requires TP=1"
+                )
+            if ep_size > 1 and force_hf is not False:
+                raise ValueError(
+                    "shared-prefix Qwen3-MoE EP requires "
+                    "policy.dtensor_cfg.automodel_kwargs.force_hf=false so "
+                    "AutoModel can shard its native grouped experts"
+                )
+            if ep_size == 1 and force_hf is not False:
+                raise ValueError(
+                    "shared-prefix Qwen3-MoE requires an explicit "
+                    "policy.dtensor_cfg.automodel_kwargs.force_hf=false for the "
+                    "native EP=1 semantic baseline"
+                )
+            if config["dtensor_cfg"].get("dp_replicate_size", 1) != 1:
+                raise ValueError(
+                    "shared-prefix native Qwen3-MoE currently requires "
+                    "dp_replicate_size=1"
+                )
+            num_experts = getattr(model_config, "num_experts", 0)
+            if ep_size > 1 and (num_experts <= 0 or num_experts % ep_size != 0):
+                raise ValueError(
+                    f"Qwen3-MoE num_experts ({num_experts}) must be divisible "
+                    f"by expert_parallel_size ({ep_size})"
+                )
+            if getattr(model_config, "output_router_logits", False):
+                raise ValueError(
+                    "shared-prefix Qwen3-MoE training requires "
+                    "output_router_logits=false; the native EP path injects its "
+                    "logical-token router auxiliary loss at each Gate"
+                )
+            raw_moe_overrides = (
+                None
+                if automodel_kwargs is None
+                else automodel_kwargs.get("moe_overrides")
+            )
+            if raw_moe_overrides is not None and not isinstance(
+                raw_moe_overrides, dict
+            ):
+                raise ValueError("Qwen3-MoE moe_overrides must be a mapping")
+            moe_overrides = raw_moe_overrides or {}
+            if "gate_bias_update_factor" in moe_overrides:
+                bias_update_factor = moe_overrides["gate_bias_update_factor"]
+                if (
+                    isinstance(bias_update_factor, bool)
+                    or not isinstance(bias_update_factor, numbers.Real)
+                    or not math.isfinite(float(bias_update_factor))
+                    or bias_update_factor != 0
+                ):
+                    raise ValueError(
+                        "dynamic routing bias is not supported for Qwen3-MoE "
+                        "because its rollout backends do not consume a "
+                        "correction-bias state; gate_bias_update_factor must be 0"
+                    )
+            supported_overrides = {
+                "aux_loss_coeff",
+                "gate_bias_update_factor",
+            }
+            unsupported_overrides = set(moe_overrides) - supported_overrides
+            if unsupported_overrides:
+                raise ValueError(
+                    "shared-prefix Qwen3-MoE only supports checkpoint-compatible "
+                    "moe_overrides "
+                    f"{sorted(supported_overrides)}, got "
+                    f"{sorted(unsupported_overrides)}"
+                )
+            aux_loss_coeff = (
+                moe_overrides["aux_loss_coeff"]
+                if "aux_loss_coeff" in moe_overrides
+                else getattr(model_config, "router_aux_loss_coef", 0.0)
+            )
+            if (
+                isinstance(aux_loss_coeff, bool)
+                or not isinstance(aux_loss_coeff, numbers.Real)
+                or not math.isfinite(float(aux_loss_coeff))
+                or aux_loss_coeff < 0
+            ):
+                raise ValueError(
+                    "Qwen3-MoE router aux_loss_coeff must be a finite "
+                    "non-negative real number"
+                )
+        elif automodel_kwargs is None or automodel_kwargs.get("force_hf") is not True:
+            raise ValueError(
+                "shared-prefix training requires "
+                "policy.dtensor_cfg.automodel_kwargs.force_hf=true"
             )
         if getattr(model_config, "attention_dropout", 0.0) != 0.0:
             raise ValueError("shared-prefix training requires attention_dropout=0")
@@ -519,6 +725,27 @@ def setup_distributed(
     dp_replicate_size = config["dtensor_cfg"].get("dp_replicate_size", 1)
     sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
 
+    use_native_shared_prefix_moe = (
+        config.get("shared_prefix_training")
+        and runtime_config.model_config.model_type == "qwen3_moe"
+        and config["dtensor_cfg"].get("automodel_kwargs", {}).get("force_hf") is False
+    )
+    # AutoModel's EP mesh must evenly partition ranks. Keep the diagnostic
+    # scoped to this new native ZoRRo path; preserve existing recipes' setup
+    # pre-validation unchanged.
+    if use_native_shared_prefix_moe and world_size % ep_size != 0:
+        raise ValueError(
+            f"world_size ({world_size}) must be divisible by "
+            f"expert_parallel_size ({ep_size})"
+        )
+    if use_native_shared_prefix_moe and world_size == 1:
+        raise ValueError(
+            "shared-prefix native Qwen3-MoE requires world_size > 1 so "
+            "AutoModel applies FSDP mixed precision before FA2"
+        )
+    if use_native_shared_prefix_moe and 1 < ep_size < world_size:
+        _prewarm_native_shared_prefix_moe_world(world_size)
+
     # HSDP requires the data-parallel axis to evenly contain the replicate dim.
     model_parallel_size = tp_size * cp_size * ep_size
     dp_size = world_size // model_parallel_size
@@ -550,6 +777,10 @@ def setup_distributed(
     # Create MoEParallelizerConfig from nested moe_parallelizer options
     moe_parallelizer_cfg = config["dtensor_cfg"].get("moe_parallelizer", {})
     moe_config = MoEParallelizerConfig(**moe_parallelizer_cfg)
+    if use_native_shared_prefix_moe:
+        # The native MoE parallelizer otherwise uses its own default BF16
+        # policy, which can diverge from the configured master-weight policy.
+        moe_config.mp_policy = fsdp2_config.mp_policy
 
     # Handle world_size=1 + cpu_offload
     if world_size == 1 and cpu_offload:
@@ -558,7 +789,7 @@ def setup_distributed(
             "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
         )
 
-    # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
+    # AutoModel constructs the PP x DP x CP x TP mesh plus its EP view.
     device_mesh, moe_mesh = create_device_mesh(
         fsdp2_config,
         dp_replicate_size=dp_replicate_size,
@@ -568,7 +799,6 @@ def setup_distributed(
         ep_size=ep_size,
         world_size=world_size,
     )
-
     # Derive sizes from mesh
     resolved_dp_size = device_mesh["dp"].size()
     resolved_tp_size = device_mesh["tp"].size()
@@ -730,13 +960,16 @@ def setup_model_and_optimizer(
     print(f"[Rank {rank}] Initializing model via from_pretrained...")
 
     # Prepare automodel kwargs
-    automodel_kwargs = config["dtensor_cfg"].get("automodel_kwargs", {})
+    automodel_kwargs = dict(config["dtensor_cfg"].get("automodel_kwargs", {}) or {})
     if automodel_kwargs.get("backend", None) is not None:
         backend_class = _resolve_target(
             automodel_kwargs.get("backend", None)["_target_"]
         )
-        backend_kwargs = automodel_kwargs.get("backend")
-        backend_kwargs.pop("_target_")
+        backend_kwargs = {
+            key: value
+            for key, value in automodel_kwargs["backend"].items()
+            if key != "_target_"
+        }
         backend = backend_class(**backend_kwargs)
         automodel_kwargs["backend"] = backend
 
@@ -812,6 +1045,31 @@ def setup_model_and_optimizer(
     # checkpoint dtype, which would break optimizer master-weight precision (see helper).
     _disable_automodel_checkpoint_dtype_restore()
 
+    use_native_shared_prefix_moe = (
+        config.get("shared_prefix_training")
+        and model_config.model_type == "qwen3_moe"
+        and automodel_kwargs.get("force_hf") is False
+    )
+    if use_native_shared_prefix_moe:
+        # The pinned native implementation otherwise mixes bf16 helper defaults
+        # into NeMo-RL's fp32 master model before FSDP can shard it.
+        enable_qwen3_moe_configured_dtype()
+        if config["dtensor_cfg"]["activation_checkpointing"]:
+            # Default AutoModel activation checkpointing wraps individual MLPs;
+            # keep Qwen's dense/MoE dispatch wrapper-transparent.
+            enable_qwen3_moe_checkpoint_wrapper_compatibility()
+    if use_native_shared_prefix_moe and ep_size == 1:
+        # The pinned state-dict adapter assumes every expert DTensor owns an
+        # ``ep`` mesh. Under the EP=1 semantic baseline FSDP shards the grouped
+        # expert axis over ``dp`` instead, so install the narrow rank-local
+        # staged-copy backport before AutoModel creates or loads the model.
+        enable_qwen3_moe_ep_free_checkpoint_adapter()
+    if use_native_shared_prefix_moe and ep_size > 1:
+        # Backport NVIDIA-NeMo/Automodel#2995 before any EP forward can be
+        # compiled or activation-checkpointed. Without it, the model loss has
+        # no gradient path from remote experts to the learned Gate.
+        enable_qwen3_moe_ep_router_gradients()
+
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
     model = model_class.from_pretrained(
@@ -829,6 +1087,9 @@ def setup_model_and_optimizer(
         **from_pretrained_kwargs,
         **automodel_kwargs,
     )
+
+    if use_native_shared_prefix_moe:
+        enable_custom_qwen3_moe_shared_prefix(model)
 
     print(model)
 

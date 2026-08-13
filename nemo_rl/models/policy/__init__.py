@@ -110,7 +110,10 @@ class AutomodelBackendConfig(TypedDict):
 
     Used when setting the backend in automodel_kwargs in your config.
     Alternatively, pass `force_hf: true` in automodel_kwargs to fall back
-    to the HuggingFace implementation.
+    to the HuggingFace implementation. Shared-prefix native Qwen3-MoE
+    currently requires an explicit ``dispatcher="torch"`` and
+    ``experts="torch"`` or ``experts="torch_mm"`` so behavior does not depend
+    on whether DeepEP happens to be installed in the runtime environment.
     """
 
     # Hydra target class path (e.g., "nemo_automodel.components.models.common.utils.BackendConfig")
@@ -132,10 +135,14 @@ class AutomodelBackendConfig(TypedDict):
     # Use fake balanced gate for testing/debugging MoE
     fake_balanced_gate: NotRequired[bool]
     # Enable HuggingFace state dict adapter for checkpoint saving/loading plus refit support for RL
-    # This should almost always be set to True when using a custom MoE implementation. Set to False only for specific use cases like debugging or performance testing.
+    # This should almost always be True for custom MoE implementations. False
+    # is intended only for narrowly scoped debugging or performance tests.
     enable_hf_state_dict_adapter: NotRequired[bool]
     # Enable FSDP-specific optimizations
     enable_fsdp_optimizations: NotRequired[bool]
+    # Transformer Engine FP8 recipe. Native shared-prefix Qwen3-MoE rejects
+    # this until the Policy train loop owns the matching TE autocast context.
+    te_fp8: NotRequired[dict[str, Any]]
     # Precision for the MoE gate computation (e.g., "float64", "float32")
     gate_precision: NotRequired[str]
 
@@ -164,6 +171,10 @@ class AutomodelKwargs(TypedDict):
     # auto-detected and set at runtime if not explicitly configured.
     # See: https://github.com/NVIDIA-NeMo/RL/issues/2072
     force_hf: NotRequired[bool]
+    # Overrides for AutoModel's native MoE config. Shared-prefix Qwen3-MoE only
+    # accepts checkpoint-compatible auxiliary-loss overrides; dynamic routing
+    # bias is rejected because Qwen rollout backends do not consume that state.
+    moe_overrides: NotRequired[dict[str, float]]
 
 
 class DTensorConfigDisabled(TypedDict):
@@ -183,8 +194,8 @@ class DTensorConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
     _v2: NotRequired[bool]
-    # Distributed parallelism sizes
-    # data_parallel_size is derived from world_size / (tp * cp * ep)
+    # Distributed parallelism sizes. AutoModel's current FSDP2 mesh derives
+    # data parallelism from world_size / (tp * cp); EP is an overlapping view.
     tensor_parallel_size: int
     context_parallel_size: int
     expert_parallel_size: NotRequired[int]
@@ -535,8 +546,9 @@ class PolicyConfig(TypedDict):
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
-    # Train Qwen3 or Llama on one physical prompt plus all responses sharing it.
-    # This path is DTensor v2/HF/FA2-only and leaves logprob inference dense.
+    # Train Qwen3, Qwen3-MoE, or Llama on one physical prompt plus all responses
+    # sharing it. Dense models use HF/FA2; Qwen3-MoE EP uses AutoModel's native
+    # grouped experts plus the same FA2 split-attention core.
     shared_prefix_training: NotRequired[bool]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Train-time shared-prefix execution for Hugging Face Qwen3 and Llama.
+"""Train-time shared-prefix execution for Qwen3, Qwen3-MoE, and Llama.
 
 The logical GRPO microbatch remains a normal ``[batch, sequence]`` tensor.  This
 module builds a physical ``[1, compact_tokens]`` representation containing one
@@ -21,13 +21,18 @@ MLPs, and projections run directly on that compact representation.  The
 registered attention backend preserves the logical causal semantics with two
 varlen FA2 calls: prompt self-attention and response-to-(prompt + own response)
 attention.
+
+For dropless token-local MoE computation, autograd sums the downstream gradients
+from every response at the shared prompt node. Router auxiliary losses and load
+statistics are different: they operate on logical token counts. The layout
+therefore also records a token multiplicity vector. ``shared_prefix_moe`` uses
+that vector for router statistics without duplicating physical expert dispatch.
 """
 
 from dataclasses import dataclass
 from typing import Any
 
 import torch
-
 
 # Deliberately contains no ``flash`` substring. Transformers treats any backend
 # name containing it as a built-in/hub FlashAttention request before dispatch.
@@ -42,6 +47,7 @@ class SharedPrefixLayout:
 
     compact_input_ids: torch.Tensor
     compact_position_ids: torch.Tensor
+    logical_token_weights: torch.Tensor
 
     prompt_token_indices: torch.Tensor
     response_token_indices: torch.Tensor
@@ -179,6 +185,7 @@ def build_shared_prefix_layout(
 
     compact_ids_parts: list[torch.Tensor] = []
     compact_positions_parts: list[torch.Tensor] = []
+    logical_weight_parts: list[torch.Tensor] = []
     prompt_indices_parts: list[torch.Tensor] = []
     response_indices_parts: list[torch.Tensor] = []
     response_kv_indices_parts: list[torch.Tensor] = []
@@ -211,6 +218,14 @@ def build_shared_prefix_layout(
 
         compact_ids_parts.append(prompt)
         compact_positions_parts.append(torch.arange(prompt_length, device=device))
+        logical_weight_parts.append(
+            torch.full(
+                (prompt_length,),
+                len(rows),
+                device=device,
+                dtype=torch.long,
+            )
+        )
         prompt_indices_parts.append(prompt_indices)
         prompt_cu.append(prompt_cu[-1] + prompt_length)
         max_prompt_length = max(max_prompt_length, prompt_length)
@@ -243,6 +258,9 @@ def build_shared_prefix_layout(
             compact_ids_parts.append(response)
             compact_positions_parts.append(
                 torch.arange(prompt_length, total_length, device=device)
+            )
+            logical_weight_parts.append(
+                torch.ones(response_length, device=device, dtype=torch.long)
             )
             response_indices_parts.append(response_indices)
             response_kv_indices_parts.append(
@@ -287,6 +305,7 @@ def build_shared_prefix_layout(
     return SharedPrefixLayout(
         compact_input_ids=torch.cat(compact_ids_parts).unsqueeze(0),
         compact_position_ids=torch.cat(compact_positions_parts).unsqueeze(0),
+        logical_token_weights=torch.cat(logical_weight_parts),
         prompt_token_indices=_cat(prompt_indices_parts),
         response_token_indices=_cat(response_indices_parts),
         response_kv_indices=_cat(response_kv_indices_parts),
@@ -408,7 +427,7 @@ def shared_prefix_flash_attention_forward(
     shared_prefix_layout: SharedPrefixLayout | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
-    """Transformers ``AttentionInterface`` for Qwen3/Llama with FA2."""
+    """Transformers ``AttentionInterface`` for Qwen3/Qwen3-MoE/Llama with FA2."""
     if query.dtype == torch.float32:
         # Match Transformers' native FA2 wrapper. Some training setups retain
         # fp32 norm weights, which can promote Q/K despite BF16 autocast.
@@ -496,7 +515,7 @@ def shared_prefix_flash_attention_forward(
 
 
 def register_shared_prefix_attention() -> None:
-    """Register the Qwen3/Llama backend before config/model construction."""
+    """Register the Qwen3/Qwen3-MoE/Llama backend before model construction."""
     from transformers import AttentionInterface
     from transformers.masking_utils import (
         AttentionMaskInterface,

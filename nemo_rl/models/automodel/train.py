@@ -57,6 +57,10 @@ from nemo_rl.models.automodel.shared_prefix import (
     response_logprobs_from_logits,
     scatter_response_logprobs,
 )
+from nemo_rl.models.automodel.shared_prefix_moe import (
+    is_custom_qwen3_moe_shared_prefix,
+    shared_prefix_moe_context,
+)
 from nemo_rl.models.policy import PolicyConfig
 
 # Union type for any post-processing function
@@ -120,10 +124,12 @@ def model_forward(
     if processed_inputs.shared_prefix_layout is not None:
         layout = processed_inputs.shared_prefix_layout
         model_args["shared_prefix_layout"] = layout
-        # Both supported HF causal LMs accept an arbitrary index tensor here.
-        # Repeated prompt-last indices make one shared hidden state predict each
-        # response's first token.
-        model_args["logits_to_keep"] = layout.predictor_indices
+        if not is_custom_qwen3_moe_shared_prefix(model):
+            # Supported HF causal LMs accept an arbitrary index tensor here.
+            # Repeated prompt-last indices make one shared hidden state predict
+            # every response's first token. AutoModel's native Qwen3-MoE does
+            # not implement this HF argument and is selected after lm_head.
+            model_args["logits_to_keep"] = layout.predictor_indices
 
     # Add flash attention kwargs if applicable
     if processed_inputs.has_flash_attention:
@@ -375,6 +381,15 @@ def forward_with_post_processing_fn(
     logits = extract_logits(model, outputs)
     del outputs
 
+    layout = processed_inputs.shared_prefix_layout
+    if layout is not None and is_custom_qwen3_moe_shared_prefix(model):
+        if logits.ndim != 3 or logits.shape[:2] != (1, layout.compact_tokens):
+            raise ValueError(
+                "native Qwen3-MoE shared-prefix logits must have shape "
+                f"[1, {layout.compact_tokens}, vocab], got {tuple(logits.shape)}"
+            )
+        logits = logits.index_select(1, layout.predictor_indices)
+
     # Apply temperature scaling only for sampling-oriented post-processors
     # Score computations should use unscaled logits
     if isinstance(
@@ -495,6 +510,18 @@ def automodel_forward_backward(
     from contextlib import nullcontext
 
     results = []
+    fsdp_backward_scale = dp_size * cp_size
+    if not forward_only and is_custom_qwen3_moe_shared_prefix(model):
+        # Router auxiliary losses are attached inside AutoModel's Gate, outside
+        # the scalar policy loss below. Match AutoModel's non-PP driver so FSDP's
+        # gradient average does not underweight them.
+        from nemo_automodel.components.moe.megatron.moe_utils import (
+            MoEAuxLossAutoScaler,
+        )
+
+        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+            float(fsdp_backward_scale)
+        )
 
     for mb_idx, processed_mb in enumerate(data_iterator):
         # Call optional callback at start of microbatch
@@ -502,6 +529,9 @@ def automodel_forward_backward(
             on_microbatch_start(mb_idx)
 
         processed_inputs = processed_mb.processed_inputs
+        is_dummy = (
+            num_valid_microbatches is not None and mb_idx >= num_valid_microbatches
+        )
 
         # Create train context if factory provided, otherwise use nullcontext
         if train_context_fn is not None:
@@ -509,7 +539,16 @@ def automodel_forward_backward(
         else:
             ctx = nullcontext()
 
-        with ctx:
+        router_ctx = (
+            shared_prefix_moe_context(
+                model,
+                processed_inputs.shared_prefix_layout,
+                valid=not is_dummy,
+            )
+            if is_custom_qwen3_moe_shared_prefix(model)
+            else nullcontext()
+        )
+        with ctx, router_ctx as router_execution:
             # Forward pass with post-processing
             result, metrics, _ = forward_with_post_processing_fn(
                 model=model,
@@ -522,11 +561,12 @@ def automodel_forward_backward(
                 sampling_params=sampling_params,
                 sequence_dim=sequence_dim,
             )
-
-            # Check if this is a dummy batch
-            is_dummy = (
-                num_valid_microbatches is not None and mb_idx >= num_valid_microbatches
-            )
+            # Commit detached statistics exactly once. Activation checkpointing
+            # may replay Gate.forward during backward; the execution remains
+            # active so aux gradients are rebuilt, while the one-shot commit
+            # prevents the replay from double-counting load state.
+            if router_execution is not None:
+                router_execution.commit()
 
             # Scale metrics for aggregation (only for loss)
             if isinstance(post_processing_fn, LossPostProcessor):
@@ -551,7 +591,7 @@ def automodel_forward_backward(
 
                     # when FSDP reduces the gradients over the DP dim, they're automatically averaged
                     # but we want to sum them so we cancel out the average here
-                    loss = result * dp_size * cp_size
+                    loss = result * fsdp_backward_scale
                     loss.backward()
 
         results.append((result, metrics))

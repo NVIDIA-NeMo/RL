@@ -52,6 +52,10 @@ from nemo_rl.models.automodel.setup import (
     validate_and_prepare_config,
 )
 from nemo_rl.models.automodel.shared_prefix import SHARED_PREFIX_GROUP_IDS
+from nemo_rl.models.automodel.shared_prefix_moe import (
+    collect_shared_prefix_moe_statistics,
+    reset_shared_prefix_moe_statistics,
+)
 from nemo_rl.models.automodel.train import (
     FullLogitsPostProcessor,
     LogprobsPostProcessor,
@@ -409,6 +413,7 @@ class DTensorPolicyWorkerV2Impl(
                 "shared-prefix training is enabled, but the training batch has no "
                 "GRPO shared-prefix metadata"
             )
+        reset_shared_prefix_moe_statistics(self.model)
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -581,6 +586,12 @@ class DTensorPolicyWorkerV2Impl(
                 dp_group=self.dp_mesh.get_group(),
                 dtype=self.dtype,
             )
+            moe_metrics = collect_shared_prefix_moe_statistics(
+                self.model,
+                self.dp_mesh.get_group(),
+            )
+            if moe_metrics:
+                metrics["moe_metrics"] = moe_metrics
 
             self.timer.stop("train")
             return metrics

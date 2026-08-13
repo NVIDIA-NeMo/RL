@@ -302,9 +302,10 @@ policy:
     algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
 
-  # Qwen3/Llama train-time shared-prefix optimization. Requires DTensor v2,
-  # sequence packing, and dtensor_cfg.automodel_kwargs.force_hf=true. Bin
-  # packing charges each prompt once per group/bin; logprob inference stays dense.
+  # Qwen3/Llama/Qwen3-MoE train-time shared-prefix optimization. Requires
+  # DTensor v2 and sequence packing. Dense models use force_hf=true; native
+  # Qwen3-MoE EP uses force_hf=false. Bin packing charges each prompt once per
+  # group/bin; logprob inference stays dense.
   shared_prefix_training: False
 
   # makes the training sequence length divisible by the tensor parallel size

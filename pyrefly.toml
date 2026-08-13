@@ -147,6 +147,7 @@ project-includes = [
   "nemo_rl/modelopt/registry.py",
   "nemo_rl/models/__init__.py",
   "nemo_rl/models/automodel/__init__.py",
+  "nemo_rl/models/automodel/shared_prefix_moe.py",
   "nemo_rl/models/dtensor/__init__.py",
   "nemo_rl/models/dtensor/parallelize.py",
   "nemo_rl/models/generation/__init__.py",

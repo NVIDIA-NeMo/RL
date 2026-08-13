@@ -32,12 +32,63 @@ from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
     RuntimeConfig,
     _maybe_set_force_hf,
+    _prewarm_native_shared_prefix_moe_world,
     get_tokenizer,
     setup_distributed,
     setup_model_and_optimizer,
     setup_reference_model_state,
     validate_and_prepare_config,
 )
+
+
+def _native_qwen3_moe_kwargs(**extra):
+    """Return the explicit backend required by native shared-prefix Qwen3-MoE."""
+    return {
+        "force_hf": False,
+        "backend": {
+            "_target_": ("nemo_automodel.components.models.common.utils.BackendConfig"),
+            "dispatcher": "torch",
+            "experts": "torch_mm",
+        },
+        **extra,
+    }
+
+
+def _configure_native_shared_prefix_qwen3_moe(
+    mock_config,
+    mock_autoconfig,
+    *,
+    expert_parallel_size=2,
+    automodel_kwargs=None,
+):
+    """Populate the minimum valid native shared-prefix Qwen3-MoE config."""
+    mock_autoconfig.model_type = "qwen3_moe"
+    mock_autoconfig.architectures = ["Qwen3MoeForCausalLM"]
+    mock_autoconfig.layer_types = ["full_attention"]
+    mock_autoconfig.attention_dropout = 0.0
+    mock_autoconfig.output_router_logits = False
+    mock_autoconfig.sliding_window = None
+    mock_autoconfig.num_experts = 8
+    mock_autoconfig.router_aux_loss_coef = 0.0
+
+    mock_config["shared_prefix_training"] = True
+    mock_config["sequence_packing"]["enabled"] = True
+    mock_config["dynamic_batching"] = {"enabled": False}
+    mock_config["dtensor_cfg"].update(
+        {
+            "_v2": True,
+            "tensor_parallel_size": 1,
+            "expert_parallel_size": expert_parallel_size,
+            "context_parallel_size": 1,
+            "sequence_parallel": False,
+            "dp_replicate_size": 1,
+            "automodel_kwargs": (
+                _native_qwen3_moe_kwargs()
+                if automodel_kwargs is None
+                else automodel_kwargs
+            ),
+        }
+    )
 
 
 def test_token_classification_backport_still_required():
@@ -290,41 +341,251 @@ class TestValidateAndPrepareConfig:
         assert result.attn_impl is None
 
     @pytest.mark.parametrize(
-        "model_type,architecture,tp_size,cp_size,sequence_parallel,expected_error",
+        (
+            "model_type,architecture,dtensor_overrides,automodel_kwargs,"
+            "model_overrides,expected_error"
+        ),
         [
-            ("qwen3", "Qwen3ForCausalLM", 2, 1, False, None),
-            ("llama", "LlamaForCausalLM", 2, 1, False, None),
-            (
+            pytest.param(
+                "qwen3",
+                "Qwen3ForCausalLM",
+                {"tensor_parallel_size": 2},
+                {"force_hf": True},
+                {},
+                None,
+                id="qwen3_tp2",
+            ),
+            pytest.param(
+                "llama",
+                "LlamaForCausalLM",
+                {"tensor_parallel_size": 2},
+                {"force_hf": True},
+                {},
+                None,
+                id="llama_tp2",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2},
+                _native_qwen3_moe_kwargs(),
+                {"num_experts": 8},
+                None,
+                id="qwen3_moe_ep2_custom",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2, "cpu_offload": True},
+                _native_qwen3_moe_kwargs(),
+                {"num_experts": 8},
+                "cpu_offload=false",
+                id="qwen3_moe_cpu_offload",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2},
+                {"force_hf": True},
+                {"num_experts": 8},
+                "requires force_hf=false",
+                id="qwen3_moe_ep2_force_hf",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2},
+                {},
+                {"num_experts": 8},
+                "force_hf=false",
+                id="qwen3_moe_ep2_force_hf_unspecified",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2},
+                {
+                    **_native_qwen3_moe_kwargs(),
+                    "backend": {
+                        **_native_qwen3_moe_kwargs()["backend"],
+                        "enable_deepep": True,
+                    },
+                },
+                {"num_experts": 8},
+                "enable_deepep=false",
+                id="qwen3_moe_deprecated_deepep_override",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2},
+                {
+                    **_native_qwen3_moe_kwargs(),
+                    "backend": {
+                        **_native_qwen3_moe_kwargs()["backend"],
+                        "fake_balanced_gate": True,
+                    },
+                },
+                {"num_experts": 8},
+                "fake_balanced_gate=false",
+                id="qwen3_moe_fake_balanced_gate",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2},
+                {
+                    **_native_qwen3_moe_kwargs(),
+                    "backend": {
+                        **_native_qwen3_moe_kwargs()["backend"],
+                        "fake_balanced_gate": 1,
+                    },
+                },
+                {"num_experts": 8},
+                "fake_balanced_gate must be boolean",
+                id="qwen3_moe_fake_balanced_gate_integer",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2},
+                {
+                    **_native_qwen3_moe_kwargs(),
+                    "backend": {
+                        **_native_qwen3_moe_kwargs()["backend"],
+                        "enable_hf_state_dict_adapter": False,
+                    },
+                },
+                {"num_experts": 8},
+                "enable_hf_state_dict_adapter=true",
+                id="qwen3_moe_state_dict_adapter_disabled",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2},
+                {
+                    **_native_qwen3_moe_kwargs(),
+                    "backend": {
+                        **_native_qwen3_moe_kwargs()["backend"],
+                        "enable_hf_state_dict_adapter": 0,
+                    },
+                },
+                {"num_experts": 8},
+                "enable_hf_state_dict_adapter must be boolean",
+                id="qwen3_moe_state_dict_adapter_integer",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2},
+                {
+                    **_native_qwen3_moe_kwargs(),
+                    "backend": {
+                        **_native_qwen3_moe_kwargs()["backend"],
+                        "te_fp8": {"recipe": "current"},
+                    },
+                },
+                {"num_experts": 8},
+                "te_fp8=null",
+                id="qwen3_moe_te_fp8",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2},
+                {
+                    **_native_qwen3_moe_kwargs(),
+                    "backend": {
+                        **_native_qwen3_moe_kwargs()["backend"],
+                        "gate_precision": "int64",
+                    },
+                },
+                {"num_experts": 8},
+                "gate_precision must be a floating-point dtype",
+                id="qwen3_moe_integer_gate_precision",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {},
+                _native_qwen3_moe_kwargs(),
+                {"num_experts": 8},
+                None,
+                id="qwen3_moe_ep1_custom",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2, "tensor_parallel_size": 2},
+                _native_qwen3_moe_kwargs(),
+                {"num_experts": 8},
+                "requires TP=1",
+                id="qwen3_moe_ep2_tp2",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2, "dp_replicate_size": 2},
+                _native_qwen3_moe_kwargs(),
+                {"num_experts": 8},
+                "requires dp_replicate_size=1",
+                id="qwen3_moe_ep2_dp_replicate2",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 3},
+                _native_qwen3_moe_kwargs(),
+                {"num_experts": 8},
+                "must be divisible by expert_parallel_size",
+                id="qwen3_moe_ep3_nondivisible_experts",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {"expert_parallel_size": 2},
+                _native_qwen3_moe_kwargs(),
+                {"num_experts": 8, "output_router_logits": True},
+                "requires output_router_logits=false",
+                id="qwen3_moe_router_aux_output",
+            ),
+            pytest.param(
+                "qwen3_moe",
+                "Qwen3MoeForCausalLM",
+                {},
+                {"force_hf": True},
+                {"num_experts": 8, "sliding_window": 4096},
+                "supports full attention only",
+                id="qwen3_moe_sliding_window",
+            ),
+            pytest.param(
                 "mistral",
                 "MistralForCausalLM",
-                2,
-                1,
-                False,
-                "currently supports Qwen3 and Llama, got mistral",
+                {"tensor_parallel_size": 2},
+                {"force_hf": True},
+                {},
+                "currently supports Qwen3, Qwen3-MoE, and Llama, got mistral",
+                id="unsupported_model",
             ),
-            (
+            pytest.param(
                 "qwen3",
                 "Qwen3ForCausalLM",
-                2,
-                2,
-                False,
+                {"tensor_parallel_size": 2, "context_parallel_size": 2},
+                {"force_hf": True},
+                {},
                 "requires CP=1 and sequence_parallel=false",
+                id="cp2",
             ),
-            (
+            pytest.param(
                 "qwen3",
                 "Qwen3ForCausalLM",
-                2,
-                1,
-                True,
+                {"tensor_parallel_size": 2, "sequence_parallel": True},
+                {"force_hf": True},
+                {},
                 "requires CP=1 and sequence_parallel=false",
+                id="sequence_parallel",
             ),
-        ],
-        ids=[
-            "qwen3_tp2",
-            "llama_tp2",
-            "unsupported_model",
-            "cp2",
-            "sequence_parallel",
         ],
     )
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
@@ -339,16 +600,22 @@ class TestValidateAndPrepareConfig:
         mock_autoconfig,
         model_type,
         architecture,
-        tp_size,
-        cp_size,
-        sequence_parallel,
+        dtensor_overrides,
+        automodel_kwargs,
+        model_overrides,
         expected_error,
     ):
-        """Shared-prefix training accepts Qwen3/Llama TP and rejects other modes."""
+        """Shared-prefix training accepts safe TP/EP layouts and rejects unsafe modes."""
         mock_autoconfig.model_type = model_type
         mock_autoconfig.architectures = [architecture]
         mock_autoconfig.layer_types = ["full_attention"]
         mock_autoconfig.attention_dropout = 0.0
+        mock_autoconfig.output_router_logits = False
+        mock_autoconfig.sliding_window = None
+        for name, value in model_overrides.items():
+            setattr(mock_autoconfig, name, value)
+        if model_type == "qwen3_moe":
+            mock_autoconfig.router_aux_loss_coef = 0.0
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
         mock_resolve_class.return_value = Mock
 
@@ -358,12 +625,15 @@ class TestValidateAndPrepareConfig:
         mock_config["dtensor_cfg"].update(
             {
                 "_v2": True,
-                "tensor_parallel_size": tp_size,
-                "context_parallel_size": cp_size,
-                "sequence_parallel": sequence_parallel,
-                "automodel_kwargs": {"force_hf": True},
+                "tensor_parallel_size": 1,
+                "expert_parallel_size": 1,
+                "context_parallel_size": 1,
+                "sequence_parallel": False,
+                "dp_replicate_size": 1,
+                "automodel_kwargs": automodel_kwargs,
             }
         )
+        mock_config["dtensor_cfg"].update(dtensor_overrides)
 
         if expected_error is None:
             result = validate_and_prepare_config(mock_config, None, 0)
@@ -371,6 +641,173 @@ class TestValidateAndPrepareConfig:
         else:
             with pytest.raises(ValueError, match=expected_error):
                 validate_and_prepare_config(mock_config, None, 0)
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_shared_prefix_qwen3_moe_dynamic_bias_validation(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """Reject dynamic bias that cannot be refit into Qwen rollout models."""
+        mock_autoconfig.model_type = "qwen3_moe"
+        mock_autoconfig.architectures = ["Qwen3MoeForCausalLM"]
+        mock_autoconfig.layer_types = ["full_attention"]
+        mock_autoconfig.attention_dropout = 0.0
+        mock_autoconfig.output_router_logits = False
+        mock_autoconfig.sliding_window = None
+        mock_autoconfig.num_experts = 8
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        mock_config["shared_prefix_training"] = True
+        mock_config["sequence_packing"]["enabled"] = True
+        mock_config["dynamic_batching"] = {"enabled": False}
+        mock_config["dtensor_cfg"].update(
+            {
+                "_v2": True,
+                "tensor_parallel_size": 1,
+                "expert_parallel_size": 2,
+                "context_parallel_size": 1,
+                "sequence_parallel": False,
+                "automodel_kwargs": {
+                    **_native_qwen3_moe_kwargs(),
+                    "moe_overrides": {"gate_bias_update_factor": 1.0e-3},
+                },
+            }
+        )
+
+        with pytest.raises(ValueError, match="dynamic routing bias is not supported"):
+            validate_and_prepare_config(mock_config, None, 0)
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_shared_prefix_qwen3_moe_allows_disabled_dynamic_bias_override(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """An explicit zero keeps Qwen's native auxiliary-loss router."""
+        _configure_native_shared_prefix_qwen3_moe(
+            mock_config,
+            mock_autoconfig,
+            automodel_kwargs=_native_qwen3_moe_kwargs(
+                moe_overrides={"gate_bias_update_factor": 0.0}
+            ),
+        )
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert isinstance(result, RuntimeConfig)
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_shared_prefix_qwen3_moe_missing_aux_coefficient_defaults_to_zero(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """Match AutoModel's zero aux-loss fallback for older checkpoints."""
+        _configure_native_shared_prefix_qwen3_moe(
+            mock_config,
+            mock_autoconfig,
+        )
+        del mock_autoconfig.router_aux_loss_coef
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert isinstance(result, RuntimeConfig)
+
+    @pytest.mark.parametrize(
+        "expert_parallel_size",
+        [
+            pytest.param(0, id="zero"),
+            pytest.param(True, id="bool"),
+        ],
+    )
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_shared_prefix_qwen3_moe_rejects_invalid_ep_size(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+        expert_parallel_size,
+    ):
+        """Reject EP sizes that would crash or silently normalize in mesh setup."""
+        _configure_native_shared_prefix_qwen3_moe(
+            mock_config,
+            mock_autoconfig,
+            expert_parallel_size=expert_parallel_size,
+        )
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        with pytest.raises(ValueError, match="expert_parallel_size"):
+            validate_and_prepare_config(mock_config, None, 0)
+
+    @pytest.mark.parametrize(
+        "coefficient",
+        [
+            pytest.param(None, id="none"),
+            pytest.param("0.1", id="string"),
+            pytest.param(True, id="bool"),
+            pytest.param(-0.1, id="negative"),
+            pytest.param(float("nan"), id="nan"),
+            pytest.param(float("inf"), id="inf"),
+        ],
+    )
+    @pytest.mark.parametrize("source", ["override", "model_config"])
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_shared_prefix_qwen3_moe_rejects_invalid_effective_aux_coefficient(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+        source,
+        coefficient,
+    ):
+        """Validate both override and model-config router aux coefficients."""
+        automodel_kwargs = _native_qwen3_moe_kwargs()
+        if source == "override":
+            automodel_kwargs["moe_overrides"] = {"aux_loss_coeff": coefficient}
+        else:
+            mock_autoconfig.router_aux_loss_coef = coefficient
+        _configure_native_shared_prefix_qwen3_moe(
+            mock_config,
+            mock_autoconfig,
+            automodel_kwargs=automodel_kwargs,
+        )
+        if source == "model_config":
+            mock_autoconfig.router_aux_loss_coef = coefficient
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        with pytest.raises(ValueError, match="aux_loss_coeff"):
+            validate_and_prepare_config(mock_config, None, 0)
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -893,6 +1330,213 @@ class TestSetupDistributed:
 
         with pytest.raises(ValueError, match="dp_replicate_size"):
             setup_distributed(mock_config, mock_runtime_config)
+
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_ep_requires_divisible_world_size(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_create_mesh,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+    ):
+        """The overlapping EP mesh still must evenly partition world ranks."""
+        mock_torch_dist.get_world_size.return_value = 6
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
+        mock_runtime_config.model_config.model_type = "qwen3_moe"
+        mock_config["shared_prefix_training"] = True
+        mock_config["dtensor_cfg"]["expert_parallel_size"] = 4
+        mock_config["dtensor_cfg"]["automodel_kwargs"] = {"force_hf": False}
+
+        with pytest.raises(ValueError, match="expert_parallel_size"):
+            setup_distributed(mock_config, mock_runtime_config)
+
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_native_moe_rejects_single_gpu(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_create_mesh,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+    ):
+        """Single-rank AutoModel skips the mixed precision required by FA2."""
+        mock_torch_dist.get_world_size.return_value = 1
+        mock_runtime_config.model_config.model_type = "qwen3_moe"
+        mock_config["shared_prefix_training"] = True
+        mock_config["dtensor_cfg"].update(
+            {
+                "expert_parallel_size": 1,
+                "automodel_kwargs": {"force_hf": False},
+            }
+        )
+
+        with pytest.raises(ValueError, match="world_size > 1"):
+            setup_distributed(mock_config, mock_runtime_config)
+
+        mock_fsdp2_config.assert_not_called()
+        mock_moe_config.assert_not_called()
+        mock_create_mesh.assert_not_called()
+
+    @patch("nemo_rl.models.automodel.setup._prewarm_native_shared_prefix_moe_world")
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_prewarms_native_shared_prefix_ep(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_create_mesh,
+        mock_moe_config,
+        mock_prewarm,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
+    ):
+        """Native EP communicator is initialized before model/FSDP setup."""
+        events = []
+        mock_torch_dist.init_process_group.side_effect = lambda **_: events.append(
+            "init"
+        )
+        mock_torch_dist.get_world_size.return_value = 8
+        mock_prewarm.side_effect = lambda _: events.append("prewarm")
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
+        mock_moe_config.return_value.ignore_router_for_ac = False
+        mock_moe_mesh = MagicMock()
+        mock_create_mesh.side_effect = lambda *_, **__: (
+            events.append("mesh") or (mock_device_mesh, mock_moe_mesh)
+        )
+        mock_runtime_config.model_config.model_type = "qwen3_moe"
+        mock_config["shared_prefix_training"] = True
+        mock_config["dtensor_cfg"].update(
+            {
+                "expert_parallel_size": 4,
+                "activation_checkpointing": True,
+                "automodel_kwargs": {"force_hf": False},
+            }
+        )
+
+        setup_distributed(mock_config, mock_runtime_config)
+
+        mock_prewarm.assert_called_once_with(8)
+        assert events[:3] == ["init", "prewarm", "mesh"]
+        assert mock_moe_config.return_value.ignore_router_for_ac is False
+
+    @patch("nemo_rl.models.automodel.setup._prewarm_native_shared_prefix_moe_world")
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_skips_world_prewarm_without_ep_shard(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_create_mesh,
+        mock_moe_config,
+        mock_prewarm,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
+    ):
+        """EP=world has no overlapping EP-shard communicator to order."""
+        mock_torch_dist.get_world_size.return_value = 4
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
+        mock_create_mesh.return_value = (mock_device_mesh, MagicMock())
+        mock_runtime_config.model_config.model_type = "qwen3_moe"
+        mock_config["shared_prefix_training"] = True
+        mock_config["dtensor_cfg"].update(
+            {
+                "expert_parallel_size": 4,
+                "automodel_kwargs": {"force_hf": False},
+            }
+        )
+
+        setup_distributed(mock_config, mock_runtime_config)
+
+        mock_prewarm.assert_not_called()
+
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_native_moe_keeps_router_checkpoint_setting(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_create_mesh,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
+    ):
+        """Native shared-prefix setup preserves the recipe's AC strategy."""
+        mock_torch_dist.get_world_size.return_value = 2
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value.ignore_router_for_ac = True
+        mock_create_mesh.return_value = (mock_device_mesh, None)
+        mock_runtime_config.model_config.model_type = "qwen3_moe"
+        mock_config["shared_prefix_training"] = True
+        mock_config["dtensor_cfg"].update(
+            {
+                "expert_parallel_size": 1,
+                "activation_checkpointing": True,
+                "moe_parallelizer": {"ignore_router_for_ac": True},
+                "automodel_kwargs": {"force_hf": False},
+            }
+        )
+
+        setup_distributed(mock_config, mock_runtime_config)
+
+        mock_moe_config.assert_called_once_with(ignore_router_for_ac=True)
+        assert mock_moe_config.return_value.ignore_router_for_ac is True
+
+
+def test_prewarm_native_shared_prefix_moe_world_uses_default_group():
+    """Prewarm initializes default NCCL before overlapping meshes exist."""
+    with (
+        patch(
+            "nemo_rl.models.automodel.setup.torch.cuda.current_device",
+            return_value=3,
+        ),
+        patch("nemo_rl.models.automodel.setup.torch.zeros") as mock_zeros,
+        patch("nemo_rl.models.automodel.setup.torch.empty") as mock_empty,
+        patch(
+            "nemo_rl.models.automodel.setup.torch.distributed.all_gather_into_tensor"
+        ) as mock_all_gather,
+        patch(
+            "nemo_rl.models.automodel.setup.torch.cuda.synchronize"
+        ) as mock_synchronize,
+    ):
+        token = MagicMock()
+        gathered = MagicMock()
+        mock_zeros.return_value = token
+        mock_empty.return_value = gathered
+        _prewarm_native_shared_prefix_moe_world(8)
+
+    mock_zeros.assert_called_once_with(
+        1,
+        dtype=torch.int64,
+        device=torch.device("cuda", 3),
+    )
+    mock_empty.assert_called_once_with(
+        8,
+        dtype=torch.int64,
+        device=torch.device("cuda", 3),
+    )
+    mock_all_gather.assert_called_once_with(gathered, token)
+    mock_synchronize.assert_called_once_with(torch.device("cuda", 3))
 
 
 @pytest.mark.automodel
@@ -1518,6 +2162,97 @@ class TestSetupModelAndOptimizer:
 
         assert result.is_moe_model is True
 
+    @patch("nemo_rl.models.automodel.setup.enable_custom_qwen3_moe_shared_prefix")
+    @patch("nemo_rl.models.automodel.setup.enable_qwen3_moe_ep_free_checkpoint_adapter")
+    @patch("nemo_rl.models.automodel.setup.enable_qwen3_moe_configured_dtype")
+    @patch(
+        "nemo_rl.models.automodel.setup.enable_qwen3_moe_checkpoint_wrapper_compatibility"
+    )
+    @patch("nemo_rl.models.automodel.setup.enable_qwen3_moe_ep_router_gradients")
+    @patch("nemo_rl.models.automodel.setup._maybe_set_force_hf")
+    @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.setup.get_class")
+    @pytest.mark.parametrize("expert_parallel_size", [1, 2])
+    @pytest.mark.parametrize("activation_checkpointing", [False, True])
+    def test_qwen3_moe_ep_uses_custom_model_adapter(
+        self,
+        mock_get_class,
+        mock_get_rank,
+        mock_lambda_lr,
+        mock_maybe_set_force_hf,
+        mock_enable_ep_router_gradients,
+        mock_enable_checkpoint_wrapper_compatibility,
+        mock_enable_configured_dtype,
+        mock_enable_ep_free_checkpoint_adapter,
+        mock_enable_custom_qwen3_moe,
+        mock_config,
+        mock_runtime_config,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+        expert_parallel_size,
+        activation_checkpointing,
+    ):
+        """Install only the native compatibility patches needed by each EP mode."""
+        mock_get_rank.return_value = 0
+        mock_lambda_lr.return_value = MagicMock()
+        mock_config["shared_prefix_training"] = True
+        source_automodel_kwargs = _native_qwen3_moe_kwargs(
+            moe_overrides={"gate_bias_update_factor": 0.0}
+        )
+        mock_config["dtensor_cfg"].update(
+            {
+                "expert_parallel_size": expert_parallel_size,
+                "activation_checkpointing": activation_checkpointing,
+                "automodel_kwargs": source_automodel_kwargs,
+            }
+        )
+
+        mock_model = MagicMock()
+        mock_model.state_dict.return_value = {
+            "model.layers.0.mlp.experts.weight": torch.zeros(4, 4, 4)
+        }
+        mock_model.config = MagicMock()
+        mock_model.config.pad_token_id = 0
+        mock_runtime_config.model_class.from_pretrained.return_value = mock_model
+        mock_runtime_config.model_config.model_type = "qwen3_moe"
+        mock_runtime_config.model_config.architectures = ["Qwen3MoeForCausalLM"]
+        mock_get_class.return_value = MagicMock(return_value=MagicMock())
+
+        result = setup_model_and_optimizer(
+            config=mock_config,
+            tokenizer=mock_tokenizer,
+            runtime_config=mock_runtime_config,
+            distributed_context=mock_distributed_context,
+            checkpoint_manager=mock_checkpoint_manager,
+        )
+
+        mock_maybe_set_force_hf.assert_called_once()
+        mock_enable_configured_dtype.assert_called_once_with()
+        if activation_checkpointing:
+            mock_enable_checkpoint_wrapper_compatibility.assert_called_once_with()
+        else:
+            mock_enable_checkpoint_wrapper_compatibility.assert_not_called()
+        if expert_parallel_size == 1:
+            mock_enable_ep_free_checkpoint_adapter.assert_called_once_with()
+            mock_enable_ep_router_gradients.assert_not_called()
+        else:
+            mock_enable_ep_free_checkpoint_adapter.assert_not_called()
+            mock_enable_ep_router_gradients.assert_called_once_with()
+        mock_enable_custom_qwen3_moe.assert_called_once_with(mock_model)
+        model_kwargs = mock_runtime_config.model_class.from_pretrained.call_args.kwargs
+        assert model_kwargs["force_hf"] is False
+        assert model_kwargs["moe_overrides"] == {"gate_bias_update_factor": 0.0}
+        assert source_automodel_kwargs == _native_qwen3_moe_kwargs(
+            moe_overrides={"gate_bias_update_factor": 0.0}
+        )
+        assert model_kwargs["moe_config"] is (
+            None if expert_parallel_size == 1 else mock_distributed_context.moe_config
+        )
+        assert model_kwargs["torch_dtype"] == "float32"
+        assert result.is_moe_model is True
+
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_with_cp_raises_for_vlm(
@@ -1684,7 +2419,15 @@ class TestSetupModelAndOptimizer:
             "backend": {
                 "_target_": "some.backend.Class",
                 "param1": "value1",
-            }
+            },
+            "attn_implementation": "eager",
+        }
+        original_automodel_kwargs = {
+            "backend": {
+                "_target_": "some.backend.Class",
+                "param1": "value1",
+            },
+            "attn_implementation": "eager",
         }
 
         setup_model_and_optimizer(
@@ -1697,6 +2440,9 @@ class TestSetupModelAndOptimizer:
 
         mock_resolve_target.assert_called_once_with("some.backend.Class")
         mock_backend_class.assert_called_once_with(param1="value1")
+        assert (
+            mock_config["dtensor_cfg"]["automodel_kwargs"] == original_automodel_kwargs
+        )
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
