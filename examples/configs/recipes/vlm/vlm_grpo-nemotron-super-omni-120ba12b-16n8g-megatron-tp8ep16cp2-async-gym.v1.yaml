@@ -124,7 +124,6 @@ env:
     policy_max_input_tokens: ${policy.max_total_sequence_length}
     skip_venv_if_present: true
     pad_dynamic_image_shapes: true
-    sanitize_image_placeholders: true
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/math_with_judge/configs/math_with_judge.yaml
