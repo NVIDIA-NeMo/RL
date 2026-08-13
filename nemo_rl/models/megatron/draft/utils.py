@@ -18,11 +18,17 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Optional
 
 import torch
 import torch.distributed as dist
+from megatron.bridge.training.config import (
+    OptimizerConfigOverrideProvider,
+    OptimizerConfigOverrideProviderContext,
+)
 from megatron.core import parallel_state
+from megatron.core.optimizer import ParamKey
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.utils import unwrap_model
@@ -960,7 +966,7 @@ def _require_state_tensor(
 ) -> Tensor:
     if parameter_name not in source_state:
         raise RuntimeError(
-            f"[draft] Missing required Eagle parameter '{parameter_name}' while "
+            f"[draft] Missing required draft parameter '{parameter_name}' while "
             "exporting weights."
         )
     return source_state[parameter_name]
@@ -1122,6 +1128,11 @@ def get_policy_lm_head_weight(policy_model_chunk: MegatronModule) -> torch.Tenso
 
 
 def _get_draft_output_layer(draft_model: MegatronModule):
+    # Block drafts (DFlash/DSpark) expose the LM head as `output_layer`;
+    # the Eagle path keeps modelopt's `eagle_module.eagle_output_layer`.
+    block_output_layer = getattr(draft_model, "output_layer", None)
+    if block_output_layer is not None:
+        return block_output_layer
     draft_output_layer = getattr(
         getattr(draft_model, "eagle_module", None), "eagle_output_layer", None
     )
@@ -1139,7 +1150,7 @@ def _get_draft_to_target_token_mapping(
 ) -> torch.Tensor:
     draft_vocab_size = int(draft_model.config.draft_vocab_size)
     reverse_mapping = torch.arange(draft_vocab_size, device=device, dtype=torch.long)
-    d2t = getattr(draft_model.eagle_module, "d2t", None)
+    d2t = getattr(getattr(draft_model, "eagle_module", None), "d2t", None)
     if d2t is not None:
         reverse_mapping = reverse_mapping + d2t.to(device=device, dtype=torch.long)
     return reverse_mapping
@@ -1203,6 +1214,32 @@ def copy_policy_lm_head_to_draft(
         )
 
 
+def get_policy_embedding_row(
+    policy_model_chunk: MegatronModule, token_id: int
+) -> torch.Tensor:
+    """Look up one policy embedding row, TP-correctly, via the module forward.
+
+    Used for the block drafts' mask embedding: the official DFlash contract
+    embeds mask slots with the target's FROZEN ``embed_tokens[mask_token_id]``
+    row (callers detach; the row is never trained). The module forward handles
+    the vocab-parallel lookup + all-reduce.
+    """
+    unwrapped_policy_model = unwrap_model(policy_model_chunk)
+    embedding_owner = getattr(unwrapped_policy_model, "embedding", None)
+    if embedding_owner is None:
+        language_model = getattr(unwrapped_policy_model, "language_model", None)
+        embedding_owner = getattr(language_model, "embedding", None)
+    if embedding_owner is None:
+        raise RuntimeError(
+            "[draft] Block draft training requires the policy embedding on "
+            "this rank (pipeline_model_parallel_size must be 1)."
+        )
+    device = embedding_owner.word_embeddings.weight.device
+    return embedding_owner.word_embeddings(
+        torch.tensor([int(token_id)], device=device)
+    )[0]
+
+
 DRAFT_GRAD_NORM_GROUP = "draft"
 
 
@@ -1225,15 +1262,390 @@ def register_draft_grad_norm_group() -> None:
         )
 
 
+# Keys appended to mcore's ``param_group_identifier_keys`` so checkpoint
+# resume can tell the draft param group apart from the policy group (see
+# extend_param_group_identifier_keys_for_resume).
+_PARAM_GROUP_IDENTIFIER_EXTRA_KEYS = ("max_lr", "min_lr")
+
+
+def extend_param_group_identifier_keys_for_resume() -> None:
+    """Include per-group LR in mcore's param-group identity used at resume.
+
+    mcore matches checkpointed optimizer param groups to runtime param groups
+    by the identity tuple ``param_group_identifier_keys = ('wd_mult',
+    'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')``. That tuple keys a
+    plain dict in both load paths (``MegatronOptimizer.
+    _filter_and_reorder_param_groups`` in megatron/core/optimizer/optimizer.py
+    and the inline ``make_needed_groups``/``param_groups_map`` in
+    ``DistributedOptimizer.load_state_dict`` in distrib_optimizer.py). The
+    draft group built by :class:`DraftOptimizerConfigOverrideProvider` differs
+    from the policy group only in ``max_lr``/``min_lr``/``start_wd``/``end_wd``
+    — none of which are identity keys — so both groups hash to the same key,
+    the last group wins the dict insert, and a resumed run silently trains the
+    policy at the draft hyperparameters (observed: policy at 50x LR after
+    resume, validation-accuracy collapse).
+
+    Appending ``max_lr``/``min_lr`` makes the identity unique whenever the
+    draft LR differs from the policy LR. Only these two are safe to append:
+    every group built by ``_get_param_groups`` carries them, while
+    ``start_wd``/``end_wd`` exist only on override groups and would raise in
+    ``make_needed_groups``. Checkpoints written before this patch carry the
+    same fields with the same values, so they remain loadable. Changing the
+    draft LR between save and resume now fails loudly at checkpoint load
+    (key-not-found) instead of silently keeping the checkpointed LR.
+    """
+    # Deferred import: keep the mcore optimizer modules a load-time dependency
+    # of this patch only, not of every draft.utils import.
+    from megatron.core import optimizer as mcore_optimizer_pkg
+    from megatron.core.optimizer import distrib_optimizer as mcore_distrib_optimizer
+    from megatron.core.optimizer import optimizer as mcore_optimizer
+
+    # distrib_optimizer binds the tuple into its own namespace via
+    # ``from ... import``, so each consuming module is patched; the package
+    # module only re-exports the name but is kept in sync for readers.
+    for module in (mcore_optimizer, mcore_distrib_optimizer, mcore_optimizer_pkg):
+        keys = module.param_group_identifier_keys
+        missing = tuple(
+            key for key in _PARAM_GROUP_IDENTIFIER_EXTRA_KEYS if key not in keys
+        )
+        if missing:
+            module.param_group_identifier_keys = (*keys, *missing)
+
+
+@dataclass
+class DraftOptimizerConfigOverrideProvider(OptimizerConfigOverrideProvider):
+    """Give ``draft_model.*`` params their own optimizer param group.
+
+    Extends the standard megatron-bridge overrides with a draft-only group so
+    the draft model trains at its own learning rate / weight decay while the
+    policy keeps the ``megatron_cfg.optimizer`` settings (FastGRPO trains the
+    draft at ~50x the policy LR during online draft learning). The schedule
+    *shape* (warmup iters, decay style) stays shared; only the per-group
+    max/min LR and weight-decay endpoints differ.
+
+    The draft (max_lr, min_lr) pair must differ from the policy's: it is what
+    identifies the draft group when a resumed run maps checkpointed param
+    groups back onto runtime groups (see
+    :func:`extend_param_group_identifier_keys_for_resume`). A draft override
+    that matches the policy pair exactly is rejected here rather than risking
+    the groups being conflated at the next resume.
+    """
+
+    draft_lr: Optional[float]
+    draft_min_lr: Optional[float]
+    draft_weight_decay: Optional[float]
+
+    def build_config_overrides(
+        self, context: OptimizerConfigOverrideProviderContext
+    ) -> dict[ParamKey, ParamGroupOverride] | None:
+        overrides = super().build_config_overrides(context) or {}
+        draft_override = ParamGroupOverride()
+        if self.draft_lr is not None:
+            draft_override["max_lr"] = float(self.draft_lr)
+            # A draft head generally wants to keep a high LR even when the
+            # policy LR decays, so min_lr follows the draft LR unless set.
+            draft_override["min_lr"] = float(
+                self.draft_min_lr if self.draft_min_lr is not None else self.draft_lr
+            )
+        elif self.draft_min_lr is not None:
+            draft_override["min_lr"] = float(self.draft_min_lr)
+        if self.draft_weight_decay is not None:
+            draft_override["start_wd"] = float(self.draft_weight_decay)
+            draft_override["end_wd"] = float(self.draft_weight_decay)
+
+        base_config = context.optimizer_config
+        effective_max_lr = draft_override.get("max_lr", base_config.lr)
+        effective_min_lr = draft_override.get("min_lr", base_config.min_lr)
+        if (effective_max_lr, effective_min_lr) == (base_config.lr, base_config.min_lr):
+            raise ValueError(
+                "[draft] policy.draft optimizer overrides must give the draft "
+                "group a (lr, min_lr) pair distinct from the policy's "
+                f"({base_config.lr}, {base_config.min_lr}); otherwise checkpoint "
+                "resume cannot tell the two param groups apart and would apply "
+                "the wrong hyperparameters to the policy. Set policy.draft.lr "
+                "(and/or min_lr) to a different value, or leave all "
+                "policy.draft optimizer keys null to share the policy settings."
+            )
+
+        overrides[ParamKey(name="*draft_model.*")] = draft_override
+        return overrides
+
+
+def build_draft_optimizer_override_provider(
+    draft_config: Mapping[str, Any],
+) -> Optional[DraftOptimizerConfigOverrideProvider]:
+    """Build the draft optimizer override provider from ``policy.draft`` config.
+
+    Returns None when the config requests no draft-specific optimizer settings,
+    so the caller falls back to megatron-bridge's default provider and the
+    optimizer param-group partition is byte-identical to a no-override run.
+    """
+    draft_lr = draft_config.get("lr")
+    draft_min_lr = draft_config.get("min_lr")
+    draft_weight_decay = draft_config.get("weight_decay")
+    if draft_lr is None and draft_min_lr is None and draft_weight_decay is None:
+        return None
+    # A draft param group exists from the first step, so the resume-matching
+    # patch must be in place before the optimizer state is ever saved/loaded.
+    extend_param_group_identifier_keys_for_resume()
+    return DraftOptimizerConfigOverrideProvider(
+        draft_lr=draft_lr,
+        draft_min_lr=draft_min_lr,
+        draft_weight_decay=draft_weight_decay,
+    )
+
+
+def _build_block_draft_model(
+    model_provider,
+    draft_config: dict[str, Any],
+    pg_collection: ProcessGroupCollection,
+    policy_model_chunk: MegatronModule,
+) -> MegatronModule:
+    """Build a DFlash/DSpark block draft model.
+
+    The full implementation lives in ``draft/dflash.py``; DSpark subclasses
+    it in ``draft/dspark.py``.
+    """
+    from transformers import AutoConfig
+
+    from nemo_rl.models.megatron.draft.dflash import (
+        SUPPORTED_BLOCK_DRAFT_METHODS,
+    )
+    from nemo_rl.models.megatron.draft.hidden_capture import (
+        get_eagle3_aux_hidden_state_layers,
+    )
+
+    method = draft_config["method"]
+    if method not in SUPPORTED_BLOCK_DRAFT_METHODS:
+        raise ValueError(
+            f"policy.draft.method must be one of {SUPPORTED_BLOCK_DRAFT_METHODS}, "
+            f"got '{method}'."
+        )
+    if int(model_provider.pipeline_model_parallel_size or 1) != 1:
+        raise ValueError(
+            "policy.draft.method dflash/dspark requires pipeline_model_parallel_size "
+            "== 1 (the policy embedding row for the mask token must live on the "
+            "draft owner rank)."
+        )
+    if int(getattr(model_provider, "context_parallel_size", 1) or 1) != 1:
+        raise ValueError(
+            "policy.draft.method dflash/dspark requires context_parallel_size == 1."
+        )
+    if bool(model_provider.sequence_parallel):
+        raise ValueError(
+            "policy.draft.method dflash/dspark requires sequence_parallel == false."
+        )
+
+    model_name = draft_config.get("model_name")
+    hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
+    hf_drafter_config = dict(hf_config.get("dflash_config") or {})
+
+    # Training implements full non-causal block attention with no sliding
+    # window / attention sink and (DSpark) no bonus-anchor slot. A checkpoint
+    # requesting a different serving-side structure (vLLM resolves these
+    # fields in qwen3_dflash._resolve_layer_attention and the DSpark
+    # speculator) would silently train a mismatched draft — reject it.
+    unsupported_structure: list[str] = []
+    if hf_drafter_config.get("causal"):
+        unsupported_structure.append("dflash_config.causal=true")
+    layer_types = hf_config.get("layer_types")
+    if layer_types:
+        draft_layer_types = layer_types[: int(hf_config.get("num_hidden_layers", 1))]
+        if any(layer_type != "full_attention" for layer_type in draft_layer_types):
+            unsupported_structure.append(f"layer_types={draft_layer_types}")
+    if hf_drafter_config.get("swa_window_size") or hf_config.get("sliding_window"):
+        unsupported_structure.append("sliding-window attention")
+    if hf_drafter_config.get("add_swa_attention_sink_bias") or hf_config.get(
+        "add_swa_attention_sink_bias"
+    ):
+        unsupported_structure.append("SWA attention-sink bias")
+    if method == "dspark" and hf_config.get("dspark_bonus_anchor"):
+        unsupported_structure.append("dspark_bonus_anchor=true")
+    if unsupported_structure:
+        raise NotImplementedError(
+            "[draft] Block draft training only implements full non-causal "
+            "block attention; the checkpoint requests unsupported structure: "
+            + ", ".join(unsupported_structure)
+        )
+
+    mask_token_id = draft_config.get("mask_token_id")
+    if mask_token_id is None:
+        mask_token_id = hf_drafter_config.get("mask_token_id")
+    if mask_token_id is None:
+        raise ValueError(
+            "policy.draft.mask_token_id is required for dflash/dspark (pick a "
+            "reserved, unused-in-data token id; its target embedding row "
+            "becomes the mask embedding)."
+        )
+    hf_mask_token_id = hf_drafter_config.get("mask_token_id")
+    if hf_mask_token_id is not None and int(hf_mask_token_id) != int(mask_token_id):
+        raise ValueError(
+            f"[draft] policy.draft.mask_token_id={mask_token_id} conflicts with "
+            f"the checkpoint's dflash_config.mask_token_id={hf_mask_token_id}."
+        )
+
+    config = TransformerConfig(
+        normalization="RMSNorm",
+        activation_func=torch.nn.functional.silu,
+        gated_linear_unit=True,
+        hidden_dropout=0.0,
+        attention_softmax_in_fp32=False,
+        tensor_model_parallel_size=model_provider.tensor_model_parallel_size,
+        pipeline_model_parallel_size=model_provider.pipeline_model_parallel_size,
+        expert_tensor_parallel_size=model_provider.expert_tensor_parallel_size,
+        sequence_parallel=model_provider.sequence_parallel,
+        use_cpu_initialization=model_provider.use_cpu_initialization,
+        fp16=model_provider.fp16,
+        bf16=model_provider.bf16,
+        params_dtype=model_provider.params_dtype,
+        pipeline_dtype=model_provider.pipeline_dtype,
+        num_layers=(
+            hf_config.get("num_hidden_layers", 1)
+            if model_name is not None
+            else draft_config.get("num_layers") or 1
+        ),
+        ffn_hidden_size=hf_config.get(
+            "intermediate_size", model_provider.ffn_hidden_size
+        ),
+        num_attention_heads=hf_config.get(
+            "num_attention_heads", model_provider.num_attention_heads
+        ),
+        kv_channels=hf_config.get("head_dim", model_provider.kv_channels),
+        num_query_groups=hf_config.get(
+            "num_key_value_heads", model_provider.num_query_groups
+        ),
+        init_method_std=model_provider.init_method_std,
+        layernorm_epsilon=hf_config.get(
+            "rms_norm_eps", model_provider.layernorm_epsilon
+        ),
+        add_bias_linear=hf_config.get("attention_bias", False),
+        attention_dropout=0.0,
+        qk_layernorm=bool(draft_config.get("qk_layernorm", True)),
+    )
+    config.hidden_size = hf_config.get("hidden_size", model_provider.hidden_size)
+    config.vocab_size = hf_config.get("vocab_size", model_provider.vocab_size)
+    # v1 trains full-vocab block drafts (no d2t).
+    config.draft_vocab_size = config.vocab_size
+    config.seq_length = model_provider.seq_length
+    config.gradient_accumulation_fusion = False
+    config.apply_rope_fusion = False
+    config.position_embedding_type = "rope"
+    config.rotary_percent = model_provider.rotary_percent
+    config.rotary_base = hf_config.get("rope_theta", model_provider.rotary_base)
+    # Official z-lab configs carry an explicit "rope_scaling": null — a
+    # present-but-null key must read as "no scaling", not crash on None.get.
+    hf_rope_scaling = (hf_config.get("rope_scaling") or {}) if hf_config else None
+    config.rope_scaling = (
+        bool(hf_rope_scaling) if hf_config else model_provider.rope_scaling
+    )
+    config.rope_scaling_factor = (
+        hf_rope_scaling.get("factor", model_provider.rope_scaling_factor)
+        if hf_config
+        else model_provider.rope_scaling_factor
+    )
+
+    if int(mask_token_id) < 0 or int(mask_token_id) >= int(config.vocab_size):
+        raise ValueError(
+            f"[draft] mask_token_id={mask_token_id} is outside the vocab "
+            f"(vocab_size={config.vocab_size})."
+        )
+
+    aux_layer_ids = [
+        int(i)
+        for i in (
+            hf_drafter_config.get("target_layer_ids")
+            or draft_config.get("aux_layer_indices")
+            or get_eagle3_aux_hidden_state_layers(model_provider.num_layers)
+        )
+    ]
+    num_policy_layers = int(model_provider.num_layers)
+    if (
+        not aux_layer_ids
+        or aux_layer_ids != sorted(set(aux_layer_ids))
+        or aux_layer_ids[0] < 0
+        or aux_layer_ids[-1] >= num_policy_layers
+    ):
+        raise ValueError(
+            f"[draft] aux layers {aux_layer_ids} (checkpoint target_layer_ids / "
+            "policy.draft.aux_layer_indices) must be unique, ascending, and in "
+            f"[0, {num_policy_layers}) of the policy — the trainer capture "
+            "concatenates taps in ascending layer order, matching vLLM's "
+            "target_layer_ids order."
+        )
+    config.eagle_aux_hidden_state_layer_ids = list(aux_layer_ids)
+
+    shared_kwargs = dict(
+        config=config,
+        gamma=int(draft_config["gamma"]),
+        mask_token_id=int(mask_token_id),
+        num_aux_hidden_states=len(aux_layer_ids),
+        target_hidden_size=model_provider.hidden_size,
+        trunk_chunk=int(draft_config.get("trunk_chunk") or 1024),
+    )
+    if method == "dflash":
+        from nemo_rl.models.megatron.draft.dflash import DFlashDraftModel
+
+        draft_model = DFlashDraftModel(**shared_kwargs)
+    else:
+        from nemo_rl.models.megatron.draft.dspark import DSparkDraftModel
+
+        draft_model = DSparkDraftModel(
+            markov_rank=int(draft_config.get("markov_rank") or 64),
+            **shared_kwargs,
+        )
+    tp_group = getattr(pg_collection, "tp", None)
+    if tp_group is not None:
+        for module in draft_model.modules():
+            if hasattr(module, "pg_collection"):
+                module.pg_collection = pg_collection
+            if hasattr(module, "_pg_collection"):
+                module._pg_collection = pg_collection
+            if hasattr(module, "tp_group"):
+                module.tp_group = tp_group
+            if hasattr(module, "_tp_group"):
+                module._tp_group = tp_group
+
+    if model_name is not None:
+        missing_keys, unexpected_keys = load_hf_weights_to_block_draft(
+            draft_model, model_name
+        )
+        # TE _extra_state entries (fp8 scales etc.) legitimately have no
+        # checkpoint counterpart; anything else unexplained means the draft
+        # would silently train from partially-random weights (or the mapping
+        # is out of date) — fail instead of printing.
+        missing_keys = [key for key in missing_keys if "_extra_state" not in key]
+        unexpected_keys = [key for key in unexpected_keys if "_extra_state" not in key]
+        if missing_keys or unexpected_keys:
+            raise RuntimeError(
+                "[draft] Block draft checkpoint does not match the model: "
+                f"missing keys {missing_keys}, unexpected keys {unexpected_keys}."
+            )
+
+    return draft_model
+
+
 def build_draft_model(
     model_provider,
     draft_config: dict[str, Any],
     pg_collection: ProcessGroupCollection,
     policy_model_chunk: MegatronModule,
 ) -> MegatronModule | None:
-    """Build an Eagle draft model before parent mixed-precision/DDP wrapping."""
+    """Build a draft model (Eagle or DFlash/DSpark) before parent DDP wrapping."""
     if not draft_config["enabled"]:
         return None
+
+    if draft_config.get("method", "eagle3") in ("dflash", "dspark"):
+        draft_model = _build_block_draft_model(
+            model_provider=model_provider,
+            draft_config=draft_config,
+            pg_collection=pg_collection,
+            policy_model_chunk=policy_model_chunk,
+        )
+        # Same separate grad-norm group + param tagging as the Eagle path.
+        register_draft_grad_norm_group()
+        for param in draft_model.parameters():
+            param.grad_norm_group = DRAFT_GRAD_NORM_GROUP
+        return draft_model
 
     from transformers import AutoConfig
 
@@ -1296,11 +1708,14 @@ def build_draft_model(
     )
     config.rotary_percent = model_provider.rotary_percent
     config.rotary_base = hf_config.get("rope_theta", model_provider.rotary_base)
+    # Official z-lab configs carry an explicit "rope_scaling": null — a
+    # present-but-null key must read as "no scaling", not crash on None.get.
+    hf_rope_scaling = (hf_config.get("rope_scaling") or {}) if hf_config else None
     config.rope_scaling = (
-        "rope_scaling" in hf_config if hf_config else model_provider.rope_scaling
+        bool(hf_rope_scaling) if hf_config else model_provider.rope_scaling
     )
     config.rope_scaling_factor = (
-        hf_config.get("rope_scaling", {}).get("factor")
+        hf_rope_scaling.get("factor", model_provider.rope_scaling_factor)
         if hf_config
         else model_provider.rope_scaling_factor
     )
@@ -1330,7 +1745,23 @@ def build_draft_model(
     config.use_mtp_layernorm = config.parallel_draft_heads_num_layers = None
     config.has_lm_head = True
 
-    draft_model = EagleModel(config=config)
+    ttt_steps = int(draft_config.get("ttt_steps", 1) or 1)
+    if ttt_steps > 1:
+        # The TTT attention/loss path slices sequences locally and stashes
+        # per-pass KV; both require every rank to see the full sequence.
+        if int(getattr(model_provider, "context_parallel_size", 1) or 1) != 1:
+            raise ValueError(
+                "policy.draft.ttt_steps > 1 requires context_parallel_size == 1."
+            )
+        if bool(model_provider.sequence_parallel):
+            raise ValueError(
+                "policy.draft.ttt_steps > 1 requires sequence_parallel == false."
+            )
+
+    draft_model = EagleModel(
+        config=config,
+        ttt_steps=ttt_steps,
+    )
     tp_group = getattr(pg_collection, "tp", None)
     if tp_group is not None:
         for module in draft_model.modules():
@@ -1377,3 +1808,344 @@ def build_draft_model(
         param.grad_norm_group = DRAFT_GRAD_NORM_GROUP
 
     return draft_model
+
+
+# ---------------------------------------------------------------------------
+# HF <-> Megatron weight mapping for DFlash/DSpark block draft models.
+#
+# The checkpoint-side names are exactly what vLLM 0.26's
+# ``DFlashQwen3ForCausalLM.load_weights`` / ``Qwen3DSparkForCausalLM.load_weights``
+# consume (root-level ``fc.weight`` / ``hidden_norm.weight`` / ``norm.weight`` /
+# ``layers.{i}.*`` in Qwen3 naming, plus ``markov_head.markov_w{1,2}.weight``
+# for DSpark; NO lm_head — official DFlash contract, vLLM shares the target's)
+# — the trainer streams these under a ``draft.`` prefix at refit time and
+# ``vllm_backend`` routes them into the drafter. Sibling of the Eagle mapping
+# above, sharing its TP-aware primitives; the model-side names are the fixed
+# ``DFlashDraftModel`` layout, so no layout detection is needed.
+# ---------------------------------------------------------------------------
+
+# Checkpoint keys that are deliberately not represented in the Megatron model.
+_SKIPPED_KEY_SUBSTRINGS = (
+    # Shared from the target at serving time; training reads the captured
+    # target embeddings directly.
+    "embed_tokens",
+    # Official DFlash contract: the draft owns no LM head (it projects
+    # through the target's live head; vLLM shares the target module with a
+    # head-less drafter). Tolerated here so pre-contract checkpoints load.
+    "lm_head",
+    # Official contract: mask slots embed via the target's frozen
+    # embed_tokens[mask_token_id] row; a separately-shipped mask embedding
+    # (interim checkpoints / trained-mask variants) is ignored.
+    "mask_embedding",
+    # Not wired into vLLM inference (its loader skips it too); not trained.
+    "confidence_head",
+    # Training-only vocab map of speculators-format checkpoints.
+    "t2d",
+)
+
+
+def _block_layer_model_prefix(layer_index: int) -> str:
+    return f"decoder.layers.{layer_index}"
+
+
+def _block_split_axis_map(model_state: StateDict) -> dict[str, int]:
+    split_axis: dict[str, int] = {
+        "markov_w2.weight": 0,
+    }
+    for key in model_state:
+        if key.endswith("self_attention.linear_qkv.weight"):
+            split_axis[key] = 0
+        elif key.endswith("self_attention.linear_proj.weight"):
+            split_axis[key] = 1
+        elif key.endswith("mlp.linear_fc1.weight"):
+            split_axis[key] = 0
+        elif key.endswith("mlp.linear_fc2.weight"):
+            split_axis[key] = 1
+    return split_axis
+
+
+def load_hf_weights_to_block_draft(
+    model: torch.nn.Module,
+    model_name: str,
+) -> tuple[list[str], list[str]]:
+    """Load a DFlash/DSpark HF checkpoint (local path or Hub repo) into the draft.
+
+    Returns ``(missing_keys, unexpected_keys)`` from the (non-strict) state
+    dict load, after removing the deliberately unmapped model params.
+    """
+    if not model_name or not model_name.strip():
+        raise ValueError(
+            "load_hf_weights_to_block_draft requires a non-empty model name or path."
+        )
+
+    hf_state = _load_checkpoint_state(model_name)
+    unwrapped = unwrap_model(model)
+    model_state = unwrapped.state_dict()
+    config = unwrapped.config
+    tp_rank = _get_tp_rank()
+
+    mapped_state: StateDict = {}
+    pending_by_layer: dict[int, _PendingLayerWeights] = {}
+    skipped: list[str] = []
+
+    for raw_key, weight in hf_state.items():
+        hf_key = raw_key.removeprefix("model.").removeprefix("draft.")
+        if hf_key.startswith("midlayer."):
+            hf_key = "layers.0." + hf_key.removeprefix("midlayer.")
+
+        if hf_key == "d2t":
+            raise NotImplementedError(
+                "Block draft training only supports full-vocab drafts; the "
+                f"checkpoint '{model_name}' ships a reduced-vocab d2t map."
+            )
+        if any(substr in hf_key for substr in _SKIPPED_KEY_SUBSTRINGS):
+            skipped.append(hf_key)
+            continue
+
+        if hf_key == "fc.weight":
+            mapped_state["fc.weight"] = weight
+            continue
+        if hf_key == "hidden_norm.weight":
+            mapped_state["hidden_norm.weight"] = weight
+            continue
+        if hf_key == "norm.weight":
+            mapped_state["decoder.final_layernorm.weight"] = weight
+            continue
+        if hf_key == "markov_head.markov_w1.weight":
+            mapped_state["markov_w1.weight"] = weight
+            continue
+        if hf_key == "markov_head.markov_w2.weight":
+            mapped_state["markov_w2.weight"] = weight
+            continue
+
+        layer_match = _CHECKPOINT_LAYER_KEY_PATTERN.match(hf_key)
+        if layer_match is None:
+            skipped.append(hf_key)
+            continue
+        layer_index = int(layer_match.group(1))
+        layer_key = layer_match.group(2)
+        prefix = _block_layer_model_prefix(layer_index)
+        pending = pending_by_layer.setdefault(layer_index, _PendingLayerWeights())
+
+        if layer_key == "self_attn.q_proj.weight":
+            pending.q_weight = weight
+        elif layer_key == "self_attn.k_proj.weight":
+            pending.k_weight = weight
+        elif layer_key == "self_attn.v_proj.weight":
+            pending.v_weight = weight
+        elif layer_key == "self_attn.qkv_proj.weight":
+            pending.qkv_weight = weight
+        elif layer_key == "self_attn.o_proj.weight":
+            mapped_state[f"{prefix}.self_attention.linear_proj.weight"] = weight
+        elif layer_key == "self_attn.q_norm.weight":
+            mapped_state[f"{prefix}.self_attention.q_layernorm.weight"] = weight
+        elif layer_key == "self_attn.k_norm.weight":
+            mapped_state[f"{prefix}.self_attention.k_layernorm.weight"] = weight
+        elif layer_key == "input_layernorm.weight":
+            mapped_state[f"{prefix}.self_attention.linear_qkv.layer_norm_weight"] = (
+                weight
+            )
+        elif layer_key == "post_attention_layernorm.weight":
+            mapped_state[f"{prefix}.mlp.linear_fc1.layer_norm_weight"] = weight
+        elif layer_key == "mlp.gate_proj.weight":
+            pending.gate_weight = weight
+        elif layer_key == "mlp.up_proj.weight":
+            pending.up_weight = weight
+        elif layer_key == "mlp.gate_up_proj.weight":
+            pending.fc1_weight = weight
+        elif layer_key == "mlp.down_proj.weight":
+            mapped_state[f"{prefix}.mlp.linear_fc2.weight"] = weight
+        else:
+            raise RuntimeError(
+                f"[draft] Unsupported block-draft checkpoint key "
+                f"'layers.{layer_index}.{layer_key}'."
+            )
+
+    for layer_index, pending in pending_by_layer.items():
+        prefix = _block_layer_model_prefix(layer_index)
+        qkv_key = f"{prefix}.self_attention.linear_qkv.weight"
+        if pending.qkv_weight is not None:
+            mapped_state[qkv_key] = pending.qkv_weight
+        elif (
+            pending.q_weight is not None
+            and pending.k_weight is not None
+            and pending.v_weight is not None
+        ):
+            mapped_state[qkv_key] = _interleave_qkv(
+                pending.q_weight, pending.k_weight, pending.v_weight, config
+            )
+        elif not (
+            pending.q_weight is None
+            and pending.k_weight is None
+            and pending.v_weight is None
+        ):
+            raise RuntimeError(
+                "[draft] Incomplete QKV tensors. Expected q_proj, k_proj, and v_proj."
+            )
+        fc1_key = f"{prefix}.mlp.linear_fc1.weight"
+        fc1_weight = _combine_or_shard_weight_parts(
+            parameter_name=fc1_key,
+            fused_weight=pending.fc1_weight,
+            component_weights=(pending.gate_weight, pending.up_weight),
+            target=model_state.get(fc1_key),
+            tp_rank=tp_rank,
+            incomplete_error=(
+                "[draft] Incomplete MLP tensors. Expected gate_proj and up_proj."
+            ),
+        )
+        if fc1_weight is not None:
+            mapped_state[fc1_key] = fc1_weight
+
+    if not mapped_state:
+        raise RuntimeError(
+            f"[draft] No block-draft weights were mapped from '{model_name}'."
+        )
+    if skipped:
+        print(f"[draft] Skipped block-draft checkpoint keys: {sorted(skipped)[:10]}")
+
+    split_axis_map = _block_split_axis_map(model_state)
+    for parameter_name in list(mapped_state):
+        mapped_state[parameter_name] = _shard_to_local_tp(
+            parameter_name=parameter_name,
+            tensor=mapped_state[parameter_name],
+            model_state=model_state,
+            split_axis_by_parameter=split_axis_map,
+            tp_rank=tp_rank,
+        )
+
+    return unwrapped.load_state_dict(mapped_state, strict=False)
+
+
+def export_block_draft_weights_to_hf(
+    model: torch.nn.Module,
+) -> list[tuple[str, Tensor]]:
+    """Export the block draft model to the vLLM DFlash/DSpark HF naming."""
+    unwrapped = unwrap_model(model)
+    source_state = unwrapped.state_dict()
+    config = unwrapped.config
+    hidden_size = int(config.hidden_size)
+    ffn_hidden_size = int(config.ffn_hidden_size)
+
+    hf_state: list[tuple[str, Tensor]] = [
+        ("fc.weight", _require_state_tensor(source_state, "fc.weight")),
+        (
+            "hidden_norm.weight",
+            _require_state_tensor(source_state, "hidden_norm.weight"),
+        ),
+        (
+            "norm.weight",
+            _require_state_tensor(source_state, "decoder.final_layernorm.weight"),
+        ),
+    ]
+
+    layer_indices = sorted(
+        int(match.group(1))
+        for key in source_state
+        if (match := re.match(r"^decoder\.layers\.(\d+)\.", key)) is not None
+    )
+    for layer_index in sorted(set(layer_indices)):
+        prefix = _block_layer_model_prefix(layer_index)
+        hf_prefix = f"layers.{layer_index}"
+
+        q_proj, k_proj, v_proj = _gather_tp_qkv_weight(
+            _require_state_tensor(
+                source_state, f"{prefix}.self_attention.linear_qkv.weight"
+            ),
+            config=config,
+        )
+        hf_state.append((f"{hf_prefix}.self_attn.q_proj.weight", q_proj))
+        hf_state.append((f"{hf_prefix}.self_attn.k_proj.weight", k_proj))
+        hf_state.append((f"{hf_prefix}.self_attn.v_proj.weight", v_proj))
+        hf_state.append(
+            (
+                f"{hf_prefix}.self_attn.o_proj.weight",
+                _gather_tp_weight_if_needed(
+                    _require_state_tensor(
+                        source_state, f"{prefix}.self_attention.linear_proj.weight"
+                    ),
+                    (hidden_size, hidden_size),
+                    split_axis=1,
+                ),
+            )
+        )
+        hf_state.append(
+            (
+                f"{hf_prefix}.self_attn.q_norm.weight",
+                _require_state_tensor(
+                    source_state, f"{prefix}.self_attention.q_layernorm.weight"
+                ),
+            )
+        )
+        hf_state.append(
+            (
+                f"{hf_prefix}.self_attn.k_norm.weight",
+                _require_state_tensor(
+                    source_state, f"{prefix}.self_attention.k_layernorm.weight"
+                ),
+            )
+        )
+        hf_state.append(
+            (
+                f"{hf_prefix}.input_layernorm.weight",
+                _require_state_tensor(
+                    source_state,
+                    f"{prefix}.self_attention.linear_qkv.layer_norm_weight",
+                ),
+            )
+        )
+        hf_state.append(
+            (
+                f"{hf_prefix}.post_attention_layernorm.weight",
+                _require_state_tensor(
+                    source_state, f"{prefix}.mlp.linear_fc1.layer_norm_weight"
+                ),
+            )
+        )
+        gate_proj, up_proj = _gather_tp_gate_up_weight(
+            _require_state_tensor(source_state, f"{prefix}.mlp.linear_fc1.weight"),
+            ffn_hidden_size=ffn_hidden_size,
+        )
+        hf_state.append((f"{hf_prefix}.mlp.gate_proj.weight", gate_proj))
+        hf_state.append((f"{hf_prefix}.mlp.up_proj.weight", up_proj))
+        hf_state.append(
+            (
+                f"{hf_prefix}.mlp.down_proj.weight",
+                _gather_tp_weight_if_needed(
+                    _require_state_tensor(
+                        source_state, f"{prefix}.mlp.linear_fc2.weight"
+                    ),
+                    (hidden_size, ffn_hidden_size),
+                    split_axis=1,
+                ),
+            )
+        )
+
+    if "markov_w1.weight" in source_state:
+        hf_state.append(
+            ("markov_head.markov_w1.weight", source_state["markov_w1.weight"])
+        )
+        markov_rank = source_state["markov_w1.weight"].shape[1]
+        hf_state.append(
+            (
+                "markov_head.markov_w2.weight",
+                _gather_tp_weight_if_needed(
+                    _require_state_tensor(source_state, "markov_w2.weight"),
+                    (int(config.draft_vocab_size), markov_rank),
+                    split_axis=0,
+                ),
+            )
+        )
+
+    return hf_state
+
+
+def export_draft_weights_to_hf(
+    model: torch.nn.Module,
+) -> list[tuple[str, Tensor]]:
+    """Export any supported draft model (Eagle or block draft) to HF naming."""
+    from nemo_rl.models.megatron.draft.dflash import DFlashDraftModel
+
+    # DSparkDraftModel subclasses DFlashDraftModel, so this covers both.
+    if isinstance(unwrap_model(model), DFlashDraftModel):
+        return export_block_draft_weights_to_hf(model)
+    return export_eagle_weights_to_hf(model)
