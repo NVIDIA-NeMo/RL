@@ -151,10 +151,22 @@ class TestReplayBufferImplCheckpointing:
         assert buffer.get_trajectories_needed(2, 2) == 0
         assert buffer.get_trajectories_needed(3, 2) == 1
 
-    def test_local_restore_can_drop_incomplete_frontier(self):
+    @pytest.mark.parametrize(
+        ("drop_incomplete_targets_on_restore", "expected_targets", "expected_needed"),
+        [
+            (True, [2, 2], 2),
+            (False, [2, 2, 3], 1),
+        ],
+    )
+    def test_local_restore_can_drop_incomplete_frontier(
+        self,
+        drop_incomplete_targets_on_restore,
+        expected_targets,
+        expected_needed,
+    ):
         buffer = ReplayBufferImpl(
             max_size=10,
-            drop_incomplete_targets_on_restore=True,
+            drop_incomplete_targets_on_restore=drop_incomplete_targets_on_restore,
         )
         state = self._state(
             trajectory_versions=[1, 1, 2],
@@ -168,8 +180,8 @@ class TestReplayBufferImplCheckpointing:
             current_training_step=2,
         )
 
-        assert buffer.get_debug_info()["target_weight_versions"] == [2, 2]
-        assert buffer.get_trajectories_needed(3, 2) == 2
+        assert buffer.get_debug_info()["target_weight_versions"] == expected_targets
+        assert buffer.get_trajectories_needed(3, 2) == expected_needed
 
     def test_local_restore_empty_state_resets_generation_watermark(self):
         buffer = ReplayBufferImpl(max_size=10)
@@ -209,10 +221,22 @@ class TestReplayBufferImplCheckpointing:
         assert not buffer.has_complete_batch(5, 2)
         assert buffer.get_trajectories_needed(5, 2) == 1
 
-    def test_local_restore_drops_target_made_incomplete_by_stale_filter(self):
+    @pytest.mark.parametrize(
+        ("drop_incomplete_targets_on_restore", "expected_targets", "expected_needed"),
+        [
+            (True, [], 2),
+            (False, [5], 1),
+        ],
+    )
+    def test_local_restore_drops_target_made_incomplete_by_stale_filter(
+        self,
+        drop_incomplete_targets_on_restore,
+        expected_targets,
+        expected_needed,
+    ):
         buffer = ReplayBufferImpl(
             max_size=10,
-            drop_incomplete_targets_on_restore=True,
+            drop_incomplete_targets_on_restore=drop_incomplete_targets_on_restore,
         )
         state = self._state(
             trajectory_versions=[4, 1],
@@ -227,8 +251,9 @@ class TestReplayBufferImplCheckpointing:
             max_age_steps=1,
         )
 
-        assert buffer.size() == 0
-        assert buffer.get_trajectories_needed(5, 2) == 2
+        assert buffer.get_debug_info()["target_weight_versions"] == expected_targets
+        assert buffer.size() == len(expected_targets)
+        assert buffer.get_trajectories_needed(5, 2) == expected_needed
 
     def test_local_restore_truncates_after_resume_cleanup(self):
         buffer = ReplayBufferImpl(max_size=2)

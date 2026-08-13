@@ -302,7 +302,7 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
         master_config,
         num_prompts_per_step=8,
         num_generations_per_prompt=10,
-        include_training_worker_idle_ratio=False,
+        is_async_rl=False,
     )
 
     # Validate key throughput metrics
@@ -377,7 +377,7 @@ def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
         master_config,
         num_prompts_per_step=8,
         num_generations_per_prompt=10,
-        include_training_worker_idle_ratio=False,
+        is_async_rl=False,
     )
 
     assert math.isclose(perf["train_flops_per_gpu"], 500.0 / 8, rel_tol=1e-6)
@@ -415,7 +415,7 @@ def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
         master_config,
         num_prompts_per_step=8,
         num_generations_per_prompt=10,
-        include_training_worker_idle_ratio=True,
+        is_async_rl=True,
     )
 
     assert "training_worker_idle_time_ratio" in perf
@@ -475,7 +475,7 @@ def test_minimal_inputs_no_counts_no_flops(capsys):
         master_config,
         num_prompts_per_step=8,
         num_generations_per_prompt=10,
-        include_training_worker_idle_ratio=False,
+        is_async_rl=False,
     )
 
     # Core metrics exist
@@ -514,7 +514,7 @@ def test_empty_per_worker_token_counts_skips_imbalance(capsys):
         master_config,
         num_prompts_per_step=8,
         num_generations_per_prompt=10,
-        include_training_worker_idle_ratio=False,
+        is_async_rl=False,
     )
 
     assert "average_token_imbalance" not in perf
@@ -524,7 +524,7 @@ def test_empty_per_worker_token_counts_skips_imbalance(capsys):
     assert "Throughputs (per GPU)" in out
 
 
-def test_async_ppo_metrics_do_not_access_grpo_config():
+def test_async_ppo_metrics_use_async_flag_without_grpo_config():
     master_config = _base_ppo_master_config(colocated=False)
     timing_metrics = {
         "policy_and_reference_logprobs": 2.0,
@@ -542,10 +542,10 @@ def test_async_ppo_metrics_do_not_access_grpo_config():
         master_config,
         num_prompts_per_step=8,
         num_generations_per_prompt=10,
-        include_training_worker_idle_ratio=False,
+        is_async_rl=True,
     )
 
-    assert "training_worker_idle_time_ratio" not in perf
+    assert "training_worker_idle_time_ratio" in perf
 
 
 # ============================================================================
