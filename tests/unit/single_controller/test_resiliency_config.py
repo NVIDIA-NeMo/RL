@@ -212,6 +212,9 @@ class TestWrongPathFaultToleranceIsRejected:
             policy={"train_global_batch_size": 8},
             loss_fn=SimpleNamespace(reference_policy_kl_penalty=0),
             env={"should_use_nemo_gym": use_nemo_gym},
+            # Read by the metric_name check upstream #3429 added to this same
+            # validator, which runs before the wrong-path check under test.
+            checkpointing={"enabled": False, "metric_name": None},
         )
 
     def test_gym_only_knobs_on_a_native_run_are_rejected(self):

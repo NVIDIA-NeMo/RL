@@ -101,7 +101,7 @@ Step-by-step guide for supervised fine-tuning on the OpenMathInstruct2 dataset.
 :::
 
 :::{grid-item-card} {octicon}`rocket` Nemotron 3 Ultra
-:link: guides/nemotron-3-ultra
+:link: guides/models/nemotron/nemotron-3-ultra
 :link-type: doc
 
 Post-train Nemotron 3 Ultra with RLVR, teacher training, and MOPD stages on GB200 NVL72 hardware.
@@ -289,11 +289,6 @@ guides/sft-openmathinstruct2.md
 ```{toctree}
 :caption: Guides
 
-guides/nemotron-3-nano.md
-guides/nemotron-3-nano-omni.md
-guides/nemotron-3.5-lightning.md
-guides/nemotron-3-super.md
-guides/nemotron-3-ultra.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
@@ -313,6 +308,12 @@ guides/environments.md
 guides/eval.md
 guides/deepseek.md
 guides/models/index.md
+guides/models/nemotron/index.md
+guides/models/nemotron/nemotron-3-nano.md
+guides/models/nemotron/nemotron-3-nano-omni.md
+guides/models/nemotron/nemotron-3.5-lightning.md
+guides/models/nemotron/nemotron-3-super.md
+guides/models/nemotron/nemotron-3-ultra.md
 guides/models/qwen/index.md
 guides/models/qwen/qwen3-5.md
 model-quirks.md
