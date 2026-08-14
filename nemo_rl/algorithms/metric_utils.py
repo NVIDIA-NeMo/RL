@@ -44,7 +44,6 @@ class SetupTimingMetrics:
     teacher_reservation_time_s: Optional[float] = None
     teacher_model_init_time_s: Optional[float] = None
     teacher_init_time_s: Optional[float] = None
-    vllm_checkpoint_engine_init_time_s: Optional[float] = None
 
     total_setup_time_s: Optional[float] = None
     worker_setup_time_s: Optional[float] = None

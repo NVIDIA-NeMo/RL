@@ -370,8 +370,9 @@ Current limitations:
   remaining generation-side support. Megatron and DTensor policy backends are
   supported for both vLLM and SGLang generation.
 - SGLang refit requires each logical engine to fit on a single node
-  (`num_gpus_per_engine <= gpus_per_node`) and does not support
-  `shard_expert_weights=true`. Both are rejected with an explicit error.
+  (`num_gpus_per_engine <= gpus_per_node`), requires `sglang_cfg.dp_size=1`,
+  and does not support `shard_expert_weights=true`. All three are rejected
+  with an explicit error.
 - The built-in NIXL backend uses paired policy-to-rollout transfer only.
 - Sharded vLLM EP refit supports static expert ownership and canonical
   unquantized Triton expert storage. Dynamic EPLB, redundant experts, and
