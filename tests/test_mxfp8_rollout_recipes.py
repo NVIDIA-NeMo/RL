@@ -23,6 +23,80 @@ PERF_SUITE_DIR = PROJECT_ROOT / "tests/test_suites/llm/performance"
 GB200_SUITE = PROJECT_ROOT / "tests/test_suites/performance_gb200.txt"
 
 MXFP8_CASES = {
+    "grpo-deepseek-v3-64n4g-mxfp8-rollout": {
+        "nodes": 64,
+        "gpus_per_node": 4,
+        "segment_size": 16,
+        "async_engine": True,
+        "tensor_parallel_size": 32,
+        "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "model.layers.*.mlp.gate",
+            "model.layers.*.mlp.shared_experts.*",
+            "model.layers.0.mlp.*",
+            "model.layers.1.mlp.*",
+            "model.layers.2.mlp.*",
+            "model.layers.61.*",
+        ],
+    },
+    "grpo-deepseek-v3-64n4g-async-1off-mxfp8-rollout": {
+        "nodes": 64,
+        "gpus_per_node": 4,
+        "segment_size": 16,
+        "async_engine": True,
+        "tensor_parallel_size": 16,
+        "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "model.layers.*.mlp.gate",
+            "model.layers.*.mlp.shared_experts.*",
+            "model.layers.0.mlp.*",
+            "model.layers.1.mlp.*",
+            "model.layers.2.mlp.*",
+            "model.layers.61.*",
+        ],
+    },
+    "grpo-nemotron3-super-120BA12B-32n4g-mxfp8-rollout": {
+        "nodes": 32,
+        "gpus_per_node": 4,
+        "segment_size": 8,
+        "async_engine": True,
+        "tensor_parallel_size": 4,
+        "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.mixer.in_proj",
+            "model.layers.*.mixer.out_proj",
+            "model.layers.*.mixer.qkv_proj",
+            "model.layers.*.mixer.o_proj",
+            "model.layers.*.mixer.up_proj",
+            "model.layers.*.mixer.down_proj",
+            "model.layers.*.mixer.gate",
+            "model.layers.*.mixer.shared_experts.*",
+            "model.layers.*.mixer.fc1_latent_proj",
+            "model.layers.*.mixer.fc2_latent_proj",
+        ],
+    },
+    "grpo-nemotron3-super-120BA12B-32n4g-async-1off-mxfp8-rollout": {
+        "nodes": 32,
+        "gpus_per_node": 4,
+        "segment_size": 8,
+        "async_engine": True,
+        "tensor_parallel_size": 4,
+        "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.mixer.in_proj",
+            "model.layers.*.mixer.out_proj",
+            "model.layers.*.mixer.qkv_proj",
+            "model.layers.*.mixer.o_proj",
+            "model.layers.*.mixer.up_proj",
+            "model.layers.*.mixer.down_proj",
+            "model.layers.*.mixer.gate",
+            "model.layers.*.mixer.shared_experts.*",
+            "model.layers.*.mixer.fc1_latent_proj",
+            "model.layers.*.mixer.fc2_latent_proj",
+        ],
+    },
     "grpo-qwen3-30ba3b-4n4g-mxfp8-rollout": {
         "nodes": 4,
         "gpus_per_node": 4,
@@ -148,6 +222,9 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     vllm_cfg = config["policy"]["generation"]["vllm_cfg"]
     cluster = config["cluster"]
 
+    assert config["checkpointing"]["checkpoint_dir"] == f"results/{case_name}"
+    assert config["logger"]["log_dir"] == f"logs/{case_name}"
+    assert config["logger"]["wandb"]["name"] == case_name
     assert vllm_cfg["precision"] == "fp8"
     assert vllm_cfg["is_mx"] is True
     assert "quantization_ignored_layer_kws" not in vllm_cfg
@@ -179,14 +256,6 @@ def test_mxfp8_rollout_backend_variant_recipes_are_not_kept() -> None:
             variant_name = f"{base_name}{suffix}"
             assert not (PERF_CONFIG_DIR / f"{variant_name}.yaml").exists()
             assert not (PERF_SUITE_DIR / f"{variant_name}.sh").exists()
-
-
-def test_qwen3_235b_async_tp4_baseline_overlay() -> None:
-    config = _load_yaml(PERF_CONFIG_DIR / "grpo-qwen3-235b-32n4g-async-1off-tp4.yaml")
-
-    assert config["defaults"] == "./grpo-qwen3-235b-32n4g-async-1off.yaml"
-    assert config["policy"]["generation"]["vllm_cfg"]["tensor_parallel_size"] == 4
-    assert config["cluster"]["segment_size"] == 16
 
 
 def test_qwen3_235b_scripts_append_distributed_timeout_override() -> None:
