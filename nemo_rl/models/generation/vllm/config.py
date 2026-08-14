@@ -185,6 +185,18 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
             "'nccl_reshard', 'vllm_s3_sparse', 'vllm_zmq_sparse', 'nixl', or a "
             "'module:ClassName' checkpoint-engine path."
         )
+    # The encoder-cache reset is implemented only on the collective/IPC and
+    # nccl_reshard async refit paths (both returned above). Fail loudly rather
+    # than let other transports silently keep stale multimodal encoder outputs
+    # across weight updates.
+    if config["vllm_cfg"].get("reset_encoder_cache_after_weight_update"):
+        raise ValueError(
+            "vllm_cfg.reset_encoder_cache_after_weight_update is not supported "
+            f"with refit_transport={transport!r}: this transport's refit path "
+            "does not reset the multimodal encoder cache, so stale vision "
+            "embeddings would silently survive weight updates. Supported "
+            "transports: null (collective/IPC) and 'nccl_reshard'."
+        )
     refit_config = VllmRefitConfig.model_validate(config.get("refit_cfg") or {})
     if ":" in transport:
         plugin_config = (refit_config.model_extra or {}).get(transport)
