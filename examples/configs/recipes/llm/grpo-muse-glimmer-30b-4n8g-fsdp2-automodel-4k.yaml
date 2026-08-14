@@ -5,6 +5,8 @@ defaults: ../../grpo_math_1B.yaml
 # token_level_loss is the one exception -- the base sets it true and this recipe
 # turns it off, matching the run this recipe reproduces.
 grpo:
+  # Reference logprobs are required by the KL penalty below (~+10% step time).
+  skip_reference_policy_logprobs_calculation: false
   val_period: 5
   # Measure the untrained policy before step 1. Without it the first datapoint
   # is step 5 and there is no baseline to say whether training helped.
@@ -22,7 +24,11 @@ grpo:
     # deliberately not set here.
     enabled: false
 loss_fn:
-  reference_policy_kl_penalty: 0.0
+  # KL anchor to the initial (reference) policy; k3 estimator (base default).
+  # Without it this model's validation accuracy rises for ~30 steps and then
+  # decays (length inflation -> truncation collapse + behavior drift); 0.01
+  # holds the curve flat. 0.001 was tested and is too weak.
+  reference_policy_kl_penalty: 0.01
   use_importance_sampling_correction: true
   truncated_importance_sampling_type: tis
   truncated_importance_sampling_ratio: 2
@@ -77,8 +83,12 @@ policy:
     kwargs:
       lr: 1.0e-06
       weight_decay: 0.1
-      master_weights: true
-      store_param_remainders: true
+      # FSDP2 keeps the sharded parameters in fp32 already (bf16 is only the
+      # compute dtype via MixedPrecisionPolicy), so TE FusedAdam's own fp32
+      # master-weight copies are redundant -- and the ~10 GB/rank they cost is
+      # what lets train_mb_tokens run at the full 4096 below.
+      master_weights: false
+      store_param_remainders: false
       exp_avg_dtype: torch.bfloat16
       exp_avg_sq_dtype: torch.bfloat16
   scheduler:
@@ -127,12 +137,13 @@ policy:
     enabled: false
   dynamic_batching:
     enabled: true
-    # Pinned rather than inherited. The base derives this from
-    # max_total_sequence_length, which would give 4096 -- and 4096 tokens on one
-    # rank drives the vocab soft cap to ~12.3 GB and OOMs the training backward.
-    # 2048 halves that. Gradient accumulation is exact, so the optimization math
-    # is unchanged; only the number of microbatches differs.
-    train_mb_tokens: 2048
+    # Must be the full sequence length: a microbatch has to fit the longest
+    # single sequence, and with a 2048-token prompt budget plus 2048 generated
+    # tokens a 4096-token sequence is routine -- a smaller cap fails
+    # shard_by_batch_size with "padded sequence length ... exceeds max
+    # microbatch size". The soft-cap memory this costs at 4096 tokens/rank is
+    # paid for by master_weights: false above.
+    train_mb_tokens: 4096
   # Deliberately 1, not the ${mul:...context_parallel_size} form other recipes
   # use. Safe here because sequence packing is off and dynamic batching is on.
   make_sequence_length_divisible_by: 1

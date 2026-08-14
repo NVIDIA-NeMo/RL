@@ -5,8 +5,9 @@ built on the Onyx architecture. Use it to set up the environment, choose a start
 recipe, and understand the settings that are specific to this model.
 
 > [!IMPORTANT]
-> **Early access.** Muse Glimmer runs end-to-end in NeMo RL and short GRPO runs
-> have been numerically validated, but long-run convergence has not been established.
+> **Early access.** Muse Glimmer runs end-to-end in NeMo RL; the KL-anchored 10k
+> recipes have been validated to hold a flat validation-accuracy band for 185-245
+> steps, but no run has yet been taken to full convergence.
 
 ## Support Status
 
@@ -95,19 +96,34 @@ or edit `policy.model_name` and `policy.tokenizer.name` in the YAML directly.
 
 ## Example Recipes
 
-Both are GRPO on DAPO-Math-17K with AIME-2024 validation, AutoModel (DTensor) training
+All run on DAPO-Math-17K with AIME-2024 validation, AutoModel (DTensor) training
 with colocated vLLM generation, on 4 nodes x 8 GPUs. Recipe YAML files under
 `examples/configs/recipes/` are the source of truth.
 
-| Seq | CP | Tokens/rank | `max_new_tokens` | Recipe |
-|---|---|---|---|---|
-| 6144 | 4 | 1536 | 4096 | [`…-30b-4n8g-fsdp2cp4-automodel-6k.yaml`](../../../examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-6k.yaml) |
-| 4096 | 1 | 4096 | 2048 | [`…-30b-4n8g-fsdp2-automodel-4k.yaml`](../../../examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2-automodel-4k.yaml) |
+| Algo | Seq | CP | Tokens/rank | `max_new_tokens` | Recipe |
+|---|---|---|---|---|---|
+| GRPO | 10240 | 4 | 2560 | 8192 | [`grpo-…-fsdp2cp4-automodel-10k.yaml`](../../../examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-10k.yaml) |
+| DAPO | 10240 | 4 | 2560 | 8192 | [`dapo-…-fsdp2cp4-automodel-10k.yaml`](../../../examples/configs/recipes/llm/dapo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-10k.yaml) |
+| GRPO | 6144 | 4 | 1536 | 4096 | [`grpo-…-fsdp2cp4-automodel-6k.yaml`](../../../examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-6k.yaml) |
+| GRPO | 4096 | 1 | 4096 | 2048 | [`grpo-…-fsdp2-automodel-4k.yaml`](../../../examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2-automodel-4k.yaml) |
 
-These are GRPO, not DAPO: no dynamic sampling, no overlong reward shaping, symmetric
-`ratio_clip` at 0.2, and sequence-level loss. The base config `grpo_math_1B.yaml`
-already defaults to all of that, so the recipes mostly just avoid overriding it —
-`loss_fn.token_level_loss: false` is the one value they state explicitly.
+The GRPO recipes use no dynamic sampling, no overlong reward shaping, symmetric
+`ratio_clip` at 0.2, and sequence-level loss — the base config `grpo_math_1B.yaml`
+already defaults to all of that. The DAPO recipe adds dynamic sampling, Clip-Higher
+(`ratio_clip_max: 0.28`), token-level loss, and the soft overlong penalty (with
+`overlong_filtering` deliberately off — filtering would zero truncated samples out of
+the loss, exempting exactly the samples the penalty exists to shape).
+
+> [!IMPORTANT]
+> **Every recipe keeps `loss_fn.reference_policy_kl_penalty: 0.01`** — including the
+> DAPO one, even though the DAPO paper drops the KL term. That advice assumes a weak
+> starting policy that must travel far from its initialization. Muse Glimmer is a
+> heavily post-trained model: without the anchor its validation accuracy rises for
+> ~30 steps and then decays (0.83 to 0.55 over 200 steps on GRPO 10k; the same shape
+> reproduces on DAPO and at every sequence length tested), driven by length inflation,
+> truncation collapse, and behavior drift. `0.001` was tested and is too weak; `0.01`
+> holds the curve flat. The penalty requires
+> `grpo.skip_reference_policy_logprobs_calculation: false` (~+10% step time).
 
 > [!IMPORTANT]
 > `max_new_tokens` is `max_total_sequence_length - data.max_input_seq_length` (2048).
@@ -118,14 +134,16 @@ already defaults to all of that, so the recipes mostly just avoid overriding it 
 
 ## Choose a Recipe
 
-**Start with the 6k (cp4) recipe.** It is better than the 4k variant on every measured
-axis — see [Reference Results](#reference-results): roughly 0.69 peak validation
-accuracy against 0.505, a `gen_kl_error` that stays flat instead of drifting upward,
-and entropy that recovers rather than collapsing.
+**Start with the 10k (cp4) recipes.** Context length is the biggest quality lever for
+this model, and the 10k runs are the ones validated deep into training — see
+[Reference Results](#reference-results): GRPO holds a 0.78-0.82 validation band
+through step 245, DAPO holds 0.79-0.84 through step 185. GRPO steps are ~3x faster
+(no dynamic sampling over-generation); DAPO reaches a slightly higher band.
 
-Use the 4k recipe when you want the shorter context or fewer moving parts. It runs
-without context parallelism, so there is no ring-attention communication and no
-per-CP-step `dq`/`dk`/`dv` copies — but it is the *tighter* of the two on memory.
+The 6k recipe is the middle ground (0.69 peak). Use the 4k recipe when you want the
+shortest context or fewer moving parts — it runs without context parallelism, so
+there is no ring-attention communication and no per-CP-step `dq`/`dk`/`dv` copies,
+but it is the *tightest* on memory and pays the largest truncation tax.
 
 ### Why context length matters here
 
@@ -145,11 +163,19 @@ correctness. `train/truncation_rate` early in training runs around **0.6 at 4k**
 ```bash
 export NRL_FORCE_REBUILD_VENVS=true
 
-# 6k, CP4 -- recommended default (pulls meta-models/Muse-Glimmer-30B from HF Hub)
+# GRPO 10k, CP4 -- recommended default (pulls meta-models/Muse-Glimmer-30B from HF Hub)
+uv run examples/run_grpo.py \
+  --config examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-10k.yaml
+
+# DAPO 10k, CP4 -- dynamic sampling + overlong penalty (keep the KL anchor on)
+uv run examples/run_grpo.py \
+  --config examples/configs/recipes/llm/dapo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-10k.yaml
+
+# 6k, CP4 -- middle ground
 uv run examples/run_grpo.py \
   --config examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-6k.yaml
 
-# 4k, no CP -- shorter context, tighter on memory
+# 4k, no CP -- shortest context, tightest on memory
 uv run examples/run_grpo.py \
   --config examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2-automodel-4k.yaml
 ```
@@ -165,11 +191,32 @@ uv run examples/run_grpo.py --config <recipe> cluster.num_nodes=4
 
 ### Training curves
 
-Both runs use the released checkpoint on 4 nodes x 8 GPUs. Each curve covers roughly
-the first 70 steps of a 300-step target, so these are **partial runs**, not completed
-ones.
+All runs use the released checkpoint on 4 nodes x 8 GPUs.
 
-**6k, CP4** — the recommended recipe.
+**GRPO 10k, CP4** — the recommended recipe, with the KL anchor
+(`reference_policy_kl_penalty: 0.01`).
+
+![Muse Glimmer 10k GRPO training curves](../../assets/muse-glimmer/muse_glimmer_8k_grpo_curve.png)
+
+Validation accuracy rises from 0.70 to ~0.81 by step 30 and **holds a 0.78-0.82 band
+through step 245** — no decay. `gen_kl_error` stays flat at ~5e-04, mean generation
+length is stable around 3,500-4,000 tokens (8,192 budget), and entropy oscillates in a
+healthy 0.4-0.55 band. Without the KL anchor the same recipe peaks at 0.83 by step 30
+and decays to 0.55 by step 210.
+
+**DAPO 10k, CP4** — dynamic sampling + soft overlong penalty, same KL anchor.
+
+![Muse Glimmer 10k DAPO training curves](../../assets/muse-glimmer/muse_glimmer_8k_dapo_curve.png)
+
+Validation accuracy reaches ~0.84 by step 20 and **holds 0.79-0.84 through step 185**.
+`gen_kl_error` stays flat at ~5.5e-04 and entropy trends gently upward (0.45 to 0.6) —
+the policy keeps exploring. Steps are ~3x slower than GRPO because dynamic sampling
+over-generates (`batch_multiplier: 3`) to fill each batch with mixed-outcome prompts.
+
+The two curves below cover roughly the first 70 steps of their runs, so they are
+**partial runs**, not completed ones.
+
+**6k, CP4** — the middle ground.
 
 ![Muse Glimmer 6k GRPO training curves](../../assets/muse-glimmer/muse_glimmer_6k_grpo_curve.png)
 
@@ -189,4 +236,8 @@ Validation accuracy rises from 0.22 to about **0.505** by step 55-60 and then fl
 
 ## Known Issues
 
-- **Long-run convergence is not validated.** Current evidence covers short runs only.
+- **No run has been taken to full convergence.** The KL-anchored 10k recipes hold a
+  flat validation band for 185-245 steps; evidence beyond that is not yet available.
+- **Do not set `loss_fn.reference_policy_kl_penalty` to 0.** Every unanchored run on
+  this model — GRPO and DAPO, at 4k, 6k, and 10k — rises for ~30 steps and then
+  decays well below its peak. See the note under [Example Recipes](#example-recipes).
