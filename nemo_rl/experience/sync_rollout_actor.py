@@ -210,16 +210,14 @@ class SyncRolloutActor:
             uses for compute (rewards, masks, lengths, prompt_ids_for_adv,
             …) — stays on the driver, never crosses an actor boundary.
         """
-        # Lazy imports — avoid pulling grpo into this module at load.
-        from nemo_rl.algorithms.grpo import (
-            _should_use_async_rollouts,
-            _should_use_nemo_gym,
-        )
+        # Lazy imports keep rollout-specific dependencies off the actor startup path.
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import (
             MESSAGE_LOG_BULK_FIELDS,
             decompose_message_log,
         )
+        from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+        from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 
         # Per-step generation-side metric hooks: snapshot once on the
         # first DS iter so backends with per-step deltas have a stable
@@ -245,7 +243,7 @@ class SyncRolloutActor:
         )
 
         # Rollout dispatch (mirrors grpo_sync.py:294-349).
-        if _should_use_nemo_gym(cfg):
+        if should_use_nemo_gym(cfg):
             r = run_nemo_gym_rollout_sync(
                 **common,
                 max_seq_len=None,
@@ -270,7 +268,7 @@ class SyncRolloutActor:
         else:
             runner = (
                 run_async_multi_turn_rollout
-                if _should_use_async_rollouts(cfg)
+                if should_use_async_rollouts(cfg.policy["generation"])
                 else run_multi_turn_rollout
             )
             final_batch, rollout_metrics = runner(

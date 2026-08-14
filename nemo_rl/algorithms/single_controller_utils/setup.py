@@ -37,7 +37,6 @@ from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _create_advantage_estimator,
     _get_grpo_save_state,
-    _should_use_nemo_gym,
 )
 from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
@@ -56,7 +55,7 @@ from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import should_mask_flagged_samples
 from nemo_rl.models.generation.interfaces import (
@@ -426,7 +425,7 @@ def setup_single_controller(
     # Setup Dataset & Environments
     # ==========================
     # TODO: add validate dataset wiring.
-    use_nemo_gym = _should_use_nemo_gym(cast(GrpoMasterConfig, master_config))
+    use_nemo_gym = should_use_nemo_gym(master_config)
     if use_nemo_gym and generation_config["backend"] != "vllm":
         raise NotImplementedError(
             "SC NeMo-Gym integration currently supports the vllm backend "

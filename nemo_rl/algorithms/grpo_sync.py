@@ -55,7 +55,6 @@ from nemo_rl.algorithms.grpo import (
     _policy_dtype,
     _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
-    _should_use_nemo_gym,
     _validation_early_stop_message,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
@@ -78,6 +77,7 @@ from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -266,7 +266,7 @@ def validate_sync(
     total_lengths: list[float] = []
     all_message_logs: list[list[dict[str, str]]] = []
     additional_metrics: dict[str, Any] = {}
-    capture_extras = _should_use_nemo_gym(master_config)
+    capture_extras = should_use_nemo_gym(master_config)
 
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)

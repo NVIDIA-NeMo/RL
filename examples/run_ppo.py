@@ -66,10 +66,11 @@ def _validate_async_ppo_config(
         raise ValueError("Async PPO requires loss_fn.force_on_policy_ratio=false")
     if generation_config["colocated"]["enabled"]:
         raise ValueError("Async PPO requires non-colocated generation")
-    if config.ppo.max_num_epochs != 1:
+    if config.ppo.max_num_epochs != -1:
         raise NotImplementedError(
-            "Async PPO requires ppo.max_num_epochs=1; use ppo.max_num_steps "
-            "to control training length"
+            "Async PPO does not support an epoch limit; set "
+            "ppo.max_num_epochs=-1 and use ppo.max_num_steps to control "
+            "training length"
         )
 
     unsupported_features = {

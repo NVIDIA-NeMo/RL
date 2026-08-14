@@ -85,7 +85,7 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
@@ -104,6 +104,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationSamplingParams,
     resolve_routed_experts_dtype_name_for_model,
+    should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
@@ -453,7 +454,7 @@ def setup(
         or generation_config["val_top_k"] != generation_config["top_k"]
     )
     if val_sampling_overridden:
-        assert generation_config["backend"] == "vllm" and _should_use_nemo_gym(
+        assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
             master_config
         ), (
             "generation.val_temperature/val_top_p/val_top_k differing from the "
@@ -674,7 +675,7 @@ def setup(
 
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
-    enable_nemo_gym = _should_use_nemo_gym(master_config)
+    enable_nemo_gym = should_use_nemo_gym(master_config)
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
@@ -725,7 +726,7 @@ def setup(
     opd_teacher_nodes = 0
     enable_opd_teachers = opd_module.is_non_colocated_teachers_enabled(master_config)
     if enable_opd_teachers:
-        assert _should_use_async_rollouts(master_config), (
+        assert should_use_async_rollouts(generation_config), (
             "Non-colocated OPD teachers require async GRPO (vLLM backend with async_engine enabled)."
         )
         from nemo_rl.models.policy.teacher_worker_group import (
@@ -1274,7 +1275,7 @@ def setup(
             assert policy_config["dtensor_cfg"]["enabled"] == False, (
                 "DTensor backend is not supported with kv cache fp8 enabled."
             )
-            assert not _should_use_async_rollouts(master_config), (
+            assert not should_use_async_rollouts(generation_config), (
                 "Async rollouts is not supported with kv cache fp8 enabled."
             )
             assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
@@ -1862,7 +1863,7 @@ def _resolve_message_level_advantage_penalties(
     # The is_invalid_tool_call / has_malformed_thinking flags these penalties rely on
     # are only populated by the NeMo-Gym environment. Without that path the penalties
     # would silently no-op, so fail loudly instead.
-    if not _should_use_nemo_gym(master_config):
+    if not should_use_nemo_gym(master_config):
         raise ValueError(
             "grpo.invalid_tool_call_advantage / grpo.malformed_thinking_advantage require "
             "the NeMo-Gym path (env.should_use_nemo_gym=true); they are not supported with "
@@ -2020,38 +2021,6 @@ def _apply_configured_message_level_advantage_penalties(
     )
 
 
-def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
-    """Determine if async rollouts should be used based on the configuration.
-
-    SGLang only uses async rollouts when explicitly configured with
-    ``policy.generation.use_async_rollouts``. vLLM and Megatron use async
-    rollouts when their respective ``async_engine`` config is enabled.
-    """
-    generation_config = master_config.policy["generation"]
-    if generation_config is None:
-        return False
-    backend = generation_config.get("backend", "")
-
-    if backend == "sglang":
-        return bool(generation_config.get("use_async_rollouts", False))
-
-    if backend == "vllm":
-        return bool(generation_config.get("vllm_cfg", {}).get("async_engine", False))
-
-    if backend == "trtllm":
-        assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
-            "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
-            "synchronous engine path (async_engine=false) is no longer supported."
-        )
-        return True
-
-    if backend == "megatron":
-        mcore_cfg = generation_config.get("mcore_generation_config", {})
-        return mcore_cfg.get("async_engine", False)
-
-    return False
-
-
 def _preserve_router_replay_routed_experts(
     target: BatchedDataDict,
     flat_messages: BatchedDataDict,
@@ -2108,43 +2077,6 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     loss_multiplier[mask_sample_bool] = 0
     repeated_batch["loss_multiplier"] = loss_multiplier
     return num_masked
-
-
-def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
-    """Determine if NeMo-Gym should be used for rollouts and validation based on the configuration."""
-    env_config = master_config.env
-    should_use_nemo_gym = bool(env_config.get("should_use_nemo_gym"))
-    if not should_use_nemo_gym:
-        return should_use_nemo_gym
-
-    # Validate the setup for training with NeMo-Gym.
-    # Megatron Inference is exempt: there is no difference between its sync and async engines.
-    generation_config = master_config.policy["generation"]
-    if generation_config["backend"] != "megatron":
-        assert _should_use_async_rollouts(master_config), (
-            "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
-        )
-
-    # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
-    if generation_config["backend"] == "vllm":
-        should_expose_http_server = generation_config["vllm_cfg"].get(
-            "expose_http_server"
-        )
-    elif generation_config["backend"] == "megatron":
-        should_expose_http_server = generation_config["mcore_generation_config"].get(
-            "expose_http_server"
-        )
-    elif generation_config["backend"] == "trtllm":
-        should_expose_http_server = generation_config["trtllm_cfg"].get(
-            "expose_http_server"
-        )
-    else:
-        should_expose_http_server = False
-    assert should_expose_http_server, (
-        "In order to use NeMo-Gym, you must expose the generation server via `expose_http_server: true`!"
-    )
-
-    return should_use_nemo_gym
 
 
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
@@ -2842,7 +2774,7 @@ def grpo_train(
                 with timer.time("data_processing"):
                     if (
                         master_config.grpo.deduplicate_multimodal_data
-                        and _should_use_nemo_gym(master_config)
+                        and should_use_nemo_gym(master_config)
                     ):
                         attach_initial_nemo_gym_image_payloads(batch, processor)
                     # Repeat batch items
@@ -2934,7 +2866,7 @@ def grpo_train(
                     if policy_generation is not None:
                         policy_generation.clear_logger_metrics()
                     # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
-                    if _should_use_nemo_gym(master_config):
+                    if should_use_nemo_gym(master_config):
                         # configure_generation_config auto-fills stop_token_ids from the EOS
                         # token, but run_async_nemo_gym_rollout asserts these are unset because
                         # NeMo-Gym manages its own stop criteria. Clear them here so the
@@ -2978,7 +2910,7 @@ def grpo_train(
                         del nemo_gym_rollout_result
 
                     # Use async rollouts when enabled by config/backend defaults.
-                    elif _should_use_async_rollouts(master_config):
+                    elif should_use_async_rollouts(master_config.policy["generation"]):
                         (
                             repeated_batch,
                             rollout_metrics,
@@ -3867,7 +3799,7 @@ def validate(
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
-            if _should_use_nemo_gym(master_config):
+            if should_use_nemo_gym(master_config):
                 if master_config.grpo.deduplicate_multimodal_data:
                     attach_initial_nemo_gym_image_payloads(val_batch, processor)
                 generation_config = master_config.policy["generation"]
@@ -3907,7 +3839,7 @@ def validate(
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
                 additional_metrics_to_report = gen_metrics
-            elif _should_use_async_rollouts(master_config):
+            elif should_use_async_rollouts(master_config.policy["generation"]):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
                     val_batch,
@@ -4113,8 +4045,8 @@ def async_grpo_train(
     # SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron", "trtllm") and _should_use_async_rollouts(
-        master_config
+    assert backend in ("vllm", "megatron", "trtllm") and should_use_async_rollouts(
+        generation_config
     ), (
         "Async GRPO requires an async vLLM, Megatron, or TRT-LLM generation engine. "
         "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "

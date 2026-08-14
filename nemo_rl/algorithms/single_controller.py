@@ -38,7 +38,7 @@ import asyncio
 import os
 import time
 from functools import partial
-from typing import Any, Optional, Union, cast
+from typing import Any, Optional, Union
 
 import ray
 import torch
@@ -64,6 +64,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -850,15 +851,9 @@ class SingleControllerActor:
         """
         self._rollout_permitted.clear()
 
-        # TODO(#2625): abort unconditionally once gym-path abort is validated;
-        # for now only the native path aborts. Local import dodges the grpo.py
-        # circular dep (as in async_utils/trajectory_collector.py).
-        from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
-        from nemo_rl.algorithms.grpo import _should_use_nemo_gym
-
         aborted_stale_inflight_groups = (
             0
-            if _should_use_nemo_gym(cast(GrpoMasterConfig, self._master_config))
+            if should_use_nemo_gym(self._master_config)
             else await self._abort_stale_inflight()
         )
 

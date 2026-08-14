@@ -16,7 +16,6 @@ import os
 import time
 import traceback
 import warnings
-from collections.abc import Iterator
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -33,8 +32,6 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
-    _should_use_async_rollouts,
-    _should_use_nemo_gym,
     aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
     extract_initial_prompt_messages,
@@ -59,6 +56,7 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
@@ -75,12 +73,16 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
 )
-from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.interfaces import (
+    GenerationInterface,
+    should_use_async_rollouts,
+)
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -227,6 +229,19 @@ class PPOConfig(BaseModel, extra="allow"):
     seq_logprob_error_threshold: float | None = None
     # Asynchronous PPO uses a replay buffer with non-colocated generation.
     async_ppo: AsyncPPOConfig = Field(default_factory=AsyncPPOConfig)
+
+    @model_validator(mode="after")
+    def validate_async_warmup_settings(self) -> "PPOConfig":
+        if (
+            self.async_ppo.enabled
+            and self.policy_training_start_step == 0
+            and self.async_ppo.warmup_max_trajectory_age_steps is not None
+        ):
+            raise ValueError(
+                "warmup_max_trajectory_age_steps requires "
+                "policy_training_start_step > 0"
+            )
+        return self
 
 
 class PPOSaveState(TypedDict):
@@ -867,7 +882,7 @@ def setup(
             assert policy_config["dtensor_cfg"]["enabled"] == False, (
                 "DTensor backend is not supported with kv cache fp8 enabled."
             )
-            assert not _should_use_async_rollouts(master_config), (
+            assert not should_use_async_rollouts(generation_config), (
                 "Async rollouts is not supported with kv cache fp8 enabled."
             )
             assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
@@ -1390,7 +1405,7 @@ def ppo_train(
                     if policy_generation is not None:
                         policy_generation.clear_logger_metrics()
 
-                    if _should_use_nemo_gym(master_config):
+                    if should_use_nemo_gym(master_config):
                         generation_config = master_config.policy["generation"]
                         nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                             policy_generation=policy_generation,
@@ -1411,7 +1426,7 @@ def ppo_train(
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
 
-                    elif _should_use_async_rollouts(master_config):
+                    elif should_use_async_rollouts(master_config.policy["generation"]):
                         (
                             repeated_batch,
                             rollout_metrics,
@@ -2060,33 +2075,6 @@ def _async_ppo_buffer_max_age(
     return max_trajectory_age_steps
 
 
-class _CyclingDataLoader:
-    """Repeat a PPO dataloader until collection stops."""
-
-    def __init__(self, dataloader: StatefulDataLoader) -> None:
-        self.dataloader = dataloader
-
-    def __iter__(self) -> Iterator[BatchedDataDict]:
-        consecutive_empty_epochs = 0
-        while True:
-            produced_this_epoch = False
-            for batch in self.dataloader:
-                produced_this_epoch = True
-                yield batch
-
-            if produced_this_epoch:
-                consecutive_empty_epochs = 0
-            else:
-                consecutive_empty_epochs += 1
-                if consecutive_empty_epochs >= 2:
-                    raise RuntimeError(
-                        "Dataloader yielded no batches for two consecutive epochs"
-                    )
-
-    def state_dict(self) -> dict[str, Any]:
-        return self.dataloader.state_dict()
-
-
 def async_ppo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -2354,7 +2342,7 @@ def async_ppo_train(
             )
         )
         ray.get(
-            trajectory_collector.start_collection.remote(_CyclingDataLoader(dataloader))
+            trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader))
         )
         print("📦 Started continuous background trajectory collection")
 
@@ -2722,9 +2710,6 @@ def async_ppo_train(
                 ):
                     with timer.time("idle/validation"):
                         ray.get(trajectory_collector.pause.remote())
-                        ray.get(
-                            trajectory_collector.wait_for_pending_generations.remote()
-                        )
                         # Policy weights were synced by the refit above.
                         policy_generation.prepare_for_generation()
                         val_metrics, validation_timings = validate(
@@ -3096,7 +3081,7 @@ def validate(
 
             rollout_fn = (
                 run_async_multi_turn_rollout
-                if _should_use_async_rollouts(master_config)
+                if should_use_async_rollouts(master_config.policy["generation"])
                 else run_multi_turn_rollout
             )
             val_batch, gen_metrics = rollout_fn(

@@ -42,9 +42,11 @@ from nemo_rl.algorithms.ppo import (
 from nemo_rl.algorithms.ppo import (
     MasterConfig as PPOMasterConfig,
 )
+from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -95,7 +97,9 @@ class AsyncTrajectoryCollector:
         async_config: AsyncGRPOConfig | AsyncPPOConfig
         if isinstance(master_config, GRPOMasterConfig):
             algorithm_config = master_config.grpo
-            async_config = algorithm_config.async_grpo
+            grpo_async_config = algorithm_config.async_grpo
+            assert grpo_async_config is not None
+            async_config = grpo_async_config
             self._deduplicate_multimodal_data = (
                 algorithm_config.deduplicate_multimodal_data
             )
@@ -152,7 +156,7 @@ class AsyncTrajectoryCollector:
 
         self.current_weight_version: int = start_step
         self.initial_weight_version: int = start_step
-        self.dataloader: StatefulDataLoader | None = None
+        self.dataloader: StatefulDataLoader | CyclingDataLoader | None = None
         self.collection_thread: _threading.Thread | None = None
         self._generation_lead_steps = self.async_config.max_trajectory_age_steps
         self._max_trajectory_age_steps = self.async_config.max_trajectory_age_steps
@@ -191,22 +195,25 @@ class AsyncTrajectoryCollector:
 
         Example:
         generation_weight_version = 10
-        max_trajectory_age_steps = 4
+        generation_lead_steps = 4
+
+        Generation lead usually equals maximum trajectory age, but PPO critic
+        warmup can temporarily configure them independently.
 
         Returns:
             [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
         """
-        max_trajectory_age = self._generation_lead_steps
+        generation_lead = self._generation_lead_steps
         if generation_weight_version == self.initial_weight_version:
             return [
                 i
                 for i in range(
                     self.initial_weight_version,
-                    self.initial_weight_version + max_trajectory_age + 1,
+                    self.initial_weight_version + generation_lead + 1,
                 )
             ]
 
-        return [generation_weight_version + i for i in range(1, max_trajectory_age + 1)]
+        return [generation_weight_version + i for i in range(1, generation_lead + 1)]
 
     def _get_next_target_for_generation(
         self, generation_weight_version: int
@@ -295,6 +302,7 @@ class AsyncTrajectoryCollector:
             )
 
             with self._generation_check_lock:
+                # Check if any target weight in our range needs generation
                 for target_weight in target_weights:
                     if target_weight <= last_consumed_target:
                         continue
@@ -315,7 +323,9 @@ class AsyncTrajectoryCollector:
         except Exception:
             return False
 
-    def start_collection(self, dataloader: StatefulDataLoader) -> None:
+    def start_collection(
+        self, dataloader: StatefulDataLoader | CyclingDataLoader
+    ) -> None:
         """Start collecting trajectories from dataloader."""
         self.running = True
         self.dataloader = dataloader
@@ -348,15 +358,11 @@ class AsyncTrajectoryCollector:
         }
 
     def _mark_collection_failed(self, error: Exception) -> None:
-        """Record the first background failure and unblock collector waits."""
+        """Record the first collection-loop failure."""
         with self._failure_lock:
             if not self.collection_failed:
                 self.collection_failed = True
                 self.collection_error = f"{type(error).__name__}: {error}"
-        self.running = False
-        self._manual_pause_cleared.set()
-        self._refit_pause_cleared.set()
-        self._generation_limit_cleared.set()
 
     def _collection_loop(self):
         """Run the collection loop in background thread."""
@@ -495,11 +501,7 @@ class AsyncTrajectoryCollector:
                 )
 
             # Generate all prompt groups needed for this target in one batched worker.
-            from nemo_rl.algorithms.grpo import _should_use_nemo_gym
-
-            use_nemo_gym = _should_use_nemo_gym(
-                cast(GRPOMasterConfig, self.master_config)
-            )
+            use_nemo_gym = should_use_nemo_gym(self.master_config)
 
             if not self._refit_pause_cleared.is_set() and self.running:
                 with self._threads_lock:
