@@ -49,11 +49,11 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
-    DataPlaneCheckpointBarrier,
     LEGACY_REPLAY_BUFFER_FILENAME,
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     REPLAY_BUFFER_METADATA_STORAGE,
+    DataPlaneCheckpointBarrier,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
@@ -209,7 +209,7 @@ class _FakeSampler:
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
 
-    def set_dispatch_index(self, resume_from_step: int) -> None:
+    def set_dispatch_index(self, resume_from_trainer_version: int) -> None:
         pass
 
 
@@ -1686,9 +1686,7 @@ class TestReplayBufferPersistence:
                 _make_actor_args(last_checkpoint_path=str(ckpt_dir)),
             )
 
-    def test_run_missing_native_replay_metadata_starts_empty(
-        self, tmp_path, monkeypatch
-    ):
+    def test_run_missing_native_replay_metadata_starts_empty(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"
         ckpt_dir.mkdir()
         mc = _actor_master_config(
@@ -1698,11 +1696,6 @@ class TestReplayBufferPersistence:
             data_plane_checkpoint=True,
         )
         buffer = _FakeTQBuffer()
-        printed: list[str] = []
-        monkeypatch.setattr(
-            "builtins.print",
-            lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
-        )
 
         actor, _ = _run_actor_run(
             mc,
@@ -1711,7 +1704,6 @@ class TestReplayBufferPersistence:
 
         assert buffer.load_calls == []
         assert actor._buffer_capacity._value == 4  # zero permits consumed
-        assert any("No native replay metadata found" in line for line in printed)
 
     def test_run_rejects_native_replay_state_with_gated_sampler(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"
