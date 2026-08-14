@@ -42,11 +42,12 @@ vLLM source checkout is needed.
 
 ### 1. Clone AutoModel into `3rdparty/`
 
-- **AutoModel** — Muse Glimmer support is not yet on
-  [main](https://github.com/NVIDIA-NeMo/Automodel); it lives on
-  [`huiyingl/feat/muse-glimmer-support`](https://github.com/NVIDIA-NeMo/Automodel/tree/huiyingl/feat/muse-glimmer-support).
-  The submodule is pinned to that branch until it merges upstream — see the
-  `.gitmodules` note for this submodule.
+- **AutoModel** — the submodule is pinned to a fixed commit on
+  [`huiyingl/feat/muse-glimmer-support`](https://github.com/NVIDIA-NeMo/Automodel/tree/huiyingl/feat/muse-glimmer-support)
+  (not tracking the branch tip), so unrelated upstream changes on that branch
+  can't break this setup. See the `.gitmodules` note for this submodule for
+  how to move the pin once Muse Glimmer support lands on
+  [main](https://github.com/NVIDIA-NeMo/Automodel).
 - **vLLM** — `pyproject.toml` pins the `vllm` extra directly to the nightly wheel
   built from vLLM main at
   [6adad0876](https://github.com/vllm-project/vllm/commit/6adad08767583f52eb4d2122111af0bf638ed5e6),
