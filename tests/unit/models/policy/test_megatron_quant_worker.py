@@ -14,7 +14,6 @@
 
 import os
 import tempfile
-from collections.abc import Iterator
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,11 +80,15 @@ _NVFP4_A16_RECIPE = (
 
 class _FakeModelOptBridge:
     def __init__(self):
-        self.transformer_config = SimpleNamespace(num_layers=0)
         self.calls = []
+        self.quantization_config = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+
+    def get_hf_modelopt_quantization_config(self, *args, **kwargs):
+        self.calls.append(("config", args, kwargs))
+        return self.quantization_config
 
     def export_hf_weights_modelopt(self, *args, **kwargs):
-        self.calls.append((args, kwargs))
+        self.calls.append(("export", args, kwargs))
         yield "model.layers.0.mlp.down_proj.weight", torch.ones(2, 2)
 
 
@@ -96,10 +99,8 @@ def _make_real_quant_worker():
         "quant_cfg": _NVFP4_A16_RECIPE,
         "generation": {
             "backend": "vllm",
-            "quant_cfg": _NVFP4_A16_RECIPE,
+            "quant_cfg": None,
             "real_quant": True,
-            "real_quant_export_cpu_offload": True,
-            "real_quant_ignore": ["lm_head"],
             "vllm_cfg": {"kv_cache_dtype": "auto"},
         },
     }
@@ -107,6 +108,7 @@ def _make_real_quant_worker():
     worker.draft_model = None
     worker.refit_conversion_tasks = ["task"]
     worker.megatron_bridge = _FakeModelOptBridge()
+    worker._modelopt_quantization_config = worker.megatron_bridge.quantization_config
     worker.rank = 0
     return worker
 
@@ -249,7 +251,7 @@ def test_warns_when_other_quantized_startup_caches_exist(tmp_path, monkeypatch):
 
 
 @requires_weight_folding
-def test_real_quant_refit_detection_requires_vllm_quant_cfg_and_flag():
+def test_real_quant_refit_detection_requires_vllm_and_flag():
     worker = _make_real_quant_worker()
 
     assert worker._use_real_quant_refit()
@@ -259,9 +261,8 @@ def test_real_quant_refit_detection_requires_vllm_quant_cfg_and_flag():
 
     worker.cfg["generation"]["real_quant"] = True
     worker.cfg["generation"]["quant_cfg"] = None
-    assert not worker._use_real_quant_refit()
+    assert worker._use_real_quant_refit()
 
-    worker.cfg["generation"]["quant_cfg"] = "NVFP4_DEFAULT_CFG"
     worker.cfg["generation"]["backend"] = "megatron"
     assert not worker._use_real_quant_refit()
 
@@ -273,96 +274,24 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
     output = list(worker._iter_real_quant_refit_params())
 
     assert output[0][0] == "model.layers.0.mlp.down_proj.weight"
-    args, kwargs = worker.megatron_bridge.calls[0]
+    _, args, kwargs = worker.megatron_bridge.calls[-1]
     assert args == ([worker.model],)
-    assert kwargs["quant_mode"] == "w4a16_nvfp4"
-    assert kwargs["cpu"] is True
+    assert kwargs["cpu"] is False
     assert kwargs["show_progress"] is False
     assert kwargs["conversion_tasks"] == worker.refit_conversion_tasks
-    assert kwargs["ignore_patterns"] == ["lm_head"]
+    assert "quant_mode" not in kwargs
+    assert "ignore_patterns" not in kwargs
 
 
 @requires_weight_folding
-def test_iter_real_quant_refit_params_can_keep_export_on_gpu() -> None:
+def test_real_quant_refit_rejects_runtime_layout_change() -> None:
     worker = _make_real_quant_worker()
-    worker.cfg["generation"]["real_quant_export_cpu_offload"] = False
+    worker.megatron_bridge.quantization_config = {
+        "quant_method": "modelopt",
+        "quant_algo": "W4A16_NVFP4",
+    }
 
-    list(worker._iter_real_quant_refit_params())
-
-    _, kwargs = worker.megatron_bridge.calls[0]
-    assert kwargs["cpu"] is False
-
-
-@pytest.mark.parametrize("quant_mode", ["w4a16_nvfp4", "nvfp4"])
-@requires_quant
-@requires_weight_folding
-def test_modelopt_real_quant_cpu_and_gpu_exports_are_byte_identical(
-    quant_mode: str,
-) -> None:
-    # Megatron Bridge is an optional dependency needed only by this CUDA test.
-    from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
-    from megatron.bridge.models.conversion.modelopt_utils import (
-        QuantMeta,
-        get_modelopt_quant_exporter,
-    )
-
-    qformat, export_weight = get_modelopt_quant_exporter(quant_mode)
-    generator = torch.Generator(device="cuda").manual_seed(42)
-    source = torch.randn(
-        (32, 32),
-        dtype=torch.bfloat16,
-        device="cuda",
-        generator=generator,
-    )
-    meta = QuantMeta(
-        qformat=qformat,
-        block_size=16,
-        weight_amax=source.abs().max(),
-        input_amax=torch.tensor(2.0, device="cuda"),
-    )
-
-    def export_hook(
-        name: str,
-        tensor: torch.Tensor,
-    ) -> Iterator[tuple[str, torch.Tensor]]:
-        yield from export_weight(name, tensor, meta)
-
-    weight = HFWeightTuple("model.layers.0.mlp.down_proj.weight", source)
-    cpu_export = list(weight.iter_finalized(cpu=True, export_hook=export_hook))
-    gpu_export = list(weight.iter_finalized(cpu=False, export_hook=export_hook))
-
-    assert [name for name, _ in cpu_export] == [name for name, _ in gpu_export]
-    assert len(cpu_export) == (4 if quant_mode == "nvfp4" else 3)
-    for (_, cpu_tensor), (_, gpu_tensor) in zip(cpu_export, gpu_export, strict=True):
-        assert cpu_tensor.device.type == "cpu"
-        assert gpu_tensor.device.type == "cuda"
-        assert cpu_tensor.shape == gpu_tensor.shape
-        assert cpu_tensor.dtype == gpu_tensor.dtype
-        assert torch.equal(
-            cpu_tensor.contiguous().reshape(-1).view(torch.uint8),
-            gpu_tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu(),
-        )
-
-
-@requires_weight_folding
-def test_iter_real_quant_refit_params_exports_w4a4_mode():
-    worker = _make_real_quant_worker()
-    quant_cfg = "NVFP4_EXPERTS_ONLY_CFG"
-    worker.cfg["quant_cfg"] = quant_cfg
-    worker.cfg["generation"]["quant_cfg"] = quant_cfg
-
-    list(worker._iter_real_quant_refit_params())
-
-    _, kwargs = worker.megatron_bridge.calls[0]
-    assert kwargs["quant_mode"] == "nvfp4"
-
-
-@requires_weight_folding
-def test_iter_real_quant_refit_params_rejects_policy_generation_mode_mismatch():
-    worker = _make_real_quant_worker()
-    worker.cfg["generation"]["quant_cfg"] = "NVFP4_EXPERTS_ONLY_CFG"
-
-    with pytest.raises(ValueError, match="matching policy and generation"):
+    with pytest.raises(RuntimeError, match="runtime layout"):
         list(worker._iter_real_quant_refit_params())
 
 

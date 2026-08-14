@@ -52,7 +52,10 @@ run_quant_rollout_case() {
     shift 6
 
     if [[ "$real_quant" == "true" ]]; then
-        real_quant_override+=(++policy.generation.real_quant=true)
+        real_quant_override+=(
+            ++policy.generation.real_quant=true
+            ++policy.generation.quant_cfg=null
+        )
     fi
 
     rm -rf "$EXP_DIR/$case_name"

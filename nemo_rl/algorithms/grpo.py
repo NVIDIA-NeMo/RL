@@ -1287,6 +1287,24 @@ def setup(
         ## make vllm hf overrides match the training policy
         vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
 
+        real_quant = bool(generation_config.get("real_quant"))
+        if real_quant:
+            from nemo_rl.modelopt.utils import (
+                configure_modelopt_real_quant_generation,
+            )
+
+            # vLLM's runtime layout is selected from the calibrated policy
+            # graph, so real quantization intentionally initializes policy first.
+            policy, policy_time = init_policy()
+            setup_timing_metrics.policy_init_time_s = policy_time
+            configure_modelopt_real_quant_generation(
+                policy_config,
+                generation_config,
+                policy.get_modelopt_quantization_config(),
+            )
+            if colocated_inference:
+                policy.offload_after_refit()
+
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
             # server URLs to NeMo Gym and spin it up while vLLM loads weights.
@@ -1321,9 +1339,12 @@ def setup(
                     generation_config["model_name"],
                 )
 
-            # Colocated: vLLM + policy share GPUs -> sequential; otherwise parallel.
+            # Real quantization already initialized policy to produce vLLM's
+            # deployment config. Other paths retain the existing overlap.
             init_tasks = {}
-            if colocated_inference:
+            if real_quant:
+                init_tasks["vllm"] = init_vllm_deferred
+            elif colocated_inference:
 
                 def init_vllm_then_policy():
                     pg, vllm_t = init_vllm_deferred()
@@ -1344,7 +1365,9 @@ def setup(
                 submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
                 results = {k: f.result() for k, f in submitted.items()}
 
-            if colocated_inference:
+            if real_quant:
+                policy_generation, vllm_load_time = results["vllm"]
+            elif colocated_inference:
                 policy_generation, vllm_load_time, policy, policy_time = results[
                     "vllm_policy"
                 ]
@@ -1355,12 +1378,20 @@ def setup(
             setup_timing_metrics.vllm_init_time_s = vllm_reserve_time + vllm_load_time
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
+            if real_quant and colocated_inference:
+                policy.prepare_for_training()
         else:
-            policy_generation, policy = initialize_generation_with_policy(
-                init_generation_fn=init_vllm,
-                colocated_inference=colocated_inference,
-                setup_timing_metrics=setup_timing_metrics,
-            )
+            if real_quant:
+                policy_generation, generation_time = init_vllm()
+                setup_timing_metrics.vllm_init_time_s = generation_time
+                if colocated_inference:
+                    policy.prepare_for_training()
+            else:
+                policy_generation, policy = initialize_generation_with_policy(
+                    init_generation_fn=init_vllm,
+                    colocated_inference=colocated_inference,
+                    setup_timing_metrics=setup_timing_metrics,
+                )
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",

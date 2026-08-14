@@ -1,6 +1,6 @@
 # Quantization-Aware RL (QARL)
 
-Quantization-Aware RL (QARL) integrates [NVIDIA Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer) into the NeMo RL training loop, enabling quantization-aware training and generation for both GRPO and on-policy distillation workflows. QARL automatically quantizes a standard model at initialization, maintains quantizer state (amax values) throughout training, and transfers quantized state to vLLM during weight refit. By default, vLLM generation uses fake-quantized modules. For NVFP4 W4A4 and W4A16 rollout experiments, NeMo RL can instead stream packed real-quant ModelOpt NVFP4 weights and scales into vLLM.
+Quantization-Aware RL (QARL) integrates [NVIDIA Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer) into the NeMo RL training loop, enabling quantization-aware training and generation for both GRPO and on-policy distillation workflows. QARL automatically quantizes a standard model at initialization, maintains quantizer state throughout training, and transfers quantized state to vLLM during weight refit. By default, vLLM generation uses fake-quantized modules. Real-quant rollout instead streams the canonical deployment tensors and configuration produced by ModelOpt.
 
 ## Overview
 
@@ -9,7 +9,7 @@ In a standard NeMo RL loop, model weights are trained in full precision and refi
 There are two vLLM rollout modes:
 
 - **Fake-quant rollout**: vLLM receives folded full-precision weights and runs fake-quantized layers. This is the default when `policy.generation.quant_cfg` is set.
-- **Real-quant rollout**: vLLM is initialized with ModelOpt NVFP4 kernels and receives packed NVFP4 weights plus scale tensors during every refit. Enable this with `policy.generation.real_quant: true`. W4A16 keeps activations in their native dtype; W4A4 additionally streams calibrated activation scales and uses an activation-quantizing vLLM kernel. The Megatron policy worker exports the payload through Megatron-Bridge.
+- **Real-quant rollout**: vLLM is initialized from ModelOpt's deployment configuration and receives ModelOpt's canonical packed tensors during every refit. Enable this with `policy.generation.real_quant: true`. The Megatron policy worker exports the payload through Megatron-Bridge.
 
 See [Verified Configurations](#verified-configurations) for the workflow + recipe combinations that have been empirically validated, and [Supported Quantization Formats](#supported-quantization-formats) for the full set of available formats. Results are recipe- and model-specific: the generic W4A4 `NVFP4_DEFAULT_CFG` has known GRPO convergence issues, while the routed-expert Qwen3 W4A4 real-quant recipe below completed the documented single-seed campaign.
 
@@ -25,10 +25,10 @@ The following workflow + quantization recipe combinations have been validated en
 | QA-Distillation | W4A4 | `examples/modelopt/quant_configs/nano3_nvfp4_default.yaml` | ✅ Converges | `examples/modelopt/qa_distillation_nano3_megatron.yaml` |
 | QA-GRPO | W4A16 | `NVFP4_MLP_WEIGHT_ONLY_CFG` | ✅ Smoke tested on MoE | `examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml` |
 | QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml` with `policy.generation.real_quant: true` | ✅ Converges | `examples/configs/recipes/llm/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.yaml` |
-| QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml` with `policy.generation.real_quant: true` and the model-specific `policy.generation.real_quant_ignore` list in the example | ✅ Converges tested on hybrid MoE/Mamba | `examples/configs/recipes/llm/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real.yaml` |
+| QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml` with `policy.generation.real_quant: true` | ✅ Converges tested on hybrid MoE/Mamba | `examples/configs/recipes/llm/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real.yaml` |
 | QA-GRPO real quantization rollout | W4A4 | `examples/modelopt/quant_configs/nvfp4_experts.yaml` with `policy.generation.real_quant: true` | ✅ Completed one 300-step Qwen3-30B-A3B MoE run | `examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real.yaml` |
 
-The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The Nano3 `nano3_nvfp4_weightonly.yaml` recipe applies the same W4A16 weight-only format to the supported MLP/MoE weights while keeping Nano3-sensitive Mamba, attention, gate/router, shared-expert, norm, and selected layer paths in BF16 through the model-specific `real_quant_ignore` list in the example config.
+The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The Nano3 `nano3_nvfp4_weightonly.yaml` recipe applies the same W4A16 weight-only format to supported MLP/MoE weights while keeping sensitive paths in BF16. All inclusions and exclusions are owned by the ModelOpt recipe.
 
 ## Simulated KV-Cache Quantization
 
@@ -130,13 +130,11 @@ sbatch \
 
 ## Real-Quant NVFP4 Rollout (W4A4 and W4A16)
 
-Real-quant rollout is intended for checking the deployment-style vLLM path during RL, not only the fake-quant training path. With `policy.generation.real_quant: true`, the Megatron policy worker exports ModelOpt QAT weights through Megatron-Bridge as packed NVFP4 tensors during refit, and the vLLM worker loads them into ModelOpt NVFP4 layers. This exercises vLLM's real FP4 kernel path during rollout while the policy training worker remains a QAT model.
-
-The W4A16 recipes below are validated configurations. W4A4 uses the same refit path plus calibrated per-layer or per-expert activation scales. The Megatron Qwen3 MoE recipe below completed one end-to-end 300-step run. Dense models can use the default real-quant ignore profile. MoE and hybrid models should use a model-specific ignore profile so unsupported or numerically sensitive paths stay in BF16.
+Real-quant rollout exercises the deployment-style vLLM path while the Megatron policy remains a QAT model. At startup, NeMo RL reads ModelOpt's canonical deployment configuration from the calibrated policy graph and gives it to vLLM through the standard Hugging Face override. During refit, Megatron-Bridge exports the matching canonical tensors. NeMo RL does not infer the quantization format or rewrite deployment names.
 
 ### Minimal Configuration
 
-Start from a Megatron GRPO config and add the ModelOpt weight-only recipe to both the policy and generation sections:
+Start from a Megatron GRPO config, configure the policy recipe, and enable real quantization for generation:
 
 ```yaml
 policy:
@@ -144,11 +142,14 @@ policy:
 
   generation:
     backend: vllm
-    quant_cfg: examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml
+    quant_cfg: null
     real_quant: true
+    vllm_cfg:
+      enforce_eager: true
+      kv_cache_dtype: auto
 ```
 
-For routed-expert Qwen3 MoE W4A4, use the block-16 E2M1 recipe in both sections:
+For routed-expert Qwen3 MoE W4A4, change only the policy recipe:
 
 ```yaml
 policy:
@@ -156,13 +157,16 @@ policy:
 
   generation:
     backend: vllm
-    quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
+    quant_cfg: null
     real_quant: true
+    vllm_cfg:
+      enforce_eager: true
+      kv_cache_dtype: auto
 ```
 
-NeMo RL derives W4A4 versus W4A16 from the effective ModelOpt quantizer formats and rejects a policy/generation mode mismatch. W4A4 requires a native activation-quantizing NVFP4 backend; the weight-only Marlin path is reserved for W4A16. Fused-MoE real-quant refits currently require every vLLM rank to own the full expert set.
+Layer selection belongs in the ModelOpt recipe. The same recipe produces the packed tensors and deployment configuration, so separate generation-side ignore lists are neither needed nor supported.
 
-For Nano3 W4A16 real-quant rollout, use the Nano3 weight-only recipe and an explicit model-specific ignore list:
+For Nano3 W4A16 real-quant rollout, use the Nano3 weight-only recipe:
 
 ```yaml
 policy:
@@ -170,42 +174,13 @@ policy:
 
   generation:
     backend: vllm
-    quant_cfg: examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml
+    quant_cfg: null
     real_quant: true
-    real_quant_ignore:
-      - lm_head
-      - '*output_layer*'
-      - '*mlp.gate'
-      - '*router*'
-      - '*block_sparse_moe.gate*'
-      - '*self_attention*'
-      - '*self_attn*'
-      - '*proj_out.*'
-      - '*.gate.*'
-      - '*mlp.shared_expert_gate.*'
-      - '*linear_attn.conv1d*'
-      - '*mixer.conv1d*'
-      - '*.mixer.in_proj*'
-      - '*.mixer.out_proj*'
-      - '*.shared_expert.*'
-      - '*.shared_experts.*'
-      - '*.norm.*'
-      - '*.q_proj*'
-      - '*.k_proj*'
-      - '*.v_proj*'
-      - '*.o_proj*'
-      - '*.qkv_proj*'
-      - '*.linear_proj*'
-      - '*.linear_qkv*'
-      - '*.layers.4.*'
-      - '*.layers.11.*'
-      - '*.layers.18.*'
-      - '*.layers.25.*'
-      - '*.layers.32.*'
-      - '*.layers.41.*'
     vllm_cfg:
       gpu_memory_utilization: 0.35
       enable_prefix_caching: false
+      enforce_eager: true
+      kv_cache_dtype: auto
 ```
 
 The ready-to-run 2-node DAPO long-context recipe is:
@@ -228,12 +203,11 @@ examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real.
 
 This recipe contains the 300-step, 256-example-validation campaign settings.
 The GB200 nightly driver overrides it to a two-step, 32-example smoke test.
-Both paths require the standalone ModelOpt-enabled Megatron-Bridge checkout;
-the embedded NeMo RL checkout does not contain the grouped-MoE W4A4 exporter.
+Both paths require the pinned Megatron-Bridge and ModelOpt revisions that expose
+the canonical distributed export API.
 
-For a BF16 baseline, copy the recipe, remove `policy.quant_cfg`,
-`policy.generation.quant_cfg`, and `policy.generation.real_quant`, and use distinct
-checkpoint and log directories.
+For a BF16 baseline, copy the recipe, remove `policy.quant_cfg` and
+`policy.generation.real_quant`, and use distinct checkpoint and log directories.
 
 ### Running the Example
 
@@ -284,16 +258,13 @@ For long runs on queues with short wall times, enable periodic checkpointing and
 
 ### Log Checks
 
-A healthy W4A16 real-rollout run should include these lines or equivalent vLLM logs:
+A healthy real-rollout run should include these lines or equivalent vLLM logs:
 
 ```text
 quantization=modelopt
 Detected ModelOpt NVFP4 checkpoint
-Using NvFp4LinearBackend.MARLIN for NVFP4 GEMM
 MegatronQuantPolicyWorker[rank=0]: Packed ... groups of tensors
 ```
-
-A W4A4 run should show the same ModelOpt checkpoint/refit signals but must not select `NvFp4LinearBackend.MARLIN`; NeMo RL rejects that weight-only backend because it would leave activations unquantized.
 
 It should not include:
 
@@ -312,8 +283,8 @@ For an initial sanity check, compare the first `Generation KL Error` with the BF
 | vLLM does not log `quantization=modelopt` | `policy.generation.real_quant` is not set or generation is not using vLLM | Check the YAML under `policy.generation` |
 | `Using rollout logprobs` appears | The run is bypassing policy/reference logprob computation | Do not use rollout logprobs for real-quant validation |
 | First-step W4A16 `Generation KL Error` is much higher than BF16 | Stale resume state, a stale converted Megatron checkpoint on the Megatron path, or a refit/export mismatch | Use a fresh training checkpoint directory; on Megatron also move aside the converted startup checkpoint; confirm packed tensors are streamed |
-| `negative scales` warning appears | Invalid or stale NVFP4 scale tensors reached vLLM | Use a fresh checkpoint directory and verify the same supported NVFP4 recipe is used for both policy and generation |
-| Nano3 first-step KL is high while dense W4A16 is healthy | Nano3-sensitive paths were quantized or the vLLM ignore set does not match the policy recipe | Use `nano3_nvfp4_weightonly.yaml` for policy and generation, and copy the explicit `policy.generation.real_quant_ignore` list from the Nano3 example recipe |
+| `negative scales` warning appears | Invalid or stale NVFP4 scale tensors reached vLLM | Use a fresh checkpoint directory and verify the intended ModelOpt policy recipe |
+| Nano3 first-step KL is high while dense W4A16 is healthy | Nano3-sensitive paths were quantized by the selected policy recipe | Use `nano3_nvfp4_weightonly.yaml` and inspect the recipe's layer selection |
 | CUDA invalid argument during refit or generation | vLLM consumed malformed packed tensors or stale IPC state | Restart from a fresh job and inspect the first real-quant refit logs |
 
 ## Quantization-Aware Distillation (On-Policy QAD)
@@ -358,16 +329,14 @@ These parameters are added under the `policy` section:
 | `quant_batch_size` | Batch size during calibration |
 | `quant_sequence_length` | Sequence length for calibration data |
 
-The `policy.generation.quant_cfg` should match `policy.quant_cfg` to ensure consistent quantization between training and generation.
+For fake-quant generation, `policy.generation.quant_cfg` should normally match `policy.quant_cfg`. For real-quant generation it must be `null`; the rollout configuration is produced from the policy graph.
 
 Generation-specific parameters are added under `policy.generation`:
 
 | Parameter | Description |
 |---|---|
-| `quant_cfg` | Quantization config used by the vLLM generation worker. For QARL, this should normally match `policy.quant_cfg`. |
-| `real_quant` | When `true`, vLLM uses ModelOpt NVFP4 real kernels and receives packed quantized weights during refit. The effective `quant_cfg` selects W4A4 or W4A16; unsupported and mismatched formats fail during setup. When unset or `false`, vLLM uses fake-quantized generation. |
-| `real_quant_ignore` | Optional list of vLLM parameter name patterns that should stay in native dtype during real-quant rollout. If omitted, NeMo RL uses the default ModelOpt NVFP4 ignore set for sensitive layers such as attention and output heads. For Nano3 hybrid MoE/Mamba W4A16 real-quant rollout, use the model-specific list shown in the Nano3 example recipe. |
-| `real_quant_export_cpu_offload` | Optional boolean, default `true`. When `true`, packed NVFP4 export tensors are copied to CPU before refit. Set to `false` only for colocated CUDA-IPC refit without an explicit `refit_transport`; this avoids the CPU round trip at the cost of transient GPU memory. |
+| `quant_cfg` | Quantization config used by the vLLM fake-quant worker. Set it to `null` for real-quant generation. |
+| `real_quant` | When `true`, vLLM receives ModelOpt's policy-produced deployment configuration and canonical packed tensors. When unset or `false`, vLLM uses fake-quantized generation. |
 
 ## Megatron Checkpoint Directory
 
@@ -388,8 +357,8 @@ QARL (via ModelOpt) and NeMo RL's built-in [FP8 training](../fp8.md) (via Transf
 
 ## Supported Quantization Formats
 
-- **Weight quantization**: per-tensor, per-channel, and block-wise formats are supported by fake-quant rollout. Real-quant rollout specifically requires block-16 E2M1 NVFP4 weights with dynamic block scaling, packed on the policy side and streamed with FP8 block scales and global scales.
-- **Input (activation) quantization**: fake-quant rollout supports the existing ModelOpt recipes. W4A4 real rollout specifically requires block-16 E2M1 NVFP4 inputs and streams one calibrated global input scale per dense projection or per expert projection.
+- **Fake quantization**: per-tensor, per-channel, and block-wise formats are supported by the existing ModelOpt recipe path.
+- **Real quantization**: a format is supported when the pinned ModelOpt canonical exporter and vLLM checkpoint loader both support it. The initial implementation covers dynamic block-16 NVFP4 W4A4 and W4A16.
 
 ## Exporting Megatron Checkpoints
 
@@ -420,8 +389,7 @@ uv run --extra mcore --extra modelopt \
 
 - **Generation**: Currently only vLLM is supported for generation.
 - **DTensor backend**: Quantization support for the DTensor policy worker is not yet implemented.
-- **Real-quant rollout**: W4A4 and W4A16 are supported for dense and fused-MoE vLLM ModelOpt NVFP4 layers exported from the Megatron policy path. Fused MoE currently requires all experts local to each vLLM rank. Hybrid MoE/Mamba recipes should keep unsupported or sensitive non-MLP paths in BF16 via `real_quant_ignore`.
+- **Real-quant rollout**: the initial canonical exporter supports dynamic block-16 NVFP4 W4A4 and W4A16. Layer selection and exclusions must be expressed in the ModelOpt policy recipe.
 - **Router Replay (R3)**: R3 is supported on the Megatron policy path.
-- **Input quantization**: W4A4 real rollout supports ModelOpt's block-16 E2M1 input format with a global scale per projection; other activation formats remain fake-quant only.
-- **Static NVFP4 weights**: The real-quant exporter rejects static weight quantizers because their calibrated per-block amax state cannot be reconstructed after distributed TP/EP gathering. Use the dynamic block-scaling recipes shown above.
+- **Runtime options**: real quantization currently requires eager vLLM execution, the default KV-cache dtype, no speculative decoding, and the default IPC or collective refit transport.
 - **Model support**: Dense Transformer, MoE (Mixture of Experts), and hybrid MoE/Mamba models are supported on the Megatron policy + vLLM generation path when Megatron-Bridge and ModelOpt support the model architecture and quantization recipe.

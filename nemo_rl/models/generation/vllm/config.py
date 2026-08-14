@@ -152,14 +152,9 @@ class VllmConfig(GenerationConfig):
 
     # quantization config
     quant_cfg: NotRequired[str | None]
-    # When set with ``quant_cfg``, initialize rollout vLLM with real ModelOpt
-    # NVFP4 kernels and stream packed quantized weights instead of fake-quant
-    # modules. This is intended for ModelOpt NVFP4 rollout experiments.
+    # Initialize vLLM from ModelOpt's deployment config and stream ModelOpt's
+    # canonical packed tensors instead of fake-quant modules.
     real_quant: NotRequired[bool]
-    # CPU offload remains the default. Disabling it is supported only for
-    # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
-    real_quant_export_cpu_offload: NotRequired[bool]
-    real_quant_ignore: NotRequired[list[str]]
 
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:

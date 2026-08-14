@@ -972,6 +972,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
+    def get_modelopt_quantization_config(self) -> dict[str, Any]:
+        """Return the canonical ModelOpt deployment config agreed by all ranks."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_modelopt_quantization_config"
+        )
+        configs = ray.get(futures)
+        config = configs[0]
+        if any(candidate != config for candidate in configs[1:]):
+            raise RuntimeError(
+                "ModelOpt deployment quantization config differs across policy ranks."
+            )
+        return config
+
     def finish_inference(self) -> None:
         """Offload policy model to CPU after inference."""
         futures = self.worker_group.run_all_workers_single_data("finish_inference")

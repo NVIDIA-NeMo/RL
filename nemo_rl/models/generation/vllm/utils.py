@@ -545,12 +545,12 @@ GENERATION_WORKER_OVERRIDES = {
 
 
 def resolve_generation_worker_cls(default_cls: str, config: dict) -> str:
-    """Return the quantized vLLM generation worker FQN if ``quant_cfg`` is set, else ``default_cls``.
+    """Return the quantized vLLM generation worker when ModelOpt is enabled.
 
     Safe to call even when ModelOpt is not installed — returns ``default_cls``
-    unchanged whenever ``quant_cfg`` is ``None``, so the core generation path
-    stays import-free of ModelOpt.
+    unchanged for ordinary generation, so the core path stays import-free of
+    ModelOpt.
     """
-    if config.get("quant_cfg") is None:
+    if config.get("quant_cfg") is None and not config.get("real_quant"):
         return default_cls
     return GENERATION_WORKER_OVERRIDES.get(default_cls, default_cls)

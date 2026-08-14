@@ -283,7 +283,7 @@ triton = [
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
-nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "9619e48d137123d2f202b9c87c47dc1f62ad76b5" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
 

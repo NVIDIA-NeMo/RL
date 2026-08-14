@@ -42,7 +42,6 @@ from nemo_rl.modelopt.models.policy.workers.utils import (
 )
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
-    resolve_nvfp4_real_quant_mode,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -453,83 +452,49 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     def _use_real_quant_refit(self) -> bool:
         generation_cfg = self.cfg["generation"]
-        return (
-            generation_cfg["backend"] == "vllm"
-            and generation_cfg.get("quant_cfg") is not None
-            and bool(generation_cfg.get("real_quant"))
+        return generation_cfg["backend"] == "vllm" and bool(
+            generation_cfg.get("real_quant")
         )
 
-    def _get_real_quant_mode(self) -> str:
-        """Resolve and cross-check the training and rollout quantization modes."""
-        cached_mode = getattr(self, "_real_quant_mode", None)
-        if cached_mode is not None:
-            return cached_mode
-
-        policy_quant_cfg = self.cfg.get("quant_cfg")
-        generation_quant_cfg = self.cfg["generation"].get("quant_cfg")
-        policy_mode = resolve_nvfp4_real_quant_mode(policy_quant_cfg)
-        generation_mode = resolve_nvfp4_real_quant_mode(generation_quant_cfg)
-        if policy_mode != generation_mode:
-            raise ValueError(
-                "Real-quant refit requires matching policy and generation "
-                f"quantization modes, got {policy_mode} from {policy_quant_cfg!r} "
-                f"and {generation_mode} from {generation_quant_cfg!r}."
-            )
-        self._real_quant_mode = policy_mode
-        return policy_mode
+    def get_modelopt_quantization_config(self) -> dict:
+        """Return and cache ModelOpt's canonical deployment config."""
+        conversion_tasks = self.refit_conversion_tasks
+        if conversion_tasks is None:
+            conversion_tasks = self._build_refit_conversion_tasks()
+            self.refit_conversion_tasks = conversion_tasks
+        config = self.megatron_bridge.get_hf_modelopt_quantization_config(
+            [self.model],
+            conversion_tasks=conversion_tasks,
+        )
+        self._modelopt_quantization_config = config
+        return config
 
     def _iter_real_quant_refit_params(
         self,
         kv_scales: dict[str, float] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Export packed NVFP4 weights and scales for real-quant vLLM rollout."""
-        from nemo_rl.modelopt.utils import DEFAULT_NVFP4_IGNORE
-
-        generation_cfg = self.cfg["generation"]
-        vllm_cfg = generation_cfg["vllm_cfg"]
-        ignore = generation_cfg.get("real_quant_ignore")
-        if ignore is None:
-            ignore = DEFAULT_NVFP4_IGNORE
-        mode = self._get_real_quant_mode()
-        export_cpu_offload = generation_cfg["real_quant_export_cpu_offload"]
+        """Export ModelOpt's canonical deployment tensors for vLLM refit."""
+        cached_config = getattr(self, "_modelopt_quantization_config", None)
+        if cached_config is None:
+            raise RuntimeError(
+                "ModelOpt real-quant refit started before the policy deployment "
+                "config was captured."
+            )
+        current_config = self.megatron_bridge.get_hf_modelopt_quantization_config(
+            [self.model],
+            conversion_tasks=self.refit_conversion_tasks,
+        )
+        if current_config != cached_config:
+            raise RuntimeError(
+                "ModelOpt's deployment quantization config changed after vLLM "
+                "initialization; online refit cannot change runtime layout."
+            )
         yield from self.megatron_bridge.export_hf_weights_modelopt(
             [self.model],
-            quant_mode="nvfp4" if mode == "w4a4" else "w4a16_nvfp4",
-            cpu=export_cpu_offload,
+            cpu=False,
             show_progress=False,
             conversion_tasks=self.refit_conversion_tasks,
-            ignore_patterns=ignore,
         )
-
-        if self.draft_model is not None:
-            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
-
-            for name, tensor in export_eagle_weights_to_hf(self.draft_model):
-                yield f"draft.{name}", tensor
-
-        if not vllm_cfg["kv_cache_dtype"].startswith("fp8"):
-            return
-
-        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
-            get_vllm_qkv_scale_names,
-        )
-
-        keys: list[str] = []
-        for layer_idx in range(self.megatron_bridge.transformer_config.num_layers):
-            keys.extend(get_vllm_qkv_scale_names(layer_idx).values())
-
-        for param_name in keys:
-            scale_value = (
-                kv_scales[param_name] if kv_scales and param_name in kv_scales else 1.0
-            )
-            yield (
-                param_name,
-                torch.tensor(
-                    scale_value,
-                    dtype=torch.float32,
-                    device="cuda",
-                ).reshape(1),
-            )
 
     @staticmethod
     def _find_weight_quantizer(
