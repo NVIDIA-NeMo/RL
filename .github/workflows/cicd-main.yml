@@ -34,13 +34,13 @@ on:
           - L2
           - megatron
         description: Test level to run. docs = doc tests only (reuses main container), Lfast = fast subset (reuses main container), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence, megatron = Megatron functional tests only
-      functional_test_script_pattern:
-        description: "Case-insensitive substring used to select functional test script names (for example, Megatron_1)."
+      test_script_pattern:
+        description: "Case-insensitive substring used to select unit and functional test script names (for example, Megatron_1 or Mcore)."
         required: false
         default: ""
         type: string
-      functional_test_platform:
-        description: "Platform on which to run functional tests. Lfast supports all and h100."
+      test_platform:
+        description: "Platform on which to run tests. Unit tests run only for all and h100."
         required: false
         default: all
         type: choice
@@ -71,8 +71,10 @@ jobs:
     outputs:
       test_level: ${{ steps.evaluate.outputs.test_level }}
       image_tag: ${{ steps.evaluate.outputs.image_tag }}
-      functional_test_script_pattern: ${{ steps.evaluate.outputs.functional_test_script_pattern }}
-      functional_test_platform: ${{ steps.evaluate.outputs.functional_test_platform }}
+      test_script_pattern: ${{ steps.evaluate.outputs.test_script_pattern }}
+      test_platform: ${{ steps.evaluate.outputs.test_platform }}
+      h100_unit_test_scripts: ${{ steps.evaluate.outputs.h100_unit_test_scripts }}
+      h100_unit_test_count: ${{ steps.evaluate.outputs.h100_unit_test_count }}
       h100_functional_test_scripts: ${{ steps.evaluate.outputs.h100_functional_test_scripts }}
       h100_functional_test_count: ${{ steps.evaluate.outputs.h100_functional_test_count }}
       gb200_functional_test_scripts: ${{ steps.evaluate.outputs.gb200_functional_test_scripts }}
@@ -156,8 +158,8 @@ jobs:
           MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           DISPATCH_TEST_LEVEL: ${{ inputs.test_to_run }}
           DISPATCH_IMAGE_TAG: ${{ inputs.image_tag }}
-          FUNCTIONAL_TEST_SCRIPT_PATTERN: ${{ inputs.functional_test_script_pattern }}
-          FUNCTIONAL_TEST_PLATFORM: ${{ inputs.functional_test_platform || 'all' }}
+          TEST_SCRIPT_PATTERN: ${{ inputs.test_script_pattern }}
+          TEST_PLATFORM: ${{ inputs.test_platform || 'all' }}
           MEGATRON_LM_COMMIT: ${{ inputs.megatron_lm_commit }}
         run: |
           # Some output that's helpful for debugging
@@ -203,23 +205,25 @@ jobs:
             echo "megatron_lm_commit must be a full 40-character hexadecimal commit SHA." >&2
             exit 1
           fi
-          if [[ -n "$FUNCTIONAL_TEST_SCRIPT_PATTERN" && ! "$FUNCTIONAL_TEST_SCRIPT_PATTERN" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
-            echo "functional_test_script_pattern may contain only letters, numbers, dots, underscores, and hyphens." >&2
+          if [[ -n "$TEST_SCRIPT_PATTERN" && ! "$TEST_SCRIPT_PATTERN" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+            echo "test_script_pattern may contain only letters, numbers, dots, underscores, and hyphens." >&2
             exit 1
           fi
 
-          functional_test_plan=$(bash .github/scripts/plan-functional-tests.sh \
-            "$TEST_LEVEL" "$FUNCTIONAL_TEST_SCRIPT_PATTERN" "$FUNCTIONAL_TEST_PLATFORM")
-          echo "Functional test plan: $functional_test_plan"
+          test_plan=$(bash .github/scripts/plan-tests.sh \
+            "$TEST_LEVEL" "$TEST_SCRIPT_PATTERN" "$TEST_PLATFORM")
+          echo "Test plan: $test_plan"
 
           {
             echo "test_level=$TEST_LEVEL"
-            echo "functional_test_script_pattern=$FUNCTIONAL_TEST_SCRIPT_PATTERN"
-            echo "functional_test_platform=$FUNCTIONAL_TEST_PLATFORM"
-            echo "h100_functional_test_scripts=$(jq -c '.h100' <<< "$functional_test_plan")"
-            echo "h100_functional_test_count=$(jq -r '.h100_count' <<< "$functional_test_plan")"
-            echo "gb200_functional_test_scripts=$(jq -c '.gb200' <<< "$functional_test_plan")"
-            echo "gb200_functional_test_count=$(jq -r '.gb200_count' <<< "$functional_test_plan")"
+            echo "test_script_pattern=$TEST_SCRIPT_PATTERN"
+            echo "test_platform=$TEST_PLATFORM"
+            echo "h100_unit_test_scripts=$(jq -c '.unit' <<< "$test_plan")"
+            echo "h100_unit_test_count=$(jq -r '.unit_count' <<< "$test_plan")"
+            echo "h100_functional_test_scripts=$(jq -c '.h100_functional' <<< "$test_plan")"
+            echo "h100_functional_test_count=$(jq -r '.h100_functional_count' <<< "$test_plan")"
+            echo "gb200_functional_test_scripts=$(jq -c '.gb200_functional' <<< "$test_plan")"
+            echo "gb200_functional_test_count=$(jq -r '.gb200_functional_count' <<< "$test_plan")"
             echo "megatron_lm_commit=${MEGATRON_LM_COMMIT,,}"
           } | tee -a "$GITHUB_OUTPUT"
 
@@ -656,59 +660,14 @@ jobs:
       fail-fast: false
       max-parallel: 16
       matrix:
-        include:
-          - script: L0_Unit_Tests_Vllm_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Vllm_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Vllm_3
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Sglang
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Trtllm
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Mcore
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Mcore_Policy_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Mcore_Policy_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Mcore_Policy_3
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Automodel
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Automodel_Policy_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Automodel_Policy_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Automodel_Policy_3
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Models_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Models_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Models_3
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Models_4
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Environments
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Nemo_Gym
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Algorithms
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Data
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Distributed
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L0_Unit_Tests_Other
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+        script: ${{ fromJSON(needs.pre-flight.outputs.h100_unit_test_scripts) }}
     needs: [pre-flight, build-container, cicd-doc-tests, org-member-pre-flight, cicd-wait-in-queue]
     if: >-
       ${{
         (
           always() &&
           contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) &&
+          needs.pre-flight.outputs.h100_unit_test_count != '0' &&
           needs.pre-flight.result == 'success' &&
           needs.org-member-pre-flight.result == 'success' &&
           (
@@ -721,7 +680,7 @@ jobs:
       }}
 
 
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
     name: ${{ matrix.script }}
     steps:
       - name: Checkout
@@ -731,14 +690,14 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
-          runner: ${{ matrix.runner }}
+          runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           script: ${{ matrix.script }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           image: ${{ vars.CI_CONTAINER_NAME }}
           image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           is_unit_test: "true"
-          cpu-only: ${{ matrix.cpu-only || false }}
+          cpu-only: "false"
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   unit-test-script-check:
@@ -764,28 +723,27 @@ jobs:
         with:
           ref: ${{ needs.pre-flight.outputs.test_sha }}
 
-      - name: Verify L0 unit scripts are in the workflow
+      - name: Verify unit test planner coverage
         run: |
           set -euo pipefail
 
           expected=$(mktemp)
-          configured=$(mktemp)
+          planned=$(mktemp)
 
           find tests/unit -maxdepth 1 -type f -name 'L0_Unit*.sh' \
             -exec basename {} .sh \; | sort -u > "$expected"
 
-          {
-            grep -E '^[[:space:]]*-[[:space:]]*script:[[:space:]]*L0_Unit' .github/workflows/cicd-main.yml || true
-          } | sed -E 's/^[[:space:]]*-[[:space:]]*script:[[:space:]]*//' | sort -u > "$configured"
+          bash .github/scripts/plan-tests.sh L0 "" all |
+            jq -r '.unit[]' | sort -u > "$planned"
 
-          missing=$(comm -23 "$expected" "$configured")
+          missing=$(comm -23 "$expected" "$planned")
           if [[ -n "$missing" ]]; then
-            echo "The following tests/unit/L0_Unit*.sh scripts are missing from .github/workflows/cicd-main.yml:"
+            echo "The following unit scripts are missing from the generated test plan:"
             printf '%s\n' "$missing"
             exit 1
           fi
 
-          echo "All L0 unit scripts are included in .github/workflows/cicd-main.yml."
+          echo "All L0 unit scripts are included in the generated test plan."
 
   functional-test-script-check:
     name: Check functional test script coverage
@@ -820,8 +778,8 @@ jobs:
           find tests/functional -maxdepth 1 -type f -name 'L1_Functional*.sh' \
             -exec basename {} .sh \; | sort -u > "$expected"
 
-          bash .github/scripts/plan-functional-tests.sh L1 "" gb200 |
-            jq -r '.gb200[]' | sort -u > "$planned"
+          bash .github/scripts/plan-tests.sh L1 "" gb200 |
+            jq -r '.gb200_functional[]' | sort -u > "$planned"
 
           missing=$(comm -23 "$expected" "$planned")
           if [[ -n "$missing" ]]; then
@@ -855,7 +813,7 @@ jobs:
         (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
         (
           needs.cicd-unit-tests.result == 'success' ||
-          (needs.pre-flight.outputs.test_level == 'megatron' && needs.cicd-unit-tests.result == 'skipped')
+          (needs.pre-flight.outputs.h100_unit_test_count == '0' && needs.cicd-unit-tests.result == 'skipped')
         ) &&
         needs.functional-test-script-check.result == 'success' &&
         !cancelled()
@@ -903,7 +861,7 @@ jobs:
         (needs.build-container-gb200.result == 'success' || needs.build-container-gb200.result == 'skipped') &&
         (
           needs.cicd-unit-tests.result == 'success' ||
-          (needs.pre-flight.outputs.test_level == 'megatron' && needs.cicd-unit-tests.result == 'skipped')
+          (needs.pre-flight.outputs.h100_unit_test_count == '0' && needs.cicd-unit-tests.result == 'skipped')
         ) &&
         needs.functional-test-script-check.result == 'success' &&
         !cancelled()
@@ -1010,6 +968,7 @@ jobs:
                     (needs.cicd-doc-tests.result == 'success' || needs.cicd-doc-tests.result == 'skipped') &&
                     (
                       !contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) ||
+                      needs.pre-flight.outputs.h100_unit_test_count == '0' ||
                       needs.cicd-unit-tests.result == 'success'
                     ) &&
                     (
@@ -1027,7 +986,7 @@ jobs:
                     ) &&
                     (
                       (
-                        needs.pre-flight.outputs.functional_test_platform != 'gb200' &&
+                        needs.pre-flight.outputs.test_platform != 'gb200' &&
                         (
                           needs.org-member-pre-flight.outputs.is_member != 'true' ||
                           vars.DISABLE_GB200_TESTS == 'true'
