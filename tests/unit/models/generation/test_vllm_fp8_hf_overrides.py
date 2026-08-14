@@ -147,3 +147,26 @@ def test_source_fp8_kwargs_not_mutated():
     _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
 
     assert "hf_overrides" in fp8_kwargs
+
+
+def test_external_draft_config_is_not_modified_by_target_fp8_overrides():
+    speculative_config = {
+        "method": "eagle3",
+        "model": "external-draft-model",
+        "num_speculative_tokens": 3,
+    }
+    vllm_kwargs = {"speculative_config": speculative_config.copy()}
+    fp8_kwargs = {
+        "quantization": "fp8",
+        "hf_overrides": {
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MXFP8",
+                "ignore": ["lm_head"],
+            }
+        },
+    }
+
+    _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
+
+    assert vllm_kwargs["speculative_config"] == speculative_config

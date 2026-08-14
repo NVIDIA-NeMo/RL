@@ -32,6 +32,9 @@ from vllm.v1.engine.utils import CoreEngineProcManager
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
 )
+from nemo_rl.models.generation.vllm.quantization.ignore_patterns import (
+    get_embedded_mtp_ignore_patterns,
+)
 
 logger = init_logger(__name__)
 
@@ -274,8 +277,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
     if global_fp8_config.is_mx:
         fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
+        embedded_mtp_ignore_patterns = get_embedded_mtp_ignore_patterns(config)
     else:
         fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+        embedded_mtp_ignore_patterns = []
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
             model = AutoModel.from_config(config)
@@ -321,9 +326,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     ignored_layers = fp8_block_quant_kwargs.setdefault("ignored_layers", [])
     ignored_layers.extend(DEFAULT_QUANTIZATION_IGNORED_LAYERS)
     fp8_block_quant_kwargs["ignored_layers"] = list(dict.fromkeys(ignored_layers))
-    if quantization_ignore_patterns:
+    if embedded_mtp_ignore_patterns or quantization_ignore_patterns:
         fp8_block_quant_kwargs.setdefault("ignore", []).extend(
-            quantization_ignore_patterns
+            [
+                *embedded_mtp_ignore_patterns,
+                *(quantization_ignore_patterns or []),
+            ]
         )
 
     if "ignored_layers" in fp8_block_quant_kwargs:
