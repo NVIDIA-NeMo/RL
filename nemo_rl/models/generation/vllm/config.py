@@ -56,6 +56,9 @@ class VllmSpecificArgs(TypedDict):
     expose_http_server: NotRequired[bool]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
+    # Invalidate weight-dependent multimodal encoder outputs after a successful
+    # async refit. Enable only when generation is quiesced during weight updates.
+    reset_encoder_cache_after_weight_update: NotRequired[bool]
     # Fixed internal refit endpoint port for stable Kubernetes targetPorts.
     http_refit_server_port: NotRequired[int | None]
     # Fixed ZeroMQ relay port for stable Kubernetes targetPorts.
