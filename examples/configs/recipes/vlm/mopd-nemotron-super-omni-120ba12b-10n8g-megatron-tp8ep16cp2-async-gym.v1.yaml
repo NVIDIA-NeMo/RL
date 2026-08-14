@@ -44,6 +44,7 @@ data:
     data_path: /path/to/circle_count_train.jsonl
 env:
   nemo_gym:
+    uv_pip_set_python: true
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/circle_count/configs/circle_count.yaml
