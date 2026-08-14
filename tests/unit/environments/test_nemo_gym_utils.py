@@ -19,6 +19,7 @@ These run in the default L0 suite. Keep this module free of heavy imports
 
 import copy
 import json
+import os
 import sys
 import types
 from contextlib import contextmanager
@@ -913,10 +914,12 @@ def test_an_unsharded_job_is_not_scanned_at_all():
     """One actor hosts everything, so parsing every row would buy nothing."""
     dataset = MagicMock()
 
-    nemo_gym_mod.validate_dataset_agent_coverage(
-        nemo_gym_mod.as_nemo_gym_shard_set(MagicMock()), {"train": dataset}
-    )
+    with patch.object(nemo_gym_mod, "_load_agent_names_from_source") as load_names:
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            nemo_gym_mod.as_nemo_gym_shard_set(MagicMock()), {"train": dataset}
+        )
 
+    load_names.assert_not_called()
     dataset.__iter__.assert_not_called()
 
 
@@ -930,26 +933,96 @@ def test_the_wrapped_dataset_is_unwrapped_before_scanning():
         )
 
 
-def test_cached_agent_names_avoid_scanning_repeated_or_separate_datasets():
+def test_source_agent_names_are_cached_across_separate_datasets(tmp_path):
+    data_path = tmp_path / "gym.jsonl"
+    data_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"agent_ref": {"name": "alpha"}}),
+                json.dumps({"agent_ref": {"name": "beta"}}),
+            ]
+        )
+        + "\n"
+    )
+    source_stat = data_path.stat()
+    source = nemo_gym_mod.NemoGymSourceIdentity.from_stat(
+        str(data_path.resolve()), source_stat
+    )
     alpha_rows = MagicMock()
     beta_rows = MagicMock()
     datasets = {
         "alpha": SimpleNamespace(
             dataset=alpha_rows,
-            agent_names=frozenset({"alpha"}),
+            agent_name_sources=frozenset({source}),
         ),
         "beta": SimpleNamespace(
             dataset=beta_rows,
-            agent_names=frozenset({"beta"}),
+            agent_name_sources=frozenset({source}),
         ),
     }
 
-    nemo_gym_mod.validate_dataset_agent_coverage(
-        _sharded_set({"alpha": "left", "beta": "right"}), {"train": datasets}
-    )
+    with patch.object(
+        nemo_gym_mod,
+        "_get_agent_name",
+        wraps=nemo_gym_mod._get_agent_name,
+    ) as get_agent_name:
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            _sharded_set({"alpha": "left", "beta": "right"}), {"train": datasets}
+        )
 
+    assert get_agent_name.call_count == 2
     alpha_rows.__iter__.assert_not_called()
     beta_rows.__iter__.assert_not_called()
+
+
+def test_changed_source_falls_back_to_loaded_rows(tmp_path):
+    data_path = tmp_path / "gym.jsonl"
+    data_path.write_text(json.dumps({"agent_ref": {"name": "alpha"}}) + "\n")
+    source_stat = data_path.stat()
+    source = nemo_gym_mod.NemoGymSourceIdentity.from_stat(
+        str(data_path.resolve()), source_stat
+    )
+    wrapper = SimpleNamespace(
+        dataset=_gym_dataset("ghost"),
+        agent_name_sources=frozenset({source}),
+    )
+    data_path.write_text(
+        json.dumps({"agent_ref": {"name": "changed-and-longer"}}) + "\n"
+    )
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="ghost"):
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            _sharded_set({"alpha": "left"}), {"train": wrapper}
+        )
+
+
+def test_same_size_source_replacement_falls_back_to_loaded_rows(tmp_path):
+    data_path = tmp_path / "gym.jsonl"
+    data_path.write_text(json.dumps({"agent_ref": {"name": "alpha"}}) + "\n")
+    source_stat = data_path.stat()
+    source = nemo_gym_mod.NemoGymSourceIdentity.from_stat(
+        str(data_path.resolve()), source_stat
+    )
+    wrapper = SimpleNamespace(
+        dataset=_gym_dataset("ghost"),
+        agent_name_sources=frozenset({source}),
+    )
+
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_text(json.dumps({"agent_ref": {"name": "bravo"}}) + "\n")
+    os.utime(
+        replacement,
+        ns=(replacement.stat().st_atime_ns, source_stat.st_mtime_ns),
+    )
+    os.replace(replacement, data_path)
+    replaced_stat = data_path.stat()
+    assert replaced_stat.st_size == source_stat.st_size
+    assert replaced_stat.st_mtime_ns == source_stat.st_mtime_ns
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="ghost"):
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            _sharded_set({"alpha": "left"}), {"train": wrapper}
+        )
 
 
 def test_shard_set_shutdown_releases_the_placement_group_once():

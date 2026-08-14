@@ -16,6 +16,7 @@ from datasets import Dataset
 
 from nemo_rl.data import PreferenceDatasetConfig, ResponseDatasetConfig
 from nemo_rl.data.interfaces import (
+    NemoGymSourceIdentity,
     TaskDataPreProcessFnCallable,
     TaskDataProcessFnCallable,
     TaskDataSpec,
@@ -27,7 +28,7 @@ class RawDataset:
     # change to ResponseDatasetConfig | PreferenceDatasetConfig once preference dataset is refactored
     data_config: ResponseDatasetConfig | PreferenceDatasetConfig
     dataset: Dataset
-    agent_names: frozenset[str] | None = None
+    agent_name_sources: frozenset[NemoGymSourceIdentity] | None = None
     # `val_dataset` is used only when current dataset is used for both training and validation
     val_dataset: Dataset | None
     processor: TaskDataProcessFnCallable
