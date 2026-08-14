@@ -35,42 +35,35 @@ Notes:
 
 ## Build the Environment
 
-Published NeMo RL containers do not include the Muse Glimmer runtime. Both AutoModel
-and vLLM must come from local sources.
+Published NeMo RL containers do not include the Muse Glimmer runtime. AutoModel must
+come from a local source; vLLM installs directly from a prebuilt nightly wheel, so no
+vLLM source checkout is needed.
 
-### 1. Clone the sources into `3rdparty/`
+### 1. Clone AutoModel into `3rdparty/`
 
-Sources:
-
-- **AutoModel** — [main branch](https://github.com/NVIDIA-NeMo/Automodel), where Muse
-  Glimmer support is merged.
-- **vLLM** — [main branch](https://github.com/vllm-project/vllm), where Muse Glimmer
-  support is merged.
+- **AutoModel** — Muse Glimmer support is not yet on
+  [main](https://github.com/NVIDIA-NeMo/Automodel); it lives on
+  [`huiyingl/feat/muse-glimmer-support`](https://github.com/NVIDIA-NeMo/Automodel/tree/huiyingl/feat/muse-glimmer-support).
+  The submodule is pinned to that branch until it merges upstream — see the
+  `.gitmodules` note for this submodule.
+- **vLLM** — `pyproject.toml` pins the `vllm` extra directly to the nightly wheel
+  built from vLLM main at
+  [6adad0876](https://github.com/vllm-project/vllm/commit/6adad08767583f52eb4d2122111af0bf638ed5e6),
+  the commit that merged Muse Glimmer support
+  ([nightly build directory layout](https://docs.vllm.ai/en/latest/contributing/ci/nightly_builds/#directory-structure)).
+  This installs as a regular (non-editable) package — there is nothing to clone.
 
 ```bash
 git submodule update --init 3rdparty/Automodel-workspace/Automodel
-
-mkdir -p 3rdparty/vLLM-workspace
-git clone https://github.com/vllm-project/vllm.git 3rdparty/vLLM-workspace/vllm
 ```
-
-`pyproject.toml` installs vLLM from `3rdparty/vLLM-workspace/vllm` as an editable
-source, so `uv sync` fails if that directory is empty.
 
 ### 2. Force a worker-venv rebuild
 
 Ray worker virtual environments are cached, so they will not pick up the local
-AutoModel and vLLM sources unless you ask for a rebuild:
+AutoModel source or a `pyproject.toml` dependency bump unless you ask for a rebuild:
 
 ```bash
 export NRL_FORCE_REBUILD_VENVS=true
-
-# Skip vLLM's CUDA build. Without this the editable install runs cmake, whose
-# FetchContent step clones cutlass from GitHub -- which fails on compute nodes
-# with no external network ("Failed to clone repository"). Stage the wheel on a
-# shared filesystem first; a URL only works if the compute nodes can reach it.
-export VLLM_USE_PRECOMPILED=1
-export VLLM_PRECOMPILED_WHEEL_LOCATION=/path/to/vllm-<version>-cp38-abi3-manylinux_2_28_x86_64.whl
 
 # Multi-node only. Every node's venv builder contends on one lock in the shared
 # uv cache while vLLM's metadata is built; uv's default 300 s lock timeout is
@@ -79,10 +72,17 @@ export VLLM_PRECOMPILED_WHEEL_LOCATION=/path/to/vllm-<version>-cp38-abi3-manylin
 export UV_LOCK_TIMEOUT=3600
 ```
 
+> [!NOTE]
+> The vLLM wheel is fetched from `https://wheels.vllm.ai` during `uv sync`/`uv lock`.
+> If compute nodes have no external network, warm the shared `UV_CACHE_DIR` first by
+> running `uv sync` (or `uv lock`) once from a node that does have network access —
+> subsequent syncs on compute nodes reuse the cached wheel.
+
 ## Get the Weights
 
-The recipes ship with a placeholder path. Point both keys at your local checkpoint
-directory:
+The recipes default `policy.model_name` and `policy.tokenizer.name` to the released
+HF Hub checkpoint, `meta-models/Muse-Glimmer-30B`. To use a local checkpoint instead,
+override both keys:
 
 ```bash
 uv run examples/run_grpo.py \
@@ -145,17 +145,13 @@ correctness. `train/truncation_rate` early in training runs around **0.6 at 4k**
 ```bash
 export NRL_FORCE_REBUILD_VENVS=true
 
-# 6k, CP4 -- recommended default
+# 6k, CP4 -- recommended default (pulls meta-models/Muse-Glimmer-30B from HF Hub)
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-6k.yaml \
-  policy.model_name=/your/path/to/muse-glimmer-30b \
-  policy.tokenizer.name=/your/path/to/muse-glimmer-30b
+  --config examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-6k.yaml
 
 # 4k, no CP -- shorter context, tighter on memory
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2-automodel-4k.yaml \
-  policy.model_name=/your/path/to/muse-glimmer-30b \
-  policy.tokenizer.name=/your/path/to/muse-glimmer-30b
+  --config examples/configs/recipes/llm/grpo-muse-glimmer-30b-4n8g-fsdp2-automodel-4k.yaml
 ```
 
 On Slurm, keep `cluster.num_nodes` in step with what you request from the scheduler.

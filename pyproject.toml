@@ -144,22 +144,25 @@ vllm = [
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Unpinned on purpose: vLLM is resolved from the local editable checkout at
-  # 3rdparty/vLLM-workspace/vllm (see [tool.uv.sources] below), because upstream
-  # vLLM has no Muse Glimmer support yet. Clone the source there before running
-  # `uv sync` -- an empty directory fails resolution. See
-  # docs/guides/models/muse-glimmer.md.
-  "vllm",
+  # Pinned to the vLLM main nightly wheel built from 6adad0876, the commit that
+  # merged Muse Glimmer support. No local vLLM source checkout is needed -- this
+  # installs the prebuilt wheel directly (not editable). See
+  # docs/guides/models/muse-glimmer.md. To move to a newer commit once Muse
+  # Glimmer support reaches a tagged release, swap both URLs for the release's
+  # PyPI/index entry and drop this pin.
+  "vllm @ https://wheels.vllm.ai/6adad08767583f52eb4d2122111af0bf638ed5e6/vllm-0.27.2rc1.dev76%2Bg6adad0876-cp38-abi3-manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64'",
+  "vllm @ https://wheels.vllm.ai/6adad08767583f52eb4d2122111af0bf638ed5e6/vllm-0.27.2rc1.dev76%2Bg6adad0876-cp38-abi3-manylinux_2_28_aarch64.whl ; platform_machine == 'aarch64'",
   "num2words>=0.5.14",
-  # Versions mirror 3rdparty/vLLM-workspace/vllm/requirements/cuda.txt. Keep them
-  # in sync on every vLLM source bump.
-  "flashinfer-python==0.6.15.post1",
+  # Versions mirror requirements/cuda.txt at the pinned vLLM commit (6adad0876).
+  # Keep them in sync on every vLLM wheel bump: see
+  # https://github.com/vllm-project/vllm/blob/6adad08767583f52eb4d2122111af0bf638ed5e6/requirements/cuda.txt
+  "flashinfer-python==0.6.16.post3",
   # flashinfer-cubin is deliberately absent: it has not been published to PyPI
   # since 0.6.14 (latest there is 0.6.9), and the vLLM source excludes it from
   # install_requires for exactly that reason. flashinfer falls back to JIT
   # compilation, which costs first-call latency only.
-  "flashinfer-jit-cache==0.6.15.post1",
-  "nvidia-cutlass-dsl[cu13]==4.6.0",
+  "flashinfer-jit-cache==0.6.16.post3",
+  "nvidia-cutlass-dsl[cu13]==4.6.2",
 ]
 sglang = [
   "sglang==0.5.12.post1",
@@ -273,7 +276,6 @@ tensorrt-llm = { path = "3rdparty/TensorRT-LLM-workspace" }
 nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = true }
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge", editable = true }
 nemo_gym = { workspace = true }
-vllm = { path = "3rdparty/vLLM-workspace/vllm", editable = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [

@@ -49,11 +49,11 @@ checkpointing:
   # means the intent survives if that worker default ever changes.
   is_async: true
 policy:
-  # Point these at your local Muse Glimmer checkpoint directory. See
-  # docs/guides/models/muse-glimmer.md.
-  model_name: /path/to/muse-glimmer-30b
+  # Defaults to the released HF Hub checkpoint. Override with a local
+  # checkpoint directory if needed -- see docs/guides/models/muse-glimmer.md.
+  model_name: meta-models/Muse-Glimmer-30B
   tokenizer:
-    name: /path/to/muse-glimmer-30b
+    name: meta-models/Muse-Glimmer-30B
   train_micro_batch_size: 1
   logprob_batch_size: 1
   # 6144 with context_parallel_size=4, i.e. 1536 tokens per rank.
