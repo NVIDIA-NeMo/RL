@@ -18,9 +18,9 @@ class FakeMambaMixer:
         batch_indices=None,
         intermediate_chunk_indices=None,
         intermediate_abs_positions=None,
+        intermediate_real_count=None,
         intermediate_ssm_out=None,
         intermediate_conv_out=None,
-        conv_gather_offsets=None,
         cu_chunk_seqlens=None,
         last_chunk_indices=None,
         seq_idx_for_varlen=None,
@@ -67,7 +67,21 @@ def fake_mamba_module(monkeypatch):
         causal_conv1d_fn=None,
         tensor_masked_update=MagicMock(),
     )
-    import_module = MagicMock(return_value=module)
+    utils_module = SimpleNamespace(
+        get_mamba_version=lambda: (_ for _ in ()).throw(
+            AssertionError("original get_mamba_version imported mamba_ssm")
+        ),
+        _mamba_ssm_version=None,
+    )
+
+    def _import_module(name, *args, **kwargs):
+        if name == "megatron.core.ssm.mamba_mixer":
+            return module
+        if name == "megatron.core.utils":
+            return utils_module
+        raise ImportError(name)
+
+    import_module = MagicMock(side_effect=_import_module)
     monkeypatch.setattr(patches.importlib, "import_module", import_module)
     yield module, import_module
     patches.restore_mamba_alignment_patch()
@@ -84,7 +98,8 @@ def test_patch_is_idempotent_and_restorable(fake_mamba_module, capsys):
     assert module.MambaMixer._ssm_prefill is patches._nrl_patched_ssm_prefill
     assert module.MambaMixer._ssm_decode is patches._nrl_patched_ssm_decode
     assert hasattr(module.MambaMixer, "_bik_decode_buffered_scan")
-    import_module.assert_called_once_with("megatron.core.ssm.mamba_mixer")
+    import_module.assert_any_call("megatron.core.ssm.mamba_mixer")
+    import_module.assert_any_call("megatron.core.utils")
     assert capsys.readouterr().out.count("installed Mamba train/prefill/decode") == 1
 
     patches.restore_mamba_alignment_patch()
@@ -172,7 +187,7 @@ def test_bik_decode_rejects_speculative_rollback_buffers(fake_mamba_module):
         )
 
 
-class FakeMambaMixerNewApi(FakeMambaMixer):
+class FakeMambaMixerOldApi(FakeMambaMixer):
     def _ssm_prefill(
         self,
         zxBCdt,
@@ -183,9 +198,9 @@ class FakeMambaMixerNewApi(FakeMambaMixer):
         batch_indices=None,
         intermediate_chunk_indices=None,
         intermediate_abs_positions=None,
-        intermediate_real_count=None,
         intermediate_ssm_out=None,
         intermediate_conv_out=None,
+        conv_gather_offsets=None,
         cu_chunk_seqlens=None,
         last_chunk_indices=None,
         seq_idx_for_varlen=None,
@@ -194,7 +209,7 @@ class FakeMambaMixerNewApi(FakeMambaMixer):
         conv_seq_idx=None,
         conv_seq_start=None,
     ):
-        return "new-api-prefill"
+        return "old-api-prefill"
 
 
 def test_policy_uses_mamba_layers():
@@ -214,14 +229,14 @@ def test_patch_skips_when_not_required_and_signature_mismatch(
     fake_mamba_module, monkeypatch, capsys
 ):
     module, import_module = fake_mamba_module
-    module.MambaMixer = FakeMambaMixerNewApi
+    module.MambaMixer = FakeMambaMixerOldApi
     original_prefill = module.MambaMixer._ssm_prefill
 
     patches.apply_mamba_alignment_patch(required=False)
 
     assert module.MambaMixer._ssm_prefill is original_prefill
     assert "skipping Mamba alignment patch" in capsys.readouterr().out
-    import_module.assert_called_once_with("megatron.core.ssm.mamba_mixer")
+    import_module.assert_any_call("megatron.core.ssm.mamba_mixer")
 
 
 def test_reference_prefill_rejects_prefix_cache(fake_mamba_module):
@@ -241,3 +256,15 @@ def test_reference_prefill_rejects_prefix_cache(fake_mamba_module):
             ssm_state=None,
             intermediate_ssm_out=torch.empty(0),
         )
+
+
+def test_get_mamba_version_uses_package_metadata(fake_mamba_module, monkeypatch):
+    monkeypatch.setattr(
+        "importlib.metadata.version",
+        lambda name: "2.2.6.post3" if name == "mamba_ssm" else (_ for _ in ()).throw(AssertionError(name)),
+    )
+    patches.apply_mamba_alignment_patch()
+
+    ver = patches._nrl_get_mamba_version()
+    assert str(ver) == "2.2.6.post3"
+    assert patches._MAMBA_UTILS_MODULE.get_mamba_version is patches._nrl_get_mamba_version

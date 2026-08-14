@@ -10,13 +10,17 @@ grpo:
 policy:
   router_replay:
     enabled: true
+  logprob_chunk_size: 2048
   megatron_cfg:
     zero_train_gen_mismatch: true
+    activation_checkpointing: true
+    defer_fp32_logits: true
     tensor_model_parallel_size: 1
     moe_token_dispatcher_type: alltoall
     moe_router_dtype: fp32
     moe_permute_fusion: false
     moe_pad_experts_for_cuda_graph_inference: true
+    cuda_graph_impl: none
     use_mamba_mem_eff_path: false
   generation:
     backend: megatron
