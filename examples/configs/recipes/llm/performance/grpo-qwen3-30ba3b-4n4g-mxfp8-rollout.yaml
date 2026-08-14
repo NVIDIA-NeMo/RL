@@ -9,6 +9,7 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-mxfp8-rollout
 policy:
   model_name: Qwen/Qwen3-30B-A3B
+  train_global_batch_size: 2048
   train_micro_batch_size: 1
   logprob_batch_size: 2
   max_total_sequence_length: 4096

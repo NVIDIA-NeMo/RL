@@ -103,6 +103,7 @@ MXFP8_CASES = {
         "segment_size": 4,
         "async_engine": None,
         "moe_backend": "flashinfer_trtllm",
+        "train_global_batch_size": 2048,
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "model.layers.*.mlp.gate",
@@ -115,6 +116,7 @@ MXFP8_CASES = {
         "segment_size": 2,
         "async_engine": True,
         "moe_backend": "flashinfer_trtllm",
+        "train_global_batch_size": 2048,
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "model.layers.*.mlp.gate",
@@ -240,6 +242,11 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
         assert (
             config["policy"]["generation"]["vllm_kwargs"]["moe_backend"]
             == expected["moe_backend"]
+        )
+    if expected.get("train_global_batch_size") is not None:
+        assert (
+            config["policy"]["train_global_batch_size"]
+            == expected["train_global_batch_size"]
         )
 
 
