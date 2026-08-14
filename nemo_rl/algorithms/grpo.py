@@ -93,6 +93,7 @@ from nemo_rl.experience.interfaces import (
     PENDING_PROMPTS_KEY,
     RESUME_BASE_ORDINAL_KEY,
     RETAINED_TASK_INDICES_KEY,
+    TRAINED_TASK_INDICES_KEY,
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
@@ -4332,10 +4333,20 @@ def async_grpo_train(
         retained_task_indices = list(
             (replay_buffer_restore_metadata or {}).get(RETAINED_TASK_INDICES_KEY, [])
         )
+        # Ordinals trained at/above the cut (present when target interleaving
+        # lowered the cut): covered like retained groups, so the re-yielded
+        # window regenerates only what was genuinely lost — no re-training.
+        trained_task_indices = [
+            int(ordinal)
+            for ordinal in (rollouts_state or {}).get(TRAINED_TASK_INDICES_KEY, [])
+        ]
+        covered_task_indices = sorted(
+            set(retained_task_indices) | set(trained_task_indices)
+        )
         collector_start_kwargs: dict[str, Any] = {
             "next_nemo_gym_task_index": int(resume_base_ordinal),
             "resume_frontier_ordinal": int(frontier_ordinal),
-            "resume_covered_task_indices": retained_task_indices,
+            "resume_covered_task_indices": covered_task_indices,
             # The rewound dataloader re-yields any carried-over remainder.
             "pending_batch": None,
             "ordinals_frontier_aligned": True,
@@ -4343,7 +4354,8 @@ def async_grpo_train(
         print(
             "📦 Frontier-aligned resume: dataloader rewound to ordinal "
             f"{resume_base_ordinal}, trained frontier {frontier_ordinal}, "
-            f"{len(retained_task_indices)} retained prompt groups"
+            f"{len(retained_task_indices)} retained prompt groups, "
+            f"{len(trained_task_indices)} trained above the cut"
         )
     else:
         collector_start_kwargs = {
@@ -4371,6 +4383,14 @@ def async_grpo_train(
     # have no such drift.
     trained_frontier_ordinal = (
         int(frontier_ordinal) if frontier_ordinal is not None else consumed_samples
+    )
+    # Trained ordinals at/above the last checkpoint cut. When interleaving
+    # lowers a future cut below the frontier, these are persisted so a resume
+    # covers them instead of re-training them. Seeded from the restored
+    # checkpoint (those prompts stay covered until the cut passes them) and
+    # pruned at each save — the cut is non-decreasing, so pruning is safe.
+    recent_trained_task_indices: set[int] = (
+        set(trained_task_indices) if frontier_restore else set()
     )
 
     _tc_py_exec = get_actor_python_env(
@@ -4741,6 +4761,9 @@ def async_grpo_train(
                         trained_frontier_ordinal = max(
                             trained_frontier_ordinal,
                             max(int(ordinal) for ordinal in sampled_ordinals) + 1,
+                        )
+                        recent_trained_task_indices.update(
+                            int(ordinal) for ordinal in sampled_ordinals
                         )
 
                     print(
@@ -5308,11 +5331,28 @@ def async_grpo_train(
                             checkpoint_path,
                         )
                         if dataloader_snapshot["frontier_aligned"]:
-                            rollouts_state[FRONTIER_ORDINAL_KEY] = (
-                                trained_frontier_ordinal
-                            )
+                            # The collector may lower the cut below the
+                            # trained frontier when prompts below it are
+                            # still in flight (target interleaving); the
+                            # persisted threshold must be the cut, or the
+                            # resume filter would drop the re-yielded window
+                            # as already-trained.
+                            cut_ordinal = int(dataloader_snapshot["frontier_ordinal"])
+                            rollouts_state[FRONTIER_ORDINAL_KEY] = cut_ordinal
                             rollouts_state[RESUME_BASE_ORDINAL_KEY] = (
                                 dataloader_snapshot["base_ordinal"]
+                            )
+                            # Trained ordinals the re-yielded window must NOT
+                            # regenerate: everything trained at/above the cut.
+                            # Prune below the cut — the cut never decreases,
+                            # so those ordinals can never be re-yielded.
+                            recent_trained_task_indices = {
+                                ordinal
+                                for ordinal in recent_trained_task_indices
+                                if ordinal >= cut_ordinal
+                            }
+                            rollouts_state[TRAINED_TASK_INDICES_KEY] = sorted(
+                                recent_trained_task_indices
                             )
                         torch.save(
                             rollouts_state,

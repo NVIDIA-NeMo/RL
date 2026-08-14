@@ -31,6 +31,11 @@ RESUME_BASE_ORDINAL_KEY = "resume_base_ordinal"
 # Post-restore replay-buffer metadata: ordinals of the retained prompt groups,
 # reported after age/step filtering so the collector can regenerate the rest.
 RETAINED_TASK_INDICES_KEY = "retained_task_indices"
+# Ordinals already trained but at or above the checkpoint cut (rollouts.pt).
+# Present when target interleaving lowered the cut below the trained frontier:
+# the resume folds them into the covered set so the re-yielded window drops
+# them instead of training them a second time.
+TRAINED_TASK_INDICES_KEY = "trained_task_indices"
 
 
 @dataclass

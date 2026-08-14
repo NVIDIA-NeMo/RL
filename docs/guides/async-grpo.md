@@ -172,7 +172,7 @@ On resume, the buffer is restored before the trajectory collector starts, then c
 3. **Incomplete targets kept** — target steps that still lack a full batch are kept in the buffer. The collector will *gap-fill* only the missing trajectories for those targets before moving on.
 4. **Buffer truncated** — if the restored count exceeds `max_size`, the buffer is truncated, prioritising entries closest to the resume step.
 
-The dataloader then re-yields the window between the trained frontier and the old cursor. Prompts already trained or retained in the restored buffer are dropped; everything else — in-flight work lost at the save, groups evicted during cleanup — is regenerated in order, so **no prompt is skipped and none is duplicated as a result of the save/restore itself**.
+The dataloader then re-yields the window between the trained frontier and the old cursor. Prompts already trained or retained in the restored buffer are dropped; everything else — in-flight work lost at the save, groups evicted during cleanup — is regenerated in order, so **no prompt is skipped and none is duplicated as a result of the save/restore itself** (prompts trained above a conservatively-cut checkpoint's threshold — see the target-interleaving note below — are carried in the checkpoint and stay covered on resume).
 
 The guarantee is scoped to frontier-aligned checkpoints. A run falls back to the previous live-cursor checkpoints — which can skip prompts that were in flight at the save — under any of these conditions, each of which is logged when it occurs:
 
@@ -182,13 +182,15 @@ The guarantee is scoped to frontier-aligned checkpoints. A run falls back to the
 
 Independently of checkpointing, prompt groups whose generation fails a tolerated number of times (`max_generation_failures > 0`) are dropped during normal operation and are not recovered by a resume.
 
+**Target interleaving and the conservative cut.** A target refilled from later prompts — after a tolerated failure, or routinely when a resume gap-fills an incomplete restored target — interleaves targets' ordinals: training the refilled target can advance the frontier past another target's still-generating groups. Checkpoints written in that window conservatively cut below the trained frontier, at the lowest ordinal still in flight (logged when it happens), and persist the ordinals already trained at or above the cut. A resume from such a checkpoint regenerates the in-flight prompts and drops the persisted trained ones — no skip, no re-training.
+
 ### Gap-filling after restore
 
 After a restore, `last_target_weight_already_generated` is reset to `current_training_step - 1` so the collector re-evaluates every target from the resume step onward. For each target it queries `get_trajectories_needed` and spawns only the workers required to complete the batch — previously buffered trajectories are reused and the collector does not regenerate them.
 
 ### Disabling replay-buffer restore
 
-Set `checkpointing.load_replay_buffer: false` to skip the restore: the buffer starts empty and, on a frontier-aligned checkpoint, the whole buffered window is regenerated fresh from the rewound dataloader. This trades resume compute for an unbiased step composition — a prompt group completes only when its *longest* rollout finishes, so the groups sitting in the buffer at a save boundary systematically skew toward short rollouts; regenerating the window removes that bias. Restoration remains enabled by default and for legacy configs that omit the field.
+Set `checkpointing.load_replay_buffer: false` to skip the restore: the buffer starts empty and, on a frontier-aligned checkpoint, the whole buffered window is regenerated fresh from the rewound dataloader. This trades resume compute for an unbiased step composition — a prompt group completes only when its *longest* rollout finishes, so the groups sitting in the buffer at a save boundary systematically skew toward short rollouts; regenerating the window removes that bias. Restoration remains enabled by default and for legacy configs that omit the field. One caveat: if the checkpoint was written with a conservative cut (target interleaving, above), buffered-but-untrained groups *below* the cut are covered only by the buffer — discarding the buffer on such a checkpoint loses them (trained prompts above the cut are unaffected; they are persisted in `rollouts.pt`, not the buffer). Prefer `load_replay_buffer: true` when resuming from a checkpoint whose log shows a lowered cut.
 
 If no `replay_buffer.pt` file is found in the latest checkpoint directory, training likewise starts with an empty buffer and waits for the collector to fill it before the first training step.
 

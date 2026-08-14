@@ -57,6 +57,20 @@ _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
 
 
+def _stamped_task_indices(batch: BatchedDataDict[DatumSpec]) -> list[int]:
+    """Stamped per-group ordinals of a pre-repeat slice ([] when unstamped)."""
+    rows = batch.get("extra_env_info")
+    if not isinstance(rows, list):
+        return []
+    raw_ordinals = [
+        row.get(NEMO_GYM_TASK_INDEX_KEY) if isinstance(row, dict) else None
+        for row in rows
+    ]
+    if not raw_ordinals or any(ordinal is None for ordinal in raw_ordinals):
+        return []
+    return [int(ordinal) for ordinal in cast("list[int]", raw_ordinals)]
+
+
 def _unanimous_task_index(rows: list[Any]) -> Optional[int]:
     """Return the task index every row agrees on, or ``None``.
 
@@ -183,6 +197,16 @@ class AsyncTrajectoryCollector:
         self._skip_horizon = max(
             [*self._covered_task_indices, (resume_frontier_ordinal or 0) - 1]
         )
+
+        # Group ordinals dispatched to a rollout worker and not yet buffered.
+        # The checkpoint cut is min(outstanding, trained frontier): after a
+        # tolerated generation failure, a target refilled from later prompts
+        # can train ordinals PAST another target's still-running groups, so
+        # prompts below the trained frontier may still be in flight — saving
+        # the frontier itself would strand them (never re-yielded on resume,
+        # never in the buffer).
+        self._outstanding_lock: _threading.Lock = _threading.Lock()
+        self._outstanding_task_indices: set[int] = set()
 
         # Timer for efficiency metrics
         self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
@@ -602,13 +626,43 @@ class AsyncTrajectoryCollector:
         restore path forces ``pending_batch=None``), so persisting it would
         be dead weight in every frontier checkpoint.
 
+        The snapshot is taken at the conservative **cut** — the minimum of
+        the trained frontier and the lowest ordinal still out with a rollout
+        worker. Normally every outstanding ordinal is at or above the
+        frontier and the cut equals it; when a target is refilled from later
+        prompts (after a tolerated generation failure, or when gap-filling an
+        incomplete target restored from a checkpoint), training it can
+        advance past another target's in-flight groups, and cutting at the
+        frontier would strand those prompts. Cutting below the frontier
+        instead re-yields a window that includes already-trained prompts;
+        the driver persists those trained ordinals in the checkpoint
+        (``TRAINED_TASK_INDICES_KEY``) so the resume covers them like
+        retained groups — nothing is skipped and nothing is re-trained.
+
         Returns:
-            Mapping with ``dataloader`` (same shape as
-            :meth:`get_checkpoint_dataloader_state`) and ``rollouts`` (same
-            shape as :meth:`get_rollouts_state`).
+            Mapping with ``dataloader`` (shape of
+            :meth:`get_checkpoint_dataloader_state`, plus ``frontier_ordinal``
+            = the cut, which the checkpoint must persist as its filter
+            threshold) and ``rollouts`` (shape of :meth:`get_rollouts_state`).
         """
+        with self._outstanding_lock:
+            outstanding_min = min(self._outstanding_task_indices, default=None)
+        cut = frontier_ordinal
+        if outstanding_min is not None and outstanding_min < cut:
+            cut = outstanding_min
+            print(
+                f"⚠️ Checkpoint cut lowered from trained frontier "
+                f"{frontier_ordinal} to {cut}: ordinals below the frontier "
+                "are still in flight (a gap-filled target was refilled from "
+                "later prompts — after a tolerated generation failure, or "
+                "when resuming with an incomplete restored target). A resume "
+                "from this checkpoint regenerates the window instead of "
+                "skipping it; trained prompts above the cut are persisted in "
+                "rollouts.pt and stay covered."
+            )
         with self._pending_lock:
-            dataloader_snapshot = self.get_checkpoint_dataloader_state(frontier_ordinal)
+            dataloader_snapshot = self.get_checkpoint_dataloader_state(cut)
+            dataloader_snapshot["frontier_ordinal"] = cut
             rollouts_state = self._build_rollouts_state(
                 include_pending=not dataloader_snapshot["frontier_aligned"]
             )
@@ -702,6 +756,7 @@ class AsyncTrajectoryCollector:
             # Task indices are stamped at yield time in _collection_loop, so
             # slices and carried-over remainders keep their original ordinals.
             rollout_batch = batch.slice(0, num_prompts_to_generate)
+            dispatched_task_indices = _stamped_task_indices(rollout_batch)
             if use_nemo_gym and self.master_config.grpo.deduplicate_multimodal_data:
                 attach_initial_nemo_gym_image_payloads(rollout_batch, self.processor)
             repeated_batch = rollout_batch.repeat_interleave(
@@ -726,6 +781,7 @@ class AsyncTrajectoryCollector:
                         target_weight_version=reserved_target,
                         num_generations=num_generations,
                         use_nemo_gym=use_nemo_gym,
+                        dispatched_task_indices=dispatched_task_indices,
                     )
                 )
 
@@ -733,11 +789,19 @@ class AsyncTrajectoryCollector:
             try:
                 with self._threads_lock:
                     self._inflight_threads.add(worker)
+                if dispatched_task_indices:
+                    with self._outstanding_lock:
+                        self._outstanding_task_indices.update(dispatched_task_indices)
                 worker.start()
                 worker_started = True
             except Exception:
                 with self._threads_lock:
                     self._inflight_threads.discard(worker)
+                if dispatched_task_indices:
+                    with self._outstanding_lock:
+                        self._outstanding_task_indices.difference_update(
+                            dispatched_task_indices
+                        )
                 raise
 
             backend = "NeMo-Gym" if use_nemo_gym else "native"
@@ -1158,6 +1222,7 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         num_generations: int,
         use_nemo_gym: bool,
+        dispatched_task_indices: Optional[list[int]] = None,
     ) -> None:
         """Own one target reservation while collecting its rollout batch."""
         worker_start = time.perf_counter()
@@ -1215,6 +1280,15 @@ class AsyncTrajectoryCollector:
                     flush=True,
                 )
         finally:
+            if dispatched_task_indices:
+                # Anything still outstanding here was neither buffered nor
+                # re-queued — a tolerated failure's permanent loss. It must
+                # stop holding the checkpoint cut down, or one failed batch
+                # would pin every later checkpoint's base forever.
+                with self._outstanding_lock:
+                    self._outstanding_task_indices.difference_update(
+                        dispatched_task_indices
+                    )
             self._release_target(target_weight_version)
             with self._threads_lock:
                 self._inflight_threads.discard(_threading.current_thread())
@@ -1335,6 +1409,18 @@ class AsyncTrajectoryCollector:
                 )
                 if status == "success":
                     buffered_group_indices.add(rollout_result.group_index)
+                    if group_task_index is not None:
+                        # Buffered groups are checkpoint-covered when the
+                        # buffer is restored (load_replay_buffer=true, the
+                        # default): they no longer hold the checkpoint cut
+                        # down. With load_replay_buffer=false, a buffered
+                        # group below a lowered cut is lost on resume — a
+                        # known corner of that opt-out, documented in the
+                        # async-grpo guide.
+                        with self._outstanding_lock:
+                            self._outstanding_task_indices.discard(
+                                int(group_task_index)
+                            )
                     group_description = f"group_index={rollout_result.group_index}"
                     if rollout_result.task_index is not None:
                         group_description = (

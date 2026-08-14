@@ -79,6 +79,7 @@ from nemo_rl.experience.interfaces import (
     PENDING_PROMPTS_KEY,
     RESUME_BASE_ORDINAL_KEY,
     RETAINED_TASK_INDICES_KEY,
+    TRAINED_TASK_INDICES_KEY,
 )
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -1032,12 +1033,20 @@ class StubAsyncTrajectoryCollector:
     Actor methods expose MagicMocks with a ``remote`` attribute.
     """
 
-    def __init__(self, health_side_effect=None, checkpoint_frontier_aligned=False):
+    def __init__(
+        self,
+        health_side_effect=None,
+        checkpoint_frontier_aligned=False,
+        checkpoint_cut_ordinal=None,
+    ):
         self.check_health = MagicMock()
         self.check_health.remote = MagicMock(
             return_value=None, side_effect=health_side_effect
         )
         self._checkpoint_frontier_aligned = checkpoint_frontier_aligned
+        # When set, stands in for a collector that lowered the cut below the
+        # trained frontier because prompts below it were still in flight.
+        self._checkpoint_cut_ordinal = checkpoint_cut_ordinal
 
     @property
     def start_collection(self):
@@ -1126,13 +1135,17 @@ class StubAsyncTrajectoryCollector:
         ``checkpoint_frontier_aligned`` constructor flag.
         """
         aligned = self._checkpoint_frontier_aligned
+        cut = self._checkpoint_cut_ordinal
         mock = MagicMock()
         mock.remote = MagicMock(
-            return_value={
+            side_effect=lambda frontier_ordinal: {
                 "dataloader": {
                     "dataloader_state": {},
                     "base_ordinal": 0 if aligned else None,
                     "frontier_aligned": aligned,
+                    # the real collector returns the (possibly lowered) cut;
+                    # with no outstanding work it echoes the frontier
+                    "frontier_ordinal": (frontier_ordinal if cut is None else cut),
                 },
                 "rollouts": {NEXT_NEMO_GYM_TASK_INDEX_KEY: 0},
             }
@@ -1147,6 +1160,7 @@ def mock_async_grpo_infrastructure(
     collector_health_side_effect=None,
     checkpoint_frontier_aligned=False,
     retained_task_indices=None,
+    checkpoint_cut_ordinal=None,
 ):
     """
     Context manager that mocks all async GRPO infrastructure (Ray actors, venv, etc).
@@ -1167,6 +1181,7 @@ def mock_async_grpo_infrastructure(
     stub_collector = StubAsyncTrajectoryCollector(
         health_side_effect=collector_health_side_effect,
         checkpoint_frontier_aligned=checkpoint_frontier_aligned,
+        checkpoint_cut_ordinal=checkpoint_cut_ordinal,
     )
 
     # Patch venv creation
@@ -1449,10 +1464,83 @@ def test_async_checkpoint_rollouts_state_frontier_key_contract(
         # frontier is P; the stub snapshot reports base_ordinal 0.
         expected_frontier = master_config.grpo.num_prompts_per_step
         assert rollouts_state[FRONTIER_ORDINAL_KEY] == expected_frontier
+        # cut == frontier here, so no trained ordinal sits at/above the cut
+        assert rollouts_state[TRAINED_TASK_INDICES_KEY] == []
         assert rollouts_state[RESUME_BASE_ORDINAL_KEY] == 0
     else:
         assert FRONTIER_ORDINAL_KEY not in rollouts_state
         assert RESUME_BASE_ORDINAL_KEY not in rollouts_state
+
+
+def test_async_checkpoint_persists_lowered_cut_not_trained_frontier(
+    mock_grpo_components, tmp_path
+):
+    """rollouts.pt must carry the collector's cut, not the trained frontier.
+
+    When the collector lowers the cut because prompts below the frontier are
+    still in flight, the persisted filter threshold has to follow it down. If
+    the driver wrote ``trained_frontier_ordinal`` instead, the rewound
+    dataloader would re-yield the stranded window and the resume filter would
+    immediately drop it as already-trained — re-stranding the prompts one
+    layer down, with no warning.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["save_period"] = 1
+    master_config.checkpointing["metric_name"] = None
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    checkpointer.checkpoint_dir = tmp_path
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    # The stub trains groups 0..P-1, so the trained frontier is P. Stand the
+    # cut strictly below it and require the cut to win.
+    trained_frontier = master_config.grpo.num_prompts_per_step
+    lowered_cut = trained_frontier - 1
+    assert lowered_cut < trained_frontier
+
+    with (
+        mock_async_grpo_infrastructure(
+            mock_batch,
+            {"mean_gen_tokens_per_sample": 2.0},
+            checkpoint_frontier_aligned=True,
+            checkpoint_cut_ordinal=lowered_cut,
+        ),
+        patch("nemo_rl.algorithms.grpo.torch.save") as mock_torch_save,
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    saved_by_name = {
+        os.path.basename(call.args[1]): call.args[0]
+        for call in mock_torch_save.call_args_list
+    }
+    rollouts_state = saved_by_name["rollouts.pt"]
+    assert rollouts_state[FRONTIER_ORDINAL_KEY] == lowered_cut
+    # the stub trained groups 0..P-1; those at/above the lowered cut must be
+    # persisted so the resume covers them instead of re-training them
+    assert rollouts_state[TRAINED_TASK_INDICES_KEY] == list(
+        range(lowered_cut, trained_frontier)
+    )
+    assert rollouts_state[RESUME_BASE_ORDINAL_KEY] == 0
 
 
 def test_async_resume_plumbs_frontier_metadata_into_collector(
@@ -1482,6 +1570,7 @@ def test_async_resume_plumbs_frontier_metadata_into_collector(
             FRONTIER_ORDINAL_KEY: 8,
             RESUME_BASE_ORDINAL_KEY: 4,
             PENDING_PROMPTS_KEY: {"should": "be dropped"},
+            TRAINED_TASK_INDICES_KEY: [15],
         },
         tmp_path / "rollouts.pt",
     )
@@ -1520,7 +1609,8 @@ def test_async_resume_plumbs_frontier_metadata_into_collector(
     collector_kwargs = collector_cls.options.return_value.remote.call_args.kwargs
     assert collector_kwargs["next_nemo_gym_task_index"] == 4
     assert collector_kwargs["resume_frontier_ordinal"] == 8
-    assert collector_kwargs["resume_covered_task_indices"] == [9, 10]
+    # retained (from the buffer) ∪ trained-above-cut (from rollouts.pt)
+    assert collector_kwargs["resume_covered_task_indices"] == [9, 10, 15]
     assert collector_kwargs["pending_batch"] is None
     assert collector_kwargs["ordinals_frontier_aligned"] is True
 
