@@ -3,12 +3,14 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source "$SCRIPT_DIR/common.env"
 
 # Parameterized because the Super Omni checkpoint and image data are external.
+# ===== BEGIN CONFIG =====
 NUM_NODES="${NUM_NODES:-10}"
 GPUS_PER_NODE=8
 STEPS_PER_RUN=3
 MAX_STEPS=3
 NUM_RUNS=1
 NUM_MINUTES="${NUM_MINUTES:-840}"
+# ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
