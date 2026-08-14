@@ -2276,14 +2276,17 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         Steps:
 
-        1. Project full-vocab student probs through ``M`` to teacher vocab.
-        2. Use the full teacher logits materialized by ``prepare_loss_input``.
-        3. Compute one ``global_top_indices [k]`` per microbatch from the
+        1. Use the full teacher logits materialized by ``prepare_loss_input``.
+        2. Compute one ``global_top_indices [k]`` per microbatch from the
            teacher's importance: ``max`` over flat ``(B*T_t)``, ``topk``
            over ``V_t``. Same vocab subset across every sample/position —
            keeps chunk-averaged KL well-defined.
-        4. Slice both the projected student probs and the teacher logits
-           to those ``k`` columns.
+        3. Restrict ``M`` to those ``k`` teacher columns and project the
+           student probs through it, so only the ``k`` columns are ever
+           produced. Each teacher column of ``M.t() @ p`` is an independent
+           contraction over the student axis, so slicing before the matmul
+           is value-preserving.
+        4. Slice the teacher logits to the same ``k`` columns.
         5. Build per-token chunk masks from ``alignment_*_chunk_id`` and
            chunk-average via ``bmm`` (shared helper).
         6. Renormalize student chunk distributions inside the top-k subset
