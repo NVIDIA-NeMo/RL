@@ -230,7 +230,9 @@ def _patch_mooncake_staging_buffers() -> None:
             pool = client._nrl_staging = _StagingPool(client._store)
         return pool
 
-    def _get_tensors_thread_worker(self, batch_keys, batch_shapes, batch_dtypes, indexes):  # type: ignore[no-untyped-def]
+    def _get_tensors_thread_worker(
+        self, batch_keys, batch_shapes, batch_dtypes, indexes
+    ):  # type: ignore[no-untyped-def]
         pool = _pool(self)
         batch_nbytes = get_nbytes(batch_dtypes, batch_shapes)
         tensors: list[Any] = [None] * len(batch_keys)
