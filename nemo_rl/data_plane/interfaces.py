@@ -42,7 +42,6 @@ from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
 from tensordict import TensorDict
 
-
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
 
 
