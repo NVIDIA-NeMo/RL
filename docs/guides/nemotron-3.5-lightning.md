@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Nemotron 3.5 Lightning
 
 > **Note:** This document has moved and will be deprecated here. See the new location: https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/models/nemotron/nemotron-3.5-lightning.md
@@ -291,7 +295,7 @@ uv run examples/run_grpo.py \
 ```
 
 For launching on a multi-node Slurm or Kubernetes cluster, see the
-[cluster guide](../../../cluster.md). Interrupted runs resume automatically
+[cluster guide](../cluster.md). Interrupted runs resume automatically
 from the latest checkpoint in `checkpointing.checkpoint_dir`.
 
 ### Results
@@ -301,4 +305,4 @@ from -0.7 to about 0.5 and AIME-2024 validation accuracy improves from 0.33
 to about 0.75. The truncation rate drops from ~0.5 to ~0.1 as responses
 shorten from ~5,500 to ~3,000 generated tokens per sample.
 
-![Nemotron 3.5 Lightning DAPO automodel training curves](../../../assets/nemotron/nemotron-3.5-lightning-automodel.png)
+![Nemotron 3.5 Lightning DAPO automodel training curves](../assets/nemotron/nemotron-3.5-lightning-automodel.png)

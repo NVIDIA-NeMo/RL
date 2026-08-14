@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Nemotron 3 Ultra
 
 > **Note:** This document has moved and will be deprecated here. See the new location: https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/models/nemotron/nemotron-3-ultra.md
