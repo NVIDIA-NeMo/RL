@@ -10,6 +10,6 @@
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
-	url = https://gitlab-master.nvidia.com/aroshanghias/Gym.git
-	branch = aroshanghias/context-compaction-v2-clean-gym
+	url = https://github.com/jinglinglingling/Gym.git
+	branch = feature/osworld-cell2-context-compaction-signed
 	shallow = true
