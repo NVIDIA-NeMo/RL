@@ -15,6 +15,7 @@
 from collections.abc import Iterable
 from typing import Any
 
+import pytest
 import torch
 
 from nemo_rl.models.generation.sglang import mxfp8_quantization_core as mxfp8_core
