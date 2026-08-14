@@ -1,4 +1,6 @@
 defaults: ../../vlm_grpo_3B_megatron.yaml
+grpo:
+  deduplicate_multimodal_data: true
 loss_fn:
   reference_policy_kl_penalty: 0.0
 checkpointing:

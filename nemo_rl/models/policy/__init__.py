@@ -328,6 +328,10 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
+    # Arbitrary model-provider attributes applied recursively to the Megatron
+    # Bridge model config before model instantiation. Keys must match configurable
+    # provider fields and must not duplicate first-class megatron_cfg fields.
+    model_overrides: NotRequired[dict[str, Any]]
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
@@ -347,6 +351,15 @@ class MegatronConfig(TypedDict):
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int
+    # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
+    # provider's checkpoint/default value.
+    radio_force_cpe_eval_mode: NotRequired[bool]
+    # Nemotron Omni tower freeze booleans. Omit any field to retain the model
+    # provider's checkpoint/default value.
+    freeze_vision_model: NotRequired[bool]
+    freeze_vision_projection: NotRequired[bool]
+    freeze_sound_encoder: NotRequired[bool]
+    freeze_sound_projection: NotRequired[bool]
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool

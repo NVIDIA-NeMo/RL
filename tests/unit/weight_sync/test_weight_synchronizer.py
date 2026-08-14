@@ -34,6 +34,10 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.ipc_weight_synchronizer import (
     IPCWeightSynchronizer,
 )
+from nemo_rl.weight_sync.nccl_reshard_utils import build_nccl_reshard_refit_info
+from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+    NcclReshardWeightSynchronizer,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -414,6 +418,77 @@ class TestCollectiveWeightSynchronizer:
         gen.init_collective.assert_called_once_with(
             "10.0.0.1", 29500, 6, train_world_size=4
         )
+
+
+# ---------------------------------------------------------------------------
+# NcclReshardWeightSynchronizer
+# ---------------------------------------------------------------------------
+
+
+class TestNcclReshardWeightSynchronizer:
+    @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
+    def test_init_communicator_ships_wire_safe_refit_info(self, mock_ray):
+        # The train-side refit info carries MeshInfo rank tensors; the copy
+        # handed to the generation side must be the wire-safe (plain-dict)
+        # form, or the vLLM worker needs `import megatron` to unpickle it.
+        mock_ray.get.return_value = [True]
+        refit_info = build_nccl_reshard_refit_info(
+            {
+                "model.layers.0.mlp.gate_proj.weight": {
+                    "shape": [64, 32],
+                    "dtype": "torch.bfloat16",
+                }
+            },
+            train_parallelism={"tp_size": 2, "ep_size": 1, "pp_size": 1},
+            gen_parallelism={"tp_size": 4, "ep_size": 1, "pp_size": 1},
+            train_world_size=2,
+            gen_world_size=4,
+        )
+        policy = _mock_policy(
+            cfg={
+                "megatron_cfg": {
+                    "tensor_model_parallel_size": 2,
+                    "expert_model_parallel_size": 1,
+                    "pipeline_model_parallel_size": 1,
+                },
+                "generation": {"vllm_cfg": {"tensor_parallel_size": 4}},
+            },
+        )
+        policy.init_nccl_reshard_comm_group.return_value = [MagicMock()]
+        policy.prepare_nccl_reshard_refit_info.return_value = refit_info
+        gen = _mock_generation()
+        gen.init_nccl_reshard_comm_group.return_value = [MagicMock()]
+        train_cluster = _mock_cluster(world_size=2)
+        train_cluster.num_gpus_per_node = 8
+        train_cluster.get_available_address_and_port.return_value = (
+            "10.0.0.1",
+            12345,
+        )
+        inference_cluster = _mock_cluster(world_size=4)
+
+        sync = NcclReshardWeightSynchronizer(
+            policy, gen, train_cluster, inference_cluster
+        )
+        sync.init_communicator()
+
+        policy.prepare_nccl_reshard_refit_info.assert_called_once()
+        gen.prepare_nccl_reshard_refit_info.assert_called_once()
+        (shipped,), _ = gen.prepare_nccl_reshard_refit_info.call_args
+        for params in shipped["per_layer_params"].values():
+            for p in params:
+                assert isinstance(p["src_mesh_info"], dict)
+                assert isinstance(p["dst_mesh_info"], dict)
+                for placement in p["src_placements"] + p["dst_placements"]:
+                    assert isinstance(placement, dict)
+
+    def test_shutdown_drops_the_generation_handle(self):
+        sync = NcclReshardWeightSynchronizer(
+            _mock_policy(), _mock_generation(), _mock_cluster(), _mock_cluster()
+        )
+
+        sync.shutdown()
+
+        assert sync._generation is None
 
 
 # ---------------------------------------------------------------------------
