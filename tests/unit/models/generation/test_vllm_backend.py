@@ -26,6 +26,16 @@ import torch
 from safetensors.torch import save_file
 
 
+def _patch_native_mxfp8_kernel(
+    monkeypatch: pytest.MonkeyPatch, kernel_type: type
+) -> None:
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.FlashInferTrtllmMxfp8LinearKernel",
+        kernel_type,
+        raising=False,
+    )
+
+
 def _make_collective_update_extension(backend):
     ext = backend.VllmInternalWorkerExtension.__new__(
         backend.VllmInternalWorkerExtension
@@ -207,6 +217,7 @@ def test_mxfp8_native_linear_refit_uses_vllm_layerwise_reload(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
+    _patch_native_mxfp8_kernel(monkeypatch, kernel_type)
     linear = torch.nn.Linear(1, 1)
     linear.quant_method = SimpleNamespace(kernel=kernel_type())
     model = torch.nn.Module()
@@ -261,6 +272,7 @@ def test_mxfp8_native_linear_refit_restores_roots_after_initialize_failure(
     )
 
     kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
+    _patch_native_mxfp8_kernel(monkeypatch, kernel_type)
     linears = [torch.nn.Linear(1, 1) for _ in range(2)]
     for linear in linears:
         linear.quant_method = SimpleNamespace(kernel=kernel_type())
@@ -314,6 +326,7 @@ def test_mxfp8_native_linear_refit_aborts_partial_weight_load(monkeypatch):
     from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
 
     kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
+    _patch_native_mxfp8_kernel(monkeypatch, kernel_type)
     linear = torch.nn.Linear(2, 2)
     linear.quant_method = SimpleNamespace(kernel=kernel_type())
     model = torch.nn.Module()
@@ -359,6 +372,7 @@ def test_mxfp8_native_linear_refit_finalizes_each_root_once_after_failure(
     from nemo_rl.models.generation.vllm import vllm_backend
 
     kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
+    _patch_native_mxfp8_kernel(monkeypatch, kernel_type)
     linears = [torch.nn.Linear(1, 1) for _ in range(2)]
     for linear in linears:
         linear.quant_method = SimpleNamespace(kernel=kernel_type())

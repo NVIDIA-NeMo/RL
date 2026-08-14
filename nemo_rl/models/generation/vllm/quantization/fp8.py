@@ -447,10 +447,20 @@ def _is_fp8_weight(name, model):
     return name in fp8_state.fp8_param_names
 
 
+def _is_mxfp8_linear_kernel(kernel: object, kernel_name: str) -> bool:
+    from vllm.model_executor.kernels.linear.mxfp8 import flashinfer
+
+    kernel_type = getattr(flashinfer, kernel_name, None)
+    return isinstance(kernel_type, type) and isinstance(kernel, kernel_type)
+
+
 def uses_native_mxfp8_linear_refit(module: torch.nn.Module) -> bool:
     quant_method = getattr(module, "quant_method", None)
     kernel = getattr(quant_method, "kernel", None)
-    return type(kernel).__name__ in _NATIVE_MXFP8_LINEAR_REFIT_KERNELS
+    return any(
+        _is_mxfp8_linear_kernel(kernel, kernel_name)
+        for kernel_name in _NATIVE_MXFP8_LINEAR_REFIT_KERNELS
+    )
 
 
 def load_weights(weights, model_runner):
@@ -698,7 +708,7 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
     else:
         kernel = getattr(self, "kernel", None)
         kernel_name = type(kernel).__name__ if kernel is not None else None
-        if kernel_name == "FlashInferCutedslMxfp8LinearKernel":
+        if _is_mxfp8_linear_kernel(kernel, "FlashInferCutedslMxfp8LinearKernel"):
             from vllm.config import get_current_vllm_config_or_none
 
             vllm_config = get_current_vllm_config_or_none()
@@ -721,12 +731,12 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
                     "select vLLM's CuTe-DSL kernel explicitly."
                 )
 
-        if kernel_name in _NATIVE_MXFP8_LINEAR_REFIT_KERNELS:
+        if uses_native_mxfp8_linear_refit(layer):
             runtime = getattr(layer, "_nrl_mxfp8_runtime_parameters", None)
             if runtime is not None:
                 runtime_kernel, runtime_weight, runtime_scale = runtime
                 if (
-                    runtime_kernel == kernel_name
+                    runtime_kernel is type(kernel)
                     and runtime_weight() is layer.weight
                     and runtime_scale() is layer.weight_scale
                 ):
@@ -735,13 +745,13 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
             kernel.process_weights_after_loading(layer)
             if runtime is None:
                 layer._nrl_mxfp8_runtime_parameters = (
-                    kernel_name,
+                    type(kernel),
                     weakref.ref(layer.weight),
                     weakref.ref(layer.weight_scale),
                 )
             return
 
-        if kernel_name != "FlashInferCutlassMxfp8LinearKernel":
+        if not _is_mxfp8_linear_kernel(kernel, "FlashInferCutlassMxfp8LinearKernel"):
             raise AssertionError(
                 f"Unsupported MXFP8 linear kernel for refit: {kernel_name}"
             )

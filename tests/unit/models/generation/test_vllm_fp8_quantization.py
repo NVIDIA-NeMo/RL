@@ -544,6 +544,7 @@ def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
 )
 def test_mxfp8_native_linear_kernel_refit_preserves_runtime_storage(
     fp8_module,
+    monkeypatch,
     kernel_name,
     linear_backend,
     runtime_weight_shape,
@@ -571,6 +572,11 @@ def test_mxfp8_native_linear_kernel_refit_preserves_runtime_storage(
             layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
 
     Kernel.__name__ = kernel_name
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer." + kernel_name,
+        Kernel,
+        raising=False,
+    )
 
     class Method(QuantizeMethodBase):
         def __init__(self):
@@ -655,6 +661,10 @@ def test_mxfp8_auto_linear_backend_keeps_refit_cutlass_default(fp8_module, monke
             self.config = config
 
     monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.FlashInferCutedslMxfp8LinearKernel",
+        FlashInferCutedslMxfp8LinearKernel,
+    )
+    monkeypatch.setattr(
         "vllm.model_executor.kernels.linear.mxfp8.flashinfer.FlashInferCutlassMxfp8LinearKernel",
         FlashInferCutlassMxfp8LinearKernel,
     )
@@ -715,6 +725,11 @@ def test_load_weights_uses_scale_name_for_mxfp8_linear_backend(
         is_mx=True,
     )
     kernel_type = type(kernel_name, (), {})
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer." + kernel_name,
+        kernel_type,
+        raising=False,
+    )
     layer = types.SimpleNamespace(
         quant_method=types.SimpleNamespace(kernel=kernel_type())
     )
