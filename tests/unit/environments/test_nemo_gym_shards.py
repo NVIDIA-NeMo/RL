@@ -433,6 +433,8 @@ def test_find_gym_config_entries_ignores_scalars_and_known_keys():
             "common_inherited_overlays": ["genrm_model"],
             "common_overrides": {"x": 1},
             "allowed_duplicate_entries": ["policy_model"],
+            "effort_levels": {"low_weight": 0.0},
+            "tokenizer_config": {"name": "policy"},
             "genrm_model": {"responses_api_models": {}},
             "safety_judge_model": {"responses_api_models": {}},
         }

@@ -44,6 +44,10 @@ SHARDING_CONFIG_KEYS = frozenset(
     }
 )
 
+# Dict-shaped NeMo RL integration settings that are not Gym server entries.
+# The actor factory or rollout code consumes these separately.
+NEMO_RL_DICT_CONFIG_KEYS = frozenset({"effort_levels", "tokenizer_config"})
+
 DEFAULT_REPLICAS = 1
 SHARD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -231,6 +235,7 @@ def find_gym_config_entries(nemo_gym_config: Mapping[str, Any]) -> list[str]:
         key
         for key, value in nemo_gym_config.items()
         if key not in SHARDING_CONFIG_KEYS
+        and key not in NEMO_RL_DICT_CONFIG_KEYS
         and (isinstance(value, Mapping) or OmegaConf.is_dict(value))
     )
 
