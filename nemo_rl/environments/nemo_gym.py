@@ -42,6 +42,11 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.experience.failures import (
+    GymTransportError,
+    RolloutDataFailure,
+    http_status_is_infra,
+)
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
@@ -72,6 +77,39 @@ def _has_nan_generation_logprobs(result: dict) -> bool:
         and torch.isnan(message["generation_logprobs"]).any()
         for message in result["message_log"]
     )
+
+
+def _typed_gym_failure(error: Exception) -> Optional[Exception]:
+    """Map a NeMo-Gym HTTP failure onto a typed, PICKLABLE failure, or None if not one.
+
+    Classification has to happen here, on the raising side, because ``run_rollouts`` runs
+    inside the ``NemoGym`` Ray actor and the exception must survive the actor boundary to
+    reach the retry policy on the driver.
+
+    It does not survive. aiohttp's ``raise_for_status`` passes ``headers=self.headers``,
+    and those are a ``CIMultiDictProxy``, which cloudpickle cannot serialize -- so Ray
+    drops the cause and the driver receives a bare ``RayTaskError`` with no type and no
+    ``.status``. Every gym HTTP failure then classified DATA, capping the gym path at
+    ``max_data_attempts_per_prompt`` (2) and leaving ``max_attempts_per_prompt`` (5)
+    unreachable on the very path whose dead-endpoint scenario motivates it. Two things
+    made that the dominant case rather than a corner: Gym's middleware turns inner-server
+    failures into 500 -- exactly the status the INFRA branch is for -- and its transport
+    layer retries disconnects in an uncapped loop, so those never arrive at all.
+
+    ``GymTransportError`` and ``RolloutDataFailure`` take a single str, so they pickle
+    cleanly and ``classify_rollout_failure``'s explicit-class fast path wins on the far
+    side.
+
+    Returns None when the exception carries no HTTP status, leaving the caller to
+    re-raise it untouched.
+    """
+    status = getattr(error, "status", None)
+    if not isinstance(status, int):
+        return None
+    detail = f"NeMo-Gym /run failed with HTTP {status}: {error}"
+    if http_status_is_infra(status):
+        return GymTransportError(detail)
+    return RolloutDataFailure(detail)
 
 
 def get_nemo_gym_uv_cache_dir() -> str | None:
@@ -370,6 +408,14 @@ class NemoGym(EnvironmentInterface):
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
+        # through __init__, which does not start the Gym servers -- reports what
+        # actually happened instead of an AttributeError from deep inside a rollout.
+        self.rh: Any = None
+        self.rch: Any = None
+        self.head_server_config: Any = None
+        self.node_ip: Optional[str] = None
+        self.head_server_port: Optional[int] = None
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -389,6 +435,27 @@ class NemoGym(EnvironmentInterface):
                 f"got {type(self._processor).__name__}. Update "
                 "_attach_multimodal_data_to_user_message before enabling."
             )
+
+    def _require_spinup(self) -> None:
+        """Raise a diagnosable error if this instance never ran :meth:`_spinup`."""
+        if self.rh is None:
+            raise RuntimeError(
+                "NeMo-Gym actor has no running servers: _spinup() was never called on "
+                "this instance. Ray recreates a restarted actor through __init__ only, "
+                "so an actor that died and came back reaches this state and cannot "
+                "serve rollouts until it is spun up again."
+            )
+
+    def health_check(self) -> None:
+        """Raise if the Gym head server or any subprocess server has died.
+
+        Thin wrapper over NeMo-Gym's own ``RunHelper.poll``, which is what ``gym env
+        start`` calls every 60s from ``run_forever``. NeMo-RL only calls ``rh.start``,
+        so without this the check Gym already implements never runs and a dead tool
+        server surfaces as unexplained rollout timeouts instead of a named process.
+        """
+        self._require_spinup()
+        self.rh.poll()
 
     def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.
@@ -494,6 +561,7 @@ Depending on your data shape, you may want to change these values."""
         deduplicate_multimodal_data: bool = False,
     ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
+        self._require_spinup()
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
 
@@ -526,6 +594,12 @@ Depending on your data shape, you may want to change these values."""
                             error.response_content,
                             file=sys.stderr,
                         )
+                    typed = _typed_gym_failure(error)
+                    if typed is not None:
+                        # `from None`, deliberately: chaining the original would put the
+                        # unpicklable exception back on the wire as __cause__ and undo
+                        # the whole point. The status and message are already in `detail`.
+                        raise typed from None
                     raise
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
@@ -836,6 +910,10 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         return result
 
     def shutdown(self) -> None:
+        # Teardown runs in a finally block, so it must not turn a real training error
+        # into a confusing AttributeError from a never-spun-up (e.g. restarted) actor.
+        if self.rh is None:
+            return
         self.rh.shutdown()
 
     def step(self, message_log_batch, metadata):
