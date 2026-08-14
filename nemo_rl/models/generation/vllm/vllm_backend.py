@@ -655,13 +655,60 @@ class VllmInternalWorkerExtension:
             self._maybe_process_fp8_kv_cache()
             return
 
-        pending_roots = list(reload_roots)
+        pending_roots: list[torch.nn.Module] = []
+
+        def abort_root(root: torch.nn.Module) -> None:
+            from vllm.model_executor.model_loader.reload.layerwise import (
+                LOADING_LAYERS,
+                _place_kernel_tensors,
+                get_layerwise_info,
+            )
+
+            if hasattr(root, "_original_do_torchao_reload"):
+                root._do_torchao_reload = root._original_do_torchao_reload
+            for layer in root.modules():
+                info = get_layerwise_info(layer)
+                if info.kernel_tensors is not None:
+                    _place_kernel_tensors(layer, info)
+                info.reset()
+                LOADING_LAYERS.discard(layer)
+
+        def abort_pending_roots() -> None:
+            while pending_roots:
+                root = pending_roots.pop(0)
+                try:
+                    abort_root(root)
+                except Exception:
+                    logger.exception(
+                        "Failed to abort MXFP8 layerwise reload for %s",
+                        type(root).__name__,
+                    )
+
+        def finalize_pending_roots() -> None:
+            first_error: Exception | None = None
+            while pending_roots:
+                root = pending_roots.pop(0)
+                try:
+                    finalize_layerwise_reload(root, self.model_config)
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+                    logger.exception(
+                        "Failed to finalize MXFP8 layerwise reload for %s",
+                        type(root).__name__,
+                    )
+                    try:
+                        abort_root(root)
+                    except Exception:
+                        logger.exception(
+                            "Failed to restore MXFP8 layerwise reload root %s",
+                            type(root).__name__,
+                        )
+            if first_error is not None:
+                raise first_error
 
         def finalize() -> None:
-            while pending_roots:
-                root = pending_roots[0]
-                finalize_layerwise_reload(root, self.model_config)
-                pending_roots.pop(0)
+            finalize_pending_roots()
             with set_current_vllm_config(self.model_runner.vllm_config):
                 process_weights_after_loading(
                     self.model_runner.model, self.model_config, self.device
@@ -670,15 +717,16 @@ class VllmInternalWorkerExtension:
 
         with set_current_vllm_config(self.model_runner.vllm_config):
             with torch.device(self.device):
-                for root in reload_roots:
-                    initialize_layerwise_reload(root)
                 try:
+                    for root in reload_roots:
+                        pending_roots.append(root)
+                        initialize_layerwise_reload(root)
                     yield finalize
-                finally:
-                    while pending_roots:
-                        root = pending_roots[0]
-                        finalize_layerwise_reload(root, self.model_config)
-                        pending_roots.pop(0)
+                except BaseException:
+                    abort_pending_roots()
+                    raise
+                else:
+                    finalize_pending_roots()
         # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
         # this optional second pass, just as it was before lifecycle hooks.
         self._maybe_process_fp8_kv_cache()

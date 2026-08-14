@@ -526,14 +526,28 @@ def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("kernel_name", "linear_backend"),
+    ("kernel_name", "linear_backend", "runtime_weight_shape", "runtime_scale_shape"),
     [
-        ("FlashInferCutedslMxfp8LinearKernel", "flashinfer_cutedsl"),
-        ("FlashInferTrtllmMxfp8LinearKernel", "flashinfer_trtllm"),
+        (
+            "FlashInferCutedslMxfp8LinearKernel",
+            "flashinfer_cutedsl",
+            (32, 2),
+            (2,),
+        ),
+        (
+            "FlashInferTrtllmMxfp8LinearKernel",
+            "flashinfer_trtllm",
+            (128, 32),
+            (128,),
+        ),
     ],
 )
 def test_mxfp8_native_linear_kernel_refit_preserves_runtime_storage(
-    fp8_module, kernel_name, linear_backend
+    fp8_module,
+    kernel_name,
+    linear_backend,
+    runtime_weight_shape,
+    runtime_scale_shape,
 ):
     from vllm.config import set_current_vllm_config
     from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -545,12 +559,16 @@ def test_mxfp8_native_linear_kernel_refit_preserves_runtime_storage(
 
     class Kernel:
         def process_weights_after_loading(self, layer):
-            layer.weight = torch.nn.Parameter(
-                layer.weight.detach().clone() + 10, requires_grad=False
-            )
-            layer.weight_scale = torch.nn.Parameter(
-                layer.weight_scale.detach().clone() + 20, requires_grad=False
-            )
+            weight = layer.weight.detach().clone() + 10
+            scale = layer.weight_scale.detach().clone() + 20
+            if kernel_name == "FlashInferCutedslMxfp8LinearKernel":
+                weight = weight.t().contiguous()
+                scale = scale.flatten()
+            else:
+                weight = torch.nn.functional.pad(weight, (0, 0, 0, 126))
+                scale = torch.nn.functional.pad(scale, (0, 0, 0, 126)).flatten()
+            layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+            layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
 
     Kernel.__name__ = kernel_name
 
@@ -588,6 +606,8 @@ def test_mxfp8_native_linear_kernel_refit_preserves_runtime_storage(
     runtime_scale = layer.weight_scale
     runtime_weight_ptr = runtime_weight.data_ptr()
     runtime_scale_ptr = runtime_scale.data_ptr()
+    assert tuple(runtime_weight.shape) == runtime_weight_shape
+    assert tuple(runtime_scale.shape) == runtime_scale_shape
 
     for value in (2, 3):
         initialize_layerwise_reload(layer)
@@ -604,16 +624,83 @@ def test_mxfp8_native_linear_kernel_refit_preserves_runtime_storage(
         assert layer.weight_scale is runtime_scale
         assert layer.weight.data_ptr() == runtime_weight_ptr
         assert layer.weight_scale.data_ptr() == runtime_scale_ptr
-        assert torch.equal(layer.weight, torch.full_like(layer.weight, value + 10))
-        assert torch.equal(
-            layer.weight_scale, torch.full_like(layer.weight_scale, value + 20)
-        )
+        if kernel_name == "FlashInferCutedslMxfp8LinearKernel":
+            assert torch.equal(layer.weight, torch.full_like(layer.weight, value + 10))
+            assert torch.equal(
+                layer.weight_scale, torch.full_like(layer.weight_scale, value + 20)
+            )
+        else:
+            assert torch.equal(
+                layer.weight[:2], torch.full_like(layer.weight[:2], value + 10)
+            )
+            assert torch.equal(
+                layer.weight_scale[:2],
+                torch.full_like(layer.weight_scale[:2], value + 20),
+            )
 
     assert layer.quant_method.kernel.__class__.__name__ == kernel_name
 
 
-def test_load_weights_uses_canonical_scale_for_native_mxfp8_linear(
-    fp8_module, monkeypatch
+def test_mxfp8_auto_linear_backend_keeps_refit_cutlass_default(fp8_module, monkeypatch):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor import parameter as vllm_parameter
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    class FlashInferCutedslMxfp8LinearKernel:
+        def __init__(self, config):
+            self.config = config
+
+    class FlashInferCutlassMxfp8LinearKernel:
+        def __init__(self, config):
+            self.config = config
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.FlashInferCutlassMxfp8LinearKernel",
+        FlashInferCutlassMxfp8LinearKernel,
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "swizzle_mxfp8_scale",
+        lambda scale, M, K: scale.contiguous(),
+    )
+
+    def weight_loader(param, loaded_weight, *args, **kwargs):
+        param.data.copy_(loaded_weight)
+
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.ones(2, 32, dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = vllm_parameter.ModelWeightParameter(
+        data=torch.ones(2, 1, dtype=torch.uint8),
+        input_dim=1,
+        output_dim=0,
+        weight_loader=weight_loader,
+    )
+    method = types.SimpleNamespace(
+        kernel=FlashInferCutedslMxfp8LinearKernel(config=object())
+    )
+    vllm_config = types.SimpleNamespace(
+        kernel_config=types.SimpleNamespace(linear_backend="auto")
+    )
+
+    with set_current_vllm_config(vllm_config):
+        fp8_module.process_weights_after_loading_mxfp8_linear(method, layer)
+
+    assert isinstance(method.kernel, FlashInferCutlassMxfp8LinearKernel)
+    assert hasattr(layer, "weight_scale_from_checkpoint")
+
+
+@pytest.mark.parametrize(
+    ("kernel_name", "expected_scale_name"),
+    [
+        ("FlashInferTrtllmMxfp8LinearKernel", "weight_scale"),
+        ("FlashInferCutedslMxfp8LinearKernel", "weight_scale"),
+        ("FlashInferCutlassMxfp8LinearKernel", "weight_scale_from_checkpoint"),
+    ],
+)
+def test_load_weights_uses_scale_name_for_mxfp8_linear_backend(
+    fp8_module, monkeypatch, kernel_name, expected_scale_name
 ):
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 
@@ -623,7 +710,7 @@ def test_load_weights_uses_canonical_scale_for_native_mxfp8_linear(
         model_parallel_size=1,
         is_mx=True,
     )
-    kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
+    kernel_type = type(kernel_name, (), {})
     layer = types.SimpleNamespace(
         quant_method=types.SimpleNamespace(kernel=kernel_type())
     )
@@ -647,5 +734,5 @@ def test_load_weights_uses_canonical_scale_for_native_mxfp8_linear(
 
     assert [name for name, _ in loaded] == [
         "model.layers.0.mlp.up_proj.weight",
-        "model.layers.0.mlp.up_proj.weight_scale",
+        f"model.layers.0.mlp.up_proj.{expected_scale_name}",
     ]
