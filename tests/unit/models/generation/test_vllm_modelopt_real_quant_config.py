@@ -26,8 +26,8 @@ from nemo_rl.modelopt.models.generation.vllm_quant_worker import (
     _configure_quant_engine_kwargs,
 )
 from nemo_rl.modelopt.utils import configure_modelopt_real_quant_generation
-from nemo_rl.models.policy.utils import IPCProtocol
 from nemo_rl.models.generation.vllm.utils import resolve_generation_worker_cls
+from nemo_rl.models.policy.utils import IPCProtocol
 
 
 def _valid_configs():
@@ -268,15 +268,34 @@ def test_real_quant_collective_load_failure_propagates(monkeypatch):
         extension.update_weights_from_collective()
 
 
-def test_real_quant_load_preserves_names_and_owns_transport_tensors(monkeypatch):
+def test_real_quant_load_owns_only_pending_transport_tensors(monkeypatch):
     extension = object.__new__(VllmQuantInternalWorkerExtension)
     extension.device = torch.device("cpu")
+    model = torch.nn.Linear(2, 2)
+    extension.model_runner = types.SimpleNamespace(model=model)
     monkeypatch.setattr(extension, "_is_real_quant_model", lambda: True)
     received = []
+
+    pending = types.SimpleNamespace(loaded_weights=[])
+
+    def load_weights(_self, weights):
+        received.extend(weights)
+        pending.loaded_weights = [
+            (
+                "weight",
+                types.SimpleNamespace(arguments={"loaded_weight": received[0][1]}),
+            )
+        ]
+        return "loaded"
+
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_backend."
         "VllmInternalWorkerExtension._load_weights",
-        lambda _self, weights: received.extend(weights) or "loaded",
+        load_weights,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.layerwise.get_layerwise_info",
+        lambda _module: pending,
     )
     source = torch.arange(4)
 
@@ -284,5 +303,8 @@ def test_real_quant_load_preserves_names_and_owns_transport_tensors(monkeypatch)
 
     assert result == "loaded"
     assert received[0][0] == "model.layers.0.weight"
-    assert torch.equal(received[0][1], source)
-    assert received[0][1].data_ptr() != source.data_ptr()
+    assert received[0][1].data_ptr() == source.data_ptr()
+
+    detached = pending.loaded_weights[0][1].arguments["loaded_weight"]
+    assert torch.equal(detached, source)
+    assert detached.data_ptr() != source.data_ptr()

@@ -34,6 +34,29 @@ from nemo_rl.models.generation.vllm.vllm_backend import (
 )
 
 
+def _detach_pending_layerwise_weights(
+    model: torch.nn.Module, source_storage_ptrs: set[int]
+) -> None:
+    """Own deferred weights before a transport buffer may be reused.
+
+    Completed layers have already dropped their buffered arguments, so only a
+    layer split across transport batches is cloned here.
+    """
+    if not source_storage_ptrs:
+        return
+
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    for module in model.modules():
+        for _, arguments in get_layerwise_info(module).loaded_weights:
+            loaded_weight = arguments.arguments.get("loaded_weight")
+            if (
+                isinstance(loaded_weight, torch.Tensor)
+                and loaded_weight.untyped_storage().data_ptr() in source_storage_ptrs
+            ):
+                arguments.arguments["loaded_weight"] = loaded_weight.clone()
+
+
 class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     _QUANT_AMAX_SUFFIXES = (
         "input_quantizer._amax",
@@ -180,12 +203,18 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     def _load_weights(self, weights):
         """Load fake-quant state or canonical ModelOpt deployment tensors."""
         if self._is_real_quant_model():
-            # IPC staging buffers are reused after each ACK, while vLLM may
-            # retain a tensor until its layer is complete. Own every payload
-            # before handing canonical HF names to vLLM's native loader.
-            owned_weights = [(name, weight.clone()) for name, weight in weights]
-            with torch.device(self.device):
-                return super()._load_weights(owned_weights)
+            weights = list(weights)
+            source_storage_ptrs = {
+                weight.untyped_storage().data_ptr() for _, weight in weights
+            }
+            try:
+                with torch.device(self.device):
+                    return super()._load_weights(weights)
+            finally:
+                with torch.device(self.device):
+                    _detach_pending_layerwise_weights(
+                        self.model_runner.model, source_storage_ptrs
+                    )
 
         # MBridge exports K/V amax with the HF-semantic attention path, such as
         # ``self_attn.k_bmm_quantizer._amax``. ModelOpt installs these quantizers
