@@ -59,6 +59,11 @@ class DataPlaneConfig(TypedDict):
     They are required (not NotRequired) so the YAML carries the full
     schema and there are no hidden Python defaults.
 
+    ``reuse_registered_buffers`` (``mooncake_cpu`` only) keeps a small pool
+    of RDMA-registered buffers alive instead of registering a fresh one per
+    transfer. Costs up to ``4 x`` the largest per-task payload in resident
+    pinned memory; set false to fall back to upstream behaviour.
+
     Both are per client *process* (one per GPU), so a node pays
     ``gpus_per_node x (segment + buffer)``. Under RDMA that memory is pinned
     and resident from setup, so keep the per-node product in mind when raising
@@ -70,6 +75,7 @@ class DataPlaneConfig(TypedDict):
     backend: Literal["simple", "mooncake_cpu"]
     storage_capacity: int
     num_storage_units: int
+    reuse_registered_buffers: bool
     claim_meta_poll_interval_s: float
     global_segment_size: int
     local_buffer_size: int
