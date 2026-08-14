@@ -203,6 +203,20 @@ def test_build_nemo_gym_config_uv_dirs(detected_uv_dirs, configured, expected):
     assert (global_config["uv_cache_dir"], global_config["uv_venv_dir"]) == expected
 
 
+def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs):
+    cfg = build_nemo_gym_config(
+        _env_configs(port_range_low=6000, port_range_high=6999),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
+
+    assert (cfg["port_range_low"], cfg["port_range_high"]) == (6000, 6999)
+    assert "port_range_low" not in cfg["initial_global_config_dict"]
+    assert "port_range_high" not in cfg["initial_global_config_dict"]
+
+
 def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(detected_uv_dirs):
     cfg = build_nemo_gym_config(
         _env_configs(),

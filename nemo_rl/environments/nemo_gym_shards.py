@@ -24,7 +24,7 @@ into a shard's merge is opaque Gym config, and validation compares entry
 
 import math
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import PurePosixPath
 from typing import Any, Mapping
 
@@ -32,17 +32,12 @@ from omegaconf import OmegaConf
 
 # Keys under ``env.nemo_gym`` that NeMo RL consumes itself. They must never
 # reach NeMo Gym: the merged config is serialized into NEMO_GYM_CONFIG_DICT for
-# every one of the ~60 child processes, and Gym treats unrecognized dict-shaped
-# top-level keys as server instance configs, which can trip its
-# error_on_almost_servers path.
-SHARDING_CONFIG_KEYS = frozenset(
-    {
-        "shards",
-        "common_inherited_overlays",
-        "common_overrides",
-        "allowed_duplicate_entries",
-    }
-)
+# every one of the ~60 child processes, so anything left here is shipped to all
+# of them.
+
+# Dict-shaped NeMo RL integration settings that are not Gym server entries.
+# The actor factory or rollout code consumes these separately.
+NEMO_RL_DICT_CONFIG_KEYS = frozenset({"effort_levels", "tokenizer_config"})
 
 DEFAULT_REPLICAS = 1
 SHARD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -51,20 +46,6 @@ SHARD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # Restated rather than imported: this module is imported on the driver, and
 # nemo_gym is installed only in the actor's venv.
 GYM_LOG_DIR_KEY = "nemo_gym_log_dir"
-
-# Per-shard keys consumed by NeMo RL rather than forwarded to Gym.
-SHARD_SPEC_KEYS = frozenset(
-    {
-        "name",
-        "config_paths",
-        "inherited_overlays",
-        "overrides",
-        "replicas",
-        "actor_cpus",
-        "port_range_low",
-        "port_range_high",
-    }
-)
 
 
 class ShardConfigError(ValueError):
@@ -89,6 +70,10 @@ class ShardSpec:
     port_range_high: int | None = None
 
 
+# Per-shard keys consumed by NeMo RL rather than forwarded to Gym.
+SHARD_SPEC_KEYS = frozenset(field.name for field in fields(ShardSpec))
+
+
 @dataclass(frozen=True)
 class ShardPlan:
     """The parsed ``shards`` block plus the settings that apply to all shards."""
@@ -98,10 +83,8 @@ class ShardPlan:
     common_overrides: dict[str, Any] = field(default_factory=dict)
     allowed_duplicate_entries: frozenset[str] = frozenset()
 
-    @property
-    def total_instances(self) -> int:
-        """Actors to create, counting replicas. One node is needed per instance."""
-        return sum(shard.replicas for shard in self.shards)
+
+SHARDING_CONFIG_KEYS = frozenset(field.name for field in fields(ShardPlan))
 
 
 def _as_plain_dict(value: Any, *, context: str) -> dict[str, Any]:
@@ -114,7 +97,12 @@ def _as_plain_dict(value: Any, *, context: str) -> dict[str, Any]:
         raise ShardConfigError(
             f"{context} must be a mapping, got {type(value).__name__}"
         )
-    return dict(value)
+    plain: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise ShardConfigError(f"{context} keys must be strings")
+        plain[key] = item
+    return plain
 
 
 def _as_string_set(value: Any, *, context: str) -> frozenset[str]:
@@ -173,22 +161,23 @@ def _parse_shard(raw: Any, index: int) -> ShardSpec:
         raise ShardConfigError(
             f"shard '{name}' must set both port_range_low and port_range_high, or neither"
         )
-    if port_low is not None and (
-        not isinstance(port_low, int)
-        or isinstance(port_low, bool)
-        or not isinstance(port_high, int)
-        or isinstance(port_high, bool)
-        or port_low < 1
-        or port_high > 65_535
-    ):
-        raise ShardConfigError(
-            f"shard '{name}' port range must use integers within [1, 65535]"
-        )
-    if port_low is not None and port_low >= port_high:
-        raise ShardConfigError(
-            f"shard '{name}' must reserve at least two ports in the inclusive "
-            f"range [{port_low}, {port_high}]"
-        )
+    if port_low is not None:
+        if (
+            not isinstance(port_low, int)
+            or isinstance(port_low, bool)
+            or not isinstance(port_high, int)
+            or isinstance(port_high, bool)
+            or port_low < 1
+            or port_high > 65_535
+        ):
+            raise ShardConfigError(
+                f"shard '{name}' port range must use integers within [1, 65535]"
+            )
+        if port_low >= port_high:
+            raise ShardConfigError(
+                f"shard '{name}' must reserve at least two ports in the inclusive "
+                f"range [{port_low}, {port_high}]"
+            )
 
     actor_cpus = entry.get("actor_cpus")
     if actor_cpus is not None and (
@@ -222,15 +211,19 @@ def _parse_shard(raw: Any, index: int) -> ShardSpec:
 def find_gym_config_entries(nemo_gym_config: Mapping[str, Any]) -> list[str]:
     """Return top-level keys that Gym would read as server instance configs.
 
-    Mirrors Gym's own rule (``filter_for_server_instance_configs``): any
-    dict-shaped top-level key that is not a known setting is an entry overlay.
-    Under sharding these values are inherited from the resolved parent config.
-    A shard claims them by key so their YAML bodies do not need to be copied.
+    Deliberately broader than Gym's own rule
+    (``filter_for_server_instance_configs``), which also requires the value to
+    validate as a ``ServerInstanceConfig``: this module cannot import Gym, so
+    any dict-shaped top-level key that is not a known setting is treated as an
+    entry overlay. Under sharding these values are inherited from the resolved
+    parent config. A shard claims them by key so their YAML bodies do not need
+    to be copied.
     """
     return sorted(
         key
         for key, value in nemo_gym_config.items()
         if key not in SHARDING_CONFIG_KEYS
+        and key not in NEMO_RL_DICT_CONFIG_KEYS
         and (isinstance(value, Mapping) or OmegaConf.is_dict(value))
     )
 
@@ -247,6 +240,16 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
             config that has no unambiguous shard to belong to.
     """
     if "shards" not in nemo_gym_config:
+        stray = sorted(
+            key
+            for key in SHARDING_CONFIG_KEYS
+            if key != "shards" and key in nemo_gym_config
+        )
+        if stray:
+            raise ShardConfigError(
+                f"env.nemo_gym has sharding keys {stray} but no 'shards' block. "
+                "Add a 'shards' block, or remove these keys."
+            )
         return None
 
     raw_shards = nemo_gym_config["shards"]
@@ -317,23 +320,54 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
             f"{sorted(inherited_inventory)}."
         )
 
-    raw_allowed = nemo_gym_config.get("allowed_duplicate_entries") or []
-    if OmegaConf.is_config(raw_allowed):
-        raw_allowed = OmegaConf.to_container(raw_allowed, resolve=True)
-    if not isinstance(raw_allowed, list) or not all(
-        isinstance(entry, str) for entry in raw_allowed
-    ):
+    common_overrides = _as_plain_dict(
+        nemo_gym_config.get("common_overrides"),
+        context="env.nemo_gym.common_overrides",
+    )
+    if "config_paths" in common_overrides:
         raise ShardConfigError(
-            "env.nemo_gym.allowed_duplicate_entries must be a list of strings"
+            "env.nemo_gym.common_overrides cannot set config_paths; "
+            "declare paths on each shard"
         )
+    wrongly_common = sorted(
+        key
+        for key in common_overrides
+        if key in inherited_inventory and key not in common_inherited
+    )
+    if wrongly_common:
+        raise ShardConfigError(
+            f"common_overrides cannot override inherited entries {wrongly_common} "
+            "because they are not claimed by common_inherited_overlays"
+        )
+    for shard in shards:
+        if "config_paths" in shard.overrides:
+            raise ShardConfigError(
+                f"shard '{shard.name}' overrides cannot set config_paths; "
+                "use the shard's config_paths field"
+            )
+        wrongly_owned = sorted(
+            key
+            for key in shard.overrides
+            if key in inherited_inventory
+            and key not in common_inherited
+            and key not in shard.inherited_overlays
+        )
+        if wrongly_owned:
+            raise ShardConfigError(
+                f"shard '{shard.name}' overrides inherited entries {wrongly_owned} "
+                "that are claimed by another shard"
+            )
+
+    raw_allowed = _as_string_set(
+        nemo_gym_config.get("allowed_duplicate_entries"),
+        context="env.nemo_gym.allowed_duplicate_entries",
+    )
 
     return ShardPlan(
         shards=shards,
         common_inherited_overlays=common_inherited,
-        common_overrides=_as_plain_dict(
-            nemo_gym_config.get("common_overrides"), context="common_overrides"
-        ),
-        allowed_duplicate_entries=frozenset(raw_allowed),
+        common_overrides=common_overrides,
+        allowed_duplicate_entries=raw_allowed,
     )
 
 
@@ -357,16 +391,18 @@ def apply_shard_overlay(
         key: base_config[key]
         for key in plan.common_inherited_overlays | shard.inherited_overlays
     }
-    merged = OmegaConf.to_container(
-        OmegaConf.merge(
-            OmegaConf.create(shared_base),
-            OmegaConf.create(selected_inherited),
-            OmegaConf.create(plan.common_overrides),
-            OmegaConf.create(shard.overrides),
+    merged = _as_plain_dict(
+        OmegaConf.to_container(
+            OmegaConf.merge(
+                OmegaConf.create(shared_base),
+                OmegaConf.create(selected_inherited),
+                OmegaConf.create(plan.common_overrides),
+                OmegaConf.create(shard.overrides),
+            ),
+            resolve=True,
         ),
-        resolve=True,
+        context=f"merged config for shard '{shard.name}'",
     )
-    assert isinstance(merged, dict)
     merged["config_paths"] = list(shard.config_paths)
     if shard.port_range_low is not None:
         merged["port_range_low"] = shard.port_range_low
