@@ -39,6 +39,8 @@ policy:
   logprob_batch_size: 1
   max_total_sequence_length: 32768
   logprob_chunk_size: 2048
+  sequence_packing:
+    fuse_loss: true
   dtensor_cfg:
     enabled: false
   megatron_cfg:
@@ -137,7 +139,8 @@ on_policy_distillation:
       tensor_model_parallel_size: 2
       pipeline_model_parallel_size: 1
       context_parallel_size: 1
+      expert_tensor_parallel_size: 1
       num_nodes: 1
       gpus_per_node: 8
-      precision: bf16
+      precision: bfloat16
       micro_batch_size: 1

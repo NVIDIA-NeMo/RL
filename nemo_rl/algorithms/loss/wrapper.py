@@ -178,7 +178,7 @@ class SequencePackingFusionLossWrapper:
     producing numerically identical results.
 
     The prepare_fn should be prepare_packed_loss_input (from nemo_rl.algorithms.loss.utils),
-    which currently only supports LossInputType.LOGPROB.
+    which supports LossInputType.LOGPROB and packed teacher-selected OPD_TOPK.
     """
 
     def __init__(
