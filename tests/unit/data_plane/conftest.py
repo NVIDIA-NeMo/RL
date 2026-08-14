@@ -34,7 +34,7 @@ import os
 import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
-from nemo_rl.data_plane.adapters.transfer_queue import rdma_device
+from nemo_rl.data_plane.adapters.transfer_queue import rdma_devices
 
 from ._rollout_shapes import mooncake_available
 
@@ -46,6 +46,7 @@ def _make_tq_cfg(backend: str) -> dict:
         "backend": backend,
         "storage_capacity": 1024,
         "num_storage_units": 1,
+        "reuse_registered_buffers": True,
         "claim_meta_poll_interval_s": 0.5,
         "global_segment_size": 8589934592,  # 8 GiB — sized for CI host RAM
         "local_buffer_size": 1073741824,  # 1 GiB
@@ -74,7 +75,7 @@ def _session_tq_client_mooncake_cpu():
     # sets NEMO_RL_REQUIRE_MOONCAKE=1 on runners that have one, which turns
     # this skip into a failure — otherwise losing the device passthrough would
     # silently drop mooncake coverage and still go green.
-    if not rdma_device():
+    if not rdma_devices():
         detail = (
             "no usable mlx5 RDMA device — mooncake_cpu requires RDMA "
             "(set MC_MOONCAKE_DEVICE=<dev> to override)"
