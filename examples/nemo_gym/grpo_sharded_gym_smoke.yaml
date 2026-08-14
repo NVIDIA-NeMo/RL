@@ -11,11 +11,11 @@
 # a supported multi-environment combination -- see the commented config_paths
 # in the base recipe -- so this only changes where they run, not what they do.
 #
-# Run `gym dataset collate` with BOTH resources-server config paths and point
-# data.train/validation at the combined JSONL before running. A dataset covering
-# only one of them still starts, but every row lands on one shard and the other
-# sits idle, so routing is never exercised. A dataset naming a third agent fails
-# at setup, which is itself worth seeing once.
+# Run `gym dataset collate` with BOTH resources-server config paths.
+# Point data.train/validation at the combined JSONL before running.
+# A dataset covering only one environment still starts.
+# Every row then lands on one shard, so routing is never exercised.
+# A dataset naming a third agent fails at setup.
 #
 # Single node:
 #   the default STRICT_SPREAD wants one node per shard, so override
@@ -31,8 +31,9 @@ defaults: "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml"
 
 env:
   nemo_gym:
-    # Retract inherited settings that no shard owns. A Hydra override can blank
-    # an inherited key but not delete it, so the schema reads null as absent.
+    # Retract inherited settings that no shard owns.
+    # A Hydra override can blank an inherited key but cannot delete it.
+    # The schema reads null as absent.
     config_paths: null
     code_gen: null
 
@@ -53,16 +54,15 @@ env:
           - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
           - resources_servers/math_with_judge/configs/math_with_judge.yaml
 
-    # The base recipe already configures policy_model. Claim that inherited
-    # overlay by key instead of copying its value here. Both shards need it,
-    # and it only proxies NeMo RL's vLLM servers, so duplicating it claims no
-    # extra GPU.
+    # The base recipe already configures policy_model.
+    # Claim that inherited overlay by key instead of copying its value.
+    # Both shards need the proxy.
+    # Duplicating it claims no extra GPU.
     common_inherited_overlays:
       - policy_model
 
     # An inherited overlay must be assigned to one shard or to all shards.
-    # Multi-shard plans reject unclaimed and multiply claimed keys before
-    # starting actors.
+    # Multi-shard plans reject unclaimed and multiply claimed keys.
     allowed_duplicate_entries:
       - policy_model
 
