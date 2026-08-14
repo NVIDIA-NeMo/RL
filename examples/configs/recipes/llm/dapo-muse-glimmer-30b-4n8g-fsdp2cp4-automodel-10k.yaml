@@ -1,0 +1,187 @@
+defaults: ../../grpo_math_1B.yaml
+# Muse Glimmer 30B DAPO at 10k (CP4) with a KL anchor and the soft overlong
+# penalty (overlong filtering off). Two deliberate departures from the DAPO
+# defaults used elsewhere in this family:
+#  - reference_policy_kl_penalty 0 -> 0.01: without the anchor this model's
+#    validation accuracy rises for ~30 steps then decays (val 0.84 @30 fell
+#    to 0.57 @110); 0.01 holds the curve flat.
+#  - overlong_filtering true -> false: filtering zeroes truncated samples out
+#    of the loss, so the soft overlong penalty below never reaches exactly the
+#    samples it exists to shape. The two are alternatives in the DAPO paper;
+#    keep the penalty and let truncated samples actually take the gradient.
+# stop_token_ids is set explicitly (see generation block). Resuming relies on
+# the reference policy being captured from the base weights before any
+# checkpoint restore (dtensor_policy_worker_v2), so the anchor stays fixed
+# across resumes.
+#
+# Environment: the standard uv-locked venvs of this repo; vLLM resolves from
+# pyproject.toml's pinned Muse Glimmer-enabled vLLM nightly wheel (see
+# docs/guides/models/muse-glimmer.md for setup).
+grpo:
+  # Reference logprobs are required by the KL penalty below (~+10% step time).
+  skip_reference_policy_logprobs_calculation: false
+  # DAPO-512: 32 prompts x 16 generations = 512 rollouts/step
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_epochs: 2
+  val_at_start: true
+  use_dynamic_sampling: true
+  batch_multiplier: 3
+  dynamic_sampling_max_gen_batches: 10
+  # Off (was true): mutually exclusive with the soft overlong penalty below.
+  overlong_filtering: false
+  use_leave_one_out_baseline: false
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: ${policy.generation.max_new_tokens}
+loss_fn:
+  # KL anchor to the initial (reference) policy; k3 estimator. 0.001 was
+  # tested and is too weak; 0.01 is the validated dose (and the grpo_math_1B
+  # base default).
+  reference_policy_kl_penalty: 0.01
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "tis"
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/dapo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-10k
+  enabled: true
+  save_period: 10
+  keep_top_k: 3
+  save_optimizer: true
+  checkpoint_must_save_by: "00:03:45:00"
+policy:
+  model_name: meta-models/Muse-Glimmer-30B
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 4096
+  # 10240 = data.max_input_seq_length (2048) + max_new_tokens (8192), exact.
+  # The previous 9216 left the budget 1024 short: vLLM silently caps generation
+  # at max_model_len - input_length, so the longest prompts were truncated
+  # below the overlong penalty ramp and the DAPO penalty never fired for
+  # exactly the samples it exists to shape. With CP4 this is 2560 tokens/rank
+  # (validated CP4 run was 2304/rank at 9216).
+  max_total_sequence_length: 10240
+  make_sequence_length_divisible_by: 8
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      # FSDP2 keeps sharded params in fp32 already; TE-side masters are a
+      # redundant copy (see the 1n8g recipe / commit a4ee63d3).
+      master_weights: false
+      store_param_remainders: false
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  dtensor_cfg:
+    activation_checkpointing: true
+    # CP splits per-rank activation/logit memory for the long
+    # sequences: without it the train forward OOMs at ~70GB/rank (the
+    # per-submodule activation checkpointing granularity plus the full-vocab
+    # softcap logits chain scale linearly with sequence length). Context
+    # parallel is also upstream Automodel's own approach for long-context
+    # Onyx (their recipes use cp8/cp32). CP2 still OOMed in backward on the
+    # final weights (job 15403904, step 3: 60.9GB allocated + 11.6GB
+    # fragmentation, 3.4GB short), so use CP4.
+    context_parallel_size: 4
+    env_vars:
+      # The cuDNN fused-attention kernels intermittently fail with
+      # CUDNN_STATUS_EXECUTION_FAILED_CUDA_DRIVER (shimCuLaunchKernelEx) under
+      # the container's CUDA compat shim on certain CP2 sequence shapes
+      # (jobs 15319737/15319739, always around step 2x). Fall back to the
+      # TE flash-attention backend.
+      NVTE_FUSED_ATTN: "0"
+      # Curb allocator fragmentation from variable-length dynamic batching
+      # (same fix as the 4k recipe). IPC-safe, unlike expandable_segments.
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+    automodel_kwargs:
+      # Validated Onyx combo (mirrors Automodel's onyx_29b_medpix_te_* recipes):
+      # HF config validation stays on SDPA, native language attention runs TE.
+      attn_implementation: sdpa
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+      # Automodel's Onyx recipes set this false; only Gemma4 turns it on.
+      use_liger_kernel: false
+      # The final checkpoint carries the vision tower. This run is text-only
+      # (DAPO math), so freeze the towers: no tower grads/optimizer state, and
+      # it matches generation, which skips the tower via language_model_only.
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    backend: vllm
+    max_new_tokens: 8192
+    # Onyx's turn terminator is <|eot|> (200008), not the tokenizer
+    # eos_token (<|end_of_text|>, 200001) that configure_generation_config
+    # auto-fills when this is null. Generation only worked before because
+    # vLLM independently stops on the model generation_config's
+    # eos_token_id list [200001, 200008]; set both explicitly instead of
+    # relying on that fallback.
+    stop_token_ids: [200008, 200001]
+    vllm_cfg:
+      # vLLM registers Onyx as multimodal; its processor init needs the
+      # tokenizer, so it cannot run with skip_tokenizer_init=True (text
+      # token-id prompts still work). The vllm_worker forces this off for
+      # Onyx anyway; kept explicit for clarity.
+      skip_tokenizer_init: false
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.5
+      # CUDA graphs on (the bring-up runs used enforce_eager: true for
+      # stability; generation was ~51% of step time in the smoke run, and
+      # eager mode leaves that on the table).
+      enforce_eager: false
+      max_model_len: ${policy.max_total_sequence_length}
+    vllm_kwargs:
+      # Text-only run: skip loading the vision tower in vLLM.
+      language_model_only: true
+    colocated:
+      enabled: true
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/dapo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-10k
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: dapo-muse-glimmer-30b-4n8g-fsdp2cp4-automodel-10k
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4
