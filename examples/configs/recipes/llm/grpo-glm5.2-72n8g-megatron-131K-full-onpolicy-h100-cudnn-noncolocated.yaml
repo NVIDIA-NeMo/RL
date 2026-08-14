@@ -83,7 +83,7 @@ policy:
   optimizer: null
   scheduler: null
   generation:
-    max_new_tokens: 2000
+    max_new_tokens: 4096
     vllm_cfg:
       precision: bfloat16
       tensor_parallel_size: 8

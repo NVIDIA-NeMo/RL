@@ -25,6 +25,9 @@ policy:
   megatron_cfg:
     enabled: true
     converter_type: GlmMoeDsaForCausalLM
+    model_overrides:
+      dsa_indexer_loss_coeff: 0.0
+      dsa_indexer_use_sparse_loss: false
     tensor_model_parallel_size: 8
     pipeline_model_parallel_size: 8
     num_layers_in_first_pipeline_stage: 9
