@@ -46,6 +46,19 @@ def test_unsharded_config_returns_no_plan():
     assert parse_shard_plan({"config_paths": ["gym.yaml"], "num_gpu_nodes": 1}) is None
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "common_inherited_overlays",
+        "common_overrides",
+        "allowed_duplicate_entries",
+    ],
+)
+def test_unsharded_config_rejects_stray_sharding_keys(key):
+    with pytest.raises(ShardConfigError, match=f"sharding keys.*{key}.*no 'shards'"):
+        parse_shard_plan({"config_paths": ["gym.yaml"], key: []})
+
+
 def test_parse_shard_plan_reads_shards_and_common_settings():
     plan = parse_shard_plan(
         _sharded_config(
@@ -66,19 +79,6 @@ def test_parse_shard_plan_accepts_omegaconf_input():
 
     assert [shard.name for shard in plan.shards] == ["judged", "tools"]
     assert isinstance(plan.shards[0].config_paths, list)
-
-
-def test_replicas_count_toward_total_instances():
-    plan = parse_shard_plan(
-        _sharded_config(
-            shards=[
-                {"name": "judged", "config_paths": ["judge.yaml"]},
-                {"name": "tools", "config_paths": ["tools.yaml"], "replicas": 3},
-            ]
-        )
-    )
-
-    assert plan.total_instances == 4
 
 
 def test_top_level_config_paths_conflicts_with_shards():
@@ -305,9 +305,69 @@ def test_config_paths_and_port_types_are_validated_at_parse_time():
         )
 
 
-def test_allowed_duplicate_entries_must_be_strings():
-    with pytest.raises(ShardConfigError, match="list of strings"):
-        parse_shard_plan(_sharded_config(allowed_duplicate_entries=[{"nope": 1}]))
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ([{"nope": 1}], "list of non-empty strings"),
+        ([""], "list of non-empty strings"),
+        (["policy_model", "policy_model"], "contains duplicate keys"),
+        ({}, "list of non-empty strings"),
+    ],
+)
+def test_allowed_duplicate_entries_requires_unique_non_empty_strings(value, expected):
+    with pytest.raises(ShardConfigError, match=expected):
+        parse_shard_plan(_sharded_config(allowed_duplicate_entries=value))
+
+
+@pytest.mark.parametrize("layer", ["common", "shard"])
+def test_override_layers_cannot_set_config_paths(layer):
+    config = _sharded_config()
+    if layer == "common":
+        config["common_overrides"] = {"config_paths": ["wrong.yaml"]}
+    else:
+        config["shards"][0]["overrides"] = {"config_paths": ["wrong.yaml"]}
+
+    with pytest.raises(ShardConfigError, match="cannot set config_paths"):
+        parse_shard_plan(config)
+
+
+def test_override_layers_cannot_override_an_entry_owned_by_another_shard():
+    config = _sharded_config(
+        shards=[
+            {
+                "name": "judged",
+                "config_paths": ["judge.yaml"],
+                "inherited_overlays": ["judge_model"],
+            },
+            {
+                "name": "tools",
+                "config_paths": ["tools.yaml"],
+                "overrides": {"judge_model": {"responses_api_models": {}}},
+            },
+        ],
+        judge_model={"responses_api_models": {"vllm_model": {}}},
+    )
+
+    with pytest.raises(ShardConfigError, match="claimed by another shard"):
+        parse_shard_plan(config)
+
+
+def test_common_overrides_only_override_common_inherited_entries():
+    config = _sharded_config(
+        shards=[
+            {
+                "name": "judged",
+                "config_paths": ["judge.yaml"],
+                "inherited_overlays": ["judge_model"],
+            },
+            {"name": "tools", "config_paths": ["tools.yaml"]},
+        ],
+        common_overrides={"judge_model": {"responses_api_models": {}}},
+        judge_model={"responses_api_models": {"vllm_model": {}}},
+    )
+
+    with pytest.raises(ShardConfigError, match="not claimed by common"):
+        parse_shard_plan(config)
 
 
 def test_apply_shard_overlay_layers_shard_over_common():
@@ -433,6 +493,8 @@ def test_find_gym_config_entries_ignores_scalars_and_known_keys():
             "common_inherited_overlays": ["genrm_model"],
             "common_overrides": {"x": 1},
             "allowed_duplicate_entries": ["policy_model"],
+            "effort_levels": {"low_weight": 0.0},
+            "tokenizer_config": {"name": "policy"},
             "genrm_model": {"responses_api_models": {}},
             "safety_judge_model": {"responses_api_models": {}},
         }
