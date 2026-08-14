@@ -33,9 +33,6 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-    text_generation_server as mlm_text_gen_server,
-)
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -173,9 +170,11 @@ def test_http_server_port_reservation(monkeypatch):
 
     The server URL is published to NeMo Gym before any worker exists, so: the
     reserved port is bound and listening from reservation time (early Gym
-    probes queue instead of being refused), the worker adopts that same socket
-    through the fd handoff — the port is never released in between — and the
-    server falls back to a fresh port only when nothing was reserved.
+    probes queue instead of being refused), and the worker adopts that same
+    socket through the fd handoff — the port is never released in between.
+    On this tree the high-level LLM API has no socket handoff, so the last
+    step is close-then-rebind: the held socket is closed and its port goes to
+    ServeConfig — falling back to a fresh port only when nothing was reserved.
     """
     monkeypatch.setattr(
         "nemo_rl.distributed.virtual_cluster._get_node_ip_local",
@@ -198,13 +197,7 @@ def test_http_server_port_reservation(monkeypatch):
         with socket.create_connection(("127.0.0.1", port), timeout=5):
             pass
 
-        # Server start with the network and MLM server stubbed out.
-        started = {}
-        monkeypatch.setattr(
-            mlm_text_gen_server,
-            "start_text_gen_server",
-            lambda **kwargs: started.update(kwargs),
-        )
+        # Server start with the network and the high-level LLM stubbed out.
         monkeypatch.setattr(
             "nemo_rl.distributed.virtual_cluster._get_free_port_local",
             lambda: 12345,
@@ -220,15 +213,20 @@ def test_http_server_port_reservation(monkeypatch):
 
         for reserved_socket, expected_port in ((reserved, port), (None, 12345)):
             worker = SimpleNamespace(
-                coordinator_addr="tcp://127.0.0.1:5555",
-                megatron_tokenizer=object(),
+                llm=MagicMock(),
                 rank=0,
                 cfg={"generation": {"mcore_generation_config": {"parsers": []}}},
                 _reserved_http_server_socket=reserved_socket,
             )
             base_url = MegatronGenerationMixin._setup_openai_api_server(worker)
-            assert started["sock"] is reserved_socket
-            assert started["server_port"] == expected_port
+            (serve_config,) = worker.llm.serve.call_args.args
+            assert worker.llm.serve.call_args.kwargs == {"blocking": False}
+            assert serve_config.port == expected_port
+            worker.llm.run_sync.assert_called_once()
             assert base_url == f"http://10.0.0.5:{expected_port}/v1"
+
+        # Close-then-rebind contract: the held socket was closed and cleared
+        # just before serve() took the port.
+        assert reserved.fileno() == -1
     finally:
         reserved.close()
