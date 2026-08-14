@@ -194,9 +194,29 @@ def _reattach_original_multimodal_payloads(
                 message for message in target_log if message.get("role") == "user"
             ]
             for original, target in zip(original_user_messages, target_user_messages):
-                for key, value in original.items():
-                    if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
-                        target[key] = value
+                attach_static_multimodal_payload([target], [original])
+
+
+def attach_static_multimodal_payload(
+    target_message_log: list[dict[str, Any]],
+    source_message_log: list[dict[str, Any]],
+) -> None:
+    """Copy policy-ready media from static source turns to Gym-authored turns."""
+    source_users = [
+        message for message in source_message_log if message.get("role") == "user"
+    ]
+    target_users = [
+        message for message in target_message_log if message.get("role") == "user"
+    ]
+    if len(target_users) < len(source_users):
+        raise ValueError(
+            "Cannot attach static multimodal payload: Gym returned fewer user "
+            "turns than the source prompt."
+        )
+    for source, target in zip(source_users, target_users):
+        for key, value in source.items():
+            if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
+                target[key] = value
 
 
 def _add_r3_fallback_metrics(
@@ -2344,6 +2364,11 @@ async def run_async_nemo_gym_rollout(
         raise ValueError(
             "returns_entire_batch requires num_generations to equal the batch size"
         )
+    original_message_logs = input_batch.get("message_log")
+    if original_message_logs is not None and len(original_message_logs) != len(
+        nemo_gym_rows
+    ):
+        raise ValueError("NeMo-Gym message-log count must match the rollout-row count")
 
     timer = Timer()
     timer_prefix = "timing/rollout"
@@ -2408,6 +2433,10 @@ async def run_async_nemo_gym_rollout(
 
                 _tensorize_nemo_gym_result(result)
                 completed_group = accumulator.add(rowidx, result)
+                if original_message_logs is not None:
+                    attach_static_multimodal_payload(
+                        result["message_log"], original_message_logs[rowidx]
+                    )
                 if completed_group is not None:
                     group_input_batch = input_batch.slice(
                         completed_group.group_index * num_generations,

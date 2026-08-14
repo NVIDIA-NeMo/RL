@@ -783,7 +783,14 @@ def extract_multimodal_model_inputs(
 
     extracted: dict[str, PackedTensor | torch.Tensor] = {}
     multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    for key in ("imgs_sizes", "num_frames"):
+    # Some remote-code processors omit these media inputs from their declared
+    # model_input_names even though their model forward requires them.
+    for key in (
+        "imgs_sizes",
+        "num_frames",
+        "pixel_values_flat",
+        "image_num_patches",
+    ):
         if key in processed and key not in multimodal_keys:
             multimodal_keys.append(key)
     for key in multimodal_keys:

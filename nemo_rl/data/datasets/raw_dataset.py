@@ -69,4 +69,12 @@ class RawDataset:
             task_name=self.task_name,
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
+            num_frames=self.data_config.get("num_frames"),
+            video_sampling_style=self.data_config.get("video_sampling_style"),
+            video_target_num_patches=self.data_config.get("video_target_num_patches"),
+            video_temporal_patch_size=self.data_config.get("video_temporal_patch_size"),
+            video_maintain_aspect_ratio=self.data_config.get(
+                "video_maintain_aspect_ratio"
+            ),
+            min_generation_tokens=self.data_config.get("min_generation_tokens"),
         )

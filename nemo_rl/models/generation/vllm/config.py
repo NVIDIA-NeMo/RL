@@ -23,6 +23,14 @@ VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_r
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
 
 
+class VllmVideoConfig(BaseModel, extra="allow"):
+    """Video sampling contract shared by policy preprocessing and vLLM."""
+
+    sampling_style: Literal["nemotron_vl"]
+    num_frames: PositiveInt
+    temporal_patch_size: PositiveInt
+
+
 class VllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
     pipeline_parallel_size: int
@@ -32,6 +40,9 @@ class VllmSpecificArgs(TypedDict):
     # Additional arguments for vLLM inserted by nemo rl based on the context of when vllm is used
     skip_tokenizer_init: bool
     async_engine: bool
+    # Optional video contract. When present, NeMo RL registers its TorchCodec
+    # loader and uses these exact sampling values on both sides of GRPO.
+    video: NotRequired[VllmVideoConfig]
     load_format: NotRequired[str]
     precision: NotRequired[str]
     # Whether vLLM returns logprobs before or after generation-time logit
@@ -163,6 +174,59 @@ class VllmConfig(GenerationConfig):
     # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
     real_quant_export_cpu_offload: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
+
+
+def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
+    """Validate and return the optional vLLM video sampling contract."""
+    raw_video_config = config["vllm_cfg"].get("video")
+    if raw_video_config is None:
+        return None
+    return VllmVideoConfig.model_validate(raw_video_config)
+
+
+def materialize_vllm_video_config(
+    policy_config: dict[str, Any], data_config: dict[str, Any]
+) -> None:
+    """Apply one video contract to tokenizer, data, and vLLM request config."""
+    generation_config = policy_config["generation"]
+    if generation_config["backend"] != "vllm":
+        return
+
+    video_config = resolve_vllm_video_config(generation_config)
+    if video_config is None:
+        return
+
+    # Keep the normalized value dict-shaped for OmegaConf/Ray serialization.
+    generation_config["vllm_cfg"]["video"] = video_config.model_dump()
+
+    tokenizer_video_config = policy_config["tokenizer"].setdefault("video", {})
+    tokenizer_video_config["num_frames"] = video_config.num_frames
+
+    data_defaults = data_config.setdefault("default", {})
+    data_defaults.update(
+        {
+            "num_frames": video_config.num_frames,
+            "video_sampling_style": video_config.sampling_style,
+            "video_temporal_patch_size": video_config.temporal_patch_size,
+        }
+    )
+
+    vllm_kwargs = generation_config.get("vllm_kwargs")
+    if vllm_kwargs is None:
+        raise ValueError(
+            "policy.generation.vllm_kwargs is required when vllm_cfg.video is set"
+        )
+    limit_mm_per_prompt = vllm_kwargs.get("limit_mm_per_prompt")
+    if not isinstance(limit_mm_per_prompt, dict):
+        raise ValueError(
+            "policy.generation.vllm_kwargs.limit_mm_per_prompt must configure video"
+        )
+    video_limit = limit_mm_per_prompt.get("video")
+    if not isinstance(video_limit, dict):
+        raise ValueError(
+            "policy.generation.vllm_kwargs.limit_mm_per_prompt.video must be a mapping"
+        )
+    video_limit["num_frames"] = video_config.num_frames
 
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:

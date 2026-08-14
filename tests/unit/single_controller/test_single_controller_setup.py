@@ -75,6 +75,7 @@ def _make_master_config(
             "megatron_cfg": {"enabled": megatron_enabled},
             "generation": {
                 "backend": backend,
+                "vllm_cfg": {},
                 "colocated": {"enabled": colocated, "resources": {}},
             },
         },
@@ -366,6 +367,29 @@ class TestSetup:
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert mc.grpo.max_num_steps == 8
+
+    def test_unlimited_steps_resolve_to_dataloader_epoch_horizon(
+        self, patched_factories
+    ):
+        mc = _make_master_config(
+            megatron_enabled=True,
+            max_num_steps=-1,
+            max_num_epochs=2,
+        )
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert mc.grpo.max_num_steps == 8
+        assert mc.policy["megatron_cfg"]["train_iters"] == 8
+
+    def test_unlimited_steps_require_finite_epoch_horizon(self, patched_factories):
+        mc = _make_master_config(
+            max_num_steps=-1,
+            max_num_epochs=None,
+        )
+
+        with pytest.raises(ValueError, match="requires a finite max_num_epochs"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_megatron_train_iters_capped_by_max_num_steps(self, patched_factories):
         """train_iters = min(max_num_steps, max_num_epochs * len(dataloader))."""
