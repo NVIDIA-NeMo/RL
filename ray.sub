@@ -156,6 +156,8 @@ fi
 # Port layout (all below ephemeral floor at 9000):
 #   1200-1201    Ray GCS + client server (head only)
 #   1301-1312    Ray management (node-mgr, obj-mgr, etc.; odd=worker, even=head)
+#   1320-1359    vLLM Router HTTP
+#   1360-1399    vLLM Router Prometheus metrics
 #   1400-1999    Master address / TCPStore (cluster.master_port_range_low/high)
 #   2000-2999    Ray worker gRPC (min/max-worker-port)
 #   3000-4999    NeMo RL generation HTTP servers + SGLang engine NCCL/dist_init

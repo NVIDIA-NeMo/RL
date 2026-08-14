@@ -15,6 +15,7 @@ import json
 import time
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import ray
@@ -28,14 +29,24 @@ from nemo_rl.data.multimodal_utils import PackedTensor, image_to_data_url
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GYM_PORT_RANGE_HIGH,
+    DEFAULT_GYM_PORT_RANGE_LOW,
+    DEFAULT_VLLM_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_VLLM_ROUTER_PORT_RANGE_LOW,
+    DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_HIGH,
+    DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_LOW,
+)
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
+    spinup_nemo_gym_actor,
     validate_reward_components_match_scalar,
 )
+from nemo_rl.environments.vllm_router import VllmRouterConfig
 from nemo_rl.experience.rollouts import _reattach_original_multimodal_payloads
 from nemo_rl.models.generation.vllm import VllmGeneration
 
@@ -141,6 +152,198 @@ def test_nemo_gym_stub_module():
     print(
         f"NeMo-Gym test successfully run! NeMo-Gym config_types module: {config_types}"
     )
+
+
+def test_spinup_nemo_gym_actor_extracts_vllm_router_config():
+    actor = MagicMock()
+    spinup_ref = object()
+    actor._spinup.remote.return_value = spinup_ref
+
+    with (
+        patch("nemo_rl.environments.nemo_gym.NemoGym") as nemo_gym_actor,
+        patch(
+            "nemo_rl.environments.nemo_gym.get_actor_python_env",
+            return_value="/tmp/nemo-gym-python",
+        ),
+        patch("nemo_rl.environments.nemo_gym.ray.get") as ray_get,
+    ):
+        nemo_gym_actor.options.return_value.remote.return_value = actor
+
+        result = spinup_nemo_gym_actor(
+            env_configs={
+                "nemo_gym": {
+                    "vllm_router": {
+                        "enabled": True,
+                        "policy": "consistent_hash",
+                    },
+                    "config_paths": ["responses_api_models/vllm_model/config.yaml"],
+                }
+            },
+            base_urls=["http://worker-0:8000/v1"],
+            model_name="test-model",
+            enable_router_replay=False,
+            routed_experts_dtype="int32",
+            use_fastokens=False,
+        )
+
+    actor_cfg = nemo_gym_actor.options.return_value.remote.call_args.args[0]
+    assert actor_cfg["vllm_router"] == VllmRouterConfig(
+        enabled=True,
+        policy="consistent_hash",
+    )
+    assert "vllm_router" not in actor_cfg["initial_global_config_dict"]
+    ray_get.assert_called_once_with(spinup_ref)
+    assert result is actor
+
+
+def test_nemo_gym_spinup_routes_policy_requests_through_vllm_router():
+    events = []
+    router = MagicMock()
+    router.openai_base_url = "http://10.0.0.5:1325/v1"
+    router.start.side_effect = lambda: events.append("router.start")
+    router.wait_until_ready.side_effect = lambda: events.append("router.ready")
+
+    run_helper = MagicMock()
+    run_helper.start.side_effect = lambda **_: events.append("gym.start")
+    router_config = VllmRouterConfig(enabled=True, policy="consistent_hash")
+    gym = MagicMock()
+    gym.cfg = NemoGymConfig(
+        model_name="test-model",
+        base_urls=[
+            "http://worker-0:8000/v1",
+            "http://worker-1:8001/v1",
+        ],
+        initial_global_config_dict={
+            "policy_model": {
+                "responses_api_models": {
+                    "vllm_model": {"num_workers": 4},
+                }
+            }
+        },
+        vllm_router=router_config,
+    )
+
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym._get_node_ip_local",
+            return_value="10.0.0.5",
+        ),
+        patch(
+            "nemo_rl.environments.nemo_gym._get_free_port_local",
+            side_effect=[5500, 1325, 1365],
+        ) as get_free_port,
+        patch(
+            "nemo_rl.environments.nemo_gym.VllmRouterProcess",
+            return_value=router,
+            create=True,
+        ) as router_process,
+        patch("nemo_gym.cli.RunHelper", return_value=run_helper),
+        patch("nemo_gym.cli.GlobalConfigDictParserConfig") as parser_config,
+        patch("nemo_gym.rollout_collection.RolloutCollectionHelper"),
+        patch("nemo_gym.server_utils.BaseServerConfig"),
+        patch("nemo_rl.environments.nemo_gym.ray.is_initialized", return_value=True),
+        patch(
+            "nemo_rl.environments.nemo_gym.ray.get_runtime_context",
+            return_value=MagicMock(gcs_address="10.0.0.5:1200"),
+        ),
+    ):
+        NemoGym.__ray_metadata__.modified_class._spinup(gym)
+
+    assert get_free_port.call_args_list == [
+        call(DEFAULT_GYM_PORT_RANGE_LOW, DEFAULT_GYM_PORT_RANGE_HIGH),
+        call(
+            DEFAULT_VLLM_ROUTER_PORT_RANGE_LOW,
+            DEFAULT_VLLM_ROUTER_PORT_RANGE_HIGH,
+        ),
+        call(
+            DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_LOW,
+            DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_HIGH,
+        ),
+    ]
+    router_process.assert_called_once_with(
+        worker_base_urls=gym.cfg["base_urls"],
+        host="10.0.0.5",
+        port=1325,
+        prometheus_port=1365,
+        config=router_config,
+    )
+    assert events == ["router.start", "router.ready", "gym.start"]
+
+    global_config = parser_config.call_args.kwargs["initial_global_config_dict"]
+    assert global_config["policy_base_url"] == [router.openai_base_url]
+    vllm_model_config = global_config["policy_model"]["responses_api_models"][
+        "vllm_model"
+    ]
+    assert vllm_model_config["session_affinity_header"] == "X-Session-ID"
+    assert vllm_model_config["num_workers"] == 4
+
+
+@pytest.mark.parametrize("failure_point", ["router.ready", "gym.start"])
+def test_nemo_gym_spinup_stops_vllm_router_on_failure(failure_point):
+    router = MagicMock()
+    router.openai_base_url = "http://10.0.0.5:1325/v1"
+    run_helper = MagicMock()
+    failure = RuntimeError(failure_point)
+    if failure_point == "router.ready":
+        router.wait_until_ready.side_effect = failure
+    else:
+        run_helper.start.side_effect = failure
+
+    gym = MagicMock()
+    gym.cfg = NemoGymConfig(
+        model_name="test-model",
+        base_urls=["http://worker-0:8000/v1"],
+        initial_global_config_dict={},
+        vllm_router=VllmRouterConfig(enabled=True),
+    )
+
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym._get_node_ip_local",
+            return_value="10.0.0.5",
+        ),
+        patch(
+            "nemo_rl.environments.nemo_gym._get_free_port_local",
+            side_effect=[5500, 1325, 1365],
+        ),
+        patch(
+            "nemo_rl.environments.nemo_gym.VllmRouterProcess",
+            return_value=router,
+        ),
+        patch("nemo_gym.cli.RunHelper", return_value=run_helper),
+        patch("nemo_gym.cli.GlobalConfigDictParserConfig"),
+        patch("nemo_gym.rollout_collection.RolloutCollectionHelper"),
+        patch("nemo_gym.server_utils.BaseServerConfig"),
+        patch("nemo_rl.environments.nemo_gym.ray.is_initialized", return_value=True),
+        patch(
+            "nemo_rl.environments.nemo_gym.ray.get_runtime_context",
+            return_value=MagicMock(gcs_address="10.0.0.5:1200"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match=failure_point):
+            NemoGym.__ray_metadata__.modified_class._spinup(gym)
+
+    router.stop.assert_called_once_with()
+
+
+def test_nemo_gym_shutdown_stops_vllm_router_after_gym_on_failure():
+    events = []
+    router = MagicMock()
+    router.stop.side_effect = lambda: events.append("router.stop")
+    gym = MagicMock()
+    gym._vllm_router = router
+
+    def fail_gym_shutdown():
+        events.append("gym.shutdown")
+        raise RuntimeError("gym shutdown failed")
+
+    gym.rh.shutdown.side_effect = fail_gym_shutdown
+
+    with pytest.raises(RuntimeError, match="gym shutdown failed"):
+        NemoGym.__ray_metadata__.modified_class.shutdown(gym)
+
+    assert events == ["gym.shutdown", "router.stop"]
+    assert gym._vllm_router is None
 
 
 @pytest.fixture(scope="function")

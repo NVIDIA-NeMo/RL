@@ -213,6 +213,7 @@ nvrx = [
 nemo_gym = ["nemo_gym"]
 
 [dependency-groups]
+nemo_gym_router = ["vllm-router==0.1.15"]
 
 # This is a default group so that we install these even with bare `uv sync`
 build = [
