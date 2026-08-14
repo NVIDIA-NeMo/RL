@@ -31,6 +31,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
+    AdvantageEstimator,
     AdvEstimatorConfig,
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
@@ -2179,14 +2180,15 @@ def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch
     return teacher_logprobs
 
 
-def _create_advantage_estimator(master_config: MasterConfig):
+def _create_advantage_estimator(master_config: MasterConfig) -> AdvantageEstimator:
     """Create and return an advantage estimator based on configuration.
 
     Args:
         master_config: The master configuration dictionary.
 
     Returns:
-        An advantage estimator instance (GRPO, GDPO, or ReinforcePlusPlus).
+        An advantage estimator satisfying the ``AdvantageEstimator`` contract
+        (GRPO, GDPO, OPD, or ReinforcePlusPlus).
 
     Raises:
         ValueError: If the advantage estimator name is not recognized.
