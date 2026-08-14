@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
@@ -198,6 +199,57 @@ class DraftCrossEntropyLossFn(LossFunction):
 
         loss = total / torch.clamp(denominator.float(), min=1.0)
         return loss, metrics
+
+
+BLOCK_DRAFT_LOSS_WEIGHTING_SCHEMES = ("uniform", "exp")
+
+# DFlash paper (arXiv 2602.06036) gamma_d table for the "exp" scheme, keyed by
+# block size (anchor + gamma slots, NOT gamma). Non-tabulated sizes
+# interpolate/extrapolate linearly, clamped to >= 1.
+_DFLASH_GAMMA_D_BY_BLOCK_SIZE: tuple[tuple[int, float], ...] = (
+    (8, 4.0),
+    (10, 5.0),
+    (16, 7.0),
+)
+
+
+def _dflash_gamma_d(block_size: int) -> float:
+    points = _DFLASH_GAMMA_D_BY_BLOCK_SIZE
+    if block_size <= points[0][0]:
+        (b0, g0), (b1, g1) = points[0], points[1]
+    elif block_size >= points[-1][0]:
+        (b0, g0), (b1, g1) = points[-2], points[-1]
+    else:
+        for (b0, g0), (b1, g1) in zip(points, points[1:]):
+            if b0 <= block_size <= b1:
+                break
+    gamma_d = g0 + (g1 - g0) * (block_size - b0) / (b1 - b0)
+    return max(gamma_d, 1.0)
+
+
+def resolve_block_draft_slot_weights(scheme: Optional[str], gamma: int) -> list[float]:
+    """Resolve a named block-draft slot-weighting scheme to per-slot weights.
+
+    Args:
+        scheme: ``None``/``"uniform"`` for all-ones weights, or ``"exp"`` for
+            the DFlash paper's exponentially decaying weight
+            ``w_j = exp(-j / gamma_d)``, with ``gamma_d`` tabulated by block
+            size (b8 -> 4, b10 -> 5, b16 -> 7) and interpolated in between.
+        gamma: Number of draft slots (block size minus the anchor).
+
+    Returns:
+        Weights of length ``gamma``, suitable as ``BlockDraftLossFn``
+        ``slot_weights``.
+    """
+    if scheme is None or scheme == "uniform":
+        return [1.0] * gamma
+    if scheme != "exp":
+        raise ValueError(
+            f"Unknown draft loss_weighting scheme {scheme!r}; expected null or "
+            f"one of {BLOCK_DRAFT_LOSS_WEIGHTING_SCHEMES}."
+        )
+    gamma_d = _dflash_gamma_d(gamma + 1)
+    return [math.exp(-j / gamma_d) for j in range(gamma)]
 
 
 class BlockDraftLossDataDict(TypedDict):

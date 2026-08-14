@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn.functional as F
 
-from nemo_rl.algorithms.loss.loss_functions import BlockDraftLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    BlockDraftLossFn,
+    resolve_block_draft_slot_weights,
+)
 from nemo_rl.algorithms.loss.utils import (
     block_draft_slot_mask,
     compute_block_draft_slot_valid_counts,
@@ -205,3 +209,36 @@ def test_draft_loss_wrapper_block_dispatch(mock_block_loss_cls):
     call_kwargs = block_loss_fn.call_args.kwargs
     assert torch.equal(call_kwargs["student_block_logits"], block_logits)
     assert not call_kwargs["teacher_logits"].requires_grad
+
+
+def test_resolve_block_draft_slot_weights_schemes():
+    assert resolve_block_draft_slot_weights(None, 4) == [1.0] * 4
+    assert resolve_block_draft_slot_weights("uniform", 3) == [1.0] * 3
+
+    # gamma=15 <-> block 16: paper gamma_d = 7, so w_1 = e^{-1/7}, w_14 = e^{-2}.
+    weights = resolve_block_draft_slot_weights("exp", 15)
+    assert len(weights) == 15
+    assert weights[0] == 1.0
+    assert math.isclose(weights[1], math.exp(-1 / 7))
+    assert math.isclose(weights[14], math.exp(-2))
+    assert all(a > b for a, b in zip(weights, weights[1:]))
+
+    # Tabulated block sizes: b8 -> gamma_d 4, b10 -> gamma_d 5.
+    assert math.isclose(resolve_block_draft_slot_weights("exp", 7)[1], math.exp(-1 / 4))
+    assert math.isclose(resolve_block_draft_slot_weights("exp", 9)[1], math.exp(-1 / 5))
+    # Interpolated (b9 -> 4.5) and extrapolated (b22 -> 9) block sizes.
+    assert math.isclose(
+        resolve_block_draft_slot_weights("exp", 8)[1], math.exp(-1 / 4.5)
+    )
+    assert math.isclose(
+        resolve_block_draft_slot_weights("exp", 21)[1], math.exp(-1 / 9)
+    )
+
+
+def test_resolve_block_draft_slot_weights_rejects_unknown_scheme():
+    try:
+        resolve_block_draft_slot_weights("linear", 8)
+    except ValueError as err:
+        assert "loss_weighting" in str(err)
+    else:
+        raise AssertionError("expected ValueError for unknown scheme")

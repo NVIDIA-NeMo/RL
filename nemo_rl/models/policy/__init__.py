@@ -488,9 +488,11 @@ class DraftConfig(TypedDict):
     # slots embed via the target's FROZEN embedding row at this id (official
     # DFlash contract; never trained).
     mask_token_id: NotRequired[int | None]
-    # DFlash per-slot exponential loss decay (weight_j = loss_decay^j);
-    # null/1.0 = uniform.
-    loss_decay: NotRequired[float | None]
+    # Named slot-weighting scheme for the block-draft loss: null/"uniform",
+    # or "exp" = the DFlash paper's exponentially decaying weight
+    # w_j = exp(-j / gamma_d), gamma_d tabulated by block size (b8 -> 4,
+    # b10 -> 5, b16 -> 7; interpolated otherwise).
+    loss_weighting: NotRequired[str | None]
     # DSpark Markov-head rank.
     markov_rank: NotRequired[int]
     # Trunk-attention bucketing granularity in tokens (correctness-neutral).

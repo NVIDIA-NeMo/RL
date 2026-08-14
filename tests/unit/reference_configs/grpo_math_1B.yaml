@@ -301,20 +301,6 @@ policy:
     loss_weight: 0.1
     num_layers: null
     aux_layer_indices: null
-    lr: null
-    min_lr: null
-    weight_decay: null
-    ttt_steps: 1
-    ttt_pass_weights: null
-    method: "eagle3"
-    gamma: 8
-    anchors_per_seq: 64
-    anchor_from_generation_only: true
-    mask_token_id: null
-    loss_decay: null
-    markov_rank: 64
-    trunk_chunk: 1024
-    qk_layernorm: true
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.

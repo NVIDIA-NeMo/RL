@@ -39,6 +39,7 @@ from nemo_rl.algorithms.loss import (
     SequencePackingLossWrapper,
     prepare_loss_input,
     prepare_packed_loss_input,
+    resolve_block_draft_slot_weights,
     wrap_loss_fn_with_input_preparation,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
@@ -621,11 +622,9 @@ class LossPostProcessor:
                 draft_cfg = self.cfg["draft"]
                 draft_method = draft_cfg.get("method", "eagle3")
                 if draft_method in ("dflash", "dspark"):
-                    # Per-slot weights: DFlash's exponential position decay
-                    # (uniform when loss_decay is 1.0/None).
-                    gamma = int(draft_cfg["gamma"])
-                    loss_decay = float(draft_cfg.get("loss_decay") or 1.0)
-                    draft_weights = [loss_decay**j for j in range(gamma)]
+                    draft_weights = resolve_block_draft_slot_weights(
+                        draft_cfg.get("loss_weighting"), int(draft_cfg["gamma"])
+                    )
                 else:
                     draft_weights = draft_cfg.get("ttt_pass_weights")
                 loss_fn_wrapped = DraftLossWrapper(
