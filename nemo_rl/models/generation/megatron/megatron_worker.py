@@ -684,8 +684,14 @@ class MegatronGenerationRefitMixin:
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             rank_offset: Offset for this side's ranks (`train_world_size` for inference).
-            refit_backend: Copy-service backend ("gloo", "nccl", or "nvshmem").
+            refit_backend: Copy-service backend ("gloo" or "nccl").
         """
+        if refit_backend == "nvshmem":
+            # Gated off, not removed: the copy-service path below works, but it may be deprecated.
+            raise ValueError(
+                'refit_backend="nvshmem" is currently disabled; use "nccl" or "gloo".'
+            )
+
         from torch.distributed.distributed_c10d import (
             PrefixStore,
             ProcessGroup,
