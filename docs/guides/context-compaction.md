@@ -55,7 +55,7 @@ The validated internal runtime is:
 | Container | `/lustre/fs1/portfolios/coreai/users/aroshanghias/omni-main-migration/containers/cuda-dl-base-26.03-cuda13.2-devel-ubuntu24.04.sqsh` |
 | Checkpoint | `/lustre/fs1/portfolios/coreai/users/aroshanghias/checkpoints/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` |
 | Public model ID | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` |
-| NeMo Gym submodule | `d17601d9d841a1b3f576cb4180d81ff791b29253` |
+| NeMo Gym submodule | `dbbeaa6883716ba4e80f042c80c4774a5042ea37` |
 | W&B project | `nvidia/nemo-rl-context-compaction` |
 
 Use writable cache and venv directories belonging to your user. Do not share
@@ -102,6 +102,26 @@ benchmark. `Stable251` contains 251 training tasks that do not require a proxy
 and have a low likelihood of environment changes. It is paired with a
 non-overlapping 71-task held-out split that excludes tasks with a high
 likelihood of environment changes.
+
+### Validation evidence
+
+All checkpoints in this Tiny32 sweep were trained with
+`OSWORLD_MAX_STEPS=15`. `T15` and `T30` below refer only to the maximum
+trajectory length used during independent evaluation; there was no separate
+T30 training run.
+
+| T15-trained checkpoint | T15 evaluation | T30 evaluation |
+|---|---:|---:|
+| Base model | 59.38% | 65.62% |
+| Step 5 | 59.38% | 68.75% |
+| Step 10 | 62.50% | 75.00% |
+| Step 15 | 68.75% | 81.25% |
+
+Equivalently, the checkpoint progression is `59.38 → 59.38 → 62.50 → 68.75`
+under T15 evaluation and `65.62 → 68.75 → 75.00 → 81.25` under T30
+evaluation. This is a fixed-seed development sweep intended to demonstrate an
+end-to-end learning signal, not a generalization benchmark or confidence
+interval. Stable251 training and held-out evaluation are still in progress.
 
 ### Configure and submit training
 
