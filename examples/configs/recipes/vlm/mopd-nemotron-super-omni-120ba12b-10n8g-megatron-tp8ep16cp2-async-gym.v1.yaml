@@ -56,7 +56,6 @@ on_policy_distillation:
   enabled: true
   teacher_model_by_agent_name:
     circle_count_simple_agent: ${policy.model_name}
-  default_teacher_alias: circle_count_simple_agent
   strict_agent_name_match: true
   deduplicate_shared_teacher_checkpoints: true
   non_colocated_teachers:
