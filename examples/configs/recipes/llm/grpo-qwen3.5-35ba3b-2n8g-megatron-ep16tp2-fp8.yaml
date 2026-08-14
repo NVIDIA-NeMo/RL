@@ -1,6 +1,6 @@
 defaults: grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16-fp8
+  checkpoint_dir: results/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8
 loss_fn:
   use_importance_sampling_correction: true
   truncated_importance_sampling_type: tis
@@ -36,4 +36,4 @@ policy:
         VLLM_USE_RAY_V2_EXECUTOR_BACKEND: '0'
 logger:
   wandb:
-    name: grpo-qwen3.5-35ba3b-2n8g-megatron-ep16-fp8
+    name: grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8
