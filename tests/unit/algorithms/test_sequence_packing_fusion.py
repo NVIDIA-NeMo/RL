@@ -40,7 +40,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 def test_prepare_packed_loss_input_excludes_filtered_neg_inf_logprobs(monkeypatch):
-    """The fused caller must persist the narrowed mask used by the actor loss."""
+    """The fused caller must publish the narrowed mask used by the actor loss."""
     data = BatchedDataDict(
         {
             "input_ids": torch.tensor([[0, 1, 2, 3]]),
@@ -67,7 +67,10 @@ def test_prepare_packed_loss_input_excludes_filtered_neg_inf_logprobs(monkeypatc
     )
 
     assert loss_input["next_token_logprobs"].tolist() == [[-0.5, 0.0, -1.5]]
-    assert updated_data["token_mask"].tolist() == [[1.0, 1.0, 0.0, 1.0]]
+    assert updated_data["curr_logprobs_keep_mask"].tolist() == [[1.0, 0.0, 1.0]]
+    # ``token_mask`` stays intact: it also reduces the reference-policy KL,
+    # which reads the unfiltered logprobs and is finite at this position.
+    assert updated_data["token_mask"].tolist() == [[1.0, 1.0, 1.0, 1.0]]
 
 
 def _setup_2d_process_groups(rank, world_size, cp_size, tp_size):

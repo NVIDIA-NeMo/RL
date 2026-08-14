@@ -101,13 +101,11 @@ def prepare_loss_input(
             logprobs, keep = mask_out_neg_inf_logprobs(
                 logprobs, mask[:, 1:], "curr_logprobs"
             )
-            # Fold the -inf positions into ``token_mask`` so the loss excludes
-            # them. The loss re-derives its reduction mask from ``data``
-            # (loss_functions.py, ``mask = token_mask * sample_mask``), so
-            # narrowing the local ``mask`` above would have no effect.
-            token_mask = data["token_mask"].clone()
-            token_mask[:, 1:] = token_mask[:, 1:] * keep
-            data["token_mask"] = token_mask
+            # Publish the narrowing instead of folding it into ``token_mask``:
+            # the actor term must drop these positions, but the
+            # reference-policy KL reduces with ``token_mask`` and is computed
+            # from ``curr_logprobs_unfiltered``, which is finite here.
+            data["curr_logprobs_keep_mask"] = keep
 
             # compute unfiltered logprobs for reference policy KL penalty
             if (
@@ -371,11 +369,11 @@ def prepare_packed_loss_input(
         logprobs, keep = mask_out_neg_inf_logprobs(
             logprobs, mask[:, 1:], "curr_logprobs"
         )
-        # See the note in ``prepare_loss_input``: the loss re-derives its
-        # reduction mask from ``data``, so the narrowing has to land there.
-        token_mask = data["token_mask"].clone()
-        token_mask[:, 1:] = token_mask[:, 1:] * keep
-        data["token_mask"] = token_mask
+        # Publish the narrowing instead of folding it into ``token_mask``:
+        # the actor term must drop these positions, but the
+        # reference-policy KL reduces with ``token_mask`` and is computed
+        # from ``curr_logprobs_unfiltered``, which is finite here.
+        data["curr_logprobs_keep_mask"] = keep
 
         if (
             hasattr(loss_fn, "reference_policy_kl_penalty")

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import math
 
 import pytest
 import torch
@@ -69,7 +70,65 @@ def test_prepare_loss_input_excludes_filtered_neg_inf_logprobs(monkeypatch):
     )
 
     assert loss_input["next_token_logprobs"].tolist() == [[-0.5, 0.0, -1.5]]
-    assert updated_data["token_mask"].tolist() == [[1.0, 1.0, 0.0, 1.0]]
+    assert updated_data["curr_logprobs_keep_mask"].tolist() == [[1.0, 0.0, 1.0]]
+    # token_mask must not be narrowed: the reference-policy KL reduces with it
+    # and is computed from unfiltered logprobs, which are finite here.
+    assert updated_data["token_mask"].tolist() == [[1.0, 1.0, 1.0, 1.0]]
+
+
+def test_filtered_positions_leave_the_actor_term_but_not_the_kl():
+    """Dropping a filtered position must not weaken the reference-policy KL.
+
+    The substituted 0.0 only corrupts the actor term. ``curr_logprobs_unfiltered``
+    is finite at the same position, so the KL there is real -- and it is exactly
+    where the policies disagree most, since the token was filtered for having
+    near-zero probability under the training policy. Narrowing the KL reduction
+    would systematically remove its largest contributions.
+    """
+    batch, seq = 1, 4
+
+    def make_data(keep_mask):
+        data = BatchedDataDict(
+            {
+                "token_mask": torch.ones(batch, seq),
+                "sample_mask": torch.ones(batch),
+                "advantages": torch.full((batch, seq), 0.5),
+                "prev_logprobs": torch.full((batch, seq), -1.0),
+                "generation_logprobs": torch.full((batch, seq), -1.0),
+                "reference_policy_logprobs": torch.full((batch, seq), -2.0),
+                # large divergence at the position the training policy filtered
+                "curr_logprobs_unfiltered": torch.tensor([[-0.5, -0.6, -3.0]]),
+            }
+        )
+        if keep_mask is not None:
+            data["curr_logprobs_keep_mask"] = keep_mask
+        return data
+
+    curr_logprobs = torch.tensor([[-0.5, -0.6, 0.0]])  # third is the substitute
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.5))
+    global_valid_toks = torch.tensor(3.0)
+    global_valid_seqs = torch.tensor(1.0)
+
+    keep = torch.tensor([[1.0, 1.0, 0.0]])
+    loss_all, metrics_all = loss_fn(
+        curr_logprobs, make_data(None), global_valid_seqs, global_valid_toks
+    )
+    loss_kept, metrics_kept = loss_fn(
+        curr_logprobs, make_data(keep), global_valid_seqs, global_valid_toks
+    )
+
+    assert metrics_kept["kl_penalty"] == pytest.approx(metrics_all["kl_penalty"]), (
+        "the keep mask must not reach the KL reduction"
+    )
+    assert metrics_kept["token_mult_prob_error"] == pytest.approx(
+        metrics_all["token_mult_prob_error"]
+    ), "mismatch diagnostics read prev/generation logprobs and stay un-narrowed"
+
+    # The actor side must move: the substituted logprob fabricates a ratio of
+    # exp(0.0 - (-1.0)) = e at the filtered position.
+    assert metrics_all["probs_ratio_max"] == pytest.approx(math.e)
+    assert metrics_kept["probs_ratio_max"] < metrics_all["probs_ratio_max"]
+    assert loss_kept.item() != pytest.approx(loss_all.item())
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
