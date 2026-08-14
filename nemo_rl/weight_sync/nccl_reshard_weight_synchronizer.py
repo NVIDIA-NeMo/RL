@@ -45,6 +45,9 @@ import ray
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.membership import RefitMembership, desired_membership
+from nemo_rl.weight_sync.nccl_reshard_utils import (
+    make_nccl_reshard_refit_info_wire_safe,
+)
 
 
 class NcclReshardWeightSynchronizer(WeightSynchronizer):
@@ -246,7 +249,16 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             train_world_size,
             inference_world_size,
         )
-        self._generation.prepare_nccl_reshard_refit_info(nccl_reshard_refit_info)
+
+        # nccl_reshard_refit_info holds MeshInfo rank tensors created under
+        # Megatron, whose pickles resolve a Megatron-patched storage loader and
+        # therefore need `import megatron` on unpickle. Convert them to plain
+        # lists here; the vLLM worker rebuilds them in
+        # `restore_refit_info_placements()`.
+        wire_refit_info = make_nccl_reshard_refit_info_wire_safe(
+            nccl_reshard_refit_info
+        )
+        self._generation.prepare_nccl_reshard_refit_info(wire_refit_info)
         self._built_membership = membership
 
     def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
@@ -300,4 +312,8 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
     def shutdown(self) -> None:
         # The NCCL process groups' lifecycle is managed by Ray actor teardown;
         # the workers that own the groups are destroyed with the cluster.
-        pass
+        # Break the VllmGeneration <-> synchronizer reference cycle so the
+        # generation wrapper is garbage-collectable after teardown. The
+        # synchronizer is never used again after shutdown(), so losing the
+        # handle is safe.
+        self._generation = None
