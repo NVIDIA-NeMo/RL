@@ -141,19 +141,22 @@ class HFVerifyWorker:
                         )
 
                 score = float(ret_score)
-                if return_extracted_answer:
-                    extracted = _select_extracted_answer(
-                        extracted_answer, math_verify_impl
-                    )
 
             # It's possible to emit a TimeoutException and that wouldn't be caught since
             # it actually subclasses from BaseException and math-verify itself does not
             # to catch it.
             except (Exception, TimeoutException):
-                score, extracted = 0.0, None
+                score = 0.0
+            else:
+                # Outside the try on purpose: failing to record an answer must
+                # not retract a score the verifier already returned.
+                if return_extracted_answer:
+                    extracted = _select_extracted_answer(
+                        extracted_answer, math_verify_impl
+                    )
 
-            # Exactly one score and one answer per sample, on every path: the
-            # scores are consumed positionally against the batch downstream.
+            # Exactly one score and one answer per sample, on every path: both
+            # are consumed positionally against the batch downstream.
             results.append(score)
             if return_extracted_answer:
                 extracted_answers.append(extracted)

@@ -540,3 +540,32 @@ def test_math_env_extracted_answers_stay_aligned_with_rewards(math_env):
     assert result.answers[2] == "137", (
         "the first prediction, not its first character"
     )
+
+
+@pytest.mark.parametrize(
+    "extracted_answer,impl,expected",
+    [
+        # Nothing parsed at all -- math-verify returns an empty prediction list.
+        ((["42"], []), "hf_math_verify", None),
+        # A wrong but parseable answer: the prediction, not its first character.
+        ((["42"], ["137"]), "hf_math_verify", "137"),
+        # A match anywhere in the list wins.
+        ((["42"], ["7", "42"]), "hf_math_verify", "42"),
+        # Shapes the hf branch can hand back when its sympy conversion gives up.
+        (None, "hf_math_verify", None),
+        (("only-one-element",), "hf_math_verify", None),
+        # The dapo branch returns a plain normalized string, not a pair.
+        ("137", "dapo_math_verify", "137"),
+        (None, "dapo_math_verify", None),
+    ],
+)
+def test_select_extracted_answer_never_raises(extracted_answer, impl, expected):
+    """The whole fix rests on this helper not raising.
+
+    The caller commits the sample's score before asking for its answer, so an
+    exception here would either retract a score the verifier already returned
+    or desynchronize the results list from the batch.
+    """
+    from nemo_rl.environments.math_environment import _select_extracted_answer
+
+    assert _select_extracted_answer(extracted_answer, impl) == expected
