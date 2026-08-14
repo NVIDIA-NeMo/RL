@@ -78,6 +78,18 @@ Generation = Union[VllmGeneration, SGLangGeneration]
 # Generous: a healthy step can wait several minutes on generation alone.
 _SELECT_STALL_WARN_SECONDS = 600.0
 
+# Deadline on a single rollout attempt. Nothing below SC bounds one: Gym retries
+# its own server-to-server hops in an uncapped loop and builds its client
+# session with an unset ClientTimeout, so a wedged environment server never
+# raises and the await simply never returns. Under a sampler that stamps
+# batches, one such hang wedges both pumps for the rest of the run: the slot is
+# reserved with a target_step that never becomes ready, and with no exception
+# fired nothing ever credits the shortfall that would let the step close short.
+# On this recipe per-prompt rollouts run ~251 s median (p25 227, p75 275, max
+# 345 over 44 steps) with a coarse tail proxy near 1166 s, so 1800 s is ~7x the
+# median and ~1.5x the worst tail: only a hang can reach it.
+_ROLLOUT_HANG_TIMEOUT_SECONDS = 1800.0
+
 # Cadence of the step-independent telemetry report. Deliberately coarser than
 # ``vllm_metrics_logger_interval``: the workers keep sampling at that interval
 # regardless, so a slower poll still summarizes every sample while keeping the
@@ -330,10 +342,12 @@ class SingleControllerActor:
         AsyncTrajectoryCollector, so the two stacks retry the same fault the
         same way and their throughput stays comparable.
 
-        Returns False only when every attempt failed. That leaves the prompt's
-        batch one group short, which a sampler matching batches to steps exactly
-        cannot close on its own, so the shortfall is recorded here for the train
-        pump to subtract from its target.
+        Returns False when every attempt failed, and on the first attempt to
+        exceed ``_ROLLOUT_HANG_TIMEOUT_SECONDS``, which is not retried at all.
+        Either way that leaves the prompt's batch one group short, which a
+        sampler matching batches to steps exactly cannot close on its own, so
+        the shortfall is recorded here for the train pump to subtract from its
+        target.
 
         Raises only when prompts keep failing back to back, which means the
         environment servers or the generation backend are down rather than one
@@ -349,61 +363,86 @@ class SingleControllerActor:
                     * (2 ** (attempt - 2))
                 )
             try:
-                rollout_metrics = await self._rollout_manager.generate_and_push(
-                    prompt, target_step=target_step
+                rollout_metrics = await asyncio.wait_for(
+                    self._rollout_manager.generate_and_push(
+                        prompt, target_step=target_step
+                    ),
+                    timeout=_ROLLOUT_HANG_TIMEOUT_SECONDS,
                 )
             except asyncio.CancelledError:
                 # Cancellation is how the TaskGroup and weight sync stop us.
                 # Retrying it would defeat both.
                 raise
+            except asyncio.TimeoutError as timeout_error:
+                # Must precede ``except Exception``: from 3.11 on this is the
+                # builtin TimeoutError, so the generic branch would otherwise
+                # swallow the deadline and spend the remaining attempts on it.
+                error: Exception = timeout_error
+                # A rollout that ran this long is wedged rather than slow, and a
+                # replay would only re-enter the same server for another full
+                # deadline, so go straight to the drop path below.
+                retryable = False
             except Exception as e:
-                name = type(e).__name__
-                self._rollout_failure_counts[name] += 1
-                if attempt < attempts:
-                    next_delay = self._async_cfg.rollout_retry_backoff_base_seconds * (
-                        2 ** (attempt - 1)
-                    )
-                    print(
-                        f"rollout_pump: prompt failed with {name}: {e} — "
-                        f"retrying ({attempt}/{attempts - 1}) in "
-                        f"{next_delay:.1f}s",
-                        flush=True,
-                    )
-                    continue
-
-                self._dropped_rollouts += 1
-                self._consecutive_rollout_failures += 1
-                # Only a sampler that stamps batches has a step to shorten;
-                # windowed selection backfills from whatever else is ready.
-                shortfall_note = ""
-                if target_step is not None:
-                    self._batch_shortfall[target_step] += 1
-                    shortfall_note = (
-                        f"; step {target_step} now expects "
-                        f"{self._batch_shortfall[target_step]} fewer group(s)"
-                    )
-                print(
-                    f"rollout_pump: dropping prompt after {attempts} attempt(s), "
-                    f"last error {name}: {e} "
-                    f"(dropped {self._dropped_rollouts} total, "
-                    f"{self._consecutive_rollout_failures} in a row"
-                    f"{shortfall_note})",
-                    flush=True,
-                )
-                if (
-                    self._consecutive_rollout_failures
-                    > self._async_cfg.max_consecutive_rollout_failures
-                ):
-                    raise RuntimeError(
-                        f"{self._consecutive_rollout_failures} consecutive rollouts "
-                        f"failed; giving up. Failures by type: "
-                        f"{dict(self._rollout_failure_counts)}"
-                    ) from e
-                return False
+                error = e
+                retryable = True
             else:
                 self._rollout_timing.add(rollout_metrics)
                 self._consecutive_rollout_failures = 0
                 return True
+
+            name = type(error).__name__
+            self._rollout_failure_counts[name] += 1
+            if not retryable:
+                print(
+                    f"rollout_pump: rollout exceeded "
+                    f"{_ROLLOUT_HANG_TIMEOUT_SECONDS:.0f}s on attempt "
+                    f"{attempt}/{attempts} (prompt idx={prompt.get('idx')}, "
+                    f"task={prompt.get('task_name')}, "
+                    f"target_step={target_step}) — treating it as a hung "
+                    f"environment server and not retrying",
+                    flush=True,
+                )
+            if retryable and attempt < attempts:
+                next_delay = self._async_cfg.rollout_retry_backoff_base_seconds * (
+                    2 ** (attempt - 1)
+                )
+                print(
+                    f"rollout_pump: prompt failed with {name}: {error} — "
+                    f"retrying ({attempt}/{attempts - 1}) in "
+                    f"{next_delay:.1f}s",
+                    flush=True,
+                )
+                continue
+
+            self._dropped_rollouts += 1
+            self._consecutive_rollout_failures += 1
+            # Only a sampler that stamps batches has a step to shorten;
+            # windowed selection backfills from whatever else is ready.
+            shortfall_note = ""
+            if target_step is not None:
+                self._batch_shortfall[target_step] += 1
+                shortfall_note = (
+                    f"; step {target_step} now expects "
+                    f"{self._batch_shortfall[target_step]} fewer group(s)"
+                )
+            print(
+                f"rollout_pump: dropping prompt after {attempt} attempt(s), "
+                f"last error {name}: {error} "
+                f"(dropped {self._dropped_rollouts} total, "
+                f"{self._consecutive_rollout_failures} in a row"
+                f"{shortfall_note})",
+                flush=True,
+            )
+            if (
+                self._consecutive_rollout_failures
+                > self._async_cfg.max_consecutive_rollout_failures
+            ):
+                raise RuntimeError(
+                    f"{self._consecutive_rollout_failures} consecutive rollouts "
+                    f"failed; giving up. Failures by type: "
+                    f"{dict(self._rollout_failure_counts)}"
+                ) from error
+            return False
 
         raise AssertionError("unreachable: the loop always returns or raises")
 
