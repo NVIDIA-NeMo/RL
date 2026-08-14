@@ -210,6 +210,34 @@ def test_compute_teacher_logprobs_dp_padding_repeats_multimodal_row():
     assert result.shape == (1, 8)
 
 
+def test_compute_teacher_logprobs_mixed_media_and_text_rows_per_teacher():
+    """Mixed image and text-only rows in one group keep the empty rows aligned."""
+    twg = _RecordingTeacherWorkerGroup(fill_value=4.0, dp_size=1)
+    collector = _make_collector(
+        teacher_worker_groups={"mixed": twg},
+        alias_to_group_alias={"mixed_agent": "mixed"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"mixed_agent": "/ckpt/mixed"},
+        },
+        _has_distillation_teachers=True,
+    )
+
+    result, _ = collector._compute_teacher_logprobs(
+        torch.randint(0, 100, (3, 8)),
+        [{"name": "mixed_agent"}] * 3,
+        multimodal_data={
+            "pixel_values": _row_marked_packed_tensor([5, None, 6]),
+            "imgs_sizes": _row_marked_packed_tensor([15, None, 16]),
+        },
+    )
+
+    assert twg.received is not None
+    # The text-only row keeps its slot so media rows stay paired with token rows.
+    assert _received_row_markers(twg.received["pixel_values"]) == [5.0, None, 6.0]
+    assert _received_row_markers(twg.received["imgs_sizes"]) == [15.0, None, 16.0]
+    assert result.shape == (3, 8)
+
+
 def test_compute_teacher_logprobs_routes_to_correct_teacher():
     """Samples are routed to the right teacher and results stitched back."""
     math_twg = _MockTeacherWorkerGroup(fill_value=1.0, dp_size=1)
