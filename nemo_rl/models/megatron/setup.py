@@ -1099,9 +1099,7 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 config["megatron_cfg"]["inference_cuda_graph_scope"]
             ]
     if "cuda_graph_modules" in config["megatron_cfg"]:
-        set_cuda_graph_modules(
-            model_cfg, config["megatron_cfg"]["cuda_graph_modules"]
-        )
+        set_cuda_graph_modules(model_cfg, config["megatron_cfg"]["cuda_graph_modules"])
     if "cuda_graph_warmup_steps" in config["megatron_cfg"]:
         model_cfg.cuda_graph_warmup_steps = config["megatron_cfg"][
             "cuda_graph_warmup_steps"
