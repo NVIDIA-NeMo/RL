@@ -84,6 +84,24 @@ These are set on spans for filtering — they answer "which one?" / "what kind?"
 | `rl.step` | step index |
 | `rl.num_generations_per_prompt` | GRPO group size |
 | `rl.backend` | generation backend (e.g. `"vllm"`) |
+| `rl.bucket` | goodput bucket: `productive` / `overhead` / `idle` / `wasted` (omit on umbrellas) |
+
+### Span group → `rl.bucket`
+
+Leaf groups are tagged automatically when using
+`nemo_rl.telemetry.instrumentation.managed_span` / `trace_fn`. Umbrellas are
+timed but **not** tagged so monitors can exclude them from goodput.
+
+| Group | `rl.bucket` |
+|---|---|
+| `job`, `step`, `rollout`, `model_init`, `evaluate` | *(none — umbrella)* |
+| `generation`, `reward`, `policy_update`, `forward_backward`, `optimizer` | `productive` |
+| `data_processing`, `checkpoint`, `load_checkpoint`, `logprob`, `advantage`, `reference_policy` | `overhead` |
+
+Async efficiency categories (`idle/*`, `wasted/failed_trajectory`) map to
+`idle` / `wasted` when emitted as phase metrics — see
+`nemo_rl/telemetry/instrumentation.py`. Rolled-up `rl.goodput` is **monitor-derived**,
+not emitted by NeMo-RL.
 
 ## Resource attributes (process tags)
 

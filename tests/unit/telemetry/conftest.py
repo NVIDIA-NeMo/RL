@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Fixtures for NeMo-RL telemetry unit tests.
 
 Resets global OpenTelemetry providers, the nemo-lens init guard, span-group

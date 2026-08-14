@@ -62,10 +62,23 @@ The one rule that trips people up. Classify each value before you emit it:
 | Kind | Use | Example |
 |---|---|---|
 | **Metric** | numerical value that changes over time | reward, loss, KL, grad norm, throughput → `rl.*` |
-| **Span tag** | categorical per-span context for filtering | `rl.iteration`, `rl.backend`, `rl.num_generations_per_prompt` |
+| **Span tag** | categorical per-span context for filtering | `rl.iteration`, `rl.backend`, `rl.bucket`, `rl.num_generations_per_prompt` |
 | **Resource attribute** | stable for the whole run | `rl.algorithm`, `rl.model`, `dl.tensor_parallel.size` |
 
 Do **not** put a time-series number (loss, reward) on a span attribute — it produces no useful series in your backend and wastes storage. Do **not** put a per-step categorical (iteration number) on a metric label — that is unbounded cardinality. See [lens: metrics — metric vs span attribute vs resource attribute](https://github.com/NVIDIA-NeMo/Lens).
+
+### Goodput (monitor-derived)
+
+NeMo-RL does **not** emit `rl.goodput` or `rl.bucket.*` rollup metrics.
+Leaf spans carry `rl.bucket` ∈ `{productive, overhead, idle, wasted}`;
+umbrella spans (`job` / `step` / `rollout`) omit it. Offline monitors
+(e.g. wandb-monitor) SUM span / phase GPU-time by `rl.bucket` and compute:
+
+```text
+rl_goodput = productive_gpu_s / (productive + overhead + idle + wasted)_gpu_s
+```
+
+See [Span groups — goodput buckets](span-groups.md) and `nemo_rl/telemetry/instrumentation.py`.
 
 Metric names use the **application scope** (`rl.*`); attribute names use the **shared namespace** (`rl.*`, `dl.*`) defined in lens's `semconv.py`.
 

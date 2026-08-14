@@ -8,15 +8,41 @@ If you work in this repo with Claude Code, the `add-span-group` skill (new span 
 
 ## The import / fallback pattern
 
-Every lens import in NeMo-RL code must go through `nemo_rl.telemetry._fallbacks`, so the code runs unchanged when nemo-lens is not installed:
+Every algorithm instrumentation import should go through
+`nemo_rl.telemetry.instrumentation` so leaf spans get the
+``rl.bucket`` attribute automatically. That module wraps the no-op-safe
+fallbacks in `_fallbacks.py` (which re-exports nemo-lens when installed):
 
 ```python
-from nemo_rl.telemetry._fallbacks import managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
 from nemo_rl.telemetry.setup import get_telemetry
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 ```
 
-`_fallbacks.py` re-exports the real nemo-lens implementations when it is installed, and provides identical no-op stubs when it is not. Never import from `nemo.lens.*` directly in algorithm code. See [lens: optional dependency](https://github.com/NVIDIA-NeMo/Lens).
+Never import from `nemo.lens.*` directly in algorithm code. See [lens: optional dependency](https://github.com/NVIDIA-NeMo/Lens).
+
+### Goodput tagging
+
+`managed_span` / `trace_fn` from `instrumentation` attach ``rl.bucket`` ∈
+``{productive, overhead, idle, wasted}`` for leaf groups (see
+`nemo_rl/telemetry/instrumentation.py`). Umbrella groups (`job`, `step`, `rollout`,
+…) are **not** tagged. Apps do **not** emit rolled-up ``rl.goodput`` /
+``rl.bucket.*`` metrics — the offline monitor SUMs tagged phase / span
+durations by bucket.
+
+To override classification for one site, pass the attribute explicitly:
+
+```python
+with managed_span(
+    RLSpanGroup.GENERATION,
+    "rl.vllm.generate",
+    **{"rl.bucket": "productive"},
+):
+    ...
+```
+
+When adding a **new** span group, update `_DEFAULT_GROUP_BUCKET` /
+`UMBRELLA_GROUPS` in `instrumentation.py` and extend `test_instrumentation.py`.
 
 ## Adding a span
 

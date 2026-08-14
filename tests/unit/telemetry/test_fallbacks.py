@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests that the fallback shims are pure no-ops when nemo-lens is absent.
 
 Each test forces the ``except ImportError`` branch of ``_fallbacks`` by blocking

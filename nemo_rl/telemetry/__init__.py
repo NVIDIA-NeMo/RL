@@ -26,12 +26,13 @@ Public surface:
 
 The instrumentation primitives (``managed_span`` / ``trace_fn`` / ``span_cm`` /
 ``is_span_group_enabled`` / ``safe_set_span_attributes``) come from
-:mod:`nemo_rl.telemetry._fallbacks`, which re-exports the real nemo-lens
-implementations when it is installed and no-op stubs when it is not. Importing
-this package never requires nemo-lens.
+:mod:`nemo_rl.telemetry.instrumentation` (``rl.bucket`` efficiency tagging) which
+wraps :mod:`nemo_rl.telemetry._fallbacks`. Importing this package never requires
+nemo-lens.
 """
 
 from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.instrumentation import Bucket, bucket_for_span_group
 from nemo_rl.telemetry.setup import (
     get_telemetry,
     init_telemetry_driver,
@@ -43,6 +44,8 @@ from nemo_rl.telemetry.span_groups import RLSpanGroup
 __all__ = [
     "TelemetryConfig",
     "RLSpanGroup",
+    "Bucket",
+    "bucket_for_span_group",
     "get_telemetry",
     "init_telemetry_driver",
     "init_telemetry_worker",
