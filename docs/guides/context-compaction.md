@@ -8,23 +8,27 @@ recent `N` image groups. Text and reasoning history remain present.
 
 This feature is work in progress. It has been validated with a deterministic
 multimodal test agent, including 100-turn generation and synchronous and
-asynchronous GRPO training, but still needs smoke testing with a real
-computer-use environment.
+asynchronous GRPO training, and with OSWorld running real Ubuntu desktop VMs
+through the Cell 2 OpenSandbox SDK.
 
 ## Code and validated runtime
 
-The internally shared branches are:
+The public draft PRs are:
 
-- NeMo RL: [`aroshanghias/context-compaction-v2-clean`](https://gitlab-master.nvidia.com/aroshanghias/nemo-rl/-/tree/aroshanghias/context-compaction-v2-clean)
-- NeMo Gym: [`aroshanghias/context-compaction-v2-clean-gym`](https://gitlab-master.nvidia.com/aroshanghias/Gym/-/tree/aroshanghias/context-compaction-v2-clean-gym)
+- NeMo RL: [NVIDIA-NeMo/RL#3642](https://github.com/NVIDIA-NeMo/RL/pull/3642)
+- NeMo Gym: [NVIDIA-NeMo/Gym#2555](https://github.com/NVIDIA-NeMo/Gym/pull/2555)
 
-The NeMo RL branch pins the required Gym commit as a submodule. Clone and
-initialize it with:
+The generic Context Compaction implementation is Ali Roshan Ghias's work. The
+OSWorld integration validates it in a real computer-use environment and does
+not claim Context Compaction itself as a new contribution.
+
+The NeMo RL draft pins the matching Gym draft as a submodule. Check out and
+initialize the publication branch with:
 
 ```bash
-git clone https://gitlab-master.nvidia.com/aroshanghias/nemo-rl.git
-cd nemo-rl
-git checkout aroshanghias/context-compaction-v2-clean
+git clone https://github.com/jinglinglingling/RL.git nemo-rl-osworld
+cd nemo-rl-osworld
+git checkout feature/osworld-grpo-training-eval-signed
 git submodule sync --recursive
 git submodule update --init --recursive
 ```
@@ -38,13 +42,129 @@ The validated internal runtime is:
 | Container | `/lustre/fs1/portfolios/coreai/users/aroshanghias/omni-main-migration/containers/cuda-dl-base-26.03-cuda13.2-devel-ubuntu24.04.sqsh` |
 | Checkpoint | `/lustre/fs1/portfolios/coreai/users/aroshanghias/checkpoints/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` |
 | Public model ID | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` |
-| NeMo Gym submodule | `f881d8fc3897f0e42c10fd80298430f43c509c67` |
+| NeMo Gym submodule | `af90075402df7027ad50bffee3bf11f469ec3bf0` |
 | W&B project | `nvidia/nemo-rl-context-compaction` |
 
 Use writable cache and venv directories belonging to your user. Do not share
 another run's mutable venv directory.
 
-## Configuration
+## Run OSWorld GRPO
+
+The main entry points are:
+
+| Purpose | File |
+|---|---|
+| Training entry point | `examples/nemo_gym/run_grpo_nemo_gym.py` |
+| OSWorld GRPO recipe | `examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_cc.yaml` |
+| Convert an OSWorld JSONL | `examples/nemo_gym/prepare_osworld_context_compaction_data.py` |
+| Build the Stable251 split | `examples/nemo_gym/prepare_osworld_stable_cc_split.py` |
+| Independent checkpoint evaluation | `examples/nemo_gym/submit_osworld_cc_eval.sh` |
+| Gym OSWorld agent config | `3rdparty/Gym-workspace/Gym/responses_api_agents/nemotron_osworld/configs/nemotron_osworld_cc.yaml` |
+| Gym OSWorld environment config | `3rdparty/Gym-workspace/Gym/resources_servers/osworld/configs/osworld.yaml` |
+| Cell 2 OpenSandbox config | `3rdparty/Gym-workspace/Gym/resources_servers/osworld/configs/opensandbox_osworld.yaml` |
+
+### Prepare data
+
+To convert any NeMo Gym OSWorld task manifest:
+
+```bash
+python examples/nemo_gym/prepare_osworld_context_compaction_data.py \
+  --input <osworld-tasks.jsonl> \
+  --output <osworld-cc.jsonl> \
+  --num-repeats 1
+```
+
+For the larger stability-filtered split:
+
+```bash
+python examples/nemo_gym/prepare_osworld_stable_cc_split.py \
+  --train-input <osworld-train-tasks.jsonl> \
+  --eval-input <osworld-eval-tasks.jsonl> \
+  --output-dir <stable251-output>
+```
+
+`Tiny32` is a fixed 32-task development subset used for inexpensive
+end-to-end debugging and learning-signal checks. It is not a generalization
+benchmark. `Stable251` contains 251 training tasks that do not require a proxy
+and have a low likelihood of environment changes. It is paired with a
+non-overlapping 71-task held-out split that excludes tasks with a high
+likelihood of environment changes.
+
+### Configure and submit training
+
+The recipe is configured through environment variables so the same file can be
+used for a smoke test or a larger run:
+
+```bash
+export OPENSANDBOX_DOMAIN=<cell-2-opensandbox-domain>
+export OPENSANDBOX_API_KEY=<cell-2-opensandbox-api-key>
+export OSWORLD_POOL_REF=osworld-kvm
+
+export NANO_OMNI_MODEL_NAME=<path-to-Nemotron-3-Nano-Omni-checkpoint>
+export OSWORLD_GRPO_TRAIN_DATA=<train.jsonl>
+export OSWORLD_GRPO_VAL_DATA=<heldout.jsonl>
+export OSWORLD_RESULTS_DIR=<results-directory>
+export CHECKPOINT_DIR=${OSWORLD_RESULTS_DIR}/checkpoints
+export NEMO_GYM_EXTRA_ROOTS=${PWD}/3rdparty/Gym-workspace/Gym
+export HF_HOME=${OSWORLD_RESULTS_DIR}/hf-home
+
+export NUM_NODES=2
+export OSWORLD_MAX_STEPS=15
+export OSWORLD_MAX_MODEL_LEN=16384
+export OSWORLD_NUM_PROMPTS_PER_STEP=8
+export OSWORLD_NUM_GENERATIONS=8
+export OSWORLD_NEMO_GYM_NUM_WORKERS=64
+export OSWORLD_MAX_PARALLEL_ROLLOUTS=64
+export OSWORLD_CC_MAX_TOTAL_TOKENS=16384
+export GRPO_MAX_NUM_STEPS=32
+export CHECKPOINTING_ENABLED=true
+export WANDB_ENABLED=true
+
+export CONTAINER=<path-to-pyxis-container.sqsh>
+export MOUNTS=/lustre:/lustre
+export BASE_LOG_DIR=${OSWORLD_RESULTS_DIR}/slurm
+mkdir -p "${BASE_LOG_DIR}"
+
+export COMMAND="cd ${PWD} && uv run --locked \
+  examples/nemo_gym/run_grpo_nemo_gym.py \
+  --config examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_cc.yaml"
+
+sbatch --parsable \
+  --nodes="${NUM_NODES}" --gres=gpu:8 \
+  --account=<slurm-account> --partition=batch --time=04:00:00 \
+  --job-name=osworld-grpo \
+  --output="${BASE_LOG_DIR}/slurm-%j.out" \
+  --export=ALL \
+  ray.sub
+```
+
+Start with fewer workers and a short `OSWORLD_MAX_STEPS` when validating a new
+OpenSandbox deployment. `OSWORLD_CC_KEEP_LAST_IMAGE_GROUPS` controls `N`, and
+`OSWORLD_CC_ACTIONS_PER_CHUNK` controls `K`.
+
+### Evaluate a checkpoint independently
+
+The evaluation wrapper runs the same OSWorld environment with optimizer steps
+disabled:
+
+```bash
+export EVAL_NAME=step-32
+export EVAL_CHECKPOINT_PATH=<checkpoint-directory>
+export OSWORLD_GRPO_VAL_DATA=<heldout.jsonl>
+export EVAL_MAX_STEPS=15
+export EVAL_NUM_WORKERS=32
+export RESULTS_DIR=<evaluation-results-directory>
+export SBATCH_ACCOUNT=<slurm-account>
+export SBATCH_PARTITION=batch
+
+bash examples/nemo_gym/submit_osworld_cc_eval.sh
+```
+
+The wrapper also requires the OpenSandbox, model, container, mount, and Slurm
+environment variables shown above. Set `EVAL_CHECKPOINT_PATH` to an empty
+string to evaluate the base model.
+
+## Deterministic smoke configuration
 
 The runnable recipe is
 [`examples/nemo_gym/grpo_nemotron_omni_30ba3b_scripted_multiturn_cc.yaml`](../../examples/nemo_gym/grpo_nemotron_omni_30ba3b_scripted_multiturn_cc.yaml).
@@ -218,4 +338,5 @@ Existing dummy-environment results are available at
 - The initial training implementation requires the Megatron policy backend and
   does not support the data-plane/TQ training path.
 - The deterministic environment validates correctness, not task-learning
-  quality. A real computer-use environment is the next qualification step.
+  quality. OSWorld validation provides a real computer-use learning signal,
+  but larger held-out generalization experiments are still in progress.
