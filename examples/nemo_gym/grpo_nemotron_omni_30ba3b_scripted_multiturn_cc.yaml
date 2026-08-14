@@ -112,10 +112,10 @@ logger:
   tensorboard_enabled: true
   monitor_gpus: false
   wandb:
-    entity: null
-    project: null
-    group: null
-    name: null
+    entity: nvidia
+    project: nemo-rl-context-compaction
+    group: shared-cc-smoke
+    name: cc-sync-k2-n1
 
 cluster:
   gpus_per_node: 8

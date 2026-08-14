@@ -1,0 +1,122 @@
+# OSWorld synchronous GRPO using logical-rollout context compaction.
+#
+# Start with the validated Nemotron Omni CC runtime. The OSWorld agent owns one
+# logical desktop rollout; Gym rewrites image history every K completed actions
+# and NeMo RL materializes the resulting physical traces for token-level GRPO.
+
+defaults: grpo_nemotron_omni_30ba3b_scripted_multiturn_cc.yaml
+
+grpo:
+  num_prompts_per_step: ${oc.decode:${oc.env:OSWORLD_NUM_PROMPTS_PER_STEP,1}}
+  num_generations_per_prompt: ${oc.decode:${oc.env:OSWORLD_NUM_GENERATIONS,2}}
+  num_val_generations_per_prompt: 1
+  val_batch_size: ${oc.decode:${oc.env:OSWORLD_VAL_BATCH_SIZE,32}}
+  max_rollout_turns: ${oc.decode:${oc.env:OSWORLD_MAX_STEPS,3}}
+  max_num_epochs: 1
+  max_num_steps: ${oc.decode:${oc.env:GRPO_MAX_NUM_STEPS,1}}
+  val_period: ${oc.decode:${oc.env:OSWORLD_VAL_PERIOD,100}}
+  val_at_start: ${oc.decode:${oc.env:OSWORLD_VAL_AT_START,false}}
+  val_at_end: ${oc.decode:${oc.env:OSWORLD_VAL_AT_END,false}}
+  overlong_filtering: false
+  use_dynamic_sampling: ${oc.decode:${oc.env:OSWORLD_USE_DYNAMIC_SAMPLING,false}}
+  dynamic_sampling_max_gen_batches: ${oc.decode:${oc.env:OSWORLD_DYNAMIC_SAMPLING_MAX_GEN_BATCHES,4}}
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  seq_logprob_error_threshold: null
+  context_compaction_training:
+    enabled: true
+  async_grpo:
+    enabled: false
+
+checkpointing:
+  enabled: ${oc.decode:${oc.env:CHECKPOINTING_ENABLED,false}}
+  checkpoint_dir: ${oc.env:CHECKPOINT_DIR,results/osworld-context-compaction/checkpoints}
+  save_period: ${oc.decode:${oc.env:CHECKPOINT_SAVE_PERIOD,5}}
+
+policy:
+  model_name: ${oc.env:NANO_OMNI_MODEL_NAME}
+  tokenizer:
+    name: ${oc.env:NANO_OMNI_MODEL_NAME}
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  # CC expands this logical batch into physical rows internally.
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step},${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: ${oc.decode:${oc.env:OSWORLD_MAX_MODEL_LEN,8192}}
+  make_sequence_length_divisible_by: 8
+  router_replay:
+    enabled: true
+  megatron_cfg:
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    scheduler:
+      lr_warmup_iters: 0
+      lr_warmup_init: ${oc.decode:${oc.env:OSWORLD_LEARNING_RATE,2e-7}}
+    optimizer:
+      lr: ${oc.decode:${oc.env:OSWORLD_LEARNING_RATE,2e-7}}
+      min_lr: ${oc.decode:${oc.env:OSWORLD_LEARNING_RATE,2e-7}}
+  generation:
+    max_new_tokens: 4096
+    temperature: ${oc.decode:${oc.env:OSWORLD_TEMPERATURE,1.0}}
+    top_p: ${oc.decode:${oc.env:OSWORLD_TOP_P,1.0}}
+    vllm_cfg:
+      max_model_len: ${oc.decode:${oc.env:OSWORLD_MAX_MODEL_LEN,8192}}
+      logprobs_mode: raw_logprobs
+      http_server_serving_chat_kwargs:
+        chat_template_content_format: string
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: ${oc.decode:${oc.env:OSWORLD_MAX_ACTIVE_IMAGES,8}}
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: 16384
+      mamba_ssm_cache_dtype: float32
+      enable_chunked_prefill: false
+
+data:
+  max_input_seq_length: ${oc.decode:${oc.env:OSWORLD_MAX_MODEL_LEN,8192}}
+  train:
+    data_path: ${oc.env:OSWORLD_GRPO_TRAIN_DATA}
+  validation:
+    data_path: ${oc.env:OSWORLD_GRPO_VAL_DATA}
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    is_trajectory_collection: ${oc.decode:${oc.env:OSWORLD_TRAJECTORY_COLLECTION,false}}
+    num_workers: ${oc.decode:${oc.env:OSWORLD_NEMO_GYM_NUM_WORKERS,2}}
+    config_paths:
+      - 3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - 3rdparty/Gym-workspace/Gym/responses_api_agents/nemotron_osworld/configs/nemotron_osworld_cc.yaml
+      - 3rdparty/Gym-workspace/Gym/resources_servers/osworld/configs/osworld.yaml
+      - 3rdparty/Gym-workspace/Gym/resources_servers/osworld/configs/opensandbox_osworld.yaml
+    nemotron_osworld:
+      responses_api_agents:
+        nemotron_osworld:
+          max_steps: ${oc.decode:${oc.env:OSWORLD_MAX_STEPS,3}}
+          max_parallel_rollouts: ${oc.decode:${oc.env:OSWORLD_MAX_PARALLEL_ROLLOUTS,2}}
+          visual_history:
+            policy:
+              config:
+                keep_last_image_groups: ${oc.decode:${oc.env:OSWORLD_CC_KEEP_LAST_IMAGE_GROUPS,1}}
+            schedule:
+              actions_per_chunk: ${oc.decode:${oc.env:OSWORLD_CC_ACTIONS_PER_CHUNK,2}}
+
+logger:
+  log_dir: ${oc.env:OSWORLD_RESULTS_DIR,logs/osworld-context-compaction}
+  wandb_enabled: ${oc.decode:${oc.env:WANDB_ENABLED,false}}
+  tensorboard_enabled: true
+  wandb:
+    entity: ${oc.env:WANDB_ENTITY,nvidia}
+    project: ${oc.env:WANDB_PROJECT,osworld-context-compaction}
+    group: ${oc.env:WANDB_GROUP,osworld-cc-smoke}
+    name: ${oc.env:WANDB_RUN_NAME,osworld-cc-smoke}
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: ${oc.decode:${oc.env:NUM_NODES,2}}

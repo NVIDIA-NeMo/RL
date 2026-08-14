@@ -133,7 +133,7 @@ mkdir -p "${RUN_ROOT}" "${BASE_LOG_DIR}"
 
 # Set WANDB_API_KEY in the environment; do not put it in the command or YAML.
 export COMMAND="cd ${PWD}
-uv run --locked --extra mcore --extra vllm \
+uv run --locked \
   examples/nemo_gym/run_grpo_nemo_gym.py \
   --config examples/nemo_gym/grpo_nemotron_omni_30ba3b_scripted_multiturn_cc.yaml \
   cluster.num_nodes=2 \
