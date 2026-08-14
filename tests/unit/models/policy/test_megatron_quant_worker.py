@@ -46,6 +46,7 @@ if _MODELOPT_AVAILABLE:
     try:
         from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
         from modelopt.torch.quantization.nn.modules.tensor_quantizer import (
+            GroupedQuantizer,
             TensorQuantizer,
         )
 
@@ -111,6 +112,34 @@ def _make_real_quant_worker():
     worker._modelopt_quantization_config = worker.megatron_bridge.quantization_config
     worker.rank = 0
     return worker
+
+
+@requires_weight_folding
+def test_hide_tensor_quantizers_hides_grouped_quantizers(monkeypatch):
+    from megatron.core import distributed
+
+    class FakeDistributedDataParallel:
+        pass
+
+    class ModelWithGroupedQuantizer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(2, 2)
+            self.weight_quantizer = GroupedQuantizer(TensorQuantizer())
+
+    monkeypatch.setattr(
+        distributed, "DistributedDataParallel", FakeDistributedDataParallel
+    )
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.model = FakeDistributedDataParallel()
+    worker.model.module = ModelWithGroupedQuantizer()
+
+    with worker.hide_tensor_quantizers():
+        visible_modules = dict(worker.model.module.named_modules())
+
+    assert "linear" in visible_modules
+    assert "weight_quantizer" not in visible_modules
 
 
 @requires_weight_folding

@@ -30,7 +30,10 @@ from megatron.bridge.training.post_training.checkpointing import (
 )
 from megatron.core.utils import unwrap_model
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
-from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+from modelopt.torch.quantization.nn.modules.tensor_quantizer import (
+    GroupedQuantizer,
+    TensorQuantizer,
+)
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from nemo_rl.modelopt.models.policy.workers.utils import (
@@ -304,7 +307,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     @contextmanager
     def hide_tensor_quantizers(self):
-        """Context manager that temporarily hides TensorQuantizer modules from module iteration."""
+        """Temporarily hide ModelOpt quantizer modules from module iteration."""
         from megatron.core.distributed import DistributedDataParallel
 
         if not isinstance(self.model, DistributedDataParallel):
@@ -316,7 +319,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
         def filtered_named_modules(*args, **kwargs):
             for name, module in original_named_modules(*args, **kwargs):
-                if not isinstance(module, TensorQuantizer):
+                if not isinstance(module, (TensorQuantizer, GroupedQuantizer)):
                     yield name, module
 
         try:
