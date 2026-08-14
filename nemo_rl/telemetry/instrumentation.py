@@ -18,12 +18,8 @@
 Algorithms should import ``managed_span`` / ``trace_fn`` from here (not raw
 nemo-lens) so every leaf span gets ``rl.bucket`` when applicable.
 
-Efficiency tagging
-------------------
-
-* Shared bucket tokens: ``productive`` | ``overhead`` | ``idle`` | ``wasted``.
-* Umbrella groups (``job``, ``step``, ``rollout``, …) are timed but **not**
-  tagged.
+Shared bucket tokens are ``productive`` | ``overhead`` | ``idle`` | ``wasted``.
+Umbrella groups (``job``, ``step``, ``rollout``, …) are timed but not tagged.
 """
 
 from __future__ import annotations
