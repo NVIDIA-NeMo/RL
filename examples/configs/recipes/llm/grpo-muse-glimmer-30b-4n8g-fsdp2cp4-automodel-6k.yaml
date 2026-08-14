@@ -5,6 +5,8 @@ defaults: ../../grpo_math_1B.yaml
 # token_level_loss is the one exception -- the base sets it true and this recipe
 # turns it off, matching the run this recipe reproduces.
 grpo:
+  # Reference logprobs are required by the KL penalty below (~+10% step time).
+  skip_reference_policy_logprobs_calculation: false
   val_period: 5
   # Measure the untrained policy before step 1. Without it the first datapoint
   # is step 5 and there is no baseline to say whether training helped.
@@ -22,7 +24,11 @@ grpo:
     # deliberately not set here.
     enabled: false
 loss_fn:
-  reference_policy_kl_penalty: 0.0
+  # KL anchor to the initial (reference) policy; k3 estimator (base default).
+  # Without it this model's validation accuracy rises for ~30 steps and then
+  # decays (length inflation -> truncation collapse + behavior drift); 0.01
+  # holds the curve flat. 0.001 was tested and is too weak.
+  reference_policy_kl_penalty: 0.01
   use_importance_sampling_correction: true
   truncated_importance_sampling_type: tis
   truncated_importance_sampling_ratio: 2
@@ -49,11 +55,11 @@ checkpointing:
   # means the intent survives if that worker default ever changes.
   is_async: true
 policy:
-  # Point these at your local Muse Glimmer checkpoint directory. See
-  # docs/guides/models/muse-glimmer.md.
-  model_name: /path/to/muse-glimmer-30b
+  # Defaults to the released HF Hub checkpoint. Override with a local
+  # checkpoint directory if needed -- see docs/guides/models/muse-glimmer.md.
+  model_name: meta-models/Muse-Glimmer-30B
   tokenizer:
-    name: /path/to/muse-glimmer-30b
+    name: meta-models/Muse-Glimmer-30B
   train_micro_batch_size: 1
   logprob_batch_size: 1
   # 6144 with context_parallel_size=4, i.e. 1536 tokens per rank.

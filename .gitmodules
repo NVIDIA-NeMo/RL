@@ -5,14 +5,16 @@
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
-	# Muse Glimmer support ships in AutoModel main.
+	# Muse Glimmer support is not yet on AutoModel main -- it lives on
+	# huiyingl/feat/muse-glimmer-support. Pinned to a fixed commit on that
+	# branch (not tracking its tip), so unrelated pushes to the branch
+	# can't break this setup.
 	#
-	# NOTE: as of this pin, upstream main does not yet carry the Onyx
-	# implementation that Muse Glimmer needs -- the model's day-0 support is
-	# still in flight. Until it lands, override this submodule to whichever
-	# branch carries Onyx, or training will fail at model construction.
+	# NOTE: until Muse Glimmer support merges upstream, this submodule must
+	# stay pinned to that branch, or training fails at model construction.
+	# Repoint to main (and drop this fixed-commit pin) once it lands there.
 	url = https://github.com/NVIDIA-NeMo/Automodel.git
-	branch = main
+	branch = huiyingl/feat/muse-glimmer-support
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
 	url = https://github.com/NVIDIA-NeMo/Gym.git
