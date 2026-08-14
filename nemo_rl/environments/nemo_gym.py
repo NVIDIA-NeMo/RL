@@ -20,6 +20,7 @@ from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from time import monotonic
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict
@@ -1610,8 +1611,9 @@ def validate_dataset_agent_coverage(
 def _iter_dataset_agent_names(dataset: Any) -> set[str]:
     """Collect the agent names a dataset's rows reference.
 
-    NemoGymDataset caches this small set before repetition and data merging.
-    Custom datasets without that metadata retain the row-scan fallback.
+    Sharded jobs lazily scan each stable source file once.
+    Unsharded jobs never call this function.
+    Custom or changed sources retain the row-scan fallback.
     """
     if dataset is None:
         return set()
@@ -1619,9 +1621,17 @@ def _iter_dataset_agent_names(dataset: Any) -> set[str]:
         return set().union(
             *(_iter_dataset_agent_names(nested) for nested in dataset.values())
         )
-    agent_names = getattr(dataset, "agent_names", None)
-    if agent_names is not None:
-        return set(agent_names)
+    agent_name_sources = getattr(dataset, "agent_name_sources", None)
+    if agent_name_sources is not None:
+        source_agent_names: set[str] = set()
+        for source in agent_name_sources:
+            names = _load_agent_names_from_source(source)
+            if names is None:
+                break
+            source_agent_names.update(names)
+        else:
+            return source_agent_names
+
     # AllTaskProcessedDataset wraps the raw rows; a plain sequence is also fine.
     rows = getattr(dataset, "dataset", dataset)
 
@@ -1630,9 +1640,48 @@ def _iter_dataset_agent_names(dataset: Any) -> set[str]:
         extra_env_info = row.get("extra_env_info") if hasattr(row, "get") else None
         if isinstance(extra_env_info, str):
             extra_env_info = json.loads(extra_env_info)
-        if not isinstance(extra_env_info, dict):
-            continue
-        agent_ref = extra_env_info.get("agent_ref")
-        if isinstance(agent_ref, dict) and "name" in agent_ref:
-            names.add(str(agent_ref["name"]))
+        agent_name = _get_agent_name(extra_env_info)
+        if agent_name is not None:
+            names.add(agent_name)
     return names
+
+
+@lru_cache(maxsize=128)
+def _load_agent_names_from_source(
+    source: tuple[str, int, int],
+) -> frozenset[str] | None:
+    """Read a stable Gym source once per controller process."""
+    path, expected_mtime_ns, expected_size = source
+    try:
+        source_stat = os.stat(path)
+        if (
+            source_stat.st_mtime_ns != expected_mtime_ns
+            or source_stat.st_size != expected_size
+        ):
+            return None
+
+        names: set[str] = set()
+        with open(path) as source_file:
+            for raw_row in source_file:
+                agent_name = _get_agent_name(json.loads(raw_row))
+                if agent_name is not None:
+                    names.add(agent_name)
+
+        source_stat_after_read = os.stat(path)
+        if (
+            source_stat_after_read.st_mtime_ns != expected_mtime_ns
+            or source_stat_after_read.st_size != expected_size
+        ):
+            return None
+    except (OSError, json.JSONDecodeError):
+        return None
+    return frozenset(names)
+
+
+def _get_agent_name(row: object) -> str | None:
+    if not isinstance(row, dict):
+        return None
+    agent_ref = row.get("agent_ref")
+    if not isinstance(agent_ref, dict) or "name" not in agent_ref:
+        return None
+    return str(agent_ref["name"])
