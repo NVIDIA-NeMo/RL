@@ -112,6 +112,7 @@ jobs:
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
           echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "test_sha=$test_sha" >> "$GITHUB_OUTPUT"
           echo "head_label=$head_label" >> "$GITHUB_OUTPUT"
           echo "ci_label=$ci_label" >> "$GITHUB_OUTPUT"
           echo "has_skip_cicd=$has_skip_cicd" >> "$GITHUB_OUTPUT"
