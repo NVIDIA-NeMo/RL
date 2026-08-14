@@ -194,6 +194,8 @@ def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
 def test_mxfp8_recipe_patterns_select_only_routed_experts(
     recipe_name, quantized_modules, bf16_modules
 ):
+    pytest.importorskip("vllm")
+
     from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
 
     recipe_path = (
