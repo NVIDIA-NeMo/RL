@@ -1388,6 +1388,11 @@ def build_nemo_gym_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    port_range = {
+        key: value
+        for key in ("port_range_low", "port_range_high")
+        if (value := nemo_gym_dict.pop(key, None)) is not None
+    }
     # Same treatment for the multimodal knobs: NemoGymConfig declares them as
     # top-level fields, so populate them here instead of leaving the actor to
     # read them back out of Gym's global config dict.
@@ -1423,6 +1428,7 @@ def build_nemo_gym_config(
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
+        **port_range,
         **multimodal_flags,
     )
 
