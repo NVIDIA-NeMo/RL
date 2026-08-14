@@ -46,6 +46,69 @@ from nemo_rl.models.generation.megatron.utils import (
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
+G_VERIFY_MXFP8_ENV = "NRL_VERIFY_MEGATRON_MXFP8"
+
+
+def _verify_mxfp8_inference_weights(
+    model: torch.nn.Module | list[torch.nn.Module] | tuple[torch.nn.Module, ...],
+    expected_backend: str | None = None,
+) -> int:
+    """Fail unless an inference model contains Megatron MXFP8 weight objects.
+
+    Inference-optimized MXFP8 weights are plain attributes rather than
+    ``nn.Parameter`` objects, so ``named_parameters()`` cannot observe them.
+    This check walks module attributes and nested containers, deduplicating
+    objects that are also referenced by concatenated expert buffers.
+
+    Args:
+        model: Wrapped Megatron model or list of model chunks.
+
+    Returns:
+        Number of distinct MXFP8 weight objects found.
+
+    Raises:
+        RuntimeError: If no MXFP8 weights are present.
+    """
+    # This type is only available with Megatron inference dependencies loaded.
+    from megatron.core.inference.quantization.mxfp8_tensor import (
+        MXFP8Tensor,
+        validate_mxfp8_tensor,
+    )
+
+    seen: dict[int, MXFP8Tensor] = {}
+
+    def visit(value: object) -> None:
+        if isinstance(value, MXFP8Tensor):
+            seen[id(value)] = value
+        elif isinstance(value, dict):
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child)
+
+    model_chunks = model if isinstance(model, (list, tuple)) else [model]
+    for model_chunk in model_chunks:
+        unwrapped_model = unwrap_model(model_chunk)
+        for module in unwrapped_model.modules():
+            for value in vars(module).values():
+                visit(value)
+
+    if not seen:
+        raise RuntimeError(
+            "Megatron MXFP8 verification failed: the inference model contains no "
+            "megatron.core.inference.quantization.MXFP8Tensor weights."
+        )
+    if expected_backend is not None:
+        for index, weight in enumerate(seen.values()):
+            validate_mxfp8_tensor(
+                weight,
+                expected_backend=expected_backend,
+                tensor_name=f"inference MXFP8 weight {index}",
+            )
+    return len(seen)
+
+
 class MegatronGenerationMixin:
     """Engine lifecycle, coordinator, HTTP server, and finish-generation machinery.
 
@@ -171,7 +234,7 @@ class MegatronGenerationMixin:
             ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
-            logprobs_mode="processed_logprobs",
+            logprobs_mode=mcore_generation_config["logprobs_mode"],
             max_requests=max_requests,
         )
 
@@ -197,6 +260,43 @@ class MegatronGenerationMixin:
         self._inference_engine_initialized = True
         self._inference_engine_asleep = True
         print(f"[Rank {self.rank}] Initialized persistent inference engine")
+
+    def get_inference_runtime_info(self) -> dict[str, object]:
+        """Return serializable state proving CUDA graphs were captured and selected.
+
+        This explicit diagnostics API avoids depending on MCore's INFO-level log
+        formatting. ``cuda_graph_replay_count`` is cumulative for the current
+        engine lifecycle and survives per-request context metadata resets.
+        ``using_cuda_graph_last_step`` is a point-in-time context diagnostic and
+        may be false after the most recent request batch has drained.
+        """
+        if not self._inference_engine_initialized:
+            return {
+                "initialized": False,
+                "captured_graph_count": 0,
+                "capture_stats": None,
+                "step_count": 0,
+                "cuda_graph_replay_count": 0,
+                "using_cuda_graph_last_step": False,
+                "padded_batch_dimensions": None,
+            }
+
+        engine = self.dynamic_inference_engine
+        context = engine.context
+        capture_stats = engine.capture_stats
+        return {
+            "initialized": True,
+            "captured_graph_count": (
+                len(context.cuda_graph_batch_dimensions_list)
+                if capture_stats is not None
+                else 0
+            ),
+            "capture_stats": capture_stats,
+            "step_count": context.step_count,
+            "cuda_graph_replay_count": engine.cuda_graph_replay_count,
+            "using_cuda_graph_last_step": context.using_cuda_graph_this_step(),
+            "padded_batch_dimensions": str(context.padded_batch_dimensions),
+        }
 
     async def _start_inference_coordinator(self):
         """Start the inference coordinator and engine loop."""
@@ -792,12 +892,30 @@ class MegatronGenerationRefitMixin:
             dst_rank_offset=self.refit_dst_rank_offset,
         )
 
+        if not is_source and os.environ.get(G_VERIFY_MXFP8_ENV) == "1":
+            model_chunks = (
+                self.model if isinstance(self.model, (list, tuple)) else [self.model]
+            )
+            model_config = unwrap_model(model_chunks[0]).config
+            expected_backend = getattr(
+                model_config, "inference_mxfp8_backend", "flashinfer"
+            )
+            mxfp8_weight_count = _verify_mxfp8_inference_weights(
+                self.model, expected_backend=expected_backend
+            )
+            print(
+                f"NRL_MXFP8_VERIFY: PASS rank={self.rank} "
+                f"weights={mxfp8_weight_count} backend={expected_backend}",
+                flush=True,
+            )
+
     def preinit_nvshmem_collective(self) -> None:
         """Initialize NVShmem collectively before any weight transfer.
 
         Must be called on ALL participating ranks (training + inference) simultaneously,
-        after `prepare_for_generation()` has completed and the CG has been recorded.
-        The `NVSHMEMCopyService` lazy init can corrupt CUDA graph state.
+        outside CUDA graph capture. Skip-load inference initializes NVSHMEM before its
+        first engine capture; initialized engines call this after capture. In either
+        ordering, the lazy initialization never occurs inside graph recording/replay.
         """
         if not hasattr(self, "refit_copy_service"):
             return

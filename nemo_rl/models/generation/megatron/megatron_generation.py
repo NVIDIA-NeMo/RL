@@ -103,7 +103,10 @@ class MegatronGeneration(GenerationInterface):
             name_prefix: Prefix for naming the worker group (non-colocated only).
             processor: Optional processor for VLMs (non-colocated only).
             weights_path: Optional path to model weights (non-colocated only).
-            skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
+            skip_weight_load: Do not load weights from the checkpoint; refit will do it.
+                Inference-engine initialization is deferred until that first refit so CUDA
+                graphs capture the final persistent weight buffers rather than placeholder
+                checkpoint tensors.
         """
         # Import here to avoid circular imports
         from nemo_rl.models.policy.lm_policy import Policy
@@ -153,8 +156,14 @@ class MegatronGeneration(GenerationInterface):
             skip_weight_load=skip_weight_load,
         )
 
-        # Start the persistent inference engine + HTTP server during construction.
-        self.prepare_for_generation()
+        # A skip-load model does not have its final weight objects yet. In particular,
+        # MXFP8 refit replaces placeholder TE tensors with persistent MXFP8Tensor buffers.
+        # Capturing CUDA graphs here would retain the placeholder addresses (and graph
+        # warmup would execute the wrong tensor type). refit_policy_generation calls
+        # prepare_for_generation(tags=["kv_cache"]) after the first weight transfer,
+        # which initializes the engine and captures against the final buffers.
+        if not skip_weight_load:
+            self.prepare_for_generation()
 
     def init_collective(
         self,
@@ -256,10 +265,18 @@ class MegatronGeneration(GenerationInterface):
         ray.get(futures)
         return True
 
-    def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
-        """Pre-initialize NVShmem collectively after CUDA graph capture.
+    def get_inference_runtime_info(self) -> list[dict[str, object]]:
+        """Return inference-engine diagnostics from every Megatron worker."""
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "get_inference_runtime_info"
+        )
+        return ray.get(futures)
 
-        Must be called simultaneously on both training and inference workers.
+    def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
+        """Pre-initialize NVShmem collectively outside CUDA graph capture.
+
+        Must be called simultaneously on both training and inference workers. For
+        skip-load inference, this intentionally runs before the first engine capture.
         """
         return self._policy.preinit_nvshmem()
 
