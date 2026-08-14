@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,7 +29,20 @@ SKIP_WEIGHT_SUBSTRINGS: tuple[str, ...] = (
     "layernorm",
     "embed",
     "router",
-    "mlp.gate.",
+    # A top-k router is a discrete argmax, so quantization error flips expert
+    # selection outright -- the one failure an RL rollout cannot absorb. Every
+    # MoE family spells it differently and only some contain "router":
+    # ``mlp.gate.`` (Qwen3-MoE, DeepSeek), ``block_sparse_moe.gate.``
+    # (Mixtral), ``mixer.gate.`` (NemotronH/nanov3) and the separate
+    # ``shared_expert_gate`` (Qwen2-MoE). ``.gate.`` covers the first three as
+    # a class rather than enumerating families we happen to have seen.
+    # The dots are load-bearing: ``gate_proj``, ``gate_up_proj`` and
+    # ``shared_expert.gate_proj`` are ordinary MLP weights and stay quantized.
+    # The repo already draws this line -- see ``DEFAULT_NVFP4_IGNORE`` in
+    # ``nemo_rl/modelopt/utils.py`` and the nanov3 recipe's
+    # ``real_quant_ignore``.
+    ".gate.",
+    "shared_expert_gate.",
     "norm",
     "lm_head",
     "eh_proj",

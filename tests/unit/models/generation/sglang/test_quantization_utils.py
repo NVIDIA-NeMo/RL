@@ -105,6 +105,18 @@ def test_quantized_refit_requires_megatron_backend() -> None:
     validate_sglang_quantized_refit_backend(scheme="mxfp8", use_megatron=True)
 
 
+def test_quantized_refit_rejects_a_non_megatron_backend() -> None:
+    """The rejecting branch is the only reason the guard exists.
+
+    Without this, neutering ``validate_sglang_quantized_refit_backend`` to a
+    bare ``return`` leaves the whole suite green -- and that guard is what
+    stops a DTensor/FSDP policy from booting SGLang off a quantized checkpoint
+    it can only ever refit in BF16.
+    """
+    with pytest.raises(NotImplementedError, match="requires a Megatron policy"):
+        validate_sglang_quantized_refit_backend(scheme="mxfp8", use_megatron=False)
+
+
 @pytest.mark.parametrize(
     ("quantization_config", "num_hidden_layers", "exception", "match"),
     [

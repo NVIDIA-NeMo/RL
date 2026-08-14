@@ -22,19 +22,18 @@ converters.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from typing import Any, Iterator
 
 import torch
 
 from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
-    SKIP_WEIGHT_SUBSTRINGS as MXFP8_SKIP_WEIGHT_SUBSTRINGS,
-)
-from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
     MXFP8_SCALE_KEY_SUFFIX,
     quantize_mxfp8,
     should_quantize,
     strip_weight_suffix,
+)
+from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
+    SKIP_WEIGHT_SUBSTRINGS as MXFP8_SKIP_WEIGHT_SUBSTRINGS,
 )
 from nemo_rl.models.generation.sglang.quantization_utils import (
     SglangQuantizationScheme,

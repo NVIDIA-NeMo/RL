@@ -2312,11 +2312,11 @@ class MegatronPolicyWorkerImpl(
         target_precision: str,
         sglang_quantization_cfg: Optional[dict] = None,
     ):
-        from nemo_rl.models.policy.workers.megatron_sglang_weight_iterator import (
-            MegatronSGLangHfWeightIterator,
-        )
         from nemo_rl.models.generation.sglang.quantization_utils import (
             get_sglang_quantization_scheme,
+        )
+        from nemo_rl.models.policy.workers.megatron_sglang_weight_iterator import (
+            MegatronSGLangHfWeightIterator,
         )
 
         if sglang_quantization_cfg is None:

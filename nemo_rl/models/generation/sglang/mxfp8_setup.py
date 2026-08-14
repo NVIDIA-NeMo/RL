@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,8 +34,8 @@ import torch
 
 from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
     MXFP8_QUANTIZATION_CONFIG,
-    SKIP_WEIGHT_SUBSTRINGS,
     MXFP8_SCALE_KEY_SUFFIX,
+    SKIP_WEIGHT_SUBSTRINGS,
     is_bf16_source_checkpoint,
     is_mxfp8_quantization_config,
     quantize_mxfp8,
@@ -51,7 +51,11 @@ from nemo_rl.models.generation.sglang.quantization_utils import (
 
 logger = logging.getLogger(__name__)
 
-CONVERTER_VERSION: str = "4"
+# Bumped to 5 when ``block_sparse_moe.gate.`` / ``shared_expert_gate.`` joined
+# ``SKIP_WEIGHT_SUBSTRINGS``. The cache fingerprint covers the config knobs but
+# NOT that module-level constant, so a cached directory converted under the old
+# skip list would otherwise be reused with its router already quantized.
+CONVERTER_VERSION: str = "5"
 
 
 class _ConversionResult:
@@ -174,10 +178,25 @@ def convert_mxfp8(
             )
 
     index_path = os.path.join(input_path, "model.safetensors.index.json")
-    with open(index_path) as f:
-        weight_map = json.load(f)["weight_map"]
+    if os.path.isfile(index_path):
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        weight_names: tuple[str, ...] = tuple(weight_map)
+        safetensors_files = sorted(set(weight_map.values()))
+    else:
+        # A checkpoint whose BF16 weights fit in one file ships
+        # ``model.safetensors`` with no index at all. ``_checkpoint_weight_names``
+        # below already handles both layouts; reading the index unconditionally
+        # here failed such a checkpoint with a bare FileNotFoundError.
+        weight_names = _checkpoint_weight_names(input_path)
+        safetensors_files = sorted(
+            filename
+            for filename in os.listdir(input_path)
+            if filename.endswith(".safetensors")
+            and os.path.isfile(os.path.join(input_path, filename))
+        )
     expanded_skip_weight_substrings = expand_sglang_atomic_high_precision_substrings(
-        weight_names=weight_map,
+        weight_names=weight_names,
         skip_weight_substrings=skip_weight_substrings,
     )
     concrete_atomic_modules = tuple(
@@ -186,7 +205,6 @@ def convert_mxfp8(
         if substring not in skip_weight_substrings
     )
     skip_weight_substrings = expanded_skip_weight_substrings
-    safetensors_files = sorted(set(weight_map.values()))
 
     result_collector = _ConversionResult()
     result_collector.modules_to_not_convert.extend(
