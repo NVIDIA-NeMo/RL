@@ -266,6 +266,9 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
 
 
 def test_mxfp8_rollout_recipes_are_in_gb200_performance_suite() -> None:
+    recipe_names = {path.stem for path in PERF_CONFIG_DIR.glob("*-mxfp8-rollout.yaml")}
+    assert recipe_names == set(MXFP8_CASES)
+
     suite_text = GB200_SUITE.read_text(encoding="utf-8")
 
     for case_name in MXFP8_CASES:
