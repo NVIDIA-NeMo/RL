@@ -427,21 +427,86 @@ class TestProcessMicrobatch:
             result.packed_seq_params.cu_seqlens_q_padded, cu_seqlens_padded
         )
 
-    def test_process_microbatch_rejects_mtp_with_model_cp_slicing(self):
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2
+    )
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    def test_process_microbatch_keeps_full_mtp_mask_for_model_cp_slicing(
+        self, mock_pack, mock_cp_world, mock_cp_rank
+    ):
+        """A model that slices CP inputs itself receives the full, unsharded mask.
+
+        Such a model inserts media into the full THD row before selecting its
+        CP-owned tokens, and validates that every token-aligned tensor it shards
+        has the same sequence length. Handing it a CP-local mask alongside
+        full-length input_ids fails that check before training starts, so the
+        mask must stay full and be sliced by the model in lockstep with the
+        tokens.
+        """
         from nemo_rl.models.megatron.data import process_microbatch
 
-        with pytest.raises(NotImplementedError, match="do not yet support MTP"):
-            process_microbatch(
-                {
-                    "input_ids": torch.tensor([[1, 2, 3, 4]]),
-                    "input_lengths": torch.tensor([4]),
-                    "mtp_loss_mask": torch.ones(1, 4),
-                },
-                seq_length_key="input_lengths",
-                pack_sequences=True,
-                model_slices_context_parallel_inputs=True,
-                straggler_timer=MagicMock(),
+        # A distinct return per call, so the assertions below discriminate both
+        # which tuple index was read (0 is the full THD row, 1 the CP-local
+        # shard, and they differ in width) and which call it came from. A
+        # shared return_value would let a regression that re-packs input_ids in
+        # place of mtp_loss_mask pass unnoticed, since both sides would then be
+        # the same object.
+        tokens_full = torch.tensor([[1, 2, 3, 4, 5, 6, 0, 0]])
+        tokens_cp = torch.tensor([[1, 2, 3, 4]])
+        mask_full = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
+        mask_cp = torch.tensor([[1, 1, 1, 0]])
+
+        def _pack_returns(tensor, *args, **kwargs):
+            full, cp = (
+                (mask_full, mask_cp)
+                if tensor is data_dict["mtp_loss_mask"]
+                else (tokens_full, tokens_cp)
             )
+            return (
+                full,
+                cp,
+                MagicMock(),
+                torch.tensor([0, 5, 8], dtype=torch.int32),
+                torch.tensor([0, 5, 8], dtype=torch.int32),
+            )
+
+        mock_pack.side_effect = _pack_returns
+
+        data_dict = {
+            "input_ids": torch.tensor(
+                [[1, 2, 3, 4, 5, 0, 0, 0], [6, 7, 8, 0, 0, 0, 0, 0]]
+            ),
+            "input_lengths": torch.tensor([5, 3]),
+            "mtp_loss_mask": torch.tensor(
+                [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]]
+            ),
+        }
+
+        result = process_microbatch(
+            data_dict,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            model_slices_context_parallel_inputs=True,
+            straggler_timer=MagicMock(),
+        )
+
+        # The mask was packed, not re-derived from input_ids: one call per
+        # tensor, and the second is the mask itself.
+        assert mock_pack.call_count == 2
+        assert torch.equal(
+            mock_pack.call_args_list[1].args[0], data_dict["mtp_loss_mask"]
+        )
+
+        assert result.mtp_loss_mask is not None
+        # The full row, not the CP-sharded one.
+        assert torch.equal(result.mtp_loss_mask, mask_full)
+        # And it lines up with the tokens the model will slice. Because the two
+        # pack calls return distinct tensors, this compares across calls rather
+        # than a tensor with itself.
+        assert result.input_ids_cp_sharded is result.input_ids
+        assert torch.equal(result.input_ids_cp_sharded, tokens_full)
+        assert result.mtp_loss_mask.shape[1] == result.input_ids_cp_sharded.shape[1]
 
     def test_caller_packing_matches_mbridge_thd_contract(self):
         from megatron.bridge.data.packing.in_batch import (
