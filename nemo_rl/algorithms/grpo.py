@@ -17,9 +17,9 @@ import os
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Optional, TypeVar, cast
+from typing import Any, Callable, Iterator, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -2052,6 +2052,34 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     return False
 
 
+@contextmanager
+def _profile_sync_vllm_rollout(
+    policy_generation: GenerationInterface,
+    *,
+    step_id: int | str,
+) -> Iterator[None]:
+    """Drive an optional profiler around one complete synchronous rollout."""
+    if not isinstance(policy_generation, VllmGeneration):
+        yield
+        return
+    if not policy_generation.rollout_profiler_enabled:
+        yield
+        return
+
+    policy_generation.begin_rollout_profile(step_id=step_id)
+    try:
+        yield
+    except BaseException as rollout_error:
+        try:
+            policy_generation.abort_rollout_profile(reason="grpo_rollout_error")
+        except Exception as profiler_error:
+            rollout_error.add_note(
+                f"Rollout profiler abort also failed: {profiler_error!r}"
+            )
+        raise
+    policy_generation.finish_rollout_profile()
+
+
 def _preserve_router_replay_routed_experts(
     target: BatchedDataDict,
     flat_messages: BatchedDataDict,
@@ -2929,7 +2957,16 @@ def grpo_train(
                     policy_generation, "snapshot_step_metrics"
                 ):
                     policy_generation.snapshot_step_metrics()
-                with timer.time("generation"):
+                with (
+                    timer.time("generation"),
+                    _profile_sync_vllm_rollout(
+                        policy_generation,
+                        step_id=(
+                            f"step{total_steps + 1}/attempt"
+                            f"{dynamic_sampling_num_gen_batches}"
+                        ),
+                    ),
+                ):
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
                         policy_generation.clear_logger_metrics()
