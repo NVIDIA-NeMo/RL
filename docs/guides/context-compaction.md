@@ -18,9 +18,22 @@ The public draft PRs are:
 - NeMo RL: [NVIDIA-NeMo/RL#3642](https://github.com/NVIDIA-NeMo/RL/pull/3642)
 - NeMo Gym: [NVIDIA-NeMo/Gym#2555](https://github.com/NVIDIA-NeMo/Gym/pull/2555)
 
-The generic Context Compaction implementation is Ali Roshan Ghias's work. The
-OSWorld integration validates it in a real computer-use environment and does
-not claim Context Compaction itself as a new contribution.
+### Provenance
+
+The generic Context Compaction implementation comes from Ali Roshan Ghias's
+original [NeMo RL branch](https://gitlab-master.nvidia.com/aroshanghias/nemo-rl/-/tree/aroshanghias/context-compaction-v2-clean)
+and [matching NeMo Gym branch](https://gitlab-master.nvidia.com/aroshanghias/Gym/-/tree/aroshanghias/context-compaction-v2-clean-gym).
+His signed implementation is preserved through
+[commit `42a65427`](https://github.com/NVIDIA-NeMo/RL/commit/42a65427dce038f57f7fd8eed6a24f6a8ce72c2b).
+
+The initial OSWorld environment and Cell 2 OpenSandbox integration was
+developed by Terry Kong in
+[commit `275f0ae9`](https://github.com/NVIDIA-NeMo/Gym/commit/275f0ae94c98c1a484658a5c995b97dce1bb1b4b).
+
+This draft connects those components for OSWorld GRPO, hardens the training and
+evaluation pipeline, and validates Context Compaction in a real computer-use
+environment. It does not claim Context Compaction or the initial OSWorld
+environment as new contributions.
 
 The NeMo RL draft pins the matching Gym draft as a submodule. Check out and
 initialize the publication branch with:
@@ -42,7 +55,7 @@ The validated internal runtime is:
 | Container | `/lustre/fs1/portfolios/coreai/users/aroshanghias/omni-main-migration/containers/cuda-dl-base-26.03-cuda13.2-devel-ubuntu24.04.sqsh` |
 | Checkpoint | `/lustre/fs1/portfolios/coreai/users/aroshanghias/checkpoints/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` |
 | Public model ID | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` |
-| NeMo Gym submodule | `ead1832afe6f3ccca8733247c86b8eb898b09521` |
+| NeMo Gym submodule | `d17601d9d841a1b3f576cb4180d81ff791b29253` |
 | W&B project | `nvidia/nemo-rl-context-compaction` |
 
 Use writable cache and venv directories belonging to your user. Do not share
