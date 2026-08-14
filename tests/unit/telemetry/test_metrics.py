@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for the RL metrics -> nemo-lens tee."""
 
 import pytest
@@ -56,17 +59,29 @@ def test_tee_emits_only_for_train_prefix_when_exporting():
         cfg, rank=0, world_size=1, metric_reader=reader
     )
 
+    # Include grad_norm even when the installed lens build does not accept it
+    # yet: the tee must still emit supported fields (reward_mean) instead of
+    # aborting the whole batch on TypeError.
     tee_rl_metrics_to_otel({"reward": 0.5, "grad_norm": 1.0}, "train")
     tee_rl_metrics_to_otel({"reward": 9.0}, "validation")  # wrong prefix -> ignored
 
+    data = reader.get_metrics_data()
+    assert data is not None, "expected metrics after train-prefix tee"
     names = {
         metric.name
-        for rm in reader.get_metrics_data().resource_metrics
+        for rm in data.resource_metrics
         for sm in rm.scope_metrics
         for metric in sm.metrics
     }
     assert "rl.reward.mean" in names
-    assert "rl.grad_norm" in names
+    # grad_norm / lr / tokens_per_sec require matching lens instruments; only
+    # assert them when the installed record_rl_metrics accepts those kwargs.
+    import inspect
+
+    from nemo.lens.instruments.rl import record_rl_metrics
+
+    if "grad_norm" in inspect.signature(record_rl_metrics).parameters:
+        assert "rl.grad_norm" in names
 
 
 def test_tee_noop_when_not_exporting():

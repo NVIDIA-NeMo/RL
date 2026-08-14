@@ -15,12 +15,20 @@
 
 """No-op fallbacks for when nemo-lens is not installed.
 
-When nemo-lens IS installed, re-exports from nemo.lens.fallbacks for
-consistency. When it is NOT installed, provides identical local no-ops.
+When nemo-lens IS installed, re-export the REAL implementations from the
+top-level ``nemo.lens`` package (``managed_span`` / ``trace_fn`` / ``span_cm`` /
+``safe_set_span_attributes`` come from ``nemo.lens.helpers``,
+``is_span_group_enabled`` from ``nemo.lens.state``). When it is NOT installed,
+provide identical local no-ops.
+
+NOTE: do NOT import these names from ``nemo.lens.fallbacks`` — that module is
+lens's own ImportError fallback (permanent no-ops), so importing from it binds
+the no-op versions even when lens is installed and telemetry is active, which
+silently disables every instrumentation site.
 """
 
 try:
-    from nemo.lens.fallbacks import (  # noqa: F401
+    from nemo.lens import (  # noqa: F401
         is_span_group_enabled,
         managed_span,
         safe_set_span_attributes,

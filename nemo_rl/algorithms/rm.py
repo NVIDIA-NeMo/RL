@@ -44,10 +44,7 @@ from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
-try:
-    from nemo.lens.helpers import managed_span, trace_fn
-except ImportError:
-    from nemo_rl.telemetry._fallbacks import managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
 
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.setup import get_telemetry

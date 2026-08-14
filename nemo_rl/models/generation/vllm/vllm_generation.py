@@ -54,10 +54,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
-try:
-    from nemo.lens.helpers import trace_fn
-except ImportError:
-    from nemo_rl.telemetry._fallbacks import trace_fn
+from nemo_rl.telemetry.instrumentation import trace_fn
 
 from nemo_rl.telemetry.setup import get_telemetry
 from nemo_rl.telemetry.span_groups import RLSpanGroup

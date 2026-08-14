@@ -88,10 +88,7 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
-try:
-    from nemo.lens.helpers import managed_span, trace_fn
-except ImportError:
-    from nemo_rl.telemetry._fallbacks import managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
 
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.setup import get_telemetry

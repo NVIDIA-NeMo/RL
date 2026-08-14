@@ -22,6 +22,7 @@ after its normal fan-out to the file/wandb/mlflow backends.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Optional
 
@@ -32,6 +33,8 @@ logger = logging.getLogger(__name__)
 # Map raw Logger metric keys (under the "train"/"" prefix) to
 # ``record_rl_metrics`` gauge fields. The first present candidate key wins.
 # Best-effort: unmatched keys and non-scalar values are silently skipped.
+# Fields not yet accepted by the installed nemo-lens ``record_rl_metrics``
+# are dropped at tee time so one unknown kwarg cannot abort the whole batch.
 _RL_OTEL_METRIC_MAP: dict[str, tuple[str, ...]] = {
     "reward_mean": ("reward", "reward_mean", "mean_reward"),
     "kl_divergence": ("kl", "kl_divergence", "mean_kl"),
@@ -80,6 +83,13 @@ def tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> No
         return
 
     kwargs = map_rl_metrics(metrics)
+    if not kwargs:
+        return
+    # Drop fields the installed lens build does not accept yet (e.g. grad_norm
+    # before the matching instruments land). Passing them as **kwargs raises
+    # TypeError and — if unfiltered — would skip the whole tee batch.
+    accepted = set(inspect.signature(record_rl_metrics).parameters) - {"meter"}
+    kwargs = {k: v for k, v in kwargs.items() if k in accepted}
     if not kwargs:
         return
     try:
