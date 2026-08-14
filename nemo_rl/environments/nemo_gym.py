@@ -731,7 +731,13 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     user_message,
                     images=images_this_turn,
                     processor=processor,
-                    pad_dynamic_image_shapes=self._pad_dynamic_image_shapes,
+                    # Read with a default, like _processor above: this method is
+                    # called unbound against lightweight stand-ins that define
+                    # only what they exercise, so a bare attribute access turns
+                    # an unrelated test into an AttributeError.
+                    pad_dynamic_image_shapes=getattr(
+                        self, "_pad_dynamic_image_shapes", False
+                    ),
                 )
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
