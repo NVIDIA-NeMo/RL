@@ -81,6 +81,211 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
 
 
+def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
+    fp8_module, monkeypatch
+):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(
+        fp8.AutoModel,
+        "from_config",
+        lambda *_args, **_kwargs: pytest.fail(
+            "ModelOpt ignore patterns must not depend on AutoModel names"
+        ),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+            "quantization_ignore_patterns": [
+                "model.layers.*.self_attn.*",
+                "model.layers.*.mlp.gate",
+                "lm_head",
+            ],
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    quant_config = vllm_kwargs["hf_overrides"]["quantization_config"]
+    assert quant_config["ignore"] == [
+        "model.layers.*.self_attn.*",
+        "model.layers.*.mlp.gate",
+        "lm_head",
+    ]
+    assert "ignored_layers" not in quant_config
+
+    modelopt_config = ModelOptMxFp8Config.from_config(quant_config)
+    qwen3_quantizable_families = {
+        "model.layers.0.self_attn.qkv_proj",
+        "model.layers.0.self_attn.o_proj",
+        "model.layers.0.mlp.gate",
+        "model.layers.0.mlp.experts",
+        "lm_head",
+    }
+    mxfp8_families = {
+        name
+        for name in qwen3_quantizable_families
+        if not modelopt_config.is_layer_excluded(name)
+    }
+    assert mxfp8_families == {"model.layers.0.mlp.experts"}
+    assert not modelopt_config.is_layer_excluded("model.layers.0.mlp.gate_up_proj")
+
+
+def test_init_fp8_keeps_regular_fp8_config_unchanged(fp8_module, monkeypatch):
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": False,
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    assert vllm_kwargs["hf_overrides"]["quantization_config"] == (
+        fp8.FP8_BLOCK_QUANT_KWARGS
+    )
+
+
+@pytest.mark.parametrize("patterns", ["lm_head", 1, {"lm_head"}])
+def test_init_fp8_rejects_non_list_modelopt_ignore_patterns(
+    fp8_module, monkeypatch, patterns
+):
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+
+    with pytest.raises(ValueError, match="list of strings"):
+        fp8.init_fp8(
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": "auto",
+                "async_engine": False,
+                "is_mx": True,
+                "quantization_ignore_patterns": patterns,
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+
+@pytest.mark.parametrize("pattern", ["", "   "])
+def test_init_fp8_rejects_empty_modelopt_ignore_pattern(
+    fp8_module, monkeypatch, pattern
+):
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    with pytest.raises(ValueError, match="non-empty strings"):
+        fp8.init_fp8(
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": "auto",
+                "async_engine": False,
+                "is_mx": True,
+                "quantization_ignore_patterns": [pattern],
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+
+def test_init_fp8_combines_legacy_and_modelopt_ignore_patterns(fp8_module, monkeypatch):
+    fp8 = fp8_module
+
+    class FakeModel:
+        def named_parameters(self):
+            return [
+                ("layers.0.self_attn.q_proj.weight", object()),
+                ("layers.0.mlp.experts.0.gate_proj.weight", object()),
+            ]
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8.AutoModel, "from_config", lambda *_args: FakeModel())
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+            "quantization_ignored_layer_kws": ["q_proj"],
+            "quantization_ignore_patterns": ["lm_head"],
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    quant_config = vllm_kwargs["hf_overrides"]["quantization_config"]
+    assert quant_config["ignore"] == [
+        "lm_head",
+        "model.layers.0.self_attn.q_proj",
+    ]
+
+
+def test_init_fp8_rejects_modelopt_ignore_patterns_for_regular_fp8(
+    fp8_module, monkeypatch
+):
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    with pytest.raises(ValueError, match="requires is_mx=True"):
+        fp8.init_fp8(
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": "auto",
+                "async_engine": False,
+                "is_mx": False,
+                "quantization_ignore_patterns": ["lm_head"],
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("is_gated", "intermediate_size", "hidden_size"),

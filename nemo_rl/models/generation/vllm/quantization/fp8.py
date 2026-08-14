@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from unittest.mock import patch
 
@@ -210,6 +211,21 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         is_mx = bool(vllm_cfg.get("is_mx"))
     else:
         is_mx = False
+    quantization_ignore_patterns = vllm_cfg.get("quantization_ignore_patterns")
+    if quantization_ignore_patterns is not None:
+        if not is_mx:
+            raise ValueError("quantization_ignore_patterns requires is_mx=True")
+        if isinstance(quantization_ignore_patterns, (str, bytes)) or not isinstance(
+            quantization_ignore_patterns, Sequence
+        ):
+            raise ValueError("quantization_ignore_patterns must be a list of strings")
+        if any(
+            not isinstance(pattern, str) or not pattern.strip()
+            for pattern in quantization_ignore_patterns
+        ):
+            raise ValueError(
+                "quantization_ignore_patterns must contain non-empty strings"
+            )
     fp8_config_kwargs = {
         "num_first_layers_in_bf16": vllm_cfg.get("num_first_layers_in_bf16", 0),
         "num_last_layers_in_bf16": vllm_cfg.get("num_last_layers_in_bf16", 0),
@@ -277,8 +293,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             bf16_params.extend(_get_params_in_layers(param_names, layers))
 
         fp8_block_quant_kwargs["ignored_layers"] = bf16_params
-    quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws", [])
-    if len(quantization_ignored_layer_kws):
+    quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws")
+    if quantization_ignored_layer_kws:
         with init_empty_weights():
             model = AutoModel.from_config(config)
         param_names = [
@@ -297,8 +313,19 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         else:
             fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
         print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
+    if quantization_ignore_patterns:
+        fp8_block_quant_kwargs.setdefault("ignore", []).extend(
+            quantization_ignore_patterns
+        )
+
     if "ignored_layers" in fp8_block_quant_kwargs:
-        fp8_block_quant_kwargs["ignore"] = fp8_block_quant_kwargs["ignored_layers"]
+        fp8_block_quant_kwargs.setdefault("ignore", []).extend(
+            fp8_block_quant_kwargs["ignored_layers"]
+        )
+    if "ignore" in fp8_block_quant_kwargs:
+        fp8_block_quant_kwargs["ignore"] = list(
+            dict.fromkeys(fp8_block_quant_kwargs["ignore"])
+        )
 
     # Return FP8 kwargs (precision=fp8 is required at this point)
     vllm_kwargs = {

@@ -58,6 +58,11 @@ MXFP8_CASES = {
         "async_engine": True,
         "tensor_parallel_size": 4,
         "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "model.layers.*.mlp.gate",
+            "lm_head",
+        ],
     },
     "grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout": {
         "nodes": 32,
@@ -66,6 +71,11 @@ MXFP8_CASES = {
         "async_engine": True,
         "tensor_parallel_size": 4,
         "moe_backend": "flashinfer_trtllm",
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "model.layers.*.mlp.gate",
+            "lm_head",
+        ],
     },
 }
 
@@ -122,12 +132,16 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
 
     assert vllm_cfg["precision"] == "fp8"
     assert vllm_cfg["is_mx"] is True
-    assert vllm_cfg["quantization_ignored_layer_kws"] == [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-    ]
+    if "ignore_patterns" in expected:
+        assert "quantization_ignored_layer_kws" not in vllm_cfg
+        assert vllm_cfg["quantization_ignore_patterns"] == expected["ignore_patterns"]
+    else:
+        assert vllm_cfg["quantization_ignored_layer_kws"] == [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+        ]
     assert cluster["num_nodes"] == expected["nodes"]
     assert cluster["gpus_per_node"] == expected["gpus_per_node"]
     assert cluster["segment_size"] == expected["segment_size"]
