@@ -69,6 +69,66 @@ def test_model_owned_mtp_loss_mask_packing_capability_is_detected():
     assert not _model_self_packs_mtp_loss_mask(object())
 
 
+def _conversion_task(megatron_param: str, hf_param) -> SimpleNamespace:
+    return SimpleNamespace(
+        global_param_name=megatron_param,
+        mapping=SimpleNamespace(hf_param=hf_param),
+    )
+
+
+def test_collect_mtp_hf_layer_names_covers_both_naming_schemes():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _collect_mtp_hf_layer_names,
+    )
+
+    tasks = [
+        None,  # dropped tasks are tolerated
+        # DeepSeek-style: megatron mtp.* exports as a trailing main-model
+        # layer index (num_hidden_layers=61 -> HF layer model.layers.61).
+        _conversion_task(
+            "mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight",
+            {
+                "gate": "model.layers.61.mlp.gate_proj.weight",
+                "up": "model.layers.61.mlp.up_proj.weight",
+            },
+        ),
+        # NemotronH-style: bare mtp. prefix survives into the HF name.
+        _conversion_task(
+            "mtp.layers.0.mtp_model_layer.layers.0.mlp.linear_fc1.weight",
+            "mtp.layers.0.mixer.up_proj.weight",
+        ),
+        # Qwen3.5-VL / EXAONE-style: megatron name carries a language_model.
+        # prefix before the mtp. segment; the HF name stays bare mtp.*.
+        _conversion_task(
+            "language_model.mtp.layers.1.mtp_model_layer.mlp.linear_fc1.weight",
+            "mtp.layers.1.mlp.up_proj.weight",
+        ),
+        # Main-model tasks must not contribute.
+        _conversion_task(
+            "decoder.layers.3.mlp.linear_fc1.weight",
+            {"gate": "model.layers.3.mlp.gate_proj.weight"},
+        ),
+        _conversion_task(
+            "embedding.word_embeddings.weight", "model.embed_tokens.weight"
+        ),
+    ]
+
+    assert _collect_mtp_hf_layer_names(tasks) == {
+        "model.layers.61",
+        "mtp.layers.0",
+        "mtp.layers.1",
+    }
+
+
+def test_collect_mtp_hf_layer_names_empty_inputs():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _collect_mtp_hf_layer_names,
+    )
+
+    assert _collect_mtp_hf_layer_names([]) == set()
+    assert _collect_mtp_hf_layer_names(None) == set()
+
+
 def test_regular_model_does_not_delegate_packing():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         _model_self_packs_for_cp,

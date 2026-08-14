@@ -494,11 +494,22 @@ class RayWorkerGroup:
 
         # Pool one IsolatedWorkerInitializer per unique pg_idx instead of one
         # per worker. All workers on a node share the same py_executable, so
-        # the initializer only needs that in its runtime_env — per-worker
+        # the initializer mostly needs only that in its runtime_env — per-worker
         # env_vars are passed through create_worker(). This reduces GCS actor
-        # registrations from N_workers to N_nodes.
+        # registrations from N_workers to N_nodes. The initializer does unpickle
+        # constructor arguments before it can create the real worker, so the
+        # import-related variables that trust_remote_code classes need to
+        # resolve their generated modules have to travel with it.
         unique_pg_indices = sorted({pg_idx for pg_idx, _ in bundle_indices_list})
-        initializer_runtime_env = {"py_executable": py_executable}
+        initializer_env_vars = {
+            key: env_vars[key]
+            for key in ("HF_HOME", "HF_MODULES_CACHE", "PYTHONPATH")
+            if key in env_vars
+        }
+        initializer_runtime_env = {
+            "py_executable": py_executable,
+            "env_vars": initializer_env_vars,
+        }
         self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
         for pg_idx in unique_pg_indices:
             # num_cpus=0 so the initializer doesn't consume a CPU slot — it

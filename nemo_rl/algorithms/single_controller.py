@@ -236,9 +236,13 @@ class SingleControllerActor:
             rollout_task.cancel()
             train_task.cancel()
             await asyncio.gather(rollout_task, train_task, return_exceptions=True)
-            self._logger.finish()
-            # Flush the last checkpoint's background finalization before exit.
-            await asyncio.to_thread(self._checkpointer.shutdown)
+            try:
+                self._weight_synchronizer.shutdown()
+            except Exception as e:  # teardown must not mask the original failure
+                print(f"Error during weight-synchronizer shutdown: {e}", flush=True)
+            finally:
+                self._logger.finish()
+                await asyncio.to_thread(self._checkpointer.shutdown)
 
         return {
             "train_steps": self._train_steps,

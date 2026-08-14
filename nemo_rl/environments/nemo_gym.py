@@ -126,6 +126,9 @@ class NemoGymConfig(TypedDict):
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
     ]  # For processor reconstruction inside the actor
+    pad_dynamic_image_shapes: NotRequired[
+        bool
+    ]  # Normalize heterogeneous image tensors while retaining exact imgs_sizes
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -244,6 +247,16 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     return images
 
 
+def _is_trainable_output_item(item: dict) -> bool:
+    """Report whether an output item becomes a trainable assistant turn.
+
+    The postprocess loop skips items whose ``generation_token_ids`` is missing
+    *or* empty, so per-turn image binning has to use the same predicate or the
+    two walks disagree and every later turn gets the wrong images.
+    """
+    return bool(item.get("generation_token_ids"))
+
+
 def _index_per_turn_images(
     output: list[dict],
     input_messages: list[dict] | None = None,
@@ -331,6 +344,7 @@ def _attach_multimodal_data_to_user_message(
     *,
     images: list[Image.Image],
     processor: Any,
+    pad_dynamic_image_shapes: bool = False,
 ) -> None:
     """Attach per-turn multimodal tensors to ``user_message``.
 
@@ -346,6 +360,7 @@ def _attach_multimodal_data_to_user_message(
         user_message,
         images=images,
         processor=processor,
+        pad_dynamic_image_shapes=pad_dynamic_image_shapes,
     )
 
 
@@ -355,6 +370,7 @@ class NemoGym(EnvironmentInterface):
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
@@ -402,6 +418,7 @@ class NemoGym(EnvironmentInterface):
         # Strip NeMo-RL-only training knobs that must not be forwarded to the
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
         initial_global_config_dict.pop("effort_levels", None)
+        initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
@@ -636,10 +653,7 @@ Depending on your data shape, you may want to change these values."""
 
             # Note that NeMo-Gym will only return token ids on "assistant" messages and not other message types.
             # Also skip if generation_token_ids is present but empty, e.g. all-EOS generation stripped to [] — torch.tensor([]) defaults to float32 and breaks batch dtype consistency.
-            if (
-                "generation_token_ids" not in output_item_dict
-                or not output_item_dict["generation_token_ids"]
-            ):
+            if not _is_trainable_output_item(output_item_dict):
                 continue
 
             assert (
@@ -717,6 +731,13 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     user_message,
                     images=images_this_turn,
                     processor=processor,
+                    # Read with a default, like _processor above: this method is
+                    # called unbound against lightweight stand-ins that define
+                    # only what they exercise, so a bare attribute access turns
+                    # an unrelated test into an AttributeError.
+                    pad_dynamic_image_shapes=getattr(
+                        self, "_pad_dynamic_image_shapes", False
+                    ),
                 )
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
@@ -957,6 +978,14 @@ def spinup_nemo_gym_actor(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    # Same treatment for the multimodal knobs: NemoGymConfig declares them as
+    # top-level fields, so populate them here instead of leaving the actor to
+    # read them back out of Gym's global config dict.
+    multimodal_flags: dict[str, bool] = {}
+    for _flag in ("pad_dynamic_image_shapes",):
+        _value = nemo_gym_dict.pop(_flag, None)
+        if _value is not None:
+            multimodal_flags[_flag] = bool(_value)
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
     # image-baked venvs instead of rebuilding them.
@@ -977,6 +1006,7 @@ def spinup_nemo_gym_actor(
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
+        **multimodal_flags,
     )
 
     nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
