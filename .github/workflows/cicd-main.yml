@@ -447,10 +447,20 @@ jobs:
           megatron_lm_dir="3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
           bash .github/scripts/checkout-megatron-lm-commit.sh "$megatron_lm_dir" "$MEGATRON_LM_COMMIT"
 
+      - name: Read uv version from Dockerfile
+        id: uv-version
+        run: |
+          uv_version="$(sed -nE 's/^ARG[[:space:]]+UV_VERSION=([^[:space:]#]+).*$/\1/p' docker/Dockerfile)"
+          if [[ ! "$uv_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid UV_VERSION from docker/Dockerfile: $uv_version" >&2
+            exit 1
+          fi
+          echo "version=$uv_version" >> "$GITHUB_OUTPUT"
+
       - name: Set up uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
-          version: "0.11.28"
+          version: ${{ steps.uv-version.outputs.version }}
           enable-cache: true
 
       - name: Generate lockfile
