@@ -234,6 +234,9 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     assert cluster["num_nodes"] == expected["nodes"]
     assert cluster["gpus_per_node"] == expected["gpus_per_node"]
     assert cluster["segment_size"] == expected["segment_size"]
+    assert f"SEGMENT_SIZE={expected['segment_size']}" in script_path.read_text(
+        encoding="utf-8"
+    )
     if expected.get("tensor_parallel_size") is not None:
         assert vllm_cfg["tensor_parallel_size"] == expected["tensor_parallel_size"]
     if expected["async_engine"] is not None:
