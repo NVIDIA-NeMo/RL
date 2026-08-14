@@ -77,12 +77,15 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     # Apply backend specific post processing and then convert to linearized uint8 tensor.
                     # contiguous() is required because the upstream iterator may
                     # yield non-contiguous tensors that view(...) cannot handle.
-                    tensor = (
-                        post_iter_func(next(iterator))
-                        .contiguous()
-                        .reshape(-1)
-                        .view(torch.uint8)
-                    )
+                    tensor = post_iter_func(next(iterator))
+                    if tensor.device.type != "cuda":
+                        # Everything here is concatenated into one buffer and
+                        # broadcast over a CUDA collective, so a single host
+                        # tensor anywhere in the stream fails the cat. The
+                        # producer owns its buffer's device rather than
+                        # trusting every upstream exporter to agree.
+                        tensor = tensor.to(torch.cuda.current_device())
+                    tensor = tensor.contiguous().reshape(-1).view(torch.uint8)
                     packing_tensor_list[buffer_idx].append(tensor)
                     packing_tensor_sizes[buffer_idx] += tensor.numel()
                     if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:

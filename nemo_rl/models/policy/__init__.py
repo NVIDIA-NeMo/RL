@@ -354,6 +354,15 @@ class MegatronConfig(TypedDict):
     # Attention context-parallel communication type. Valid MCore values include
     # "p2p", "all_gather", "a2a", and "a2a+p2p"; null uses MCore's default.
     cp_comm_type: NotRequired[str | list[str] | None]
+    # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
+    # provider's checkpoint/default value.
+    radio_force_cpe_eval_mode: NotRequired[bool]
+    # Nemotron Omni tower freeze booleans. Omit any field to retain the model
+    # provider's checkpoint/default value.
+    freeze_vision_model: NotRequired[bool]
+    freeze_vision_projection: NotRequired[bool]
+    freeze_sound_encoder: NotRequired[bool]
+    freeze_sound_projection: NotRequired[bool]
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool

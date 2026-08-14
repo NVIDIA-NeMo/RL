@@ -315,6 +315,10 @@ class GRPOSaveState:
     total_steps: int
     total_valid_tokens: int  # Track total number of non-padding tokens during training
     val_reward: float  # May be removed when no validation metrics are available
+    # SingleController only: name of the sampler that wrote the replay buffer,
+    # used to gate the SC buffer restore. None on checkpoints from the other
+    # algorithms and from SC runs that predate this field.
+    sampler_name: Optional[str] = None
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:
@@ -325,6 +329,7 @@ def _initial_grpo_save_state() -> GRPOSaveState:
         total_steps=0,
         total_valid_tokens=0,
         val_reward=-99999999.0,
+        sampler_name=None,
     )
 
 
@@ -382,6 +387,17 @@ def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
             "grpo.deduplicate_multimodal_data=true is currently supported "
             "only when data_plane.enabled=false."
         )
+
+
+def _needs_hf_refit_handshake(
+    generation_backend: str,
+    nccl_reshard_refit_enabled: bool,
+    colocated_inference: bool,
+) -> bool:
+    """Whether setup must run the HF-schema prepare_refit_info handshake."""
+    if generation_backend == "megatron":
+        return False
+    return not (nccl_reshard_refit_enabled and not colocated_inference)
 
 
 def setup(
@@ -1530,7 +1546,9 @@ def setup(
             flush=True,
         )
     else:
-        if not (nccl_reshard_refit_enabled and not colocated_inference):
+        if _needs_hf_refit_handshake(
+            backend, nccl_reshard_refit_enabled, colocated_inference
+        ):
             state_dict_info = policy.prepare_refit_info()
             if policy_generation is not None:
                 policy_generation.prepare_refit_info(state_dict_info)
