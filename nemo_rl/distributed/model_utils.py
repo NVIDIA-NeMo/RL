@@ -2003,9 +2003,16 @@ def get_distillation_topk_logprobs_from_logits(
 
         # Non-distributed processing
         else:
-            # teacher_topk_indices are distinct per position (torch.topk), so the
-            # gather backward scatters rather than accumulates and this stays
-            # bitwise equal to gathering from an fp32 copy.
+            # Gathering K columns and then widening is bitwise equal to
+            # widening the whole vocab axis first: bf16 -> fp32 is exact and
+            # gather is pure selection.
+            #
+            # Duplicate indices do occur -- padded sequence positions carry K
+            # copies of index 0, because dtensor_policy_worker.py pads
+            # topk_indices with value=0 -- so the gather backward accumulates
+            # there rather than scattering. The equality holds anyway, because
+            # DistillationLossFn masks those positions to exactly 0.0 before
+            # reduction, so the accumulated gradient is zero either way.
             student_topk_logits = student_logits.gather(
                 dim=-1, index=teacher_topk_indices
             ).to(torch.float32)
