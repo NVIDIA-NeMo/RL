@@ -39,6 +39,15 @@ on:
         required: false
         default: ""
         type: string
+      functional_test_platform:
+        description: "Platform on which to run functional tests. Lfast supports all and h100."
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - h100
+          - gb200
       megatron_lm_commit:
         description: "Full Megatron-LM commit SHA to check out in the Megatron-Bridge submodule."
         required: false
@@ -63,6 +72,11 @@ jobs:
       test_level: ${{ steps.evaluate.outputs.test_level }}
       image_tag: ${{ steps.evaluate.outputs.image_tag }}
       functional_test_script_pattern: ${{ steps.evaluate.outputs.functional_test_script_pattern }}
+      functional_test_platform: ${{ steps.evaluate.outputs.functional_test_platform }}
+      h100_functional_test_scripts: ${{ steps.evaluate.outputs.h100_functional_test_scripts }}
+      h100_functional_test_count: ${{ steps.evaluate.outputs.h100_functional_test_count }}
+      gb200_functional_test_scripts: ${{ steps.evaluate.outputs.gb200_functional_test_scripts }}
+      gb200_functional_test_count: ${{ steps.evaluate.outputs.gb200_functional_test_count }}
       megatron_lm_commit: ${{ steps.evaluate.outputs.megatron_lm_commit }}
       base_ref: ${{ steps.base-head-ref.outputs.base_ref }}
       base_sha: ${{ steps.base-head-ref.outputs.base_sha }}
@@ -143,6 +157,7 @@ jobs:
           DISPATCH_TEST_LEVEL: ${{ inputs.test_to_run }}
           DISPATCH_IMAGE_TAG: ${{ inputs.image_tag }}
           FUNCTIONAL_TEST_SCRIPT_PATTERN: ${{ inputs.functional_test_script_pattern }}
+          FUNCTIONAL_TEST_PLATFORM: ${{ inputs.functional_test_platform || 'all' }}
           MEGATRON_LM_COMMIT: ${{ inputs.megatron_lm_commit }}
         run: |
           # Some output that's helpful for debugging
@@ -193,30 +208,18 @@ jobs:
             exit 1
           fi
 
-          if [[ "$TEST_LEVEL" == "megatron" || -n "$FUNCTIONAL_TEST_SCRIPT_PATTERN" ]]; then
-            match_count=0
-            while IFS= read -r script; do
-              script_lower="${script,,}"
-              if [[ "$TEST_LEVEL" == "megatron" && "$script_lower" != *megatron* ]]; then
-                continue
-              fi
-              if [[ -n "$FUNCTIONAL_TEST_SCRIPT_PATTERN" && "$script_lower" != *"${FUNCTIONAL_TEST_SCRIPT_PATTERN,,}"* ]]; then
-                continue
-              fi
-              ((match_count += 1))
-            done < <(
-              grep -E '^[[:space:]]*-[[:space:]]*script:[[:space:]]*L1_Functional' .github/workflows/cicd-main.yml |
-                sed -E 's/^[[:space:]]*-[[:space:]]*script:[[:space:]]*//' | sort -u
-            )
-            if ((match_count == 0)); then
-              echo "No functional test scripts match the requested selection." >&2
-              exit 1
-            fi
-          fi
+          functional_test_plan=$(bash .github/scripts/plan-functional-tests.sh \
+            "$TEST_LEVEL" "$FUNCTIONAL_TEST_SCRIPT_PATTERN" "$FUNCTIONAL_TEST_PLATFORM")
+          echo "Functional test plan: $functional_test_plan"
 
           {
             echo "test_level=$TEST_LEVEL"
             echo "functional_test_script_pattern=$FUNCTIONAL_TEST_SCRIPT_PATTERN"
+            echo "functional_test_platform=$FUNCTIONAL_TEST_PLATFORM"
+            echo "h100_functional_test_scripts=$(jq -c '.h100' <<< "$functional_test_plan")"
+            echo "h100_functional_test_count=$(jq -r '.h100_count' <<< "$functional_test_plan")"
+            echo "gb200_functional_test_scripts=$(jq -c '.gb200' <<< "$functional_test_plan")"
+            echo "gb200_functional_test_count=$(jq -r '.gb200_count' <<< "$functional_test_plan")"
             echo "megatron_lm_commit=${MEGATRON_LM_COMMIT,,}"
           } | tee -a "$GITHUB_OUTPUT"
 
@@ -462,6 +465,7 @@ jobs:
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
         needs.pre-flight.outputs.test_level != 'none' &&
+        (needs.pre-flight.outputs.test_level != 'megatron' || needs.pre-flight.outputs.h100_functional_test_count != '0') &&
         needs.pre-flight.outputs.image_tag == '' &&
         (needs.prepare-megatron-lock.result == 'success' || needs.prepare-megatron-lock.result == 'skipped') &&
         (
@@ -508,6 +512,7 @@ jobs:
         needs.org-member-pre-flight.outputs.is_member == 'true' &&
         vars.DISABLE_GB200_TESTS != 'true' &&
         contains('L1 L2 megatron', needs.pre-flight.outputs.test_level) &&
+        needs.pre-flight.outputs.gb200_functional_test_count != '0' &&
         (needs.prepare-megatron-lock.result == 'success' || needs.prepare-megatron-lock.result == 'skipped') &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
@@ -805,75 +810,41 @@ jobs:
         with:
           ref: ${{ needs.pre-flight.outputs.test_sha }}
 
-      - name: Verify L1 functional scripts are in the workflow
+      - name: Verify functional test planner coverage
         run: |
           set -euo pipefail
 
           expected=$(mktemp)
-          configured=$(mktemp)
+          planned=$(mktemp)
 
           find tests/functional -maxdepth 1 -type f -name 'L1_Functional*.sh' \
             -exec basename {} .sh \; | sort -u > "$expected"
 
-          {
-            grep -E '^[[:space:]]*-[[:space:]]*script:[[:space:]]*L1_Functional' .github/workflows/cicd-main.yml || true
-          } | sed -E 's/^[[:space:]]*-[[:space:]]*script:[[:space:]]*//' | sort -u > "$configured"
+          bash .github/scripts/plan-functional-tests.sh L1 "" gb200 |
+            jq -r '.gb200[]' | sort -u > "$planned"
 
-          missing=$(comm -23 "$expected" "$configured")
+          missing=$(comm -23 "$expected" "$planned")
           if [[ -n "$missing" ]]; then
-            echo "The following tests/functional/L1_Functional*.sh scripts are missing from .github/workflows/cicd-main.yml:"
+            echo "The following functional scripts are missing from the generated test plan:"
             printf '%s\n' "$missing"
             exit 1
           fi
 
-          echo "All L1 functional scripts are included in .github/workflows/cicd-main.yml."
+          echo "All L1 functional scripts are included in the generated test plan."
 
   cicd-functional-tests:
     strategy:
       fail-fast: false
       max-parallel: 16
       matrix:
-        include:
-          - script: L1_Functional_Tests_Megatron_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Megatron_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Megatron_3
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Megatron_4
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_AutoModel
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_SGLang
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Trtllm
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Gym
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_GRPO_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_GRPO_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_GRPO_3
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_SFT
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_PPO
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_SingleController
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Eval
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Other_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Other_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+        script: ${{ fromJSON(needs.pre-flight.outputs.h100_functional_test_scripts) }}
     needs: [pre-flight, prepare-megatron-lock, build-container, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
     if: >-
       ${{
         always() &&
         contains('L1 L2 megatron', needs.pre-flight.outputs.test_level) &&
+        needs.pre-flight.outputs.h100_functional_test_count != '0' &&
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
         (needs.prepare-megatron-lock.result == 'success' || needs.prepare-megatron-lock.result == 'skipped') &&
@@ -889,18 +860,16 @@ jobs:
         needs.functional-test-script-check.result == 'success' &&
         !cancelled()
       }}
-    name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
+    name: ${{ matrix.script }}
     steps:
       - name: Checkout
-        if: ${{ (needs.pre-flight.outputs.test_level != 'megatron' || contains(matrix.script, 'megatron')) && (needs.pre-flight.outputs.functional_test_script_pattern == '' || contains(matrix.script, needs.pre-flight.outputs.functional_test_script_pattern)) }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: main
-        if: ${{ (needs.pre-flight.outputs.test_level != 'megatron' || contains(matrix.script, 'megatron')) && (needs.pre-flight.outputs.functional_test_script_pattern == '' || contains(matrix.script, needs.pre-flight.outputs.functional_test_script_pattern)) }}
         uses: ./.github/actions/test-template
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
-          runner: ${{ matrix.runner }}
+          runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
@@ -914,49 +883,14 @@ jobs:
       fail-fast: false
       max-parallel: 16
       matrix:
-        include:
-          - script: L1_Functional_Tests_Megatron_1
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_Megatron_2
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_Megatron_3
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_Megatron_4
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_AutoModel
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_SGLang
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_Trtllm
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_Gym
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_GRPO_1
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_GRPO_2
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_GRPO_3
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_SFT
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_PPO
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_SingleController
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_Eval
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_Other_1
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_Other_2
-            runner: ${{ vars.GB200_RUNNER }}
-          - script: L1_Functional_Tests_GB200_MXFP8
-            runner: ${{ vars.GB200_RUNNER }}
+        script: ${{ fromJSON(needs.pre-flight.outputs.gb200_functional_test_scripts) }}
     needs: [pre-flight, prepare-megatron-lock, build-container-gb200, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ vars.GB200_RUNNER }}
     if: >-
       ${{
         always() &&
         contains('L1 L2 megatron', needs.pre-flight.outputs.test_level) &&
+        needs.pre-flight.outputs.gb200_functional_test_count != '0' &&
         needs.org-member-pre-flight.outputs.is_member == 'true' &&
         vars.DISABLE_GB200_TESTS != 'true' &&
         needs.pre-flight.result == 'success' &&
@@ -974,18 +908,16 @@ jobs:
         needs.functional-test-script-check.result == 'success' &&
         !cancelled()
       }}
-    name: gb200_${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
+    name: gb200_${{ matrix.script }}
     steps:
       - name: Checkout
-        if: ${{ (needs.pre-flight.outputs.test_level != 'megatron' || contains(matrix.script, 'megatron')) && (needs.pre-flight.outputs.functional_test_script_pattern == '' || contains(matrix.script, needs.pre-flight.outputs.functional_test_script_pattern)) }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: main
-        if: ${{ (needs.pre-flight.outputs.test_level != 'megatron' || contains(matrix.script, 'megatron')) && (needs.pre-flight.outputs.functional_test_script_pattern == '' || contains(matrix.script, needs.pre-flight.outputs.functional_test_script_pattern)) }}
         uses: ./.github/actions/test-template
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
-          runner: ${{ matrix.runner }}
+          runner: ${{ vars.GB200_RUNNER }}
           registry: ${{ needs.gb200-config.outputs.registry }}
           image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
@@ -999,46 +931,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - script: L1_Functional_Tests_Megatron_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Megatron_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Megatron_3
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Megatron_4
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_AutoModel
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_SGLang
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Trtllm
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Gym
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_GRPO_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_GRPO_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_GRPO_3
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_SFT
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_PPO
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_SingleController
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Eval
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Other_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Other_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+        script: ${{ fromJSON(needs.pre-flight.outputs.h100_functional_test_scripts) }}
     needs: [pre-flight, prepare-megatron-lock, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
     if: >-
       ${{
         always() &&
         contains('Lfast', needs.pre-flight.outputs.test_level) &&
+        needs.pre-flight.outputs.h100_functional_test_count != '0' &&
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
         (needs.prepare-megatron-lock.result == 'success' || needs.prepare-megatron-lock.result == 'skipped') &&
@@ -1049,19 +948,17 @@ jobs:
         needs.functional-test-script-check.result == 'success' &&
         !cancelled()
       }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
     name: fast_${{ matrix.script }}
     steps:
       - name: Checkout
-        if: ${{ needs.pre-flight.outputs.functional_test_script_pattern == '' || contains(matrix.script, needs.pre-flight.outputs.functional_test_script_pattern) }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: main
-        if: ${{ needs.pre-flight.outputs.functional_test_script_pattern == '' || contains(matrix.script, needs.pre-flight.outputs.functional_test_script_pattern) }}
         uses: ./.github/actions/test-template
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
-          runner: ${{ matrix.runner }}
+          runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           script: ${{ matrix.script }}
           image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
@@ -1125,16 +1022,24 @@ jobs:
                     ) &&
                     (
                       !contains('L1 L2 megatron', needs.pre-flight.outputs.test_level) ||
+                      needs.pre-flight.outputs.h100_functional_test_count == '0' ||
                       needs.cicd-functional-tests.result == 'success'
                     ) &&
                     (
-                      needs.org-member-pre-flight.outputs.is_member != 'true' ||
-                      vars.DISABLE_GB200_TESTS == 'true' ||
+                      (
+                        needs.pre-flight.outputs.functional_test_platform != 'gb200' &&
+                        (
+                          needs.org-member-pre-flight.outputs.is_member != 'true' ||
+                          vars.DISABLE_GB200_TESTS == 'true'
+                        )
+                      ) ||
                       !contains('L1 L2 megatron', needs.pre-flight.outputs.test_level) ||
+                      needs.pre-flight.outputs.gb200_functional_test_count == '0' ||
                       needs.cicd-functional-tests-gb200.result == 'success'
                     ) &&
                     (
                       !contains('Lfast', needs.pre-flight.outputs.test_level) ||
+                      needs.pre-flight.outputs.h100_functional_test_count == '0' ||
                       needs.cicd-fast-functional-tests.result == 'success'
                     )
                   )
