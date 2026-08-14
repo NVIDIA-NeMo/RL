@@ -86,12 +86,118 @@ def test_top_level_config_paths_conflicts_with_shards():
         parse_shard_plan(_sharded_config(config_paths=["gym.yaml"]))
 
 
-def test_stray_entry_overlay_is_rejected():
-    """A top-level Gym overlay has no unambiguous shard, so it must be placed."""
-    with pytest.raises(ShardConfigError, match="nl2bash_judge_model"):
+def test_multi_shard_plan_rejects_an_unclaimed_inherited_overlay():
+    with pytest.raises(ShardConfigError, match="have no owner"):
         parse_shard_plan(
             _sharded_config(
                 nl2bash_judge_model={"responses_api_models": {"local_vllm_model": {}}}
+            )
+        )
+
+
+def test_single_shard_plan_automatically_claims_every_inherited_overlay():
+    plan = parse_shard_plan(
+        _sharded_config(
+            shards=[{"name": "only", "config_paths": ["gym.yaml"]}],
+            policy_model={"responses_api_models": {"vllm_model": {"num_workers": 4}}},
+            math={"resources_servers": {"math": {"workers": 8}}},
+        )
+    )
+
+    assert plan.shards[0].inherited_overlays == frozenset({"math", "policy_model"})
+    merged = apply_shard_overlay(
+        _sharded_config(
+            shards=[],
+            policy_model={"responses_api_models": {"vllm_model": {"num_workers": 4}}},
+            math={"resources_servers": {"math": {"workers": 8}}},
+        ),
+        plan,
+        plan.shards[0],
+    )
+    assert (
+        merged["policy_model"]["responses_api_models"]["vllm_model"]["num_workers"] == 4
+    )
+    assert merged["math"]["resources_servers"]["math"]["workers"] == 8
+
+
+def test_multi_shard_plan_routes_inherited_overlays_by_key():
+    policy_model = {"responses_api_models": {"vllm_model": {"num_workers": 4}}}
+    judged = {"resources_servers": {"judge": {"workers": 8}}}
+    tools = {"resources_servers": {"tools": {"workers": 16}}}
+    config = _sharded_config(
+        shards=[
+            {
+                "name": "judged",
+                "config_paths": ["judge.yaml"],
+                "inherited_overlays": ["judged"],
+            },
+            {
+                "name": "tools",
+                "config_paths": ["tools.yaml"],
+                "inherited_overlays": ["tools"],
+            },
+        ],
+        common_inherited_overlays=["policy_model"],
+        policy_model=policy_model,
+        judged=judged,
+        tools=tools,
+    )
+
+    plan = parse_shard_plan(config)
+    judged_config = apply_shard_overlay(config, plan, plan.shards[0])
+    tools_config = apply_shard_overlay(config, plan, plan.shards[1])
+
+    assert judged_config["policy_model"] == policy_model
+    assert judged_config["judged"] == judged
+    assert "tools" not in judged_config
+    assert tools_config["policy_model"] == policy_model
+    assert tools_config["tools"] == tools
+    assert "judged" not in tools_config
+    for merged in (judged_config, tools_config):
+        assert "shards" not in merged
+        assert "common_inherited_overlays" not in merged
+
+
+def test_inherited_overlay_claims_must_be_known_and_unique():
+    config = _sharded_config(
+        shards=[
+            {
+                "name": "judged",
+                "config_paths": ["judge.yaml"],
+                "inherited_overlays": ["missing"],
+            },
+            {"name": "tools", "config_paths": ["tools.yaml"]},
+        ],
+        policy_model={"responses_api_models": {}},
+    )
+    with pytest.raises(ShardConfigError, match="Available overlays.*policy_model"):
+        parse_shard_plan(config)
+
+    config["shards"][0]["inherited_overlays"] = ["policy_model"]
+    config["shards"][1]["inherited_overlays"] = ["policy_model"]
+    with pytest.raises(ShardConfigError, match="duplicate claims.*policy_model"):
+        parse_shard_plan(config)
+
+
+def test_inherited_overlay_lists_require_unique_non_empty_strings():
+    with pytest.raises(ShardConfigError, match="list of non-empty strings"):
+        parse_shard_plan(
+            _sharded_config(
+                shards=[
+                    {
+                        "name": "only",
+                        "config_paths": ["gym.yaml"],
+                        "inherited_overlays": [""],
+                    }
+                ]
+            )
+        )
+
+    with pytest.raises(ShardConfigError, match="contains duplicate keys"):
+        parse_shard_plan(
+            _sharded_config(
+                shards=[{"name": "only", "config_paths": ["gym.yaml"]}],
+                common_inherited_overlays=["policy_model", "policy_model"],
             )
         )
 
@@ -227,6 +333,35 @@ def test_apply_shard_overlay_layers_shard_over_common():
     assert merged["shared_judge"] == {"replicas": 1}
 
 
+def test_explicit_overrides_layer_over_inherited_values():
+    base = {
+        "policy_model": {
+            "responses_api_models": {"vllm_model": {"num_workers": 2, "timeout": 30}}
+        }
+    }
+    plan = ShardPlan(
+        shards=[],
+        common_inherited_overlays=frozenset({"policy_model"}),
+        common_overrides={
+            "policy_model": {"responses_api_models": {"vllm_model": {"num_workers": 4}}}
+        },
+    )
+    shard = ShardSpec(
+        name="judged",
+        config_paths=["judge.yaml"],
+        overrides={
+            "policy_model": {"responses_api_models": {"vllm_model": {"num_workers": 8}}}
+        },
+    )
+
+    merged = apply_shard_overlay(base, plan, shard)
+
+    assert merged["policy_model"]["responses_api_models"]["vllm_model"] == {
+        "num_workers": 8,
+        "timeout": 30,
+    }
+
+
 def test_apply_shard_overlay_applies_per_shard_port_range():
     shard = ShardSpec(
         name="ci",
@@ -295,6 +430,7 @@ def test_find_gym_config_entries_ignores_scalars_and_known_keys():
             "uv_venv_dir": "/opt/venvs",
             "num_gpu_nodes": 2,
             "shards": [{"name": "a"}],
+            "common_inherited_overlays": ["genrm_model"],
             "common_overrides": {"x": 1},
             "allowed_duplicate_entries": ["policy_model"],
             "genrm_model": {"responses_api_models": {}},

@@ -24,7 +24,7 @@ into a shard's merge is opaque Gym config, and validation compares entry
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import Any, Mapping
 
@@ -36,7 +36,12 @@ from omegaconf import OmegaConf
 # top-level keys as server instance configs, which can trip its
 # error_on_almost_servers path.
 SHARDING_CONFIG_KEYS = frozenset(
-    {"shards", "common_overrides", "allowed_duplicate_entries"}
+    {
+        "shards",
+        "common_inherited_overlays",
+        "common_overrides",
+        "allowed_duplicate_entries",
+    }
 )
 
 DEFAULT_REPLICAS = 1
@@ -52,6 +57,7 @@ SHARD_SPEC_KEYS = frozenset(
     {
         "name",
         "config_paths",
+        "inherited_overlays",
         "overrides",
         "replicas",
         "actor_cpus",
@@ -75,6 +81,7 @@ class ShardSpec:
 
     name: str
     config_paths: list[str]
+    inherited_overlays: frozenset[str] = frozenset()
     overrides: dict[str, Any] = field(default_factory=dict)
     replicas: int = DEFAULT_REPLICAS
     actor_cpus: float | None = None
@@ -87,6 +94,7 @@ class ShardPlan:
     """The parsed ``shards`` block plus the settings that apply to all shards."""
 
     shards: list[ShardSpec]
+    common_inherited_overlays: frozenset[str] = frozenset()
     common_overrides: dict[str, Any] = field(default_factory=dict)
     allowed_duplicate_entries: frozenset[str] = frozenset()
 
@@ -107,6 +115,21 @@ def _as_plain_dict(value: Any, *, context: str) -> dict[str, Any]:
             f"{context} must be a mapping, got {type(value).__name__}"
         )
     return dict(value)
+
+
+def _as_string_set(value: Any, *, context: str) -> frozenset[str]:
+    """Coerce a list of unique strings to a set."""
+    if value is None:
+        return frozenset()
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    if not isinstance(value, list) or not all(
+        isinstance(entry, str) and entry for entry in value
+    ):
+        raise ShardConfigError(f"{context} must be a list of non-empty strings")
+    if len(value) != len(set(value)):
+        raise ShardConfigError(f"{context} contains duplicate keys")
+    return frozenset(value)
 
 
 def _parse_shard(raw: Any, index: int) -> ShardSpec:
@@ -182,6 +205,10 @@ def _parse_shard(raw: Any, index: int) -> ShardSpec:
     return ShardSpec(
         name=name,
         config_paths=list(config_paths),
+        inherited_overlays=_as_string_set(
+            entry.get("inherited_overlays"),
+            context=f"shard '{name}' inherited_overlays",
+        ),
         overrides=_as_plain_dict(
             entry.get("overrides"), context=f"shard '{name}' overrides"
         ),
@@ -197,8 +224,8 @@ def find_gym_config_entries(nemo_gym_config: Mapping[str, Any]) -> list[str]:
 
     Mirrors Gym's own rule (``filter_for_server_instance_configs``): any
     dict-shaped top-level key that is not a known setting is an entry overlay.
-    Under sharding these are ambiguous — they have no shard to belong to — so
-    the caller rejects them and asks the author to place them explicitly.
+    Under sharding these values are inherited from the resolved parent config.
+    A shard claims them by key so their YAML bodies do not need to be copied.
     """
     return sorted(
         key
@@ -228,24 +255,13 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
     if not isinstance(raw_shards, list) or not raw_shards:
         raise ShardConfigError("env.nemo_gym.shards must be a non-empty list")
 
-    # Anything whose scope would be implicit has to be placed by hand: a
-    # top-level config_paths or entry overlay could plausibly belong to one
-    # shard or to all of them, and guessing wrong silently changes what each
-    # actor hosts.
+    # A top-level config_paths could plausibly belong to one shard or all of
+    # them, so its scope must remain explicit.
     if "config_paths" in nemo_gym_config:
         raise ShardConfigError(
             "env.nemo_gym.config_paths cannot be combined with 'shards'. "
             "Move each path into the shard that should host it."
         )
-    stray_entries = find_gym_config_entries(nemo_gym_config)
-    if stray_entries:
-        raise ShardConfigError(
-            f"Gym config overlays {stray_entries} sit at the top level alongside "
-            f"'shards', so their scope is ambiguous. Move each one into "
-            f"'common_overrides' (to apply to every shard) or into the "
-            f"'overrides' of the shard that hosts it."
-        )
-
     shards = [_parse_shard(raw, index) for index, raw in enumerate(raw_shards)]
 
     duplicate_names = sorted(
@@ -257,6 +273,49 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
     )
     if duplicate_names:
         raise ShardConfigError(f"Duplicate shard names: {duplicate_names}")
+
+    inherited_inventory = frozenset(find_gym_config_entries(nemo_gym_config))
+    common_inherited = _as_string_set(
+        nemo_gym_config.get("common_inherited_overlays"),
+        context="env.nemo_gym.common_inherited_overlays",
+    )
+    claims: dict[str, list[str]] = {}
+    for key in common_inherited:
+        claims.setdefault(key, []).append("common_inherited_overlays")
+    for shard in shards:
+        for key in shard.inherited_overlays:
+            claims.setdefault(key, []).append(f"shard '{shard.name}'")
+
+    unknown = sorted(set(claims) - inherited_inventory)
+    if unknown:
+        raise ShardConfigError(
+            f"Inherited overlay keys {unknown} do not exist in the resolved "
+            f"env.nemo_gym config. Available overlays: {sorted(inherited_inventory)}."
+        )
+
+    duplicated = {
+        key: owners for key, owners in sorted(claims.items()) if len(owners) > 1
+    }
+    if duplicated:
+        raise ShardConfigError(
+            "Each inherited Gym overlay must be claimed once; duplicate claims: "
+            f"{duplicated}."
+        )
+
+    unclaimed = inherited_inventory - set(claims)
+    if len(shards) == 1:
+        if unclaimed:
+            shards[0] = replace(
+                shards[0],
+                inherited_overlays=shards[0].inherited_overlays | unclaimed,
+            )
+    elif unclaimed:
+        raise ShardConfigError(
+            f"Inherited Gym overlays {sorted(unclaimed)} have no owner. List each "
+            f"key under one shard's 'inherited_overlays' or under "
+            f"'common_inherited_overlays'. Complete overlay inventory: "
+            f"{sorted(inherited_inventory)}."
+        )
 
     raw_allowed = nemo_gym_config.get("allowed_duplicate_entries") or []
     if OmegaConf.is_config(raw_allowed):
@@ -270,6 +329,7 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
 
     return ShardPlan(
         shards=shards,
+        common_inherited_overlays=common_inherited,
         common_overrides=_as_plain_dict(
             nemo_gym_config.get("common_overrides"), context="common_overrides"
         ),
@@ -280,15 +340,27 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
 def apply_shard_overlay(
     base_config: dict[str, Any], plan: ShardPlan, shard: ShardSpec
 ) -> dict[str, Any]:
-    """Build one shard's Gym config: base, then common overrides, then the shard's.
+    """Build one shard's Gym config from shared settings and its claimed overlays.
 
     The ``config_paths`` merge itself still happens inside Gym, exactly as for
-    an unsharded job; this only settles which paths and overlays that shard
-    starts from. Per-shard overrides win over ``common_overrides`` on conflict.
+    an unsharded job. Dict-shaped entries inherited from a parent recipe are
+    removed from the shared base and restored only for the shards that claim
+    them. Explicit overrides win over inherited values.
     """
+    inherited_entries = set(find_gym_config_entries(base_config))
+    shared_base = {
+        key: value
+        for key, value in base_config.items()
+        if key not in inherited_entries and key not in SHARDING_CONFIG_KEYS
+    }
+    selected_inherited = {
+        key: base_config[key]
+        for key in plan.common_inherited_overlays | shard.inherited_overlays
+    }
     merged = OmegaConf.to_container(
         OmegaConf.merge(
-            OmegaConf.create(base_config),
+            OmegaConf.create(shared_base),
+            OmegaConf.create(selected_inherited),
             OmegaConf.create(plan.common_overrides),
             OmegaConf.create(shard.overrides),
         ),
