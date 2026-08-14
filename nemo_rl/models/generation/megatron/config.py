@@ -48,7 +48,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
 
-    refit_backend: Literal["gloo", "nccl", "nvshmem"]
+    refit_backend: Literal["gloo", "nccl"]
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
