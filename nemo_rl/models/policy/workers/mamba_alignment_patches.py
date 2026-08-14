@@ -30,6 +30,8 @@ import torch.nn.functional as F
 _MAMBA_MIXER_MODULE: Optional[ModuleType] = None
 _ORIGINAL_SSM_PREFILL: Optional[Callable[..., torch.Tensor]] = None
 _ORIGINAL_SSM_DECODE: Optional[Callable[..., torch.Tensor]] = None
+_ORIGINAL_GET_MAMBA_VERSION: Optional[Callable[..., Any]] = None
+_MAMBA_UTILS_MODULE: Optional[ModuleType] = None
 
 _EXPECTED_PREFILL_PARAMETERS = (
     "self",
@@ -41,9 +43,9 @@ _EXPECTED_PREFILL_PARAMETERS = (
     "batch_indices",
     "intermediate_chunk_indices",
     "intermediate_abs_positions",
+    "intermediate_real_count",
     "intermediate_ssm_out",
     "intermediate_conv_out",
-    "conv_gather_offsets",
     "cu_chunk_seqlens",
     "last_chunk_indices",
     "seq_idx_for_varlen",
@@ -590,9 +592,9 @@ def _nrl_patched_ssm_prefill(
     batch_indices: Optional[torch.Tensor] = None,
     intermediate_chunk_indices: Optional[torch.Tensor] = None,
     intermediate_abs_positions: Optional[torch.Tensor] = None,
+    intermediate_real_count: Optional[torch.Tensor] = None,
     intermediate_ssm_out: Optional[torch.Tensor] = None,
     intermediate_conv_out: Optional[torch.Tensor] = None,
-    conv_gather_offsets: Optional[torch.Tensor] = None,
     cu_chunk_seqlens: Optional[torch.Tensor] = None,
     last_chunk_indices: Optional[torch.Tensor] = None,
     seq_idx_for_varlen: Optional[torch.Tensor] = None,
@@ -615,9 +617,9 @@ def _nrl_patched_ssm_prefill(
             batch_indices=batch_indices,
             intermediate_chunk_indices=intermediate_chunk_indices,
             intermediate_abs_positions=intermediate_abs_positions,
+            intermediate_real_count=intermediate_real_count,
             intermediate_ssm_out=intermediate_ssm_out,
             intermediate_conv_out=intermediate_conv_out,
-            conv_gather_offsets=conv_gather_offsets,
             cu_chunk_seqlens=cu_chunk_seqlens,
             last_chunk_indices=last_chunk_indices,
             seq_idx_for_varlen=seq_idx_for_varlen,
@@ -754,6 +756,61 @@ def _validate_method_signature(
         )
 
 
+def _nrl_get_mamba_version() -> Any:
+    """Read ``mamba_ssm`` version from package metadata without importing it.
+
+    ``import mamba_ssm`` pulls ``mamba3`` → ``tilelang`` → ``tvm``, which crashes
+    on Python 3.13 (``attribute '__dict__' of 'type' objects is not writable``).
+    CUDA-graph warmup only needs the version for a sequence-packing check.
+    """
+    from importlib.metadata import PackageNotFoundError, version as pkg_version
+
+    from packaging.version import Version as PkgVersion
+
+    if _MAMBA_UTILS_MODULE is None:
+        raise RuntimeError("Mamba version metadata patch has not been installed")
+    cached = getattr(_MAMBA_UTILS_MODULE, "_mamba_ssm_version", None)
+    if cached is not None:
+        return cached
+    try:
+        ver_str = pkg_version("mamba_ssm")
+    except PackageNotFoundError:
+        raise ImportError("mamba_ssm is not installed") from None
+    ver = PkgVersion(ver_str)
+    _MAMBA_UTILS_MODULE._mamba_ssm_version = ver
+    return ver
+
+
+def _apply_mamba_version_metadata_patch() -> None:
+    """Replace ``get_mamba_version`` so graph capture does not import ``mamba_ssm``."""
+    global _MAMBA_UTILS_MODULE, _ORIGINAL_GET_MAMBA_VERSION
+    if _ORIGINAL_GET_MAMBA_VERSION is not None:
+        return
+    try:
+        mcore_utils = importlib.import_module("megatron.core.utils")
+    except ImportError:
+        return
+    _MAMBA_UTILS_MODULE = mcore_utils
+    _ORIGINAL_GET_MAMBA_VERSION = mcore_utils.get_mamba_version
+    mcore_utils.get_mamba_version = _nrl_get_mamba_version
+    mcore_utils._mamba_ssm_version = None
+    print(
+        "[zero_train_gen_mismatch] patched get_mamba_version to use "
+        "importlib.metadata (skip mamba_ssm/tvm import)",
+        flush=True,
+    )
+
+
+def _restore_mamba_version_metadata_patch() -> None:
+    global _MAMBA_UTILS_MODULE, _ORIGINAL_GET_MAMBA_VERSION
+    if _ORIGINAL_GET_MAMBA_VERSION is None or _MAMBA_UTILS_MODULE is None:
+        return
+    _MAMBA_UTILS_MODULE.get_mamba_version = _ORIGINAL_GET_MAMBA_VERSION
+    _MAMBA_UTILS_MODULE._mamba_ssm_version = None
+    _ORIGINAL_GET_MAMBA_VERSION = None
+    _MAMBA_UTILS_MODULE = None
+
+
 def apply_mamba_alignment_patch(*, required: bool = True) -> None:
     """Install the zero-KL Mamba prefill and decode paths once per process.
 
@@ -761,6 +818,7 @@ def apply_mamba_alignment_patch(*, required: bool = True) -> None:
     logged and the patch is skipped instead of failing worker initialization.
     """
     global _MAMBA_MIXER_MODULE, _ORIGINAL_SSM_DECODE, _ORIGINAL_SSM_PREFILL
+    _apply_mamba_version_metadata_patch()
     if _ORIGINAL_SSM_PREFILL is not None:
         return
 
@@ -809,6 +867,7 @@ def apply_mamba_alignment_patch(*, required: bool = True) -> None:
 def restore_mamba_alignment_patch() -> None:
     """Restore original MambaMixer methods for isolated tests."""
     global _MAMBA_MIXER_MODULE, _ORIGINAL_SSM_DECODE, _ORIGINAL_SSM_PREFILL
+    _restore_mamba_version_metadata_patch()
     if _ORIGINAL_SSM_PREFILL is None or _MAMBA_MIXER_MODULE is None:
         return
 
