@@ -37,7 +37,11 @@ from typing import cast
 import torch
 from tensordict import TensorDict
 
-from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
+from nemo_rl.data_plane import (
+    DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
+    DataPlaneConfig,
+    build_data_plane_client,
+)
 
 PARTITION_ID = "tq_checkpoint_smoke"
 TASK_NAME = "train"
@@ -111,7 +115,9 @@ def _save(checkpoint_dir: Path, num_storage_units: int) -> None:
         dp_client.save_checkpoint(
             checkpoint_dir,
             metadata={
-                "data_plane_checkpoint_schema_version": 1,
+                "data_plane_checkpoint_schema_version": (
+                    DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
+                ),
                 "expected_consumed_ids": consumed.sample_ids,
             },
         )
@@ -134,10 +140,17 @@ def _load(checkpoint_dir: Path, num_storage_units: int) -> None:
         )
         expected = _expected_fields()
         for field in FIELDS:
-            if not torch.equal(restored[field], expected[field]):
+            restored_value = restored[field]
+            expected_value = expected[field]
+            assert isinstance(restored_value, torch.Tensor)
+            assert isinstance(expected_value, torch.Tensor)
+            if not torch.equal(restored_value, expected_value):
                 raise AssertionError(f"Restored field differs: {field}")
 
-        if metadata["data_plane_checkpoint_schema_version"] != 1:
+        if (
+            metadata["data_plane_checkpoint_schema_version"]
+            != DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
+        ):
             raise AssertionError("Unexpected data-plane checkpoint schema")
         consumed_ids = set(metadata["expected_consumed_ids"])
         expected_remaining_ids = set(SAMPLE_IDS) - consumed_ids

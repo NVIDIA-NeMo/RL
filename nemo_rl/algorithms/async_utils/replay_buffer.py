@@ -16,18 +16,20 @@ import asyncio
 import gc
 import hashlib
 import json
+import math
 import statistics
 import threading as _threading
 import uuid
 from collections import Counter
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from numbers import Integral, Real
 from typing import Any, Iterable, Literal, Optional, TypedDict
 
 import ray
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
-from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG, ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import PromptGroupRecord
@@ -35,13 +37,17 @@ from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.experience.row_dump import maybe_dump_train_rows
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
-
 DATA_PLANE_CHECKPOINT_DIR = "data_plane"
-DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
 REPLAY_BUFFER_METADATA_FILENAME = "replay_buffer_metadata.pt"
 LEGACY_REPLAY_BUFFER_FILENAME = "replay_buffer.pt"
 REPLAY_BUFFER_METADATA_SCHEMA_VERSION = 1
 REPLAY_BUFFER_METADATA_STORAGE: Literal["tq_checkpoint"] = "tq_checkpoint"
+
+# These TypedDicts describe the versioned, plain-mapping checkpoint wire
+# format. They are intentionally not dataclass instances: persisting a
+# dataclass would couple recovery to its Python import path and class layout.
+# Runtime objects such as KVBatchMeta remain explicitly represented as fields
+# inside this schema.
 
 
 class TQReplayGroupMetadata(TypedDict):
@@ -63,6 +69,38 @@ class TQReplayMetadataState(TypedDict):
     saved_capacity: int
     manifest_digest: str
     groups: list[TQReplayGroupMetadata]
+
+
+def _canonical_manifest_value(value: Any, *, path: str) -> Any:
+    """Return a deterministic JSON value or reject unsupported metadata."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Real):
+        float_value = float(value)
+        if not math.isfinite(float_value):
+            raise TypeError(f"Replay metadata at {path} must be finite")
+        return float_value
+    if isinstance(value, Mapping):
+        canonical: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"Replay metadata at {path} has non-string key {key!r}")
+            canonical[key] = _canonical_manifest_value(
+                item,
+                path=f"{path}.{key}",
+            )
+        return canonical
+    if isinstance(value, (list, tuple)):
+        return [
+            _canonical_manifest_value(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise TypeError(
+        f"Replay metadata at {path} has unsupported type "
+        f"{type(value).__name__}; expected JSON-compatible primitive values"
+    )
 
 
 def replay_manifest_digest(groups: list[TQReplayGroupMetadata]) -> str:
@@ -87,20 +125,35 @@ def replay_manifest_digest(groups: list[TQReplayGroupMetadata]) -> str:
                     if group["meta"].sequence_lengths is not None
                     else None
                 ),
-                "tags": group["meta"].tags,
-                "extra_info": group["meta"].extra_info,
+                "tags": _canonical_manifest_value(
+                    group["meta"].tags,
+                    path=f"groups[{group_index}].meta.tags",
+                ),
+                "extra_info": _canonical_manifest_value(
+                    group["meta"].extra_info,
+                    path=f"groups[{group_index}].meta.extra_info",
+                ),
             },
         }
-        for group in groups
+        for group_index, group in enumerate(groups)
     ]
-    encoded = json.dumps(digest_input, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    encoded = json.dumps(
+        digest_input,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
 class DataPlaneCheckpointBarrier:
-    """Allow concurrent mutations while giving checkpoints exclusive access."""
+    """Allow concurrent mutations while giving live checkpoints exclusivity.
+
+    At most one checkpoint holder is active. New mutations queue behind it,
+    and a checkpoint waits for all active mutations before yielding. Every
+    live canonical TQ commit/clear and native save must use this barrier so the
+    snapshot and controller replay index describe the same rows.
+    """
 
     def __init__(self) -> None:
         self._condition = asyncio.Condition()

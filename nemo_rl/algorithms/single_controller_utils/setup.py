@@ -35,11 +35,13 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
-    DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
     LEGACY_REPLAY_BUFFER_FILENAME,
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     TQReplayBuffer,
+)
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    sampler_supports_buffer_checkpoint,
 )
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
@@ -61,7 +63,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
-from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
+from nemo_rl.data_plane import (
+    DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
+    DataPlaneClient,
+    build_data_plane_client,
+)
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
@@ -505,7 +511,7 @@ def setup_single_controller(
         )
     if (
         master_config.checkpointing["enabled"]
-        and master_config.async_rl.sampler.supports_buffer_checkpoint is True
+        and sampler_supports_buffer_checkpoint(master_config.async_rl.sampler)
         and not dp_config.get("checkpointing_enabled")
     ):
         raise ValueError(

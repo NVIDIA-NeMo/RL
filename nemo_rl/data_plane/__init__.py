@@ -21,6 +21,7 @@ detail of a specific adapter.
 from nemo_rl.data_plane.codec import materialize
 from nemo_rl.data_plane.factory import build_data_plane_client
 from nemo_rl.data_plane.interfaces import (
+    DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
     DataPlaneClient,
     DataPlaneConfig,
     KVBatchMeta,
@@ -28,6 +29,7 @@ from nemo_rl.data_plane.interfaces import (
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient, log_event
 
 __all__ = [
+    "DATA_PLANE_CHECKPOINT_SCHEMA_VERSION",
     "DataPlaneClient",
     "DataPlaneConfig",
     "KVBatchMeta",
