@@ -537,9 +537,7 @@ def test_math_env_extracted_answers_stay_aligned_with_rewards(math_env):
     assert result.rewards[2] == 0.0, "the wrong answer keeps its own slot"
     assert len(result.answers) == 3
     assert result.answers[1] is None, "nothing parseable means no answer"
-    assert result.answers[2] == "137", (
-        "the first prediction, not its first character"
-    )
+    assert result.answers[2] == "137", "the first prediction, not its first character"
 
 
 @pytest.mark.parametrize(
