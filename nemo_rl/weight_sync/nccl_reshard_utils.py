@@ -191,8 +191,12 @@ def is_nccl_reshard_param(param_name: str) -> bool:
     ``load_weights`` path.
 
     Shared-expert FFN weights (``*.shared_expert.*``) are routed to misc path.
-    Co-trained MTP weights are also routed to misc because vLLM keeps the MTP
-    drafter separate from the main model and updates it through ``load_weights``.
+    Bare ``mtp.``-prefixed HF names are routed to misc too, because vLLM keeps
+    the MTP drafter separate and updates it through ``load_weights``. That only
+    covers families whose HF names keep the ``mtp.`` prefix. DeepSeek exports
+    MTP under ``model.layers.N`` HF names (the ``mtp.`` appears only on the
+    Megatron side), so those return True here; the caller drops them instead,
+    using the layer set from ``_collect_mtp_hf_layer_names``.
     """
     if "shared_expert" in param_name:
         return False
