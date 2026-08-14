@@ -663,6 +663,10 @@ def test_mxfp8_auto_linear_backend_keeps_refit_cutlass_default(fp8_module, monke
         "swizzle_mxfp8_scale",
         lambda scale, M, K: scale.contiguous(),
     )
+    monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vllm_parameter, "get_tensor_model_parallel_world_size", lambda: 1
+    )
 
     def weight_loader(param, loaded_weight, *args, **kwargs):
         param.data.copy_(loaded_weight)
