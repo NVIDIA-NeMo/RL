@@ -198,7 +198,7 @@ def _load_flash_attn() -> dict[str, Callable[..., Any]]:
         _flash_attn_varlen_forward,
     )
 
-    # Same vendored-interface contract as ttt_attention.py: the private
+    # Same vendored-interface contract as eagle.py: the private
     # functions are torch custom ops on torch >= 2.4 (no introspectable
     # python signature), so gate on the package version and fail loudly.
     version_parts = flash_attn.__version__.split(".")
@@ -506,7 +506,7 @@ class BlockDraftAttention(torch.autograd.Function):
     whole prefix rides varlen). The two disjoint-key softmaxes merge exactly
     via ``logaddexp`` of the LSEs; backward hands each kernel the joint
     ``(out, lse)`` — the ring-attention mechanism, same as
-    ``ttt_attention.TwoPartTTTAttention`` — so gradients are exact, with
+    ``eagle.TwoPartTTTAttention`` — so gradients are exact, with
     part-A/B trunk-key grads scattered back via ``index_add``.
 
     Inputs (FlashAttention head layouts, bf16/fp16):

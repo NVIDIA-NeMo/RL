@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nemo_rl.models.megatron.draft.ttt_attention import (
+from nemo_rl.models.megatron.draft.eagle import (
     TTTDraftCoreAttention,
     TwoPartTTTAttention,
 )
