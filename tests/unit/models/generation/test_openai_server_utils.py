@@ -518,11 +518,11 @@ def test_complete_token_injection_matches_real_gemma_template() -> None:
     conversation = [prior_user, prior_assistant, next_user]
     first_prompt_token_ids = tokenizer.apply_chat_template(
         [prior_user], tokenize=True, add_generation_prompt=True
-    )
+    ).input_ids
     generation_token_ids = tokenizer.encode("answer", add_special_tokens=False)
     native_token_ids = tokenizer.apply_chat_template(
         conversation, tokenize=True, add_generation_prompt=True
-    )
+    ).input_ids
 
     injected_token_ids = build_complete_prompt_token_ids(
         tokenizer=tokenizer,
