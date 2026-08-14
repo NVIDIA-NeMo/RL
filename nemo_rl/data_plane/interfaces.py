@@ -43,6 +43,9 @@ from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 from tensordict import TensorDict
 
 
+DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
+
+
 class DataPlaneConfig(TypedDict):
     """Feature-gated config; defaults to disabled.
 

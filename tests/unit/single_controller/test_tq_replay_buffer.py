@@ -261,6 +261,35 @@ class TestDataPlaneCheckpointBarrier:
 
         asyncio.run(exercise())
 
+    def test_two_checkpoints_serialize_without_deadlock(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            release = asyncio.Event()
+            entered: list[str] = []
+
+            async def checkpoint(tag: str) -> None:
+                async with barrier.checkpoint():
+                    entered.append(f"{tag}-enter")
+                    await release.wait()
+                    entered.append(f"{tag}-exit")
+
+            first = asyncio.create_task(checkpoint("first"))
+            await asyncio.sleep(0)
+            second = asyncio.create_task(checkpoint("second"))
+            await asyncio.sleep(0)
+            assert entered == ["first-enter"]
+
+            release.set()
+            await asyncio.wait_for(asyncio.gather(first, second), timeout=5.0)
+            assert entered == [
+                "first-enter",
+                "first-exit",
+                "second-enter",
+                "second-exit",
+            ]
+
+        asyncio.run(exercise())
+
 
 class TestTQReplayBufferReserveCommit:
     def test_commit_waits_for_active_checkpoint(self):
@@ -943,6 +972,27 @@ def _load(
             expected_manifest_digest=expected_manifest_digest,
         )
     )
+
+
+class TestReplayManifestDigest:
+    def test_rejects_non_json_metadata_with_field_path(self):
+        group = _make_group_entry("group-1", weight=1)
+        assert group["meta"].tags is not None
+        group["meta"].tags[0]["unsupported"] = torch.tensor(1)
+
+        with pytest.raises(
+            TypeError,
+            match=r"groups\[0\]\.meta\.tags\[0\]\.unsupported",
+        ):
+            replay_manifest_digest([group])
+
+    def test_mapping_order_does_not_change_digest(self):
+        first = _make_group_entry("group-1", weight=1)
+        second = _make_group_entry("group-1", weight=1)
+        first["meta"].extra_info = {"a": 1, "b": [2, 3]}
+        second["meta"].extra_info = {"b": [2, 3], "a": 1}
+
+        assert replay_manifest_digest([first]) == replay_manifest_digest([second])
 
 
 class TestTQReplayBufferStateDict:

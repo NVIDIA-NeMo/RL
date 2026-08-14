@@ -36,6 +36,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSampler,
     WindowedSamplerConfig,
     create_sampler,
+    sampler_supports_buffer_checkpoint,
 )
 from nemo_rl.data_plane import KVBatchMeta
 
@@ -161,14 +162,12 @@ class TestFactory:
             (InOrderSamplerConfig(), False),
             (
                 CustomSamplerConfig(target=f"{__name__}:EchoSampler"),
-                None,
+                False,
             ),
         ],
     )
-    def test_config_declares_checkpoint_capability_without_serializing_it(
-        self, config, expected
-    ):
-        assert config.supports_buffer_checkpoint is expected
+    def test_capability_comes_from_sampler_class(self, config, expected):
+        assert sampler_supports_buffer_checkpoint(config) is expected
         assert "supports_buffer_checkpoint" not in config.model_dump()
 
     def test_windowed_config_builds_windowed(self):
@@ -190,17 +189,37 @@ class TestFactory:
         assert isinstance(s, WeightFifoSampler)
         assert s.max_staleness_versions == 4
 
-    def test_factory_rejects_config_implementation_capability_drift(self, monkeypatch):
-        monkeypatch.setattr(
-            WindowedSampler,
-            "supports_buffer_checkpoint",
-            property(lambda _self: False),
+    def test_factory_rejects_dynamic_capability_before_construction(self):
+        PropertyCapabilitySampler.constructed = False
+        with pytest.raises(TypeError, match="boolean class attribute"):
+            create_sampler(
+                FakeBuffer(),
+                CustomSamplerConfig(
+                    target=f"{__name__}:PropertyCapabilitySampler",
+                ),
+            )
+        assert not PropertyCapabilitySampler.constructed
+
+    def test_custom_checkpoint_capability_is_discoverable_without_construction(self):
+        CheckpointingEchoSampler.constructed = False
+        assert sampler_supports_buffer_checkpoint(
+            CustomSamplerConfig(
+                target=f"{__name__}:CheckpointingEchoSampler",
+            )
         )
-        with pytest.raises(RuntimeError, match="disagrees with"):
-            create_sampler(FakeBuffer(), WindowedSamplerConfig())
+        assert not CheckpointingEchoSampler.constructed
 
 
 class TestCustomFqnSampler:
+    def test_custom_target_must_be_a_class(self):
+        with pytest.raises(TypeError, match="not a class"):
+            create_sampler(
+                FakeBuffer(),
+                CustomSamplerConfig(
+                    target=f"{__name__}:NOT_A_SAMPLER_CLASS",
+                ),
+            )
+
     def test_custom_target_loads_out_of_repo_sampler(self):
         # A user sampler defined anywhere importable; here, this test module.
         s = create_sampler(
@@ -352,7 +371,7 @@ class TestDispatchCursorRestore:
         assert _run(s.admit(trainer_version_fn=lambda: 0)) == 0
 
     def test_negative_resume_step_rejected(self):
-        with pytest.raises(ValueError, match="resume_from_step"):
+        with pytest.raises(ValueError, match="resume_from_trainer_version"):
             WindowedSampler(FakeBuffer(), max_staleness_versions=1).set_dispatch_index(
                 -1
             )
@@ -404,3 +423,30 @@ class TestInflightAbortPolicy:
 
 class EchoSampler(InOrderSampler):
     """Stand-in for a user-defined sampler loaded by FQN."""
+
+
+class CheckpointingEchoSampler(EchoSampler):
+    """Custom sampler with a static replay-checkpoint capability."""
+
+    supports_buffer_checkpoint = True
+    constructed = False
+
+    def __init__(self, *args, **kwargs) -> None:
+        type(self).constructed = True
+        super().__init__(*args, **kwargs)
+
+
+class PropertyCapabilitySampler:
+    """Invalid custom sampler whose capability requires construction."""
+
+    constructed = False
+
+    def __init__(self, *args, **kwargs) -> None:
+        type(self).constructed = True
+
+    @property
+    def supports_buffer_checkpoint(self) -> bool:
+        return True
+
+
+NOT_A_SAMPLER_CLASS = object()

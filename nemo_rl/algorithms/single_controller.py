@@ -46,11 +46,10 @@ import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
-    DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
-    DataPlaneCheckpointBarrier,
     LEGACY_REPLAY_BUFFER_FILENAME,
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+    DataPlaneCheckpointBarrier,
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
@@ -71,7 +70,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     tensor_field,
 )
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
@@ -643,7 +642,12 @@ class SingleControllerActor:
     async def _validate_replay_inventory(
         self, replay_metadata: TQReplayMetadataState
     ) -> None:
-        """Require the canonical TQ keys to match the SC replay index exactly."""
+        """Require the canonical TQ keys to match the SC replay index exactly.
+
+        Live checkpoint callers must hold the exclusive data-plane barrier so
+        commits and clears cannot race this inventory read. Restore calls are
+        also safe before the rollout and train pumps start any live writers.
+        """
         expected_sample_ids = {
             sample_id
             for group in replay_metadata["groups"]
@@ -1272,11 +1276,11 @@ class SingleControllerActor:
                     replay_metadata = self._buffer.metadata_state_dict(
                         saved_capacity=self._async_cfg.max_buffered_rollouts
                     )
+                if replay_metadata is not None:
+                    await self._validate_replay_inventory(replay_metadata)
                 await self._save_data_plane_checkpoint(
                     checkpoint_path, replay_metadata=replay_metadata
                 )
-                if replay_metadata is not None:
-                    await self._validate_replay_inventory(replay_metadata)
         if replay_metadata is not None:
             await asyncio.to_thread(
                 torch.save,

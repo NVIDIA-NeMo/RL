@@ -30,7 +30,11 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
 )
-from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    CustomSamplerConfig,
+    WindowedSampler,
+    WindowedSamplerConfig,
+)
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     GRPOSaveState,
@@ -43,6 +47,13 @@ from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerActorArgs,
     setup_single_controller,
 )
+
+
+class _CheckpointingCustomSampler(WindowedSampler):
+    """Custom sampler whose static capability must be validated during setup."""
+
+    def __init__(self, buffer: Any) -> None:
+        super().__init__(buffer, max_staleness_versions=1)
 
 
 def _make_master_config(
@@ -282,6 +293,28 @@ class TestSetup:
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True
         mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
+        mc.data_plane.update(
+            {
+                "backend": "simple",
+                "checkpointing_enabled": False,
+            }
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "replay-checkpoint-capable sampler requires "
+                "data_plane.checkpointing_enabled=true"
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_rejects_checkpointing_custom_sampler_without_native_tq(self):
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target=f"{__name__}:_CheckpointingCustomSampler"
+        )
         mc.data_plane.update(
             {
                 "backend": "simple",
