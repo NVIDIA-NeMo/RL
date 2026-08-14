@@ -203,6 +203,54 @@ def test_update_weights_from_collective_processes_weights_after_loading(
 
 
 @pytest.mark.vllm
+def test_mxfp8_native_linear_refit_uses_vllm_layerwise_reload(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
+    linear = torch.nn.Linear(1, 1)
+    linear.quant_method = SimpleNamespace(kernel=kernel_type())
+    model = torch.nn.Module()
+    model.add_module("linear", linear)
+
+    extension = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    extension.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    extension.model_config = object()
+    extension.device = torch.device("cpu")
+    calls = []
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda root: calls.append(("initialize", root)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
+        lambda root, config: calls.append(("finalize", root, config)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda loaded_model, config, device: calls.append(
+            ("process", loaded_model, config, device)
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _config: contextlib.nullcontext()
+    )
+
+    with extension._weight_update_lifecycle("collective") as finish:
+        calls.append("load")
+        finish()
+
+    assert calls == [
+        ("initialize", linear),
+        "load",
+        ("finalize", linear, extension.model_config),
+        ("process", model, extension.model_config, extension.device),
+    ]
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     "method_name",
     ["update_weights_via_ipc_zmq", "update_weights_from_collective"],

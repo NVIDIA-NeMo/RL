@@ -523,3 +523,129 @@ def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     assert layer.weight_scale_inv is scale_param
     # The processed values must actually land.
     assert torch.equal(layer.weight.data, torch.ones(4, 4))
+
+
+@pytest.mark.parametrize(
+    ("kernel_name", "linear_backend"),
+    [
+        ("FlashInferCutedslMxfp8LinearKernel", "flashinfer_cutedsl"),
+        ("FlashInferTrtllmMxfp8LinearKernel", "flashinfer_trtllm"),
+    ],
+)
+def test_mxfp8_native_linear_kernel_refit_preserves_runtime_storage(
+    fp8_module, kernel_name, linear_backend
+):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+    from vllm.model_executor.model_loader.reload import (
+        finalize_layerwise_reload,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+
+    class Kernel:
+        def process_weights_after_loading(self, layer):
+            layer.weight = torch.nn.Parameter(
+                layer.weight.detach().clone() + 10, requires_grad=False
+            )
+            layer.weight_scale = torch.nn.Parameter(
+                layer.weight_scale.detach().clone() + 20, requires_grad=False
+            )
+
+    Kernel.__name__ = kernel_name
+
+    class Method(QuantizeMethodBase):
+        def __init__(self):
+            self.kernel = Kernel()
+
+        def create_weights(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def apply(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def process_weights_after_loading(self, layer):
+            fp8_module.process_weights_after_loading_mxfp8_linear(self, layer)
+
+    def weight_loader(param, loaded_weight, *args, **kwargs):
+        param.data.copy_(loaded_weight)
+
+    layer = torch.nn.Module()
+    layer.quant_method = Method()
+    layer.weight = torch.nn.Parameter(torch.ones(2, 32), requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(torch.ones(2, 1), requires_grad=False)
+    layer.weight.weight_loader = weight_loader
+    layer.weight_scale.weight_loader = weight_loader
+    record_metadata_for_reloading(layer)
+
+    vllm_config = types.SimpleNamespace(
+        kernel_config=types.SimpleNamespace(linear_backend=linear_backend)
+    )
+    with set_current_vllm_config(vllm_config):
+        layer.quant_method.process_weights_after_loading(layer)
+
+    runtime_weight = layer.weight
+    runtime_scale = layer.weight_scale
+    runtime_weight_ptr = runtime_weight.data_ptr()
+    runtime_scale_ptr = runtime_scale.data_ptr()
+
+    for value in (2, 3):
+        initialize_layerwise_reload(layer)
+        with set_current_vllm_config(vllm_config), torch.device("cpu"):
+            layer.weight.weight_loader(
+                layer.weight, torch.full((2, 32), value, dtype=torch.float32)
+            )
+            layer.weight_scale.weight_loader(
+                layer.weight_scale, torch.full((2, 1), value, dtype=torch.float32)
+            )
+            finalize_layerwise_reload(layer, model_config=None)
+
+        assert layer.weight is runtime_weight
+        assert layer.weight_scale is runtime_scale
+        assert layer.weight.data_ptr() == runtime_weight_ptr
+        assert layer.weight_scale.data_ptr() == runtime_scale_ptr
+        assert torch.equal(layer.weight, torch.full_like(layer.weight, value + 10))
+        assert torch.equal(
+            layer.weight_scale, torch.full_like(layer.weight_scale, value + 20)
+        )
+
+    assert layer.quant_method.kernel.__class__.__name__ == kernel_name
+
+
+def test_load_weights_uses_canonical_scale_for_native_mxfp8_linear(
+    fp8_module, monkeypatch
+):
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+    )
+    kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
+    layer = types.SimpleNamespace(
+        quant_method=types.SimpleNamespace(kernel=kernel_type())
+    )
+    loaded = []
+    model = types.SimpleNamespace(load_weights=lambda weights: loaded.extend(weights))
+    model_runner = types.SimpleNamespace(model=model)
+    low_precision = torch.ones(2, 32, dtype=torch.float8_e4m3fn)
+    scale = torch.ones(2, 1, dtype=torch.uint8)
+
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: True)
+    monkeypatch.setattr(fp8, "_get_module_from_param_name", lambda _model, _name: layer)
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "mxfp8_e4m3_quantize",
+        lambda _weight: (low_precision, scale.unsqueeze(-1)),
+    )
+
+    fp8.load_weights(
+        [("model.layers.0.mlp.up_proj.weight", torch.ones(2, 32))], model_runner
+    )
+
+    assert [name for name, _ in loaded] == [
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.mlp.up_proj.weight_scale",
+    ]
