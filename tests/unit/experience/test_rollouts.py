@@ -2441,6 +2441,8 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
             return _FailedStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._timeouts = RolloutTimeouts()
+    manager._max_gym_row_attempts = 1
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
