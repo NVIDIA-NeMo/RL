@@ -42,7 +42,7 @@ The validated internal runtime is:
 | Container | `/lustre/fs1/portfolios/coreai/users/aroshanghias/omni-main-migration/containers/cuda-dl-base-26.03-cuda13.2-devel-ubuntu24.04.sqsh` |
 | Checkpoint | `/lustre/fs1/portfolios/coreai/users/aroshanghias/checkpoints/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` |
 | Public model ID | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` |
-| NeMo Gym submodule | `af90075402df7027ad50bffee3bf11f469ec3bf0` |
+| NeMo Gym submodule | `ead1832afe6f3ccca8733247c86b8eb898b09521` |
 | W&B project | `nvidia/nemo-rl-context-compaction` |
 
 Use writable cache and venv directories belonging to your user. Do not share
