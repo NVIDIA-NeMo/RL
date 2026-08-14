@@ -11,11 +11,11 @@
 # a supported multi-environment combination -- see the commented config_paths
 # in the base recipe -- so this only changes where they run, not what they do.
 #
-# Run `ng_prepare_data` for BOTH environments and point data.train/validation
-# at the combined jsonl before running. A dataset covering only one of them
-# still starts, but every row lands on one shard and the other sits idle, so
-# routing is never exercised. A dataset naming a third agent fails at setup,
-# which is itself worth seeing once.
+# Run `gym dataset collate` with BOTH resources-server config paths and point
+# data.train/validation at the combined JSONL before running. A dataset covering
+# only one of them still starts, but every row lands on one shard and the other
+# sits idle, so routing is never exercised. A dataset naming a third agent fails
+# at setup, which is itself worth seeing once.
 #
 # Single node:
 #   the default STRICT_SPREAD wants one node per shard, so override
@@ -31,13 +31,9 @@ defaults: "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml"
 
 env:
   nemo_gym:
-    # Retract the inherited single-stack settings. A Hydra override can blank
-    # an inherited key but not delete it, so null is how these are given up;
-    # the sharded schema reads null as absent.
+    # Retract inherited settings that no shard owns. A Hydra override can blank
+    # an inherited key but not delete it, so the schema reads null as absent.
     config_paths: null
-    policy_model: null
-    # An overlay for an environment neither shard hosts. Left in place it would
-    # be rejected as having no shard to belong to, which is the check working.
     code_gen: null
 
     # Each shard gets its own port window so two stacks on one node cannot
@@ -57,19 +53,16 @@ env:
           - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
           - resources_servers/math_with_judge/configs/math_with_judge.yaml
 
-    # Both shards need policy_model, which is a client of NeMo RL's vLLM
-    # servers rather than an engine of its own, so hosting it twice claims no
-    # extra GPU. That is what the allowlist below is for; without it the
-    # duplicate-entry check would stop the job, which is the right default
-    # since a duplicated engine-bearing entry doubles its GPU claim silently.
-    common_overrides:
-      policy_model:
-        responses_api_models:
-          vllm_model:
-            uses_reasoning_parser: false
-            extra_body:
-              chat_template_kwargs:
-                enable_thinking: false
+    # The base recipe already configures policy_model. Claim that inherited
+    # overlay by key instead of copying its value here. Both shards need it,
+    # and it only proxies NeMo RL's vLLM servers, so duplicating it claims no
+    # extra GPU.
+    common_inherited_overlays:
+      - policy_model
+
+    # An inherited overlay must be assigned to one shard or to all shards.
+    # Multi-shard plans reject unclaimed and multiply claimed keys before
+    # starting actors.
     allowed_duplicate_entries:
       - policy_model
 
