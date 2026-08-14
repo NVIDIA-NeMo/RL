@@ -17,7 +17,11 @@ from contextlib import nullcontext
 from typing import ContextManager
 
 try:
-    import torch_memory_saver  # pyrefly: ignore[import-error]
+    from torch_memory_saver import (  # pyrefly: ignore[import-error]
+        torch_memory_saver,
+    )
+
+    torch_memory_saver.hook_mode = "torch"
 
     HAVE_TORCH_MEMORY_SAVER = True
 except ImportError:
