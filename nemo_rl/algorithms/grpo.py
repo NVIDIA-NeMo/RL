@@ -384,6 +384,17 @@ def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
         )
 
 
+def _needs_hf_refit_handshake(
+    generation_backend: str,
+    nccl_reshard_refit_enabled: bool,
+    colocated_inference: bool,
+) -> bool:
+    """Whether setup must run the HF-schema prepare_refit_info handshake."""
+    if generation_backend == "megatron":
+        return False
+    return not (nccl_reshard_refit_enabled and not colocated_inference)
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -1530,8 +1541,8 @@ def setup(
             flush=True,
         )
     else:
-        if backend != "megatron" and not (
-            nccl_reshard_refit_enabled and not colocated_inference
+        if _needs_hf_refit_handshake(
+            backend, nccl_reshard_refit_enabled, colocated_inference
         ):
             state_dict_info = policy.prepare_refit_info()
             if policy_generation is not None:
