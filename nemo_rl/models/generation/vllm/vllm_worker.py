@@ -104,9 +104,12 @@ def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -
 
     fp8_quantization_config = fp8_hf_overrides.get("quantization_config")
     existing_quantization_config = existing_hf_overrides.get("quantization_config")
-    if isinstance(fp8_quantization_config, dict) and isinstance(
-        existing_quantization_config, dict
-    ):
+    if existing_quantization_config is None:
+        if fp8_quantization_config is not None:
+            merged_hf_overrides["quantization_config"] = fp8_quantization_config
+    elif not isinstance(existing_quantization_config, dict):
+        raise ValueError("hf_overrides.quantization_config must be a mapping")
+    elif isinstance(fp8_quantization_config, dict):
         merged_quantization_config = {
             **fp8_quantization_config,
             **existing_quantization_config,
