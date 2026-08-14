@@ -92,6 +92,7 @@ def _request() -> FinalizationRequest:
     return FinalizationRequest(
         group_id="group",
         rollout_ids=("group_g0",),
+        canonical_sample_ids=("group_g0",),
         receipts=(
             {
                 "manifest": [

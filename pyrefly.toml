@@ -149,6 +149,7 @@ project-includes = [
   "nemo_rl/experience/blackbox_finalizer.py",
   "nemo_rl/experience/finalizer_actor.py",
   "nemo_rl/experience/row_dump.py",
+  "nemo_rl/experience/failures.py",
   "nemo_rl/experience/interfaces.py",
   "nemo_rl/experience/metric_utils.py",
   "nemo_rl/experience/payload.py",
