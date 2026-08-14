@@ -587,10 +587,43 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     ]
     assert loaded[0][1] is gate_up
     assert loaded[1][1] is down
+    # Pass-through is also what a failed lookup produces, so pin that the
+    # bf16 RoutedExperts was actually resolved.
+    assert isinstance(
+        fp8._get_module_from_param_name(
+            model, "model.layers.0.mlp.experts.gate_up_proj"
+        ),
+        fp8.RoutedExperts,
+    )
+
+
+def _assert_dequant_close(weight_fp8, scale_inv, source_bf16):
+    """Dequantized FP8 must match the bf16 source within e4m3 half-ULP.
+
+    Worst-case blockwise quantization error is half the e4m3 ULP at the
+    block amax: amax * (16 / 448) = amax / 28.
+    """
+    import torch
+
+    dequant = weight_fp8.to(torch.float32) * scale_inv.repeat_interleave(
+        128, dim=0
+    ).repeat_interleave(128, dim=1)
+    source = source_bf16.to(torch.float32)
+    rows, cols = source.shape
+    block_amax = (
+        source.abs().reshape(rows // 128, 128, cols // 128, 128).amax(dim=(1, 3))
+    )
+    atol = block_amax.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1) / 28
+    assert torch.all((dequant - source).abs() <= atol + 1e-6 * source.abs())
 
 
 def test_load_weights_expands_grouped_experts_for_fp8_layers(fp8_module, monkeypatch):
-    """FP8-built experts keep the per-expert expand+quantize refit path."""
+    """FP8-built experts keep the per-expert expand+quantize refit path.
+
+    Non-square expert shards (256x384 gate/up, 384x256 down) give a scale
+    grid larger than 1x1 so a transposed or misrouted scale cannot pass, and
+    the dequantization check pins values, not just names and shapes.
+    """
     import torch
 
     fp8 = fp8_module
@@ -601,9 +634,14 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(fp8_module, monkeyp
     loaded = []
     model.load_weights = lambda pairs: loaded.extend(pairs)
 
-    gate_up = torch.randn(2, 256, 128).to(torch.bfloat16)
+    intermediate, hidden = 256, 384
+    gate_up = torch.randn(2, 2 * intermediate, hidden).to(torch.bfloat16)
+    down = torch.randn(2, hidden, intermediate).to(torch.bfloat16)
     fp8.load_weights(
-        [("model.layers.0.mlp.experts.gate_up_proj", gate_up)],
+        [
+            ("model.layers.0.mlp.experts.gate_up_proj", gate_up),
+            ("model.layers.0.mlp.experts.down_proj", down),
+        ],
         types.SimpleNamespace(model=model),
     )
 
@@ -613,8 +651,45 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(fp8_module, monkeyp
         for proj in ("gate_proj", "up_proj")
         for eid in (0, 1)
         for suffix in ("", "_scale_inv")
+    ] + [
+        f"{base}.{eid}.down_proj.weight{suffix}"
+        for eid in (0, 1)
+        for suffix in ("", "_scale_inv")
     ]
-    weights = {k: v for k, v in loaded}
-    assert weights[f"{base}.0.gate_proj.weight"].dtype == torch.float8_e4m3fn
-    assert weights[f"{base}.0.gate_proj.weight"].shape == (128, 128)
-    assert weights[f"{base}.0.gate_proj.weight_scale_inv"].shape == (1, 1)
+    entries = dict(loaded)
+    shards = {
+        "gate_proj": (gate_up[:, :intermediate, :], (intermediate, hidden)),
+        "up_proj": (gate_up[:, intermediate:, :], (intermediate, hidden)),
+        "down_proj": (down, (hidden, intermediate)),
+    }
+    for proj, (source, shape) in shards.items():
+        for eid in (0, 1):
+            weight = entries[f"{base}.{eid}.{proj}.weight"]
+            scale = entries[f"{base}.{eid}.{proj}.weight_scale_inv"]
+            assert weight.dtype == torch.float8_e4m3fn
+            assert weight.shape == shape
+            assert scale.shape == (shape[0] // 128, shape[1] // 128)
+            _assert_dequant_close(weight, scale, source[eid])
+
+
+def test_load_weights_rejects_grouped_experts_for_mxfp8(fp8_module, monkeypatch):
+    """Grouped MoE expansion only implements blockwise FP8, not MXFP8."""
+    import torch
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(
+        use_weight_pow2_scale=False, is_mx=True
+    )
+    model = _grouped_expert_model(fp8, monkeypatch, torch.float8_e4m3fn)
+    model.load_weights = lambda pairs: pytest.fail("must raise before loading")
+
+    with pytest.raises(NotImplementedError, match="MXFP8"):
+        fp8.load_weights(
+            [
+                (
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    torch.randn(2, 512, 384).to(torch.bfloat16),
+                )
+            ],
+            types.SimpleNamespace(model=model),
+        )
