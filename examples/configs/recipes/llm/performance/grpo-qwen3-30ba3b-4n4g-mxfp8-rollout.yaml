@@ -44,6 +44,8 @@ policy:
         - model.layers.*.self_attn.*
         - model.layers.*.mlp.gate
         - lm_head
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n4g-mxfp8-rollout
   wandb_enabled: true

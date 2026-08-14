@@ -102,7 +102,7 @@ MXFP8_CASES = {
         "gpus_per_node": 4,
         "segment_size": 4,
         "async_engine": None,
-        "moe_backend": None,
+        "moe_backend": "flashinfer_trtllm",
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "model.layers.*.mlp.gate",
@@ -114,7 +114,7 @@ MXFP8_CASES = {
         "gpus_per_node": 4,
         "segment_size": 2,
         "async_engine": True,
-        "moe_backend": None,
+        "moe_backend": "flashinfer_trtllm",
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "model.layers.*.mlp.gate",
