@@ -624,16 +624,26 @@ def _quantize_grouped_experts_blockwise(grouped_moe_expert):
         "pad across expert boundaries."
     )
 
-    flat = grouped_moe_expert.reshape(num_experts * out_features, in_features)
-    weight_fp8, scale_inv = cast_tensor_to_fp8_blockwise(
-        flat.to(torch.float),
-        weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
+    # Quantize expert-by-expert rather than as one flat [E*out, in] tensor:
+    # the fp32 upcast and cast-internal copies then peak at 1/num_experts the
+    # size (4.75 GiB -> 2.25 GiB on the 35B-A3B gate_up slab), and this runs
+    # during refit next to a live vLLM allocation. Bitwise-identical to the
+    # flat path: the divisibility assert above means no 128-row block ever
+    # straddles an expert boundary, so per-block amax (and hence scales) see
+    # the same elements either way.
+    weight_fp8 = torch.empty_like(grouped_moe_expert, dtype=torch.float8_e4m3fn)
+    scale_inv = torch.empty(
+        (num_experts, out_features // block0, in_features // block1),
+        dtype=torch.float32,
+        device=grouped_moe_expert.device,
     )
-    scale_inv = torch.squeeze(scale_inv, dim=-1)
-    weight_fp8 = weight_fp8.reshape(num_experts, out_features, in_features)
-    scale_inv = scale_inv.reshape(
-        num_experts, out_features // block0, in_features // block1
-    )
+    for expert_id in range(num_experts):
+        expert_fp8, expert_scale_inv = cast_tensor_to_fp8_blockwise(
+            grouped_moe_expert[expert_id].to(torch.float),
+            weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
+        )
+        weight_fp8[expert_id].copy_(expert_fp8)
+        scale_inv[expert_id].copy_(torch.squeeze(expert_scale_inv, dim=-1))
     return weight_fp8, scale_inv
 
 
