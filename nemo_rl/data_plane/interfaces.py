@@ -59,6 +59,11 @@ class DataPlaneConfig(TypedDict):
     They are required (not NotRequired) so the YAML carries the full
     schema and there are no hidden Python defaults.
 
+    ``num_storage_units`` (``simple`` only) scales with the cluster: TQ
+    round-robins storage units over Ray nodes and recommends ``>= 2 x`` the
+    node count, so a fixed literal under-provisions a multi-node run. Set a
+    plain int to pin it.
+
     ``reuse_registered_buffers`` (``mooncake_cpu`` only) keeps a small pool
     of RDMA-registered buffers alive instead of registering a fresh one per
     transfer. Costs up to ``4 x`` the largest per-task payload in resident
