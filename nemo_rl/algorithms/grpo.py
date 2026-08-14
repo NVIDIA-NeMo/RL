@@ -5308,9 +5308,15 @@ def async_grpo_train(
                             checkpoint_path,
                         )
                         if dataloader_snapshot["frontier_aligned"]:
-                            rollouts_state[FRONTIER_ORDINAL_KEY] = (
-                                trained_frontier_ordinal
-                            )
+                            # The collector may lower the cut below the
+                            # trained frontier when prompts below it are
+                            # still in flight (post-failure interleaving);
+                            # the persisted threshold must be the cut, or
+                            # the resume filter would drop the re-yielded
+                            # window as already-trained.
+                            rollouts_state[FRONTIER_ORDINAL_KEY] = dataloader_snapshot[
+                                "frontier_ordinal"
+                            ]
                             rollouts_state[RESUME_BASE_ORDINAL_KEY] = (
                                 dataloader_snapshot["base_ordinal"]
                             )

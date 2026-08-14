@@ -39,6 +39,7 @@ from nemo_rl.algorithms.async_utils import (
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
 from nemo_rl.algorithms.async_utils.trajectory_collector import (
+    _stamped_task_indices,
     _unanimous_task_index,
 )
 from nemo_rl.algorithms.grpo import (
@@ -1476,6 +1477,7 @@ class TestAsyncTrajectoryCollector:
 
         aligned = collector.get_checkpoint_state(4)
         assert aligned["dataloader"]["frontier_aligned"] is True
+        assert aligned["dataloader"]["frontier_ordinal"] == 4
         assert aligned["rollouts"] == {NEXT_NEMO_GYM_TASK_INDEX_KEY: 4}
 
         collector._ordinals_frontier_aligned = False
@@ -1483,6 +1485,333 @@ class TestAsyncTrajectoryCollector:
         assert fallback["dataloader"]["frontier_aligned"] is False
         assert fallback["rollouts"][NEXT_NEMO_GYM_TASK_INDEX_KEY] == 4
         assert fallback["rollouts"][PENDING_PROMPTS_KEY] is collector._pending_batch
+
+    def test_stamped_task_indices_extraction(self):
+        stamped = BatchedDataDict[DatumSpec](
+            {
+                "extra_env_info": [
+                    {NEMO_GYM_TASK_INDEX_KEY: 5},
+                    {NEMO_GYM_TASK_INDEX_KEY: 6},
+                ]
+            }
+        )
+        unstamped = BatchedDataDict[DatumSpec]({"extra_env_info": [{}, {}]})
+        no_rows = BatchedDataDict[DatumSpec]({"value": [1]})
+
+        assert _stamped_task_indices(stamped) == [5, 6]
+        assert _stamped_task_indices(unstamped) == []
+        assert _stamped_task_indices(no_rows) == []
+
+    def test_checkpoint_cut_lowered_by_outstanding_ordinals(self):
+        """A target refilled past another target's in-flight groups must not
+        strand them: 24 prompts in 8-batches, target 0 lost {3..7} to a
+        tolerated failure and was refilled with {16..20}; training it moved
+        the frontier to 21 while target 1's {8..15} are still generating.
+        The checkpoint must cut at 8 — not 21 — or those never-failed
+        prompts sit below the resume base and are silently lost.
+        """
+        collector = self.create_local_collector()
+        collector._dataloader_snapshots.extend(
+            [(0, {"pos": 0}), (8, {"pos": 1}), (16, {"pos": 2})]
+        )
+        collector._outstanding_task_indices = set(range(8, 16))
+
+        poisoned = collector.get_checkpoint_state(21)
+        assert poisoned["dataloader"]["frontier_ordinal"] == 8
+        assert poisoned["dataloader"]["base_ordinal"] == 8
+        assert poisoned["dataloader"]["frontier_aligned"] is True
+
+        # Healthy path: outstanding work at/above the frontier changes nothing.
+        collector._outstanding_task_indices = {21, 22, 23}
+        healthy = collector.get_checkpoint_state(21)
+        assert healthy["dataloader"]["frontier_ordinal"] == 21
+        assert healthy["dataloader"]["base_ordinal"] == 16
+
+        # No outstanding work at all: also unchanged.
+        collector._outstanding_task_indices = set()
+        idle = collector.get_checkpoint_state(21)
+        assert idle["dataloader"]["frontier_ordinal"] == 21
+
+    def test_failure_interleaving_resume_regenerates_stranded_window(self):
+        """Resume from a lowered cut re-yields the stranded prompts.
+
+        Cut = 8 with retained {11, 12}: the resumed stream must contain the
+        never-failed prompts {8, 9, 10, 13, 14, 15}. Prompts 16+ are
+        re-yielded too — the documented bounded re-train that the
+        conservative cut trades for never skipping.
+        """
+        batches = [self.create_mock_batch(8) for _ in range(3)]
+        phase_a = self.create_local_collector()
+        self._run_loop_collecting(phase_a, self._FakeStatefulLoader(batches))
+
+        resumed = self.create_local_collector(
+            next_nemo_gym_task_index=8,
+            resume_frontier_ordinal=8,
+            resume_covered_task_indices=[11, 12],
+        )
+        stream = self._run_loop_collecting(
+            resumed, self._FakeStatefulLoader(batches, start=1)
+        )
+
+        assert self._ordinals(stream) == [8, 9, 10, 13, 14, 15] + list(range(16, 24))
+
+    def test_process_batch_tracks_dispatched_outstanding(self, monkeypatch):
+        """Dispatch adds stamped group ordinals; a failed start removes them."""
+        replay_buffer = mock.MagicMock()
+        replay_buffer.get_trajectories_needed.remote.return_value = 2
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector._refit_pause_cleared.set()
+        collector._get_next_target_for_generation = lambda version: 1
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector.ray",
+            mock.MagicMock(get=lambda ref: ref),
+        )
+        worker_calls = []
+
+        async def _fake_worker(**kwargs):
+            worker_calls.append(kwargs)
+
+        collector._run_rollout_batch_worker = _fake_worker
+
+        batch = self.create_mock_batch(size=4)
+        collector._stamp_task_indices(batch)
+        collector._process_batch(batch)
+        collector.wait_for_pending_generations()
+
+        # The fake worker bypasses the real finally-discard, so the dispatch
+        # registration is observable here.
+        assert collector._outstanding_task_indices == {0, 1}
+        assert worker_calls[0]["dispatched_task_indices"] == [0, 1]
+
+        # A worker that fails to start must roll its registration back.
+        collector._outstanding_task_indices = set()
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector._threading.Thread",
+            mock.MagicMock(side_effect=RuntimeError("no threads")),
+        )
+        remainder = collector._process_batch(batch)
+        assert remainder is batch  # nothing consumed
+        assert collector._outstanding_task_indices == set()
+
+    def test_worker_clears_outstanding_on_success_and_tolerated_failure(
+        self, monkeypatch
+    ):
+        """Buffered groups leave the outstanding set; a tolerated failure's
+        remainder leaves it at worker exit instead of pinning the cut."""
+
+        class _ReadyResult:
+            def __await__(self):
+                async def _resolve():
+                    return "success"
+
+                return _resolve().__await__()
+
+        class _AddRemote:
+            def remote(self, *args):
+                return _ReadyResult()
+
+        class _ReplayBuffer:
+            add = _AddRemote()
+
+        def _fake_rollouts_factory(fail_after):
+            async def fake_rollouts(**kwargs):
+                for group_index in range(2):
+                    if group_index == fail_after:
+                        raise RuntimeError("worker died mid-batch")
+                    yield trajectory_collector_mod.RolloutGroupResult(
+                        group_index=group_index,
+                        final_batch=BatchedDataDict({"value": torch.tensor([1])}),
+                        rollout_metrics={},
+                    )
+
+            return fake_rollouts
+
+        for fail_after, description in ((None, "success"), (1, "tolerated failure")):
+            collector = self.create_local_collector(
+                replay_buffer=_ReplayBuffer(), max_generation_failures=5
+            )
+            collector.running = True
+            collector._generating_targets.add(3)
+            collector._outstanding_task_indices = {5, 6}
+            monkeypatch.setattr(
+                trajectory_collector_mod,
+                "run_async_multi_turn_rollout_groups",
+                _fake_rollouts_factory(fail_after),
+            )
+
+            # Stamp the input at ordinals 5-6 so group_input_task_indices
+            # carries them. This asserts only the end state (either discard
+            # mechanism suffices); the per-group discard itself is pinned by
+            # test_buffered_groups_clear_outstanding_before_worker_exit.
+            input_batch = self.create_mock_batch(size=2)
+            collector._next_nemo_gym_task_index = 5
+            collector._stamp_task_indices(input_batch)
+
+            asyncio.run(
+                collector._run_rollout_batch_worker(
+                    repeated_batch=input_batch.repeat_interleave(1),
+                    generation_weight_version=2,
+                    target_weight_version=3,
+                    num_generations=1,
+                    use_nemo_gym=False,
+                    dispatched_task_indices=[5, 6],
+                )
+            )
+
+            assert collector._outstanding_task_indices == set(), description
+            assert collector.collection_failed is False, description
+
+    class _AwaitableStatus:
+        """Awaitable stand-in for a Ray ObjectRef returned by ``add.remote``."""
+
+        def __init__(self, status="success"):
+            self._status = status
+
+        def __await__(self):
+            async def _resolve():
+                return self._status
+
+            return _resolve().__await__()
+
+    class _FakeReplayBuffer:
+        """Replay buffer whose ``add`` always succeeds immediately."""
+
+        def __init__(self, outer):
+            self._outer = outer
+
+        @property
+        def add(self):
+            outer = self._outer
+
+            class _AddRemote:
+                @staticmethod
+                def remote(*args):
+                    return outer._AwaitableStatus()
+
+            return _AddRemote
+
+    def _fake_two_group_rollouts(self):
+        async def fake_rollouts(**kwargs):
+            for group_index in range(2):
+                yield trajectory_collector_mod.RolloutGroupResult(
+                    group_index=group_index,
+                    final_batch=BatchedDataDict({"value": torch.tensor([1])}),
+                    rollout_metrics={},
+                )
+
+        return fake_rollouts
+
+    def test_buffered_groups_clear_outstanding_before_worker_exit(self, monkeypatch):
+        """The window where every group has buffered but the worker has not
+        yet reached its ``finally``.
+
+        If only the worker-exit sweep cleared the set, a checkpoint taken in
+        this window during a perfectly healthy run would still see the just-
+        buffered ordinals outstanding and lower the cut below the frontier.
+        Driving ``_collect_rollout_batch`` directly bypasses the worker-exit
+        sweep, so only the per-group discard can empty the set here.
+        """
+        collector = self.create_local_collector(
+            replay_buffer=self._FakeReplayBuffer(self)
+        )
+        collector.running = True
+        collector._outstanding_task_indices = {5, 6}
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "run_async_multi_turn_rollout_groups",
+            self._fake_two_group_rollouts(),
+        )
+
+        input_batch = self.create_mock_batch(size=2)
+        collector._next_nemo_gym_task_index = 5
+        collector._stamp_task_indices(input_batch)
+
+        asyncio.run(
+            collector._collect_rollout_batch(
+                repeated_batch=input_batch.repeat_interleave(1),
+                generation_weight_version=2,
+                target_weight_version=3,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert collector._outstanding_task_indices == set()
+
+        # The healthy consequence: a frontier that just advanced past the
+        # buffered ordinals is not lowered.
+        collector._dataloader_snapshots.append((0, {"pos": 0}))
+        assert collector.get_checkpoint_state(7)["dataloader"]["frontier_ordinal"] == 7
+
+    def test_worker_sweeps_outstanding_when_stopped_mid_flight(self, monkeypatch):
+        """A worker that fails after ``running`` went False must not leak.
+
+        The failure handler returns early when the collector is shutting
+        down; the sweep lives in ``finally`` so the ordinals still clear. A
+        leak here is silent — it pins every later checkpoint's cut and shows
+        up only as mass regeneration on the next resume.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+        collector._generating_targets.add(3)
+        collector._outstanding_task_indices = {5, 6}
+
+        async def _stop_and_fail(**kwargs):
+            collector.running = False
+            raise RuntimeError("collector shut down mid-batch")
+
+        collector._collect_rollout_batch = _stop_and_fail
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=self.create_mock_batch(size=2),
+                generation_weight_version=2,
+                target_weight_version=3,
+                num_generations=1,
+                use_nemo_gym=False,
+                dispatched_task_indices=[5, 6],
+            )
+        )
+
+        assert collector._outstanding_task_indices == set()
+        assert 3 not in collector._generating_targets
+
+    def test_healthy_dispatch_leaves_cut_at_frontier_without_warning(
+        self, monkeypatch, capsys
+    ):
+        """End-to-end healthy path: dispatch through ``_process_batch``, let
+        the real worker buffer both groups, and check the cut is untouched.
+
+        The frontier can only reach 2 once ordinals 0-1 are buffered, and the
+        next dispatch's ordinals sit at/above it — so the cut equals the
+        frontier and nothing is logged.
+        """
+        replay_buffer = self._FakeReplayBuffer(self)
+        replay_buffer.get_trajectories_needed = mock.MagicMock()
+        replay_buffer.get_trajectories_needed.remote.return_value = 2
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.running = True
+        collector._refit_pause_cleared.set()
+        collector._get_next_target_for_generation = lambda version: 1
+        collector._dataloader_snapshots.append((0, {"pos": 0}))
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda ref: ref)
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "run_async_multi_turn_rollout_groups",
+            self._fake_two_group_rollouts(),
+        )
+
+        batch = self.create_mock_batch(size=2)
+        collector._stamp_task_indices(batch)
+        assert collector._process_batch(batch) is None
+        collector.wait_for_pending_generations()
+
+        # Both groups buffered, so nothing pins the cut down.
+        assert collector._outstanding_task_indices == set()
+        capsys.readouterr()
+        state = collector.get_checkpoint_state(2)
+        assert state["dataloader"]["frontier_ordinal"] == 2
+        assert "cut lowered" not in capsys.readouterr().out
 
     def test_stamping_falls_back_when_rows_cannot_carry_ordinals(self):
         """Un-stampable batches disable frontier alignment instead of crashing."""
