@@ -268,24 +268,17 @@ def test_real_quant_collective_load_failure_propagates(monkeypatch):
         extension.update_weights_from_collective()
 
 
-def test_real_quant_load_owns_only_pending_transport_tensors(monkeypatch):
+def test_real_quant_load_detaches_pending_transport_tensors(monkeypatch):
     extension = object.__new__(VllmQuantInternalWorkerExtension)
     extension.device = torch.device("cpu")
     model = torch.nn.Linear(2, 2)
     extension.model_runner = types.SimpleNamespace(model=model)
     monkeypatch.setattr(extension, "_is_real_quant_model", lambda: True)
     received = []
-
-    pending = types.SimpleNamespace(loaded_weights=[])
+    detached = []
 
     def load_weights(_self, weights):
         received.extend(weights)
-        pending.loaded_weights = [
-            (
-                "weight",
-                types.SimpleNamespace(arguments={"loaded_weight": received[0][1]}),
-            )
-        ]
         return "loaded"
 
     monkeypatch.setattr(
@@ -294,8 +287,8 @@ def test_real_quant_load_owns_only_pending_transport_tensors(monkeypatch):
         load_weights,
     )
     monkeypatch.setattr(
-        "vllm.model_executor.model_loader.reload.layerwise.get_layerwise_info",
-        lambda _module: pending,
+        "vllm.model_executor.model_loader.reload.detach_layerwise_weights_from_source",
+        lambda model, weights: detached.append((model, list(weights))),
     )
     source = torch.arange(4)
 
@@ -303,8 +296,33 @@ def test_real_quant_load_owns_only_pending_transport_tensors(monkeypatch):
 
     assert result == "loaded"
     assert received[0][0] == "model.layers.0.weight"
-    assert received[0][1].data_ptr() == source.data_ptr()
+    assert received[0][1] is source
+    assert detached == [(model, [source])]
 
-    detached = pending.loaded_weights[0][1].arguments["loaded_weight"]
-    assert torch.equal(detached, source)
-    assert detached.data_ptr() != source.data_ptr()
+
+def test_real_quant_load_detaches_transport_tensors_after_failure(monkeypatch):
+    extension = object.__new__(VllmQuantInternalWorkerExtension)
+    extension.device = torch.device("cpu")
+    model = torch.nn.Linear(2, 2)
+    extension.model_runner = types.SimpleNamespace(model=model)
+    monkeypatch.setattr(extension, "_is_real_quant_model", lambda: True)
+    detached = []
+
+    def fail_load(_self, _weights):
+        raise RuntimeError("load failed")
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_backend."
+        "VllmInternalWorkerExtension._load_weights",
+        fail_load,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.detach_layerwise_weights_from_source",
+        lambda target, weights: detached.append((target, list(weights))),
+    )
+    source = torch.arange(4)
+
+    with pytest.raises(RuntimeError, match="load failed"):
+        extension._load_weights([("model.layers.0.weight", source)])
+
+    assert detached == [(model, [source])]
