@@ -1022,7 +1022,9 @@ class TestApplyPerformanceConfig:
         return {"megatron_cfg": megatron_cfg}
 
     def test_cuda_graph_training_values_are_forwarded(self):
-        """Explicit training CUDA Graph settings propagate to the model config."""
+        """Explicit training CUDA Graph settings are normalized on assignment."""
+        from megatron.core.transformer.enums import CudaGraphModule
+
         from nemo_rl.models.megatron.setup import _apply_performance_config
 
         model_cfg = SimpleNamespace(
@@ -1044,7 +1046,10 @@ class TestApplyPerformanceConfig:
 
         _apply_performance_config(model_cfg, config)
 
-        assert model_cfg.cuda_graph_modules == ["attn", "mlp"]
+        assert model_cfg.cuda_graph_modules == [
+            CudaGraphModule.attn,
+            CudaGraphModule.mlp,
+        ]
         assert model_cfg.cuda_graph_warmup_steps == 3
 
     def test_omitted_cuda_graph_training_values_preserve_model_config(self):

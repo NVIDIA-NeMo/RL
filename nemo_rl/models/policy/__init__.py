@@ -404,7 +404,7 @@ class MegatronConfig(TypedDict):
     cuda_graph_impl: NotRequired[str]
     # Training capture regions supported by Megatron-Core: attn, mlp, moe,
     # moe_router, moe_preprocess, and mamba. An empty list captures whole layers.
-    # Used only by the local and transformer_engine implementations.
+    # Scoped training capture requires the transformer_engine implementation.
     cuda_graph_modules: NotRequired[str | list[str]]
     # Number of training warmup steps before CUDA Graph capture. This is inactive
     # when cuda_graph_impl is 'none'; the Megatron-Core default is 3.
