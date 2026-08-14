@@ -27,7 +27,7 @@ delta and NIXL cannot both be active.
 | NCCL | vLLM or Megatron | DTensor or Megatron | Uses the standard full-weight loader. |
 | NCCL reshard | vLLM | Megatron | Requires matching BF16 or blockwise FP8 precision; Megatron ETP must be 1. Currently supporting Megatron+vLLM backends. |
 | Sparse delta | vLLM | Megatron | BF16/FP16, unquantized rollout only. |
-| NIXL, full weights | vLLM or SGLang | DTensor or Megatron | Supports the standard full-weight FP8 loader. DTensor FP8 KV-cache scale transfer is not yet supported. SGLang requires one node per logical engine and `dp_size=1`. |
+| NIXL, full weights | vLLM or SGLang | DTensor or Megatron | Supports the standard full-weight FP8 loader. DTensor FP8 KV-cache scale transfer is not yet supported. SGLang requires one node per logical engine, `dp_size=1` and `pp_size=1`. |
 | NIXL, sharded experts | vLLM | DTensor or Megatron | Unquantized BF16/FP16 Triton MoE only; FP8/MXFP8 and dynamic expert placement are rejected. |
 
 Non-colocated SGLang generation is supported only through checkpoint-engine
