@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterator
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -898,8 +897,8 @@ def _run_mock_ppo_train(
         ppo_mod, "print_efficiency_summary", lambda *_args, **_kwargs: {}
     )
     monkeypatch.setattr(ppo_mod, "scale_rewards", lambda batch, _config: batch)
-    monkeypatch.setattr(ppo_mod, "_should_use_nemo_gym", lambda _config: False)
-    monkeypatch.setattr(ppo_mod, "_should_use_async_rollouts", lambda _config: False)
+    monkeypatch.setattr(ppo_mod, "should_use_nemo_gym", lambda _config: False)
+    monkeypatch.setattr(ppo_mod, "should_use_async_rollouts", lambda _config: False)
     monkeypatch.setattr(ppo_mod, "run_multi_turn_rollout", fake_rollout)
     monkeypatch.setattr(ppo_mod, "refit_policy_generation", refit)
     monkeypatch.setattr(ppo_mod, "batched_message_log_to_flat_message", fake_flatten)
@@ -918,7 +917,7 @@ def _run_mock_ppo_train(
         ppo=PPOConfig(
             async_ppo={"enabled": async_mode},
             max_num_steps=max_num_steps,
-            max_num_epochs=1,
+            max_num_epochs=-1 if async_mode else 1,
             max_rollout_turns=1,
             num_prompts_per_step=2,
             num_generations_per_prompt=1,
@@ -977,7 +976,6 @@ def _run_mock_ppo_train(
                 for i in range(2)
             ],
             "avg_trajectory_age": 0.0,
-            "generation_weight_versions": [0, 0],
         }
         replay_actor.size.remote.return_value = 2
 
@@ -1916,7 +1914,7 @@ def test_megatron_train_iters_matches_ppo_training_limit(
     config.policy["dtensor_cfg"]["enabled"] = False
     config.policy["megatron_cfg"]["enabled"] = True
     config.ppo.max_num_steps = 10
-    config.ppo.max_num_epochs = 1
+    config.ppo.max_num_epochs = -1 if async_enabled else 1
     config.ppo.ppo_epochs = 3
     config.ppo.async_ppo = AsyncPPOConfig(enabled=async_enabled)
 
@@ -2028,7 +2026,7 @@ def _make_async_ppo_config() -> SimpleNamespace:
         ),
         ppo=PPOConfig(
             async_ppo=AsyncPPOConfig(enabled=True),
-            max_num_epochs=1,
+            max_num_epochs=-1,
             policy_training_start_step=0,
             ppo_epochs=1,
             use_dynamic_sampling=False,
@@ -2155,7 +2153,7 @@ def test_async_ppo_training_loop_guards(mutate, message):
         ),
         (
             lambda cfg: setattr(cfg.ppo, "max_num_epochs", 2),
-            "max_num_epochs=1",
+            "max_num_epochs=-1",
         ),
     ],
 )
@@ -2209,6 +2207,31 @@ def test_async_ppo_config_rejects_warmup_age_below_training_age():
             max_trajectory_age_steps=2,
             warmup_max_trajectory_age_steps=1,
         )
+
+
+def test_ppo_config_rejects_warmup_age_without_critic_warmup():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="policy_training_start_step > 0"):
+        PPOConfig(
+            policy_training_start_step=0,
+            async_ppo={
+                "enabled": True,
+                "warmup_max_trajectory_age_steps": 2,
+            },
+        )
+
+
+def test_ppo_config_allows_warmup_age_with_critic_warmup():
+    config = PPOConfig(
+        policy_training_start_step=1,
+        async_ppo={
+            "enabled": True,
+            "warmup_max_trajectory_age_steps": 2,
+        },
+    )
+
+    assert config.async_ppo.warmup_max_trajectory_age_steps == 2
 
 
 @pytest.mark.parametrize(
@@ -2331,64 +2354,12 @@ def test_async_ppo_consumes_frozen_policy_rollout_at_safe_warmup_frontier():
     assert buffer.size() == 0
 
 
-class _EpochListLoader:
-    def __init__(self, sizes: list[int]) -> None:
-        self.sizes = list(sizes)
-        self.iter_count = 0
-
-    def __iter__(self) -> Iterator[int]:
-        size = self.sizes[min(self.iter_count, len(self.sizes) - 1)]
-        self.iter_count += 1
-        return iter(range(size))
-
-    def state_dict(self) -> dict[str, int]:
-        return {"iter_count": self.iter_count}
-
-
-def test_async_ppo_dataloader_cycles_after_resume_boundary():
-    from nemo_rl.algorithms.ppo import _CyclingDataLoader
-
-    dataloader = _EpochListLoader([0, 3])
-    iterator = iter(_CyclingDataLoader(dataloader))
-
-    assert [next(iterator) for _ in range(3)] == [0, 1, 2]
-    assert dataloader.iter_count == 2
-
-
-def test_async_ppo_dataloader_cycles_multiple_epochs():
-    from nemo_rl.algorithms.ppo import _CyclingDataLoader
-
-    dataloader = _EpochListLoader([2])
-    iterator = iter(_CyclingDataLoader(dataloader))
-
-    assert [next(iterator) for _ in range(5)] == [0, 1, 0, 1, 0]
-    assert dataloader.iter_count == 3
-
-
-def test_async_ppo_dataloader_rejects_empty_dataset():
-    from nemo_rl.algorithms.ppo import _CyclingDataLoader
-
-    dataloader = _EpochListLoader([0])
-
-    with pytest.raises(RuntimeError, match="two consecutive epochs"):
-        next(iter(_CyclingDataLoader(dataloader)))
-    assert dataloader.iter_count == 2
-
-
-def test_async_ppo_dataloader_delegates_checkpoint_state():
-    from nemo_rl.algorithms.ppo import _CyclingDataLoader
-
-    dataloader = _EpochListLoader([1])
-
-    assert _CyclingDataLoader(dataloader).state_dict() == {"iter_count": 0}
-
-
 def test_async_ppo_completed_resume_exits_before_actor_start(monkeypatch):
     from nemo_rl.algorithms import ppo
 
     config = _make_async_ppo_config()
     config.ppo.max_num_steps = 10
-    config.ppo.max_num_epochs = 1
+    config.ppo.max_num_epochs = -1
     config.ppo.val_period = 0
     config.ppo.val_at_start = False
     config.ppo.val_at_end = False
@@ -2444,7 +2415,7 @@ def test_async_ppo_initial_refit_failure_cleans_up_actors(monkeypatch):
     config = _make_async_ppo_config()
     config.policy["make_sequence_length_divisible_by"] = 1
     config.ppo.max_num_steps = 2
-    config.ppo.max_num_epochs = 1
+    config.ppo.max_num_epochs = -1
     config.ppo.val_period = 0
     config.ppo.val_at_start = False
     config.ppo.val_at_end = False

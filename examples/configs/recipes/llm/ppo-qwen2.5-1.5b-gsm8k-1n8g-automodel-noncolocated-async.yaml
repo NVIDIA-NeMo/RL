@@ -2,7 +2,8 @@ defaults: ../../ppo_math_1B.yaml
 ppo:
   num_prompts_per_step: 1024
   num_generations_per_prompt: 1
-  max_num_epochs: 1
+  # Async PPO cycles the dataloader and stops via max_num_steps.
+  max_num_epochs: -1
   ppo_epochs: 1
   val_period: 1
   overlong_filtering: true

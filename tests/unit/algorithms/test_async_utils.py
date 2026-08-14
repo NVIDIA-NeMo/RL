@@ -32,7 +32,6 @@ os.environ["RAY_TMPDIR"] = _temp_dir  # Alternative env var
 os.environ["TMPDIR"] = _temp_dir  # System temp dir
 
 import nemo_rl.algorithms.async_utils.trajectory_collector as trajectory_collector_mod
-import nemo_rl.algorithms.grpo as grpo_mod
 from nemo_rl.algorithms.async_utils import (
     AsyncTrajectoryCollector,
     ReplayBuffer,
@@ -1773,7 +1772,9 @@ class TestAsyncTrajectoryCollector:
         collector._get_next_target_for_generation = reserve_target
         collector._run_rollout_batch_worker = capture_batch
         monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
-        monkeypatch.setattr(grpo_mod, "_should_use_nemo_gym", lambda config: True)
+        monkeypatch.setattr(
+            trajectory_collector_mod, "should_use_nemo_gym", lambda config: True
+        )
         monkeypatch.setattr(
             trajectory_collector_mod._threading, "Thread", RecordingThread
         )
@@ -1832,7 +1833,9 @@ class TestAsyncTrajectoryCollector:
         collector._get_next_target_for_generation = reserve_target
         collector._run_rollout_batch_worker = capture_batch
         monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
-        monkeypatch.setattr(grpo_mod, "_should_use_nemo_gym", lambda config: False)
+        monkeypatch.setattr(
+            trajectory_collector_mod, "should_use_nemo_gym", lambda config: False
+        )
         monkeypatch.setattr(
             trajectory_collector_mod._threading, "Thread", RecordingThread
         )

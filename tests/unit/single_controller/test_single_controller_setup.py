@@ -410,7 +410,7 @@ class TestSetup:
         assert "train_iters" not in mc.policy.get("megatron_cfg", {})
 
     def test_nemo_gym_wires_env_handle(self, patched_factories):
-        """When _should_use_nemo_gym is True the nemo-gym actor is spun up and stored."""
+        """When should_use_nemo_gym is True the nemo-gym actor is spun up and stored."""
         mc = _make_master_config(colocated=True, backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
@@ -423,7 +423,7 @@ class TestSetup:
         fake_gym_actor = MagicMock(name="nemo_gym_actor")
 
         with (
-            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "spinup_nemo_gym_actor", return_value=fake_gym_actor
             ) as mock_spinup,
@@ -503,7 +503,7 @@ class TestSetup:
         patched_factories["setup_response_data"].return_value = (list(range(8)), None)
 
         with (
-            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
             ),
@@ -529,7 +529,7 @@ class TestSetup:
         patched_factories["setup_response_data"].return_value = (list(range(8)), None)
 
         with (
-            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
             ),
@@ -555,7 +555,7 @@ class TestSetup:
         patched_factories["setup_response_data"].return_value = (list(range(8)), None)
 
         with (
-            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
             ),
@@ -600,7 +600,7 @@ class TestSetup:
         )
 
         with (
-            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
             ),
@@ -624,7 +624,7 @@ class TestSetup:
         )
 
         with (
-            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(sc_setup_mod, "spinup_nemo_gym_actor") as mock_spinup,
             pytest.raises(NotImplementedError, match="vllm"),
         ):
