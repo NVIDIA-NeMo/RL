@@ -416,3 +416,18 @@ class TestCheckpointEngineFactory:
                 generation_backend=SGLANG_BACKEND,
                 colocated=False,
             )
+
+    def test_checkpoint_engine_rejects_sglang_pipeline_parallelism(self):
+        """One receiver is created per engine GPU, but SGLang indexes the
+        payload list by TP rank, and pp_size>1 makes those counts differ."""
+        gen = _mock_generation(cfg=_nixl_refit_cfg())
+        gen.cfg["backend"] = SGLANG_BACKEND
+        gen.cfg["sglang_cfg"] = {"pp_size": 2}
+
+        with pytest.raises(NotImplementedError, match="pp_size=1"):
+            create_weight_synchronizer(
+                policy=_mock_policy(cfg={}),
+                generation=gen,
+                generation_backend=SGLANG_BACKEND,
+                colocated=False,
+            )
