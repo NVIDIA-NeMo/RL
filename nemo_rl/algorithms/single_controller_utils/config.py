@@ -363,24 +363,33 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     # filling in the block for the path this run is not taking -- and a populated
     # wrong-path block is still a silent no-op, which is the failure this whole
     # restructure exists to remove. Only a check at setup actually closes it.
-    use_nemo_gym = bool(master_config.env.get("should_use_nemo_gym"))
-    unused_name = "native" if use_nemo_gym else "nemo_gym"
-    unused_block = getattr(async_config.rollout_failure, unused_name)
-    unused_defaults = type(unused_block)()
-    populated = [
-        f"  async_rl.rollout_failure.{unused_name}.{field}="
-        f"{getattr(unused_block, field)!r}"
-        for field in type(unused_block).model_fields
-        if getattr(unused_block, field) != getattr(unused_defaults, field)
-    ]
-    if populated:
-        active = "nemo_gym" if use_nemo_gym else "native"
-        raise ValueError(
-            f"this run uses the {active} rollout path, so these "
-            f"{unused_name}-only settings would be silently ignored:\n"
-            + "\n".join(populated)
-            + f"\nMove them under async_rl.rollout_failure.{active}, or remove them."
-        )
+    #
+    # ``env`` is a required field, so a run built the production way -- through
+    # MasterConfig(**cfg), which validates -- always carries it. model_construct
+    # skips validation and only fills fields that have defaults, so a config
+    # assembled that way can genuinely lack the attribute, and without it the
+    # rollout path is unknowable. This check only reads it to decide which half of
+    # the block is inert, so skip rather than fail a construction over it.
+    env_config = getattr(master_config, "env", None)
+    if env_config is not None:
+        use_nemo_gym = bool(env_config.get("should_use_nemo_gym"))
+        unused_name = "native" if use_nemo_gym else "nemo_gym"
+        unused_block = getattr(async_config.rollout_failure, unused_name)
+        unused_defaults = type(unused_block)()
+        populated = [
+            f"  async_rl.rollout_failure.{unused_name}.{field}="
+            f"{getattr(unused_block, field)!r}"
+            for field in type(unused_block).model_fields
+            if getattr(unused_block, field) != getattr(unused_defaults, field)
+        ]
+        if populated:
+            active = "nemo_gym" if use_nemo_gym else "native"
+            raise ValueError(
+                f"this run uses the {active} rollout path, so these "
+                f"{unused_name}-only settings would be silently ignored:\n"
+                + "\n".join(populated)
+                + f"\nMove them under async_rl.rollout_failure.{active}, or remove them."
+            )
 
 
 # ── Internal SingleController configs ────────────────────────────────────
