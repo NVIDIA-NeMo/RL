@@ -107,7 +107,7 @@ overrides = [
     { name = "nvidia-cublas", marker = "sys_platform != 'darwin'", specifier = "==13.5.1.27" },
     { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.20.0.48" },
     { name = "nvidia-cudnn-frontend", specifier = "==1.23.0" },
-    { name = "nvidia-modelopt", extras = ["torch"], git = "https://github.com/NVIDIA/Model-Optimizer?rev=9619e48d137123d2f202b9c87c47dc1f62ad76b5" },
+    { name = "nvidia-modelopt", extras = ["torch"], git = "https://github.com/NVIDIA/Model-Optimizer?rev=e58473a64e352143a45f2960d8e719e70e5b87b5" },
     { name = "nvidia-nccl-cu13", specifier = "==2.30.7" },
     { name = "nvidia-nvshmem-cu13", marker = "sys_platform != 'darwin'", specifier = ">=3.6.5" },
     { name = "opencv-python-headless", marker = "sys_platform == 'never'" },
@@ -4451,7 +4451,7 @@ requires-dist = [
     { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.20.0.48" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'vllm'", specifier = "==4.5.2" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=9619e48d137123d2f202b9c87c47dc1f62ad76b5" },
+    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=e58473a64e352143a45f2960d8e719e70e5b87b5" },
     { name = "nvidia-nvshmem-cu13", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = ">=3.6.5" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'nvrx'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?tag=v0.6.0" },
     { name = "nvshmem4py-cu13", marker = "extra == 'mcore'", specifier = ">=0.2.1" },
@@ -4952,8 +4952,8 @@ wheels = [
 
 [[package]]
 name = "nvidia-modelopt"
-version = "0.47.0.dev70+g9619e48d1"
-source = { git = "https://github.com/NVIDIA/Model-Optimizer?rev=9619e48d137123d2f202b9c87c47dc1f62ad76b5#9619e48d137123d2f202b9c87c47dc1f62ad76b5" }
+version = "0.47.0.dev71+ge58473a64"
+source = { git = "https://github.com/NVIDIA/Model-Optimizer?rev=e58473a64e352143a45f2960d8e719e70e5b87b5#e58473a64e352143a45f2960d8e719e70e5b87b5" }
 dependencies = [
     { name = "ninja" },
     { name = "numpy" },
