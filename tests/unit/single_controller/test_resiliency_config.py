@@ -315,3 +315,16 @@ class TestWrongPathFaultToleranceIsRejected:
         validate_single_controller_config(
             self._master_config(use_nemo_gym=use_nemo_gym, rollout_failure={})
         )
+
+    def test_a_config_without_env_is_skipped_not_crashed(self):
+        """`env` is required, so model_construct leaves it absent entirely.
+
+        Reading it unguarded raised AttributeError from inside
+        SingleControllerActor.__init__ and killed the actor -- for a check that only
+        needs it to pick which half of the block is inert. Caught by an upstream
+        vLLM test that builds its config this way, not by this suite.
+        """
+        cfg = self._master_config(use_nemo_gym=False, rollout_failure={})
+        del cfg.env
+        assert not hasattr(cfg, "env")
+        validate_single_controller_config(cfg)
