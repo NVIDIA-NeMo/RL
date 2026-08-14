@@ -2335,6 +2335,8 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
             return _FailedStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._timeouts = RolloutTimeouts()
+    manager._max_gym_row_attempts = 1
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
@@ -2343,7 +2345,7 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
     with pytest.raises(RuntimeError, match="instance 'nemo_gym' failed"):
         asyncio.run(
             manager._run_rollouts(
-                inputs=[{"agent_ref": {"name": "agent"}}],
+                inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
                 timer=rollouts_mod.Timer(),
                 timer_prefix="timing/test",
             )
