@@ -20,13 +20,7 @@ policy:
   train_global_batch_size: 8
   max_total_sequence_length: 2048
   make_sequence_length_divisible_by: 2
-  dtensor_cfg:
-    enabled: false
   megatron_cfg:
-    enabled: true
-    tensor_model_parallel_size: 2
-    pipeline_model_parallel_size: 1
-    context_parallel_size: 1
     sequence_parallel: true
     activation_checkpointing: false
     apply_rope_fusion: false
