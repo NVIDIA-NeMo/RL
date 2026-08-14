@@ -33,6 +33,9 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'mean(data["train/gen_kl_error"]) < 0.003' \
         'max(data["train/reward"]) > 0.5'
+    # gen_kl_error measured on the fp8 verification run: first-20-step mean
+    # 0.0014, 586-step mean 0.0018 / max 0.0025 => 0.003 bounds the 20-step
+    # mean with ~2x margin (bf16 parent: 0.002).
 
     rm -rf "$CKPT_DIR"
 fi
