@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+
 """Build the stable OSWorld train/held-out split with the CC v2 contract."""
 
 import argparse

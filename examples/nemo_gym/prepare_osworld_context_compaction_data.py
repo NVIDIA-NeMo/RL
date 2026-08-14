@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+
 """Convert OSWorld tasks into context-compaction-aware NeMo-Gym rows."""
 
 import argparse
