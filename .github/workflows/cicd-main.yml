@@ -365,6 +365,78 @@ jobs:
       - name: Approved
         run: echo "Approved to run CI tests."
 
+  prepare-megatron-lock:
+    name: Prepare Megatron lockfile
+    needs: [pre-flight, cicd-wait-in-queue]
+    if: >-
+      ${{
+        always() &&
+        needs.pre-flight.result == 'success' &&
+        needs.pre-flight.outputs.megatron_lm_commit != '' &&
+        (
+          needs.cicd-wait-in-queue.result == 'success' ||
+          !startsWith(github.ref, 'refs/heads/pull-request/')
+        ) &&
+        !cancelled()
+      }}
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.package.outputs.artifact_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.pre-flight.outputs.test_sha }}
+          submodules: recursive
+
+      - name: Override Megatron-LM commit
+        env:
+          MEGATRON_LM_COMMIT: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
+        run: |
+          megatron_lm_dir="3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+          bash .github/scripts/checkout-megatron-lm-commit.sh "$megatron_lm_dir" "$MEGATRON_LM_COMMIT"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.11.28"
+          enable-cache: true
+
+      - name: Generate lockfile
+        run: uv lock
+
+      - name: Package lockfile
+        id: package
+        env:
+          MEGATRON_LM_COMMIT: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
+          NEMO_RL_COMMIT: ${{ needs.pre-flight.outputs.test_sha }}
+        run: |
+          artifact_dir="$RUNNER_TEMP/megatron-lock"
+          megatron_lm_dir="3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+          actual_nemo_rl_commit="$(git rev-parse HEAD)"
+          actual_megatron_lm_commit="$(git -C "$megatron_lm_dir" rev-parse HEAD)"
+          test "$actual_nemo_rl_commit" = "${NEMO_RL_COMMIT,,}"
+          test "$actual_megatron_lm_commit" = "${MEGATRON_LM_COMMIT,,}"
+          mkdir -p "$artifact_dir"
+          cp uv.lock "$artifact_dir/uv.lock"
+          {
+            echo "nemo-rl-commit=$actual_nemo_rl_commit"
+            echo "megatron-lm-commit=$actual_megatron_lm_commit"
+          } > "$artifact_dir/manifest.txt"
+          (
+            cd "$artifact_dir"
+            sha256sum uv.lock > uv.lock.sha256
+          )
+          echo "artifact_name=megatron-lock-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload lockfile
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ runner.temp }}/megatron-lock
+          retention-days: 1
+          if-no-files-found: error
+
   sphinx-build:
     needs: [pre-flight, cicd-wait-in-queue]
     if: >-
@@ -390,13 +462,14 @@ jobs:
         needs.org-member-pre-flight.result == 'success' &&
         needs.pre-flight.outputs.test_level != 'none' &&
         needs.pre-flight.outputs.image_tag == '' &&
+        (needs.prepare-megatron-lock.result == 'success' || needs.prepare-megatron-lock.result == 'skipped') &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
           !startsWith(github.ref, 'refs/heads/pull-request/')
         ) &&
         !cancelled()
       }}
-    needs: [pre-flight, org-member-pre-flight, cicd-wait-in-queue]
+    needs: [pre-flight, prepare-megatron-lock, org-member-pre-flight, cicd-wait-in-queue]
     permissions:
       contents: read
       pull-requests: read
@@ -415,6 +488,7 @@ jobs:
       trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
       trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
       megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
+      megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
       build-args: |
         MAX_JOBS=4
         TRTLLM_BUILD_JOBS=24
@@ -433,13 +507,14 @@ jobs:
         needs.org-member-pre-flight.outputs.is_member == 'true' &&
         vars.DISABLE_GB200_TESTS != 'true' &&
         contains('L1 L2 megatron', needs.pre-flight.outputs.test_level) &&
+        (needs.prepare-megatron-lock.result == 'success' || needs.prepare-megatron-lock.result == 'skipped') &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
           !startsWith(github.ref, 'refs/heads/pull-request/')
         ) &&
         !cancelled()
       }}
-    needs: [pre-flight, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
+    needs: [pre-flight, prepare-megatron-lock, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
     permissions:
       contents: read
       pull-requests: read
@@ -458,6 +533,7 @@ jobs:
       trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
       trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
       megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
+      megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
       build-args: |
         MAX_JOBS=4
         TRTLLM_BUILD_JOBS=8
@@ -791,7 +867,7 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Other_2
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-    needs: [pre-flight, build-container, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
+    needs: [pre-flight, prepare-megatron-lock, build-container, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
     runs-on: ${{ matrix.runner }}
     if: >-
       ${{
@@ -799,6 +875,7 @@ jobs:
         contains('L1 L2 megatron', needs.pre-flight.outputs.test_level) &&
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
+        (needs.prepare-megatron-lock.result == 'success' || needs.prepare-megatron-lock.result == 'skipped') &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
           !startsWith(github.ref, 'refs/heads/pull-request/')
@@ -829,6 +906,7 @@ jobs:
           script: ${{ matrix.script }}
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
           megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
+          megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
 
   cicd-functional-tests-gb200:
     strategy:
@@ -872,7 +950,7 @@ jobs:
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_GB200_MXFP8
             runner: ${{ vars.GB200_RUNNER }}
-    needs: [pre-flight, build-container-gb200, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
+    needs: [pre-flight, prepare-megatron-lock, build-container-gb200, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
     runs-on: ${{ matrix.runner }}
     if: >-
       ${{
@@ -882,6 +960,7 @@ jobs:
         vars.DISABLE_GB200_TESTS != 'true' &&
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
+        (needs.prepare-megatron-lock.result == 'success' || needs.prepare-megatron-lock.result == 'skipped') &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
           !startsWith(github.ref, 'refs/heads/pull-request/')
@@ -913,6 +992,7 @@ jobs:
           script: ${{ matrix.script }}
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
           megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
+          megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
 
   cicd-fast-functional-tests:
     strategy:
@@ -953,13 +1033,14 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Other_2
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-    needs: [pre-flight, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
+    needs: [pre-flight, prepare-megatron-lock, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
     if: >-
       ${{
         always() &&
         contains('Lfast', needs.pre-flight.outputs.test_level) &&
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
+        (needs.prepare-megatron-lock.result == 'success' || needs.prepare-megatron-lock.result == 'skipped') &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
           !startsWith(github.ref, 'refs/heads/pull-request/')
@@ -987,6 +1068,7 @@ jobs:
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
           megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
+          megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
 
   CI_QA_Gate:
     name: "CI quality check${{ needs.pre-flight.outputs.test_level == 'none' && ' (No tests run: Label CI:L*)' || '' }}"
@@ -998,6 +1080,7 @@ jobs:
       - pr-branch-up-to-date-check
       - lint-check
       - cicd-wait-in-queue
+      - prepare-megatron-lock
       - sphinx-build
       - build-container
       - build-container-gb200
@@ -1017,6 +1100,7 @@ jobs:
             ${{
               needs.lint-check.result == 'success' &&
               (needs.cicd-wait-in-queue.result == 'success' || needs.cicd-wait-in-queue.result == 'skipped') &&
+              (needs.prepare-megatron-lock.result == 'success' || needs.prepare-megatron-lock.result == 'skipped') &&
               (needs.pr-branch-up-to-date-check.result == 'success' || needs.pr-branch-up-to-date-check.result == 'skipped') &&
               (
                 needs.pre-flight.outputs.test_level != 'none' &&
