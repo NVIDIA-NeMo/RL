@@ -29,6 +29,11 @@ MXFP8_CASES = {
         "segment_size": 4,
         "async_engine": None,
         "moe_backend": None,
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "model.layers.*.mlp.gate",
+            "lm_head",
+        ],
     },
     "grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout": {
         "nodes": 4,
@@ -36,6 +41,11 @@ MXFP8_CASES = {
         "segment_size": 2,
         "async_engine": True,
         "moe_backend": None,
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "model.layers.*.mlp.gate",
+            "lm_head",
+        ],
     },
     "grpo-qwen3-32b-4n4g-mxfp8-rollout": {
         "nodes": 4,
@@ -43,6 +53,10 @@ MXFP8_CASES = {
         "segment_size": 4,
         "async_engine": None,
         "moe_backend": None,
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "lm_head",
+        ],
     },
     "grpo-qwen3-32b-8n4g-async-1off-mxfp8-rollout": {
         "nodes": 8,
@@ -50,6 +64,10 @@ MXFP8_CASES = {
         "segment_size": 4,
         "async_engine": True,
         "moe_backend": None,
+        "ignore_patterns": [
+            "model.layers.*.self_attn.*",
+            "lm_head",
+        ],
     },
     "grpo-qwen3-235b-16n4g-mxfp8-rollout": {
         "nodes": 16,
@@ -132,16 +150,8 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
 
     assert vllm_cfg["precision"] == "fp8"
     assert vllm_cfg["is_mx"] is True
-    if "ignore_patterns" in expected:
-        assert "quantization_ignored_layer_kws" not in vllm_cfg
-        assert vllm_cfg["quantization_ignore_patterns"] == expected["ignore_patterns"]
-    else:
-        assert vllm_cfg["quantization_ignored_layer_kws"] == [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-        ]
+    assert "quantization_ignored_layer_kws" not in vllm_cfg
+    assert vllm_cfg["quantization_ignore_patterns"] == expected["ignore_patterns"]
     assert cluster["num_nodes"] == expected["nodes"]
     assert cluster["gpus_per_node"] == expected["gpus_per_node"]
     assert cluster["segment_size"] == expected["segment_size"]
