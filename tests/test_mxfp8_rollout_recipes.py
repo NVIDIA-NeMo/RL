@@ -128,7 +128,7 @@ MXFP8_CASES = {
         "gpus_per_node": 4,
         "segment_size": 4,
         "async_engine": None,
-        "moe_backend": None,
+        "moe_backend": "flashinfer_trtllm",
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "lm_head",
@@ -139,7 +139,7 @@ MXFP8_CASES = {
         "gpus_per_node": 4,
         "segment_size": 4,
         "async_engine": True,
-        "moe_backend": None,
+        "moe_backend": "flashinfer_trtllm",
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "lm_head",
@@ -220,6 +220,12 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     assert config_path.is_file()
     assert script_path.is_file()
 
+    recipe = _load_yaml(config_path)
+    assert (
+        recipe["policy"]["generation"]["vllm_kwargs"]["moe_backend"]
+        == "flashinfer_trtllm"
+    )
+
     config = _load_resolved_yaml(config_path)
     vllm_cfg = config["policy"]["generation"]["vllm_cfg"]
     cluster = config["cluster"]
@@ -241,11 +247,10 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
         assert vllm_cfg["tensor_parallel_size"] == expected["tensor_parallel_size"]
     if expected["async_engine"] is not None:
         assert vllm_cfg["async_engine"] is expected["async_engine"]
-    if expected["moe_backend"] is not None:
-        assert (
-            config["policy"]["generation"]["vllm_kwargs"]["moe_backend"]
-            == expected["moe_backend"]
-        )
+    assert (
+        config["policy"]["generation"]["vllm_kwargs"]["moe_backend"]
+        == expected["moe_backend"]
+    )
     if expected.get("train_global_batch_size") is not None:
         assert (
             config["policy"]["train_global_batch_size"]

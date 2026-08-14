@@ -11,6 +11,8 @@ policy:
       quantization_ignore_patterns:
         - model.layers.*.self_attn.*
         - lm_head
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
 logger:
   log_dir: logs/grpo-qwen3-32b-4n4g-mxfp8-rollout
   wandb:
