@@ -52,10 +52,9 @@ dependencies = [
   "torchvision==0.26.0",
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
-  # Keep the base range broad enough while allowing backend extras to tighten as needed.
-  # Floor raised to 5.5.0 for Gemma 4 support.
-  # Ceiling raised to <5.13.0 for Automodel r0.6.0, which pins transformers==5.12.1.
-  "transformers>=5.5.0,<5.13.0",
+  # Keep the base range compatible with backend-specific pins while selecting 5.12.1
+  # for the base and compatible backend environments in uv.lock.
+  "transformers>=5.5.0,<=5.12.1",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -518,6 +517,34 @@ conflicts = [
   [
     { extra = "trtllm" },
     { extra = "mcore" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "fsdp" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "modelopt" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "nvrx" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "nemo_gym" },
+  ],
+  [
+    { extra = "sglang" },
+    { extra = "modelopt" },
+  ],
+  [
+    { extra = "sglang" },
+    { extra = "nvrx" },
+  ],
+  [
+    { extra = "sglang" },
+    { extra = "nemo_gym" },
   ],
 ]
 
