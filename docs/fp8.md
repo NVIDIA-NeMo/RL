@@ -71,8 +71,10 @@ attention, the router, and the language-model head in BF16:
                 quantization_ignore_patterns:
                     - model.layers.*.self_attn.*
                     - model.layers.*.mlp.gate
-                    - lm_head
 ```
+
+`lm_head` is always excluded from FP8 and MXFP8 quantization, even when it is
+not listed in `quantization_ignore_patterns` in the YAML configuration.
 
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
