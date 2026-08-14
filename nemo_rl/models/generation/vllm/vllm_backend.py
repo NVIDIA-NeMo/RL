@@ -200,10 +200,15 @@ class VllmInternalWorkerExtension:
                 uses_native_mxfp8_linear_refit,
             )
 
-            roots = tuple(
-                module
-                for module in self.model_runner.model.modules()
-                if uses_native_mxfp8_linear_refit(module)
+            modules = getattr(self.model_runner.model, "modules", None)
+            roots = (
+                tuple(
+                    module
+                    for module in modules()
+                    if uses_native_mxfp8_linear_refit(module)
+                )
+                if modules is not None
+                else ()
             )
             self._nrl_mxfp8_linear_reload_roots = roots
         return roots
