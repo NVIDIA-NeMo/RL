@@ -30,7 +30,7 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
-from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
+from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import (
