@@ -73,7 +73,13 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert vllm_kwargs == {
         "quantization": "fp8",
         "kv_cache_dtype": "auto",
-        "hf_overrides": {"quantization_config": fp8.MXFP8_BLOCK_QUANT_KWARGS},
+        "hf_overrides": {
+            "quantization_config": {
+                **fp8.MXFP8_BLOCK_QUANT_KWARGS,
+                "ignored_layers": ["lm_head"],
+                "ignore": ["lm_head"],
+            }
+        },
     }
     assert applied_configs == [fp8.global_fp8_config]
     assert fp8.global_fp8_config.is_mx is True
@@ -124,7 +130,7 @@ def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
         "model.layers.*.mlp.gate",
         "lm_head",
     ]
-    assert "ignored_layers" not in quant_config
+    assert quant_config["ignored_layers"] == ["lm_head"]
 
     modelopt_config = ModelOptMxFp8Config.from_config(quant_config)
     qwen3_quantizable_families = {
@@ -143,7 +149,9 @@ def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
     assert not modelopt_config.is_layer_excluded("model.layers.0.mlp.gate_up_proj")
 
 
-def test_init_fp8_keeps_regular_fp8_config_unchanged(fp8_module, monkeypatch):
+def test_init_fp8_excludes_lm_head_from_regular_fp8(fp8_module, monkeypatch):
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
     fp8 = fp8_module
 
     monkeypatch.setattr(
@@ -164,9 +172,13 @@ def test_init_fp8_keeps_regular_fp8_config_unchanged(fp8_module, monkeypatch):
         model_parallel_size=1,
     )
 
-    assert vllm_kwargs["hf_overrides"]["quantization_config"] == (
-        fp8.FP8_BLOCK_QUANT_KWARGS
-    )
+    quant_config = vllm_kwargs["hf_overrides"]["quantization_config"]
+    assert quant_config == {
+        **fp8.FP8_BLOCK_QUANT_KWARGS,
+        "ignored_layers": ["lm_head"],
+        "ignore": ["lm_head"],
+    }
+    assert Fp8Config.from_config(quant_config).ignored_layers == ["lm_head"]
 
 
 @pytest.mark.parametrize("patterns", ["lm_head", 1, {"lm_head"}])
@@ -258,6 +270,7 @@ def test_init_fp8_combines_legacy_and_modelopt_ignore_patterns(fp8_module, monke
         "lm_head",
         "model.layers.0.self_attn.q_proj",
     ]
+    assert quant_config["ignore"].count("lm_head") == 1
 
 
 def test_init_fp8_rejects_modelopt_ignore_patterns_for_regular_fp8(
