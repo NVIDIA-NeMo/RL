@@ -20,12 +20,13 @@ import threading
 import time
 import uuid
 import warnings
-from typing import Any, AsyncGenerator, Optional, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
-import uvicorn
-from fastapi import FastAPI
+if TYPE_CHECKING:
+    import uvicorn
+    from fastapi import FastAPI
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -346,7 +347,7 @@ class VllmAsyncGenerationWorkerImpl(
         return self.base_url
 
     # ruff: noqa
-    def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
+    def _setup_vllm_openai_api_server(self, app: "FastAPI") -> "FastAPI":
         from copy import deepcopy
         from logging import Filter as LoggingFilter
         from logging import LogRecord
