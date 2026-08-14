@@ -188,8 +188,10 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     # The encoder-cache reset is implemented only on the collective/IPC and
     # nccl_reshard async refit paths (both returned above). Fail loudly rather
     # than let other transports silently keep stale multimodal encoder outputs
-    # across weight updates.
-    if config["vllm_cfg"].get("reset_encoder_cache_after_weight_update"):
+    # across weight updates. Some callers re-validate partial generation
+    # configs (e.g. worker-side NIXL setup), so vllm_cfg may be absent here.
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg and vllm_cfg.get("reset_encoder_cache_after_weight_update"):
         raise ValueError(
             "vllm_cfg.reset_encoder_cache_after_weight_update is not supported "
             f"with refit_transport={transport!r}: this transport's refit path "
