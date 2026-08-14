@@ -535,7 +535,7 @@ data_plane:
   impl: transfer_queue
   backend: "simple"                  # TQ storage backend ('simple' or 'mooncake_cpu')
   storage_capacity: 1000000          # max samples retained per partition
-  num_storage_units: 2               # storage shards
+  num_storage_units: ${mul:2, ${cluster.num_nodes}}  # 'simple' only; TQ wants >= 2 per node
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
   reuse_registered_buffers: true     # 'mooncake_cpu' only; reuse RDMA-registered buffers
   # Per client process — see DataPlaneConfig before raising these.
