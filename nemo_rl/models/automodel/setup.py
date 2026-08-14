@@ -576,12 +576,17 @@ def validate_and_prepare_config(
                     isinstance(bias_update_factor, bool)
                     or not isinstance(bias_update_factor, numbers.Real)
                     or not math.isfinite(float(bias_update_factor))
-                    or bias_update_factor != 0
+                    or bias_update_factor < 0
                 ):
                     raise ValueError(
-                        "dynamic routing bias is not supported for Qwen3-MoE "
-                        "because its rollout backends do not consume a "
-                        "correction-bias state; gate_bias_update_factor must be 0"
+                        "Qwen3-MoE gate_bias_update_factor must be a finite "
+                        "non-negative real number"
+                    )
+                generation_backend = (config.get("generation") or {}).get("backend")
+                if bias_update_factor > 0 and generation_backend not in {None, "vllm"}:
+                    raise ValueError(
+                        "Qwen3-MoE dynamic routing bias currently supports "
+                        "generation.backend='vllm' only"
                     )
             supported_overrides = {
                 "aux_loss_coeff",
@@ -1061,6 +1066,20 @@ def setup_model_and_optimizer(
         # no gradient path from remote experts to the learned Gate.
         enable_qwen3_moe_ep_router_gradients()
 
+    model_automodel_kwargs = automodel_kwargs
+    routing_bias_factor = 0.0
+    if use_native_shared_prefix_moe:
+        moe_overrides = automodel_kwargs.get("moe_overrides") or {}
+        routing_bias_factor = float(moe_overrides.get("gate_bias_update_factor", 0.0))
+        if routing_bias_factor > 0:
+            # Add the correction-bias buffer only after the base checkpoint is
+            # loaded. The pinned AutoModel DCP adapter cannot plan an EP load
+            # for a newly configured buffer that is absent from the HF source.
+            construction_overrides = dict(moe_overrides)
+            construction_overrides["gate_bias_update_factor"] = 0.0
+            model_automodel_kwargs = dict(automodel_kwargs)
+            model_automodel_kwargs["moe_overrides"] = construction_overrides
+
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
     model = model_class.from_pretrained(
@@ -1076,11 +1095,11 @@ def setup_model_and_optimizer(
         trust_remote_code=True,
         sdpa_method=sdpa_method,
         **from_pretrained_kwargs,
-        **automodel_kwargs,
+        **model_automodel_kwargs,
     )
 
     if use_native_shared_prefix_moe:
-        enable_custom_qwen3_moe_shared_prefix(model)
+        enable_custom_qwen3_moe_shared_prefix(model, routing_bias_factor)
 
     print(model)
 

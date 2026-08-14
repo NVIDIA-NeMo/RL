@@ -42,7 +42,12 @@ pytestmark = [
 ]
 
 
-def _config(*, aux_loss_coeff: float, n_routed_experts: int = 4):
+def _config(
+    *,
+    aux_loss_coeff: float,
+    n_routed_experts: int = 4,
+    gate_bias_update_factor: float = 0.0,
+):
     from nemo_automodel.components.moe.config import MoEConfig
 
     return MoEConfig(
@@ -52,9 +57,10 @@ def _config(*, aux_loss_coeff: float, n_routed_experts: int = 4):
         n_expert_groups=1,
         n_limited_groups=1,
         train_gate=True,
-        gate_bias_update_factor=0.0,
+        gate_bias_update_factor=gate_bias_update_factor,
         aux_loss_coeff=aux_loss_coeff,
-        score_func="softmax",
+        score_func=("softmax_with_bias" if gate_bias_update_factor > 0 else "softmax"),
+        force_e_score_correction_bias=gate_bias_update_factor > 0,
         route_scale=1.0,
         dim=4,
         inter_dim=8,
@@ -221,6 +227,7 @@ def test_ep4_matches_dense_main_and_logical_router_gradients():
         collect_shared_prefix_moe_statistics,
         enable_qwen3_moe_ep_router_gradients,
         shared_prefix_moe_context,
+        update_shared_prefix_moe_bias,
     )
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -308,7 +315,10 @@ def test_ep4_matches_dense_main_and_logical_router_gradients():
         # exclusively injected by the router auxiliary loss. Sending the
         # compact weights through EP also verifies that the routing-weight
         # all-gather preserves this autograd edge.
-        aux_config = _config(aux_loss_coeff=0.125)
+        aux_config = _config(
+            aux_loss_coeff=0.125,
+            gate_bias_update_factor=0.0625,
+        )
         logical_gate = _make_gate(aux_config, device)
         dense_aux_gate = copy.deepcopy(logical_gate)
         _install_logical_router(logical_gate)
@@ -370,6 +380,24 @@ def test_ep4_matches_dense_main_and_logical_router_gradients():
             rtol=4e-5,
             atol=4e-6,
         )
+
+        expected_global_load = dense_aux_gate._cumulative_expert_load.clone().float()
+        dist.all_reduce(expected_global_load)
+        expected_bias = (
+            torch.sign(expected_global_load.mean() - expected_global_load)
+            * aux_config.gate_bias_update_factor
+        )
+        bias_model = torch.nn.Module()
+        bias_model.add_module("gate", logical_gate)
+        bias_model._nemo_shared_prefix_custom_qwen3_moe = True
+        update_shared_prefix_moe_bias(bias_model, dist.group.WORLD)
+        torch.testing.assert_close(
+            logical_gate.e_score_correction_bias,
+            expected_bias,
+            rtol=0.0,
+            atol=0.0,
+        )
+        assert logical_gate._cumulative_expert_load is None
 
         # DP statistics collectives must remain aligned when packing gives one
         # rank only dummy microbatches. Simulate that by retaining accumulators

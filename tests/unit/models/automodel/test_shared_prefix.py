@@ -156,6 +156,7 @@ def test_shared_prefix_moe_router_matches_logical_dense_tokens():
     from nemo_rl.models.automodel.shared_prefix_moe import (
         _logical_router_forward,
         shared_prefix_moe_context,
+        update_shared_prefix_moe_bias,
     )
 
     layout = build_shared_prefix_layout(*_interleaved_rollouts())
@@ -181,9 +182,10 @@ def test_shared_prefix_moe_router_matches_logical_dense_tokens():
         n_expert_groups=1,
         n_limited_groups=1,
         train_gate=True,
-        gate_bias_update_factor=0.0,
+        gate_bias_update_factor=0.125,
         aux_loss_coeff=0.03125,
-        score_func="softmax",
+        score_func="softmax_with_bias",
+        force_e_score_correction_bias=True,
         route_scale=1.0,
         dim=3,
         inter_dim=8,
@@ -209,6 +211,7 @@ def test_shared_prefix_moe_router_matches_logical_dense_tokens():
     compact_gate._track_load_balance = True
     compact_gate._nemo_shared_prefix_original_forward = compact_gate.forward
     compact_gate.forward = MethodType(_logical_router_forward, compact_gate)
+    compact_gate._nemo_shared_prefix_custom_qwen3_moe = True
 
     dense_weights, dense_indices, dense_aux_loss = dense_gate(
         dense_x,
@@ -221,6 +224,9 @@ def test_shared_prefix_moe_router_matches_logical_dense_tokens():
             torch.ones(compact_x.shape[0], dtype=torch.bool),
             None,
         )
+        execution.commit()
+        committed_load = compact_gate._cumulative_expert_load.clone()
+        compact_gate(compact_x, torch.ones(compact_x.shape[0], dtype=torch.bool), None)
         execution.commit()
 
     assert torch.equal(compact_indices[dense_gather], dense_indices)
@@ -240,6 +246,16 @@ def test_shared_prefix_moe_router_matches_logical_dense_tokens():
     expected_compact_input_grad = torch.zeros_like(compact_x)
     expected_compact_input_grad.index_add_(0, dense_gather, dense_x.grad)
     torch.testing.assert_close(compact_x.grad, expected_compact_input_grad)
+    torch.testing.assert_close(compact_gate._cumulative_expert_load, committed_load)
+    torch.testing.assert_close(
+        compact_gate._cumulative_expert_load, dense_gate._cumulative_expert_load
+    )
+    dense_gate.update_bias()
+    update_shared_prefix_moe_bias(compact_gate, dp_group=None)
+    torch.testing.assert_close(
+        compact_gate.e_score_correction_bias, dense_gate.e_score_correction_bias
+    )
+    assert compact_gate._cumulative_expert_load is None
 
 
 def test_shared_prefix_moe_context_is_module_scoped_and_restored():
@@ -289,7 +305,6 @@ def test_shared_prefix_moe_context_is_module_scoped_and_restored():
 @pytest.mark.parametrize(
     "bias_update_factor",
     [
-        1.0e-3,
         -1.0e-3,
         True,
         False,
@@ -300,7 +315,7 @@ def test_shared_prefix_moe_context_is_module_scoped_and_restored():
         "x",
     ],
 )
-def test_shared_prefix_moe_router_rejects_dynamic_bias_without_layout(
+def test_shared_prefix_moe_router_rejects_invalid_bias_without_layout(
     bias_update_factor,
 ):
     pytest.importorskip("nemo_automodel")
@@ -313,7 +328,7 @@ def test_shared_prefix_moe_router_rejects_dynamic_bias_without_layout(
         ),
     )
 
-    with pytest.raises(ValueError, match="does not support dynamic bias"):
+    with pytest.raises(ValueError, match="finite non-negative"):
         _logical_router_forward(
             gate,
             torch.zeros(1, 2),

@@ -54,7 +54,9 @@ from nemo_rl.models.automodel.setup import (
 from nemo_rl.models.automodel.shared_prefix import SHARED_PREFIX_GROUP_IDS
 from nemo_rl.models.automodel.shared_prefix_moe import (
     collect_shared_prefix_moe_statistics,
+    is_custom_qwen3_moe_shared_prefix,
     reset_shared_prefix_moe_statistics,
+    update_shared_prefix_moe_bias,
 )
 from nemo_rl.models.automodel.train import (
     FullLogitsPostProcessor,
@@ -109,15 +111,25 @@ def dtensor_params_generator(
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            # Convert to target dtype
+            refit_dtype = _refit_tensor_dtype(adapted_fqn, target_dtype)
             yield (
                 adapted_fqn,
-                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+                adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
             )
             del adapted_tensor
         del adapted_fqn_tensors
         del merged_tensor
         del full_tensor
+
+
+def _refit_tensor_dtype(
+    name: str,
+    target_dtype: torch.dtype,
+) -> torch.dtype:
+    """Keep routing correction bias in FP32 across rollout refits."""
+    if name == "e_score_correction_bias" or name.endswith(".e_score_correction_bias"):
+        return torch.float32
+    return target_dtype
 
 
 @torch.no_grad()
@@ -385,6 +397,9 @@ class DTensorPolicyWorkerV2Impl(
 
     def _update_moe_gate_bias_if_supported(self) -> None:
         """Update the non-gradient MoE routing bias after the optimizer step."""
+        if is_custom_qwen3_moe_shared_prefix(self.model):
+            update_shared_prefix_moe_bias(self.model, self.dp_mesh.get_group())
+            return
         update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
         if update_moe_gate_bias is not None:
             update_moe_gate_bias()
@@ -1095,7 +1110,10 @@ class DTensorPolicyWorkerV2Impl(
                 self.model, name, full_tensor
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
+                state_dict_info[adapted_fqn] = (
+                    adapted_tensor.shape,
+                    _refit_tensor_dtype(adapted_fqn, self.dtype),
+                )
 
         return state_dict_info
 

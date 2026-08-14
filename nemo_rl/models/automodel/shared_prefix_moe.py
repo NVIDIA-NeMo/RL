@@ -931,6 +931,14 @@ class _RouterExecution:
             gate._last_expert_load = expert_load
             gate._last_aux_loss = aux_loss
 
+            if getattr(gate, "bias_update_factor", 0.0) > 0:
+                cumulative_load = gate._cumulative_expert_load
+                gate._cumulative_expert_load = (
+                    expert_load.clone()
+                    if cumulative_load is None
+                    else cumulative_load + expert_load
+                )
+
             accumulated = getattr(gate, "_nemo_shared_prefix_logical_expert_load", None)
             gate._nemo_shared_prefix_logical_expert_load = (
                 expert_load.clone()
@@ -1010,7 +1018,54 @@ def is_custom_qwen3_moe_shared_prefix(model: nn.Module) -> bool:
     return bool(getattr(model, _CUSTOM_QWEN3_MOE_FLAG, False))
 
 
-def enable_custom_qwen3_moe_shared_prefix(model: nn.Module) -> None:
+@torch.no_grad()
+def update_shared_prefix_moe_bias(
+    model: nn.Module,
+    dp_group: torch.distributed.ProcessGroup | None,
+) -> None:
+    """Update correction biases from logical, DP-global expert load.
+
+    AutoModel's native ``Gate.update_bias`` only reduces load when its bias is
+    a DTensor. FSDP keeps this persistent buffer replicated, so use the
+    Policy-owned DP group explicitly and make every rank participate, including
+    ranks that received only dummy packing microbatches.
+    """
+    if not is_custom_qwen3_moe_shared_prefix(model):
+        return
+
+    from nemo_automodel.components.moe.layers import Gate
+
+    for gate in model.modules():
+        if not isinstance(gate, Gate):
+            continue
+
+        factor = float(gate.bias_update_factor)
+        if factor == 0:
+            continue
+
+        correction_bias = gate.e_score_correction_bias
+        local_load = gate._cumulative_expert_load
+        gate._cumulative_expert_load = None
+        if local_load is None:
+            local_load = torch.zeros(
+                gate.n_experts,
+                dtype=torch.float32,
+                device=correction_bias.device,
+            )
+        else:
+            local_load = local_load.to(
+                device=correction_bias.device,
+                dtype=torch.float32,
+            )
+        if torch.distributed.is_initialized() and dp_group is not None:
+            torch.distributed.all_reduce(local_load, group=dp_group)
+        correction_bias.add_(torch.sign(local_load.mean() - local_load) * factor)
+
+
+def enable_custom_qwen3_moe_shared_prefix(
+    model: nn.Module,
+    routing_bias_factor: float = 0.0,
+) -> None:
     """Install native-attention and logical-router adapters on one model."""
     from nemo_automodel.components.models.qwen3_moe.layers import (
         Qwen3MoeAttention,
@@ -1030,6 +1085,19 @@ def enable_custom_qwen3_moe_shared_prefix(model: nn.Module) -> None:
         elif isinstance(module, Gate):
             module._nemo_shared_prefix_original_forward = module.forward
             module.forward = MethodType(_logical_router_forward, module)
+            if routing_bias_factor > 0:
+                # Add this only after loading: it is absent from HF checkpoints.
+                del module.e_score_correction_bias
+                module.register_buffer(
+                    "e_score_correction_bias",
+                    torch.zeros(
+                        module.n_experts,
+                        dtype=torch.float32,
+                        device=module.weight.device,
+                    ),
+                )
+                module.bias_update_factor = routing_bias_factor
+                module.score_func = "softmax_with_bias"
             gate_count += 1
 
     if attention_count == 0 or gate_count == 0:
@@ -1122,10 +1190,11 @@ def _logical_router_forward(
         isinstance(bias_update_factor, bool)
         or not isinstance(bias_update_factor, numbers.Real)
         or not math.isfinite(float(bias_update_factor))
-        or bias_update_factor != 0
+        or bias_update_factor < 0
     ):
         raise ValueError(
-            "native Qwen3-MoE shared-prefix routing does not support dynamic bias"
+            "Qwen3-MoE gate_bias_update_factor must be a finite "
+            "non-negative real number"
         )
 
     execution = getattr(gate, _ROUTER_EXECUTION_ATTR, None)
@@ -1184,6 +1253,7 @@ def _logical_router_forward(
     original_compute_aux_loss = gate._compute_aux_loss
     aux_loss_coeff = gate.aux_loss_coeff
     track_load_balance = gate._track_load_balance
+    original_bias_update_factor = gate.bias_update_factor
     original_aux_scaler = moe_layers.MoEAuxLossAutoScaler
     gate._compute_expert_load = MethodType(logical_expert_load, gate)
     gate._compute_aux_loss = MethodType(logical_aux_loss, gate)
@@ -1193,6 +1263,10 @@ def _logical_router_forward(
     gate._track_load_balance = execution.valid
     if not execution.valid:
         gate.aux_loss_coeff = 0.0
+    # Native Gate.forward accumulates physical load immediately. Stage logical
+    # load in the execution and commit it exactly once before backward instead;
+    # this also prevents activation-checkpoint replay from double counting.
+    gate.bias_update_factor = 0.0
     moe_layers.MoEAuxLossAutoScaler = _LogicalAuxLossAutoScaler
     try:
         weights, indices, aux_loss = gate._nemo_shared_prefix_original_forward(
@@ -1204,6 +1278,7 @@ def _logical_router_forward(
         gate._compute_aux_loss = original_compute_aux_loss
         gate.aux_loss_coeff = aux_loss_coeff
         gate._track_load_balance = track_load_balance
+        gate.bias_update_factor = original_bias_update_factor
 
     if execution.valid:
         if captured_load is None:
@@ -1223,6 +1298,7 @@ def reset_shared_prefix_moe_statistics(model: nn.Module) -> None:
             module._nemo_shared_prefix_logical_expert_load = None
             module._nemo_shared_prefix_aux_loss_sum = None
             module._nemo_shared_prefix_aux_loss_count = 0
+            module._cumulative_expert_load = None
 
 
 def collect_shared_prefix_moe_statistics(

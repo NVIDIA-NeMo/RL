@@ -79,11 +79,31 @@ def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
 def test_dtensor_v2_update_moe_gate_bias_called_when_supported():
     worker = object.__new__(DTensorPolicyWorkerV2Impl)
     worker.model = MagicMock()
+    worker.model._nemo_shared_prefix_custom_qwen3_moe = False
     worker.model.update_moe_gate_bias = MagicMock()
 
     DTensorPolicyWorkerV2Impl._update_moe_gate_bias_if_supported(worker)
 
     worker.model.update_moe_gate_bias.assert_called_once_with()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@patch(
+    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2."
+    "update_shared_prefix_moe_bias"
+)
+def test_dtensor_v2_updates_shared_prefix_moe_bias_with_dp_group(mock_update):
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.model = nn.Linear(1, 1)
+    worker.model._nemo_shared_prefix_custom_qwen3_moe = True
+    dp_group = object()
+    worker.dp_mesh = MagicMock()
+    worker.dp_mesh.get_group.return_value = dp_group
+
+    DTensorPolicyWorkerV2Impl._update_moe_gate_bias_if_supported(worker)
+
+    mock_update.assert_called_once_with(worker.model, dp_group)
 
 
 @pytest.mark.automodel
@@ -685,6 +705,18 @@ class TestDTensorParamsGenerator:
             assert tensor.dtype == target_dtype, (
                 f"Tensor {name} should be converted to {target_dtype}"
             )
+
+    def test_correction_bias_stays_float32(self):
+        """Routing decisions must not quantize the correction bias on refit."""
+        model = nn.Module()
+        model.register_buffer(
+            "e_score_correction_bias",
+            torch.tensor([0.125, -0.25], dtype=torch.float32),
+        )
+
+        results = dict(dtensor_params_generator(model, torch.bfloat16))
+
+        assert results["e_score_correction_bias"].dtype == torch.float32
 
     def test_contiguous_output(self):
         """Test that output tensors are contiguous."""

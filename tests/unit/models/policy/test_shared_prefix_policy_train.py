@@ -356,6 +356,7 @@ def test_shared_prefix_policy_train_native_qwen3_moe(
         activation_checkpointing=True,
         automodel_kwargs={
             "force_hf": False,
+            "moe_overrides": {"gate_bias_update_factor": 0.0625},
             "backend": {
                 "_target_": (
                     "nemo_automodel.components.models.common.utils.BackendConfig"
@@ -370,6 +371,7 @@ def test_shared_prefix_policy_train_native_qwen3_moe(
         },
     )
     config["shared_prefix_training"] = True
+    config["generation"]["backend"] = "vllm"
     config["train_global_batch_size"] = 8
     config["train_micro_batch_size"] = 2
     config["logprob_batch_size"] = 2
@@ -445,6 +447,27 @@ def test_shared_prefix_policy_train_native_qwen3_moe(
         assert not _any_parameter_changed(
             before_parameters, after_aux_parameters, ".mlp.experts."
         )
+        correction_bias_names = {
+            name
+            for snapshot in after_aux_parameters
+            for name in snapshot
+            if name.endswith(".e_score_correction_bias")
+        }
+        assert len(correction_bias_names) == 1
+        correction_bias_name = correction_bias_names.pop()
+        assert any(
+            not torch.equal(before[correction_bias_name], after[correction_bias_name])
+            for before, after in zip(before_parameters, after_aux_parameters)
+        )
+        reference_bias = after_aux_parameters[0][correction_bias_name]
+        assert reference_bias.dtype == torch.float32
+        for rank_snapshot in after_aux_parameters[1:]:
+            torch.testing.assert_close(
+                rank_snapshot[correction_bias_name],
+                reference_bias,
+                rtol=0.0,
+                atol=0.0,
+            )
 
         moe_metrics = aux_only_result["moe_metrics"]
         assert moe_metrics["logical_token_layer_events"] == pytest.approx(8 * 26)

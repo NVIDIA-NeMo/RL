@@ -171,9 +171,7 @@ class AutomodelKwargs(TypedDict):
     # auto-detected and set at runtime if not explicitly configured.
     # See: https://github.com/NVIDIA-NeMo/RL/issues/2072
     force_hf: NotRequired[bool]
-    # Overrides for AutoModel's native MoE config. Shared-prefix Qwen3-MoE only
-    # accepts checkpoint-compatible auxiliary-loss overrides; dynamic routing
-    # bias is rejected because Qwen rollout backends do not consume that state.
+    # Numeric overrides for AutoModel's native Qwen3-MoE config.
     moe_overrides: NotRequired[dict[str, float]]
 
 

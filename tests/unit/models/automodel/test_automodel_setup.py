@@ -644,7 +644,6 @@ class TestValidateAndPrepareConfig:
     @pytest.mark.parametrize(
         "bias_update_factor",
         [
-            1.0e-3,
             -1.0e-3,
             True,
             False,
@@ -667,7 +666,7 @@ class TestValidateAndPrepareConfig:
         mock_autoconfig,
         bias_update_factor,
     ):
-        """Reject dynamic bias that cannot be refit into Qwen rollout models."""
+        """Reject malformed dynamic-bias update factors."""
         mock_autoconfig.model_type = "qwen3_moe"
         mock_autoconfig.architectures = ["Qwen3MoeForCausalLM"]
         mock_autoconfig.layer_types = ["full_attention"]
@@ -695,8 +694,45 @@ class TestValidateAndPrepareConfig:
             }
         )
 
-        with pytest.raises(ValueError, match="dynamic routing bias is not supported"):
+        with pytest.raises(ValueError, match="finite non-negative"):
             validate_and_prepare_config(mock_config, None, 0)
+
+    @pytest.mark.parametrize(
+        "generation_backend,expected_error",
+        [("vllm", None), ("sglang", "backend='vllm' only")],
+    )
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_shared_prefix_qwen3_moe_enables_dynamic_bias(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+        generation_backend,
+        expected_error,
+    ):
+        """Require a rollout backend that consumes the refitted bias."""
+        _configure_native_shared_prefix_qwen3_moe(
+            mock_config,
+            mock_autoconfig,
+            automodel_kwargs=_native_qwen3_moe_kwargs(
+                moe_overrides={"gate_bias_update_factor": 1.0e-3}
+            ),
+        )
+        mock_config["generation"]["backend"] = generation_backend
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        if expected_error:
+            with pytest.raises(ValueError, match=expected_error):
+                validate_and_prepare_config(mock_config, None, 0)
+        else:
+            assert isinstance(
+                validate_and_prepare_config(mock_config, None, 0), RuntimeConfig
+            )
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -2266,7 +2302,7 @@ class TestSetupModelAndOptimizer:
         else:
             mock_enable_ep_free_checkpoint_adapter.assert_not_called()
             mock_enable_ep_router_gradients.assert_called_once_with()
-        mock_enable_custom_qwen3_moe.assert_called_once_with(mock_model)
+        mock_enable_custom_qwen3_moe.assert_called_once_with(mock_model, 0.0)
         model_kwargs = mock_runtime_config.model_class.from_pretrained.call_args.kwargs
         assert model_kwargs["force_hf"] is False
         assert model_kwargs["moe_overrides"] == {"gate_bias_update_factor": 0.0}

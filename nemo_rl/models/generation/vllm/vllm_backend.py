@@ -38,6 +38,33 @@ except ImportError:
     )
 
 
+def _enable_qwen3_moe_routing_bias_refit() -> None:
+    """Plumb Qwen3-MoE's refitted correction bias into vLLM's existing router."""
+    from vllm.model_executor.models import qwen3_moe
+
+    marker = "_nemo_qwen3_moe_routing_bias_refit"
+    original_fused_moe = qwen3_moe.FusedMoE
+    if getattr(original_fused_moe, marker, False):
+        return
+
+    def fused_moe_with_routing_bias(*args, **kwargs):
+        gate = kwargs["gate"]
+        correction_bias = torch.nn.Parameter(
+            torch.zeros(kwargs["num_experts"], dtype=torch.float32),
+            requires_grad=False,
+        )
+        gate.e_score_correction_bias = correction_bias
+        return original_fused_moe(
+            *args, e_score_correction_bias=correction_bias, **kwargs
+        )
+
+    setattr(fused_moe_with_routing_bias, marker, True)
+    qwen3_moe.FusedMoE = fused_moe_with_routing_bias
+
+
+_enable_qwen3_moe_routing_bias_refit()
+
+
 def fix_gemma3_vision_weight_name(key: str) -> str:
     """Re-insert the `vision_model` segment into Gemma3 vision-tower weights.
 
