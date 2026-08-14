@@ -24,8 +24,7 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import cache
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
-
+from typing import Any, Literal, NamedTuple, cast
 
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
@@ -54,9 +53,6 @@ from nemo_rl.utils.weight_transfer_stream import (
 from nemo_rl.utils.weight_transfer_zmq import (
     ZmqSparseRefitServer,
 )
-
-if TYPE_CHECKING:
-    from fastapi import Request
 
 logger = logging.getLogger(__name__)
 
@@ -421,15 +417,16 @@ class VllmSparseRefitReceiver:
         return result
 
     def setup_api_server(self, app: Any) -> None:
+        from fastapi import Request
         from fastapi.responses import JSONResponse
 
         cfg = self._worker.cfg
         token = vllm_refit_api_key(cfg["vllm_cfg"].get("http_refit_api_key_env_var"))
 
         async def respond(
-            raw_request: "Request",
+            raw_request: Request,
             action: Literal["prepare", "s3", "flush", "zmq_flush"],
-        ) -> "JSONResponse":
+        ) -> JSONResponse:
             if cfg["vllm_cfg"]["async_engine"]:
                 self._refit_async_loop = asyncio.get_running_loop()
             supplied_token = raw_request.headers.get(G_VLLM_REFIT_API_KEY_HEADER)
@@ -468,7 +465,7 @@ class VllmSparseRefitReceiver:
         def endpoint(
             action: Literal["prepare", "s3", "flush", "zmq_flush"],
         ):
-            async def handle(raw_request: "Request") -> "JSONResponse":
+            async def handle(raw_request: Request) -> JSONResponse:
                 return await respond(raw_request, action)
 
             return handle

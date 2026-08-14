@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
+
 if TYPE_CHECKING:
     import uvicorn
     from fastapi import FastAPI
