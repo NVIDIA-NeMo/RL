@@ -228,6 +228,9 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             raise ValueError(
                 "quantization_ignore_patterns must contain non-empty strings"
             )
+        quantization_ignore_patterns = [
+            pattern.strip() for pattern in quantization_ignore_patterns
+        ]
     fp8_config_kwargs = {
         "num_first_layers_in_bf16": vllm_cfg.get("num_first_layers_in_bf16", 0),
         "num_last_layers_in_bf16": vllm_cfg.get("num_last_layers_in_bf16", 0),

@@ -48,14 +48,32 @@ def test_fp8_and_user_hf_overrides_coexist():
 
 def test_user_hf_overrides_take_precedence():
     """On key collision, the user-supplied hf_overrides value wins."""
-    vllm_kwargs = {"hf_overrides": {"quantization_config": {"user": "wins"}}}
+    vllm_kwargs = {
+        "hf_overrides": {
+            "quantization_config": {
+                "user": "wins",
+                "ignore": ["model.layers.0.self_attn.*"],
+            }
+        }
+    }
     fp8_kwargs = {
-        "hf_overrides": {"quantization_config": {"fp8": "base"}},
+        "hf_overrides": {
+            "quantization_config": {
+                "fp8": "base",
+                "ignore": ["lm_head"],
+                "ignored_layers": ["lm_head"],
+            }
+        },
     }
 
     _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
 
-    assert vllm_kwargs["hf_overrides"]["quantization_config"] == {"user": "wins"}
+    assert vllm_kwargs["hf_overrides"]["quantization_config"] == {
+        "fp8": "base",
+        "user": "wins",
+        "ignore": ["lm_head", "model.layers.0.self_attn.*"],
+        "ignored_layers": ["lm_head"],
+    }
 
 
 def test_no_existing_hf_overrides():
