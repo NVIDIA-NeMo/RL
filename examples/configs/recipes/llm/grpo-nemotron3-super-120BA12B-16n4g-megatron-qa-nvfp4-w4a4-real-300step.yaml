@@ -16,7 +16,7 @@ policy:
     vllm_cfg:
       enforce_eager: true
     vllm_kwargs:
-      moe_backend: auto
+      moe_backend: cutlass
 
 logger:
   log_dir: logs/super120b-w4a4-real-300step

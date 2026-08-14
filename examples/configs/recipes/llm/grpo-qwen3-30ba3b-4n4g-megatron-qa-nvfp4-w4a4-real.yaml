@@ -18,7 +18,7 @@ policy:
     vllm_cfg:
       enforce_eager: true
     vllm_kwargs:
-      moe_backend: auto
+      moe_backend: cutlass
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real
   wandb:
