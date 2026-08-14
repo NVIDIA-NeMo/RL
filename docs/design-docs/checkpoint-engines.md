@@ -370,7 +370,7 @@ Current limitations:
   remaining generation-side support. Megatron and DTensor policy backends are
   supported for both vLLM and SGLang generation.
 - SGLang refit requires each logical engine to fit on a single node
-  (`num_gpus_per_engine <= gpus_per_node`), requires `sglang_cfg.dp_size=1`,
+  (`num_gpus_per_engine <= gpus_per_node`), requires `sglang_cfg.dp_size=1` and `sglang_cfg.pp_size=1`,
   and does not support `shard_expert_weights=true`. All three are rejected
   with an explicit error.
 - The built-in NIXL backend uses paired policy-to-rollout transfer only.

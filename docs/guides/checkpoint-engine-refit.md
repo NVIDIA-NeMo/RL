@@ -13,7 +13,7 @@ Use it only for non-colocated generation:
 | Generation backend | Supported | Notes |
 | --- | --- | --- |
 | vLLM | yes | Includes sharded EP refit (`shard_expert_weights`). |
-| SGLang | yes | One node per logical engine, `dp_size=1`; `shard_expert_weights` not supported. |
+| SGLang | yes | One node per logical engine, `dp_size=1`, `pp_size=1`; `shard_expert_weights` not supported. |
 | Megatron | no | Tracked by [issue #3288](https://github.com/NVIDIA-NeMo/RL/issues/3288). |
 
 For SGLang, NIXL terminates in the generation worker actor and the weights are

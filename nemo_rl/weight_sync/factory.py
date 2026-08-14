@@ -106,6 +106,15 @@ def create_weight_synchronizer(
                     "SGLang checkpoint-engine refit currently requires "
                     "sglang_cfg.dp_size=1."
                 )
+            if sglang_cfg.get("pp_size", 1) != 1:
+                # One receiver is created per engine GPU, but SGLang indexes
+                # ``serialized_named_tensors`` by TP rank, and with pp_size>1
+                # the engine has tp_size = num_gpus_per_engine // pp_size TP
+                # ranks. The payload list would be pp_size times too long.
+                raise NotImplementedError(
+                    "SGLang checkpoint-engine refit currently requires "
+                    "sglang_cfg.pp_size=1."
+                )
             if engine_kwargs.get("shard_expert_weights", False):
                 raise NotImplementedError(
                     "SGLang checkpoint-engine refit does not support "
