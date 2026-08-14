@@ -8,8 +8,8 @@ grpo:
   max_num_steps: 100
   val_period: -1
   reward_shaping:
-    # Cap rollout responses at 2K while retaining 131K model capacity.
-    max_response_length: 2000
+    # Cap rollout responses at 4K while retaining 131K model capacity.
+    max_response_length: 4000
   skip_reference_policy_logprobs_calculation: true
 loss_fn:
   reference_policy_kl_penalty: 0.0
