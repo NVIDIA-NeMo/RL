@@ -27,6 +27,7 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
+    AdvantageEstimator,
     GAEConfig,
     GeneralizedAdvantageEstimator,
     RawRewardAdvantageEstimator,
@@ -1109,7 +1110,7 @@ def dynamic_sampling(
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
 
 
-def _create_advantage_estimator(master_config: MasterConfig):
+def _create_advantage_estimator(master_config: MasterConfig) -> AdvantageEstimator:
     """Create and return an advantage estimator based on configuration.
 
     PPO's training loop consumes a `(advantages, returns)` pair from a
