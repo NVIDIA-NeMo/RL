@@ -103,6 +103,24 @@ def load_dataloader_state(
     dataloader.load_state_dict(saved_state)
 
 
+def _combine_agent_names(datasets: list[Any]) -> frozenset[str] | None:
+    return _combine_agent_name_sets([dataset.agent_names for dataset in datasets])
+
+
+def _combine_agent_name_sets(
+    agent_name_sets: list[frozenset[str] | None],
+) -> frozenset[str] | None:
+    """Combine complete agent metadata without hiding an unknown source."""
+    if any(agent_names is None for agent_names in agent_name_sets):
+        return None
+    return frozenset(
+        agent_name
+        for agent_names in agent_name_sets
+        if agent_names is not None
+        for agent_name in agent_names
+    )
+
+
 # TODO: @yukih: unify to setup_data after dataset refactored
 def setup_response_data(
     tokenizer: AutoProcessor | AutoTokenizer,
@@ -202,6 +220,7 @@ def setup_response_data(
                 task_data_processors,
                 task_data_preprocessors=task_data_preprocessors,
                 max_seq_length=data_config["max_input_seq_length"],
+                agent_names=data.agent_names,
             )
             for data in data_list
         }
@@ -215,6 +234,7 @@ def setup_response_data(
             task_data_processors,
             task_data_preprocessors=task_data_preprocessors,
             max_seq_length=data_config["max_input_seq_length"],
+            agent_names=_combine_agent_names(data_list),
         )
     sample_count = sum(len(data.dataset) for data in data_list)
     print(f"  ✓ Training dataset loaded with {sample_count} samples.")
@@ -226,11 +246,13 @@ def setup_response_data(
     val_task_data_preprocessors = {}
     val_task_to_env = {}
     val_data_list = []
+    val_agent_name_sets = []
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
     for data in data_list:
         if hasattr(data, "val_dataset") and data.val_dataset is not None:
             val_data_list.append(data.val_dataset)
+            val_agent_name_sets.append(data.agent_names)
             print(
                 f"  - Loaded validation dataset {data.task_name} with {len(data.val_dataset)} samples."
             )
@@ -255,6 +277,7 @@ def setup_response_data(
                 update_single_dataset_config(cfg, data_config["default"])
             val_data = load_response_dataset(cfg)
             val_data_list.append(val_data.dataset)
+            val_agent_name_sets.append(val_data.agent_names)
             print(
                 f"  - Loaded validation dataset {val_data.task_name} with {len(val_data.dataset)} samples."
             )
@@ -280,6 +303,7 @@ def setup_response_data(
             val_task_data_processors,
             task_data_preprocessors=val_task_data_preprocessors,
             max_seq_length=data_config["max_input_seq_length"],
+            agent_names=_combine_agent_name_sets(val_agent_name_sets),
         )
         print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 

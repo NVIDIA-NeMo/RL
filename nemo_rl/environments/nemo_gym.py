@@ -1620,13 +1620,18 @@ def validate_dataset_agent_coverage(
 def _iter_dataset_agent_names(dataset: Any) -> set[str]:
     """Collect the agent names a dataset's rows reference.
 
-    Rows store ``extra_env_info`` as a JSON string, since a HuggingFace
-    ``Dataset`` does not hold the nested structure well, so reading the agent
-    out means parsing each row. That cost is paid once, at setup, and only by
-    sharded jobs.
+    NemoGymDataset caches this small set before repetition and data merging.
+    Custom datasets without that metadata retain the row-scan fallback.
     """
     if dataset is None:
         return set()
+    if isinstance(dataset, Mapping):
+        return set().union(
+            *(_iter_dataset_agent_names(nested) for nested in dataset.values())
+        )
+    agent_names = getattr(dataset, "agent_names", None)
+    if agent_names is not None:
+        return set(agent_names)
     # AllTaskProcessedDataset wraps the raw rows; a plain sequence is also fine.
     rows = getattr(dataset, "dataset", dataset)
 

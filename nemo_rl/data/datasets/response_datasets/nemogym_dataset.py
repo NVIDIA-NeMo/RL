@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
 from datasets import Dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
@@ -30,19 +32,34 @@ class NemoGymDataset(RawDataset):
         if self.task_name[0] == "-":
             self.task_name = self.task_name[1:]
 
-        # load raw line from jsonl
-        # will use `json.loads` to load to dict format at `nemo_gym_data_processor` later since `Dataset` cannot handle nested structure well
+        # Keep raw lines because Dataset cannot reliably represent the nested Gym rows.
+        # Cache the distinct agents while each source row is read once.
+        # Repeating a dataset must not multiply this setup work.
         with open(data_path) as f:
-            self.dataset = [raw_line for raw_line in f]
+            raw_rows = [raw_line for raw_line in f]
+        self.agent_names = frozenset(
+            agent_name
+            for raw_row in raw_rows
+            if (agent_name := _get_agent_name(json.loads(raw_row))) is not None
+        )
 
         # format the dataset
         self.dataset = Dataset.from_dict(
             {
-                "extra_env_info": self.dataset,
-                "task_name": [self.task_name] * len(self.dataset),
+                "extra_env_info": raw_rows,
+                "task_name": [self.task_name] * len(raw_rows),
             }
         )
 
         # repeat the dataset
         if repeat > 1:
             self.dataset = self.dataset.repeat(repeat)
+
+
+def _get_agent_name(row: object) -> str | None:
+    if not isinstance(row, dict):
+        return None
+    agent_ref = row.get("agent_ref")
+    if not isinstance(agent_ref, dict) or "name" not in agent_ref:
+        return None
+    return str(agent_ref["name"])

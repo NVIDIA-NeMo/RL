@@ -930,6 +930,28 @@ def test_the_wrapped_dataset_is_unwrapped_before_scanning():
         )
 
 
+def test_cached_agent_names_avoid_scanning_repeated_or_separate_datasets():
+    alpha_rows = MagicMock()
+    beta_rows = MagicMock()
+    datasets = {
+        "alpha": SimpleNamespace(
+            dataset=alpha_rows,
+            agent_names=frozenset({"alpha"}),
+        ),
+        "beta": SimpleNamespace(
+            dataset=beta_rows,
+            agent_names=frozenset({"beta"}),
+        ),
+    }
+
+    nemo_gym_mod.validate_dataset_agent_coverage(
+        _sharded_set({"alpha": "left", "beta": "right"}), {"train": datasets}
+    )
+
+    alpha_rows.__iter__.assert_not_called()
+    beta_rows.__iter__.assert_not_called()
+
+
 def test_shard_set_shutdown_releases_the_placement_group_once():
     pg = MagicMock()
     shard_set = nemo_gym_mod.NemoGymShardSet(
