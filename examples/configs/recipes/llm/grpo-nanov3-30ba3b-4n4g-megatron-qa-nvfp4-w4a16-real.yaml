@@ -7,6 +7,11 @@ checkpointing:
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   quant_cfg: ${oc.env:PWD}/examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml
+  make_sequence_length_divisible_by: 1
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: false
   tokenizer:
     name: ${policy.model_name}
   generation:
@@ -14,8 +19,8 @@ policy:
     real_quant: true
     vllm_cfg:
       # Keep vLLM conservative because the full-parameter Nano3 policy and
-      # reference model are colocated on these GPUs. With TP=4, this leaves
-      # refit headroom while providing ample KV cache for the 2K smoke workload.
+      # reference model are colocated on these GPUs. Rollout TP=4 leaves refit
+      # headroom while providing ample KV cache for the 2K smoke workload.
       gpu_memory_utilization: 0.35
       enable_prefix_caching: false
     vllm_kwargs:

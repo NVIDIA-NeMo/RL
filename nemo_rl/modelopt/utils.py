@@ -39,6 +39,16 @@ def validate_modelopt_real_quant_policy_config(
             "generation.real_quant requires policy.quant_cfg so the policy can "
             "produce ModelOpt deployment tensors"
         )
+    uses_cutlass_moe = (
+        generation_config.get("vllm_kwargs", {}).get("moe_backend") == "cutlass"
+    )
+    if uses_cutlass_moe and not generation_config.get("vllm_cfg", {}).get(
+        "enforce_eager"
+    ):
+        raise ValueError(
+            "generation.real_quant with the CUTLASS MoE backend requires "
+            "generation.vllm_cfg.enforce_eager=true"
+        )
 
 
 def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:

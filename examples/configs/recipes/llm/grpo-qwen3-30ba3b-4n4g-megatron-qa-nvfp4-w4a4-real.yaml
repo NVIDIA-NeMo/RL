@@ -15,6 +15,9 @@ policy:
   generation:
     quant_cfg: null
     real_quant: true
+    vllm_cfg:
+      # CUDA graphs retain the pre-refit CUTLASS activation-scale tensors.
+      enforce_eager: true
     vllm_kwargs:
       # vLLM 0.25.1 FlashInfer NVFP4 MoE scales are not writable during refit.
       moe_backend: cutlass

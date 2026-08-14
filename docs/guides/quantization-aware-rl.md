@@ -156,9 +156,16 @@ policy:
   generation:
     backend: vllm
     real_quant: true
+    vllm_cfg:
+      enforce_eager: true
 ```
 
 NeMo RL derives vLLM's deployment configuration from the initialized policy quantizer graph. W4A4 requires a native activation-quantizing NVFP4 backend; the weight-only Marlin path is reserved for W4A16. Fused-MoE real-quant refits currently require every vLLM rank to own the full expert set.
+
+With the pinned vLLM version, routed-expert W4A4 real-quant rollout must use
+eager execution. The CUTLASS MoE backend derives activation-scale tensors when
+the model is initialized, so CUDA graphs captured before the first refit retain
+the placeholder scale tensors. W4A16 rollout does not have this requirement.
 
 For Nano3 W4A16 real-quant rollout, use the Nano3 weight-only policy recipe:
 

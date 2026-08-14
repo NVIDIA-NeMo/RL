@@ -111,6 +111,18 @@ def test_real_quant_rejects_non_vllm_backend():
         )
 
 
+def test_real_quant_cutlass_moe_requires_eager_execution():
+    with pytest.raises(ValueError, match="enforce_eager=true"):
+        validate_modelopt_real_quant_policy_config(
+            {"megatron_cfg": {"enabled": True}, "quant_cfg": "NVFP4_DEFAULT_CFG"},
+            {
+                "backend": "vllm",
+                "real_quant": True,
+                "vllm_kwargs": {"moe_backend": "cutlass"},
+            },
+        )
+
+
 @pytest.mark.parametrize(
     ("method_name", "base_method_name"),
     [
