@@ -31,6 +31,9 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 CHECK_INTERVAL = 0.01
 CHECK_TIMEOUT = 0.5
 WAIT_TIMEOUT = 5.0
+# ``stop`` joins for ``timeout + interval + 5``; the +5 is a fixed floor, so a
+# test that needs the join to expire cannot run faster than this.
+STOP_JOIN_TIMEOUT = CHECK_TIMEOUT + CHECK_INTERVAL + 5
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +265,46 @@ def test_stop_without_start_is_a_noop(monitor_factory):
     monitor = monitor_factory(_FakeGeneration([_FakeEngine()]))
     monitor.stop()
     assert monitor._thread is None
+
+
+def test_stop_leaves_events_intact_when_the_join_times_out(monitor_factory):
+    """A probe can outlive ``stop``'s join budget: it is bounded at
+    ``2 * timeout``, and a failed probe then spends up to another ``timeout``
+    in ``_kill_engine``, against a budget of ``timeout + interval + 5``.
+    Clearing the events on that path killed the still-running thread with
+    ``AttributeError: 'NoneType' object has no attribute 'wait'``.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _blocking_health(timeout=None):
+        entered.set()
+        # Must outlast ``stop``'s join budget, which has a fixed +5s floor.
+        release.wait(STOP_JOIN_TIMEOUT + WAIT_TIMEOUT)
+        return True
+
+    engine = _FakeEngine(health_fn=_blocking_health)
+    monitor = monitor_factory(_FakeGeneration([engine]))
+    monitor.start()
+    monitor.resume()
+    assert entered.wait(WAIT_TIMEOUT)
+
+    died = []
+    previous_hook = threading.excepthook
+    threading.excepthook = died.append
+    try:
+        monitor.stop()
+        # The join could not reap the thread, so its events must survive.
+        assert monitor._thread is not None
+        assert monitor._stop_event is not None and monitor._stop_event.is_set()
+        assert monitor.is_checking_enabled() is False
+
+        release.set()
+        assert _wait_until(lambda: not monitor._thread.is_alive())
+        assert died == []
+    finally:
+        release.set()
+        threading.excepthook = previous_hook
 
 
 # ---------------------------------------------------------------------------
