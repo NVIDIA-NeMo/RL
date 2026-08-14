@@ -26,7 +26,7 @@ from nemo_rl.modelopt.models.generation.vllm_quant_worker import (
     _configure_quant_engine_kwargs,
 )
 from nemo_rl.modelopt.utils import configure_modelopt_real_quant_generation
-from nemo_rl.models.generation.vllm.vllm_backend import IPCWeightManifestError
+from nemo_rl.models.policy.utils import IPCProtocol
 from nemo_rl.models.generation.vllm.utils import resolve_generation_worker_cls
 
 
@@ -173,14 +173,7 @@ def test_real_quant_uses_vllm_full_model_reload_lifecycle(monkeypatch):
     assert events.count(("synchronize",)) == 1
 
 
-@pytest.mark.parametrize(
-    ("transport", "error", "match"),
-    [
-        ("ipc", IPCWeightManifestError("missing weight"), "refit rejected"),
-        ("collective", RuntimeError("load failed"), "collective refit failed"),
-    ],
-)
-def test_real_quant_reload_failures_are_fatal(monkeypatch, transport, error, match):
+def _real_quant_extension(monkeypatch):
     extension = object.__new__(VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(
         model=torch.nn.Linear(2, 2),
@@ -188,7 +181,7 @@ def test_real_quant_reload_failures_are_fatal(monkeypatch, transport, error, mat
     )
     extension.model_config = object()
     extension.device = torch.device("cpu")
-    monkeypatch.setattr(extension, "_is_real_quant_model", lambda: True)
+    monkeypatch.setenv("VLLM_MODELOPT_REAL_QUANT", "1")
 
     @contextmanager
     def set_current(_config):
@@ -202,12 +195,77 @@ def test_real_quant_reload_failures_are_fatal(monkeypatch, transport, error, mat
         "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
         lambda _model: None,
     )
+    return extension
 
-    with pytest.raises(RuntimeError, match=match):
-        with extension._weight_update_lifecycle(transport):
-            raise error
 
-    assert extension._weight_update_errors_are_fatal()
+def test_real_quant_ipc_load_failure_acks_and_propagates(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    class FakeSocket:
+        def __init__(self):
+            self.received = iter(
+                [
+                    (object(), ["model.weight"], 4),
+                    IPCProtocol.COMPLETE,
+                ]
+            )
+            self.sent = []
+
+        def recv_pyobj(self):
+            return next(self.received)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    extension = _real_quant_extension(monkeypatch)
+    extension.state_dict_info = {"model.weight": (torch.Size([1]), torch.float32)}
+    extension.zmq_socket = FakeSocket()
+    extension.maybe_init_zmq = lambda: None
+    extension._synchronize_before_ipc_data_ack = lambda: None
+
+    def fail_load(_weights):
+        raise RuntimeError("load failed")
+
+    extension._load_weights = fail_load
+    monkeypatch.setattr(
+        vllm_backend,
+        "rebuild_cuda_tensor_from_ipc",
+        lambda _handle, _device_index: torch.zeros(4, dtype=torch.uint8),
+    )
+    monkeypatch.setattr(vllm_backend, "calculate_aligned_size", lambda size: size)
+
+    with pytest.raises(RuntimeError, match="refit rejected"):
+        extension.update_weights_via_ipc_zmq()
+
+    assert extension.zmq_socket.sent == [
+        IPCProtocol.ACK.value.encode(),
+        IPCProtocol.ACK.value.encode(),
+    ]
+
+
+def test_real_quant_collective_load_failure_propagates(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    extension = _real_quant_extension(monkeypatch)
+    extension.state_dict_info = {"model.weight": object()}
+    extension.model_update_group = object()
+
+    def fail_load(_weights):
+        raise RuntimeError("load failed")
+
+    extension._load_weights = fail_load
+
+    def consume(**kwargs):
+        kwargs["post_unpack_func"]([("model.weight", torch.ones(1))])
+
+    monkeypatch.setattr(
+        vllm_backend,
+        "packed_broadcast_consumer",
+        consume,
+    )
+
+    with pytest.raises(RuntimeError, match="collective refit failed"):
+        extension.update_weights_from_collective()
 
 
 def test_real_quant_load_preserves_names_and_owns_transport_tensors(monkeypatch):
