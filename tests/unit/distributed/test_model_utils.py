@@ -1630,3 +1630,46 @@ def test_distillation_topk_non_tp_defers_fp32_upcast():
     assert topk_logprobs.dtype == torch.float32
     assert torch.equal(topk_logprobs, expected)
     assert torch.equal(student.grad, reference.grad)
+
+
+def test_distillation_topk_gathers_before_upcasting(monkeypatch):
+    """The full-vocab tensor must still be bf16 when ``gather`` runs.
+
+    The equivalence test above cannot catch a revert: its reference is the
+    old ``to(float32).gather(...)`` formulation, so it holds whether or not
+    the upcast was deferred. This one observes the deferral itself.
+    """
+    torch.manual_seed(0)
+    batch, seq, vocab, k = 1, 8, 512, 4
+    logits = torch.randn(batch, seq, vocab, dtype=torch.bfloat16)
+    teacher_topk_logits = torch.randn(batch, seq, k)
+    teacher_topk_indices = torch.stack(
+        [
+            torch.stack([torch.randperm(vocab)[:k] for _ in range(seq)])
+            for _ in range(batch)
+        ]
+    )
+
+    seen_dtypes = []
+    real_gather = torch.Tensor.gather
+
+    def spy(self, dim, index):
+        # only the full-vocab gather is interesting; K-wide ones are downstream
+        if self.shape[-1] == vocab:
+            seen_dtypes.append(self.dtype)
+        return real_gather(self, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "gather", spy, raising=True)
+
+    get_distillation_topk_logprobs_from_logits(
+        student_logits=logits,
+        teacher_topk_logits=teacher_topk_logits,
+        teacher_topk_indices=teacher_topk_indices,
+        zero_outside_topk=False,
+        calculate_entropy=False,
+    )
+
+    assert seen_dtypes, "expected a gather over the vocab axis"
+    assert all(d == torch.bfloat16 for d in seen_dtypes), (
+        f"the vocab-wide tensor was upcast before the gather: {seen_dtypes}"
+    )
