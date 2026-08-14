@@ -164,6 +164,43 @@ def _save_async_replay_buffer_checkpoint(
     return num_buffered_trajectories
 
 
+def _maybe_restore_async_replay_buffer_checkpoint(
+    replay_buffer: Any,
+    checkpoint_path: str,
+    *,
+    load_replay_buffer: bool | None,
+    num_prompts_per_step: int,
+    current_training_step: int,
+    max_age_steps: int,
+) -> dict[str, int] | None:
+    """Restore async replay state unless the config explicitly opts out."""
+    if load_replay_buffer is False:
+        print(
+            "📦 Skipping replay buffer restore (checkpointing.load_replay_buffer=false)"
+        )
+        return None
+
+    replay_buffer_path = os.path.join(checkpoint_path, "replay_buffer.pt")
+    if not os.path.exists(replay_buffer_path):
+        print(
+            f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
+            "Starting with an empty replay buffer."
+        )
+        return None
+
+    print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
+    restore_metadata = ray.get(
+        replay_buffer.load_from_path.remote(
+            replay_buffer_path,
+            num_prompts_per_step=num_prompts_per_step,
+            current_training_step=current_training_step,
+            max_age_steps=max_age_steps,
+        )
+    )
+    print("✅ Replay buffer restored from checkpoint")
+    return restore_metadata
+
+
 class RewardScalingConfig(BaseModel, extra="allow"):
     """Configure linear reward scaling with clamping.
 
@@ -4231,23 +4268,14 @@ def async_grpo_train(
     replay_buffer_restore_metadata: dict[str, int] | None = None
     rollouts_state = None
     if last_checkpoint_path is not None:
-        replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
-        if os.path.exists(replay_buffer_path):
-            print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
-            replay_buffer_restore_metadata = ray.get(
-                replay_buffer.load_from_path.remote(
-                    replay_buffer_path,
-                    num_prompts_per_step=num_prompts_per_step,
-                    current_training_step=step,
-                    max_age_steps=max_trajectory_age_steps,
-                )
-            )
-            print("✅ Replay buffer restored from checkpoint")
-        else:
-            print(
-                f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
-                "Starting with an empty replay buffer."
-            )
+        replay_buffer_restore_metadata = _maybe_restore_async_replay_buffer_checkpoint(
+            replay_buffer,
+            last_checkpoint_path,
+            load_replay_buffer=master_config.checkpointing.get("load_replay_buffer"),
+            num_prompts_per_step=num_prompts_per_step,
+            current_training_step=step,
+            max_age_steps=max_trajectory_age_steps,
+        )
 
         rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
         if os.path.exists(rollouts_path):
