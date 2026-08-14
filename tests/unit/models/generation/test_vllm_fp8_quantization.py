@@ -13,11 +13,15 @@
 # limitations under the License.
 
 import types
+from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 pytestmark = pytest.mark.vllm
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
 @pytest.fixture()
@@ -147,6 +151,71 @@ def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
     }
     assert mxfp8_families == {"model.layers.0.mlp.experts"}
     assert not modelopt_config.is_layer_excluded("model.layers.0.mlp.gate_up_proj")
+
+
+@pytest.mark.parametrize(
+    ("recipe_name", "quantized_modules", "bf16_modules"),
+    [
+        (
+            "grpo-deepseek-v3-64n4g-mxfp8-rollout.yaml",
+            {
+                "model.layers.3.mlp.experts",
+                "model.layers.60.mlp.experts",
+            },
+            {
+                "model.layers.2.mlp.experts",
+                "model.layers.3.self_attn.qkv_proj",
+                "model.layers.3.mlp.gate",
+                "model.layers.3.mlp.shared_experts",
+                "model.layers.61.mlp.experts",
+                "model.layers.61.mtp.fc",
+                "lm_head",
+            },
+        ),
+        (
+            "grpo-nemotron3-super-120BA12B-32n4g-mxfp8-rollout.yaml",
+            {"model.layers.3.mixer.experts"},
+            {
+                "model.layers.3.mixer.in_proj",
+                "model.layers.3.mixer.out_proj",
+                "model.layers.3.mixer.qkv_proj",
+                "model.layers.3.mixer.o_proj",
+                "model.layers.3.mixer.up_proj",
+                "model.layers.3.mixer.down_proj",
+                "model.layers.3.mixer.gate",
+                "model.layers.3.mixer.shared_experts",
+                "model.layers.3.mixer.fc1_latent_proj",
+                "model.layers.3.mixer.fc2_latent_proj",
+                "lm_head",
+            },
+        ),
+    ],
+)
+def test_mxfp8_recipe_patterns_select_only_routed_experts(
+    recipe_name, quantized_modules, bf16_modules
+):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+
+    recipe_path = (
+        PROJECT_ROOT / "examples/configs/recipes/llm/performance" / recipe_name
+    )
+    recipe = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
+    patterns = recipe["policy"]["generation"]["vllm_cfg"][
+        "quantization_ignore_patterns"
+    ]
+    modelopt_config = ModelOptMxFp8Config.from_config(
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MXFP8",
+            "ignore": [*patterns, "lm_head"],
+            "ignored_layers": ["lm_head"],
+        }
+    )
+
+    assert all(
+        not modelopt_config.is_layer_excluded(name) for name in quantized_modules
+    )
+    assert all(modelopt_config.is_layer_excluded(name) for name in bf16_modules)
 
 
 def test_init_fp8_excludes_lm_head_from_regular_fp8(fp8_module, monkeypatch):

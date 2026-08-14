@@ -249,6 +249,13 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
             == expected["train_global_batch_size"]
         )
 
+    expected_async = "-async-1off-" in case_name
+    async_grpo = config["grpo"]["async_grpo"]
+    assert async_grpo["enabled"] is expected_async
+    assert async_grpo["in_flight_weight_updates"] is expected_async
+    if expected_async:
+        assert config["policy"]["generation"]["colocated"]["enabled"] is False
+
 
 def test_mxfp8_rollout_recipes_are_in_gb200_performance_suite() -> None:
     suite_text = GB200_SUITE.read_text(encoding="utf-8")
