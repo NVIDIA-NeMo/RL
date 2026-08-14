@@ -128,17 +128,25 @@ class RolloutHealthMonitor:
             self._pause_event.clear()
         timeout = self._check_timeout + self._check_interval + 5
         self._thread.join(timeout=timeout)
+        self._is_checking_enabled = False
         if self._thread.is_alive():
+            # Keep the events: the thread outlived the join and dereferences
+            # them on its next iteration, so clearing them here would kill it
+            # with an AttributeError instead of letting it exit on its own.
+            # The join budget is not generous enough to rely on -- one probe
+            # can burn 2*timeout before ``_kill_engine`` spends up to another
+            # timeout on a graceful shutdown, which overruns it.
             logger.warning(
-                "Rollout health monitor thread did not terminate within %.1fs", timeout
+                "Rollout health monitor thread did not terminate within %.1fs; "
+                "leaving it to exit on its own",
+                timeout,
             )
-        else:
-            logger.info("RolloutHealthMonitor stopped.")
+            return
 
+        logger.info("RolloutHealthMonitor stopped.")
         self._thread = None
         self._stop_event = None
         self._pause_event = None
-        self._is_checking_enabled = False
 
     def pause(self) -> None:
         """Pause health checking. Called when engines are offloaded."""
