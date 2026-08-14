@@ -29,6 +29,7 @@ from nemo_rl.data.datasets.response_datasets.intent import (
     _format_options,
 )
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
+from nemo_rl.data.interfaces import NemoGymSourceIdentity
 from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
@@ -96,19 +97,23 @@ def test_aime_defaults_to_one_copy_and_supports_explicit_repeat(monkeypatch):
     assert default_dataset.processor is PROCESSOR_REGISTRY["math_hf_data_processor"]
 
 
-def test_nemo_gym_dataset_caches_agent_names_before_repetition(tmp_path):
+def test_nemo_gym_dataset_records_source_without_parsing_rows(tmp_path):
     data_path = tmp_path / "gym.jsonl"
     rows = [
         {"agent_ref": {"name": "math"}},
         {"agent_ref": {"name": "code"}},
         {"agent_ref": {"name": "math"}},
-        {"responses_create_params": {"input": "no agent"}},
     ]
-    data_path.write_text("".join(f"{json.dumps(row)}\n" for row in rows))
+    data_path.write_text(
+        "".join(f"{json.dumps(row)}\n" for row in rows) + "not parsed at load time\n"
+    )
 
     dataset = NemoGymDataset(str(data_path), repeat=100)
+    source_stat = data_path.stat()
 
-    assert dataset.agent_names == frozenset({"code", "math"})
+    assert dataset.agent_name_sources == frozenset(
+        {NemoGymSourceIdentity.from_stat(str(data_path.resolve()), source_stat)}
+    )
     assert len(dataset.dataset) == 400
 
 

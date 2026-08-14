@@ -21,6 +21,7 @@ from transformers import AutoProcessor, PreTrainedTokenizerBase
 from nemo_rl.data.datasets.utils import assert_no_double_bos
 from nemo_rl.data.interfaces import (
     DatumSpec,
+    NemoGymSourceIdentity,
     TaskDataPreProcessFnCallable,
     TaskDataProcessFnCallable,
     TaskDataSpec,
@@ -42,7 +43,7 @@ class AllTaskProcessedDataset:
         task_data_processors: Either a single TaskDataProcessFnCallable for single-task,
             or a dict mapping task names to (TaskDataSpec, TaskDataProcessFnCallable) for multi-task
         max_seq_length: Maximum sequence length for tokenized outputs
-        agent_names: Cached NeMo Gym agent names, when every source dataset provides them.
+        agent_name_sources: Stable NeMo Gym source identities used by sharded validation.
     """
 
     def __init__(
@@ -58,10 +59,10 @@ class AllTaskProcessedDataset:
             Union[dict[str, TaskDataPreProcessFnCallable], TaskDataPreProcessFnCallable]
         ] = None,
         max_seq_length: Optional[int] = None,
-        agent_names: frozenset[str] | None = None,
+        agent_name_sources: frozenset[NemoGymSourceIdentity] | None = None,
     ):
         self.dataset = dataset
-        self.agent_names = agent_names
+        self.agent_name_sources = agent_name_sources
         self.tokenizer = tokenizer
         # TODO @yukih: will be removed once eval datasets are adapted
         self.default_task_data_spec = default_task_data_spec
