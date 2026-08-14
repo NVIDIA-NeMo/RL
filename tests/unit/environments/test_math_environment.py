@@ -507,3 +507,36 @@ Now, let's consider \(f = x - n = (2 + \sqrt{3})^{1000} - \lfloor (2 + \sqrt{3})
         "Terminated flags should be a tensor of shape (1,)"
     )
     assert result.terminateds[0] == 1.0, "Terminated flag should be 1.0"
+
+
+def test_math_env_extracted_answers_stay_aligned_with_rewards(math_env):
+    """One score and one answer per sample, even when extraction finds nothing.
+
+    ``HFVerifyWorker.verify`` used to commit the score before attempting the
+    extraction, so a generation math-verify cannot parse produced a second
+    score from the except branch and pushed every later reward one slot out of
+    position. Nothing downstream notices: ``eval_pass_k`` splits the rewards
+    positionally and would report a wrong number rather than fail.
+    """
+    responses = [
+        "The answer is \\boxed{42}",  # correct
+        "I don't know.",  # nothing parseable
+        "The answer is \\boxed{137}",  # wrong, but parseable
+    ]
+    message_log_batch = [
+        [{"role": "assistant", "content": content}] for content in responses
+    ]
+    metadata = [{"ground_truth": "42"} for _ in responses]
+
+    result = ray.get(math_env.step.remote(message_log_batch, metadata, True))
+
+    assert result.rewards.shape == (3,), (
+        "one score per sample; an unparseable generation used to add a second"
+    )
+    assert result.rewards[0] == 1.0
+    assert result.rewards[2] == 0.0, "the wrong answer keeps its own slot"
+    assert len(result.answers) == 3
+    assert result.answers[1] is None, "nothing parseable means no answer"
+    assert result.answers[2] == "137", (
+        "the first prediction, not its first character"
+    )
