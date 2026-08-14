@@ -48,9 +48,10 @@ from nemo_rl.algorithms.utils import (
 class AdvantageResult:
     """What every advantage estimator returns.
 
-    ``returns`` is ``None`` for estimators that have no value target (everything
-    except GAE and the raw-reward estimator), and ``metrics`` carries anything the
-    estimator wants logged, so callers no longer read it off the instance.
+    ``returns`` is a value target and is populated only by
+    :class:`GeneralizedAdvantageEstimator`; every other estimator leaves it
+    ``None``. ``metrics`` carries anything the estimator wants logged, so
+    callers no longer read it off the instance.
     """
 
     advantages: torch.Tensor
@@ -126,7 +127,8 @@ class GRPOAdvantageEstimator:
             **kwargs: Additional arguments (unused).
 
         Returns:
-            Advantages tensor of shape [batch_size, seq_len].
+            AdvantageResult whose ``advantages`` has shape
+            [batch_size, seq_len]; ``returns`` is None.
         """
         baseline, std = calculate_baseline_and_std_per_prompt(
             prompt_ids,
@@ -180,7 +182,8 @@ class GDPOAdvantageEstimator:
             **kwargs: Additional arguments (unused).
 
         Returns:
-            Advantages tensor of shape [batch_size, seq_len].
+            AdvantageResult whose ``advantages`` has shape
+            [batch_size, seq_len]; ``returns`` is None.
         """
         reward_component_keys = get_gdpo_reward_component_keys(repeated_batch)
         if len(reward_component_keys) < 2:
@@ -278,7 +281,8 @@ class ReinforcePlusPlusAdvantageEstimator:
             **kwargs: Additional arguments (unused).
 
         Returns:
-            Advantages tensor of shape [batch_size, seq_len], globally normalized across valid tokens.
+            AdvantageResult whose ``advantages`` has shape [batch_size, seq_len],
+            globally normalized across valid tokens; ``returns`` is None.
         """
         # minus baseline
         if self.minus_baseline:
@@ -336,7 +340,7 @@ class RawRewardAdvantageEstimator:
             **kwargs: Additional arguments (unused).
 
         Returns:
-            Tuple of (advantages, returns) where returns is None.
+            AdvantageResult with ``returns`` left None.
         """
         adv = rewards.unsqueeze(-1).expand(mask.shape)
 
@@ -502,7 +506,8 @@ class GeneralizedAdvantageEstimator:
         When none of these are set, this is standard GAE.
 
         Returns:
-            Tuple of (advantages, returns), each of shape [batch_size, seq_len].
+            AdvantageResult with ``advantages`` and ``returns``, each of shape
+            [batch_size, seq_len].
         """
         token_level_rewards = self._build_token_level_rewards(
             rewards,
@@ -645,7 +650,8 @@ class OPDAdvantageEstimator:
             prev_logprobs: [B, S] student training-engine logprobs (required)
 
         Returns:
-            [B, S] token-level distillation advantages (stop-gradient)
+            AdvantageResult whose ``advantages`` is the [B, S] token-level
+            distillation advantage (stop-gradient); ``returns`` is None.
         """
         if teacher_logprobs is None:
             raise ValueError("OPD requires teacher_logprobs")
