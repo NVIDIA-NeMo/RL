@@ -286,6 +286,42 @@ def test_shared_prefix_moe_context_is_module_scoped_and_restored():
     assert not hasattr(gate, attribute)
 
 
+@pytest.mark.parametrize(
+    "bias_update_factor",
+    [
+        1.0e-3,
+        -1.0e-3,
+        True,
+        False,
+        None,
+        float("nan"),
+        float("inf"),
+        -float("inf"),
+        "x",
+    ],
+)
+def test_shared_prefix_moe_router_rejects_dynamic_bias_without_layout(
+    bias_update_factor,
+):
+    pytest.importorskip("nemo_automodel")
+    from nemo_rl.models.automodel.shared_prefix_moe import _logical_router_forward
+
+    gate = SimpleNamespace(
+        bias_update_factor=bias_update_factor,
+        _nemo_shared_prefix_original_forward=lambda *_: pytest.fail(
+            "dynamic bias reached the original Gate forward"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="does not support dynamic bias"):
+        _logical_router_forward(
+            gate,
+            torch.zeros(1, 2),
+            torch.ones(1, dtype=torch.bool),
+            None,
+        )
+
+
 def test_logical_aux_autoscaler_uses_no_saved_tensors_and_preserves_gradient():
     pytest.importorskip("nemo_automodel")
     from nemo_automodel.components.moe.megatron.moe_utils import (
@@ -482,7 +518,8 @@ def test_qwen3_moe_checkpoint_wrapper_compatibility_preserves_wrapper_call():
         block = object.__new__(Block)
         torch.nn.Module.__init__(block)
         dense = MLP(4, 8, "torch", dtype=torch.float32)
-        dense.init_weights(torch.device("cpu"))
+        with torch.no_grad():
+            dense.init_weights(torch.device("cpu"))
         block.mlp = checkpoint_wrapper(dense)
         dense_input = torch.randn(2, 3, 4)
         torch.testing.assert_close(
@@ -491,7 +528,8 @@ def test_qwen3_moe_checkpoint_wrapper_compatibility_preserves_wrapper_call():
         )
 
         moe = MoE(config, backend)
-        moe.init_weights(torch.device("cpu"))
+        with torch.no_grad():
+            moe.init_weights(torch.device("cpu"))
         block.mlp = checkpoint_wrapper(moe)
         moe_input = torch.randn(2, 3, 4)
         padding_mask = torch.zeros(2, 3, dtype=torch.bool)
@@ -539,6 +577,7 @@ def _qwen3_moe_dtype_backport_methods():
         (Block, "__init__"),
         (Qwen3MoeModel, "__init__"),
         (Qwen3MoeForCausalLM, "__init__"),
+        (Qwen3MoeForCausalLM, "forward"),
         (Qwen3MoeForCausalLM, "initialize_weights"),
     )
 
@@ -626,6 +665,57 @@ def test_qwen3_moe_configured_dtype_backport_is_idempotent():
 
         enable_qwen3_moe_configured_dtype()
         assert tuple(getattr(owner, name) for owner, name in targets) == patched
+    finally:
+        for (owner, name), original in zip(targets, originals):
+            setattr(owner, name, original)
+
+
+def test_qwen3_moe_configured_dtype_backport_casts_lm_head_input():
+    pytest.importorskip("nemo_automodel")
+    from nemo_automodel.components.models.qwen3_moe.model import (
+        Qwen3MoeForCausalLM,
+    )
+
+    from nemo_rl.models.automodel.shared_prefix_moe import (
+        enable_qwen3_moe_configured_dtype,
+    )
+
+    class _HiddenState(torch.nn.Module):
+        def __init__(self, hidden):
+            super().__init__()
+            self.hidden = hidden
+
+        def forward(self, *args, **kwargs):
+            return self.hidden
+
+    targets = _qwen3_moe_dtype_backport_methods()
+    originals = tuple(getattr(owner, name) for owner, name in targets)
+    try:
+        enable_qwen3_moe_configured_dtype()
+        hidden = torch.randn(2, 3, 4, dtype=torch.float32, requires_grad=True)
+        model = object.__new__(Qwen3MoeForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.model = _HiddenState(hidden)
+        model.lm_head = torch.nn.Linear(
+            4,
+            5,
+            bias=False,
+            dtype=torch.bfloat16,
+        )
+
+        logits = model(torch.zeros(2, 3, dtype=torch.long))
+        expected = torch.nn.functional.linear(
+            hidden.to(torch.bfloat16),
+            model.lm_head.weight,
+        )
+        torch.testing.assert_close(logits, expected)
+        assert logits.dtype == torch.bfloat16
+
+        logits.float().sum().backward()
+        assert hidden.grad is not None
+        assert model.lm_head.weight.grad is not None
+        assert torch.isfinite(hidden.grad).all()
+        assert torch.isfinite(model.lm_head.weight.grad).all()
     finally:
         for (owner, name), original in zip(targets, originals):
             setattr(owner, name, original)

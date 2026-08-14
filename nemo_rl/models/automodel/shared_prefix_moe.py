@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import math
+import numbers
 import re
 import textwrap
 from contextlib import contextmanager
@@ -78,7 +79,7 @@ def _qwen3_moe_configured_dtype(config: Any) -> torch.dtype:
 
 
 def enable_qwen3_moe_configured_dtype() -> None:
-    """Backport configured-dtype construction for native Qwen3-MoE.
+    """Backport configured-dtype construction and forward boundaries.
 
     The pinned AutoModel revision constructs several native Qwen3-MoE
     parameters with helper defaults (bf16), even when NeMo-RL requests fp32
@@ -223,6 +224,20 @@ def enable_qwen3_moe_configured_dtype() -> None:
                 (
                     "dtype=get_dtype(config.torch_dtype, torch.bfloat16)",
                     "dtype=model_dtype",
+                    1,
+                ),
+            ),
+        ),
+        (
+            model_module,
+            model_module.Qwen3MoeForCausalLM,
+            "forward",
+            (
+                (
+                    "        logits = self.lm_head(hidden) if self.lm_head else hidden\n",
+                    "        if self.lm_head:\n"
+                    "            hidden = hidden.to(dtype=self.lm_head.weight.dtype)\n"
+                    "        logits = self.lm_head(hidden) if self.lm_head else hidden\n",
                     1,
                 ),
             ),
@@ -450,7 +465,7 @@ def _ep_free_expert_ids(tensor: Any, n_experts: int) -> tuple[int, ...] | None:
     if not isinstance(tensor, DTensor):
         return None
     mesh = tensor.device_mesh
-    if "ep" in mesh.mesh_dim_names:
+    if "ep" in (mesh.mesh_dim_names or ()):
         return None
     if mesh.ndim != 1 or len(tensor.placements) != 1:
         raise ValueError(
@@ -844,14 +859,27 @@ class _LogicalAuxLossAutoScaler(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
-        ctx.aux_shape = aux_loss.shape
-        ctx.aux_dtype = aux_loss.dtype
-        ctx.aux_device = aux_loss.device
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        output: torch.Tensor,
+        aux_loss: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.aux_shape = (  # pyrefly: ignore[implicitly-defined-attribute]
+            aux_loss.shape
+        )
+        ctx.aux_dtype = (  # pyrefly: ignore[implicitly-defined-attribute]
+            aux_loss.dtype
+        )
+        ctx.aux_device = (  # pyrefly: ignore[implicitly-defined-attribute]
+            aux_loss.device
+        )
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ):
         from nemo_automodel.components.moe.megatron.moe_utils import (
             MoEAuxLossAutoScaler,
         )
@@ -872,13 +900,13 @@ class _RouterExecution:
     logical_token_weights: torch.Tensor | None
     valid: bool
     committed: bool = False
-    pending: dict[nn.Module, tuple[torch.Tensor, torch.Tensor | None]] = field(
+    pending: dict[Any, tuple[torch.Tensor, torch.Tensor | None]] = field(
         default_factory=dict
     )
 
     def record(
         self,
-        gate: nn.Module,
+        gate: Any,
         expert_load: torch.Tensor,
         aux_loss: torch.Tensor | None,
     ) -> None:
@@ -1013,7 +1041,7 @@ def enable_custom_qwen3_moe_shared_prefix(model: nn.Module) -> None:
 
 
 def _custom_qwen3_moe_attention_forward(
-    module: nn.Module,
+    module: Any,
     x: torch.Tensor,
     *,
     freqs_cis: torch.Tensor,
@@ -1082,22 +1110,29 @@ def _custom_qwen3_moe_attention_forward(
 
 
 def _logical_router_forward(
-    gate: nn.Module,
+    gate: Any,
     x: torch.Tensor,
     token_mask: torch.Tensor,
     cp_mesh: Any,
 ):
     from nemo_automodel.components.moe import layers as moe_layers
 
+    bias_update_factor = gate.bias_update_factor
+    if (
+        isinstance(bias_update_factor, bool)
+        or not isinstance(bias_update_factor, numbers.Real)
+        or not math.isfinite(float(bias_update_factor))
+        or bias_update_factor != 0
+    ):
+        raise ValueError(
+            "native Qwen3-MoE shared-prefix routing does not support dynamic bias"
+        )
+
     execution = getattr(gate, _ROUTER_EXECUTION_ATTR, None)
     if execution is None or execution.logical_token_weights is None:
         return gate._nemo_shared_prefix_original_forward(x, token_mask, cp_mesh)
     if cp_mesh is not None:
         raise ValueError("shared-prefix logical router statistics require CP=1")
-    if gate.bias_update_factor != 0:
-        raise ValueError(
-            "native Qwen3-MoE shared-prefix routing does not support dynamic bias"
-        )
 
     if not gate.training:
         return gate._nemo_shared_prefix_original_forward(x, token_mask, cp_mesh)
@@ -1112,7 +1147,7 @@ def _logical_router_forward(
     captured_load: torch.Tensor | None = None
 
     def logical_expert_load(
-        module: nn.Module,
+        module: Any,
         indices: torch.Tensor,
         physical_token_mask: torch.Tensor,
     ) -> torch.Tensor:
@@ -1127,7 +1162,7 @@ def _logical_router_forward(
         return expert_load
 
     def logical_aux_loss(
-        module: nn.Module,
+        module: Any,
         original_scores: torch.Tensor,
         expert_load: torch.Tensor,
         physical_token_mask: torch.Tensor,

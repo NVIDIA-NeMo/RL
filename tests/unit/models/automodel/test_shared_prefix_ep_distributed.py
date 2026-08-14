@@ -228,7 +228,11 @@ def test_ep4_matches_dense_main_and_logical_router_gradients():
     device = torch.device("cuda", local_rank)
     initialized_here = not dist.is_initialized()
     if initialized_here:
-        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=2))
+        dist.init_process_group(
+            backend="nccl",
+            timeout=timedelta(minutes=2),
+            device_id=device,
+        )
 
     original_aux_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
     try:
@@ -447,9 +451,6 @@ def test_ep4_ep_shard2_matches_dense_post_scaled_main_and_aux_gradients():
     from torch.distributed.tensor import DTensor, Shard
     from torch.distributed.tensor.parallel import parallelize_module
 
-    from nemo_rl.models.automodel.setup import (
-        _prewarm_native_shared_prefix_moe_world,
-    )
     from nemo_rl.models.automodel.shared_prefix_moe import (
         enable_qwen3_moe_ep_router_gradients,
         shared_prefix_moe_context,
@@ -460,14 +461,17 @@ def test_ep4_ep_shard2_matches_dense_post_scaled_main_and_aux_gradients():
     device = torch.device("cuda", local_rank)
     initialized_here = not dist.is_initialized()
     if initialized_here:
-        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=2))
+        dist.init_process_group(
+            backend="nccl",
+            timeout=timedelta(minutes=2),
+            device_id=device,
+        )
 
     original_aux_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
     try:
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         assert world_size == 8
-        _prewarm_native_shared_prefix_moe_world(world_size)
         enable_qwen3_moe_ep_router_gradients()
 
         # This is the same overlapping interpretation used by NeMo-RL:

@@ -98,21 +98,6 @@ STRING_TO_DTYPE = {
 }
 
 
-def _prewarm_native_shared_prefix_moe_world(world_size: int) -> None:
-    """Initialize NCCL before AutoModel creates overlapping EP/FSDP groups.
-
-    With both EP and EP-shard dimensions, ranks can otherwise lazily initialize
-    overlapping communicators in different orders and block in the first expert
-    all-gather.  A default-process-group collective before device-mesh creation
-    establishes one common NCCL ordering without changing model state.
-    """
-    device = torch.device("cuda", torch.cuda.current_device())
-    token = torch.zeros(1, dtype=torch.int64, device=device)
-    gathered = torch.empty(world_size, dtype=torch.int64, device=device)
-    torch.distributed.all_gather_into_tensor(gathered, token)
-    torch.cuda.synchronize(device)
-
-
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     """Validate and maybe auto-set force_hf based on adapter compatibility.
 
@@ -709,27 +694,36 @@ def setup_distributed(
     Returns:
         DistributedContext containing device meshes and distributed configuration
     """
-    # Initialize process group
-    backend = "nccl" if not runtime_config.cpu_offload else "cuda:nccl,cpu:gloo"
-    torch.distributed.init_process_group(backend=backend)
-    world_size = torch.distributed.get_world_size()
-
-    # Extract configuration values
-    dtype = runtime_config.dtype
     cpu_offload = runtime_config.cpu_offload
-
-    # Extract parallelization config
-    tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
-    cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
     ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
-    dp_replicate_size = config["dtensor_cfg"].get("dp_replicate_size", 1)
-    sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
-
     use_native_shared_prefix_moe = (
         config.get("shared_prefix_training")
         and runtime_config.model_config.model_type == "qwen3_moe"
         and config["dtensor_cfg"].get("automodel_kwargs", {}).get("force_hf") is False
     )
+
+    # Binding WORLD to the actor's CUDA device eagerly establishes NCCL and lets
+    # DeviceMesh use coordinated communicator splits for its derived EP and
+    # EP-shard groups.  Keep this scoped to the native shared-prefix MoE path so
+    # existing distributed setups retain their current initialization behavior.
+    backend = "nccl" if not cpu_offload else "cuda:nccl,cpu:gloo"
+    if use_native_shared_prefix_moe and ep_size > 1 and not cpu_offload:
+        torch.distributed.init_process_group(
+            backend=backend,
+            device_id=torch.device("cuda", torch.cuda.current_device()),
+        )
+    else:
+        torch.distributed.init_process_group(backend=backend)
+    world_size = torch.distributed.get_world_size()
+
+    # Extract configuration values
+    dtype = runtime_config.dtype
+
+    # Extract parallelization config
+    tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
+    cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
+    dp_replicate_size = config["dtensor_cfg"].get("dp_replicate_size", 1)
+    sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
     # AutoModel's EP mesh must evenly partition ranks. Keep the diagnostic
     # scoped to this new native ZoRRo path; preserve existing recipes' setup
     # pre-validation unchanged.
@@ -743,9 +737,6 @@ def setup_distributed(
             "shared-prefix native Qwen3-MoE requires world_size > 1 so "
             "AutoModel applies FSDP mixed precision before FA2"
         )
-    if use_native_shared_prefix_moe and 1 < ep_size < world_size:
-        _prewarm_native_shared_prefix_moe_world(world_size)
-
     # HSDP requires the data-parallel axis to evenly contain the replicate dim.
     model_parallel_size = tp_size * cp_size * ep_size
     dp_size = world_size // model_parallel_size

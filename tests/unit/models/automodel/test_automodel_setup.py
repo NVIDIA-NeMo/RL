@@ -32,7 +32,6 @@ from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
     RuntimeConfig,
     _maybe_set_force_hf,
-    _prewarm_native_shared_prefix_moe_world,
     get_tokenizer,
     setup_distributed,
     setup_model_and_optimizer,
@@ -642,6 +641,20 @@ class TestValidateAndPrepareConfig:
             with pytest.raises(ValueError, match=expected_error):
                 validate_and_prepare_config(mock_config, None, 0)
 
+    @pytest.mark.parametrize(
+        "bias_update_factor",
+        [
+            1.0e-3,
+            -1.0e-3,
+            True,
+            False,
+            None,
+            float("nan"),
+            float("inf"),
+            -float("inf"),
+            "x",
+        ],
+    )
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
@@ -652,6 +665,7 @@ class TestValidateAndPrepareConfig:
         mock_autoconfig_class,
         mock_config,
         mock_autoconfig,
+        bias_update_factor,
     ):
         """Reject dynamic bias that cannot be refit into Qwen rollout models."""
         mock_autoconfig.model_type = "qwen3_moe"
@@ -676,7 +690,7 @@ class TestValidateAndPrepareConfig:
                 "sequence_parallel": False,
                 "automodel_kwargs": {
                     **_native_qwen3_moe_kwargs(),
-                    "moe_overrides": {"gate_bias_update_factor": 1.0e-3},
+                    "moe_overrides": {"gate_bias_update_factor": bias_update_factor},
                 },
             }
         )
@@ -709,6 +723,39 @@ class TestValidateAndPrepareConfig:
         result = validate_and_prepare_config(mock_config, None, 0)
 
         assert isinstance(result, RuntimeConfig)
+
+    @pytest.mark.parametrize(
+        "unsupported_override",
+        [
+            {"score_func": "softmax_with_bias"},
+            {"force_e_score_correction_bias": True},
+        ],
+    )
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_shared_prefix_qwen3_moe_rejects_correction_bias_overrides(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+        unsupported_override,
+    ):
+        """Do not allow correction-bias state or score semantics to bypass validation."""
+        _configure_native_shared_prefix_qwen3_moe(
+            mock_config,
+            mock_autoconfig,
+            automodel_kwargs=_native_qwen3_moe_kwargs(
+                moe_overrides=unsupported_override
+            ),
+        )
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        with pytest.raises(ValueError, match="only supports checkpoint-compatible"):
+            validate_and_prepare_config(mock_config, None, 0)
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -1353,7 +1400,13 @@ class TestSetupDistributed:
         mock_config["dtensor_cfg"]["expert_parallel_size"] = 4
         mock_config["dtensor_cfg"]["automodel_kwargs"] = {"force_hf": False}
 
-        with pytest.raises(ValueError, match="expert_parallel_size"):
+        with (
+            patch(
+                "nemo_rl.models.automodel.setup.torch.cuda.current_device",
+                return_value=3,
+            ),
+            pytest.raises(ValueError, match="expert_parallel_size"),
+        ):
             setup_distributed(mock_config, mock_runtime_config)
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
@@ -1387,29 +1440,26 @@ class TestSetupDistributed:
         mock_moe_config.assert_not_called()
         mock_create_mesh.assert_not_called()
 
-    @patch("nemo_rl.models.automodel.setup._prewarm_native_shared_prefix_moe_world")
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
     @patch("nemo_rl.models.automodel.setup.create_device_mesh")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
-    def test_setup_distributed_prewarms_native_shared_prefix_ep(
+    def test_setup_distributed_binds_native_shared_prefix_ep_to_cuda_device(
         self,
         mock_torch_dist,
         mock_fsdp2_config,
         mock_create_mesh,
         mock_moe_config,
-        mock_prewarm,
         mock_config,
         mock_runtime_config,
         mock_device_mesh,
     ):
-        """Native EP communicator is initialized before model/FSDP setup."""
+        """Native EP binds the default NCCL process group to its CUDA device."""
         events = []
         mock_torch_dist.init_process_group.side_effect = lambda **_: events.append(
             "init"
         )
         mock_torch_dist.get_world_size.return_value = 8
-        mock_prewarm.side_effect = lambda _: events.append("prewarm")
         mock_fsdp2_config.return_value = MagicMock()
         mock_moe_config.return_value = MagicMock()
         mock_moe_config.return_value.ignore_router_for_ac = False
@@ -1427,29 +1477,34 @@ class TestSetupDistributed:
             }
         )
 
-        setup_distributed(mock_config, mock_runtime_config)
+        with patch(
+            "nemo_rl.models.automodel.setup.torch.cuda.current_device",
+            return_value=3,
+        ):
+            setup_distributed(mock_config, mock_runtime_config)
 
-        mock_prewarm.assert_called_once_with(8)
-        assert events[:3] == ["init", "prewarm", "mesh"]
+        mock_torch_dist.init_process_group.assert_called_once_with(
+            backend="nccl",
+            device_id=torch.device("cuda", 3),
+        )
+        assert events[:2] == ["init", "mesh"]
         assert mock_moe_config.return_value.ignore_router_for_ac is False
 
-    @patch("nemo_rl.models.automodel.setup._prewarm_native_shared_prefix_moe_world")
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
     @patch("nemo_rl.models.automodel.setup.create_device_mesh")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
-    def test_setup_distributed_skips_world_prewarm_without_ep_shard(
+    def test_setup_distributed_binds_native_shared_prefix_ep_without_ep_shard(
         self,
         mock_torch_dist,
         mock_fsdp2_config,
         mock_create_mesh,
         mock_moe_config,
-        mock_prewarm,
         mock_config,
         mock_runtime_config,
         mock_device_mesh,
     ):
-        """EP=world has no overlapping EP-shard communicator to order."""
+        """EP=world still binds the default NCCL group to its CUDA device."""
         mock_torch_dist.get_world_size.return_value = 4
         mock_fsdp2_config.return_value = MagicMock()
         mock_moe_config.return_value = MagicMock()
@@ -1463,9 +1518,16 @@ class TestSetupDistributed:
             }
         )
 
-        setup_distributed(mock_config, mock_runtime_config)
+        with patch(
+            "nemo_rl.models.automodel.setup.torch.cuda.current_device",
+            return_value=3,
+        ):
+            setup_distributed(mock_config, mock_runtime_config)
 
-        mock_prewarm.assert_not_called()
+        mock_torch_dist.init_process_group.assert_called_once_with(
+            backend="nccl",
+            device_id=torch.device("cuda", 3),
+        )
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
     @patch("nemo_rl.models.automodel.setup.create_device_mesh")
@@ -1501,42 +1563,6 @@ class TestSetupDistributed:
 
         mock_moe_config.assert_called_once_with(ignore_router_for_ac=True)
         assert mock_moe_config.return_value.ignore_router_for_ac is True
-
-
-def test_prewarm_native_shared_prefix_moe_world_uses_default_group():
-    """Prewarm initializes default NCCL before overlapping meshes exist."""
-    with (
-        patch(
-            "nemo_rl.models.automodel.setup.torch.cuda.current_device",
-            return_value=3,
-        ),
-        patch("nemo_rl.models.automodel.setup.torch.zeros") as mock_zeros,
-        patch("nemo_rl.models.automodel.setup.torch.empty") as mock_empty,
-        patch(
-            "nemo_rl.models.automodel.setup.torch.distributed.all_gather_into_tensor"
-        ) as mock_all_gather,
-        patch(
-            "nemo_rl.models.automodel.setup.torch.cuda.synchronize"
-        ) as mock_synchronize,
-    ):
-        token = MagicMock()
-        gathered = MagicMock()
-        mock_zeros.return_value = token
-        mock_empty.return_value = gathered
-        _prewarm_native_shared_prefix_moe_world(8)
-
-    mock_zeros.assert_called_once_with(
-        1,
-        dtype=torch.int64,
-        device=torch.device("cuda", 3),
-    )
-    mock_empty.assert_called_once_with(
-        8,
-        dtype=torch.int64,
-        device=torch.device("cuda", 3),
-    )
-    mock_all_gather.assert_called_once_with(gathered, token)
-    mock_synchronize.assert_called_once_with(torch.device("cuda", 3))
 
 
 @pytest.mark.automodel
