@@ -90,6 +90,10 @@ CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
+# Keep the cluster control plane on one Ray version. Launchers that use a
+# tier-specific actor environment can point this at that environment's ``ray``
+# executable so head, workers, driver, and actors all agree.
+RAY_CLI=${RAY_CLI:-ray}
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
@@ -582,7 +586,7 @@ ray-status-sidecar() {
   set +x
   while true; do
     sleep 10
-    units=\$(ray status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print \$4}' || echo 0)
+    units=\$("$RAY_CLI" status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print \$4}' || echo 0)
     # Write to a temp file, then rename. A plain '>' truncates before writing, so the
     # submit host (reading this over the shared FS from another node) could catch it
     # empty or half-written. rename is atomic: the reader always gets either the old
@@ -608,7 +612,7 @@ while [[ \$count -lt $num_retries ]]; do
   # Clean up stale Ray state before every attempt. A timed-out attempt leaves a
   # session directory behind, and the next 'ray start --head' would otherwise hit:
   #   AssertionError: Session name ... does not match persisted value ...
-  ray stop || true
+  "$RAY_CLI" stop || true
   rm -rf /tmp/ray/session_* || true
 
   if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
@@ -616,7 +620,7 @@ while [[ \$count -lt $num_retries ]]; do
     bash "$SETUP_COMMAND_FILE"
   fi
   if cat <<EOFINNER | bash; then
-ray start --head \
+"$RAY_CLI" start --head \
     --disable-usage-stats \
     --resources="\$RAY_RESOURCES" \
     --node-ip-address="$head_node_ip" \
@@ -663,7 +667,7 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
   if [[ -n "$SANDBOX_PORTS_DIR" ]]; then sandbox_ready=0; else sandbox_ready=1; fi
   while true; do
     if [[ "\$workers_ready" -eq 0 ]]; then
-      worker_units=\$(ray status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print \$4}' || echo 0)
+      worker_units=\$("$RAY_CLI" status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print \$4}' || echo 0)
       echo "[INFO] Number of actors online: \$worker_units/$NUM_ACTORS"
       if [[ "\$worker_units" -eq "$NUM_ACTORS" ]]; then
         workers_ready=1
@@ -806,7 +810,7 @@ count=0
 while [[ \$count -lt $WORKER_NUM_RETRIES ]]; do
   # Clean up stale Ray state before every attempt so a half-started raylet from a
   # previous attempt doesn't block the next one.
-  ray stop || true
+  "$RAY_CLI" stop || true
   rm -rf /tmp/ray/session_* || true
 
   if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
@@ -815,7 +819,7 @@ while [[ \$count -lt $WORKER_NUM_RETRIES ]]; do
   fi
   echo "[INFO] Worker \$SLURM_PROCID: starting Ray worker (attempt \$((count+1))/$WORKER_NUM_RETRIES)..."
   cat <<EOFINNER | bash
-ray start --address "$ip_head" \
+"$RAY_CLI" start --address "$ip_head" \
           --disable-usage-stats \
           --resources="\$RAY_RESOURCES" \
           --min-worker-port=${MIN_WORKER_PORT} \
