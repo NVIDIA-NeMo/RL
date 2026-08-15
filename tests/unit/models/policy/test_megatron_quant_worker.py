@@ -323,6 +323,14 @@ def test_real_quant_config_rejects_non_auto_kv_cache():
 
 
 @requires_weight_folding
+def test_real_quant_refit_rejects_kv_scales():
+    worker = _make_real_quant_worker()
+
+    with pytest.raises(ValueError, match="does not support KV-cache scale sync"):
+        list(worker._iter_real_quant_refit_params({"scale": 1.0}))
+
+
+@requires_weight_folding
 def test_iter_params_with_optional_kv_scales_uses_real_quant_export(monkeypatch):
     worker = _make_real_quant_worker()
     monkeypatch.setattr(
@@ -477,7 +485,7 @@ def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
         fake_stream_weights_via_ipc_zmq_impl,
     )
 
-    worker.stream_weights_via_ipc_zmq(buffer_size_bytes=123, kv_scales={"scale": 1.0})
+    worker.stream_weights_via_ipc_zmq(buffer_size_bytes=123)
 
     assert calls[0] == "init_zmq"
     assert calls[1]["buffer_size_bytes"] == 123
