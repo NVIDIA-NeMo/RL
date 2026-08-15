@@ -129,6 +129,7 @@ policy:
     empty_unused_memory_level: 1
     activation_checkpointing: false
     # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
+    # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
     fine_grained_activation_offloading: false
     # Modules to offload when enabled; null disables module selection.
     offload_modules: null
@@ -322,6 +323,7 @@ value:
     empty_unused_memory_level: 1
     activation_checkpointing: false
     # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
+    # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
     fine_grained_activation_offloading: false
     # Modules to offload when enabled; null disables module selection.
     offload_modules: null

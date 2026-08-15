@@ -74,7 +74,7 @@ PostProcessingFunction = Union[
 
 
 @contextmanager
-def _suspend_activation_offload_for_forward_only(
+def suspend_activation_offload_for_forward_only(
     model: Union[GPTModel, List[GPTModel]], forward_only: bool
 ) -> Iterator[None]:
     """Keep inference-only RL phases from consuming MCore's training warmup."""
@@ -403,7 +403,7 @@ def megatron_forward_backward(
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:
         clear_router_replay(model)
-    with _suspend_activation_offload_for_forward_only(model, forward_only):
+    with suspend_activation_offload_for_forward_only(model, forward_only):
         try:
             return forward_backward_func(
                 forward_step_func=forward_step,

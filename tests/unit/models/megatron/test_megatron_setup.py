@@ -1228,8 +1228,8 @@ class TestApplyPerformanceConfig:
         assert model_cfg.fine_grained_activation_offloading is True
         assert model_cfg.offload_modules == offload_modules
 
-    def test_fine_grained_activation_offloading_disabled_skips(self):
-        """When flag is False (default), no offload attrs should be set."""
+    def test_absent_offloading_flag_leaves_attrs_unset(self):
+        """When the key is absent and the provider has no offload attrs, none are added."""
         from nemo_rl.models.megatron.setup import _apply_performance_config
 
         model_cfg = SimpleNamespace(gated_linear_unit=True)
@@ -1284,7 +1284,7 @@ class TestApplyPerformanceConfig:
         _apply_performance_config(model_cfg, config)
 
         assert model_cfg.fine_grained_activation_offloading is False
-        assert model_cfg.offload_modules is None
+        assert model_cfg.offload_modules == []
 
     @pytest.mark.parametrize(
         "offload_modules",

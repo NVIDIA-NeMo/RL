@@ -77,8 +77,13 @@ policy:
     offload_modules: ["core_attn", "attn_proj"]
 ```
 
-Pinned MCore requires the `transformer_engine` CUDA-graph implementation for
-this dense module pair; `local` CUDA graphs support only partial MoE offload.
+Activation offloading requires the Transformer Engine model implementation.
+CUDA graphs are optional; this example was validated with Transformer Engine
+CUDA graphs. If graphs are enabled, pinned MCore permits `transformer_engine`
+or `full_iteration` for this dense module pair, but only the former is validated
+here. `local` CUDA graphs support only partial MoE offload (`expert_fc1`,
+`moe_act`, and `fused_group_mlp`). With the default `cuda_graph_impl: none`, no
+graph-specific restriction applies.
 
 Supported module names are `attn_norm`, `qkv_linear`, `core_attn`,
 `attn_proj`, `mlp_norm`, `expert_fc1`, `moe_act`, and `fused_group_mlp`.

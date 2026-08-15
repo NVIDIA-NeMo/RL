@@ -1104,18 +1104,15 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
 
     megatron_cfg = config["megatron_cfg"]
-    if "fine_grained_activation_offloading" in megatron_cfg:
-        fine_grained_activation_offloading = megatron_cfg[
-            "fine_grained_activation_offloading"
-        ]
-    else:
-        fine_grained_activation_offloading = None
+    fine_grained_activation_offloading = megatron_cfg.get(
+        "fine_grained_activation_offloading"
+    )
 
     if fine_grained_activation_offloading is False:
         # Preserve the legacy exemplar's disabled/null semantics and clear any
         # enabled state carried by a provider or checkpoint.
         model_cfg.fine_grained_activation_offloading = False
-        model_cfg.offload_modules = None
+        model_cfg.offload_modules = []
     elif fine_grained_activation_offloading:
         offload_modules = megatron_cfg.get("offload_modules")
         if not isinstance(offload_modules, list) or not offload_modules:

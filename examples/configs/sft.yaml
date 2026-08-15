@@ -119,8 +119,9 @@ policy:
     empty_unused_memory_level: 1
     activation_checkpointing: false
     # Offload specific module activations to CPU. Works for both dense and MoE
-    # models. Requires transformer_engine. Different from optimizer_cpu_offload
-    # which offloads optimizer states.
+    # models and requires transformer_engine. Different from optimizer_cpu_offload,
+    # which offloads optimizer states. On TE >= 2.10,
+    # also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
     fine_grained_activation_offloading: false
     # Modules to offload when fine_grained_activation_offloading is true.
     # Valid options: ["attn_norm", "qkv_linear", "core_attn", "attn_proj",
