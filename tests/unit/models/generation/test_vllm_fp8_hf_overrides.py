@@ -25,6 +25,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from nemo_rl.models.generation.vllm.patches import (
+    _patch_vllm_mxfp8_speculative_draft_precision,
+)
 from nemo_rl.models.generation.vllm.vllm_worker import _merge_fp8_kwargs
 
 
@@ -234,13 +237,14 @@ def test_external_draft_stays_bf16_with_target_runtime_mxfp8(monkeypatch):
         _capture_vllm_0251_draft_model_config(
             monkeypatch,
             {
-                "quantization": vllm_kwargs["quantization"],
+                "quantization": "modelopt_mxfp8",
                 "hf_overrides": vllm_kwargs["hf_overrides"],
             },
         )
     )
+    _patch_vllm_mxfp8_speculative_draft_precision()
 
-    SpeculativeConfig(
+    speculative_config_obj = SpeculativeConfig(
         **vllm_kwargs["speculative_config"],
         target_model_config=target_model_config,
         target_parallel_config=SimpleNamespace(),
@@ -255,12 +259,14 @@ def test_external_draft_stays_bf16_with_target_runtime_mxfp8(monkeypatch):
     )
     captured["hf_overrides"](draft_hf_config)
     assert not hasattr(draft_hf_config, "quantization_config")
+    assert speculative_config_obj.target_model_config is target_model_config
 
 
-def test_native_mtp_stays_bf16_with_target_runtime_mxfp8(monkeypatch):
+@pytest.mark.parametrize("method", ["mtp", "deepseek_mtp"])
+def test_native_mtp_stays_bf16_with_target_runtime_mxfp8(monkeypatch, method: str):
     vllm_kwargs = _runtime_mxfp8_kwargs(
         {
-            "method": "mtp",
+            "method": method,
             "num_speculative_tokens": 1,
         }
     )
@@ -268,19 +274,51 @@ def test_native_mtp_stays_bf16_with_target_runtime_mxfp8(monkeypatch):
         _capture_vllm_0251_draft_model_config(
             monkeypatch,
             {
-                "quantization": vllm_kwargs["quantization"],
+                "quantization": "modelopt_mxfp8",
                 "hf_overrides": vllm_kwargs["hf_overrides"],
             },
         )
     )
+    _patch_vllm_mxfp8_speculative_draft_precision()
 
-    SpeculativeConfig(
+    speculative_config_obj = SpeculativeConfig(
         **vllm_kwargs["speculative_config"],
         target_model_config=target_model_config,
         target_parallel_config=SimpleNamespace(),
     )
 
     assert captured["quantization"] is None
+    assert target_model_config.quantization == "modelopt_mxfp8"
+    assert speculative_config_obj.target_model_config is target_model_config
+
+
+def test_native_mtp_respects_explicit_draft_quantization(monkeypatch):
+    vllm_kwargs = _runtime_mxfp8_kwargs(
+        {
+            "method": "mtp",
+            "num_speculative_tokens": 1,
+            "quantization": "fp8",
+        }
+    )
+    SpeculativeConfig, target_model_config, captured = (
+        _capture_vllm_0251_draft_model_config(
+            monkeypatch,
+            {
+                "quantization": "modelopt_mxfp8",
+                "hf_overrides": vllm_kwargs["hf_overrides"],
+            },
+        )
+    )
+    _patch_vllm_mxfp8_speculative_draft_precision()
+
+    speculative_config_obj = SpeculativeConfig(
+        **vllm_kwargs["speculative_config"],
+        target_model_config=target_model_config,
+        target_parallel_config=SimpleNamespace(),
+    )
+
+    assert captured["quantization"] == "fp8"
+    assert speculative_config_obj.target_model_config is target_model_config
 
 
 def test_vllm_keeps_target_dict_overrides_out_of_draft_model():

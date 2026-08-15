@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
+import threading
 from contextlib import contextmanager
 from importlib.util import find_spec
+from typing import Any, Callable, get_args
+
+
+_VLLM_SPECULATIVE_PATCH_LOCK = threading.Lock()
+_VLLM_SPECULATIVE_POST_INIT: Callable[[Any], Any] | None = None
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -582,6 +589,69 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_radio_layerscale_loader(patch_logger)
 
 
+def _mxfp8_speculative_post_init(self: Any) -> Any:
+    """Keep implicit native-MTP drafts in the target model's BF16 dtype."""
+    from vllm.config.speculative import MTPModelTypes
+
+    if _VLLM_SPECULATIVE_POST_INIT is None:
+        raise RuntimeError("vLLM speculative precision patch was not initialized")
+
+    target_model_config = self.target_model_config
+    is_implicit_native_mtp = (
+        self.model is None
+        and self.num_speculative_tokens is not None
+        and self.method in get_args(MTPModelTypes)
+        and not self.quantization
+    )
+    if (
+        not is_implicit_native_mtp
+        or target_model_config is None
+        or target_model_config.quantization != "modelopt_mxfp8"
+    ):
+        return _VLLM_SPECULATIVE_POST_INIT(self)
+
+    draft_target_config = copy.copy(target_model_config)
+    draft_target_config.quantization = None
+    self.target_model_config = draft_target_config
+    try:
+        return _VLLM_SPECULATIVE_POST_INIT(self)
+    finally:
+        self.target_model_config = target_model_config
+
+
+def _patch_vllm_mxfp8_speculative_draft_precision(logger: Any | None = None) -> None:
+    """Prevent native MTP from implicitly inheriting target ModelOpt MXFP8.
+
+    vLLM 0.25.1 copies the target model's normalized quantization backend into
+    a native MTP draft when the draft does not specify one. Runtime ModelOpt
+    MXFP8 is scoped to the target model, so construct that draft from a shallow
+    target-config copy with quantization disabled. External drafts and explicit
+    draft quantization settings keep vLLM's normal behavior.
+    """
+    from vllm.config.speculative import SpeculativeConfig
+
+    global _VLLM_SPECULATIVE_POST_INIT
+
+    with _VLLM_SPECULATIVE_PATCH_LOCK:
+        if SpeculativeConfig.__post_init__ is _mxfp8_speculative_post_init:
+            return
+
+        if _VLLM_SPECULATIVE_POST_INIT is not None:
+            raise RuntimeError(
+                "vLLM SpeculativeConfig.__post_init__ changed after the MXFP8 "
+                "draft-precision patch was installed"
+            )
+
+        _VLLM_SPECULATIVE_POST_INIT = SpeculativeConfig.__post_init__
+        SpeculativeConfig.__post_init__ = _mxfp8_speculative_post_init
+
+    if logger is not None:
+        logger.info(
+            "Patched vLLM native MTP construction to keep implicit drafts in BF16 "
+            "when the target uses runtime ModelOpt MXFP8."
+        )
+
+
 def _apply_vllm_patches(
     py_executable: str,
     *,
@@ -592,6 +662,8 @@ def _apply_vllm_patches(
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
+
+    _patch_vllm_mxfp8_speculative_draft_precision(patch_logger)
 
     # Whether the v1 patch matters at all depends on which executor vLLM will
     # select. 0.25 defaults this to "1" (RayExecutorV2), which has no
