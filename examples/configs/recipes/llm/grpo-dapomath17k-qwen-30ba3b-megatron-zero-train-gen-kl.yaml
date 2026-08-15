@@ -47,9 +47,9 @@ policy:
       enabled: true
     max_new_tokens: 8192
     mcore_generation_config:
-      use_cuda_graphs_for_non_decode_steps: true
+      use_cuda_graphs_for_non_decode_steps: false
       cuda_graph_impl: local
-      num_cuda_graphs: 4
+      num_cuda_graphs: 16
       inference_cuda_graph_scope: block
       kv_cache_management_mode: persist
       buffer_size_gb: 16

@@ -12,10 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Runtime patches for zero train/gen KL on colocated Megatron MoE inference.
+
+Wired from ``setup._apply_zero_train_gen_mismatch`` for recipes such as
+Qwen3-30B-A3B DAPO with ``zero_train_gen_mismatch: true``:
+
+1. **MoE combine** — deterministic ``moe_utils.unpermute`` (gather on train;
+   gather+droppad on CUDA-graphed decode when ``moe_pad_experts_for_cuda_graph_inference``).
+2. **Router replay** — reconstruct finished-request routing before KV blocks release.
+3. **CUDA graphs** — 64-token graph bucket floor and runtime decode padding alignment.
+
+TP=1 log-softmax lives in ``patches.py`` (generic zero-KL, not MoE-specific).
+
+Public API::
+
+    apply_moe_determinism_patches()
+    apply_cuda_graph_inference_determinism_patches()  # when cuda_graph_impl != none
+    restore_moe_determinism_patches()
+"""
+
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+import os
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Sequence, Tuple
 
 import torch
 
@@ -27,19 +47,58 @@ if TYPE_CHECKING:
 
 _NRL_LOGGER = logging.getLogger(__name__)
 
-# One-shot guard so the unpermute-combine-path diagnostic surfaces which combine
-# branch actually executes (fused vs fixed-order vs scatter_add) without flooding.
-_NRL_UNPERMUTE_PATH_SEEN: set[str] = set()
+# ---------------------------------------------------------------------------
+# Module state
+# ---------------------------------------------------------------------------
 
+# MoE combine
+_NRL_UNPERMUTE_PATH_SEEN: set[str] = set()
 _UNPERMUTE_ORIG: Optional[Callable[..., torch.Tensor]] = None
 _TOKEN_DISPATCHER_UNPERMUTE_ORIG: Optional[Callable[..., torch.Tensor]] = None
+_MOE_UNPERMUTE_PATCHED = False
+_NRL_DET_COMBINE_BANNER = False
+_COMBINE_IMPL_OVERRIDE: Optional[str] = None
+_COMBINE_GATHER_DROPPAD_OVERRIDE: Optional[bool] = None
+
+# Router replay inference
 _DYNAMIC_STEP_BOOKKEEPING_ORIG: Optional[Callable[..., Dict[str, Any]]] = None
 _ASYNC_BOOKKEEP_ORIG: Optional[Callable[..., Any]] = None
-_DISTRIBUTED_LOG_SOFTMAX_ORIG: Optional[Callable[..., torch.Tensor]] = None
-
-_MOE_UNPERMUTE_PATCHED = False
 _ROUTER_REPLAY_INFERENCE_PATCHED = False
-_LOG_SOFTMAX_PATCHED = False
+
+# CUDA graph inference (colocated decode)
+_CUDA_GRAPH_BUCKET_FLOOR_PATCHED = False
+_CG_DIMS_GEN_ORIG: Optional[Callable[..., Tuple[Sequence, Optional[Sequence]]]] = None
+_MIN_TOKEN_PAD_PATCHED = False
+_DIC_SETATTR_ORIG: Optional[Callable[..., None]] = None
+
+# ---------------------------------------------------------------------------
+# MoE combine — configuration
+# ---------------------------------------------------------------------------
+
+
+def configure_moe_combine_for_cuda_graph_inference() -> None:
+    """Select gather+droppad combine for CUDA-graphed MoE decode (Qwen30B path).
+
+    Invoked from ``apply_cuda_graph_inference_determinism_patches``; the patched
+    unpermute reads these overrides at forward time.
+    """
+    global _COMBINE_IMPL_OVERRIDE, _COMBINE_GATHER_DROPPAD_OVERRIDE
+    _COMBINE_IMPL_OVERRIDE = "gather"
+    _COMBINE_GATHER_DROPPAD_OVERRIDE = True
+
+
+def _combine_impl() -> str:
+    if _COMBINE_IMPL_OVERRIDE is not None:
+        impl = _COMBINE_IMPL_OVERRIDE
+    else:
+        impl = os.environ.get("NRL_COMBINE_IMPL", "padded").strip().lower()
+    return impl if impl in ("padded", "segmented", "gather") else "padded"
+
+
+def _combine_gather_droppad() -> bool:
+    if _COMBINE_GATHER_DROPPAD_OVERRIDE is not None:
+        return _COMBINE_GATHER_DROPPAD_OVERRIDE
+    return os.environ.get("NRL_COMBINE_GATHER_DROPPAD", "0") == "1"
 
 
 def _nrl_log_unpermute_path(path: str) -> None:
@@ -48,16 +107,17 @@ def _nrl_log_unpermute_path(path: str) -> None:
         _NRL_LOGGER.warning("[moe-combine] unpermute executed via '%s'", path)
 
 
+# ---------------------------------------------------------------------------
+# MoE combine — deterministic kernels
+# ---------------------------------------------------------------------------
+
+
 def _unpermute_fixed_order_combine(
     permuted_tokens: torch.Tensor,
     sorted_indices: torch.Tensor,
     restore_shape: torch.Size,
 ) -> torch.Tensor:
-    """Sum expert outputs per token in stable (permute) order via [T, max_slots, H].sum(1).
-
-    Avoids atomic ``scatter_add_`` / ``index_add_``. Uses the same accumulation dtype as
-    ``scatter_add_`` (``permuted_tokens.dtype`` after gating weights).
-    """
+    """Sum expert outputs per token in stable (permute) order via [T, max_slots, H].sum(1)."""
     num_tokens, hidden = restore_shape
     num_permuted = permuted_tokens.size(0)
     if num_permuted == 0:
@@ -136,18 +196,34 @@ def _unpermute_segmented_combine(
     return out
 
 
+def _unpermute_gather_combine(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    restore_shape: torch.Size,
+    routing_map: torch.Tensor,
+) -> torch.Tensor:
+    """Packed top-k combine for train/logprob (matches droppad expert-id order)."""
+    num_tokens, hidden = restore_shape
+    rmap = routing_map.bool()
+    within = rmap.long().cumsum(dim=0) - 1
+    expert_counts = rmap.long().sum(dim=0)
+    expert_offset = torch.zeros_like(expert_counts)
+    expert_offset[1:] = expert_counts.cumsum(0)[:-1]
+    pos = expert_offset.unsqueeze(0) + within
+    pos_sel = pos[rmap]
+    if num_tokens == 0 or pos_sel.numel() % num_tokens != 0:
+        return _unpermute_segmented_combine(permuted_tokens, sorted_indices, restore_shape)
+    gathered = permuted_tokens.index_select(0, pos_sel)
+    return gathered.view(num_tokens, -1, hidden).sum(dim=1)
+
+
 def _unpermute_gather_combine_droppad(
     permuted_tokens: torch.Tensor,
     sorted_indices: torch.Tensor,
     restore_shape: torch.Size,
     routing_map: torch.Tensor,
 ) -> torch.Tensor:
-    """``drop_and_pad`` combine for CUDA-graphed decode (capture-safe, no ``nonzero()``).
-
-    Used when ``moe_pad_experts_for_cuda_graph_inference`` fixes per-expert token counts.
-    The padded fixed-order path can diverge from training; this gather path matches the
-    portoptim golden bed and stays graph-capturable.
-    """
+    """Gather combine for ``drop_and_pad`` CUDA-graphed decode (capture-safe, no ``nonzero()``)."""
     num_tokens, hidden = restore_shape
     rmap = routing_map.bool()
     num_experts = rmap.size(1)
@@ -158,7 +234,6 @@ def _unpermute_gather_combine_droppad(
     rank = rmap.long().cumsum(dim=0) - 1
     expert_base = torch.arange(num_experts, device=rmap.device) * capacity
     pos = expert_base.unsqueeze(0) + rank
-    # Static-shape per-row sort instead of boolean-mask nonzero() (host sync under capture).
     sel_key = torch.where(
         rmap,
         torch.arange(num_experts, device=rmap.device).unsqueeze(0).expand_as(rmap),
@@ -190,9 +265,10 @@ def _patched_unpermute(
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """``moe_utils.unpermute`` with fixed-order combine."""
+    """``moe_utils.unpermute`` with deterministic combine routing."""
     import megatron.core.transformer.moe.moe_utils as moe_utils
 
+    global _NRL_DET_COMBINE_BANNER
     if fused:
         if not moe_utils.HAVE_TE or moe_utils.fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
@@ -227,10 +303,34 @@ def _patched_unpermute(
             permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
-    if drop_and_pad and routing_map is not None:
+    if not _NRL_DET_COMBINE_BANNER:
+        _NRL_DET_COMBINE_BANNER = True
+        print(
+            f"[NRL_DET_COMBINE] deterministic combine ACTIVE impl={_combine_impl()} "
+            f"droppad={_combine_gather_droppad()}",
+            flush=True,
+        )
+
+    impl = _combine_impl()
+    if impl == "gather" and routing_map is not None and not drop_and_pad:
+        _nrl_log_unpermute_path("gather_combine")
+        output_tokens = _unpermute_gather_combine(
+            permuted_tokens, sorted_indices, restore_shape, routing_map
+        )
+    elif (
+        impl == "gather"
+        and drop_and_pad
+        and routing_map is not None
+        and _combine_gather_droppad()
+    ):
         _nrl_log_unpermute_path("gather_combine_droppad")
         output_tokens = _unpermute_gather_combine_droppad(
             permuted_tokens, sorted_indices, restore_shape, routing_map
+        )
+    elif impl in ("segmented", "gather"):
+        _nrl_log_unpermute_path("segmented_combine")
+        output_tokens = _unpermute_segmented_combine(
+            permuted_tokens, sorted_indices, restore_shape
         )
     else:
         _nrl_log_unpermute_path("fixed_order_combine")
@@ -240,8 +340,40 @@ def _patched_unpermute(
     return output_tokens.to(dtype=input_dtype)
 
 
+def apply_moe_unpermute_determinism_patch() -> None:
+    """Patch MoE unpermute and the token dispatcher's cached import."""
+    global _UNPERMUTE_ORIG, _TOKEN_DISPATCHER_UNPERMUTE_ORIG, _MOE_UNPERMUTE_PATCHED
+    if _MOE_UNPERMUTE_PATCHED:
+        return
+    try:
+        import megatron.core.transformer.moe.moe_utils as moe_utils
+        import megatron.core.transformer.moe.token_dispatcher as token_dispatcher
+    except ImportError:
+        print(
+            "moe_determinism_patches: Megatron MoE modules are not importable; "
+            "skipping unpermute patch."
+        )
+        return
+
+    _UNPERMUTE_ORIG = moe_utils.unpermute
+    _TOKEN_DISPATCHER_UNPERMUTE_ORIG = token_dispatcher.unpermute
+    moe_utils.unpermute = _patched_unpermute
+    # token_dispatcher binds unpermute at import time; patch both call sites.
+    token_dispatcher.unpermute = _patched_unpermute
+    _MOE_UNPERMUTE_PATCHED = True
+    print(
+        "[moe_determinism_patches] patched moe_utils.unpermute and "
+        "token_dispatcher.unpermute with deterministic combine routing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Router replay inference
+# ---------------------------------------------------------------------------
+
+
 def _nrl_dynamic_step_context_bookkeeping(self: "TextGenerationController") -> Dict[str, Any]:
-    """Early MoE routing reconstruction before KV blocks are released (a6e829b)."""
+    """Reconstruct MoE routing for finished requests before KV blocks are released."""
     from torch.cuda.nvtx import range_pop, range_push
 
     context = self.inference_wrapped_model.inference_context
@@ -319,7 +451,7 @@ async def _nrl_async_bookkeep(
     context_state: Dict[str, Any],
     step_time: float,
 ):
-    """Apply pre-reconstructed routing before upstream post_process (a6e829b)."""
+    """Apply pre-reconstructed routing before upstream post_process."""
     if step_result is not None:
         finished_routing_indices = step_result.get("finished_routing_indices")
         if finished_routing_indices:
@@ -332,75 +464,8 @@ async def _nrl_async_bookkeep(
     return await _ASYNC_BOOKKEEP_ORIG(self, step_result, context_state, step_time)
 
 
-def _nrl_inference_compatible_log_softmax(
-    vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
-) -> torch.Tensor:
-    """Use Megatron inference's log-softmax operation when TP is one."""
-    if torch.distributed.get_world_size(group) == 1:
-        return torch.nn.functional.log_softmax(vocab_parallel_logits, dim=-1)
-
-    assert _DISTRIBUTED_LOG_SOFTMAX_ORIG is not None
-    return _DISTRIBUTED_LOG_SOFTMAX_ORIG(vocab_parallel_logits, group)
-
-
-def apply_log_softmax_determinism_patch() -> None:
-    """Match TP=1 train/logprob normalization to Megatron raw inference.
-
-    With ``logprobs_mode=raw_logprobs``, generation uses
-    ``F.log_softmax(logits.float())``. Train/logprob still uses a max/exp/sum/log
-    decomposition that is algebraically equivalent but not bit-identical, so
-    this patch replaces that path with ``F.log_softmax`` when TP is one.
-    """
-    global _DISTRIBUTED_LOG_SOFTMAX_ORIG, _LOG_SOFTMAX_PATCHED
-    if _LOG_SOFTMAX_PATCHED:
-        return
-
-    from nemo_rl.distributed import model_utils
-
-    _DISTRIBUTED_LOG_SOFTMAX_ORIG = (
-        model_utils._compute_distributed_log_softmax_with_grad
-    )
-    model_utils._compute_distributed_log_softmax_with_grad = (
-        _nrl_inference_compatible_log_softmax
-    )
-    _LOG_SOFTMAX_PATCHED = True
-    print(
-        "[moe_determinism_patches] patched TP=1 train/logprob computation "
-        "to use inference-compatible fp32 F.log_softmax."
-    )
-
-
-def apply_moe_unpermute_determinism_patch() -> None:
-    """Patch MoE unpermute and the token dispatcher's cached import."""
-    global _UNPERMUTE_ORIG, _TOKEN_DISPATCHER_UNPERMUTE_ORIG, _MOE_UNPERMUTE_PATCHED
-    if _MOE_UNPERMUTE_PATCHED:
-        return
-    try:
-        import megatron.core.transformer.moe.moe_utils as moe_utils
-        import megatron.core.transformer.moe.token_dispatcher as token_dispatcher
-    except ImportError:
-        print(
-            "moe_determinism_patches: Megatron MoE modules are not importable; "
-            "skipping unpermute patch."
-        )
-        return
-
-    _UNPERMUTE_ORIG = moe_utils.unpermute
-    _TOKEN_DISPATCHER_UNPERMUTE_ORIG = token_dispatcher.unpermute
-    moe_utils.unpermute = _patched_unpermute
-    # token_dispatcher imports unpermute by value, so changing only the source
-    # module leaves its already-bound call site on the original implementation.
-    token_dispatcher.unpermute = _patched_unpermute
-    _MOE_UNPERMUTE_PATCHED = True
-    print(
-        "[moe_determinism_patches] patched moe_utils.unpermute and "
-        "token_dispatcher.unpermute with fixed-order combine "
-        "(gather+droppad for CUDA-graph moe_pad decode)."
-    )
-
-
 def apply_router_replay_inference_patches() -> None:
-    """Patch dynamic inference for early router-replay reconstruction (a6e829b)."""
+    """Patch dynamic inference for early router-replay reconstruction."""
     global _DYNAMIC_STEP_BOOKKEEPING_ORIG, _ASYNC_BOOKKEEP_ORIG, _ROUTER_REPLAY_INFERENCE_PATCHED
     if _ROUTER_REPLAY_INFERENCE_PATCHED:
         return
@@ -431,18 +496,226 @@ def apply_router_replay_inference_patches() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# CUDA graph inference — bucket floor + runtime decode padding
+# ---------------------------------------------------------------------------
+
+
+def floor_cuda_graph_batch_dimensions(
+    ladder: Sequence,
+    *,
+    max_tokens: int,
+    max_requests: int,
+) -> Tuple[list, list[int]]:
+    """Keep only 64-token-multiple CUDA graph decode buckets."""
+    from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+
+    if not ladder:
+        return [], []
+
+    seen: set[int] = set()
+    new_list: list[InferenceBatchDimensions] = []
+    cap = min(max_tokens, (max_requests // 64) * 64)
+    for dim in ladder:
+        token_count = ((max(dim.token_count, 64) + 63) // 64) * 64
+        if token_count > cap:
+            token_count = cap
+        if token_count < 64 or token_count in seen:
+            continue
+        seen.add(token_count)
+        new_list.append(
+            InferenceBatchDimensions(
+                token_count=token_count,
+                prefill_req_count=dim.prefill_req_count,
+                decode_req_count=(
+                    token_count if dim.prefill_req_count == 0 else dim.decode_req_count
+                ),
+            )
+        )
+    token_counts = [dim.token_count for dim in new_list]
+    return new_list, token_counts
+
+
+def apply_cuda_graph_bucket_floor_patch() -> None:
+    """Patch ``CUDAGraphBatchDimensionBuilder`` to 64-align graph capture buckets."""
+    global _CUDA_GRAPH_BUCKET_FLOOR_PATCHED, _CG_DIMS_GEN_ORIG
+    if _CUDA_GRAPH_BUCKET_FLOOR_PATCHED:
+        return
+
+    from megatron.core.inference.batch_dimensions_utils import (
+        CUDAGraphBatchDimensionBuilder,
+    )
+
+    _CG_DIMS_GEN_ORIG = (
+        CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list
+    )
+
+    @classmethod  # type: ignore[misc]
+    def _patched_generate(cls, *args, **kwargs):
+        assert _CG_DIMS_GEN_ORIG is not None
+        ladder, token_counts = _CG_DIMS_GEN_ORIG(*args, **kwargs)
+        max_tokens = kwargs.get("max_tokens")
+        max_requests = kwargs.get("max_requests")
+        if max_tokens is None or max_requests is None:
+            if len(args) >= 6:
+                max_requests = args[5]
+            if len(args) >= 7:
+                max_tokens = args[6]
+        if max_tokens is None or max_requests is None:
+            return ladder, token_counts
+
+        old_len = len(ladder)
+        new_ladder, new_counts = floor_cuda_graph_batch_dimensions(
+            ladder,
+            max_tokens=int(max_tokens),
+            max_requests=int(max_requests),
+        )
+        if new_ladder:
+            print(
+                f"[cuda_graph_bucket_floor] ladder {old_len} -> "
+                f"{[dim.token_count for dim in new_ladder]} (64-multiples)",
+                flush=True,
+            )
+            return new_ladder, new_counts
+        return ladder, token_counts
+
+    CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list = (
+        _patched_generate
+    )
+    _CUDA_GRAPH_BUCKET_FLOOR_PATCHED = True
+
+
+def restore_cuda_graph_bucket_floor_patch() -> None:
+    """Restore the original CUDA graph bucket builder (for tests)."""
+    global _CUDA_GRAPH_BUCKET_FLOOR_PATCHED, _CG_DIMS_GEN_ORIG
+    if not _CUDA_GRAPH_BUCKET_FLOOR_PATCHED or _CG_DIMS_GEN_ORIG is None:
+        return
+    from megatron.core.inference.batch_dimensions_utils import (
+        CUDAGraphBatchDimensionBuilder,
+    )
+
+    CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list = (
+        _CG_DIMS_GEN_ORIG
+    )
+    _CG_DIMS_GEN_ORIG = None
+    _CUDA_GRAPH_BUCKET_FLOOR_PATCHED = False
+
+
+def align_runtime_decode_padded_dimensions(
+    dims: Any,
+    *,
+    max_tokens: int,
+    max_requests: int,
+    round_up_tokens: Callable[[int], int],
+    is_creating_cuda_graphs: bool = False,
+) -> Any:
+    """Round pure-decode padded dims up to the 64-token quantum."""
+    if is_creating_cuda_graphs:
+        return dims
+    if dims is None or dims.token_count <= 0:
+        return dims
+    if dims.prefill_req_count != 0:
+        return dims
+    if dims.token_count != dims.decode_req_count:
+        return dims
+
+    token_count = dims.token_count
+    new_token_count = min(
+        round_up_tokens(token_count), max_tokens, max_requests
+    )
+    if new_token_count <= token_count:
+        return dims
+
+    from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+
+    return InferenceBatchDimensions(
+        token_count=new_token_count,
+        prefill_req_count=0,
+        decode_req_count=new_token_count,
+    )
+
+
+def _maybe_align_runtime_decode_padding(context: Any) -> None:
+    if getattr(context, "is_creating_cuda_graphs", False):
+        return
+
+    aligned = align_runtime_decode_padded_dimensions(
+        context.padded_batch_dimensions,
+        max_tokens=int(context.max_tokens),
+        max_requests=int(context.max_requests),
+        round_up_tokens=context.round_up_tokens,
+        is_creating_cuda_graphs=False,
+    )
+    if aligned is context.padded_batch_dimensions:
+        return
+
+    if not getattr(type(context), "_nrl_pad_banner", False):
+        type(context)._nrl_pad_banner = True
+        old_tc = context.padded_batch_dimensions.token_count
+        print(
+            f"[cuda_graph_min_token_pad] decode step M {old_tc} -> "
+            f"{aligned.token_count} (tokens+requests, 64-quantum)",
+            flush=True,
+        )
+    object.__setattr__(context, "padded_batch_dimensions", aligned)
+
+
+def apply_min_token_pad_patch() -> None:
+    """Patch ``DynamicInferenceContext`` to 64-align runtime decode padding."""
+    global _MIN_TOKEN_PAD_PATCHED, _DIC_SETATTR_ORIG
+    if _MIN_TOKEN_PAD_PATCHED:
+        return
+
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+
+    _DIC_SETATTR_ORIG = DynamicInferenceContext.__setattr__
+
+    def _patched_setattr(self: Any, name: str, value: Any) -> None:
+        assert _DIC_SETATTR_ORIG is not None
+        _DIC_SETATTR_ORIG(self, name, value)
+        if name == "padded_batch_dimensions":
+            _maybe_align_runtime_decode_padding(self)
+
+    DynamicInferenceContext.__setattr__ = _patched_setattr  # type: ignore[method-assign]
+    _MIN_TOKEN_PAD_PATCHED = True
+
+
+def restore_min_token_pad_patch() -> None:
+    """Restore the original ``DynamicInferenceContext.__setattr__`` (for tests)."""
+    global _MIN_TOKEN_PAD_PATCHED, _DIC_SETATTR_ORIG
+    if not _MIN_TOKEN_PAD_PATCHED or _DIC_SETATTR_ORIG is None:
+        return
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+
+    DynamicInferenceContext.__setattr__ = _DIC_SETATTR_ORIG  # type: ignore[method-assign]
+    _DIC_SETATTR_ORIG = None
+    _MIN_TOKEN_PAD_PATCHED = False
+
+
+def apply_cuda_graph_inference_determinism_patches() -> None:
+    """CUDA-graph zero-KL path: gather+droppad MoE combine, bucket floor, decode padding."""
+    configure_moe_combine_for_cuda_graph_inference()
+    apply_cuda_graph_bucket_floor_patch()
+    apply_min_token_pad_patch()
+
+
+# ---------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------
+
+
 def apply_moe_determinism_patches() -> None:
-    """Apply all MoE train/generation determinism patches."""
+    """Apply MoE combine and router replay patches."""
     apply_moe_unpermute_determinism_patch()
     apply_router_replay_inference_patches()
-    apply_log_softmax_determinism_patch()
 
 
 def restore_moe_determinism_patches() -> None:
-    """Restore Megatron entry points patched by this module (for tests)."""
-    global _LOG_SOFTMAX_PATCHED
+    """Restore all Megatron entry points patched by this module (for tests)."""
     global _MOE_UNPERMUTE_PATCHED
     global _ROUTER_REPLAY_INFERENCE_PATCHED
+    global _NRL_DET_COMBINE_BANNER
+    global _COMBINE_IMPL_OVERRIDE, _COMBINE_GATHER_DROPPAD_OVERRIDE
 
     if _MOE_UNPERMUTE_PATCHED and _UNPERMUTE_ORIG is not None:
         import megatron.core.transformer.moe.moe_utils as moe_utils
@@ -467,14 +740,12 @@ def restore_moe_determinism_patches() -> None:
             DynamicInferenceEngine.async_bookkeep = _ASYNC_BOOKKEEP_ORIG
         _ROUTER_REPLAY_INFERENCE_PATCHED = False
 
-    if _LOG_SOFTMAX_PATCHED and _DISTRIBUTED_LOG_SOFTMAX_ORIG is not None:
-        from nemo_rl.distributed import model_utils
-
-        model_utils._compute_distributed_log_softmax_with_grad = (
-            _DISTRIBUTED_LOG_SOFTMAX_ORIG
-        )
-        _LOG_SOFTMAX_PATCHED = False
+    restore_cuda_graph_bucket_floor_patch()
+    restore_min_token_pad_patch()
 
     _NRL_UNPERMUTE_PATH_SEEN.clear()
     if hasattr(_unpermute_gather_combine_droppad, "_nrl_static_topk"):
         del _unpermute_gather_combine_droppad._nrl_static_topk
+    _NRL_DET_COMBINE_BANNER = False
+    _COMBINE_IMPL_OVERRIDE = None
+    _COMBINE_GATHER_DROPPAD_OVERRIDE = None
