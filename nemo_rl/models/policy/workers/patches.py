@@ -17,8 +17,14 @@ import os
 from importlib.util import find_spec
 from typing import Callable, Optional
 
+import torch
+
 # Original TE cuBLAS workspace sizer, saved by apply_te_gemm_cublas_pinned_patch().
 _TE_CUBLAS_WS_SIZE_FN_ORIG: Optional[Callable[[], int]] = None
+
+# TP=1 train/logprob log-softmax, saved by apply_log_softmax_determinism_patch().
+_DISTRIBUTED_LOG_SOFTMAX_ORIG: Optional[Callable[..., torch.Tensor]] = None
+_LOG_SOFTMAX_PATCHED = False
 
 # Minimum workspace that satisfies TE's NVFP4 alpha-scratch guard in cublaslt_gemm.cu.
 _TE_CUBLAS_WS_PINNED_BYTES: int = 4
@@ -176,6 +182,54 @@ def restore_te_gemm_cublas_pinned_patch() -> None:
     if ws_fn is not None and hasattr(ws_fn, "cache_clear"):
         try:
             ws_fn.cache_clear()
-        except Exception:  # pylint: disable=broad-except
-            pass
     _TE_CUBLAS_WS_SIZE_FN_ORIG = None
+
+
+def _nrl_inference_compatible_log_softmax(
+    vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
+) -> torch.Tensor:
+    if torch.distributed.get_world_size(group) == 1:
+        return torch.nn.functional.log_softmax(vocab_parallel_logits, dim=-1)
+
+    assert _DISTRIBUTED_LOG_SOFTMAX_ORIG is not None
+    return _DISTRIBUTED_LOG_SOFTMAX_ORIG(vocab_parallel_logits, group)
+
+
+def apply_log_softmax_determinism_patch() -> None:
+    """Match TP=1 train/logprob normalization to Megatron ``raw_logprobs`` inference.
+
+    Intended for ``zero_train_gen_mismatch`` only — call from
+    ``_apply_zero_train_gen_mismatch`` in setup.py alongside TE cuBLAS pinning.
+    """
+    global _DISTRIBUTED_LOG_SOFTMAX_ORIG, _LOG_SOFTMAX_PATCHED
+    if _LOG_SOFTMAX_PATCHED:
+        return
+
+    from nemo_rl.distributed import model_utils
+
+    _DISTRIBUTED_LOG_SOFTMAX_ORIG = (
+        model_utils._compute_distributed_log_softmax_with_grad
+    )
+    model_utils._compute_distributed_log_softmax_with_grad = (
+        _nrl_inference_compatible_log_softmax
+    )
+    _LOG_SOFTMAX_PATCHED = True
+    print(
+        "[zero_train_gen_mismatch] patched TP=1 train/logprob to use "
+        "inference-compatible fp32 F.log_softmax."
+    )
+
+
+def restore_log_softmax_determinism_patch() -> None:
+    """Restore the original distributed log-softmax helper (for tests)."""
+    global _DISTRIBUTED_LOG_SOFTMAX_ORIG, _LOG_SOFTMAX_PATCHED
+    if not _LOG_SOFTMAX_PATCHED or _DISTRIBUTED_LOG_SOFTMAX_ORIG is None:
+        return
+
+    from nemo_rl.distributed import model_utils
+
+    model_utils._compute_distributed_log_softmax_with_grad = (
+        _DISTRIBUTED_LOG_SOFTMAX_ORIG
+    )
+    _DISTRIBUTED_LOG_SOFTMAX_ORIG = None
+    _LOG_SOFTMAX_PATCHED = False

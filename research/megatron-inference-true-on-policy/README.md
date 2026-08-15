@@ -29,4 +29,6 @@ Recipes:
 - `examples/configs/recipes/llm/grpo-dapomath17k-qwen-30ba3b-megatron-zero-train-gen-kl.yaml`
 - `examples/configs/recipes/llm/grpo-nanov3-30ba3b-megatron-zero-train-gen-kl.yaml`
 
-Per-model wrappers (`run_qwen1.5b_zero_kl_precision.sh`, etc.) forward to `run_zero_kl_precision.sh`.
+For `MODEL=qwen30ba3b`, `run_zero_kl_precision.sh` bind-mounts
+`dapo_zero_kl_patch.py` over `nemo_rl/environments/dapo_math_verifier.py`
+(Miles/DAPO `\boxed{}` on full CoT).

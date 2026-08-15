@@ -13,10 +13,6 @@
 # limitations under the License.
 
 """Runtime Mamba train/prefill/decode alignment patches for zero train/gen mismatch.
-
-This ports the final ``mamba_mixer.py`` behavior from YigongQin/Megatron-LM
-commits 41fce34, 6e08a0d, d3f7bea, and 0f78b26. The patch is intentionally
-kept in NeMo-RL so zero-KL runs do not require a custom Megatron-LM fork.
 """
 
 import importlib

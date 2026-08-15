@@ -105,6 +105,15 @@ cd "${RL_DIR}"
 export TORCH_CUDA_ARCH_LIST='9.0 10.0'
 export CONTAINER="${CONTAINER_IMAGE}"
 export MOUNTS="/lustre:/lustre,${RL_DIR}:/opt/nemo-rl${NRL_RAY_VENVS_MOUNT_SUFFIX}"
+if [[ "${RUN_PREFIX}" == "qwen30ba3b" ]]; then
+    _dapo_patch="${SCRIPT_DIR}/dapo_zero_kl_patch.py"
+    if [[ -f "${_dapo_patch}" ]]; then
+        export MOUNTS="${MOUNTS},${_dapo_patch}:/opt/nemo-rl/nemo_rl/environments/dapo_math_verifier.py"
+    else
+        echo "WARNING: DAPO verifier patch missing: ${_dapo_patch}" >&2
+    fi
+    unset _dapo_patch
+fi
 [[ -d /scratch ]] && export MOUNTS="${MOUNTS},/scratch:/scratch"
 export GPUS_PER_NODE
 export NEMO_RL_VENV_DIR="${NEMO_RL_VENV_CONTAINER}"

@@ -18,11 +18,14 @@ import tempfile
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
+import torch
 
 from nemo_rl.models.policy.workers.patches import (
     _get_transformer_engine_file,
+    apply_log_softmax_determinism_patch,
     apply_te_gemm_cublas_pinned_patch,
     apply_transformer_engine_patch,
+    restore_log_softmax_determinism_patch,
     restore_te_gemm_cublas_pinned_patch,
 )
 
@@ -502,3 +505,33 @@ class TestApplyTeGemmCublasPinnedPatch:
             restore_te_gemm_cublas_pinned_patch()
 
         assert mock_gemm_mod.get_cublas_workspace_size_bytes is orig_fn
+
+
+class TestApplyLogSoftmaxDeterminismPatch:
+    def setup_method(self):
+        restore_log_softmax_determinism_patch()
+
+    def teardown_method(self):
+        restore_log_softmax_determinism_patch()
+
+    def test_matches_inference_for_tp1(self):
+        from nemo_rl.distributed import model_utils
+
+        original = model_utils._compute_distributed_log_softmax_with_grad
+        logits = torch.randn(2, 5, dtype=torch.float32)
+
+        with patch("torch.distributed.get_world_size", return_value=1):
+            apply_log_softmax_determinism_patch()
+            apply_log_softmax_determinism_patch()
+            actual = model_utils._compute_distributed_log_softmax_with_grad(
+                logits, MagicMock()
+            )
+
+        torch.testing.assert_close(
+            actual,
+            torch.nn.functional.log_softmax(logits, dim=-1),
+            rtol=0,
+            atol=0,
+        )
+        restore_log_softmax_determinism_patch()
+        assert model_utils._compute_distributed_log_softmax_with_grad is original

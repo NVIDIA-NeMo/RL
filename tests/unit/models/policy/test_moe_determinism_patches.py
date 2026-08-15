@@ -18,12 +18,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_rl.models.policy.workers.moe_determinism_patches import (
+from nemo_rl.models.policy.workers.moe_zero_kl_patches import (
     _nrl_dynamic_step_context_bookkeeping,
     _patched_unpermute,
     _unpermute_fixed_order_combine,
+    _unpermute_gather_combine,
     _unpermute_gather_combine_droppad,
-    apply_log_softmax_determinism_patch,
     apply_moe_unpermute_determinism_patch,
     apply_router_replay_inference_patches,
     restore_moe_determinism_patches,
@@ -68,6 +68,59 @@ class TestGatherCombineDroppad:
             drop_and_pad=True,
         )
         assert torch.allclose(out, torch.tensor([[3.0], [4.0]]))
+
+
+class TestGatherCombineUnified:
+    def setup_method(self):
+        restore_moe_determinism_patches()
+
+    def teardown_method(self):
+        restore_moe_determinism_patches()
+
+    def test_packed_gather_matches_droppad_gather(self):
+        routing_map = torch.tensor([[True, False], [False, True]])
+        packed = torch.tensor([[1.5], [2.5]])
+        packed_idx = torch.tensor([0, 1])
+        droppad = torch.tensor([[1.5], [0.0], [2.5], [0.0]])
+        droppad_idx = torch.tensor([0, 0, 1, 1])
+        packed_out = _unpermute_gather_combine(
+            packed, packed_idx, torch.Size([2, 1]), routing_map
+        )
+        droppad_out = _unpermute_gather_combine_droppad(
+            droppad, droppad_idx, torch.Size([2, 1]), routing_map
+        )
+        expected = torch.tensor([[1.5], [2.5]])
+        assert torch.allclose(packed_out, expected)
+        assert torch.allclose(droppad_out, expected)
+
+    def test_patched_unpermute_routes_gather_for_train_and_droppad_for_decode(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("NRL_COMBINE_IMPL", "gather")
+        monkeypatch.setenv("NRL_COMBINE_GATHER_DROPPAD", "1")
+        routing_map = torch.tensor([[True, False], [False, True]])
+        probs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+        train_out = _patched_unpermute(
+            torch.tensor([[3.0], [4.0]]),
+            torch.tensor([0, 1]),
+            torch.Size([2, 1]),
+            probs=probs,
+            routing_map=routing_map,
+            drop_and_pad=False,
+        )
+        decode_out = _patched_unpermute(
+            torch.tensor([[3.0], [0.0], [4.0], [0.0]]),
+            torch.tensor([0, 0, 1, 1]),
+            torch.Size([2, 1]),
+            probs=probs,
+            routing_map=routing_map,
+            drop_and_pad=True,
+        )
+        assert torch.allclose(train_out, torch.tensor([[3.0], [4.0]]))
+        assert torch.allclose(decode_out, torch.tensor([[3.0], [4.0]]))
+
+
 class TestApplyMoeDeterminismPatches:
     def setup_method(self):
         restore_moe_determinism_patches()
@@ -104,28 +157,6 @@ class TestApplyMoeDeterminismPatches:
         sorted_indices = torch.tensor([0, 0])
         out = _patched_unpermute(permuted, sorted_indices, torch.Size([1, 1]))
         assert torch.allclose(out, torch.tensor([[3.0]]))
-
-    def test_log_softmax_patch_matches_inference_for_tp1(self):
-        from nemo_rl.distributed import model_utils
-
-        original = model_utils._compute_distributed_log_softmax_with_grad
-        logits = torch.randn(2, 5, dtype=torch.float32)
-
-        with patch("torch.distributed.get_world_size", return_value=1):
-            apply_log_softmax_determinism_patch()
-            apply_log_softmax_determinism_patch()
-            actual = model_utils._compute_distributed_log_softmax_with_grad(
-                logits, MagicMock()
-            )
-
-        torch.testing.assert_close(
-            actual,
-            torch.nn.functional.log_softmax(logits, dim=-1),
-            rtol=0,
-            atol=0,
-        )
-        restore_moe_determinism_patches()
-        assert model_utils._compute_distributed_log_softmax_with_grad is original
 
     def test_router_replay_inference_patch_replaces_methods(self):
         pytest.importorskip("megatron")
