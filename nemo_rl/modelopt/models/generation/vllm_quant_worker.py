@@ -32,7 +32,6 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 
 _EXTRA_ENV_VARS = (
     "VLLM_QUANT_CFG",
-    "VLLM_MODELOPT_REAL_QUANT",
     "PYTHONPATH",
 )
 
@@ -56,36 +55,21 @@ def _configure_quant_engine_kwargs(
     )
     real_quant = bool(cfg.get("real_quant"))
     if real_quant:
-        from nemo_rl.modelopt.models.generation.vllm_modelopt import (
-            quantization_method_for_mode,
-            register_nemo_modelopt_nvfp4,
-        )
-        from nemo_rl.modelopt.utils import (
-            build_vllm_modelopt_nvfp4_config,
-            resolve_nvfp4_real_quant_mode,
-        )
-
-        quant_cfg = cfg.get("quant_cfg")
-        if not quant_cfg:
-            raise ValueError("NVFP4 real quantization requires a non-empty quant_cfg.")
-        mode = resolve_nvfp4_real_quant_mode(quant_cfg)
-        register_nemo_modelopt_nvfp4()
         os.environ.pop("VLLM_QUANT_CFG", None)
-        os.environ["VLLM_MODELOPT_REAL_QUANT"] = "1"
-
-        hf_overrides = llm_kwargs.setdefault("hf_overrides", {})
-        hf_overrides["quantization_config"] = build_vllm_modelopt_nvfp4_config(
-            mode=mode,
-            ignore=cfg.get("real_quant_ignore"),
+        quantization_config = llm_kwargs.get("hf_overrides", {}).get(
+            "quantization_config"
         )
-        llm_kwargs["quantization"] = quantization_method_for_mode(mode)
+        if not quantization_config:
+            raise ValueError(
+                "Real quantization requires a policy-produced "
+                "hf_overrides.quantization_config before vLLM initialization"
+            )
     else:
         llm_kwargs["worker_cls"] = (
             "nemo_rl.modelopt.models.generation.vllm_quant_patch.FakeQuantWorker"
         )
         # Expert fakequant needs a decomposed MoE path; explicit user config still wins.
         llm_kwargs.setdefault("moe_backend", "triton")
-        os.environ.pop("VLLM_MODELOPT_REAL_QUANT", None)
         os.environ.pop("VLLM_QUANT_CFG", None)
         if cfg["quant_cfg"]:
             os.environ["VLLM_QUANT_CFG"] = _quant_cfg_for_worker_env(cfg["quant_cfg"])

@@ -16,11 +16,27 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping, Sequence
 from fnmatch import fnmatchcase
 from typing import Any, Iterator, Literal
 
 MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS = 600_000
+
+
+def prepare_real_quant_generation_config(policy: Any, generation_config: dict) -> None:
+    """Inject the policy-produced canonical ModelOpt config into vLLM config."""
+    quantization_config = policy.get_real_quantization_config()
+    hf_overrides = generation_config.setdefault("vllm_kwargs", {}).setdefault(
+        "hf_overrides", {}
+    )
+    existing = hf_overrides.get("quantization_config")
+    if existing is not None and existing != quantization_config:
+        raise ValueError(
+            "generation.vllm_kwargs.hf_overrides.quantization_config conflicts "
+            "with the policy-produced ModelOpt config"
+        )
+    hf_overrides["quantization_config"] = copy.deepcopy(quantization_config)
 
 _QUANT_IGNORE_NAME_SUFFIXES = (
     ".weight",
