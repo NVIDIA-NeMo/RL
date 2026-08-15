@@ -442,6 +442,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     _nrl_w13_num_shards_by_prefix: dict[str, int]
     _nrl_modelopt_reload_roots: tuple[torch.nn.Module, ...] | None = None
 
+    def _supports_unquantized_flashinfer_trtllm_refit(self) -> bool:
+        return False
+
     def maybe_init_zmq(self) -> None:
         """Use a longer timeout only for ModelOpt real-quant refits."""
         super().maybe_init_zmq()
