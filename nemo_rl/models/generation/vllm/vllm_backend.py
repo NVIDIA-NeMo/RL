@@ -1076,9 +1076,11 @@ class VllmInternalWorkerExtension:
         Wraps the ``(vllm_param, merged_slice)`` resolution from
         ``_build_hf_to_gen_backend_mapping`` into ``LocalParamSpec``s:
         - direct (slice ``None``): ``base`` is the live vLLM param; receive in place.
-        - merged (dense ``gate_up_proj`` / grouped-expert ``w13``): ``pre`` allocs a
-          recv buffer for this component's ``region`` slice, ``post`` copies it back
-          (region recomputed each refit to track live storage).
+        - merged (dense ``gate_up_proj`` / grouped-expert ``w13``): ``pre`` allocates
+          a receive buffer for this component's ``region`` slice, and ``post`` copies
+          it back (the region is recomputed each refit to track live storage).
+        - TRTLLM grouped experts: ``pre`` allocates canonical EP-local BF16 storage,
+          and ``post`` sends each expert through vLLM's native weight loader.
         """
 
         def _merged_param_spec(vllm_param, merged_slice):
@@ -1123,7 +1125,9 @@ class VllmInternalWorkerExtension:
 
             return LocalParamSpec(base=value_param.data, pre=pre, post=post)
 
-        def _trtllm_grouped_expert_spec(param_info: dict) -> LocalParamSpec:
+        def _trtllm_grouped_expert_spec(
+            param_info: dict[str, Any],
+        ) -> LocalParamSpec:
             from torch.distributed._tensor import Shard
 
             unsupported_shards = [
@@ -1146,7 +1150,7 @@ class VllmInternalWorkerExtension:
                 if shard_slice.start is None
                 else shard_slice.stop - shard_slice.start
                 for global_size, shard_slice in zip(
-                    param_info["global_shape"], local_slices
+                    param_info["global_shape"], local_slices, strict=True
                 )
             )
             expert_start = local_slices[0].start or 0
@@ -1423,7 +1427,8 @@ class VllmInternalWorkerExtension:
         for a direct param xferdtensor receives straight into the live vLLM
         param (no hooks); for a merged param (dense gate_up_proj, grouped w13)
         ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
-        slice back into the live merged param.
+        slice back into the live merged param. TRTLLM grouped experts instead
+        receive into canonical local tensors and load through vLLM's native path.
         """
         import os
         from collections import OrderedDict
