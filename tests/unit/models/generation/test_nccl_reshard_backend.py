@@ -374,6 +374,38 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
     torch.testing.assert_close(packed_w13, torch.full_like(packed_w13, 7.0))
 
 
+def test_build_hf_to_local_param_map_rejects_trtllm_tensor_sharding():
+    """TRTLLM expert staging supports expert-parallel destination shards only."""
+    expert_name = "model.layers.0.mlp.experts.gate_proj.weight"
+    refit_info = {
+        "gen_tp_size": 2,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [4, 32, 16],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "gate_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
+                    "dst_placements": [Shard(1)],
+                }
+            ]
+        },
+    }
+    ext = _make_ext(
+        {
+            "model.layers.0.mlp.experts.routed_experts.w13_weight": torch.empty(
+                128, 16, 24, 64
+            ),
+        }
+    )
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+
+    with pytest.raises(ValueError, match="unsupported tensor shard dimensions"):
+        ext.build_hf_to_local_param_map(refit_info)
+
+
 def test_nccl_reshard_lifecycle_initializes_only_trtllm_moe_modules(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
