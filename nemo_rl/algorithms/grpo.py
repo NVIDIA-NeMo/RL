@@ -387,6 +387,55 @@ def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
             "grpo.deduplicate_multimodal_data=true is currently supported "
             "only when data_plane.enabled=false."
         )
+def _validate_student_topk_config(
+    master_config: MasterConfig, student_topk: Optional[int]
+) -> None:
+    """Reject settings that the student-top-k OPD loss cannot honor."""
+    if student_topk is None:
+        return
+
+    grpo_config = master_config.grpo
+    policy_config = master_config.policy
+    generation_config = policy_config["generation"]
+    megatron_cfg = policy_config.get("megatron_cfg", {})
+
+    if not opd_module.is_opd_enabled(master_config):
+        raise ValueError(
+            "on_policy_distillation.student_topk requires "
+            "on_policy_distillation.enabled=true."
+        )
+    if not grpo_config.async_grpo.enabled:
+        raise NotImplementedError(
+            "Student-top-k OPD currently supports only grpo.async_grpo.enabled=true."
+        )
+    if policy_config["sequence_packing"]["enabled"]:
+        raise NotImplementedError(
+            "Student-top-k OPD does not yet support sequence packing."
+        )
+    if megatron_cfg.get("context_parallel_size", 1) != 1:
+        raise NotImplementedError(
+            "Student-top-k OPD does not yet support context parallelism."
+        )
+    if not megatron_cfg.get("enabled", False):
+        raise NotImplementedError(
+            "Student-top-k OPD currently requires the Megatron policy backend."
+        )
+    if need_top_k_or_top_p_filtering(
+        TrainingSamplingParams(
+            top_k=generation_config["top_k"],
+            top_p=generation_config["top_p"],
+        )
+    ):
+        raise NotImplementedError(
+            "Student-top-k OPD currently requires unfiltered training distributions "
+            "(policy.generation.top_k=null and top_p=1.0)."
+        )
+    if master_config.loss_fn.reference_policy_kl_penalty != 0:
+        raise ValueError(
+            "Student-top-k OPD requires loss_fn.reference_policy_kl_penalty=0."
+        )
+    if grpo_config.adv_estimator.name != "opd":
+        raise ValueError("Student-top-k OPD requires grpo.adv_estimator.name='opd'.")
 
 
 def _needs_hf_refit_handshake(
@@ -620,6 +669,8 @@ def setup(
     use_fused_linear_logprobs = bool(
         megatron_cfg.get("enabled") and megatron_cfg.get("use_fused_linear_logprobs")
     )
+    student_topk = opd_module.get_student_topk(master_config)
+    _validate_student_topk_config(master_config, student_topk)
     if use_fused_linear_logprobs:
         # Sequence packing is not yet validated with the fused path: the fused
         # forward rolls labels over the whole (packed) sequence and would mix
@@ -648,7 +699,9 @@ def setup(
         )
 
     loss_fn = ClippedPGLossFn(
-        loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
+        loss_config,
+        use_fused_linear_logprobs=use_fused_linear_logprobs,
+        opd_student_topk=student_topk,
     )
 
     # Validate force_on_policy_ratio
@@ -4132,6 +4185,7 @@ def async_grpo_train(
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
     max_generation_failures = master_config.grpo.async_grpo.max_generation_failures
+    student_topk = opd_module.get_student_topk(master_config)
 
     if router_replay_enabled(master_config.policy) and (
         master_config.data_plane or {}
@@ -4644,11 +4698,13 @@ def async_grpo_train(
                     # Teacher logprobs are stored in batch dict by collection-time
                     # computation and padded by from_batches. Extract here.
                     trajectory_teacher_logprobs = None
+                    teacher_agent_refs = None
                     if opd_module.is_opd_enabled(master_config):
                         if "teacher_reference_logprobs" in repeated_batch:
                             trajectory_teacher_logprobs = repeated_batch[
                                 "teacher_reference_logprobs"
                             ]
+                        teacher_agent_refs = repeated_batch.get("agent_ref")
 
                     # Aggregate rollout metrics across groups with proper aggregation per metric type
                     per_group_metrics = {}
@@ -4787,6 +4843,40 @@ def async_grpo_train(
                             train_data["generation_logprobs"]
                         )
 
+                    if student_topk is not None:
+                        if trajectory_teacher_logprobs is None:
+                            raise ValueError(
+                                "Student-top-k OPD requires collection-time teacher "
+                                "target logprobs in the replay batch."
+                            )
+                        if not isinstance(teacher_agent_refs, list):
+                            raise ValueError(
+                                "Student-top-k OPD requires one agent_ref per training sample."
+                            )
+                        topk_output = policy.get_topk_logits(
+                            train_data,
+                            k=student_topk,
+                            timer=timer,
+                        )
+                        train_data["prev_topk_indices"] = topk_output["topk_indices"]
+                        (
+                            teacher_support_logprobs,
+                            teacher_support_time,
+                        ) = ray.get(
+                            trajectory_collector.compute_teacher_support_logprobs.remote(
+                                train_data["input_ids"],
+                                train_data["prev_topk_indices"],
+                                teacher_agent_refs,
+                                input_lengths=train_data["input_lengths"],
+                            )
+                        )
+                        train_data["teacher_support_logprobs"] = (
+                            teacher_support_logprobs
+                        )
+                        rollout_metrics["teacher_support_logprob_time"] = (
+                            teacher_support_time
+                        )
+
                     if not skip_reference_logprobs:
                         train_data["reference_policy_logprobs"] = (
                             policy.get_reference_policy_logprobs(
@@ -4824,6 +4914,10 @@ def async_grpo_train(
                     trajectory_teacher_logprobs = _pad_teacher_logprobs(
                         trajectory_teacher_logprobs, train_data["input_ids"].shape[1]
                     )
+                    if student_topk is not None:
+                        train_data["teacher_reference_logprobs"] = (
+                            trajectory_teacher_logprobs
+                        )
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):

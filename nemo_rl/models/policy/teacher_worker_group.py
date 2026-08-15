@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
+import torch
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.opd import TeacherResourceConfig
@@ -114,7 +115,7 @@ class TeacherWorkerGroup:
     - Never initializes an optimizer
     - Never initializes a reference model
     - Loads the checkpoint once at startup
-    - Only exposes get_logprobs()
+    - Exposes sampled-token and caller-selected-support logprob inference
     """
 
     def __init__(
@@ -293,6 +294,57 @@ class TeacherWorkerGroup:
             result.reorder_data(unsorted_data_indices)
 
         return result
+
+    def get_logprobs_on_support(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Evaluate teacher logprobs on student-selected vocabulary indices.
+
+        ``data['topk_indices']`` must have shape ``[B, S, K]`` and align with
+        ``input_ids``. This first implementation intentionally excludes packing
+        and context parallelism; those layouts require explicit support-index
+        packing/sharding rather than implicit reshaping.
+        """
+        if self.use_sequence_packing:
+            raise NotImplementedError(
+                "Student-top-k teacher evaluation does not yet support sequence packing."
+            )
+        if self.cfg["megatron_cfg"]["context_parallel_size"] != 1:
+            raise NotImplementedError(
+                "Student-top-k teacher evaluation does not yet support context parallelism."
+            )
+        if "topk_indices" not in data:
+            raise ValueError("get_logprobs_on_support requires data['topk_indices'].")
+
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        mbs = micro_batch_size or self._micro_batch_size
+        sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "get_logprobs_on_support",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={"micro_batch_size": mbs},
+        )
+        worker_batches = self.worker_group.get_all_worker_results(futures)
+        return BatchedDataDict(
+            {
+                "support_logprobs": torch.cat(
+                    [batch["support_logprobs"] for batch in worker_batches], dim=0
+                ).cpu()
+            }
+        )
 
     def shutdown(self) -> bool:
         """Shut down all workers and clean up resources."""

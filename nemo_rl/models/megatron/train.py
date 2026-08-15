@@ -49,6 +49,8 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
+    gather_logits_at_global_indices,
+    vocab_parallel_log_softmax,
 )
 from nemo_rl.models.megatron.config import MegatronModule
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
@@ -66,6 +68,7 @@ from nemo_rl.models.policy import PolicyConfig
 PostProcessingFunction = Union[
     "LossPostProcessor",
     "LogprobsPostProcessor",
+    "SupportLogprobsPostProcessor",
     "TopkLogitsPostProcessor",
 ]
 
@@ -271,7 +274,12 @@ def forward_with_post_processing_fn(
     # Loss computation should use unscaled logits.
     if isinstance(
         post_processing_fn,
-        (LossPostProcessor, LogprobsPostProcessor, TopkLogitsPostProcessor),
+        (
+            LossPostProcessor,
+            LogprobsPostProcessor,
+            SupportLogprobsPostProcessor,
+            TopkLogitsPostProcessor,
+        ),
     ):
         # Temperature scaling is element-wise, directly applying it here.
         # Other sampling parameters like top-k and top-p need the logits from whole vocabulary,
@@ -297,6 +305,8 @@ def forward_with_post_processing_fn(
             data_dict=data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
         )
+    elif isinstance(post_processing_fn, SupportLogprobsPostProcessor):
+        post_processing_fn_wrapped = post_processing_fn(data_dict=data_dict)
     else:
         raise TypeError(
             f"Unknown post-processing function type: {type(post_processing_fn)}"
@@ -648,7 +658,7 @@ class TopkLogitsPostProcessor:
 
         Returns:
             Callable: Function that takes output tensor and returns
-                      (dummy_loss, {"topk_logits": values, "topk_indices": indices})
+                ``(dummy_loss, {"topk_logits": values, "topk_indices": indices})``.
         """
         pack = self.cfg["sequence_packing"]["enabled"]
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
@@ -673,7 +683,6 @@ class TopkLogitsPostProcessor:
                 vocab_end_index=vocab_start_index + vocab_shard_size,
                 chunk_size=chunk_size,
             )
-
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()
                 if pack:
@@ -691,7 +700,6 @@ class TopkLogitsPostProcessor:
                         dtype=topk_idx_local.dtype,
                         device=topk_idx_local.device,
                     )
-
                     for i in range(batch_size):
                         start_idx = int(cu_seqlens_padded[i].item())
                         end_idx = int(cu_seqlens_padded[i + 1].item())
@@ -767,6 +775,68 @@ class TopkLogitsPostProcessor:
                     "topk_logits": topk_vals_full,
                     "topk_indices": topk_idx_full,
                 }
+
+        return processor_fn_inner
+
+
+class SupportLogprobsPostProcessor:
+    """Gather full-vocabulary-normalized logprobs on caller-provided support."""
+
+    def __init__(self, cfg: PolicyConfig):
+        self.cfg = cfg
+
+    def __call__(
+        self,
+        data_dict: BatchedDataDict[Any],
+    ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        """Create a function that gathers normalized log-probabilities.
+
+        Args:
+            data_dict: Model inputs containing ``topk_indices`` with shape
+                ``[batch, sequence, k]``.
+
+        Returns:
+            Function returning ``support_logprobs`` at the requested indices.
+        """
+        if self.cfg["sequence_packing"]["enabled"]:
+            raise NotImplementedError(
+                "Support logprob gathering does not yet support sequence packing."
+            )
+        if self.cfg["megatron_cfg"]["context_parallel_size"] != 1:
+            raise NotImplementedError(
+                "Support logprob gathering does not yet support context parallelism."
+            )
+        support_indices = data_dict["topk_indices"]
+        if support_indices.ndim != 3 or support_indices.shape[-1] < 1:
+            raise ValueError(
+                "topk_indices must have shape [batch, sequence, k] with k >= 1, "
+                f"got {support_indices.shape}."
+            )
+
+        def processor_fn_inner(output_tensor):
+            if support_indices.shape[:2] != output_tensor.shape[:2]:
+                raise ValueError(
+                    "topk_indices must match model output batch and sequence dimensions, "
+                    f"got {support_indices.shape[:2]} and {output_tensor.shape[:2]}."
+                )
+            tp_grp = get_tensor_model_parallel_group()
+            tp_rank = get_tensor_model_parallel_rank()
+            vocab_shard_size = output_tensor.shape[-1]
+            vocab_start_index = tp_rank * vocab_shard_size
+            active_tp_grp = tp_grp if torch.distributed.is_initialized() else None
+            local_logprobs = vocab_parallel_log_softmax(
+                output_tensor,
+                temperature=1.0,
+                tp_group=active_tp_grp,
+            )
+            support_logprobs = gather_logits_at_global_indices(
+                local_logprobs,
+                support_indices.to(device=output_tensor.device, dtype=torch.long),
+                tp_group=active_tp_grp,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_start_index + vocab_shard_size,
+            )
+            return output_tensor.new_zeros(()), {"support_logprobs": support_logprobs}
 
         return processor_fn_inner
 

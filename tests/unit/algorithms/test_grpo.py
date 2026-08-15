@@ -46,6 +46,7 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _should_use_async_rollouts,
     _validate_multimodal_dedup_capability,
+    _validate_student_topk_config,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
@@ -58,6 +59,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -183,6 +185,71 @@ def test_initial_policy_generation_stale() -> None:
 
     generation.weight_synchronizer.is_stale = True
     assert _initial_policy_generation_stale(generation, completed_steps=0)
+
+
+def _enable_valid_student_topk(master_config: MasterConfig) -> None:
+    master_config.on_policy_distillation = OnPolicyDistillationConfig(
+        enabled=True, student_topk=8
+    )
+    master_config.grpo.async_grpo.enabled = True
+    master_config.grpo.adv_estimator.name = "opd"
+    master_config.loss_fn.reference_policy_kl_penalty = 0
+    master_config.policy["sequence_packing"] = {"enabled": False}
+    master_config.policy["megatron_cfg"] = {
+        "enabled": True,
+        "context_parallel_size": 1,
+    }
+    master_config.policy["generation"]["top_k"] = None
+    master_config.policy["generation"]["top_p"] = 1.0
+
+
+def test_validate_student_topk_config_accepts_supported_settings(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_student_topk(master_config)
+
+    _validate_student_topk_config(master_config, student_topk=8)
+
+
+@pytest.mark.parametrize(
+    ("invalid_setting", "error_type", "message"),
+    [
+        ("opd_disabled", ValueError, "requires on_policy_distillation.enabled=true"),
+        ("sync_grpo", NotImplementedError, "only grpo.async_grpo.enabled=true"),
+        ("sequence_packing", NotImplementedError, "sequence packing"),
+        ("context_parallel", NotImplementedError, "context parallelism"),
+        ("non_megatron", NotImplementedError, "Megatron policy backend"),
+        ("filtered_sampling", NotImplementedError, "unfiltered training distributions"),
+        ("reference_kl", ValueError, "reference_policy_kl_penalty=0"),
+        ("adv_estimator", ValueError, "adv_estimator.name='opd'"),
+    ],
+)
+def test_validate_student_topk_config_rejects_unsupported_settings(
+    mock_grpo_components, invalid_setting, error_type, message
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_student_topk(master_config)
+
+    if invalid_setting == "opd_disabled":
+        master_config.on_policy_distillation.enabled = False
+    elif invalid_setting == "sync_grpo":
+        master_config.grpo.async_grpo.enabled = False
+    elif invalid_setting == "sequence_packing":
+        master_config.policy["sequence_packing"]["enabled"] = True
+    elif invalid_setting == "context_parallel":
+        master_config.policy["megatron_cfg"]["context_parallel_size"] = 2
+    elif invalid_setting == "non_megatron":
+        master_config.policy["megatron_cfg"]["enabled"] = False
+    elif invalid_setting == "filtered_sampling":
+        master_config.policy["generation"]["top_k"] = 16
+    elif invalid_setting == "reference_kl":
+        master_config.loss_fn.reference_policy_kl_penalty = 0.01
+    elif invalid_setting == "adv_estimator":
+        master_config.grpo.adv_estimator.name = "grpo"
+
+    with pytest.raises(error_type, match=message):
+        _validate_student_topk_config(master_config, student_topk=8)
 
 
 @pytest.fixture

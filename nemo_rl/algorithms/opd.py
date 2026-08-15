@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import ray
+import torch
 from pydantic import BaseModel, Field
 
 from nemo_rl.distributed.virtual_cluster import (
@@ -68,6 +69,7 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     """User-facing config for the top-level ``on_policy_distillation`` block."""
 
     enabled: bool = False
+    student_topk: Optional[int] = Field(default=None, ge=1)
     teacher_model_by_agent_name: dict[str, str] = Field(default_factory=dict)
     default_teacher_alias: Optional[str] = None
     strict_agent_name_match: bool = False
@@ -110,6 +112,77 @@ def is_non_colocated_teachers_enabled(master_config: Any) -> bool:
     return bool(
         _opd_cfg(master_config).get("non_colocated_teachers", {}).get("enabled", False)
     )
+
+
+def get_student_topk(master_config: Any) -> Optional[int]:
+    """Return the configured student-selected OPD support size, if any."""
+    topk = _opd_cfg(master_config).get("student_topk")
+    if topk is None:
+        return None
+    topk = int(topk)
+    if topk < 1:
+        raise ValueError(
+            f"on_policy_distillation.student_topk must be at least 1, got {topk}."
+        )
+    return topk
+
+
+def student_topk_reverse_kl_loss(
+    *,
+    student_support_logprobs: torch.Tensor,
+    teacher_support_logprobs: torch.Tensor,
+    student_target_logprobs: torch.Tensor,
+    teacher_target_logprobs: torch.Tensor,
+    target_in_support: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the per-token student-top-k reverse-KL estimator.
+
+    The exact reverse-KL contribution is used for the student-selected top-k
+    support. When the sampled target is outside that support, its score-function
+    contribution estimates the remaining vocabulary tail without transferring
+    full-vocabulary teacher logits.
+
+    All log-probabilities must be normalized against their model's full
+    vocabulary. Support selection and teacher values are treated as constants;
+    gradients flow only through the current student log-probabilities.
+    """
+    if student_support_logprobs.shape != teacher_support_logprobs.shape:
+        raise ValueError(
+            "student and teacher support logprobs must have the same shape, "
+            f"got {student_support_logprobs.shape} and "
+            f"{teacher_support_logprobs.shape}."
+        )
+    if student_support_logprobs.ndim < 1:
+        raise ValueError("support logprobs must have a top-k dimension.")
+    token_shape = student_support_logprobs.shape[:-1]
+    for name, value in (
+        ("student_target_logprobs", student_target_logprobs),
+        ("teacher_target_logprobs", teacher_target_logprobs),
+        ("target_in_support", target_in_support),
+    ):
+        if value.shape != token_shape:
+            raise ValueError(
+                f"{name} must have shape {token_shape}, got {value.shape}."
+            )
+
+    teacher_support_logprobs = teacher_support_logprobs.to(
+        device=student_support_logprobs.device,
+        dtype=student_support_logprobs.dtype,
+    ).detach()
+    teacher_target_logprobs = teacher_target_logprobs.to(
+        device=student_target_logprobs.device,
+        dtype=student_target_logprobs.dtype,
+    ).detach()
+
+    support_loss = (
+        student_support_logprobs.exp()
+        * (student_support_logprobs - teacher_support_logprobs)
+    ).sum(dim=-1)
+    tail_advantage = (teacher_target_logprobs - student_target_logprobs).detach()
+    # The score-function coefficient includes +1 from differentiating the
+    # student-probability prefactor in p_s * (log p_s - log p_t).
+    tail_loss = (1.0 - tail_advantage) * student_target_logprobs
+    return support_loss + tail_loss * (~target_in_support.bool()).to(tail_loss.dtype)
 
 
 def _skip_prev_logprobs(master_config: Any) -> bool:

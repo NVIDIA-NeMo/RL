@@ -35,6 +35,20 @@ tool / environment tokens contribute zero. Because the advantage subtracts a
 real `prev_logprobs`, MOPD requires the student log-probabilities to actually be
 computed — see [Configuration](#configuration).
 
+### Student top-k reverse KL
+
+Setting `on_policy_distillation.student_topk` replaces the sampled-token MOPD
+loss with a lower-variance reverse-KL estimator. For every token, the student
+selects its highest-probability `k` vocabulary entries. NeMo RL evaluates the
+student and teacher exactly on that support and uses the sampled rollout token
+to estimate the contribution from the remaining vocabulary.
+
+The sampled tail uses the score-function coefficient
+`1 + log π_student − log π_teacher`. The `1` is required because the derivative
+also acts on the student probability multiplying the log-probability gap.
+Support indices and teacher probabilities are treated as constants; gradients
+flow only through the current student probabilities.
+
 ## Configuration
 
 Enable MOPD in two places: select the advantage estimator and add the
@@ -63,6 +77,9 @@ loss_fn:
 
 on_policy_distillation:
   enabled: true
+  # Optional: use the student's top-k vocabulary entries for an exact KL head
+  # and the sampled rollout token for the remaining tail.
+  # student_topk: 64
   # Map each NeMo Gym agent name to a teacher checkpoint.
   teacher_model_by_agent_name:
     default_teacher: Qwen/Qwen3-1.7B
@@ -98,6 +115,20 @@ on_policy_distillation:
 > `prev_logprobs` (`loss_fn.force_on_policy_ratio: true` with no
 > `grpo.seq_logprob_error_threshold`), because the advantage would silently
 > degrade to `teacher_logprobs − 0`.
+
+> [!NOTE]
+> Student top-k mode currently requires async GRPO, a Megatron policy backend,
+> token-level loss, `loss_fn.disable_ppo_ratio: true`, sequence packing disabled,
+> context parallel size 1, fused linear log-probabilities disabled, and an
+> unfiltered training distribution (`generation.top_k: null`, `top_p: 1.0`).
+> CISPO, dual PPO clipping, and sequence-level importance ratios are unsupported.
+
+Student top-k training reports four additional metrics:
+
+- `opd_topk_head_loss`: exact reverse-KL contribution on the selected support.
+- `opd_topk_tail_loss`: sampled score-function surrogate for the tail gradient.
+- `opd_topk_student_mass`: student probability mass captured by the support.
+- `opd_topk_target_outside_fraction`: fraction of sampled targets outside it.
 
 ### Teacher routing
 
@@ -140,6 +171,22 @@ The reference recipe self-distills `Qwen/Qwen3-1.7B` (student == teacher) across
 3 nodes (1 policy + 1 vLLM + 1 teacher) with sequence packing enabled. Because
 student and teacher are identical, the OPD loss stays near zero — it is a
 correctness smoke test, not a demonstration of distillation gains.
+
+To exercise the student-top-k path with that recipe, disable its inherited
+sequence packing and set the support size explicitly:
+
+```sh
+uv run examples/nemo_gym/run_grpo_nemo_gym.py \
+  --config examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml \
+  policy.sequence_packing.enabled=false \
+  on_policy_distillation.student_topk=64 \
+  data.train.data_path=/path/to/train.jsonl \
+  data.validation.data_path=/path/to/val.jsonl
+```
+
+This remains a smoke-test configuration. Measure throughput, peak memory, and
+loss/reward convergence against full-vocabulary MOPD before using it as a
+performance or quality baseline.
 
 ## References
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -57,6 +57,138 @@ def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
 
     next_token_logits = torch.zeros((2 * batch_size, seq_len, vocab_size)).to("cuda")
     return data, next_token_logits
+
+
+def _student_topk_opd_loss_data():
+    return BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[0, 1, 2]]),
+            "token_mask": torch.tensor([[0.0, 1.0, 1.0]]),
+            "sample_mask": torch.tensor([1.0]),
+            "advantages": torch.zeros(1, 3),
+            "prev_logprobs": torch.tensor([[0.0, -1.1, -1.2]]),
+            "generation_logprobs": torch.tensor([[0.0, -1.1, -1.2]]),
+            "reference_policy_logprobs": torch.zeros(1, 3),
+            "prev_topk_indices": torch.tensor([[[1, 0], [0, 1], [0, 0]]]),
+            "teacher_support_logprobs": torch.tensor(
+                [[[-0.7, -1.2], [-0.8, -1.0], [0.0, 0.0]]]
+            ),
+            "teacher_reference_logprobs": torch.tensor([[0.0, -0.7, -0.9]]),
+        }
+    )
+
+
+def test_student_topk_opd_loss_configuration_guards():
+    with pytest.raises(ValueError, match="disable_ppo_ratio"):
+        ClippedPGLossFn(ClippedPGLossConfig(), opd_student_topk=2)
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            disable_ppo_ratio=True,
+            reference_policy_kl_penalty=0.0,
+        ),
+        opd_student_topk=2,
+    )
+    assert loss_fn.input_type.value == "opd_student_topk"
+
+
+@pytest.mark.parametrize(
+    "config_overrides,use_fused_linear_logprobs,error_match",
+    [
+        ({}, True, "fused linear logprobs"),
+        ({"use_cispo": True}, False, "CISPO"),
+        ({"ratio_clip_c": 2.0}, False, "dual PPO clipping"),
+        (
+            {"sequence_level_importance_ratios": True},
+            False,
+            "token-level loss and importance ratios",
+        ),
+        (
+            {"token_level_loss": False},
+            False,
+            "token-level loss and importance ratios",
+        ),
+    ],
+)
+def test_student_topk_opd_loss_rejects_incompatible_options(
+    config_overrides, use_fused_linear_logprobs, error_match
+):
+    cfg = ClippedPGLossConfig(
+        disable_ppo_ratio=True,
+        reference_policy_kl_penalty=0.0,
+        **config_overrides,
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        ClippedPGLossFn(
+            cfg,
+            use_fused_linear_logprobs=use_fused_linear_logprobs,
+            opd_student_topk=2,
+        )
+
+
+def test_student_topk_opd_loss_uses_head_and_sampled_tail():
+    from nemo_rl.algorithms.opd import student_topk_reverse_kl_loss
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            disable_ppo_ratio=True,
+            reference_policy_kl_penalty=0.0,
+        ),
+        opd_student_topk=2,
+    )
+    data = _student_topk_opd_loss_data()
+    # Only the second target contributes. This makes the assertion sensitive to
+    # the loss function's internal ``token_mask[:, 1:]`` slicing.
+    data["token_mask"] = torch.tensor([[0.0, 0.0, 1.0]])
+    current_target = torch.tensor([[-0.6, -1.3]], requires_grad=True)
+    current_support = torch.tensor([[[-0.3, -1.6], [-0.4, -1.7]]], requires_grad=True)
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=current_target,
+        current_support_logprobs=current_support,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(1.0),
+    )
+
+    expected = student_topk_reverse_kl_loss(
+        student_support_logprobs=current_support,
+        teacher_support_logprobs=data["teacher_support_logprobs"][:, :-1],
+        student_target_logprobs=current_target,
+        teacher_target_logprobs=data["teacher_reference_logprobs"][:, 1:],
+        target_in_support=torch.tensor([[True, False]]),
+    )[:, 1].mean()
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert current_target.grad is not None
+    assert current_support.grad is not None
+    assert metrics["opd_topk_target_outside_fraction"] == pytest.approx(1.0)
+
+
+def test_prepare_student_topk_opd_loss_input_uses_full_vocab_normalization():
+    if not torch.cuda.is_available():
+        pytest.skip("Loss-input preparation follows the CUDA training path.")
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            disable_ppo_ratio=True,
+            reference_policy_kl_penalty=0.0,
+        ),
+        opd_student_topk=2,
+    )
+    data = _student_topk_opd_loss_data().to("cuda")
+    logits = torch.tensor(
+        [[[0.0, 2.0, 1.0], [2.0, 0.0, 1.0], [0.5, 0.0, 1.0]]],
+        device="cuda",
+    )
+
+    loss_input, _ = prepare_loss_input(logits, data, loss_fn)
+
+    full_logprobs = logits.log_softmax(dim=-1)
+    expected_support = full_logprobs.gather(-1, data["prev_topk_indices"])[:, :-1]
+    torch.testing.assert_close(loss_input["current_support_logprobs"], expected_support)
+    assert loss_input["next_token_logprobs"].shape == (1, 2)
 
 
 def test_nll_loss():

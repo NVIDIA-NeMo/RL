@@ -29,8 +29,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
     from_parallel_logits_to_logprobs_packed_sequences,
+    gather_logits_at_global_indices,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
+    vocab_parallel_log_softmax,
 )
 
 
@@ -118,6 +120,64 @@ def prepare_loss_input(
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
+
+    elif loss_fn.input_type == LossInputType.OPD_STUDENT_TOPK:
+        if (
+            context_parallel_group is not None
+            and torch.distributed.get_world_size(context_parallel_group) > 1
+        ):
+            raise NotImplementedError(
+                "Student-top-k OPD loss preparation does not yet support context parallelism."
+            )
+        if "prev_topk_indices" not in data:
+            raise ValueError("Student-top-k OPD requires data['prev_topk_indices'].")
+        support_indices = data["prev_topk_indices"].to(
+            device=logits.device, dtype=torch.long
+        )
+        if support_indices.shape[:2] != logits.shape[:2]:
+            raise ValueError(
+                "prev_topk_indices must match logits batch and sequence dimensions, "
+                f"got {support_indices.shape[:2]} and {logits.shape[:2]}."
+            )
+
+        active_tp_group = vocab_parallel_group
+        if active_tp_group is not None:
+            assert vocab_parallel_rank is not None, (
+                "vocab_parallel_rank is required with vocab_parallel_group"
+            )
+            vocab_shard_size = logits.shape[-1]
+            vocab_start_index = vocab_parallel_rank * vocab_shard_size
+            vocab_end_index = vocab_start_index + vocab_shard_size
+        else:
+            vocab_start_index = 0
+            vocab_end_index = logits.shape[-1]
+
+        local_logprobs = vocab_parallel_log_softmax(
+            logits,
+            temperature=1.0,
+            tp_group=active_tp_group,
+        )
+        current_support_logprobs = gather_logits_at_global_indices(
+            local_logprobs,
+            support_indices,
+            tp_group=active_tp_group,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+        )
+        current_target_logprobs = get_next_token_logprobs_from_logits(
+            input_ids=data["input_ids"],
+            next_token_logits=logits,
+            seq_index=data.get("seq_index", None),
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=None,
+            sampling_params=sampling_params,
+            chunk_size=chunk_size,
+        )
+        loss_input = {
+            "next_token_logprobs": current_target_logprobs,
+            "current_support_logprobs": current_support_logprobs[:, :-1],
+        }
 
     elif loss_fn.input_type == LossInputType.DISTILLATION:
         calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
