@@ -21,6 +21,8 @@ silently reverted (#2188), and re-fixed (#2904). These tests pin the merge
 behavior so it cannot regress a third time.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from nemo_rl.models.generation.vllm.vllm_worker import _merge_fp8_kwargs
@@ -149,13 +151,8 @@ def test_source_fp8_kwargs_not_mutated():
     assert "hf_overrides" in fp8_kwargs
 
 
-def test_external_draft_config_is_not_modified_by_target_fp8_overrides():
-    speculative_config = {
-        "method": "eagle3",
-        "model": "external-draft-model",
-        "num_speculative_tokens": 3,
-    }
-    vllm_kwargs = {"speculative_config": speculative_config.copy()}
+def _runtime_mxfp8_kwargs(speculative_config):
+    vllm_kwargs = {"speculative_config": speculative_config}
     fp8_kwargs = {
         "quantization": "fp8",
         "hf_overrides": {
@@ -169,7 +166,121 @@ def test_external_draft_config_is_not_modified_by_target_fp8_overrides():
 
     _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
 
+    return vllm_kwargs
+
+
+def _capture_vllm_0251_draft_model_config(monkeypatch, target_kwargs):
+    from vllm.config import speculative as speculative_module
+    from vllm.config.speculative import SpeculativeConfig
+
+    captured = {}
+
+    def fake_model_config(**kwargs):
+        captured.update(kwargs)
+        model_type = "deepseek_mtp" if kwargs["model"] == "target-model" else "qwen3"
+        return SimpleNamespace(
+            **kwargs,
+            architectures=["DraftForCausalLM"],
+            hf_config=SimpleNamespace(
+                architectures=["DraftForCausalLM"],
+                model_type=model_type,
+            ),
+            get_vocab_size=lambda: 32000,
+            verify_with_parallel_config=lambda _parallel_config: None,
+        )
+
+    monkeypatch.setattr(speculative_module, "ModelConfig", fake_model_config)
+    monkeypatch.setattr(
+        SpeculativeConfig,
+        "_verify_and_get_draft_tp",
+        staticmethod(lambda *_args, **_kwargs: 1),
+    )
+    monkeypatch.setattr(
+        SpeculativeConfig,
+        "create_draft_parallel_config",
+        staticmethod(lambda *_args, **_kwargs: SimpleNamespace()),
+    )
+
+    target_model_config = SimpleNamespace(
+        model="target-model",
+        tokenizer="target-tokenizer",
+        tokenizer_mode="auto",
+        trust_remote_code=False,
+        allowed_local_media_path=None,
+        allowed_media_domains=None,
+        dtype="bfloat16",
+        seed=0,
+        tokenizer_revision=None,
+        max_model_len=4096,
+        enforce_eager=False,
+        max_logprobs=20,
+        config_format="auto",
+        hf_text_config=SimpleNamespace(model_type="deepseek_v3"),
+        get_vocab_size=lambda: 32000,
+        **target_kwargs,
+    )
+
+    return SpeculativeConfig, target_model_config, captured
+
+
+def test_external_draft_stays_bf16_with_target_runtime_mxfp8(monkeypatch):
+    speculative_config = {
+        "method": "draft_model",
+        "model": "external-draft-model",
+        "num_speculative_tokens": 3,
+    }
+    vllm_kwargs = _runtime_mxfp8_kwargs(speculative_config.copy())
+    SpeculativeConfig, target_model_config, captured = (
+        _capture_vllm_0251_draft_model_config(
+            monkeypatch,
+            {
+                "quantization": vllm_kwargs["quantization"],
+                "hf_overrides": vllm_kwargs["hf_overrides"],
+            },
+        )
+    )
+
+    SpeculativeConfig(
+        **vllm_kwargs["speculative_config"],
+        target_model_config=target_model_config,
+        target_parallel_config=SimpleNamespace(),
+    )
+
     assert vllm_kwargs["speculative_config"] == speculative_config
+    assert captured["quantization"] is None
+
+    draft_hf_config = SimpleNamespace(
+        architectures=["DraftForCausalLM"],
+        model_type="qwen3",
+    )
+    captured["hf_overrides"](draft_hf_config)
+    assert not hasattr(draft_hf_config, "quantization_config")
+
+
+def test_native_mtp_stays_bf16_with_target_runtime_mxfp8(monkeypatch):
+    vllm_kwargs = _runtime_mxfp8_kwargs(
+        {
+            "method": "mtp",
+            "num_speculative_tokens": 1,
+        }
+    )
+    SpeculativeConfig, target_model_config, captured = (
+        _capture_vllm_0251_draft_model_config(
+            monkeypatch,
+            {
+                "quantization": vllm_kwargs["quantization"],
+                "hf_overrides": vllm_kwargs["hf_overrides"],
+            },
+        )
+    )
+
+    SpeculativeConfig(
+        **vllm_kwargs["speculative_config"],
+        target_model_config=target_model_config,
+        target_parallel_config=SimpleNamespace(),
+    )
+
+    assert captured["quantization"] is None
 
 
 def test_vllm_keeps_target_dict_overrides_out_of_draft_model():
