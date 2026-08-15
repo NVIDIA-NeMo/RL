@@ -1297,9 +1297,7 @@ def setup(
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
         ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = dict(
-            policy_config.get("hf_config_overrides", {})
-        )
+        vllm_kwargs["hf_overrides"] = dict(policy_config.get("hf_config_overrides", {}))
 
         if real_quant:
             from nemo_rl.modelopt.utils import prepare_real_quant_generation_config

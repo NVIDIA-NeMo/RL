@@ -53,7 +53,7 @@ policy:
     2}
   generation:
     max_new_tokens: 28672
-    quant_cfg: examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml
+    quant_cfg: null
     real_quant: true
     vllm_cfg:
       tensor_parallel_size: 2

@@ -36,6 +36,7 @@ def prepare_real_quant_generation_config(policy: Any, generation_config: dict) -
         )
     hf_overrides["quantization_config"] = copy.deepcopy(quantization_config)
 
+
 def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
     """Resolve a quantization config string into a dict consumable by ``mtq.quantize``.
 

@@ -1079,6 +1079,7 @@ def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypat
             "policy": {
                 "model_name": "test-student",
                 "quant_cfg": "/tmp/modelopt.yaml",
+                "hf_config_overrides": {"architectures": ["TestStudent"]},
                 "dtensor_cfg": {"enabled": False},
                 "megatron_cfg": {
                     "enabled": True,
@@ -1159,10 +1160,10 @@ def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypat
 
         def __init__(self, *, config, **_kwargs):
             events.append("vllm")
-            assert (
-                config["vllm_kwargs"]["hf_overrides"]["quantization_config"]
-                == descriptor
-            )
+            assert config["vllm_kwargs"]["hf_overrides"] == {
+                "architectures": ["TestStudent"],
+                "quantization_config": descriptor,
+            }
 
         def finish_generation(self):
             events.append("finish")

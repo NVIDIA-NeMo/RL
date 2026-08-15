@@ -527,6 +527,11 @@ def setup(
     real_quant = backend == "vllm" and bool(generation_config.get("real_quant"))
     student_policy = None
 
+    if backend == "vllm":
+        generation_config = cast(VllmConfig, generation_config)
+        vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
+        vllm_kwargs["hf_overrides"] = dict(policy_config.get("hf_config_overrides", {}))
+
     if real_quant:
         from nemo_rl.modelopt.utils import prepare_real_quant_generation_config
 
@@ -538,12 +543,6 @@ def setup(
     if backend == "megatron":
         student_generation = None
     elif backend == "vllm":
-        generation_config = cast(VllmConfig, generation_config)
-        if "vllm_cfg" in generation_config:
-            ## make vllm hf overrides match the training policy
-            generation_config["vllm_kwargs"]["hf_overrides"] = dict(
-                generation_config["vllm_kwargs"].get("hf_overrides", {})
-            )
         if enable_nemo_gym:
             deferred_vllm = VllmGeneration(
                 cluster=inference_cluster,

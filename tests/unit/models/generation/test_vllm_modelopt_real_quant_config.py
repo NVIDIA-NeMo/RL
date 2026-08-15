@@ -399,9 +399,7 @@ def test_prepare_real_quant_generation_config_copies_policy_config():
     policy = types.SimpleNamespace(
         get_real_quantization_config=lambda: quantization_config
     )
-    generation_config = {
-        "vllm_kwargs": {"hf_overrides": {"trust_remote_code": True}}
-    }
+    generation_config = {"vllm_kwargs": {"hf_overrides": {"trust_remote_code": True}}}
 
     modelopt_utils.prepare_real_quant_generation_config(policy, generation_config)
     quantization_config["quant_algo"] = "modified"
@@ -542,7 +540,7 @@ async def test_async_quant_generation_worker_collective_rpc_accessors():
     ]
 
 
-def test_vllm_modelopt_backend_imports_without_gpt_oss_helper(monkeypatch):
+def test_vllm_quant_backend_imports_without_gpt_oss_helper(monkeypatch):
     _import_vllm_quant_backend(monkeypatch)
 
 
@@ -630,7 +628,9 @@ def test_real_quant_load_owns_transport_tensors(monkeypatch):
 
     assert [name for name, _ in loaded] == ["model.weight"]
     torch.testing.assert_close(loaded[0][1], source)
-    assert loaded[0][1].untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+    assert (
+        loaded[0][1].untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+    )
 
 
 def test_fake_quant_load_weights_exposes_activation_quantizer_buffers(monkeypatch):
@@ -1270,7 +1270,6 @@ def test_get_quantizer_stats_counts_enabled_positive_amax(monkeypatch):
         "positive_amax": 1,
         "kv_amax": {},
     }
-
 
 
 def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):

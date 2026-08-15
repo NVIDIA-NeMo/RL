@@ -451,9 +451,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     def _use_real_quant_refit(self) -> bool:
         generation_cfg = self.cfg["generation"]
-        return (
-            generation_cfg["backend"] == "vllm"
-            and bool(generation_cfg.get("real_quant"))
+        return generation_cfg["backend"] == "vllm" and bool(
+            generation_cfg.get("real_quant")
         )
 
     def _get_modelopt_export_plan(self):

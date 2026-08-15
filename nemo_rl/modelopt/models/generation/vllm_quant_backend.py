@@ -116,7 +116,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         def new_named_parameters(self, *args, **kwargs):
             yield from original_named_parameters(*args, **kwargs)
             for name, buf in self.named_buffers(*args, **kwargs):
-                if not name.endswith(VllmQuantInternalWorkerExtension._QUANT_AMAX_SUFFIXES):
+                if not name.endswith(
+                    VllmQuantInternalWorkerExtension._QUANT_AMAX_SUFFIXES
+                ):
                     continue
                 if not hasattr(buf, "weight_loader"):
                     buf.weight_loader = amax_loader

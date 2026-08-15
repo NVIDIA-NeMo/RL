@@ -298,7 +298,9 @@ def test_real_quant_config_and_stream_reuse_one_megatron_bridge_plan():
     assert kwargs["cpu"] is True
     assert kwargs["show_progress"] is False
     assert kwargs["export_plan"] is worker.megatron_bridge.plan
-    assert len([call for call in worker.megatron_bridge.calls if call[0] == "plan"]) == 1
+    assert (
+        len([call for call in worker.megatron_bridge.calls if call[0] == "plan"]) == 1
+    )
 
 
 @requires_weight_folding
