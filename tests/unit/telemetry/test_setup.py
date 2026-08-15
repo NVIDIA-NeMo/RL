@@ -11,13 +11,14 @@ from nemo_rl.telemetry.setup import (
     _dig,
     get_telemetry,
     init_telemetry_driver,
+    init_telemetry_worker,
 )
 
 
 class _FakeMasterConfig:
-    def __init__(self, telemetry=None):
+    def __init__(self, telemetry=None, policy=None):
         self.telemetry = telemetry
-        self.policy = {
+        self.policy = policy or {
             "model_name": "org/Model-1B",
             "precision": "bfloat16",
             "megatron_cfg": {
@@ -39,14 +40,25 @@ def test_dig_handles_dicts_objects_and_missing():
 
 
 def test_build_resource_attributes():
-    attrs = _build_resource_attributes(
-        _FakeMasterConfig(), "grpo", rank=0, world_size=1
-    )
+    attrs = _build_resource_attributes(_FakeMasterConfig(), "grpo")
     assert attrs["rl.algorithm"] == "grpo"
     assert attrs["rl.model"] == "org/Model-1B"
     assert attrs["nemo.precision"] == "bfloat16"
     assert attrs["dl.tensor_parallel.size"] == 2
     assert attrs["dl.pipeline_parallel.size"] == 1
+
+
+def test_build_resource_attributes_dtensor_tp():
+    cfg = _FakeMasterConfig(
+        policy={
+            "model_name": "org/Model-1B",
+            "precision": "bfloat16",
+            "dtensor_cfg": {"tensor_parallel_size": 4},
+        }
+    )
+    attrs = _build_resource_attributes(cfg, "grpo")
+    assert attrs["dl.tensor_parallel.size"] == 4
+    assert "dl.pipeline_parallel.size" not in attrs
 
 
 def test_init_driver_returns_none_when_disabled():
@@ -60,6 +72,13 @@ def test_init_driver_returns_none_when_disabled():
 def test_init_driver_returns_none_when_no_telemetry_block():
     handle = init_telemetry_driver(_FakeMasterConfig(telemetry=None), "grpo")
     assert handle is None
+
+
+def test_init_worker_returns_none_when_disabled():
+    # No NEMO_RL_OTEL_ENABLED / NEMO_LENS_ENABLED — every actor takes this path.
+    handle = init_telemetry_worker()
+    assert handle is None
+    assert get_telemetry() is None
 
 
 def test_init_driver_enabled_is_idempotent():
