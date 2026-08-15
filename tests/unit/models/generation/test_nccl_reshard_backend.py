@@ -365,8 +365,12 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
         "model.layers.0.mlp.experts.2.gate_proj.weight",
         "model.layers.0.mlp.experts.3.gate_proj.weight",
     ]
-    torch.testing.assert_close(loaded_weights[0][1], torch.full((P, H), 2.0))
-    torch.testing.assert_close(loaded_weights[1][1], torch.full((P, H), 3.0))
+    torch.testing.assert_close(
+        loaded_weights[0][1], torch.full((P, H), 2.0, dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(
+        loaded_weights[1][1], torch.full((P, H), 3.0, dtype=torch.bfloat16)
+    )
     torch.testing.assert_close(packed_w13, torch.full_like(packed_w13, 7.0))
 
 
