@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import inspect
 import logging
 import os
 import sys
@@ -108,8 +109,6 @@ def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
         )
         return
     try:
-        import inspect
-
         from vllm.engine.arg_utils import EngineArgs
 
         supported = set(getattr(EngineArgs, "__dataclass_fields__", {})) | set(
