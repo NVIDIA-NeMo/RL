@@ -170,3 +170,19 @@ def test_external_draft_config_is_not_modified_by_target_fp8_overrides():
     _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
 
     assert vllm_kwargs["speculative_config"] == speculative_config
+
+
+def test_vllm_keeps_target_dict_overrides_out_of_draft_model():
+    from vllm.config.speculative import SpeculativeConfig
+
+    draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
+        {
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MXFP8",
+                "ignore": ["lm_head"],
+            }
+        }
+    )
+
+    assert draft_hf_overrides is SpeculativeConfig.hf_config_override

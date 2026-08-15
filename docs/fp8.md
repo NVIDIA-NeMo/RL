@@ -75,15 +75,12 @@ attention, the router, and the language-model head in BF16:
 
 `lm_head` is always excluded from FP8 and MXFP8 quantization, even when it is
 not listed in `quantization_ignore_patterns` in the YAML configuration.
-For MXFP8 checkpoints that store multi-token prediction (MTP) layers after the
-main transformer layers, NeMo RL also derives and excludes those layer prefixes
-from the Hugging Face model configuration. This covers both top-level and nested
-text configurations used by current vLLM MTP model paths.
-
-An external draft model, such as an Eagle3 checkpoint, is loaded by vLLM with a
-separate model configuration. The target model's generated MXFP8 ignore list is
-not applied to that draft model. Configure the external draft's precision through
-its own checkpoint or speculative-decoding configuration.
+MTP and external speculative-decoding modules are separate vLLM draft models.
+The target model's dictionary-based MXFP8 overrides are not applied to a draft
+model, so target ignore patterns must not include draft-model parameter names.
+This covers MTP weights stored in the target checkpoint as well as a separate
+draft checkpoint such as Eagle3. Configure draft precision through its own
+checkpoint or speculative-decoding configuration.
 
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
