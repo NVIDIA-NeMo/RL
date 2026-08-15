@@ -22,14 +22,18 @@ business logic. Backend init is lifted from
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import ipaddress
 import os
+import resource
 import socket
+import threading
 import time
 import warnings
 from importlib import resources
 from pathlib import Path
+from queue import Empty, SimpleQueue
 from typing import Any, cast
 
 import torch
@@ -142,6 +146,162 @@ def _mooncake_transport_config() -> dict:
     return {"protocol": "rdma", "device_name": devices}
 
 
+# Per-slot ceiling for the staging pool: bounds resident pinned memory at
+# n_slots x this x procs-per-node (8 GiB on an 8-GPU node). Larger transfers
+# bypass the pool.
+_STAGING_MAX_BYTES = 256 * 1024 * 1024
+
+# A slot is held for exactly one transfer, so waiting minutes for one means
+# this process runs more concurrent transfers than the pool has slots — not
+# that a transfer is slow. Fail with that diagnosis rather than block forever.
+_STAGING_SLOT_TIMEOUT_S = 600.0
+
+# Guards the lazy per-client pool construction. Module-level rather than
+# per-client because it is only ever contended on the first transfer.
+_staging_pool_lock = threading.Lock()
+
+
+def _memlock_limit() -> str:
+    """Return this process's RLIMIT_MEMLOCK soft limit, for error messages."""
+    soft, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    return "unlimited" if soft == resource.RLIM_INFINITY else f"{soft} bytes"
+
+
+def _register_checked(store: Any, ptr: int, nbytes: int) -> None:
+    """``store.register_buffer`` with its status actually checked.
+
+    Mooncake returns a status int here, and TQ drops it at every call site
+    (``mooncake_client.py``'s ``_register_all_buffers``). A registration that
+    fails is then invisible: the transfer into that unmapped region comes
+    back as the generic ``TRANSFER_FAIL`` (-800), which carries no root
+    cause, and burns its three retries against the same unmapped memory.
+    Registration pins pages with ``ibv_reg_mr`` once per RDMA rail, so it is
+    exactly the call that a memlock rlimit or a missing ``IPC_LOCK`` breaks.
+
+    ``None`` counts as success — the binding's return type has varied across
+    mooncake wheels, so only an explicit non-zero status is a failure.
+    """
+    status = store.register_buffer(ptr, nbytes)
+    if status is not None and status != 0:
+        raise RuntimeError(
+            f"mooncake register_buffer(0x{ptr:x}, {nbytes} bytes) failed with "
+            f"status {status}. Registration pins the pages with ibv_reg_mr "
+            f"once per rail (devices={rdma_devices() or 'none'}), so it needs "
+            f"IPC_LOCK and a high memlock rlimit — RLIMIT_MEMLOCK is "
+            f"{_memlock_limit()} here. Lower data_plane.global_segment_size / "
+            "local_buffer_size if the limit is the bound."
+        )
+
+
+class _StagingPool:
+    """RDMA-registered host buffers, owned by one mooncake client.
+
+    Not thread-local: the ``ThreadPoolExecutor`` is rebuilt inside each
+    get/put, so thread-local buffers would be discarded every call. Sized to
+    the executor width so no worker normally waits for a slot.
+
+    A slot's buffer is registered for as long as the pool holds it. The
+    invariant that matters is the converse: **no buffer is ever freed while
+    still registered**, because mooncake would keep a mapping over an address
+    the allocator immediately hands to the next caller.
+    """
+
+    def __init__(self, store: Any, n_slots: int) -> None:
+        self._store = store
+        self._free: SimpleQueue = SimpleQueue()
+        for _ in range(n_slots):
+            self._free.put(None)  # allocated on first use
+        self._n_slots = n_slots
+
+    @contextlib.contextmanager
+    def buffer(self, nbytes: int):
+        # Outliers bypass the pool: slots only ever grow, so admitting one
+        # long-sequence sample would pin that size in every slot for the
+        # rest of the run. Registering it transiently is the cheaper trade.
+        if nbytes > _STAGING_MAX_BYTES:
+            tmp = torch.empty(nbytes, dtype=torch.uint8)
+            _register_checked(self._store, tmp.data_ptr(), tmp.nbytes)
+            try:
+                yield tmp
+            finally:
+                self._store.unregister_buffer(tmp.data_ptr())
+            return
+        try:
+            buf = self._free.get(timeout=_STAGING_SLOT_TIMEOUT_S)
+        except Empty:
+            raise RuntimeError(
+                f"No mooncake staging slot free after {_STAGING_SLOT_TIMEOUT_S}s. "
+                f"The pool has {self._n_slots} slots, sized to one TQ worker "
+                "pool, so this means overlapping put/get calls in this process. "
+                "Set data_plane.reuse_registered_buffers=false to fall back to "
+                "upstream's per-call registration."
+            ) from None
+        try:
+            if buf is None or buf.nbytes < nbytes:
+                if buf is not None:
+                    self._store.unregister_buffer(buf.data_ptr())
+                    # Empty the slot before allocating: if the registration
+                    # below fails, the slot must come back empty rather than
+                    # holding a buffer the NIC no longer maps.
+                    buf = None
+                grown = torch.empty(nbytes, dtype=torch.uint8)
+                _register_checked(self._store, grown.data_ptr(), grown.nbytes)
+                buf = grown
+            yield buf
+        finally:
+            self._free.put(buf)
+
+
+def _staging_pool(client: Any, n_slots: int) -> _StagingPool:
+    """Return ``client``'s pool, building it at most once across threads.
+
+    Double-checked under a lock because ``put``/``get`` drive the thread
+    workers from a ``ThreadPoolExecutor``, so two of them reach a cold client
+    at once whenever a call splits into more than one ``BATCH_SIZE_LIMIT``
+    batch. Unsynchronized, the loser's pool is dropped on the floor and its
+    buffers are freed while still registered — mooncake keeps a mapping over
+    memory the allocator hands straight to the next caller, and the transfer
+    that lands there fails with ``TRANSFER_FAIL`` (-800) on every retry.
+    """
+    pool = getattr(client, "_nrl_staging", None)
+    if pool is not None:
+        return pool
+    with _staging_pool_lock:
+        pool = getattr(client, "_nrl_staging", None)
+        if pool is None:
+            pool = client._nrl_staging = _StagingPool(client._store, n_slots)
+    return pool
+
+
+def _patch_mooncake_register_check() -> None:
+    """Make a failed RDMA registration fail at the registration.
+
+    Upstream's ``_register_all_buffers`` ignores ``register_buffer``'s
+    status, so every worker that uses it — including the two bytes workers
+    :func:`_patch_mooncake_staging_buffers` leaves alone — transfers into
+    memory the NIC may never have mapped and reports only ``TRANSFER_FAIL``
+    (-800). Applied for every ``mooncake_cpu`` client, independent of
+    ``reuse_registered_buffers``, so the check survives disabling the pool.
+    """
+    try:
+        from transfer_queue.storage.clients import mooncake_client as _mc
+    except ImportError:
+        return
+
+    cls = getattr(_mc, "MooncakeStoreClient", None)
+    if cls is None or getattr(cls, "_nrl_register_checked", False):
+        return
+    if not hasattr(cls, "_register_all_buffers"):
+        return
+
+    def _register_all_buffers(self, ptrs, sizes):  # type: ignore[no-untyped-def]
+        for ptr, size in zip(ptrs, sizes, strict=True):
+            _register_checked(self._store, ptr, size)
+
+    cls._register_all_buffers = _register_all_buffers
+    cls._nrl_register_checked = True
+
+
 def _patch_mooncake_staging_buffers() -> None:
     """Reuse RDMA-registered host buffers for mooncake tensor GETs and PUTs.
 
@@ -152,12 +312,9 @@ def _patch_mooncake_staging_buffers() -> None:
     cached. This keeps a small pool of registered buffers alive instead.
 
     Monkey-patched because TransferQueue is pinned by git SHA in
-    ``pyproject.toml``. Returns False, leaving upstream behaviour intact, if
+    ``pyproject.toml``. Returns early, leaving upstream behaviour intact, if
     the internals it drives are not shaped as expected.
     """
-    import contextlib
-    from queue import SimpleQueue
-
     try:
         from transfer_queue.storage.clients import mooncake_client as _mc
         from transfer_queue.utils.mooncake_utils import _aligned_offsets, split_by_bytes
@@ -180,60 +337,11 @@ def _patch_mooncake_staging_buffers() -> None:
         return
 
     n_slots = getattr(_mc, "MAX_BATCH_WORKER_THREADS", 4)
-    # Per-slot ceiling: bounds resident pinned memory at n_slots x this x
-    # procs-per-node (8 GiB on an 8-GPU node). Larger transfers bypass the pool.
-    _STAGING_MAX_BYTES = 256 * 1024 * 1024
-
-    class _StagingPool:
-        """Registered buffers, owned by the client.
-
-        Not thread-local: the ``ThreadPoolExecutor`` is rebuilt inside each
-        get/put, so thread-local buffers would be discarded every call. Sized
-        to the executor width so no worker blocks on a buffer.
-        """
-
-        def __init__(self, store: Any) -> None:
-            self._store = store
-            self._free: SimpleQueue = SimpleQueue()
-            # Keyed by id(): a list would compare tensors by value on
-            # remove(), which raises for multi-element tensors.
-            for _ in range(n_slots):
-                self._free.put(None)  # allocated on first use
-
-        @contextlib.contextmanager
-        def buffer(self, nbytes: int):
-            # Outliers bypass the pool: slots only ever grow, so admitting one
-            # long-sequence sample would pin that size in every slot for the
-            # rest of the run. Registering it transiently is the cheaper trade.
-            if nbytes > _STAGING_MAX_BYTES:
-                tmp = torch.empty(nbytes, dtype=torch.uint8)
-                self._store.register_buffer(tmp.data_ptr(), tmp.nbytes)
-                try:
-                    yield tmp
-                finally:
-                    self._store.unregister_buffer(tmp.data_ptr())
-                return
-            buf = self._free.get()
-            try:
-                if buf is None or buf.nbytes < nbytes:
-                    if buf is not None:
-                        self._store.unregister_buffer(buf.data_ptr())
-                    buf = torch.empty(nbytes, dtype=torch.uint8)
-                    self._store.register_buffer(buf.data_ptr(), buf.nbytes)
-                yield buf
-            finally:
-                self._free.put(buf)
-
-    def _pool(client):  # type: ignore[no-untyped-def]
-        pool = getattr(client, "_nrl_staging", None)
-        if pool is None:
-            pool = client._nrl_staging = _StagingPool(client._store)
-        return pool
 
     def _get_tensors_thread_worker(
         self, batch_keys, batch_shapes, batch_dtypes, indexes
     ):  # type: ignore[no-untyped-def]
-        pool = _pool(self)
+        pool = _staging_pool(self, n_slots)
         batch_nbytes = get_nbytes(batch_dtypes, batch_shapes)
         tensors: list[Any] = [None] * len(batch_keys)
         # Split the payload to fit a bounded buffer rather than sizing the
@@ -259,7 +367,7 @@ def _patch_mooncake_staging_buffers() -> None:
 
     def _put_tensors_thread_worker(self, batch_keys, batch_tensors):  # type: ignore[no-untyped-def]
         """PUT direction of the GET patch: stage into the pooled buffer, then transfer."""
-        pool = _pool(self)
+        pool = _staging_pool(self, n_slots)
         contiguous = [t.contiguous() for t in batch_tensors]
         nbytes = [t.nbytes for t in contiguous]
         for idxs in split_by_bytes(nbytes, _STAGING_MAX_BYTES):
@@ -543,7 +651,11 @@ class TQDataPlaneClient(DataPlaneClient):
                 # IP — peers fail with "connection refused".
                 os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
             os.environ.setdefault("MC_STORE_MEMCPY", "0")
-            # Must run before the first get, in every process with a TQ client.
+            # Both must run before the first get, in every process with a TQ
+            # client. The registration check is unconditional: it also covers
+            # the two bytes workers the staging patch leaves untouched, which
+            # is where an unchecked registration surfaces as TRANSFER_FAIL.
+            _patch_mooncake_register_check()
             if cfg["reuse_registered_buffers"]:
                 _patch_mooncake_staging_buffers()
 
