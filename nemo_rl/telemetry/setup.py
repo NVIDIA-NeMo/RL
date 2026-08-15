@@ -302,3 +302,5 @@ def shutdown_telemetry(timeout_ms: int = 5000) -> None:
         handle.shutdown(timeout_ms=timeout_ms)
     except Exception:
         logger.warning("nemo-lens: error during telemetry shutdown", exc_info=True)
+    finally:
+        _TELEMETRY_HANDLE = None
