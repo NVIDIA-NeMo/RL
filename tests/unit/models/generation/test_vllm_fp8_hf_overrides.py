@@ -226,9 +226,9 @@ def _capture_vllm_0251_draft_model_config(monkeypatch, target_kwargs):
     return SpeculativeConfig, target_model_config, captured
 
 
-def test_external_draft_stays_bf16_with_target_runtime_mxfp8(monkeypatch):
+def test_kimi_eagle3_draft_stays_bf16_with_target_runtime_mxfp8(monkeypatch):
     speculative_config = {
-        "method": "draft_model",
+        "method": "eagle3",
         "model": "external-draft-model",
         "num_speculative_tokens": 3,
     }
@@ -259,6 +259,36 @@ def test_external_draft_stays_bf16_with_target_runtime_mxfp8(monkeypatch):
     )
     captured["hf_overrides"](draft_hf_config)
     assert not hasattr(draft_hf_config, "quantization_config")
+    assert speculative_config_obj.target_model_config is target_model_config
+
+
+def test_external_draft_respects_explicit_quantization(monkeypatch):
+    vllm_kwargs = _runtime_mxfp8_kwargs(
+        {
+            "method": "eagle3",
+            "model": "external-draft-model",
+            "num_speculative_tokens": 3,
+            "quantization": "fp8",
+        }
+    )
+    SpeculativeConfig, target_model_config, captured = (
+        _capture_vllm_0251_draft_model_config(
+            monkeypatch,
+            {
+                "quantization": "modelopt_mxfp8",
+                "hf_overrides": vllm_kwargs["hf_overrides"],
+            },
+        )
+    )
+    _patch_vllm_mxfp8_speculative_draft_precision()
+
+    speculative_config_obj = SpeculativeConfig(
+        **vllm_kwargs["speculative_config"],
+        target_model_config=target_model_config,
+        target_parallel_config=SimpleNamespace(),
+    )
+
+    assert captured["quantization"] == "fp8"
     assert speculative_config_obj.target_model_config is target_model_config
 
 
