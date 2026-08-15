@@ -119,14 +119,13 @@ def _dig(obj: Any, *path: str) -> Any:
 def _build_resource_attributes(
     master_config: Any,
     algorithm: str,
-    rank: int,
-    world_size: int,
 ) -> dict:
     """Build process-lifetime resource attributes (Jaeger "Process" tags).
 
     Only stable-for-the-run values belong here (algorithm, model, precision,
     parallelism). Per-step values are span tags; time-series values are metrics.
     Best-effort: a missing key simply omits that attribute — never raises.
+    ``dl.rank`` / ``dl.world_size`` are set by lens from the setup call, not here.
     """
     attrs: dict[str, Any] = {"rl.algorithm": algorithm}
 
@@ -201,9 +200,7 @@ def init_telemetry_driver(
         config.run_id = run_id
 
     try:
-        resource_attrs = _build_resource_attributes(
-            master_config, algorithm, rank=0, world_size=1
-        )
+        resource_attrs = _build_resource_attributes(master_config, algorithm)
     except Exception:
         logger.warning("nemo-lens: failed to build resource attributes", exc_info=True)
         resource_attrs = {"rl.algorithm": algorithm}
