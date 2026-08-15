@@ -422,11 +422,11 @@ class MegatronConfig(TypedDict):
     # Megatron-Bridge at runtime).
     fine_grained_activation_offloading: NotRequired[bool]
     # Modules to offload when fine_grained_activation_offloading is True.
-    # Required (no default). Valid values:
-    # "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm",
-    # "expert_fc1", "moe_act", "fused_group_mlp". Note: "attn_proj"
-    # requires "core_attn".
-    # See: https://github.com/NVIDIA/Megatron-LM/blob/d12f6c8c9aff51e166d872fd70151687a8e3f375/megatron/core/transformer/transformer_config.py#L1234-L1245
+    # Required (no default). Common examples: "core_attn", "attn_proj",
+    # "expert_fc1", and "moe_act". Supported names depend on the pinned
+    # Megatron-LM version and are validated by MCore. "attn_proj" requires
+    # "core_attn". See the latest upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
     offload_modules: NotRequired[list[str] | None]
     # Create gloo process groups during Megatron distributed init.
     # Omitted: use the Megatron Bridge default.
