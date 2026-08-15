@@ -91,8 +91,10 @@ def _detach_pending_layerwise_weights(
                 arguments.arguments["loaded_weight"] = loaded_weight.clone()
 
 
-def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
-    """Return whether a model realized the unquantized TRTLLM MoE backend."""
+def _unquantized_flashinfer_trtllm_modules(
+    model: torch.nn.Module,
+) -> list[torch.nn.Module]:
+    """Return modules that realized the unquantized TRTLLM MoE backend."""
     # Import backend types only when inspecting a constructed vLLM model.
     from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
         UnquantizedMoeBackend,
@@ -101,13 +103,43 @@ def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
         UnquantizedFusedMoEMethod,
     )
 
-    return any(
-        isinstance(
+    return [
+        module
+        for module in model.modules()
+        if isinstance(
             quant_method := getattr(module, "quant_method", None),
             UnquantizedFusedMoEMethod,
         )
         and quant_method.unquantized_backend is UnquantizedMoeBackend.FLASHINFER_TRTLLM
-        for module in model.modules()
+    ]
+
+
+def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
+    """Return whether a model realized the unquantized TRTLLM MoE backend."""
+    return bool(_unquantized_flashinfer_trtllm_modules(model))
+
+
+def _local_shard_slices(param_info: dict[str, Any], rank: int) -> tuple[slice, ...]:
+    """Return this destination rank's slices in an HF-global tensor."""
+    from nemo_rl.weight_sync.xferdtensor import (
+        _compute_shard_slices,
+        _get_mesh_coords,
+    )
+
+    dst_mesh = param_info["dst_mesh_info"]
+    mesh_coords = _get_mesh_coords(dst_mesh, rank)
+    if mesh_coords is None:
+        raise ValueError(
+            f"Destination rank {rank} is absent from the mesh for "
+            f"{param_info['name']!r}"
+        )
+    return tuple(
+        _compute_shard_slices(
+            param_info["global_shape"],
+            list(dst_mesh.mesh.shape),
+            mesh_coords,
+            param_info["dst_placements"],
+        )
     )
 
 
@@ -729,7 +761,6 @@ class VllmInternalWorkerExtension:
         Native reload initialization invalidates the old runtime layout. Any
         subsequent exception therefore marks this worker permanently unusable.
         """
-        del transport
         if self._uses_unquantized_flashinfer_trtllm():
             self._validate_weight_update_compatibility()
             previous_failure = self._nrl_layerwise_reload_failure
@@ -745,6 +776,11 @@ class VllmInternalWorkerExtension:
             )
 
             model = self.model_runner.model
+            reload_targets = (
+                _unquantized_flashinfer_trtllm_modules(model)
+                if transport == "nccl_reshard"
+                else [model]
+            )
 
             def finalize() -> None:
                 with torch.device(self.device):
@@ -755,7 +791,8 @@ class VllmInternalWorkerExtension:
             try:
                 with set_current_vllm_config(self.model_runner.vllm_config):
                     with torch.device(self.device):
-                        initialize_layerwise_reload(model)
+                        for reload_target in reload_targets:
+                            initialize_layerwise_reload(reload_target)
                     self._nrl_layerwise_reload_active = True
                     yield finalize
             except Exception as error:
@@ -983,14 +1020,76 @@ class VllmInternalWorkerExtension:
 
             return LocalParamSpec(base=vllm_param, pre=pre, post=post)
 
+        def _trtllm_grouped_expert_spec(param_info: dict) -> LocalParamSpec:
+            from torch.distributed._tensor import Shard
+
+            from nemo_rl.weight_sync.nccl_reshard_utils import _STR_TO_DTYPE
+
+            unsupported_shards = [
+                placement.dim
+                for placement in param_info["dst_placements"]
+                if isinstance(placement, Shard) and placement.dim != 0
+            ]
+            if unsupported_shards:
+                raise ValueError(
+                    "Unquantized FlashInfer TRTLLM nccl_reshard refit requires "
+                    "expert-parallel destination shards; unsupported tensor shard "
+                    f"dimensions {unsupported_shards} for {param_info['name']!r}"
+                )
+
+            pp_stage = param_info.get("pp_stage", 0)
+            rank = self.pp_comm_groups[pp_stage].rank
+            local_slices = _local_shard_slices(param_info, rank)
+            local_shape = tuple(
+                global_size
+                if shard_slice.start is None
+                else shard_slice.stop - shard_slice.start
+                for global_size, shard_slice in zip(
+                    param_info["global_shape"], local_slices
+                )
+            )
+            expert_start = local_slices[0].start or 0
+            grouped_proj = param_info["grouped_expert_proj"]
+            expert_prefix = param_info["name"].rsplit(f".{grouped_proj}.weight", 1)[0]
+            dtype = _STR_TO_DTYPE[str(param_info["dtype"])]
+
+            def pre(_base: None) -> RefitCtx:
+                return RefitCtx(
+                    buf=torch.empty(local_shape, dtype=dtype, device=self.device)
+                )
+
+            def post(ctx: RefitCtx) -> None:
+                weights = [
+                    (
+                        f"{expert_prefix}.{expert_start + local_idx}."
+                        f"{grouped_proj}.weight",
+                        expert_weight,
+                    )
+                    for local_idx, expert_weight in enumerate(ctx.buf.unbind(0))
+                ]
+                self._load_full_hf_weights(weights)
+
+            return LocalParamSpec(base=None, pre=pre, post=post)
+
         # Get dict of vllm_param and merged_slice for each hf_name
         vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
+        param_info_by_name = {
+            param_info["name"]: param_info
+            for layer_name in refit_info["layer_names"]
+            for param_info in refit_info["per_layer_params"][layer_name]
+        }
+        use_trtllm_staging = self._uses_unquantized_flashinfer_trtllm()
         return HFToLocalParamMap(
             specs={
                 hf_name: (
-                    LocalParamSpec(base=vllm_param.data)
-                    if merged_slice is None
-                    else _merged_param_spec(vllm_param, merged_slice)
+                    _trtllm_grouped_expert_spec(param_info_by_name[hf_name])
+                    if use_trtllm_staging
+                    and param_info_by_name[hf_name].get("grouped_expert_proj")
+                    else (
+                        LocalParamSpec(base=vllm_param.data)
+                        if merged_slice is None
+                        else _merged_param_spec(vllm_param, merged_slice)
+                    )
                 )
                 for hf_name, (
                     vllm_param,
@@ -1145,6 +1244,11 @@ class VllmInternalWorkerExtension:
         return mapping
 
     def nccl_reshard_refit(self) -> bool:
+        """Receive and finalize one NCCL reshard weight update."""
+        with self._weight_update_lifecycle("nccl_reshard") as finalize:
+            return self._nccl_reshard_refit_impl(finalize)
+
+    def _nccl_reshard_refit_impl(self, finalize: WeightUpdateFinalizer) -> bool:
         """Receive weights from training workers via xferdtensor.
 
         Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``,
@@ -1219,26 +1323,18 @@ class VllmInternalWorkerExtension:
 
         import time
 
-        with self._weight_update_lifecycle("nccl_reshard") as finalize:
-            misc_t0 = time.perf_counter()
-            self._receive_and_load_misc_params()
-            torch.cuda.synchronize()
-            if torch.distributed.get_rank() == 0:
-                print(
-                    f"[nccl_reshard_refit] misc recv+load (gen side): "
-                    f"{time.perf_counter() - misc_t0:.2f}s",
-                    flush=True,
-                )
-            torch.cuda.empty_cache()
-
-            # Finalize post-load weight processing: dense Linear + attention/MLA,
-            # the per-MoE-backend w13 layout (FlashInfer CUTLASS/TRTLLM) that the
-            # canonical [gate; up] bulk write above defers to here, and the MTP
-            # drafter's mirror of the same. The FP8 KV-cache per-layer k/v scales
-            # are finalized by the lifecycle on exit.
-            finalize()
-
-            torch.cuda.empty_cache()
+        misc_t0 = time.perf_counter()
+        self._receive_and_load_misc_params()
+        torch.cuda.synchronize()
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[nccl_reshard_refit] misc recv+load (gen side): "
+                f"{time.perf_counter() - misc_t0:.2f}s",
+                flush=True,
+            )
+        torch.cuda.empty_cache()
+        finalize()
+        torch.cuda.empty_cache()
         return True
 
     def _receive_and_load_misc_params(self) -> None:
