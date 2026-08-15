@@ -4313,14 +4313,6 @@ def async_grpo_train(
         processor=processor,
     )
 
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    # Ensure collector knows initial weight version
-    trajectory_collector.set_weight_version.remote(weight_version)
-
-    print("📦 Started continuous background trajectory collection")
-
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, "
         f"max_age={max_trajectory_age_steps} steps, "
@@ -4355,6 +4347,19 @@ def async_grpo_train(
 
             traceback.print_exc()
             return
+
+    # Start trajectory collection only after generation holds real weights.
+    # The engines come up with load_format=dummy (weights arrive via the refit
+    # above); collecting before the refit can race weight loading and produce
+    # rollouts from randomly initialized weights.
+    collection_task = trajectory_collector.start_collection.remote(  # noqa: F841
+        dataloader
+    )
+
+    # Ensure collector knows initial weight version
+    trajectory_collector.set_weight_version.remote(weight_version)
+
+    print("📦 Started continuous background trajectory collection")
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
