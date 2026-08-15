@@ -24,9 +24,11 @@ skipped where vllm is unavailable.
 """
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
+from torch.distributed._tensor import Shard
 
 pytest.importorskip("vllm")  # module-top `import vllm` in vllm_backend
 
@@ -35,6 +37,7 @@ from nemo_rl.models.generation.vllm.vllm_backend import (  # noqa: E402
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import (  # noqa: E402
     HFToLocalParamMap,
+    MeshInfo,
 )
 
 pytestmark = pytest.mark.vllm
@@ -611,6 +614,61 @@ def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_scale_shape():
 
     with pytest.raises(ValueError, match="has shape"):
         ext.build_hf_to_local_param_map(refit_info)
+
+
+def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
+    """Packed TRTLLM storage receives canonical EP-local weights via load_weights."""
+    H, E, P = 16, 4, 32
+    expert_name = "model.layers.0.mlp.experts.gate_proj.weight"
+    refit_info = {
+        "gen_tp_size": 2,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [E, P, H],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "gate_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
+                    "dst_placements": [Shard(0)],
+                }
+            ]
+        },
+    }
+    packed_w13 = torch.full((128, 16, 24, 64), 7.0)
+    ext = _make_ext(
+        {
+            "model.layers.0.mlp.experts.routed_experts.w13_weight": packed_w13,
+        }
+    )
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._load_full_hf_weights = MagicMock()
+
+    spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
+    assert spec is not None and spec.pre is not None and spec.post is not None
+
+    ctx = spec.pre(spec.base)
+    assert ctx.buf.shape == (2, P, H)
+    assert ctx.buf.dtype == torch.bfloat16
+    ctx.buf[0].fill_(2.0)
+    ctx.buf[1].fill_(3.0)
+    spec.post(ctx)
+
+    loaded_weights = ext._load_full_hf_weights.call_args.args[0]
+    assert [name for name, _ in loaded_weights] == [
+        "model.layers.0.mlp.experts.2.gate_proj.weight",
+        "model.layers.0.mlp.experts.3.gate_proj.weight",
+    ]
+    torch.testing.assert_close(
+        loaded_weights[0][1], torch.full((P, H), 2.0, dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(
+        loaded_weights[1][1], torch.full((P, H), 3.0, dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(packed_w13, torch.full_like(packed_w13, 7.0))
 
 
 @pytest.mark.parametrize(
