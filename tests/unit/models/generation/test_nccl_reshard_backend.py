@@ -393,6 +393,83 @@ def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):
     assert torch.all(w2_scale == 7)
 
 
+def test_build_hf_to_local_param_map_uses_routed_expert_runtime_mxfp8_scale(
+    monkeypatch,
+):
+    hidden_size, num_experts, intermediate_size = 32, 2, 64
+    gate_name = "model.layers.0.mlp.experts.gate_proj.weight"
+    up_name = "model.layers.0.mlp.experts.up_proj.weight"
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": gate_name,
+                    "global_shape": [
+                        num_experts,
+                        intermediate_size,
+                        hidden_size,
+                    ],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "gate_proj",
+                },
+                {
+                    "name": up_name,
+                    "global_shape": [
+                        num_experts,
+                        intermediate_size,
+                        hidden_size,
+                    ],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "up_proj",
+                },
+            ]
+        },
+    }
+    weight = torch.empty(
+        num_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=torch.float8_e4m3fn,
+    )
+    runtime_scale = torch.empty(
+        num_experts,
+        2 * intermediate_size,
+        hidden_size // 32,
+        dtype=torch.uint8,
+    )
+    ext = _make_ext(
+        {
+            "model.layers.0.mlp.experts.routed_experts.w13_weight": weight,
+            "model.layers.0.mlp.experts.routed_experts.w13_weight_scale": runtime_scale,
+        }
+    )
+
+    def fake_quantize(value):
+        return (
+            torch.full_like(value, 3, dtype=torch.float8_e4m3fn),
+            torch.full(
+                (*value.shape[:-1], value.shape[-1] // 32),
+                7,
+                dtype=torch.uint8,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.quantization.fp8.quantize_mxfp8_weight",
+        fake_quantize,
+    )
+
+    spec = ext.build_hf_to_local_param_map(refit_info).get(gate_name)
+    assert spec is not None and spec.pre is not None and spec.post is not None
+    ctx = spec.pre(spec.base)
+    spec.post(ctx)
+
+    assert torch.all(weight[:, :intermediate_size, :].float() == 3)
+    assert torch.all(runtime_scale[:, :intermediate_size, :] == 7)
+
+
 def test_build_hf_to_local_param_map_quantizes_dense_gate_and_up_for_mxfp8(
     monkeypatch,
 ):

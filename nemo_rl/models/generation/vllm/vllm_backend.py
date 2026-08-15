@@ -890,12 +890,21 @@ class VllmInternalWorkerExtension:
                         f"build_hf_to_local_param_map: resolved vLLM target for "
                         f"{hf_name!r} is not a registered model parameter"
                     )
-                scale_name = vllm_name + "_scale_from_checkpoint"
-                scale_param = vllm_params.get(scale_name)
+                scale_names = (
+                    vllm_name + "_scale_from_checkpoint",
+                    vllm_name + "_scale",
+                )
+                scale_name = next(
+                    (name for name in scale_names if name in vllm_params), None
+                )
+                scale_param = (
+                    vllm_params.get(scale_name) if scale_name is not None else None
+                )
                 if scale_param is None:
                     raise ValueError(
                         f"build_hf_to_local_param_map: MXFP8 target {vllm_name!r} "
-                        f"for {hf_name!r} has no scale parameter {scale_name!r}"
+                        f"for {hf_name!r} has no scale parameter among "
+                        f"{scale_names!r}"
                     )
                 value_region = (
                     vllm_param if merged_slice is None else vllm_param[merged_slice]
