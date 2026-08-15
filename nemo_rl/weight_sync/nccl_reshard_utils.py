@@ -91,10 +91,9 @@ class LocalParamSpec:
         post: ``RefitCtx -> None``; runs after xferdtensor
             e.g., copy back the received buffer into the merged param.
 
-    TODO: A layout that block-permutes the *assembled* param (e.g. FlashInfer
-    TRTLLM w13) would need a group-level finalize run once after all components
-    land — a future loop-level addition, not a per-param field. ``pre``/``post``
-    covers today's backends (Triton, FlashInfer CUTLASS, Megatron).
+    Layout-specific backends can receive into canonical storage in ``pre``, load
+    each logical component in ``post``, and use a transport-level finalizer after
+    all components land. FlashInfer TRTLLM uses this path for grouped experts.
     """
 
     base: Any
