@@ -22,7 +22,7 @@ policy:
   max_total_sequence_length: 2048
   disable_modelopt_layer_spec: true
 
-  quant_cfg: "NVFP4_MLP_WEIGHT_ONLY_CFG"
+  quant_cfg: "W4A16_NVFP4_CFG"
   quant_calib_data: "cnn_dailymail"
   quant_calib_size: 128
   quant_batch_size: 1
