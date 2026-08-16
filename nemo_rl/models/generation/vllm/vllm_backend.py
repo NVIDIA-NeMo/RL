@@ -15,6 +15,7 @@ import gc
 import logging
 import re
 import socket
+import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, Literal
@@ -43,6 +44,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 logger = logging.getLogger(__name__)
+_BF16_TRTLLM_LAYOUT_PATCH_LOCK = threading.RLock()
 
 try:
     import vllm  # noqa: F401
@@ -205,18 +207,19 @@ def _use_batched_bf16_trtllm_layout_conversion() -> Iterator[None]:
     """Use the batched converter only while vLLM rebuilds TRTLLM MoE state."""
     from vllm.model_executor.layers.fused_moe.oracle import unquantized
 
-    original_converter = (
-        unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
-    )
-    unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout = (
-        _convert_bf16_moe_weights_to_trtllm_block_layout_batched
-    )
-    try:
-        yield
-    finally:
-        unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout = (
-            original_converter
+    with _BF16_TRTLLM_LAYOUT_PATCH_LOCK:
+        original_converter = (
+            unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
         )
+        unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout = (
+            _convert_bf16_moe_weights_to_trtllm_block_layout_batched
+        )
+        try:
+            yield
+        finally:
+            unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout = (
+                original_converter
+            )
 
 
 def _local_shard_slices(param_info: dict[str, Any], rank: int) -> tuple[slice, ...]:
@@ -900,20 +903,20 @@ class VllmInternalWorkerExtension:
             )
 
             def finalize() -> None:
-                with _use_batched_bf16_trtllm_layout_conversion():
-                    with torch.device(self.device):
-                        finalize_layerwise_reload(model, self.model_config)
-                        _process_hpc_modules_after_loading(model)
-                        self._maybe_process_mtp_drafter_after_loading()
+                with torch.device(self.device):
+                    finalize_layerwise_reload(model, self.model_config)
+                    _process_hpc_modules_after_loading(model)
+                    self._maybe_process_mtp_drafter_after_loading()
                 torch.accelerator.synchronize()
 
             try:
                 with set_current_vllm_config(self.model_runner.vllm_config):
-                    with torch.device(self.device):
-                        for reload_target in reload_targets:
-                            initialize_layerwise_reload(reload_target)
-                    self._nrl_layerwise_reload_active = True
-                    yield finalize
+                    with _use_batched_bf16_trtllm_layout_conversion():
+                        with torch.device(self.device):
+                            for reload_target in reload_targets:
+                                initialize_layerwise_reload(reload_target)
+                        self._nrl_layerwise_reload_active = True
+                        yield finalize
             except Exception as error:
                 self._nrl_layerwise_reload_failure = error
                 raise
