@@ -18,6 +18,7 @@ import socket
 import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Literal
 
 import torch
@@ -45,6 +46,9 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 
 logger = logging.getLogger(__name__)
 _BF16_TRTLLM_LAYOUT_PATCH_LOCK = threading.RLock()
+_BF16_TRTLLM_LAYOUT_PATCH_ACTIVE: ContextVar[bool] = ContextVar(
+    "bf16_trtllm_layout_patch_active", default=False
+)
 
 try:
     import vllm  # noqa: F401
@@ -211,12 +215,31 @@ def _use_batched_bf16_trtllm_layout_conversion() -> Iterator[None]:
         original_converter = (
             unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
         )
-        unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout = (
-            _convert_bf16_moe_weights_to_trtllm_block_layout_batched
-        )
+
+        def _dispatch(
+            cache_permute_indices: dict[torch.Size, torch.Tensor],
+            w13_weight: torch.Tensor,
+            w2_weight: torch.Tensor,
+            is_gated_act_gemm: bool = True,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            converter = (
+                _convert_bf16_moe_weights_to_trtllm_block_layout_batched
+                if _BF16_TRTLLM_LAYOUT_PATCH_ACTIVE.get()
+                else original_converter
+            )
+            return converter(
+                cache_permute_indices,
+                w13_weight,
+                w2_weight,
+                is_gated_act_gemm=is_gated_act_gemm,
+            )
+
+        active_token = _BF16_TRTLLM_LAYOUT_PATCH_ACTIVE.set(True)
+        unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout = _dispatch
         try:
             yield
         finally:
+            _BF16_TRTLLM_LAYOUT_PATCH_ACTIVE.reset(active_token)
             unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout = (
                 original_converter
             )
