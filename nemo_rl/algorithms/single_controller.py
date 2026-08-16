@@ -45,7 +45,11 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
-from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
+from nemo_rl.algorithms.grpo import (
+    GRPOSaveState,
+    _write_latest_checkpoint_status,
+    compute_and_apply_seq_logprob_error_masking,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
@@ -267,6 +271,7 @@ class SingleControllerActor:
             "rewards": [],
             "masked_advantages": [],
             "sequence_lengths": [],
+            "seq_logprob_error_metrics": [],
         }
 
         # NeMo-Gym rollout phase times pooled over the groups committed so far.
@@ -1277,6 +1282,48 @@ class SingleControllerActor:
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
+
+        seq_logprob_error_threshold = (
+            self._master_config.grpo.seq_logprob_error_threshold
+        )
+        if seq_logprob_error_threshold is not None:
+            masking_data = BatchedDataDict(
+                {
+                    "token_mask": token_mask,
+                    "sample_mask": sample_mask,
+                    "prev_logprobs": tensor_field(
+                        data,
+                        adv_cfg.policy_logprobs_field,
+                    ),
+                    "generation_logprobs": tensor_field(
+                        data,
+                        adv_cfg.generation_logprobs_field,
+                    ),
+                }
+            )
+            num_valid_seqs_before = float(
+                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                .sum()
+                .item()
+            )
+            seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
+                train_data=masking_data,
+                rewards=rewards,
+                seq_logprob_error_threshold=seq_logprob_error_threshold,
+            )
+            sample_mask = masking_data["sample_mask"]
+            num_valid_seqs_after = float(
+                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                .sum()
+                .item()
+            )
+            seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
+                seq_error_metrics.pop("num_masked_seqs")
+            )
+            seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
+            seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
+            self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
+
         mask = token_mask * sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
@@ -1312,14 +1359,15 @@ class SingleControllerActor:
             response_advantages.detach().cpu()
         )
 
+        fields_to_put = {adv_cfg.output_field: advantages}
+        if seq_logprob_error_threshold is not None:
+            fields_to_put[adv_cfg.sample_mask_field] = sample_mask
+
         await self._call_dp(
             "put_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
-            fields=fields_for_put(
-                meta,
-                {adv_cfg.output_field: advantages},
-            ),
+            fields=fields_for_put(meta, fields_to_put),
         )
         return meta.with_fields([adv_cfg.output_field])
 
@@ -1336,6 +1384,8 @@ class SingleControllerActor:
         ]
         if self._policy_logprobs_required:
             fields.append(adv_cfg.policy_logprobs_field)
+        if self._master_config.grpo.seq_logprob_error_threshold is not None:
+            fields.append(adv_cfg.generation_logprobs_field)
         if self._reference_logprobs_required:
             fields.append(adv_cfg.reference_logprobs_field)
         return list(dict.fromkeys(fields))

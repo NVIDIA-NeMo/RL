@@ -94,6 +94,7 @@ def reduce_advantage_pump_metrics(
     rewards: list[torch.Tensor],
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
+    seq_logprob_error_metrics: list[dict[str, float]] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -101,6 +102,8 @@ def reduce_advantage_pump_metrics(
         rewards: One tensor per advantage_stage call; each row a sample reward.
         masked_advantages: Token-masked advantages, one tensor per call.
         sequence_lengths: All input_lengths trained on this step.
+        seq_logprob_error_metrics: Sequence-error metrics and their aggregation
+            counts, one record per streaming chunk.
 
     Returns:
         Dict with reward, advantages/{mean,max,min}, total_num_tokens.
@@ -120,6 +123,83 @@ def reduce_advantage_pump_metrics(
             out["advantages/min"] = 0.0
     if sequence_lengths:
         out["total_num_tokens"] = float(sum(sequence_lengths))
+    if seq_logprob_error_metrics:
+        before_count = sum(
+            record["_num_valid_seqs_before"] for record in seq_logprob_error_metrics
+        )
+        after_count = sum(
+            record["_num_valid_seqs_after"] for record in seq_logprob_error_metrics
+        )
+        masked_count = sum(
+            record["num_masked_seqs_by_logprob_error"]
+            for record in seq_logprob_error_metrics
+        )
+
+        before_records = [
+            record
+            for record in seq_logprob_error_metrics
+            if record["_num_valid_seqs_before"] > 0
+        ]
+        after_records = [
+            record
+            for record in seq_logprob_error_metrics
+            if record["_num_valid_seqs_after"] > 0
+        ]
+
+        out["max_seq_mult_prob_error"] = (
+            max(record["max_seq_mult_prob_error"] for record in before_records)
+            if before_records
+            else 0.0
+        )
+        out["mean_seq_mult_prob_error"] = (
+            sum(
+                record["mean_seq_mult_prob_error"] * record["_num_valid_seqs_before"]
+                for record in before_records
+            )
+            / before_count
+            if before_count
+            else 0.0
+        )
+        out["min_seq_mult_prob_error"] = (
+            min(record["min_seq_mult_prob_error"] for record in before_records)
+            if before_records
+            else 0.0
+        )
+        out["max_seq_mult_prob_error_after_mask"] = (
+            max(
+                record["max_seq_mult_prob_error_after_mask"] for record in after_records
+            )
+            if after_records
+            else 0.0
+        )
+        out["mean_seq_mult_prob_error_after_mask"] = (
+            sum(
+                record["mean_seq_mult_prob_error_after_mask"]
+                * record["_num_valid_seqs_after"]
+                for record in after_records
+            )
+            / after_count
+            if after_count
+            else 0.0
+        )
+        out["min_seq_mult_prob_error_after_mask"] = (
+            min(
+                record["min_seq_mult_prob_error_after_mask"] for record in after_records
+            )
+            if after_records
+            else 0.0
+        )
+        out["num_masked_seqs_by_logprob_error"] = int(masked_count)
+        out["masked_correct_pct"] = (
+            sum(
+                record["masked_correct_pct"]
+                * record["num_masked_seqs_by_logprob_error"]
+                for record in seq_logprob_error_metrics
+            )
+            / masked_count
+            if masked_count
+            else 0.0
+        )
     return out
 
 

@@ -15,12 +15,14 @@
 """Tests for SingleController initialization and pump lifecycle."""
 
 import asyncio
+import math
 from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
@@ -208,6 +210,101 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(
         kv_scales={"layer.0": 0.5}
     )
+
+
+class _AdvantageDataPlane:
+    def __init__(self, data: TensorDict) -> None:
+        self._data = data
+        self.selected_fields: list[str] | None = None
+        self.written_fields: TensorDict | None = None
+
+    def get_samples(self, *, select_fields, **kwargs):
+        del kwargs
+        self.selected_fields = list(select_fields)
+        return self._data
+
+    def put_samples(self, *, fields, **kwargs) -> None:
+        del kwargs
+        self.written_fields = fields
+
+
+class _MaskRecordingAdvantageEstimator:
+    def __init__(self) -> None:
+        self.mask: torch.Tensor | None = None
+
+    def compute_advantage(self, *, rewards, mask, **kwargs) -> torch.Tensor:
+        del kwargs
+        self.mask = mask.clone()
+        return rewards.unsqueeze(-1).expand_as(mask).clone()
+
+
+def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    batch_size, sequence_length = 4, 5
+    generation_logprobs = torch.zeros(batch_size, sequence_length)
+    # exp(abs(1 - 0)) > the configured threshold of 2, so only row 2
+    # should be removed from the loss while the other rows remain trainable.
+    generation_logprobs[2, 1:] = 1.0
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([0.0, 0.0, 1.0, 0.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "prev_logprobs": torch.zeros(batch_size, sequence_length),
+            "generation_logprobs": generation_logprobs,
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+    )
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+    )
+
+    result_meta = asyncio.run(ctrl._advantage_stage(meta))
+    capsys.readouterr()
+
+    assert data_plane.selected_fields is not None
+    assert "prev_logprobs" in data_plane.selected_fields
+    assert "generation_logprobs" in data_plane.selected_fields
+    assert data_plane.written_fields is not None
+    assert torch.equal(
+        data_plane.written_fields["sample_mask"],
+        torch.tensor([1.0, 1.0, 0.0, 1.0]),
+    )
+    assert estimator.mask is not None
+    assert estimator.mask[2].count_nonzero() == 0
+    assert estimator.mask[[0, 1, 3]].all()
+    metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
+    assert len(metrics) == 1
+    assert metrics[0]["num_masked_seqs_by_logprob_error"] == 1
+    assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
+    assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
+    assert "advantages" in (result_meta.fields or [])
 
 
 class _EmptySampler:

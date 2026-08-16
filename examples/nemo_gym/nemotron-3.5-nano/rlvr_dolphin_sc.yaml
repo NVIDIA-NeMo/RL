@@ -35,6 +35,11 @@ checkpointing:
   enabled: false
 
 grpo:
+  # Explicitly retain the V1 sequence-level protection on the SC path. This
+  # value is also inherited from student_rlvr1.yaml; spelling it out here makes
+  # the V2 masking contract visible in the config selected by this launcher.
+  seq_logprob_error_threshold: 2.0
+
   # setup_single_controller rejects val_period > 0 outright, so the baseline's
   # "effectively disabled" 10000000 is not enough — validation has to be off.
   # val_start_at: -1, val_at_start: false and val_at_end: false are inherited
