@@ -249,12 +249,12 @@ def test_batched_bf16_trtllm_layout_matches_expertwise_permutation(monkeypatch):
     w13_rows = 4
     w2_rows = 3
     cols = 64
-    w13 = torch.arange(
-        num_experts * w13_rows * cols, dtype=torch.bfloat16
-    ).view(num_experts, w13_rows, cols)
-    w2 = torch.arange(
-        num_experts * w2_rows * cols, dtype=torch.bfloat16
-    ).view(num_experts, w2_rows, cols)
+    w13 = torch.arange(num_experts * w13_rows * cols, dtype=torch.bfloat16).view(
+        num_experts, w13_rows, cols
+    )
+    w2 = torch.arange(num_experts * w2_rows * cols, dtype=torch.bfloat16).view(
+        num_experts, w2_rows, cols
+    )
     w13_perm = torch.tensor([2, 0, 3, 1])
     w2_perm = torch.tensor([1, 2, 0])
     calls = []
@@ -306,6 +306,57 @@ def test_batched_bf16_trtllm_layout_matches_expertwise_permutation(monkeypatch):
         ("w13", (w13_rows, 128), 128, True),
         ("w2", (w2_rows, 128), 128),
     ]
+
+
+@pytest.mark.vllm
+def test_batched_bf16_trtllm_layout_is_scoped_to_reload_finalize(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from vllm.model_executor.layers.fused_moe.oracle import unquantized
+
+    original_converter = MagicMock()
+    monkeypatch.setattr(
+        unquantized,
+        "convert_moe_weights_to_flashinfer_trtllm_block_layout",
+        original_converter,
+    )
+
+    model = _make_unquantized_moe_model("FlashInfer TRTLLM")
+    vllm_config = SimpleNamespace(quant_config=None)
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = object()
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda _: None,
+    )
+
+    def finalize_layerwise_reload(_model, _model_config):
+        assert (
+            unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
+            is vllm_backend._convert_bf16_moe_weights_to_trtllm_block_layout_batched
+        )
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
+        finalize_layerwise_reload,
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        finalize()
+
+    assert (
+        unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
+        is original_converter
+    )
 
 
 class _DeferredReloadLayer(torch.nn.Module):
