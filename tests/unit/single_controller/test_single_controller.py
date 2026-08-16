@@ -15,11 +15,13 @@
 """Tests for SingleController initialization and pump lifecycle."""
 
 import asyncio
+import math
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
+from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
@@ -285,6 +287,274 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     )
 
 
+class _AdvantageDataPlane:
+    def __init__(self, data: TensorDict) -> None:
+        self._data = data
+        self.selected_fields: list[str] | None = None
+        self.written_fields: TensorDict | None = None
+
+    def get_samples(self, *, select_fields, **kwargs):
+        del kwargs
+        self.selected_fields = list(select_fields)
+        return self._data
+
+    def put_samples(self, *, fields, **kwargs) -> None:
+        del kwargs
+        self.written_fields = fields
+
+
+class _MaskRecordingAdvantageEstimator:
+    def __init__(self) -> None:
+        self.mask: torch.Tensor | None = None
+
+    def compute_advantage(self, *, rewards, mask, **kwargs) -> torch.Tensor:
+        del kwargs
+        self.mask = mask.clone()
+        return rewards.unsqueeze(-1).expand_as(mask).clone()
+
+
+def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    batch_size, sequence_length = 4, 5
+    generation_logprobs = torch.zeros(batch_size, sequence_length)
+    # exp(abs(1 - 0)) > the configured threshold of 2, so only row 2
+    # should be removed from the loss while the other rows remain trainable.
+    generation_logprobs[2, 1:] = 1.0
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([0.0, 0.0, 1.0, 0.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "prev_logprobs": torch.zeros(batch_size, sequence_length),
+            "generation_logprobs": generation_logprobs,
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+    )
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+    )
+
+    result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+    capsys.readouterr()
+
+    assert has_valid_training_tokens
+    assert data_plane.selected_fields is not None
+    assert "prev_logprobs" in data_plane.selected_fields
+    assert "generation_logprobs" in data_plane.selected_fields
+    assert data_plane.written_fields is not None
+    assert torch.equal(
+        data_plane.written_fields["sample_mask"],
+        torch.tensor([1.0, 1.0, 0.0, 1.0]),
+    )
+    assert estimator.mask is not None
+    assert estimator.mask[2].count_nonzero() == 0
+    assert estimator.mask[[0, 1, 3]].all()
+    metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
+    assert len(metrics) == 1
+    assert metrics[0]["num_masked_seqs_by_logprob_error"] == 1
+    assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
+    assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
+    assert "advantages" in (result_meta.fields or [])
+
+
+def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
+    batch_size, sequence_length = 2, 5
+    generation_logprobs = torch.zeros(batch_size, sequence_length)
+    generation_logprobs[1, 1:] = 1.0
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([0.0, 1.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "prev_logprobs": torch.zeros(batch_size, sequence_length),
+            "generation_logprobs": generation_logprobs,
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+    )
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+    )
+
+    _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert has_valid_training_tokens
+    assert data_plane.selected_fields is not None
+    assert "prev_logprobs" in data_plane.selected_fields
+    assert "generation_logprobs" in data_plane.selected_fields
+    assert data_plane.written_fields is not None
+    assert "sample_mask" not in data_plane.written_fields
+    assert estimator.mask is not None
+    assert estimator.mask.all()
+    metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
+    assert len(metrics) == 1
+    assert metrics[0]["num_masked_seqs_by_logprob_error"] == 0
+    assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
+    assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(math.e)
+
+
+def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    batch_size, sequence_length = 2, 5
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([1.0, 0.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "prev_logprobs": torch.zeros(batch_size, sequence_length),
+            "generation_logprobs": torch.ones(batch_size, sequence_length),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = MagicMock()
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
+    )
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+    )
+
+    result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+    capsys.readouterr()
+
+    assert not has_valid_training_tokens
+    estimator.compute_advantage.assert_not_called()
+    assert data_plane.written_fields is not None
+    assert not data_plane.written_fields["sample_mask"].bool().any()
+    assert torch.equal(
+        data_plane.written_fields["advantages"],
+        torch.zeros(batch_size, sequence_length),
+    )
+    assert "advantages" in (result_meta.fields or [])
+
+
+def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() -> None:
+    batch_size, sequence_length = 2, 5
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([1.0, 0.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.zeros(batch_size),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = MagicMock()
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(seq_logprob_error_threshold=None)
+    )
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+    )
+
+    result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert not has_valid_training_tokens
+    estimator.compute_advantage.assert_not_called()
+    assert data_plane.selected_fields is not None
+    assert "prev_logprobs" not in data_plane.selected_fields
+    assert "generation_logprobs" not in data_plane.selected_fields
+    assert data_plane.written_fields is not None
+    assert "sample_mask" not in data_plane.written_fields
+    assert torch.equal(
+        data_plane.written_fields["advantages"],
+        torch.zeros(batch_size, sequence_length),
+    )
+    assert "advantages" in (result_meta.fields or [])
+
+
 class _EmptySampler:
     async def evict(self, *, current_train_weight: int) -> int:
         del current_train_weight
@@ -336,6 +606,17 @@ class _ChunkedSampler(_EmptySampler):
             return None, 0
         self._remaining -= 1
         return self._meta, 1
+
+
+class _SequenceSampler(_EmptySampler):
+    def __init__(self, metas: list[KVBatchMeta]) -> None:
+        self._metas = list(metas)
+
+    async def select(self, **kwargs):
+        del kwargs
+        if not self._metas:
+            return None, 0
+        return self._metas.pop(0), 1
 
 
 class _EmptyBuffer:
@@ -577,6 +858,75 @@ def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert ctrl._batch_shortfall == {5: 1}
+
+
+def test_train_pump_rejects_step_with_no_valid_training_chunks() -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    ctrl = _train_pump_controller(sampler=_OneThenEmptySampler(meta))
+    ctrl._master_config.grpo.num_prompts_per_step = 1
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, False))
+    trainer = MagicMock(spec=_NoOpTrainer)
+    ctrl._trainer = trainer
+
+    with pytest.raises(
+        RuntimeError,
+        match="no valid response tokens after filtering",
+    ):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    trainer.prepare_for_training.assert_called_once_with()
+    trainer.begin_train_step.assert_not_called()
+    trainer.train_microbatches_from_meta.assert_not_called()
+    trainer.finish_train_step.assert_not_called()
+
+
+def test_train_pump_skips_empty_chunk_and_trains_later_valid_chunk(
+    monkeypatch,
+) -> None:
+    empty_meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["empty-sample"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    valid_meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["valid-sample"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    ctrl = _train_pump_controller(sampler=_SequenceSampler([empty_meta, valid_meta]))
+    ctrl._advantage_stage = AsyncMock(
+        side_effect=[
+            (empty_meta, False),
+            (valid_meta, True),
+        ]
+    )
+    trainer = MagicMock(spec=_NoOpTrainer)
+    trainer.finish_train_step.return_value = {}
+    ctrl._trainer = trainer
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert trainer.prepare_for_training.call_count == 2
+    trainer.begin_train_step.assert_called_once_with(None)
+    trainer.train_microbatches_from_meta.assert_called_once_with(valid_meta)
+    trainer.finish_train_step.assert_called_once_with()
+    assert ctrl._train_steps == 1
 
 
 def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
