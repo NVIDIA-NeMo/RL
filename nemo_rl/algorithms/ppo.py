@@ -2244,9 +2244,6 @@ def async_ppo_train(
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
         if os.path.exists(replay_buffer_path):
             print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
-            # weights_only=False: trajectories are pickled BatchedDataDict/dicts,
-            # not plain tensors. The checkpoint is a trusted same-job artifact.
-            replay_buffer_state = torch.load(replay_buffer_path, weights_only=False)
             restore_max_age = _async_ppo_buffer_max_age(
                 step=step,
                 policy_training_start_step=policy_training_start_step,
@@ -2254,8 +2251,8 @@ def async_ppo_train(
                 warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
             )
             ray.get(
-                replay_buffer.load_state_dict.remote(
-                    replay_buffer_state,
+                replay_buffer.load_from_path.remote(
+                    replay_buffer_path,
                     num_prompts_per_step=num_prompts_per_step,
                     current_training_step=step,
                     max_age_steps=restore_max_age,
@@ -2904,10 +2901,14 @@ def async_ppo_train(
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
                         print("📦 Saving replay buffer state...")
-                        replay_buffer_state = ray.get(replay_buffer.state_dict.remote())
-                        torch.save(
-                            replay_buffer_state,
-                            os.path.join(checkpoint_path, "replay_buffer.pt"),
+                        num_buffered_trajectories = ray.get(
+                            replay_buffer.save_to_path.remote(
+                                os.path.join(checkpoint_path, "replay_buffer.pt")
+                            )
+                        )
+                        print(
+                            "✅ Saved replay buffer with "
+                            f"{num_buffered_trajectories} trajectories"
                         )
                         checkpointer.begin_finalization(
                             checkpoint_path,

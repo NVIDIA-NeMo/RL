@@ -743,6 +743,7 @@ def _run_mock_ppo_train(
     monkeypatch,
     *,
     async_mode: bool = False,
+    checkpoint_path: str | None = None,
     max_num_steps: int,
     ppo_epochs: int,
     seq_logprob_error_threshold: float | None,
@@ -942,7 +943,7 @@ def _run_mock_ppo_train(
         },
         loss_fn=_make_loss_config(),
         checkpointing={
-            "enabled": False,
+            "enabled": checkpoint_path is not None,
             "checkpoint_must_save_by": None,
             "save_period": 100,
             "metric_name": None,
@@ -953,11 +954,13 @@ def _run_mock_ppo_train(
     logger = MagicMock()
     checkpointer = MagicMock()
     checkpointer.save_optimizer = False
-    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.get_latest_checkpoint_path.return_value = checkpoint_path
+    checkpointer.init_tmp_checkpoint.return_value = checkpoint_path
     dataloader = DummyLoader(
         [_make_ppo_loop_batch(truncated_samples) for _ in range(max_num_steps)]
     )
     tokenizer = SimpleNamespace(pad_token_id=0)
+    replay_actor = None
 
     if async_mode:
         from nemo_rl.algorithms import async_utils
@@ -978,6 +981,7 @@ def _run_mock_ppo_train(
             "avg_trajectory_age": 0.0,
         }
         replay_actor.size.remote.return_value = 2
+        replay_actor.save_to_path.remote.return_value = 2
 
         collector_actor = MagicMock()
         collector_actor.check_health.remote.return_value = None
@@ -988,6 +992,7 @@ def _run_mock_ppo_train(
             "data_exhausted": False,
         }
         collector_actor.get_efficiency_metrics.remote.return_value = {}
+        collector_actor.get_dataloader_state.remote.return_value = {}
 
         replay_type = MagicMock()
         replay_type.options.return_value.remote.return_value = replay_actor
@@ -1041,6 +1046,7 @@ def _run_mock_ppo_train(
         checkpointer=checkpointer,
         advantage_estimator=advantage_estimator,
         refit=refit,
+        replay_actor=replay_actor,
         events=events,
     )
 
@@ -1109,6 +1115,34 @@ def test_ppo_train_critic_warmup_reuses_generation_until_policy_update(
             "generation_prepare",
             "rollout",
         ]
+
+
+def test_async_ppo_checkpoints_replay_buffer_inside_actor(monkeypatch, tmp_path):
+    checkpoint_path = tmp_path / "step_0"
+    checkpoint_path.mkdir()
+    replay_buffer_path = checkpoint_path / "replay_buffer.pt"
+    replay_buffer_path.touch()
+
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        async_mode=True,
+        checkpoint_path=str(checkpoint_path),
+        max_num_steps=1,
+        ppo_epochs=1,
+        seq_logprob_error_threshold=None,
+    )
+
+    harness.replay_actor.load_from_path.remote.assert_called_once_with(
+        str(replay_buffer_path),
+        num_prompts_per_step=2,
+        current_training_step=0,
+        max_age_steps=1,
+    )
+    harness.replay_actor.load_state_dict.remote.assert_not_called()
+    harness.replay_actor.save_to_path.remote.assert_called_once_with(
+        str(replay_buffer_path)
+    )
+    harness.replay_actor.state_dict.remote.assert_not_called()
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
