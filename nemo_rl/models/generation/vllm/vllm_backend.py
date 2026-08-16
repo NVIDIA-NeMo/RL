@@ -173,6 +173,94 @@ def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
     return bool(_unquantized_flashinfer_trtllm_modules(model))
 
 
+def _convert_bf16_moe_weights_to_trtllm_block_layout_batched(
+    cache_permute_indices: dict[torch.Size, torch.Tensor],
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    is_gated_act_gemm: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert all BF16 experts to TRTLLM block layout in two gathers."""
+    if w13_weight.dtype != torch.bfloat16 or w2_weight.dtype != torch.bfloat16:
+        raise ValueError(
+            "Unquantized MoE backend FlashInfer TRTLLM requires bfloat16 weights"
+        )
+    if w13_weight.ndim != 3 or w2_weight.ndim != 3:
+        raise ValueError(
+            "TRTLLM BF16 MoE weights must have shape [experts, rows, cols]"
+        )
+    if w13_weight.shape[0] != w2_weight.shape[0]:
+        raise ValueError("W13 and W2 must contain the same number of experts")
+
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+    epilogue_tile_m = 128
+    block_k = 128
+    w13_expert_uint8 = w13_weight[0].view(torch.uint8)
+    w2_expert_uint8 = w2_weight[0].view(torch.uint8)
+    w13_permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+        cache_permute_indices,
+        w13_expert_uint8,
+        epilogue_tile_m,
+        is_gated_act_gemm=is_gated_act_gemm,
+    )
+    if is_gated_act_gemm:
+        rows = w13_expert_uint8.shape[0]
+        w13_permute_indices = (w13_permute_indices + rows // 2) % rows
+    w2_permute_indices = get_w2_permute_indices_with_cache(
+        cache_permute_indices,
+        w2_expert_uint8,
+        epilogue_tile_m,
+    )
+
+    def _convert(weight: torch.Tensor, source_indices: torch.Tensor) -> torch.Tensor:
+        weight_uint8 = weight.view(torch.uint8)
+        num_experts, rows, byte_cols = weight_uint8.shape
+        if byte_cols % block_k != 0:
+            raise ValueError(
+                f"TRTLLM BF16 MoE byte columns must be divisible by {block_k}; "
+                f"got {byte_cols}"
+            )
+        expert_blocks = weight_uint8.view(
+            num_experts, rows, byte_cols // block_k, block_k
+        ).permute(0, 2, 1, 3)
+        return (
+            torch.index_select(
+                expert_blocks,
+                2,
+                source_indices.to(weight.device),
+            )
+            .contiguous()
+            .view(torch.bfloat16)
+        )
+
+    return (
+        _convert(w13_weight, w13_permute_indices),
+        _convert(w2_weight, w2_permute_indices),
+    )
+
+
+@contextmanager
+def _use_batched_bf16_trtllm_layout_conversion() -> Iterator[None]:
+    """Use the batched converter only while vLLM rebuilds TRTLLM MoE state."""
+    from vllm.model_executor.layers.fused_moe.oracle import unquantized
+
+    original_converter = (
+        unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
+    )
+    unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout = (
+        _convert_bf16_moe_weights_to_trtllm_block_layout_batched
+    )
+    try:
+        yield
+    finally:
+        unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout = (
+            original_converter
+        )
+
+
 def _local_shard_slices(param_info: dict[str, Any], rank: int) -> tuple[slice, ...]:
     """Return this destination rank's slices in an HF-global tensor."""
     from nemo_rl.weight_sync.xferdtensor_python import _compute_shard_slices
@@ -1033,13 +1121,14 @@ class VllmInternalWorkerExtension:
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
 
             def finalize() -> None:
-                with torch.device(self.device):
-                    finalize_layerwise_reload(model, self.model_config)
-                    _process_mxfp8_modules_after_native_reload(
-                        model, reloaded_module_ids
-                    )
-                    _refresh_hpc_modules_after_layerwise_reload(model)
-                    self._maybe_process_mtp_drafter_after_loading()
+                with _use_batched_bf16_trtllm_layout_conversion():
+                    with torch.device(self.device):
+                        finalize_layerwise_reload(model, self.model_config)
+                        _process_mxfp8_modules_after_native_reload(
+                            model, reloaded_module_ids
+                        )
+                        _refresh_hpc_modules_after_layerwise_reload(model)
+                        self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
 
             try:
