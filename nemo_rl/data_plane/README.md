@@ -409,28 +409,38 @@ global_forward_pad_seqlen = round_up(1320, 64) = 1344
 ## Configuration
 
 The data plane is configured via a `data_plane:` block in the master
-YAML (`examples/configs/...`). **YAML is the single source of truth
-for defaults** — the adapter has no hidden `cfg.get(key, default)`
-fallbacks. The canonical exemplar is
+YAML (`examples/configs/...`). The canonical exemplar is
 `examples/configs/grpo_math_1B.yaml`.
 
-All eight keys below are **required** when `enabled=true`. Recipes
-under `examples/configs/recipes/**/*.yaml` inherit them via
-`defaults:` from the exemplar.
+`enabled`, `impl`, `backend` and `claim_meta_poll_interval_s` are
+**required** when `enabled=true`. Backend sizing lives in a block named
+for the backend that reads it; only the block named by `backend` is
+consulted, and an absent block means that backend's defaults, which are
+declared on `SimpleStorageConfig` / `MooncakeCpuConfig` in
+`nemo_rl/data_plane/interfaces.py`. Recipes under
+`examples/configs/recipes/**/*.yaml` inherit all of it via `defaults:`.
 
 ```yaml
 data_plane:
   enabled: false                       # flip to true to engage grpo_train_sync
   impl: transfer_queue                 # only one impl today
   backend: "simple"                    # "simple" or "mooncake_cpu"
-  storage_capacity: 1000000            # max samples retained per partition
-  num_storage_units: 2                 # storage shards
   claim_meta_poll_interval_s: 0.5      # blocking-claim poll cadence
-  global_segment_size: 68719476736     # 64 GiB/process — used when backend == "mooncake_cpu"
-  local_buffer_size:    4294967296     # 4 GiB/process  — used when backend == "mooncake_cpu"
+  simple:
+    storage_capacity: 1000000          # max samples retained per partition
+    num_storage_units: 2               # storage shards
+  mooncake_cpu:
+    global_segment_size: 68719476736   # 64 GiB/process
+    local_buffer_size:    4294967296   # 4 GiB/process
+    reuse_registered_buffers: true     # reuse RDMA-registered buffers
   # observability:                     # NotRequired
   #   enabled: false
 ```
+
+These keys used to sit directly under `data_plane:`. That spelling is
+rejected with a migration message rather than silently accepted — an
+inherited config supplies the nested block, so a surviving flat key
+would always lose the merge without warning.
 
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
