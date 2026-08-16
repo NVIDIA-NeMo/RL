@@ -122,3 +122,53 @@ def test_raises_when_no_device_since_mooncake_is_rdma_only(fake_fabric):
     fake_fabric(_MIXED, uverbs=False)
     with pytest.raises(RuntimeError, match="requires RDMA"):
         tq_adapter._mooncake_transport_config()
+
+
+# ── Peer-rail pairing ────────────────────────────────────────────────────────
+#
+# Mooncake picks the peer rail at random unless told otherwise. Where each rail
+# is its own subnet (the RoCE-only gb200 CI runners) a cross-rail pair has no
+# route, which was 100% of the failures observed there.
+
+
+def _mooncake_cfg() -> dict:
+    return {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "mooncake_cpu",
+        "claim_meta_poll_interval_s": 0.5,
+    }
+
+
+@pytest.fixture
+def stub_client(monkeypatch):
+    """Build a TQDataPlaneClient without touching TQ, mooncake, or the network."""
+
+    def _build(cfg: dict):
+        monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
+        monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
+        monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
+        monkeypatch.setattr(tq_adapter, "_patch_mooncake_staging_buffers", lambda: None)
+        monkeypatch.setattr(os, "environ", dict(os.environ))
+        return tq_adapter.TQDataPlaneClient(cfg, bootstrap=False)
+
+    return _build
+
+
+def test_peer_rail_is_pinned_to_the_local_rail(stub_client):
+    """Same-rail pairing keeps every rail in use instead of narrowing to one."""
+    stub_client(_mooncake_cfg())
+    assert os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
+
+
+def test_peer_rail_pairing_is_overridable(stub_client, monkeypatch):
+    """A fully-routable fabric can opt back into random peer selection."""
+    monkeypatch.setenv("MC_ENABLE_DEST_DEVICE_AFFINITY", "0")
+    stub_client(_mooncake_cfg())
+    assert os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "0"
+
+
+def test_peer_rail_pairing_not_applied_to_simple_backend(stub_client):
+    """The knob is mooncake-only; `simple` never touches RDMA."""
+    stub_client({**_mooncake_cfg(), "backend": "simple"})
+    assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
