@@ -242,13 +242,19 @@ def test_refresh_hpc_modules_after_layerwise_reload(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_batched_bf16_trtllm_layout_matches_expertwise_permutation(monkeypatch):
+@pytest.mark.parametrize("is_gated_act_gemm", [False, True])
+def test_batched_bf16_trtllm_layout_matches_vllm_expertwise_converter(
+    monkeypatch, is_gated_act_gemm
+):
     from nemo_rl.models.generation.vllm import vllm_backend
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        convert_moe_weights_to_flashinfer_trtllm_block_layout,
+    )
 
     num_experts = 3
     w13_rows = 4
     w2_rows = 3
-    cols = 64
+    cols = 128
     w13 = torch.arange(num_experts * w13_rows * cols, dtype=torch.bfloat16).view(
         num_experts, w13_rows, cols
     )
@@ -257,14 +263,11 @@ def test_batched_bf16_trtllm_layout_matches_expertwise_permutation(monkeypatch):
     )
     w13_perm = torch.tensor([2, 0, 3, 1])
     w2_perm = torch.tensor([1, 2, 0])
-    calls = []
 
     def get_w13_perm(cache, weight, tile_m, *, is_gated_act_gemm):
-        calls.append(("w13", tuple(weight.shape), tile_m, is_gated_act_gemm))
         return w13_perm
 
     def get_w2_perm(cache, weight, tile_m):
-        calls.append(("w2", tuple(weight.shape), tile_m))
         return w2_perm
 
     monkeypatch.setattr(
@@ -276,36 +279,17 @@ def test_batched_bf16_trtllm_layout_matches_expertwise_permutation(monkeypatch):
         get_w2_perm,
     )
 
+    expected_w13, expected_w2 = convert_moe_weights_to_flashinfer_trtllm_block_layout(
+        {}, w13, w2, is_gated_act_gemm=is_gated_act_gemm
+    )
     actual_w13, actual_w2 = (
         vllm_backend._convert_bf16_moe_weights_to_trtllm_block_layout_batched(
-            {}, w13, w2, is_gated_act_gemm=True
+            {}, w13, w2, is_gated_act_gemm=is_gated_act_gemm
         )
-    )
-
-    adjusted_w13_perm = (w13_perm + w13_rows // 2) % w13_rows
-    expected_w13 = (
-        w13.view(torch.uint8)
-        .view(num_experts, w13_rows, 1, 128)
-        .permute(0, 2, 1, 3)
-        .index_select(2, adjusted_w13_perm)
-        .contiguous()
-        .view(torch.bfloat16)
-    )
-    expected_w2 = (
-        w2.view(torch.uint8)
-        .view(num_experts, w2_rows, 1, 128)
-        .permute(0, 2, 1, 3)
-        .index_select(2, w2_perm)
-        .contiguous()
-        .view(torch.bfloat16)
     )
 
     torch.testing.assert_close(actual_w13, expected_w13)
     torch.testing.assert_close(actual_w2, expected_w2)
-    assert calls == [
-        ("w13", (w13_rows, 128), 128, True),
-        ("w2", (w2_rows, 128), 128),
-    ]
 
 
 @pytest.mark.vllm
@@ -351,6 +335,10 @@ def test_batched_bf16_trtllm_layout_is_scoped_to_reload_finalize(monkeypatch):
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
     with ext._weight_update_lifecycle("collective") as finalize:
+        assert (
+            unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
+            is vllm_backend._convert_bf16_moe_weights_to_trtllm_block_layout_batched
+        )
         finalize()
 
     assert (
