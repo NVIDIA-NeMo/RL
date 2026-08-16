@@ -651,6 +651,14 @@ class TQDataPlaneClient(DataPlaneClient):
                 # IP — peers fail with "connection refused".
                 os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
             os.environ.setdefault("MC_STORE_MEMCPY", "0")
+            # Pin each transfer's peer rail to the local one by name.
+            # Mooncake otherwise picks the peer rail at random
+            # (Topology::selectDevice), and where each rail is its own subnet
+            # — the RoCE-only gb200 CI runners — a cross-rail pair has no
+            # route. Mooncake recommends this for rail-optimized topologies
+            # generally, so it is not conditioned on RoCE. setdefault: a
+            # fully-routable fabric can set 0 to regain cross-rail failover.
+            os.environ.setdefault("MC_ENABLE_DEST_DEVICE_AFFINITY", "1")
             # Both must run before the first get, in every process with a TQ
             # client. The registration check is unconditional: it also covers
             # the two bytes workers the staging patch leaves untouched, which
