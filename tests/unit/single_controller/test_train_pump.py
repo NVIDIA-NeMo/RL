@@ -69,11 +69,12 @@ def _simple_tq_cfg() -> dict:
         "enabled": True,
         "impl": "transfer_queue",
         "backend": "simple",
-        "storage_capacity": 1024,
-        "num_storage_units": 1,
         "claim_meta_poll_interval_s": 0.5,
-        "global_segment_size": 8589934592,  # 8 GiB
-        "local_buffer_size": 1073741824,  # 1 GiB
+        "simple": {"storage_capacity": 1024, "num_storage_units": 1},
+        "mooncake_cpu": {
+            "global_segment_size": 8589934592,  # 8 GiB
+            "local_buffer_size": 1073741824,  # 1 GiB
+        },
     }
 
 

@@ -44,6 +44,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     DataPlaneConfig,
     KVBatchMeta,
+    backend_config,
 )
 from nemo_rl.data_plane.schema import PROMOTE_1D_FIELDS
 
@@ -188,8 +189,7 @@ def _register_checked(store: Any, ptr: int, nbytes: int) -> None:
             f"status {status}. Registration pins the pages with ibv_reg_mr "
             f"once per rail (devices={rdma_devices() or 'none'}), so it needs "
             f"IPC_LOCK and a high memlock rlimit — RLIMIT_MEMLOCK is "
-            f"{_memlock_limit()} here. Lower data_plane.global_segment_size / "
-            "local_buffer_size if the limit is the bound."
+            f"{_memlock_limit()} here. Lower data_plane.mooncake_cpu.global_segment_size / local_buffer_size if the limit is the bound."
         )
 
 
@@ -233,8 +233,8 @@ class _StagingPool:
                 f"No mooncake staging slot free after {_STAGING_SLOT_TIMEOUT_S}s. "
                 f"The pool has {self._n_slots} slots, sized to one TQ worker "
                 "pool, so this means overlapping put/get calls in this process. "
-                "Set data_plane.reuse_registered_buffers=false to fall back to "
-                "upstream's per-call registration."
+                "Set data_plane.mooncake_cpu.reuse_registered_buffers=false to "
+                "fall back to upstream's per-call registration."
             ) from None
         try:
             if buf is None or buf.nbytes < nbytes:
@@ -255,22 +255,20 @@ class _StagingPool:
 def _staging_pool(client: Any, n_slots: int) -> _StagingPool:
     """Return ``client``'s pool, building it at most once across threads.
 
-    Double-checked under a lock because ``put``/``get`` drive the thread
-    workers from a ``ThreadPoolExecutor``, so two of them reach a cold client
-    at once whenever a call splits into more than one ``BATCH_SIZE_LIMIT``
-    batch. Unsynchronized, the loser's pool is dropped on the floor and its
-    buffers are freed while still registered — mooncake keeps a mapping over
-    memory the allocator hands straight to the next caller, and the transfer
-    that lands there fails with ``TRANSFER_FAIL`` (-800) on every retry.
+    Locked because ``put``/``get`` drive the thread workers from a
+    ``ThreadPoolExecutor``, so two of them reach a cold client at once whenever
+    a call splits into more than one ``BATCH_SIZE_LIMIT`` batch. Unsynchronized,
+    the loser's pool is dropped on the floor and its buffers are freed while
+    still registered — see :func:`_register_checked` for why that surfaces as a
+    bare ``TRANSFER_FAIL``. The lock is taken on every lookup rather than
+    double-checked: it is uncontended after the first transfer, and nanoseconds
+    against a millisecond RDMA transfer is not worth reasoning about visibility.
     """
-    pool = getattr(client, "_nrl_staging", None)
-    if pool is not None:
-        return pool
     with _staging_pool_lock:
         pool = getattr(client, "_nrl_staging", None)
         if pool is None:
             pool = client._nrl_staging = _StagingPool(client._store, n_slots)
-    return pool
+        return pool
 
 
 def _patch_mooncake_register_check() -> None:
@@ -415,17 +413,18 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
     controller_overlay = {"controller": {"polling_mode": True}}
 
     if backend == "simple":
-        # Read here, not above: MooncakeStore has no unit count and no sample
-        # cap — it sizes from global_segment_size/local_buffer_size — so both
-        # keys are SimpleStorage-only and reading them at the top implied
-        # otherwise.
+        # Resolved here, not above: MooncakeStore has no unit count and no
+        # sample cap — it sizes from global_segment_size/local_buffer_size —
+        # so both keys are SimpleStorage-only and reading them at the top
+        # implied otherwise.
+        simple_cfg = backend_config(cfg)
         overlay = {
             **controller_overlay,
             "backend": {
                 "storage_backend": "SimpleStorage",
                 "SimpleStorage": {
-                    "total_storage_size": cfg["storage_capacity"],
-                    "num_data_storage_units": cfg["num_storage_units"],
+                    "total_storage_size": simple_cfg.storage_capacity,
+                    "num_data_storage_units": simple_cfg.num_storage_units,
                 },
             },
         }
@@ -465,15 +464,16 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                 "Mooncake backend requires a local node IP; "
                 "_get_local_node_ip() returned empty."
             )
-        # Sizes are per client process and RDMA-pinned — see DataPlaneConfig
+        # Sizes are per client process and RDMA-pinned — see MooncakeCpuConfig
         # in nemo_rl/data_plane/interfaces.py for the per-node arithmetic.
+        mooncake_cfg = backend_config(cfg)
         overlay = {
             **controller_overlay,
             "backend": {
                 "storage_backend": "MooncakeStore",
                 "MooncakeStore": {
-                    "global_segment_size": int(cfg["global_segment_size"]),
-                    "local_buffer_size": int(cfg["local_buffer_size"]),
+                    "global_segment_size": int(mooncake_cfg.global_segment_size),
+                    "local_buffer_size": int(mooncake_cfg.local_buffer_size),
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that
                     # mooncake_master + the metadata server bind to.
@@ -656,7 +656,10 @@ class TQDataPlaneClient(DataPlaneClient):
             # the two bytes workers the staging patch leaves untouched, which
             # is where an unchecked registration surfaces as TRANSFER_FAIL.
             _patch_mooncake_register_check()
-            if cfg["reuse_registered_buffers"]:
+            # Opt-out flag, defaulted on MooncakeCpuConfig rather than here:
+            # an absent mooncake_cpu block means "this backend's defaults",
+            # so the pool is on unless a config deliberately turns it off.
+            if backend_config(cfg).reuse_registered_buffers:
                 _patch_mooncake_staging_buffers()
 
         # Workaround for TQ KVStorageManager's 1D-field schema/data

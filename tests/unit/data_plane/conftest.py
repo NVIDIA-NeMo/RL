@@ -44,12 +44,15 @@ def _make_tq_cfg(backend: str) -> dict:
         "enabled": True,
         "impl": "transfer_queue",
         "backend": backend,
-        "storage_capacity": 1024,
-        "num_storage_units": 1,
-        "reuse_registered_buffers": True,
         "claim_meta_poll_interval_s": 0.5,
-        "global_segment_size": 8589934592,  # 8 GiB — sized for CI host RAM
-        "local_buffer_size": 1073741824,  # 1 GiB
+        "simple": {"storage_capacity": 1024, "num_storage_units": 1},
+        "mooncake_cpu": {
+            "global_segment_size": 8589934592,  # 8 GiB — sized for CI host RAM
+            "local_buffer_size": 1073741824,  # 1 GiB
+            # reuse_registered_buffers omitted on purpose: absent must mean on,
+            # so the fixture exercises the default the same way a user config
+            # that never mentions the flag does.
+        },
     }
 
 
