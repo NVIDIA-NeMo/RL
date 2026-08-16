@@ -32,14 +32,14 @@ from nemo_rl.models.generation.dynamo.arguments import (
     redact_argv,
     redact_environment,
 )
-from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.config import (
+    VLLM_PACKED_BUFFER_SIZE_BYTES,
+    VLLM_PACKED_NUM_BUFFERS,
+    DynamoConfig,
+)
 from nemo_rl.models.generation.dynamo.venv import (
     get_dynamo_python,
     get_dynamo_venv_dir,
-)
-from nemo_rl.utils.packed_tensor import (
-    VLLM_PACKED_BUFFER_SIZE_BYTES,
-    VLLM_PACKED_NUM_BUFFERS,
 )
 
 
@@ -57,6 +57,29 @@ class DynamoGpuReservation:  # pragma: no cover
                 f"Expected one GPU for Dynamo reservation, got {gpu_ids}."
             )
         return {"node_ip": _get_node_ip_local(), "gpu_id": gpu_ids[0]}
+
+    def select_free_port(
+        self,
+        *,
+        port_range_low: int,
+        port_range_high: int,
+        excluded_ports: list[int],
+    ) -> int:
+        """Select an unused node-local port from a half-open range."""
+        excluded = set(excluded_ports)
+        for port in range(port_range_low, port_range_high):
+            if port in excluded:
+                continue
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind(("0.0.0.0", port))
+            except OSError:
+                continue
+            return port
+        raise RuntimeError(
+            "No free managed Dynamo system port is available in "
+            f"[{port_range_low}, {port_range_high})."
+        )
 
     def register_process_group(self, pid: int) -> bool:
         """Record the colocated worker process group for failure cleanup."""

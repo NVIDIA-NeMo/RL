@@ -61,6 +61,10 @@ must update and reverify these coupled locations:
   keys `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
   reverify them against real Dynamo output because unit tests validate only the
   expected local response shape
+- `nemo_rl/models/generation/dynamo/managed_runtime.py`: the managed
+  `DYN_ENABLE_EXPERIMENTAL_PARSERS_V2=1` setting. Dynamo 1.3.0's legacy tool
+  jail removes `nvext.engine_data`; remove this setting only after an upgraded
+  Dynamo preserves the token metadata for `tool_choice=auto`
 - this guide and the Dynamo design document: the stated versions and backport
   behavior
 
@@ -149,28 +153,23 @@ steps exercise generation, refit, post-refit cache invalidation, telemetry,
 and cleanup. For a matched control, run the same seed/model/batch settings with
 the standard non-colocated vLLM backend and compare post-refit output validity.
 
-## Run SWE with W&B
+## Run SWE1 with W&B
 
-The public six-node recipe targets
-`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`. Supply site data, sandbox images,
-Slurm routing, and W&B credentials to its launcher:
+The three-node nightly recipe targets
+`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`. It uses two 8-GPU training
+nodes and one 8-GPU inference node. The inference node runs two TP4/EP4 Dynamo
+engines. Download the standard SWE1 split under
+`${HF_HOME}/superv3_data/swe1`, then run the registered test-suite driver:
 
 ```bash
-CONTAINER=/shared/images/nemo-rl-dynamo.sqsh \
-TRAIN_PATH=/shared/data/swe-train.jsonl \
-VAL_PATH=/shared/data/swe-validation.jsonl \
-SIF_FORMATTERS='["/shared/swe/{instance_id}.sif"]' \
-SANDBOX_CONTAINER=/shared/images/nemo-skills-sandbox.sqsh \
-SLURM_ACCOUNT=<account> \
-SLURM_PARTITION=<partition> \
+HF_HOME=/shared/huggingface \
 WANDB_API_KEY=<key> \
-EXTRA_MOUNTS=/shared:/shared \
-bash examples/swe_bench/run_grpo_nanov3_30ba3b_swe_dynamo_hsg_r2_wandb.sh
+bash tests/test_suites/llm/grpo-nanov3-30ba3b-3n8g-megatron-dynamo-swe1.sh
 ```
 
-Use `DRY_RUN=1` to inspect the command without submitting. A successful
-acceptance run completes four training steps, produces valid generations after
-refit, and records worker timelines under `generation_metrics/*` in W&B.
+A successful acceptance run completes four training steps, produces valid
+generations after refit, and records worker timelines under
+`generation_metrics/*` in TensorBoard and W&B.
 
 ## Operational notes
 

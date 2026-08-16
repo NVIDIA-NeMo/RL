@@ -36,16 +36,6 @@ from nemo_rl.models.generation.dynamo.dynamo_worker import (
 _WORKER_FQN = "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker"
 
 
-def _system_port_for_node_slot(node_slot: int) -> int:
-    port = DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW + node_slot
-    if port >= DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH:
-        raise ValueError(
-            "Managed Dynamo has more node-local engine groups than its "
-            f"system-port band supports: slot={node_slot}"
-        )
-    return port
-
-
 def _vllm_port_for_node_slot(node_slot: int) -> int:
     """Return vLLM's deterministic node-local rendezvous port."""
     return DEFAULT_VLLM_PORT_RANGE_LOW + node_slot * DEFAULT_VLLM_PORTS_PER_ENGINE
@@ -92,6 +82,7 @@ class FixedDynamoWorkerPool:
 
         group_index = 0
         engine_slots_by_node: dict[str, int] = {}
+        system_ports_by_node: dict[str, set[int]] = {}
         metadata_refs: list[ray.ObjectRef] = []
         for pg_index, placement_group in enumerate(placement_groups):
             bundle_count = placement_group.bundle_count
@@ -132,7 +123,15 @@ class FixedDynamoWorkerPool:
                 node_ip = next(iter(node_ips))
                 node_slot = engine_slots_by_node.get(node_ip, 0)
                 engine_slots_by_node[node_ip] = node_slot + 1
-                system_port = _system_port_for_node_slot(node_slot)
+                system_ports = system_ports_by_node.setdefault(node_ip, set())
+                system_port = ray.get(
+                    reservation_handles[0].select_free_port.remote(
+                        port_range_low=DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW,
+                        port_range_high=DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH,
+                        excluded_ports=sorted(system_ports),
+                    )
+                )
+                system_ports.add(system_port)
                 vllm_port = _vllm_port_for_node_slot(node_slot)
                 group_name = f"{self._namespace}-dynamo-vllm-{pg_index}-{group_index}"
                 leader_strategy = PlacementGroupSchedulingStrategy(

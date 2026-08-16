@@ -25,6 +25,12 @@ from pydantic import (
     model_validator,
 )
 
+# Must match vLLM's packed weight-transfer defaults exactly. The Dynamo
+# producer and consumer recompute chunk boundaries without negotiation. Verify
+# these values whenever Dynamo's pinned vLLM changes.
+VLLM_PACKED_BUFFER_SIZE_BYTES = 1024**3
+VLLM_PACKED_NUM_BUFFERS = 2
+
 DYNAMO_VLLM_FLAGS: dict[str, str] = {
     "tensor_parallel_size": "--tensor-parallel-size",
     "pipeline_parallel_size": "--pipeline-parallel-size",

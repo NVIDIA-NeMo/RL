@@ -147,6 +147,10 @@ class ManagedDynamoRuntime:
             "NATS_SERVER": f"nats://{self._host}:{self._nats_port}",
             "DYN_NAMESPACE": self._namespace,
             "DYN_DISCOVERY_BACKEND": "etcd",
+            # Dynamo 1.3.0's legacy tool jail rebuilds response chunks with
+            # nvext=None. Its qwen3/deepseek v2 path preserves engine_data,
+            # which NeMo-Gym needs for exact token IDs and log probabilities.
+            "DYN_ENABLE_EXPERIMENTAL_PARSERS_V2": "1",
             "DYN_REQUEST_PLANE": "tcp",
             "DYN_EVENT_PLANE": "nats",
             "DYN_HEALTH_CHECK_ENABLED": "false",

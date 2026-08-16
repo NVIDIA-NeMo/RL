@@ -37,6 +37,7 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     refit_policy_generation,
     setup,
+    shutdown_environments,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
@@ -342,11 +343,11 @@ The validation set you pass in will directly be used for validation with no addi
                 processor=processor,
             )
     finally:
-        if config.policy["generation"]["backend"] == "dynamo":
-            try:
-                policy_generation.shutdown()
-            except Exception as error:
-                print(f"Error shutting down Dynamo generation: {error}", flush=True)
+        shutdown_environments(task_to_env, val_task_to_env)
+        try:
+            policy_generation.shutdown()
+        except Exception as error:
+            print(f"Error shutting down generation: {error}", flush=True)
 
 
 if __name__ == "__main__":

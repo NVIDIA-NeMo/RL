@@ -90,6 +90,9 @@ class TestUnspunActor:
 
     def test_shutdown_still_forwards_when_spun_up(self):
         env = _unspun()
-        env.rh = _FakeRunHelper()
+        run_helper = _FakeRunHelper()
+        env.rh = run_helper
         env.shutdown()
-        assert env.rh.shutdowns == 1
+        env.shutdown()
+        assert run_helper.shutdowns == 1
+        assert env.rh is None

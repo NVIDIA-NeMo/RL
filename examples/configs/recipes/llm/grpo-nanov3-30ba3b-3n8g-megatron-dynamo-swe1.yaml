@@ -1,7 +1,6 @@
 defaults: ../../../nemo_gym/grpo_nanov3.yaml
 cluster:
-  gpus_per_node: 4
-  num_nodes: 6
+  num_nodes: 3
   segment_size: 1
 checkpointing:
   enabled: false
@@ -14,7 +13,7 @@ checkpointing:
 grpo:
   num_prompts_per_step: 2
   num_generations_per_prompt: 2
-  num_val_generations_per_prompt: 2
+  val_num_generations_per_prompt: 2
   max_num_epochs: 4
   max_num_steps: 4
   advantage_clip_low: -100
@@ -36,13 +35,7 @@ grpo:
   async_grpo:
     enabled: true
     in_flight_weight_updates: false
-    recompute_kv_cache_after_weight_updates: false
-reward_penalties:
-  penalize_duplicated_reasoning: true
-  penalize_empty_final_answer: true
-  penalize_unwanted_tokens: false
-  penalize_malformed_think_tag: true
-  token_ids: null
+    recompute_kv_cache_after_weight_updates: true
 loss_fn:
   truncated_importance_sampling_ratio: 5
   truncated_importance_sampling_ratio_min: 0.2
@@ -145,22 +138,17 @@ policy:
     colocated:
       enabled: false
       resources:
-        gpus_per_node: 4
-        num_nodes: 2
+        gpus_per_node: 8
+        num_nodes: 1
 data:
   train:
-    data_path: data/swe/train.jsonl
+    data_path: ${oc.env:HF_HOME}/superv3_data/swe1/train-split.jsonl
   validation:
-    data_path: data/swe/validation.jsonl
+    data_path: ${oc.env:HF_HOME}/superv3_data/swe1/val-split.jsonl
 env:
   nemo_gym:
     skip_venv_if_present: true
     num_gpu_nodes: 0
-    effort_levels:
-      low_string: '{reasoning effort: efficient}'
-      low_weight: 0.1
-      low_penalty: 1
-      low_ub: 15000
     invalid_tool_call_patterns:
     - <tool_call>
     - </tool_call>
@@ -171,30 +159,27 @@ env:
     - </think>
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
-    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
-    swe_agents_train:
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            force_nonempty_content: true
+    single_step_tool_use_with_argument_comparison_swe:
       responses_api_agents:
-        swe_agents:
-          agent_max_turns: 200
-          concurrency: ${mul:2, ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}}
-          swebench_agent_timeout: 3600
-          run_with_mixed_prompts: true
-          dataset_path: ${data.train.data_path}
-          apptainer_memory_limit_mb: 65536
-          container_formatter: []
-    swe_agents_val:
-      responses_api_agents:
-        swe_agents:
-          agent_max_turns: 200
-          concurrency: ${mul:2, ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}}
-          swebench_agent_timeout: 3600
-          dataset_path: ${data.validation.data_path}
-          apptainer_memory_limit_mb: 65536
-          container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
+        tool_simulation_agent:
+          entrypoint: app.py
+          resources_server:
+            type: resources_servers
+            name: swe_pivot_single_step_tool_use_with_argument_comparison_resources_server
+          model_server:
+            type: responses_api_models
+            name: policy_model
     use_absolute_ip: true
 logger:
   log_dir: results/nemotron-3-nano-swe-dynamo
   wandb_enabled: true
+  tensorboard_enabled: true
   wandb:
-    project: nemo-rl-dynamo-swe
-    name: nemotron-3-nano-swe-dynamo
+    project: nemo-rl
+    name: grpo-nanov3-30ba3b-3n8g-megatron-dynamo-swe1

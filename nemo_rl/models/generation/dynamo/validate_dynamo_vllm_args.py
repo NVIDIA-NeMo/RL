@@ -61,7 +61,8 @@ def main() -> None:
         raise SystemExit(
             "vLLM packed-transfer geometry changed: "
             f"engine has {actual_geometry}, NeMo RL sends {expected_geometry}. "
-            "Update the Dynamo CollectiveSenderSpec and VLLM_PACKED_* constants."
+            "Update the Dynamo CollectiveSenderSpec and the Dynamo "
+            "VLLM_PACKED_* constants."
         )
 
 

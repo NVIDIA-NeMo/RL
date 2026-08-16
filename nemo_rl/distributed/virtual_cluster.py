@@ -85,12 +85,13 @@ class PY_EXECUTABLES:
 # service port is pinned below 9000 to avoid TOCTOU collisions.  See ray.sub for
 # the full layout including Ray's own GCS / worker gRPC ports.
 #
+# Python port-range bounds below are half-open: [low, high).
+#
 #   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
-#   3000-4999    Shared NeMo RL generation band  (policy.generation.port_range_low/high)
-#     3000-3999  Dynamo frontend/token-wrapper HTTP endpoints
-#     4000-4099  Dynamo worker system endpoints  (node-local engine index)
-#     4100-4999  Other generation HTTP servers + SGLang engine NCCL/dist_init
+#   [3000, 4999) Shared NeMo RL generation range (policy.generation.port_range_low/high)
+#     [3000, 4000) Dynamo frontend/token-wrapper HTTP endpoints
+#     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
 #   6000-6099    SingleController gen. router    (async_rl.generation_router.port_range_low/high;
 #                                                 one fixed port per run — NeMo-Gym holds the

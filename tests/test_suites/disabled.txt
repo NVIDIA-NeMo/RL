@@ -23,6 +23,3 @@ tests/test_suites/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep
 tests/test_suites/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp-specdec.v1.sh
 tests/test_suites/vlm/mopd-nemotron-super-omni-120ba12b-10n8g-megatron-tp8ep16cp2-async-gym.v1.sh
 tests/test_suites/vlm/mopd-nemotron-super-omni-120ba12b-4n8g-smoke.v1.sh
-
-# Requires external SWE data plus a NeMo Skills sandbox image.
-tests/test_suites/llm/grpo-nanov3-30ba3b-swe-6n4g-megatron-dynamo-wandb.sh

@@ -25,15 +25,15 @@ from nemo_rl.models.generation.dynamo import DynamoGeneration
 from nemo_rl.models.generation.dynamo import dynamo_generation as generation_module
 from nemo_rl.models.generation.dynamo import metrics as metrics_module
 from nemo_rl.models.generation.dynamo import refit as refit_module
+from nemo_rl.models.generation.dynamo.config import (
+    VLLM_PACKED_BUFFER_SIZE_BYTES,
+    VLLM_PACKED_NUM_BUFFERS,
+)
 from nemo_rl.models.generation.dynamo.metrics import (
     DynamoMetricsSampler,
     parse_prometheus_metrics,
 )
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
-from nemo_rl.utils.packed_tensor import (
-    VLLM_PACKED_BUFFER_SIZE_BYTES,
-    VLLM_PACKED_NUM_BUFFERS,
-)
 
 
 def _config(*, tp: int = 1, expose_http_server: bool = False) -> dict[str, Any]:

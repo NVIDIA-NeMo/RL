@@ -20,15 +20,15 @@ from typing import Any
 
 import ray
 
+from nemo_rl.models.generation.dynamo.config import (
+    VLLM_PACKED_BUFFER_SIZE_BYTES,
+    VLLM_PACKED_NUM_BUFFERS,
+)
 from nemo_rl.models.generation.dynamo.http_client import (
     format_dynamo_error,
     http_post_json,
 )
 from nemo_rl.models.generation.interfaces import CollectiveSenderSpec
-from nemo_rl.utils.packed_tensor import (
-    VLLM_PACKED_BUFFER_SIZE_BYTES,
-    VLLM_PACKED_NUM_BUFFERS,
-)
 
 
 @dataclass(frozen=True)

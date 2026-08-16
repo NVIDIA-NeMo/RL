@@ -914,7 +914,9 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         # into a confusing AttributeError from a never-spun-up (e.g. restarted) actor.
         if self.rh is None:
             return
-        self.rh.shutdown()
+        run_helper = self.rh
+        self.rh = None
+        run_helper.shutdown()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.

@@ -34,6 +34,7 @@ _GYM_TOKEN_METADATA_FIELDS = (
     "generation_token_ids",
     "generation_log_probs",
 )
+_TOOL_ARGUMENT_MAPPING_ERROR = "Can only get item pairs from a mapping."
 
 
 def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
@@ -156,6 +157,38 @@ def _render_prompt_token_ids(
     )
 
 
+def _render_prompt_token_ids_with_optional_prefix(
+    *,
+    tokenizer: Any,
+    request_body: dict[str, Any],
+    messages: list[Any],
+    tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
+    exclude_tools_when_tool_choice_none: bool,
+    add_generation_prompt: bool,
+    assistant_index: int | None,
+) -> tuple[list[int], list[int] | None]:
+    full_prompt_token_ids = _render_prompt_token_ids(
+        tokenizer=tokenizer,
+        request_body=request_body,
+        messages=messages,
+        tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+        exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
+        add_generation_prompt=add_generation_prompt,
+    )
+    if assistant_index is None:
+        return full_prompt_token_ids, None
+
+    template_prefix_token_ids = _render_prompt_token_ids(
+        tokenizer=tokenizer,
+        request_body=request_body,
+        messages=messages[: assistant_index + 1],
+        tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+        exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
+        add_generation_prompt=False,
+    )
+    return full_prompt_token_ids, template_prefix_token_ids
+
+
 def _latest_tokenized_assistant_index(messages: list[Any]) -> Optional[int]:
     for index in reversed(range(len(messages))):
         message = messages[index]
@@ -185,14 +218,12 @@ def _derive_required_prefix_token_ids(messages: list[Any]) -> list[int] | None:
 def _normalize_tool_arguments_for_template(
     messages: list[Any], *, before_index: int
 ) -> None:
-    """Make prior OpenAI tool calls renderable by model chat templates.
+    """Make OpenAI tool calls renderable by model chat templates.
 
     OpenAI chat messages carry ``function.arguments`` as a JSON string, while
-    the Nemotron template iterates those arguments as a mapping. Dynamo does
-    not need to re-render the preserved model prefix, but the template-prefix
-    render still traverses older assistant turns. Normalize only the local
-    template copy; the request forwarded to Dynamo retains its original OpenAI
-    payload.
+    some model templates iterate those arguments as a mapping. Normalize only
+    the local template copy; the request forwarded to Dynamo retains its
+    original OpenAI payload.
     """
     for message in messages[:before_index]:
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -302,28 +333,41 @@ def prepare_dynamo_chat_completion_request(
             raise ValueError(
                 "Dynamo prefix token metadata must be attached to an assistant message."
             )
-        _normalize_tool_arguments_for_template(
-            template_messages, before_index=assistant_index + 1
-        )
 
-    full_prompt_token_ids = _render_prompt_token_ids(
-        tokenizer=tokenizer,
-        request_body=prepared_body,
-        messages=template_messages,
-        tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
-        exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
-        add_generation_prompt=add_generation_prompt,
-    )
-    if required_prefix_token_ids is not None:
-        assert assistant_index is not None
-        template_prefix_token_ids = _render_prompt_token_ids(
+    try:
+        (
+            full_prompt_token_ids,
+            template_prefix_token_ids,
+        ) = _render_prompt_token_ids_with_optional_prefix(
             tokenizer=tokenizer,
             request_body=prepared_body,
-            messages=template_messages[: assistant_index + 1],
+            messages=template_messages,
             tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
             exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
-            add_generation_prompt=False,
+            add_generation_prompt=add_generation_prompt,
+            assistant_index=assistant_index,
         )
+    except TypeError as e:
+        if str(e) != _TOOL_ARGUMENT_MAPPING_ERROR:
+            raise
+        _normalize_tool_arguments_for_template(
+            template_messages, before_index=len(template_messages)
+        )
+        (
+            full_prompt_token_ids,
+            template_prefix_token_ids,
+        ) = _render_prompt_token_ids_with_optional_prefix(
+            tokenizer=tokenizer,
+            request_body=prepared_body,
+            messages=template_messages,
+            tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+            exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
+            add_generation_prompt=add_generation_prompt,
+            assistant_index=assistant_index,
+        )
+
+    if required_prefix_token_ids is not None:
+        assert template_prefix_token_ids is not None
         full_prompt_token_ids = replace_prefix_tokens(
             tokenizer,
             model_prefix_token_ids=required_prefix_token_ids,

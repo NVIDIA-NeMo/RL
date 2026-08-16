@@ -32,7 +32,6 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
 )
 from nemo_rl.models.generation.dynamo.worker_pool import (
     FixedDynamoWorkerPool,
-    _system_port_for_node_slot,
     _vllm_port_for_node_slot,
 )
 
@@ -129,8 +128,9 @@ class _FakeWorker:
 
 
 class _FakeReservation:
-    def __init__(self, metadata=None):
+    def __init__(self, metadata=None, system_port=4000):
         self.metadata = _RemoteMethod(metadata or {})
+        self.select_free_port = _RemoteMethod(system_port)
         self.register_process_group = _RemoteMethod(True)
         self.cleanup_process_group = _RemoteMethod(True)
 
@@ -209,11 +209,8 @@ def test_managed_service_and_frontend_environments_are_runtime_owned(
     assert frontend_env["DYN_TOKENIZER_CACHE_BYTES"] == "4096"
 
 
-def test_node_local_port_bands_are_deterministic() -> None:
-    assert [_system_port_for_node_slot(slot) for slot in range(3)] == [4000, 4001, 4002]
+def test_vllm_node_local_port_bands_are_deterministic() -> None:
     assert [_vllm_port_for_node_slot(slot) for slot in range(3)] == [7000, 7100, 7200]
-    with pytest.raises(ValueError, match="system-port band"):
-        _system_port_for_node_slot(100)
 
 
 def test_startup_failure_cleans_up_partial_worker_pool(monkeypatch, tmp_path) -> None:
@@ -292,6 +289,7 @@ def test_startup_failure_cleans_up_partial_worker_pool(monkeypatch, tmp_path) ->
     assert runtime._pool is None
     assert runtime._started is False
     assert exit_hooks == []
+    assert pool_init_kwargs["manager_env"]["DYN_ENABLE_EXPERIMENTAL_PARSERS_V2"] == "1"
     assert pool_init_kwargs["manager_env"]["DYN_RL_INIT_WEIGHTS_TIMEOUT_S"] == "10.0"
     assert not etcd_dir.exists()
     assert not nats_dir.exists()
@@ -340,6 +338,42 @@ def test_reservation_records_and_cleans_registered_process_group(monkeypatch) ->
     assert reservation.cleanup_process_group()
     assert reservation.cleanup_process_group()
     assert signals == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
+
+
+def test_reservation_selects_a_free_nonexcluded_system_port(monkeypatch) -> None:
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        @staticmethod
+        def bind(address):
+            if address[1] == 4000:
+                raise OSError("host service")
+
+    reservation_cls = DynamoGpuReservation.__ray_metadata__.modified_class
+    reservation = reservation_cls()
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker.socket.socket",
+        lambda *args, **kwargs: FakeSocket(),
+    )
+
+    assert (
+        reservation.select_free_port(
+            port_range_low=4000,
+            port_range_high=4003,
+            excluded_ports=[4001],
+        )
+        == 4002
+    )
+    with pytest.raises(RuntimeError, match="No free managed Dynamo system port"):
+        reservation.select_free_port(
+            port_range_low=4000,
+            port_range_high=4002,
+            excluded_ports=[4001],
+        )
 
 
 def test_worker_registers_process_group_immediately_after_launch(monkeypatch) -> None:
@@ -536,6 +570,8 @@ def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
     def fake_get(refs, **kwargs):
         if refs == [reservation.metadata.remote()]:
             return [{"node_ip": "10.0.0.1", "gpu_id": 0}]
+        if refs == 4000:
+            return refs
         raise RuntimeError("metadata failed")
 
     monkeypatch.setattr(
@@ -553,8 +589,12 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
     monkeypatch,
 ) -> None:
     reservation_objects = [
-        _FakeReservation(metadata={"node_ip": "10.0.0.1", "gpu_id": 0}),
-        _FakeReservation(metadata={"node_ip": "10.0.0.1", "gpu_id": 1}),
+        _FakeReservation(
+            metadata={"node_ip": "10.0.0.1", "gpu_id": 0}, system_port=4001
+        ),
+        _FakeReservation(
+            metadata={"node_ip": "10.0.0.1", "gpu_id": 1}, system_port=4002
+        ),
     ]
     reservations = iter(reservation_objects)
     workers = [
@@ -619,6 +659,8 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
     )
 
     def fake_get(refs, **kwargs):
+        if isinstance(refs, int):
+            return refs
         if isinstance(refs, list) and refs and "node_ip" in refs[0]:
             return refs
         assert pool._workers == workers
@@ -634,11 +676,31 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
         {"instance_id": "worker-0"},
         {"instance_id": "worker-1"},
     ]
-    assert [kwargs["system_port"] for kwargs in launch_kwargs] == [4000, 4001]
+    assert [kwargs["system_port"] for kwargs in launch_kwargs] == [4001, 4002]
     assert [kwargs["vllm_port"] for kwargs in launch_kwargs] == [7000, 7100]
     assert [kwargs["cleanup_reservation"] for kwargs in launch_kwargs] == (
         reservation_objects
     )
+    assert reservation_objects[0].select_free_port.calls == [
+        (
+            (),
+            {
+                "port_range_low": 4000,
+                "port_range_high": 4100,
+                "excluded_ports": [],
+            },
+        )
+    ]
+    assert reservation_objects[1].select_free_port.calls == [
+        (
+            (),
+            {
+                "port_range_low": 4000,
+                "port_range_high": 4100,
+                "excluded_ports": [4001],
+            },
+        )
+    ]
 
 
 def test_fixed_pool_shutdown_releases_workers_and_reservations(monkeypatch) -> None:

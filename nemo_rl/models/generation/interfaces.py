@@ -378,6 +378,11 @@ class GenerationInterface(ABC):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         pass
 
+    @abstractmethod
+    def shutdown(self) -> bool:
+        """Shut down generation resources; repeated calls must be safe."""
+        pass
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Whether the generation backend requires KV cache scales synchronization."""

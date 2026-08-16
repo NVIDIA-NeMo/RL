@@ -401,6 +401,35 @@ def _needs_hf_refit_handshake(
     return not (nccl_reshard_refit_enabled and not colocated_inference)
 
 
+def shutdown_environments(
+    task_to_env: dict[str, EnvironmentInterface] | None,
+    val_task_to_env: dict[str, EnvironmentInterface] | None,
+) -> None:
+    """Shut down each unique environment actor before generation stops."""
+    seen_environment_handles: set[int] = set()
+    for environment_map in (task_to_env, val_task_to_env):
+        if environment_map is None:
+            continue
+        for task_name, environment in environment_map.items():
+            handle_id = id(environment)
+            if handle_id in seen_environment_handles:
+                continue
+            seen_environment_handles.add(handle_id)
+
+            print(f"🛑 Shutting down environment {task_name}...")
+            try:
+                ray.get(environment.shutdown.remote(), timeout=10)
+            except Exception as shutdown_error:
+                print(
+                    f"Environment {task_name} graceful shutdown failed: "
+                    f"{shutdown_error}"
+                )
+                try:
+                    ray.kill(environment)
+                except Exception as kill_error:
+                    print(f"Error stopping environment {task_name}: {kill_error}")
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -1593,11 +1622,10 @@ def setup(
             flush=True,
         )
     else:
-        if (
-            getattr(policy_generation, "weight_synchronizer", None) is None
-            and _needs_hf_refit_handshake(
-                backend, nccl_reshard_refit_enabled, colocated_inference
-            )
+        if getattr(
+            policy_generation, "weight_synchronizer", None
+        ) is None and _needs_hf_refit_handshake(
+            backend, nccl_reshard_refit_enabled, colocated_inference
         ):
             state_dict_info = policy.prepare_refit_info()
             if policy_generation is not None:
@@ -4358,12 +4386,6 @@ def async_grpo_train(
         processor=processor,
     )
 
-    defer_collection_until_refit = backend == "dynamo"
-    if not defer_collection_until_refit:
-        trajectory_collector.start_collection.remote(dataloader)
-        trajectory_collector.set_weight_version.remote(weight_version)
-        print("📦 Started continuous background trajectory collection")
-
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, "
         f"max_age={max_trajectory_age_steps} steps, "
@@ -4399,12 +4421,12 @@ def async_grpo_train(
             traceback.print_exc()
             return
 
-    if defer_collection_until_refit:
-        # Dynamo workers start with dummy weights. Publish the initial weight
-        # version before allowing any request to reach the freshly refit fleet.
-        ray.get(trajectory_collector.set_weight_version.remote(weight_version))
-        trajectory_collector.start_collection.remote(dataloader)
-        print("📦 Started continuous background trajectory collection")
+    # Generation must hold the policy's real weights before any backend starts
+    # collecting. In particular, vLLM and Dynamo start with dummy weights when
+    # the first refit supplies model parameters.
+    ray.get(trajectory_collector.set_weight_version.remote(weight_version))
+    trajectory_collector.start_collection.remote(dataloader)
+    print("📦 Started continuous background trajectory collection")
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -4973,8 +4995,12 @@ def async_grpo_train(
 
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
-                        trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
+                        ray.get(
+                            trajectory_collector.set_weight_version.remote(
+                                weight_version
+                            )
+                        )
+                        ray.get(trajectory_collector.resume_after_refit.remote())
 
                     timer.stop("idle/refit_bubble")
 
@@ -5435,21 +5461,8 @@ def async_grpo_train(
         except Exception as e:
             print(f"Error stopping replay buffer: {e}")
 
-        # Environments must be shut down before generation workers because
-        # they may have in-flight HTTP requests to vLLM HTTP endpoints.
-        # Killing generation first leaves environments retrying dead connections.
-        for env_dict in (task_to_env, val_task_to_env):
-            if env_dict is None:
-                continue
-            for task_name, env in env_dict.items():
-                print(f"🛑 Shutting down environment {task_name}...")
-                try:
-                    ray.get(env.shutdown.remote(), timeout=10)
-                except Exception:
-                    try:
-                        ray.kill(env)
-                    except Exception as e:
-                        print(f"Error shutting down environment {task_name}: {e}")
+        # Environments can have in-flight HTTP requests to generation workers.
+        shutdown_environments(task_to_env, val_task_to_env)
 
         print("🛑 Shutting down generation workers...")
         try:

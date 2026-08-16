@@ -88,7 +88,7 @@ class _Tokenizer:
                 function = tool_call.get("function", tool_call)
                 arguments = function.get("arguments")
                 if arguments is not None and not isinstance(arguments, dict):
-                    raise TypeError("tool arguments must be a mapping")
+                    raise TypeError("Can only get item pairs from a mapping.")
             if role == "user" and content == "hello":
                 token_ids.extend([10])
                 rendered += "hello"
@@ -163,7 +163,10 @@ def test_prepare_dynamo_chat_completion_request_first_turn() -> None:
         "model": "dummy-model",
         "messages": [{"role": "user", "content": "hello"}],
         "nvext": {"extra_fields": ["timing"], "trace": "keep-me"},
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+            "force_nonempty_content": True,
+        },
     }
 
     prepared = prepare_dynamo_chat_completion_request(
@@ -176,12 +179,19 @@ def test_prepare_dynamo_chat_completion_request_first_turn() -> None:
     assert prepared["messages"] == [{"role": "user", "content": "hello"}]
     assert "logprobs" not in prepared
     assert "return_tokens_as_token_ids" not in prepared
+    assert prepared["chat_template_kwargs"] == {
+        "enable_thinking": False,
+        "force_nonempty_content": True,
+    }
     assert prepared["nvext"] == {
         "extra_fields": ["timing", "engine_data"],
         "trace": "keep-me",
         "token_data": [10, 99],
     }
-    assert tokenizer.calls[0]["kwargs"] == {"enable_thinking": False}
+    assert tokenizer.calls[0]["kwargs"] == {
+        "enable_thinking": False,
+        "force_nonempty_content": True,
+    }
 
 
 def test_public_qwen3_tokenizer_first_turn_matches_chat_template(
@@ -456,6 +466,43 @@ def test_prepare_dynamo_chat_completion_request_normalizes_prior_tool_arguments(
     assert prepared["messages"][1]["tool_calls"][1]["function"]["arguments"] == (
         "not-json"
     )
+
+
+def test_prepare_dynamo_chat_completion_request_normalizes_tools_without_prefix() -> (
+    None
+):
+    tokenizer = _Tokenizer()
+    body = {
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "older tool call",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": '{"command":"pwd"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "user", "content": "next"},
+        ]
+    }
+
+    prepared = prepare_dynamo_chat_completion_request(
+        body,
+        tokenizer=tokenizer,
+        exclude_tools_when_tool_choice_none=True,
+    )
+
+    assert prepared["nvext"]["token_data"] == [10, 777, 2, 40, 99]
+    assert prepared["messages"][1]["tool_calls"][0]["function"]["arguments"] == (
+        '{"command":"pwd"}'
+    )
+    assert len(tokenizer.calls) == 2
 
 
 def test_prepare_dynamo_chat_completion_request_rejects_stream() -> None:
