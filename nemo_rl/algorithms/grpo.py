@@ -4348,10 +4348,9 @@ def async_grpo_train(
             traceback.print_exc()
             return
 
-    # Start trajectory collection only after generation holds real weights.
-    # The engines come up with load_format=dummy (weights arrive via the refit
-    # above); collecting before the refit can race weight loading and produce
-    # rollouts from randomly initialized weights.
+    # Start trajectory collection only after generation setup completes.
+    # Starting it earlier can overlap rollout work with the initial
+    # policy-to-generation refit and stall the refit collectives.
     collection_task = trajectory_collector.start_collection.remote(  # noqa: F841
         dataloader
     )
