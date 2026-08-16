@@ -3020,6 +3020,19 @@ class MegatronPolicyWorkerImpl(
                 ckpt_cfg=self.mcore_state.cfg.checkpoint,
                 blocking=True,
             )
+
+            # Onload model before saving it.
+            self.model = self.move_model(
+                self.model, "cuda", move_params=True, move_grads=False
+            )
+            if (
+                optimizer_path is not None
+                and self.optimizer is not None
+                and not self.optimizer_cpu_offload
+            ):
+                self.move_optimizer("cuda")
+            torch.cuda.synchronize()
+
             self.mcore_state.cfg.checkpoint.save = weights_path
 
             optimizer_to_save = None
