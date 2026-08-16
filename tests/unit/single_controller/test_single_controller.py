@@ -368,7 +368,13 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
-    ctrl._gen = SimpleNamespace(requires_kv_scale_sync=False)
+    ctrl._gen = SimpleNamespace(
+        requires_kv_scale_sync=False,
+        # Interface defaults: no samples collected, so the step-close saturation
+        # report no-ops, which is every backend but vLLM with its metrics logger on.
+        get_logger_metrics=lambda: {},
+        clear_logger_metrics=lambda: None,
+    )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()

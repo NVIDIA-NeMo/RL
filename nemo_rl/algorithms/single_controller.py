@@ -60,6 +60,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     squeeze_trailing_unit_dim,
     tensor_field,
 )
+from nemo_rl.algorithms.utils import log_generation_metrics_to_wandb
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
@@ -74,6 +75,53 @@ from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
+
+# Cadence for the step-independent telemetry pump. Matched to the watchdog's default
+# tick so the two report at a comparable rate.
+_TELEMETRY_REPORT_SECONDS = 30.0
+
+
+def _summarize_generation_saturation(
+    gen_metrics: dict[str, dict[int, list[Any]]],
+) -> dict[str, float]:
+    """Pool per-worker vLLM engine samples into one saturation summary.
+
+    ``num_pending_samples`` is vLLM's ``num_requests_waiting``, which is what separates
+    an engine fleet that is compute-bound from one that is merely under-subscribed. The
+    two are indistinguishable from the trainer's side -- both surface only as time spent
+    in generation -- but only the second can be improved by admitting more in-flight
+    prompts, so this is the measurement that decides whether a deeper lag setting can
+    buy throughput.
+
+    ``queue_busy_frac`` is reported because the mean alone hides the shape: a queue that
+    is deep for a tenth of the step and empty afterwards averages out to look idle.
+
+    Returns an empty dict when the backend collects none of these, which is the case for
+    every backend except vLLM with ``enable_vllm_metrics_logger`` set.
+    """
+
+    def pooled(name: str) -> list[float]:
+        per_worker: dict[int, list[Any]] = gen_metrics.get(name, {})
+        return [float(v) for samples in per_worker.values() for v in samples]
+
+    running = pooled("inflight_batch_sizes")
+    waiting = pooled("num_pending_samples")
+    kv_usage = pooled("kv_cache_usage_perc")
+
+    saturation: dict[str, float] = {}
+    if running:
+        saturation["requests_running_mean"] = sum(running) / len(running)
+        saturation["requests_running_max"] = max(running)
+    if waiting:
+        saturation["requests_waiting_mean"] = sum(waiting) / len(waiting)
+        saturation["requests_waiting_max"] = max(waiting)
+        saturation["queue_busy_frac"] = sum(1.0 for v in waiting if v > 0) / len(
+            waiting
+        )
+    if kv_usage:
+        saturation["kv_cache_usage_mean"] = sum(kv_usage) / len(kv_usage)
+        saturation["kv_cache_usage_max"] = max(kv_usage)
+    return saturation
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -232,11 +280,12 @@ class SingleControllerActor:
 
         await self._maybe_restore_replay_buffer()
 
-        # Start the rollout and train pumps, plus the watchdog
+        # Start the rollout and train pumps, plus the watchdog and telemetry
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
         watchdog_task = asyncio.create_task(self._watchdog_pump())
-        tasks = (rollout_task, train_task, watchdog_task)
+        telemetry_task = asyncio.create_task(self._telemetry_report_pump())
+        tasks = (rollout_task, train_task, watchdog_task, telemetry_task)
         try:
             done, _ = await asyncio.wait(
                 set(tasks), return_when=asyncio.FIRST_COMPLETED
@@ -708,9 +757,9 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            # TODO: per-step train_data jsonl dump, vllm metrics logger,
-            #   histogram log, rollout_metrics, seq_logprob_error_metrics,
-            #   pretty-print "Training Results" block, print_performance_metrics.
+            # TODO: per-step train_data jsonl dump, rollout_metrics,
+            #   seq_logprob_error_metrics, pretty-print "Training Results" block,
+            #   print_performance_metrics.
             print(f"step_metrics={step_metrics}", flush=True)
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
@@ -718,6 +767,7 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 timing_metrics, step=self._train_steps, prefix="timing/train"
             )
+            await self._report_generation_saturation()
             self._timer.reset()
 
             # min sample version refers to the version each consumed sample was
@@ -770,9 +820,28 @@ class SingleControllerActor:
 
             metrics = dict(stats.as_metrics())
             metrics["rollout/inflight"] = float(self._inflight_rollouts)
+            metrics["rollout/buffered"] = float(len(self._buffer))
             metrics["rollout/idle_s"] = idle_s
             metrics["rollout/train_steps"] = float(self._train_steps)
             self._logger.log_metrics(metrics, step=self._train_steps)
+
+            # Occupancy against the two capacities that bound it, which is the series
+            # the async knobs are tuned against. Buffer depth was previously readable
+            # only from the train pump's stall warning, so a run that never stalled
+            # reported it nowhere. Printed as well as logged because sizing these
+            # knobs is usually done from a job's stdout, and printed here rather than
+            # from a reporter of its own so the line and the series it summarizes
+            # cannot drift onto different cadences.
+            print(
+                f"occupancy (train_step={self._train_steps}): "
+                f"inflight={self._inflight_rollouts}/"
+                f"{self._async_cfg.max_inflight_prompts} "
+                f"buffered={len(self._buffer)}/"
+                f"{self._async_cfg.max_buffered_rollouts} "
+                f"committed={stats.committed} skipped={stats.skipped} "
+                f"trainer_v={self._trainer_version}",
+                flush=True,
+            )
 
             if watchdog_cfg.gym_subprocess_check:
                 # Bounded by one tick so a wedged environment cannot stop the pump, and
@@ -837,6 +906,99 @@ class SingleControllerActor:
             except Exception as error:
                 problems.append(f"environment {env_name!r} reported unhealthy: {error}")
         return problems
+
+    async def _report_generation_saturation(self) -> None:
+        """Log engine saturation for the step just closed, and clear the samples.
+
+        This is the metrics channel: a closed step gives the samples a step index to be
+        logged against, so the series here is the one to read in W&B or TensorBoard. The
+        stdout line is deliberately one line -- the numbers are in the series.
+
+        No-ops on backends that collect none of this, which is everything except vLLM
+        with ``enable_vllm_metrics_logger`` set.
+        """
+        # Collection does a blocking ray.get, so keep it off the event loop the rollout
+        # pump shares.
+        gen_metrics = await asyncio.to_thread(self._gen.get_logger_metrics)
+        if not gen_metrics:
+            return
+
+        saturation = _summarize_generation_saturation(gen_metrics)
+        if not saturation:
+            return
+
+        summary = " ".join(f"{k}={v:.3f}" for k, v in saturation.items())
+        engines = len(gen_metrics.get("inflight_batch_sizes", {}))
+        print(
+            f"engine saturation (engines={engines}): {summary}",
+            flush=True,
+        )
+        self._logger.log_metrics(
+            saturation, step=self._train_steps, prefix="generation"
+        )
+
+        if self._master_config.logger["wandb_enabled"]:
+            # W&B can block on the network; the rollout pump shares this loop.
+            await asyncio.to_thread(
+                log_generation_metrics_to_wandb,
+                gen_metrics,
+                self._train_steps,
+                self._master_config.policy["generation"]["vllm_cfg"][
+                    "vllm_metrics_logger_interval"
+                ],
+                self._logger,
+            )
+
+        await asyncio.to_thread(self._gen.clear_logger_metrics)
+
+    async def _telemetry_report_pump(self) -> None:
+        """Print engine saturation on a fixed cadence, independent of step boundaries.
+
+        The step-close reporter above only runs when a step closes, so a run that stalls
+        before completing one emits nothing at all -- precisely the run where the numbers
+        decide what to do next. This closes that gap on stdout only: with no step to log
+        against there is no meaningful step index, and writing the same ``generation/``
+        keys from two places at one step index would just have the last writer win.
+        Nothing is cleared here either, so the step-close reporting is unaffected.
+
+        Never exits, including on error. It is one of the tasks ``run`` waits on, so
+        returning would be read as a pump finishing and would stop the training loop over
+        a telemetry failure.
+        """
+        collect: Optional[asyncio.Task[dict[str, dict[int, list[Any]]]]] = None
+        while True:
+            await asyncio.sleep(_TELEMETRY_REPORT_SECONDS)
+
+            if collect is None:
+                collect = asyncio.create_task(
+                    asyncio.to_thread(self._gen.get_logger_metrics)
+                )
+            done, _ = await asyncio.wait({collect}, timeout=_TELEMETRY_REPORT_SECONDS)
+            if not done:
+                # A collection outliving its own cadence is itself the signal that the
+                # fleet is unreachable. Keep the handle and try again next tick rather
+                # than awaiting it -- an unbounded await is how the environment health
+                # probe used to wedge the watchdog -- and rather than issuing a second
+                # one, which would pile a thread up per tick behind the wedged first.
+                continue
+
+            try:
+                gen_metrics = collect.result()
+            except Exception as error:
+                # Telemetry must not end a run; this is whatever Ray raises for an
+                # unreachable worker.
+                print(f"WARNING: engine saturation unavailable -- {error}", flush=True)
+                gen_metrics = {}
+            collect = None
+
+            saturation = _summarize_generation_saturation(gen_metrics)
+            if not saturation:
+                continue
+            summary = " ".join(f"{k}={v:.3f}" for k, v in saturation.items())
+            print(
+                f"engine saturation (train_step={self._train_steps}): {summary}",
+                flush=True,
+            )
 
     async def _abort_stale_inflight(self) -> int:
         """Abort in-flight rollouts that the sampler can no longer select."""
