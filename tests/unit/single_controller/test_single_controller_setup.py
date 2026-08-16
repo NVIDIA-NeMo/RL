@@ -486,6 +486,7 @@ class TestSetup:
             enable_router_replay=False,
             routed_experts_dtype="int16",
             use_fastokens=False,
+            rollout_fan_in=mc.async_rl.max_inflight_prompts,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 

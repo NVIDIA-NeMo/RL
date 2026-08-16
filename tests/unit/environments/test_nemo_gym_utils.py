@@ -21,9 +21,13 @@ import pytest
 
 from nemo_rl.environments import nemo_gym as nemo_gym_mod
 from nemo_rl.environments.nemo_gym import (
+    NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM,
+    RAY_DEFAULT_ASYNC_ACTOR_MAX_CONCURRENCY,
     _detect_invalid_tool_call_and_malformed_thinking,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    resolve_nemo_gym_max_concurrency,
+    validate_nemo_gym_actor_concurrency,
 )
 
 
@@ -97,3 +101,46 @@ def test_get_nemo_gym_uv_cache_dir_uses_uv_inside_container(monkeypatch):
         lambda *args, **kwargs: b"  /root/.cache/uv\n",
     )
     assert get_nemo_gym_uv_cache_dir() == "/root/.cache/uv"
+
+
+class TestResolveNemoGymMaxConcurrency:
+    """max_concurrency sizing for the single NemoGym rollout actor."""
+
+    def test_derives_from_fan_in_when_unset(self):
+        assert (
+            resolve_nemo_gym_max_concurrency(None, rollout_fan_in=5120)
+            == 5120 + NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM
+        )
+
+    def test_derived_default_admits_a_fan_in_past_rays_default(self):
+        """The 6K shape: Ray's 1000 default is what stalled it, so never return it."""
+        resolved = resolve_nemo_gym_max_concurrency(None, rollout_fan_in=5120)
+
+        assert resolved > RAY_DEFAULT_ASYNC_ACTOR_MAX_CONCURRENCY
+
+    def test_explicit_value_wins(self):
+        assert resolve_nemo_gym_max_concurrency(9000, rollout_fan_in=5120) == 9000
+
+    def test_explicit_value_equal_to_fan_in_is_allowed(self):
+        assert resolve_nemo_gym_max_concurrency(640, rollout_fan_in=640) == 640
+
+    def test_rejects_explicit_value_below_fan_in(self):
+        with pytest.raises(ValueError, match="below the rollout fan-in"):
+            resolve_nemo_gym_max_concurrency(1000, rollout_fan_in=5120)
+
+    def test_rejects_non_positive_fan_in(self):
+        with pytest.raises(ValueError, match="rollout_fan_in must be positive"):
+            resolve_nemo_gym_max_concurrency(None, rollout_fan_in=0)
+
+
+class TestValidateNemoGymActorConcurrency:
+    def test_unset_is_a_no_op(self):
+        validate_nemo_gym_actor_concurrency(None, rollout_fan_in=5120)
+
+    def test_error_names_both_knobs(self):
+        with pytest.raises(ValueError) as excinfo:
+            validate_nemo_gym_actor_concurrency(1000, rollout_fan_in=5120)
+
+        message = str(excinfo.value)
+        assert "env.nemo_gym.max_concurrency" in message
+        assert "async_rl.max_inflight_prompts" in message
