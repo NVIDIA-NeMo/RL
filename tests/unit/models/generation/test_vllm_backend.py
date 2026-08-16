@@ -302,10 +302,20 @@ def test_batched_bf16_trtllm_layout_matches_vllm_expertwise_converter(
 
 @pytest.mark.vllm
 def test_batched_bf16_trtllm_layout_is_scoped_to_reload_finalize(monkeypatch):
+    import threading
+
     from nemo_rl.models.generation.vllm import vllm_backend
     from vllm.model_executor.layers.fused_moe.oracle import unquantized
 
-    original_converter = MagicMock()
+    original_result = (object(), object())
+    batched_result = (object(), object())
+    original_converter = MagicMock(return_value=original_result)
+    batched_converter = MagicMock(return_value=batched_result)
+    monkeypatch.setattr(
+        vllm_backend,
+        "_convert_bf16_moe_weights_to_trtllm_block_layout_batched",
+        batched_converter,
+    )
     monkeypatch.setattr(
         unquantized,
         "convert_moe_weights_to_flashinfer_trtllm_block_layout",
@@ -331,10 +341,7 @@ def test_batched_bf16_trtllm_layout_is_scoped_to_reload_finalize(monkeypatch):
     )
 
     def finalize_layerwise_reload(_model, _model_config):
-        assert (
-            unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
-            is vllm_backend._convert_bf16_moe_weights_to_trtllm_block_layout_batched
-        )
+        assert unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
 
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
@@ -343,16 +350,28 @@ def test_batched_bf16_trtllm_layout_is_scoped_to_reload_finalize(monkeypatch):
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
     with ext._weight_update_lifecycle("collective") as finalize:
-        assert (
+        active_converter = (
             unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
-            is vllm_backend._convert_bf16_moe_weights_to_trtllm_block_layout_batched
         )
+        assert active_converter({}, object(), object()) == batched_result
+
+        thread_results = []
+        thread = threading.Thread(
+            target=lambda: thread_results.append(
+                active_converter({}, object(), object())
+            )
+        )
+        thread.start()
+        thread.join()
+        assert thread_results == [original_result]
         finalize()
 
     assert (
         unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
         is original_converter
     )
+    batched_converter.assert_called_once()
+    original_converter.assert_called_once()
 
 
 class _DeferredReloadLayer(torch.nn.Module):
