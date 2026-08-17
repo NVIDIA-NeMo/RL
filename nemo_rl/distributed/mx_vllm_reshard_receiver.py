@@ -14,6 +14,8 @@ the version preflight and confines the one pinned private cleanup dependency
 
 from __future__ import annotations
 
+import json
+import time
 from typing import Any
 
 
@@ -42,6 +44,7 @@ class MxVllmReshardReceiver:
 
         self._num_trainer_sources = num_trainer_sources
         self._timeout = timeout
+        self._global_rank = global_rank
         self._client = MxClient(server_url=server_url)
         self._rendezvous = MxReshardRendezvous(
             self._client,
@@ -78,10 +81,17 @@ class MxVllmReshardReceiver:
 
     def update_weights(self, version: int) -> dict[str, Any]:
         """Require every visible trainer stamp before MX can install weights."""
+        # Timed separately because MX_REFIT_STAGE records cover only the install
+        # that follows, leaving the majority of a MoE refit unattributed. The
+        # quorum check costs one list_sources plus a get_metadata round-trip per
+        # trainer rank, and each response carries that rank's whole shard table,
+        # so it scales with sources rather than with bytes moved.
+        discover_t0 = time.perf_counter()
         payloads = self._rendezvous.discover_trainers(
             self._num_trainer_sources,
             timeout=self._timeout,
         )
+        discover_s = time.perf_counter() - discover_t0
         observed = [payload.publisher_step for payload in payloads]
         if len(observed) != self._num_trainer_sources or any(
             step != version for step in observed
@@ -90,7 +100,25 @@ class MxVllmReshardReceiver:
                 f"ModelExpress publisher version mismatch: requested {version}, "
                 f"observed {observed}"
             )
-        return self._receiver.update_weights(version, timeout=self._timeout)
+        install_t0 = time.perf_counter()
+        result = self._receiver.update_weights(version, timeout=self._timeout)
+        install_s = time.perf_counter() - install_t0
+        print(
+            "MX_RECV_PHASE "
+            + json.dumps(
+                {
+                    "schema": "mx-recv-phase-v1",
+                    "step": version,
+                    "rank": self._global_rank,
+                    "discover_s": round(discover_s, 6),
+                    "mx_update_s": round(install_s, 6),
+                    "tensors_seen": sum(len(p.tensors) for p in payloads),
+                    "trainer_sources": len(payloads),
+                }
+            ),
+            flush=True,
+        )
+        return result
 
     def shutdown(self) -> None:
         """Release #635's receiver-owned NIXL manager and both gRPC clients."""
