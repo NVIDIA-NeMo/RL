@@ -121,6 +121,7 @@ class MegatronGeneration(GenerationInterface):
         self.cfg: MCoreGenerationConfig = config["generation"]
         # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
+        self.current_generate_dp_shard_idx = 0
 
         if policy is not None:
             # Reuse the existing training policy.
@@ -190,14 +191,19 @@ class MegatronGeneration(GenerationInterface):
         """Receive updated weights from the training cluster via collective communication."""
         return self._policy.swap_weights_via_reshard(is_source=False)
 
+    @property
+    def sharding_annotations(self):
+        """Parallelism layout for the underlying Megatron policy workers."""
+        return self._policy.sharding_annotations
+
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using the Megatron generation backend.
 
-        mcore's data-parallel coordinator only accepts requests from DP rank 0 —
-        the other workers' engine loops drain the coordinator queue but never
-        receive a Python-side call. So we dispatch straight to worker 0.
+        Prompts are sharded across DP coordinator leaders (mirroring the vLLM
+        backend). Each leader submits its shard to its replica's mcore
+        coordinator; non-leader TP/PP ranks are not invoked.
 
         Args:
             data: BatchedDataDict containing input_ids and input_lengths.
@@ -206,25 +212,72 @@ class MegatronGeneration(GenerationInterface):
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec.
         """
-        future = self._policy.worker_group.run_single_worker_single_data(
-            method_name="generate",
-            worker_idx=0,
-            data=data,
-            greedy=greedy,
+        assert isinstance(data, BatchedDataDict), (
+            f"data must be a BatchedDataDict, got type: {type(data)}"
         )
-        return ray.get(future)
+        assert "input_ids" in data and "input_lengths" in data, (
+            "input_ids and input_lengths are required in data for Megatron generation"
+        )
+
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        sharded_data = data.shard_by_batch_size(dp_size, allow_uneven_shards=True)
+        future_bundle = self._policy.worker_group.run_all_workers_sharded_data(
+            "generate",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=None,
+            output_is_replicated=None,
+            common_kwargs={"greedy": greedy},
+        )
+        results = self._policy.worker_group.get_all_worker_results(future_bundle)
+        combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
+            results,
+            pad_value_dict={"output_ids": self.cfg["_pad_token_id"]},
+        )
+
+        required_keys = [
+            "output_ids",
+            "generation_lengths",
+            "unpadded_sequence_lengths",
+            "logprobs",
+        ]
+        missing_keys = [key for key in required_keys if key not in combined]
+        if missing_keys:
+            raise ValueError(
+                f"Missing required keys for GenerationOutputSpec: {missing_keys}"
+            )
+
+        return combined
 
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
-        """Generate asynchronously, yielding `(index, batch)` tuples as they complete."""
-        worker = self._policy.worker_group.workers[0]
+        """Generate asynchronously, yielding `(index, batch)` tuples as they complete.
+
+        Single-sample requests are round-robin dispatched across DP coordinator
+        leaders, matching the vLLM async rollout path.
+        """
+        assert isinstance(data, BatchedDataDict), (
+            f"data must be a BatchedDataDict, got type: {type(data)}"
+        )
+        assert data.size == 1, (
+            "Megatron generate_async handles one sample per call; batch outside this method."
+        )
+
+        leader_worker_idx = self._policy.worker_group.get_dp_leader_worker_idx(
+            self.current_generate_dp_shard_idx
+        )
+        worker = self._policy.worker_group.workers[leader_worker_idx]
         futures = worker.generate_async.options(num_returns="streaming").remote(
             data=data, greedy=greedy
         )
+        self.current_generate_dp_shard_idx = (
+            self.current_generate_dp_shard_idx + 1
+        ) % self._policy.worker_group.dp_size
+
         async for result_ref in futures:
             index, result_batch = await result_ref
-            result_batch["gen_leader_worker_idx"] = [0]
+            result_batch["gen_leader_worker_idx"] = [leader_worker_idx]
             yield index, result_batch
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
@@ -241,9 +294,15 @@ class MegatronGeneration(GenerationInterface):
             not self.dp_openai_server_base_urls
             and self.cfg["mcore_generation_config"]["expose_http_server"]
         ):
-            url_futures = self._policy.worker_group.run_all_workers_single_data(
-                "report_dp_openai_server_base_url"
-            )
+            url_futures = []
+            for dp_idx in range(self._policy.worker_group.dp_size):
+                worker_idx = self._policy.worker_group.get_dp_leader_worker_idx(dp_idx)
+                url_futures.append(
+                    self._policy.worker_group.run_single_worker_single_data(
+                        "report_dp_openai_server_base_url",
+                        worker_idx=worker_idx,
+                    )
+                )
             self.dp_openai_server_base_urls = [
                 url for url in ray.get(url_futures) if url is not None
             ]
