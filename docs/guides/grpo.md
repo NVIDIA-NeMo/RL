@@ -504,7 +504,7 @@ The table below covers the metrics reported by `ClippedPGLossFn` (the GRPO/PPO f
 | **Keyed on a different parameter** | `sampling_importance_ratio` follows `sequence_level_importance_ratios`; `is_oob_ratio` is sequence-normalized only for `truncated_importance_sampling_type: seq-mask-tis` |
 | **Not normalized** — raw counts, per-microbatch means, or extrema combined with min/max | `num_valid_samples`, `positive_nll_loss`, `probs_ratio_min`, `probs_ratio_max`, `probs_ratio_clamped_min`, `probs_ratio_clamped_max` |
 
-The authoritative list is the [`metric_normalizations` table in `ClippedPGLossFn`](https://github.com/NVIDIA-NeMo/RL/blob/e98357616c0bb8fb13140841e225583b5cc36b0e/nemo_rl/algorithms/loss/loss_functions.py#L335-L371), which is kept in sync with the metrics the loss returns.
+The authoritative list is the [`metric_normalizations` table in `ClippedPGLossFn`](https://github.com/NVIDIA-NeMo/RL/blob/4a1454bf430624786251d14ba0197169c8e68a5c/nemo_rl/algorithms/loss/loss_functions.py#L335-L371), which is kept in sync with the metrics the loss returns.
 
 #### Choosing a setting
 
