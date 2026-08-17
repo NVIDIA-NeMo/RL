@@ -1773,8 +1773,7 @@ def setup_model_and_optimizer(
             raise NotImplementedError(
                 "MCore colocated reshard is not supported with PEFT."
             )
-        draft_cfg = policy_cfg.get("draft")
-        if draft_cfg is not None and draft_cfg.get("enabled"):
+        if draft_enabled:
             raise NotImplementedError(
                 "MCore colocated reshard is not supported with draft models."
             )

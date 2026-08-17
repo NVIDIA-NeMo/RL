@@ -622,7 +622,7 @@ class MegatronPolicyWorkerImpl(
 
         # Colocated reshard: build a dedicated inference-layout model container.
         self.inference_model = None
-        self._colocated_reshard_plan_ready = False
+        self._swap_weights_plan_prepared = False
         self._inference_model_offloaded = False
 
         # vars used for refit
@@ -2749,8 +2749,7 @@ class MegatronPolicyWorkerImpl(
         """Build the dedicated inference-layout model planned at setup."""
         plan = self._colocated_reshard_plan
         inference_mcfg = plan.inference_megatron_cfg
-        inference_config = copy.deepcopy(config)
-        inference_config["megatron_cfg"] = inference_mcfg
+        inference_config = {**config, "megatron_cfg": inference_mcfg}
 
         print(
             "[colocated-reshard] building dedicated inference model "

@@ -27,6 +27,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.megatron.config import (
     MCoreGenerationConfig,
+    dedicated_inference_megatron_cfg,
     merged_inference_megatron_cfg,
 )
 from nemo_rl.models.policy import PolicyConfig
@@ -53,13 +54,22 @@ class MegatronGeneration(GenerationInterface):
 
     @classmethod
     def nvlink_domain_span(cls, config: PolicyConfig) -> int:
-        """Largest GPU group requiring full NVLink connectivity."""
-        megatron_cfg = cls.effective_megatron_cfg(config)
+        """Largest GPU group requiring full NVLink connectivity.
+
+        Colocated reshard hosts a second, inference-layout model on the same ranks.
+        """
+        layouts = [cls.effective_megatron_cfg(config)]
+        if config["generation"]["colocated"]["enabled"]:
+            inference_mcfg = dedicated_inference_megatron_cfg(config)
+            if inference_mcfg is not None:
+                layouts.append(inference_mcfg)
         return max(
-            megatron_cfg["tensor_model_parallel_size"]
-            * megatron_cfg["context_parallel_size"],
-            megatron_cfg.get("expert_tensor_parallel_size", 1)
-            * megatron_cfg.get("expert_model_parallel_size", 1),
+            max(
+                mcfg["tensor_model_parallel_size"] * mcfg["context_parallel_size"],
+                mcfg.get("expert_tensor_parallel_size", 1)
+                * mcfg.get("expert_model_parallel_size", 1),
+            )
+            for mcfg in layouts
         )
 
     @classmethod

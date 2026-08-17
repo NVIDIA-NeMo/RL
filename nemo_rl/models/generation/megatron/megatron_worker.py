@@ -907,7 +907,7 @@ class MegatronGenerationRefitMixin:
             self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
 
         # Build + cache the same-rank reshard plan once, before the first CUDA-graph capture.
-        if not self._colocated_reshard_plan_ready:
+        if not self._swap_weights_plan_prepared:
             prepare_swap_model_weights(
                 src_model=self.model,
                 target_model=inference_model,
@@ -915,7 +915,7 @@ class MegatronGenerationRefitMixin:
                 src_rank_offset=0,
                 dst_rank_offset=0,
             )
-            self._colocated_reshard_plan_ready = True
+            self._swap_weights_plan_prepared = True
 
         swap_model_weights(
             self.model,
