@@ -182,6 +182,8 @@ def restore_te_gemm_cublas_pinned_patch() -> None:
     if ws_fn is not None and hasattr(ws_fn, "cache_clear"):
         try:
             ws_fn.cache_clear()
+        except Exception:  # pylint: disable=broad-except
+            pass
     _TE_CUBLAS_WS_SIZE_FN_ORIG = None
 
 
