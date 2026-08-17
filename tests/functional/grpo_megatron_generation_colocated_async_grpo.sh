@@ -33,7 +33,6 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.logprob_batch_size=4 \
     policy.train_micro_batch_size=1 \
     policy.generation.backend=megatron \
-    policy.generation.mcore_generation_config.async_engine=true \
     grpo.async_grpo.enabled=true \
     grpo.async_grpo.max_trajectory_age_steps=1 \
     grpo.async_grpo.in_flight_weight_updates=true \
