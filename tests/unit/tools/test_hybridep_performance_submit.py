@@ -23,6 +23,12 @@ SUBMIT_SCRIPT = (
     / "h100-hybridep-performance-20260817"
     / "submit.sh"
 )
+WARMUP_SCRIPT = (
+    Path(__file__).resolve().parents[3]
+    / "experiments"
+    / "h100-hybridep-performance-20260817"
+    / "warm_hybridep_cache.sbatch"
+)
 
 
 def _run(command: list[str], cwd: Path) -> str:
@@ -158,3 +164,13 @@ def test_queued_job_rejects_source_revision_change(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "source revision changed after submission" in result.stderr
     assert not Path(environment["FAKE_UV_MARKER"]).exists()
+
+
+def test_hybridep_warmup_uses_locked_mcore_resolution() -> None:
+    script = WARMUP_SCRIPT.read_text()
+
+    assert "uv sync" in script
+    assert "--locked" in script
+    assert "--extra mcore" in script
+    assert 'UV_PROJECT_ENVIRONMENT="${warm_venv}"' in script
+    assert "import torch; print" not in script

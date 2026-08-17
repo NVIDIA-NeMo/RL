@@ -23,6 +23,7 @@ if [[ ${UV_CACHE_DIR_OVERRIDE} != /* ]]; then
 fi
 
 mkdir -p "${UV_CACHE_DIR_OVERRIDE}"
+export PROJECT_ROOT UV_CACHE_DIR_OVERRIDE
 
 # shellcheck disable=SC2016  # The container shell expands warm_venv.
 srun \
@@ -32,14 +33,12 @@ srun \
   bash -lc '
     set -euo pipefail
     export UV_CACHE_DIR=/root/.cache/uv
-    warm_venv=/tmp/hybridep-cache-warm
-    uv venv --system-site-packages "${warm_venv}"
-    torch_requirement=$("${warm_venv}/bin/python" -c \
-      "import torch; print(f\"torch=={torch.__version__}\")")
-    uv pip install \
-      --python "${warm_venv}/bin/python" \
-      --no-deps \
-      "${torch_requirement}" \
-      "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e"
+    warm_venv="/tmp/hybridep-cache-warm-${SLURM_JOB_ID}"
+    export UV_PROJECT_ENVIRONMENT="${warm_venv}"
+    uv sync \
+      --locked \
+      --extra mcore \
+      --directory "${PROJECT_ROOT}" \
+      --no-install-project
     "${warm_venv}/bin/python" -c "import deep_ep; print(deep_ep.__file__)"
   '
