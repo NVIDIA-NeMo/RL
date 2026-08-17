@@ -554,9 +554,7 @@ class AsyncTrajectoryCollector:
                 "async_engine", False
             )
         elif backend == "megatron":
-            is_async_engine = generation_cfg.get("mcore_generation_config", {}).get(
-                "async_engine", False
-            )
+            is_async_engine = True
         elif backend == "trtllm":
             assert generation_cfg.get("trtllm_cfg", {}).get("async_engine", False), (
                 "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "

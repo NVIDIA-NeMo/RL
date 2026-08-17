@@ -39,6 +39,7 @@ from nemo_rl.algorithms.grpo import (
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
+    _needs_hf_refit_handshake,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
@@ -4628,3 +4629,25 @@ def test_validate_use_kl_in_reward_allows_zero_kl_penalty():
 def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
     fields = _train_fields_for_step(skip_prev_logprobs)
     assert ("prev_logprobs" in fields) is expect_prev
+
+
+@pytest.mark.parametrize(
+    "backend, nccl_reshard, colocated, expected",
+    [
+        # MInf refits through mcore's swap_model_weights and never touches HF
+        # names; a revert here is silent (setup time + peak memory only), so
+        # every megatron combination must stay False.
+        ("megatron", False, True, False),
+        ("megatron", False, False, False),
+        ("megatron", True, False, False),
+        ("megatron", True, True, False),
+        # vLLM keeps the handshake, except NCCL-reshard non-colocated, which
+        # builds its own refit info.
+        ("vllm", False, True, True),
+        ("vllm", False, False, True),
+        ("vllm", True, False, False),
+        ("vllm", True, True, True),
+    ],
+)
+def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
+    assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
