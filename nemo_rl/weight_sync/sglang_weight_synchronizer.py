@@ -124,8 +124,13 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         )
 
     def _refit(self, buffer_size_bytes: int) -> None:
+        from nemo_rl.models.generation.sglang.config import (
+            get_sglang_quantization_scheme,
+        )
+
         sglang_quantization_cfg = self._quantization_cfg()
-        target_precision = sglang_quantization_cfg.get("scheme", "bf16")
+        # Validating read: a misspelled scheme must raise, not fall back to BF16.
+        target_precision = get_sglang_quantization_scheme(sglang_quantization_cfg)
 
         (
             rollout_engines,
