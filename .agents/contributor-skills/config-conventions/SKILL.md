@@ -16,7 +16,7 @@ We are **gradually migrating** the config schema from `typing.TypedDict` (v1) to
 
 Use the right tool for the job. **v2 (the new convention):**
 
-- **`pydantic.BaseModel` — v2, user-facing config (the new default).** Any class the user touches via YAML — currently the top-level `MasterConfig` of each algorithm (`grpo`, `dpo`, `sft`, `rm`, `distillation`, `eval`) and a few shared schemas like `ClippedPGLossConfig` — is a `BaseModel` declared with `extra="allow"` so unknown keys don't break older configs:
+- **`pydantic.BaseModel` — v2, user-facing config (the new default).** Any class the user touches via YAML — the top-level `MasterConfig` of every algorithm (`grpo`, `ppo`, `dpo`, `sft`, `rm`, `distillation`, `opd`, `eval`, single-controller) and most algorithm-level sub-configs (`GRPOConfig`, `AsyncGRPOConfig`, `ClippedPGLossConfig`, ...) — is a `BaseModel`, normally declared with `extra="allow"` so unknown keys don't break older configs (rarely `extra="forbid"` where strict validation is intended, e.g. `MseValueLossConfig`):
 
   ```python
   from pydantic import BaseModel
@@ -33,7 +33,7 @@ Use the right tool for the job. **v2 (the new convention):**
 
 **v1 (legacy, being migrated away):**
 
-- **`typing.TypedDict` — v1, legacy / not-yet-migrated user-facing config.** Most nested sub-configs (e.g. `GRPOConfig`, `RewardScalingConfig`, `AsyncGRPOConfig`) are still `TypedDict`. Continue to maintain them with the same defaults rules below until they are migrated to `BaseModel`. Use `typing.NotRequired` to mark optional attributes. **Do not add new `TypedDict`-based config classes.**
+- **`typing.TypedDict` — v1, legacy / not-yet-migrated user-facing config.** The remaining `TypedDict` configs live mostly outside the algorithm modules — e.g. `PolicyConfig` and its nested blocks (`DTensorConfig`, `MegatronConfig`, ...) in `nemo_rl/models/policy/__init__.py`, plus `ClusterConfig`, `CheckpointingConfig`, `LoggerConfig`, and the environment configs. Continue to maintain them with the same defaults rules below until they are migrated to `BaseModel`. Use `typing.NotRequired` to mark optional attributes. **Do not add new `TypedDict`-based config classes.**
 
 When in doubt: *is this class populated from a user-edited YAML?* If yes → `BaseModel` (or legacy `TypedDict`). If no → `@dataclass`.
 
@@ -114,10 +114,11 @@ When accessing a `NotRequired` field, use an `in` check or `.get(key)` / `.get(k
 **Do:**
 ```python
 # .get() with None (not a hidden default)
-stop_properly_penalty_coef = cfg.get("stop_properly_penalty_coef", None)
+if checkpointing_cfg.get("model_save_format", None) is not None:
+    ...
 
 # Truthiness check for optional booleans
-if master_config.grpo.get("skip_reference_policy_logprobs_calculation"):
+if megatron_cfg.get("enabled") and megatron_cfg.get("use_fused_linear_logprobs"):
     ...
 
 # Nested NotRequired: check presence at each level explicitly
