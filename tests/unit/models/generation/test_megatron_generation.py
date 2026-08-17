@@ -123,7 +123,6 @@ basic_megatron_test_config: PolicyConfig = {
             "resources": {"gpus_per_node": None, "num_nodes": None},
         },
         "mcore_generation_config": {
-            "async_engine": False,
             "max_model_len": 1024,
             "cuda_graph_impl": "local",
             "inference_cuda_graph_scope": "block",
@@ -363,7 +362,6 @@ def test_megatron_policy_generation(
 async def test_megatron_policy_generation_async(cluster, test_input_data, tokenizer):
     """Standalone Megatron async generation."""
     config = deepcopy(basic_megatron_test_config)
-    config["generation"]["mcore_generation_config"]["async_engine"] = True
     mg = None
     try:
         mg = MegatronGeneration(config=config, tokenizer=tokenizer, cluster=cluster)

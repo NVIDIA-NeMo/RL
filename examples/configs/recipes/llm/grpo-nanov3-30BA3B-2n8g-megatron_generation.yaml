@@ -34,7 +34,6 @@ policy:
       tensor_model_parallel_size: 2
       expert_model_parallel_size: 8
       sequence_parallel: true
-      async_engine: true
     colocated:
       enabled: false
       resources:
