@@ -39,7 +39,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         logger={"log_dir": "/tmp/logs"},
         checkpointing={"enabled": False},
         async_rl=SimpleNamespace(
-            watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0)
+            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0)
         ),
         grpo=GRPOConfig(async_grpo=None),
     )

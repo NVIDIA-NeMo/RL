@@ -172,8 +172,10 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # shard from re-entering rotation on one lucky probe.
     healthy_threshold: PositiveInt = 2
     # How a shard is chosen. least_outstanding steers away from a slow or wedged shard
-    # without needing that diagnosed first.
-    selection: Literal["least_outstanding", "round_robin"] = "least_outstanding"
+    # without needing that diagnosed first. A Literal of one, like on_dead_shard below:
+    # nothing dispatches on this value, so accepting "round_robin" would silently give
+    # the caller least_outstanding anyway.
+    selection: Literal["least_outstanding"] = "least_outstanding"
     # What to do once a shard is quarantined. Recovery modes arrive with the
     # communicator rebuild.
     on_dead_shard: Literal["fail_fast"] = "fail_fast"
@@ -195,7 +197,7 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     def _check_consistent(self) -> "FleetHealthConfig":
         if self.probe_timeout_s >= self.probe_interval_s:
             raise ValueError(
-                f"async_rl.fleet_health.probe_timeout_s ({self.probe_timeout_s}) must "
+                f"async_rl.generation_fleet_health.probe_timeout_s ({self.probe_timeout_s}) must "
                 f"be < probe_interval_s ({self.probe_interval_s}); otherwise probes "
                 "overlap and a slow fleet is reported as a dead one."
             )
@@ -208,7 +210,7 @@ class FleetHealthConfig(BaseModel, extra="allow"):
 _GYM_RETRY_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 520})
 
 
-class PolicyRouterConfig(BaseModel, extra="allow"):
+class GenerationRouterConfig(BaseModel, extra="allow"):
     """NeMo-RL-owned HTTP router placed in front of the vLLM fleet for NeMo-Gym.
 
     Gym selects a policy endpoint by static round-robin over a list fixed at process
@@ -223,16 +225,42 @@ class PolicyRouterConfig(BaseModel, extra="allow"):
     # URL Gym holds never changes.
     port_range_low: PositiveInt = 6000
     port_range_high: PositiveInt = 6099
-    # Router -> backend deadline. This is the timeout Gym's own client never sets.
+    # Router -> backend deadline, covering the whole generation. This is the timeout
+    # Gym's own client never sets.
     backend_timeout_s: PositiveFloat = 600.0
+    # TCP handshake deadline, separate from the generation deadline above. A connect to
+    # a local vLLM either completes in milliseconds or never will, so giving it the full
+    # backend budget only means a black-holed SYN parks the rollout for that long.
+    connect_timeout_s: PositiveFloat = 5.0
     # Status returned when no shard is eligible.
     no_healthy_backend_status: PositiveInt = 409
 
     @model_validator(mode="after")
-    def _check_status_is_not_retried_by_gym(self) -> "PolicyRouterConfig":
+    def _check_port_range(self) -> "GenerationRouterConfig":
+        if self.port_range_low >= self.port_range_high:
+            raise ValueError(
+                f"async_rl.generation_router.port_range_low ({self.port_range_low}) must be "
+                f"< port_range_high ({self.port_range_high}). Transposed, this surfaces "
+                "at setup as 'ValueError: empty range for randrange()' from deep inside "
+                "port allocation, far from the typo."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_connect_timeout_fits(self) -> "GenerationRouterConfig":
+        if self.connect_timeout_s > self.backend_timeout_s:
+            raise ValueError(
+                f"async_rl.generation_router.connect_timeout_s ({self.connect_timeout_s}) "
+                f"exceeds backend_timeout_s ({self.backend_timeout_s}), so the total "
+                "deadline would expire before the handshake one could ever fire."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_status_is_not_retried_by_gym(self) -> "GenerationRouterConfig":
         if self.no_healthy_backend_status in _GYM_RETRY_STATUSES:
             raise ValueError(
-                "async_rl.policy_router.no_healthy_backend_status="
+                "async_rl.generation_router.no_healthy_backend_status="
                 f"{self.no_healthy_backend_status} is a status NeMo-Gym retries "
                 f"internally ({sorted(_GYM_RETRY_STATUSES)}). For the rate-limit codes "
                 "Gym raises its own retry ceiling on each attempt, so returning one "
@@ -258,7 +286,7 @@ class WatchdogConfig(BaseModel, extra="allow"):
     def _check_consistent(self) -> "WatchdogConfig":
         if self.stall_timeout_s <= self.interval_s:
             raise ValueError(
-                f"async_rl.watchdog.stall_timeout_s ({self.stall_timeout_s}) must be "
+                f"async_rl.stall_watchdog.stall_timeout_s ({self.stall_timeout_s}) must be "
                 f"> interval_s ({self.interval_s}); otherwise the watchdog reports a "
                 "stall before it has had a chance to observe one."
             )
@@ -275,11 +303,15 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         default_factory=RolloutFailureConfig,
     )
     # Stall detection.
-    watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
+    stall_watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
     # Generation-fleet liveness tracking and shard eligibility.
-    fleet_health: FleetHealthConfig = Field(default_factory=FleetHealthConfig)
+    generation_fleet_health: FleetHealthConfig = Field(
+        default_factory=FleetHealthConfig
+    )
     # NeMo-Gym-facing router in front of the generation fleet.
-    policy_router: PolicyRouterConfig = Field(default_factory=PolicyRouterConfig)
+    generation_router: GenerationRouterConfig = Field(
+        default_factory=GenerationRouterConfig
+    )
     # Recompute generation KV caches after each weight update.
     recompute_kv_cache_after_weight_updates: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.
@@ -292,7 +324,34 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     diagnostics: bool = False
 
     @model_validator(mode="after")
-    def _check_watchdog_outlasts_rollouts(self) -> "AsyncRLConfig":
+    def _reject_renamed_blocks(self) -> "AsyncRLConfig":
+        """Fail loudly on the previous block names rather than ignoring them.
+
+        ``extra="allow"`` means an old key parses fine and then does nothing at all --
+        so a config carrying ``watchdog:`` would silently lose its stall detection and
+        run with the defaults, which is precisely the class of silent misconfiguration
+        this work exists to remove. ``watchdog`` in particular shipped, so this is a
+        migration path rather than a courtesy.
+        """
+        renamed = {
+            "watchdog": "stall_watchdog",
+            "fleet_health": "generation_fleet_health",
+            "policy_router": "generation_router",
+        }
+        stale = [
+            f"  async_rl.{old} -> async_rl.{new}"
+            for old, new in renamed.items()
+            if getattr(self, old, None) is not None
+        ]
+        if stale:
+            raise ValueError(
+                "async_rl blocks have been renamed to say what they watch or route:\n"
+                + "\n".join(stale)
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_stall_watchdog_outlasts_rollouts(self) -> "AsyncRLConfig":
         # A rollout that is merely slow already has its own deadline; the watchdog must
         # give it a chance to fire first, or every long rollout reads as a stall.
         #
@@ -316,10 +375,10 @@ class AsyncRLConfig(BaseModel, extra="allow"):
             ),
         )
         for name, deadline in deadlines:
-            if deadline is not None and self.watchdog.stall_timeout_s <= deadline:
+            if deadline is not None and self.stall_watchdog.stall_timeout_s <= deadline:
                 raise ValueError(
-                    f"async_rl.watchdog.stall_timeout_s "
-                    f"({self.watchdog.stall_timeout_s}) must be > async_rl.{name} "
+                    f"async_rl.stall_watchdog.stall_timeout_s "
+                    f"({self.stall_watchdog.stall_timeout_s}) must be > async_rl.{name} "
                     f"({deadline}); otherwise the watchdog reports a stall for rollouts "
                     "that are merely slow and would have timed out on their own."
                 )

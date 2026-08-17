@@ -33,7 +33,7 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.fleet_health import (
-    GenerationFleetMonitor,
+    GenerationFleetHealth,
     HealthyShardSelector,
 )
 from nemo_rl.models.generation.interfaces import (
@@ -269,9 +269,9 @@ class VllmGeneration(GenerationInterface):
         # when no fleet selector is attached.
         self.current_generate_dp_shard_idx = 0
 
-        # Set by attach_fleet_health when async_rl.fleet_health is enabled. While None,
+        # Set by attach_fleet_health when async_rl.generation_fleet_health is enabled. While None,
         # shard selection stays health-blind, which is the historical behaviour.
-        self.fleet_monitor: Optional[GenerationFleetMonitor] = None
+        self.fleet_monitor: Optional[GenerationFleetHealth] = None
         self.fleet_selector: Optional[HealthyShardSelector] = None
 
         if defer_model_load:
@@ -891,7 +891,7 @@ class VllmGeneration(GenerationInterface):
 
     def attach_fleet_health(
         self,
-        monitor: GenerationFleetMonitor,
+        monitor: GenerationFleetHealth,
         selector: HealthyShardSelector,
     ) -> None:
         """Route generation through fleet health from now on.
@@ -968,18 +968,33 @@ class VllmGeneration(GenerationInterface):
                 sample_result = await asyncio.wait_for(
                     sample_result_ref, timeout=timeout_seconds
                 )
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as error:
                 ray.cancel(worker_gen_proxy)
-                raise RuntimeError(
-                    f"Timeout waiting for worker results after {timeout_seconds}s. "
-                    f"For longer sequences, increase timeout by setting: "
+                # Reported and typed, not a bare RuntimeError. This is the one failure
+                # the fleet-health docstrings cite to justify reactive reporting -- an
+                # engine that answers is_alive from a live worker and still never
+                # returns a generation -- and it used to be the one case that never
+                # reached the ledger, because raising inside the try meant the
+                # RayError handler below could not see it. The shard then dropped back
+                # to inflight=0 and became the *preferred* next pick, at 900s a visit.
+                if self.fleet_monitor is not None:
+                    self.fleet_monitor.report_failure(dp_shard_idx, error)
+                raise GenerationUnavailable(
+                    f"generation shard {dp_shard_idx} (worker {leader_worker_idx}) "
+                    f"did not return within {timeout_seconds}s. For longer sequences, "
+                    f"increase timeout by setting: "
                     f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
                     f"{int(timeout_seconds * 2)}"
-                )
+                ) from error
 
             # sample_result is a tuple: (original_idx, BatchedDataDict).
             original_idx, result_batch = sample_result
             result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
+            # Clears the reported-failure streak: it counts *consecutive* failures, so
+            # without a success signal it is monotonic and any shard eventually reaches
+            # unhealthy_threshold however healthy it is.
+            if self.fleet_monitor is not None:
+                self.fleet_monitor.report_success(dp_shard_idx)
             # Inside the try: main added the cancellation handler below precisely so a
             # consumer abandoning this generator mid-yield still cancels the Ray call.
             yield (original_idx, result_batch)

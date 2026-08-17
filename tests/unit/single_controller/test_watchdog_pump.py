@@ -36,7 +36,7 @@ from nemo_rl.experience.rollout_manager import RolloutStats
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetExhausted,
-    GenerationFleetMonitor,
+    GenerationFleetHealth,
     ShardState,
 )
 
@@ -66,7 +66,7 @@ def _make_controller(
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._async_cfg = SimpleNamespace(
-        watchdog=SimpleNamespace(
+        stall_watchdog=SimpleNamespace(
             # Tiny tick so the loop runs immediately; the stall threshold is what the
             # tests actually vary.
             interval_s=watchdog_interval_s,
@@ -74,7 +74,7 @@ def _make_controller(
             stall_action=stall_action,
             gym_subprocess_check=gym_subprocess_check,
         ),
-        fleet_health=SimpleNamespace(
+        generation_fleet_health=SimpleNamespace(
             probe_timeout_s=1.0, probe_interval_s=probe_interval_s
         ),
     )
@@ -87,9 +87,8 @@ def _make_controller(
     ctrl._logger = _RecordingLogger()
     ctrl._env_handles = env_handles if env_handles is not None else {}
     # These tests cover stall detection, not fleet health or gym routing.
-    ctrl._fleet_monitor = None
-    ctrl._policy_router = None
-    ctrl._pushed_membership_epoch = -1
+    ctrl._gen_fleet = None
+    ctrl._generation_router = None
     return ctrl
 
 
@@ -108,12 +107,12 @@ async def _run_pump(pump, ticks: int):
 
 async def _run_ticks(ctrl, ticks: int):
     """Run the watchdog for a bounded number of ticks, then cancel it."""
-    return await _run_pump(ctrl._watchdog_pump(), ticks)
+    return await _run_pump(ctrl._stall_watchdog_pump(), ticks)
 
 
 async def _run_probe_ticks(ctrl, ticks: int):
     """Run the fleet probe pump for a bounded number of ticks, then cancel it."""
-    return await _run_pump(ctrl._fleet_probe_pump(), ticks)
+    return await _run_pump(ctrl._gen_fleet_probe_pump(), ticks)
 
 
 class TestStallDetection:
@@ -122,7 +121,7 @@ class TestStallDetection:
 
         async def _main():
             ctrl = _make_controller(stats=stats, inflight=4, stall_timeout_s=0.0)
-            task = asyncio.ensure_future(ctrl._watchdog_pump())
+            task = asyncio.ensure_future(ctrl._stall_watchdog_pump())
             for _ in range(5):
                 await asyncio.sleep(0.003)
                 stats.committed += 1  # progress on every tick
@@ -139,7 +138,7 @@ class TestStallDetection:
             stats=stats, inflight=8, stall_timeout_s=0.0, stall_action="abort"
         )
         with pytest.raises(RolloutStall, match="8 rollouts in flight"):
-            asyncio.run(ctrl._watchdog_pump())
+            asyncio.run(ctrl._stall_watchdog_pump())
 
     def test_a_wedge_with_nothing_in_flight_is_still_a_stall(self):
         """Regression guard for the gap a fault-injection run walked straight through.
@@ -161,7 +160,7 @@ class TestStallDetection:
             max_num_steps=50,
         )
         with pytest.raises(RolloutStall, match="0 rollouts in flight"):
-            asyncio.run(ctrl._watchdog_pump())
+            asyncio.run(ctrl._stall_watchdog_pump())
 
     def test_warn_mode_reports_without_ending_the_run(self, capsys):
         stats = RolloutStats()
@@ -198,7 +197,7 @@ class TestStallDetection:
                 stall_action="abort",
                 max_num_steps=100,
             )
-            task = asyncio.ensure_future(ctrl._watchdog_pump())
+            task = asyncio.ensure_future(ctrl._stall_watchdog_pump())
             for _ in range(5):
                 await asyncio.sleep(0.003)
                 ctrl._train_steps += 1  # commits frozen, steps advancing
@@ -240,7 +239,7 @@ class TestGenerationFleetProbe:
         ctrl = _make_controller(
             stats=RolloutStats(), inflight=0, stall_timeout_s=1000.0, **kwargs
         )
-        ctrl._fleet_monitor = monitor
+        ctrl._gen_fleet = monitor
         ctrl._gen = SimpleNamespace(
             worker_group=SimpleNamespace(
                 get_dp_leader_worker_idx=lambda shard: shard,
@@ -259,7 +258,7 @@ class TestGenerationFleetProbe:
         return ctrl
 
     def test_a_live_fleet_stays_serving(self):
-        monitor = GenerationFleetMonitor(
+        monitor = GenerationFleetHealth(
             shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True, True])
@@ -267,7 +266,7 @@ class TestGenerationFleetProbe:
         assert monitor.serving_shards() == [0, 1]
 
     def test_a_dead_worker_is_quarantined_by_the_probe(self):
-        monitor = GenerationFleetMonitor(
+        monitor = GenerationFleetHealth(
             shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True, False])
@@ -284,7 +283,7 @@ class TestGenerationFleetProbe:
         expire inside that delay, which is exactly how job 5925668 aborted a hung refit
         while the corpse was still SUSPECT. A threshold of 99 makes counting impossible.
         """
-        monitor = GenerationFleetMonitor(
+        monitor = GenerationFleetHealth(
             shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=99)
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True, False])
@@ -298,11 +297,11 @@ class TestGenerationFleetProbe:
         A shard busy inside a refit stops answering probes without being dead. Treating
         that like proof of death would condemn a healthy fleet on one slow round.
         """
-        monitor = GenerationFleetMonitor(
+        monitor = GenerationFleetHealth(
             shard_count=1, policy=FleetHealthPolicy(unhealthy_threshold=99)
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True])
-        ctrl._async_cfg.fleet_health.probe_timeout_s = 0.001
+        ctrl._async_cfg.generation_fleet_health.probe_timeout_s = 0.001
         ctrl._gen.worker_group.workers = [
             SimpleNamespace(
                 is_alive=SimpleNamespace(remote=lambda: asyncio.sleep(10.0))
@@ -313,7 +312,7 @@ class TestGenerationFleetProbe:
         assert monitor.absent_shards() == []
 
     def test_fleet_state_is_published(self):
-        monitor = GenerationFleetMonitor(
+        monitor = GenerationFleetHealth(
             shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True, False])
@@ -325,12 +324,12 @@ class TestGenerationFleetProbe:
 
         asyncio.run(_main())
         published = ctrl._logger.metrics[-1]
-        assert published["fleet/shards/dead"] == 1.0
-        assert published["fleet/serving_shards"] == 1.0
+        assert published["gen_fleet/shards/dead"] == 1.0
+        assert published["gen_fleet/serving_shards"] == 1.0
 
     def test_losing_the_whole_fleet_ends_the_run(self):
         """Below the floor there is nothing left to generate with."""
-        monitor = GenerationFleetMonitor(
+        monitor = GenerationFleetHealth(
             shard_count=1,
             policy=FleetHealthPolicy(unhealthy_threshold=1, min_healthy_shards=1),
         )
@@ -338,7 +337,7 @@ class TestGenerationFleetProbe:
 
         async def _main():
             await _run_probe_ticks(ctrl, 3)
-            await ctrl._watchdog_pump()
+            await ctrl._stall_watchdog_pump()
 
         with pytest.raises(GenerationFleetExhausted):
             asyncio.run(_main())
@@ -364,7 +363,7 @@ class TestGenerationFleetProbe:
         The watchdog ticks fast here *on purpose*: a slow interval would make this pass
         because the loop never ran, which is no evidence at all.
         """
-        monitor = GenerationFleetMonitor(
+        monitor = GenerationFleetHealth(
             shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
         )
         ctrl = self._with_fleet(
@@ -379,7 +378,7 @@ class TestGenerationFleetProbe:
 
     def test_the_probe_runs_on_its_own_interval(self):
         """The other half: a slow watchdog must not slow detection down."""
-        monitor = GenerationFleetMonitor(
+        monitor = GenerationFleetHealth(
             shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
         )
         ctrl = self._with_fleet(
@@ -398,7 +397,7 @@ class TestGenerationFleetProbe:
         complete a round within its own interval -- and the config validator only checks
         those two against each other, silently assuming a single probe per tick.
         """
-        monitor = GenerationFleetMonitor(
+        monitor = GenerationFleetHealth(
             shard_count=4, policy=FleetHealthPolicy(unhealthy_threshold=1)
         )
         started = asyncio.Event()
@@ -470,7 +469,7 @@ class TestEnvHealthCheck:
             env_handles={"nemo_gym": _Handle()},
         )
         with pytest.raises(RuntimeError, match="'nemo_gym' reported unhealthy"):
-            asyncio.run(ctrl._watchdog_pump())
+            asyncio.run(ctrl._stall_watchdog_pump())
 
     def test_an_unhealthy_environment_only_warns_under_the_default_action(self, capsys):
         """stall_action="warn" promises to "only report". It has to mean that here too.

@@ -60,11 +60,38 @@ async_rl:
 
   # Last-resort stall detection. stall_timeout_s must exceed interval_s and every
   # deadline above, so a merely-slow rollout is not reported as a stall.
-  watchdog:
+  stall_watchdog:
     interval_s: 30.0
     stall_timeout_s: 600.0
     stall_action: warn                # warn | abort
     gym_subprocess_check: true        # polls NeMo-Gym's RunHelper for dead servers
+
+  # Per-shard liveness for the generation fleet. Off by default, in which case shard
+  # selection keeps its historical health-blind round-robin. On, a shard that fails
+  # probes or real requests is quarantined instead of keeping its 1/N of traffic, and
+  # the run aborts with an attributable error once too few shards remain.
+  generation_fleet_health:
+    enabled: false
+    probe_interval_s: 5.0             # must exceed probe_timeout_s
+    probe_timeout_s: 2.0
+    unhealthy_threshold: 3            # ~15s to quarantine at the default interval
+    healthy_threshold: 2              # successes before a suspect shard is trusted again
+    selection: least_outstanding      # steers away from a slow shard without diagnosing it
+    on_dead_shard: fail_fast          # recovery modes arrive with the communicator rebuild
+    max_restart_attempts_per_shard: 5
+    min_healthy_shards: 1             # below this the run aborts
+
+  # NeMo-Gym-facing router in front of the generation fleet. Gym picks an endpoint by
+  # round-robin over a list fixed at process start and never fails over, so it is handed
+  # one NeMo-RL-owned URL instead and the routing decision moves next to generation_fleet_health.
+  # Only meaningful on the NeMo-Gym path; the native path calls generation over Ray.
+  generation_router:
+    enabled: false
+    port_range_low: 6000              # distinct from Gym (5000-5999) and vLLM (7000-8999)
+    port_range_high: 6099
+    backend_timeout_s: 600.0          # covers a whole generation; Gym sets none at all
+    connect_timeout_s: 5.0            # a local handshake is ms-or-never
+    no_healthy_backend_status: 409    # must stay outside Gym's retry set
 
 checkpointing:
   enabled: false

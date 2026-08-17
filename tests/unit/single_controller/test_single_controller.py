@@ -79,7 +79,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         rollout_manager=SimpleNamespace(_tq_buffer=None),
         env_handles={},
         fleet_monitor=None,
-        policy_router=None,
+        generation_router=None,
         train_cluster=None,
         inference_cluster=None,
     )
@@ -135,7 +135,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         rollout_manager=SimpleNamespace(_tq_buffer=None),
         env_handles={},
         fleet_monitor=None,
-        policy_router=None,
+        generation_router=None,
         train_cluster=None,
         inference_cluster=None,
         save_state=_initial_grpo_save_state(),
@@ -228,7 +228,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     ctrl._rollout_permitted.set()
     # No fleet health: _sync_weights reconciles refit membership first, and with no
     # monitor there is nothing to reconcile.
-    ctrl._fleet_monitor = None
+    ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
@@ -257,7 +257,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._rollout_permitted.set()
     # No fleet health: _sync_weights reconciles refit membership first, and with no
     # monitor there is nothing to reconcile.
-    ctrl._fleet_monitor = None
+    ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),

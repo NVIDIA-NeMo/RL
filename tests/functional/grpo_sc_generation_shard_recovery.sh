@@ -191,11 +191,11 @@ uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     logger.wandb_enabled=false \
     logger.tensorboard_enabled=true \
     logger.monitor_gpus=false \
-    ++async_rl.fleet_health.enabled=true \
-    ++async_rl.fleet_health.probe_interval_s=5.0 \
-    ++async_rl.fleet_health.refit_timeout_s="$REFIT_TIMEOUT_S" \
-    ++async_rl.watchdog.interval_s=30.0 \
-    ++async_rl.watchdog.stall_timeout_s=300.0 \
+    ++async_rl.generation_fleet_health.enabled=true \
+    ++async_rl.generation_fleet_health.probe_interval_s=5.0 \
+    ++async_rl.generation_fleet_health.refit_timeout_s="$REFIT_TIMEOUT_S" \
+    ++async_rl.stall_watchdog.interval_s=30.0 \
+    ++async_rl.stall_watchdog.stall_timeout_s=300.0 \
     "$@" \
     > "$RUN_LOG" 2>&1 &
 TRAIN_PID=$!
@@ -375,7 +375,7 @@ if (( FINISHED == 0 )); then
     fi
     echo "[recovery] watchdog lines:"; grep -E "watchdog|stall|inflight" "$RUN_LOG" | tail -20
     echo "[recovery] fleet/refit activity:"
-    grep -E "fleet: shard|rebuilt refit communicator|_sync_weights: sync done" "$RUN_LOG" | tail -15
+    grep -E "gen_fleet: shard|rebuilt refit communicator|_sync_weights: sync done" "$RUN_LOG" | tail -15
     exit 1
 fi
 
