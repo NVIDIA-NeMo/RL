@@ -119,7 +119,7 @@ uv run "$PROJECT_ROOT/examples/run_grpo_single_controller.py" \
     policy.generation.colocated.resources.gpus_per_node=2 \
     grpo.num_prompts_per_step=4 \
     grpo.num_generations_per_prompt=2 \
-    grpo.max_num_steps=40 \
+    grpo.max_num_steps=150 \
     grpo.val_period=-1 \
     grpo.val_at_start=false \
     grpo.async_grpo=null \
@@ -156,6 +156,31 @@ uv run "$PROJECT_ROOT/examples/run_grpo_single_controller.py" \
     > "$RUN_LOG" 2>&1 &
 TRAIN_PID=$!
 
+echo "[failover] waiting for ${KILL_AFTER_STEPS} training steps (up to ${STEADY_STATE_WAIT_S}s)..."
+STEPS=0
+for _ in $(seq 1 "$STEADY_STATE_WAIT_S"); do
+    kill -0 $TRAIN_PID 2>/dev/null || { echo "[failover] FAIL: job died before the kill"; tail -60 "$RUN_LOG"; exit 1; }
+    STEPS=$(grep -cE "train step [0-9]+/" "$RUN_LOG" 2>/dev/null || true)
+    (( STEPS >= KILL_AFTER_STEPS )) && break
+    sleep 1
+done
+
+if (( STEPS < KILL_AFTER_STEPS )); then
+    # Distinguished from a failover failure on purpose: reaching steady state is a
+    # PRECONDITION of this test, not the thing it measures. Reporting it as "the run
+    # died after losing a shard" is what made job 6251221's result unreadable.
+    echo "[failover] FAIL: only $STEPS training step(s) in ${STEADY_STATE_WAIT_S}s;"
+    echo "[failover] the run never reached steady state, so nothing about failover was tested."
+    tail -60 "$RUN_LOG"
+    exit 1
+fi
+echo "[failover] $STEPS training steps done -- rollouts are flowing through the router."
+
+
+# Discovered AFTER the run is confirmed training, not before. Each attempt is a full
+# ray.init round trip, and running this first put minutes of latency ahead of the kill --
+# enough that job 6251951's entire 40-step run finished before discovery returned. By
+# here the actors certainly exist, so this is one query rather than a polling loop.
 echo "[failover] discovering generation actors (up to ${ACTOR_WAIT_S}s)..."
 ACTORS=()
 for _ in $(seq 1 $((ACTOR_WAIT_S / 3))); do
@@ -176,25 +201,23 @@ if (( ${#ACTORS[@]} < 2 )); then
 fi
 echo "[failover] generation actors: ${ACTORS[*]}"
 
-echo "[failover] waiting for ${KILL_AFTER_STEPS} training steps (up to ${STEADY_STATE_WAIT_S}s)..."
-STEPS=0
-for _ in $(seq 1 "$STEADY_STATE_WAIT_S"); do
-    kill -0 $TRAIN_PID 2>/dev/null || { echo "[failover] FAIL: job died before the kill"; tail -60 "$RUN_LOG"; exit 1; }
-    STEPS=$(grep -cE "train step [0-9]+/" "$RUN_LOG" 2>/dev/null || true)
-    (( STEPS >= KILL_AFTER_STEPS )) && break
-    sleep 1
-done
-
-if (( STEPS < KILL_AFTER_STEPS )); then
-    # Distinguished from a failover failure on purpose: reaching steady state is a
-    # PRECONDITION of this test, not the thing it measures. Reporting it as "the run
-    # died after losing a shard" is what made job 6251221's result unreadable.
-    echo "[failover] FAIL: only $STEPS training step(s) in ${STEADY_STATE_WAIT_S}s;"
-    echo "[failover] the run never reached steady state, so nothing about failover was tested."
-    tail -60 "$RUN_LOG"
+# Guard the other end of the window, re-read HERE rather than at the step gate above,
+# because discovery sits between the two and is not free.
+#
+# Job 6251951 crossed the step threshold with the run ALREADY COMPLETE -- 40/40 -- so the
+# kill hit a shutting-down job and proved nothing. Two causes, both addressed: discovery
+# ran first and cost more wall-clock than the entire run (its first ray.init hit a stale
+# GCS address and spent two minutes timing out), and a 40-step run at ~4s/step is under
+# three minutes end to end. Discovery now runs after the step gate, and max_num_steps is
+# large enough that the kill lands with real work left.
+STEPS=$(grep -cE "train step [0-9]+/" "$RUN_LOG" 2>/dev/null || true)
+TOTAL_STEPS=$(grep -oE "train step [0-9]+/[0-9]+" "$RUN_LOG" | tail -1 | sed -E "s|.*/||")
+if [[ -n "$TOTAL_STEPS" ]] && (( STEPS > TOTAL_STEPS - 5 )); then
+    echo "[failover] FAIL: the run is at step $STEPS of $TOTAL_STEPS at kill time --"
+    echo "[failover] too little left for surviving on N-1 shards to mean anything."
+    echo "[failover] Raise grpo.max_num_steps or lower KILL_AFTER_STEPS."
     exit 1
 fi
-echo "[failover] $STEPS training steps done -- rollouts are flowing through the router."
 
 VICTIM=${ACTORS[0]}
 echo "[failover] killing generation actor $VICTIM"
