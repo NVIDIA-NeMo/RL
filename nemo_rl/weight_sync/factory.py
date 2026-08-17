@@ -127,6 +127,22 @@ def create_weight_synchronizer(
                 "for non-colocated weight synchronization."
             )
 
+        if generation.cfg.get("refit_transport") == "mx_reshard":
+            if generation_backend != VLLM_BACKEND:
+                raise NotImplementedError(
+                    "mx_reshard is only supported with the vLLM generation backend."
+                )
+            from nemo_rl.weight_sync.mx_reshard_weight_synchronizer import (
+                MxReshardWeightSynchronizer,
+            )
+
+            return MxReshardWeightSynchronizer(
+                policy=policy,
+                generation=generation,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
+            )
+
         if generation.cfg.get("refit_transport") == "nccl_reshard":
             from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
                 NcclReshardWeightSynchronizer,

@@ -15,6 +15,12 @@ class ReplicatedOnlyModule(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.ones(2))
 
 
+class ModuleWrapper(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+
 def _published_names(*, tp_rank: int) -> list[str]:
     model = ReplicatedOnlyModule()
     published = collect_megatron_publish_set(
@@ -35,6 +41,22 @@ def test_collect_megatron_publish_set_skips_replicated_on_nonzero_tp_rank():
 
 def test_collect_megatron_publish_set_publishes_replicated_on_zero_tp_rank():
     assert _published_names(tp_rank=0) == ["weight"]
+
+
+def test_collect_megatron_publish_set_strips_all_leading_module_wrappers():
+    model = ModuleWrapper(ModuleWrapper(ReplicatedOnlyModule()))
+
+    published = collect_megatron_publish_set(
+        model,
+        tp_size=1,
+        pp_size=1,
+        pp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+        tp_rank=0,
+    )
+
+    assert [name for name, _, _, _ in published] == ["weight"]
 
 
 def test_grouped_expert_column_records_tp_geometry():

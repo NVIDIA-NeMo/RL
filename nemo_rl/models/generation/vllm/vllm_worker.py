@@ -369,12 +369,11 @@ class BaseVllmGenerationWorker:
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
         checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
-        if checkpoint_engine_config is not None:
-            from nemo_rl.models.generation.vllm.checkpoint_engine import (
-                configure_nixl_worker,
-            )
+        from nemo_rl.models.generation.vllm.checkpoint_engine import (
+            configure_nixl_worker,
+        )
 
-            configure_nixl_worker(self.cfg, vllm_kwargs)
+        configure_nixl_worker(self.cfg, vllm_kwargs)
 
         # A speculative_config with num_speculative_tokens == 0 is the supported
         # way to disable speculative decoding (e.g. MTP) from a launch script
@@ -1257,6 +1256,71 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
             traceback.print_exc()
             return False
+
+    def init_mx_reshard_receiver(
+        self,
+        rank_prefix: int,
+        inference_world_size: int,
+        train_world_size: int,
+    ) -> bool:
+        """Initialize ModelExpress receivers in the vLLM backend workers."""
+        from nemo_rl.distributed.mx_reshard_config import (
+            resolve_mx_reshard_receiver_listen_port_base,
+        )
+
+        refit_cfg = self.cfg.get("refit_cfg") or {}
+        mx_cfg = (
+            refit_cfg.mx_reshard
+            if hasattr(refit_cfg, "mx_reshard")
+            else refit_cfg.get("mx_reshard", {})
+        )
+        server_url = (
+            getattr(mx_cfg, "server_url", None)
+            if not isinstance(mx_cfg, dict)
+            else mx_cfg.get("server_url")
+        ) or os.environ.get("MX_SERVER_URL") or os.environ.get(
+            "MODEL_EXPRESS_URL"
+        ) or os.environ.get("MX_SERVER_ADDRESS")
+        if not server_url:
+            raise ValueError(
+                "mx_reshard requires refit_cfg.mx_reshard.server_url, "
+                "MX_SERVER_URL, MODEL_EXPRESS_URL, or MX_SERVER_ADDRESS"
+            )
+        timeout_s = (
+            getattr(mx_cfg, "timeout_s", 1200.0)
+            if not isinstance(mx_cfg, dict)
+            else mx_cfg.get("timeout_s", 1200.0)
+        )
+        receiver_listen_port_base = (
+            resolve_mx_reshard_receiver_listen_port_base(mx_cfg)
+        )
+        results = self.llm.collective_rpc(
+            "init_mx_reshard_receiver",
+            args=(
+                rank_prefix,
+                inference_world_size,
+                train_world_size,
+                self.model_name,
+                server_url,
+                timeout_s,
+                receiver_listen_port_base,
+            ),
+        )
+        return bool(results) and all(result is True for result in results)
+
+    def update_weights_from_mx_reshard(self, version: int) -> bool:
+        """Pull one ModelExpress version on every backend rank."""
+        results = self.llm.collective_rpc(
+            "update_weights_from_mx_reshard", args=(version,)
+        )
+        return bool(results) and all(result is True for result in results)
+
+    def shutdown_mx_reshard_receiver(self) -> bool:
+        """Shut down ModelExpress receivers on every backend rank."""
+        results = self.llm.collective_rpc(
+            "shutdown_mx_reshard_receiver", args=tuple()
+        )
+        return bool(results) and all(result is True for result in results)
 
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""

@@ -11,6 +11,9 @@ one expert's weights under another's.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
 import pytest
 import torch
 
@@ -19,6 +22,15 @@ pytest.importorskip(
     reason="ModelExpress is an optional integration dependency",
 )
 
+from nemo_rl.distributed.mx_reshard_config import (
+    DEFAULT_PUBLISHER_LISTEN_PORT_BASE,
+    DEFAULT_RECEIVER_LISTEN_PORT_BASE,
+    maybe_preinit_mx_reshard_nixl,
+    resolve_mx_reshard_listen_port_bases,
+    resolve_mx_reshard_publisher_listen_port_base,
+    resolve_mx_reshard_receiver_listen_port_base,
+    validate_mx_reshard_listen_port_ranges,
+)
 from nemo_rl.distributed.mx_megatron_helpers import (
     ROLE_EXPERT_COLUMN,
     ROLE_GATED_MLP_COLUMN,
@@ -31,9 +43,12 @@ from nemo_rl.distributed.mx_reshard_publisher import (
     _gated_mlp_extras,
     PLACEMENT_REPLICATE,
     PLACEMENT_SHARD,
+    MxMegatronPublisher,
     UnmappedMegatronTensor,
+    build_bridge_name_map,
     build_megatron_alias_inputs,
     make_bridge_resolver,
+    publish_megatron_hf_aliases,
     published_byte_count,
 )
 
@@ -50,6 +65,228 @@ def _entry(name, tensor, role, extras=None, **spec_kwargs):
     full = {"megatron_role": role, "tp_size": "1", "ep_size": "8"}
     full.update(descriptor_extras)
     return name, tensor, spec, full
+
+
+def test_publisher_step_is_forwarded_to_mx_rendezvous_encoder():
+    entry = _entry("norm.weight", torch.zeros(16), ROLE_REPLICATED)
+    resolver = make_bridge_resolver({"norm.weight": ["model.norm.weight"]})
+    items = list(
+        build_megatron_alias_inputs(
+            [entry], resolve_hf_names=resolver, tp_size=1, tp_rank=0
+        )
+    )
+    manager = MagicMock(agent_name="trainer-r0", nixl_metadata=b"metadata")
+    rendezvous = MagicMock()
+    rendezvous.publish.return_value = "source-id"
+
+    with patch(
+        "nemo_rl.distributed.mx_reshard_publisher.wrap_rendezvous_blob",
+        return_value=b"stamped",
+    ) as wrap:
+        source_id, _ = publish_megatron_hf_aliases(
+            manager=manager,
+            rendezvous=rendezvous,
+            items=items,
+            metadata_endpoint="trainer:5555",
+            publisher_step=17,
+        )
+
+    assert source_id == "source-id"
+    assert wrap.call_args.kwargs["publisher_step"] == 17
+    rendezvous.publish.assert_called_once_with(b"stamped")
+
+
+def test_bridge_map_uses_local_pp_name_and_local_tasks_only():
+    local = SimpleNamespace(
+        param_name="decoder.layers.0.self_attention.linear_qkv.weight",
+        global_param_name="decoder.layers.24.self_attention.linear_qkv.weight",
+        param_weight=torch.zeros(1),
+        mapping=SimpleNamespace(
+            hf_param={
+                "k": "model.layers.24.self_attn.k_proj.weight",
+                "q": "model.layers.24.self_attn.q_proj.weight",
+                "v": "model.layers.24.self_attn.v_proj.weight",
+            }
+        ),
+    )
+    remote_pp = SimpleNamespace(
+        param_name="decoder.layers.0.input_layernorm.weight",
+        global_param_name="decoder.layers.0.input_layernorm.weight",
+        param_weight=None,
+        mapping=SimpleNamespace(hf_param="model.layers.0.input_layernorm.weight"),
+    )
+
+    name_map = build_bridge_name_map([local, remote_pp])
+
+    assert name_map == {
+        "decoder.layers.0.self_attention.linear_qkv.weight": (
+            "model.layers.24.self_attn.q_proj.weight",
+            "model.layers.24.self_attn.k_proj.weight",
+            "model.layers.24.self_attn.v_proj.weight",
+        )
+    }
+
+
+def test_bridge_map_rejects_conflicting_local_names():
+    def task(hf_name):
+        return SimpleNamespace(
+            param_name="decoder.layers.0.weight",
+            global_param_name="decoder.layers.0.weight",
+            param_weight=torch.zeros(1),
+            mapping=SimpleNamespace(hf_param=hf_name),
+        )
+
+    with pytest.raises(ValueError, match="conflicting Bridge mappings"):
+        build_bridge_name_map([task("model.layers.0.a"), task("model.layers.0.b")])
+
+
+def test_default_publisher_and_receiver_port_ranges_do_not_overlap():
+    publisher, receiver = validate_mx_reshard_listen_port_ranges(
+        {},
+        train_world_size=8,
+        inference_world_size=8,
+    )
+
+    assert publisher == DEFAULT_PUBLISHER_LISTEN_PORT_BASE
+    assert receiver == DEFAULT_RECEIVER_LISTEN_PORT_BASE
+    assert publisher + 7 < receiver
+
+
+def test_legacy_port_base_falls_back_to_shifted_receiver_range():
+    assert resolve_mx_reshard_listen_port_bases({"listen_port_base": 7000}) == (
+        7000,
+        17000,
+    )
+
+
+def test_role_specific_port_bases_forward_to_the_correct_side():
+    config = {
+        "publisher_listen_port_base": 19000,
+        "receiver_listen_port_base": 29000,
+    }
+    assert resolve_mx_reshard_publisher_listen_port_base(config) == 19000
+    assert resolve_mx_reshard_receiver_listen_port_base(config) == 29000
+
+
+def test_mx_reshard_preinitializes_nixl_only_for_selected_transport(monkeypatch):
+    from nemo_rl.utils.checkpoint_engines import nixl
+
+    calls = []
+    agent = object()
+    monkeypatch.setattr(
+        nixl,
+        "preinit_nixl_agent",
+        lambda **kwargs: calls.append(kwargs) or agent,
+    )
+
+    assert maybe_preinit_mx_reshard_nixl({}) is None
+    assert (
+        maybe_preinit_mx_reshard_nixl(
+            {"generation": {"refit_transport": "mx_reshard"}}
+        )
+        is agent
+    )
+    assert calls == [{}]
+
+
+def test_overlapping_explicit_port_ranges_are_rejected():
+    with pytest.raises(ValueError, match="listen port ranges overlap"):
+        validate_mx_reshard_listen_port_ranges(
+            {
+                "publisher_listen_port_base": 19000,
+                "receiver_listen_port_base": 19004,
+            },
+            train_world_size=8,
+            inference_world_size=8,
+        )
+
+
+def test_trainer_publisher_uses_exact_mx_635_constructor_arguments():
+    item = SimpleNamespace(name="weight", tensor=torch.zeros(1))
+    manager = MagicMock()
+    client = MagicMock()
+    rendezvous = MagicMock()
+    with (
+        patch(
+            "modelexpress.nixl_transfer.NixlTransferManager",
+            return_value=manager,
+        ) as manager_cls,
+        patch("modelexpress.client.MxClient", return_value=client) as client_cls,
+        patch(
+            "modelexpress.refit.reshard.rendezvous.MxReshardRendezvous",
+            return_value=rendezvous,
+        ) as rendezvous_cls,
+    ):
+        publisher = MxMegatronPublisher(
+            items=[item],
+            model_name="Qwen/Qwen3-30B",
+            server_url="mx.example:8001",
+            rank=11,
+            device_id=3,
+            listen_port=19011,
+            metadata_endpoint="trainer-1:19011",
+        )
+
+    manager_cls.assert_called_once_with(
+        agent_name="nemo-rl-trainer-11",
+        device_id=3,
+        listen_port=19011,
+    )
+    manager.initialize.assert_called_once()
+    manager.register_tensors.assert_called_once_with({"weight": item.tensor})
+    client_cls.assert_called_once_with(server_url="mx.example:8001")
+    rendezvous_cls.assert_called_once_with(
+        client,
+        role="trainer",
+        rank=11,
+        model_name="Qwen/Qwen3-30B",
+        worker_id="nemo-rl-trainer-11",
+    )
+
+    publisher.shutdown()
+    rendezvous.close.assert_called_once()
+    manager.shutdown.assert_called_once()
+    client.close.assert_called_once()
+
+
+def test_dp_replica_ranks_receive_unique_worker_ids():
+    item = SimpleNamespace(name="weight", tensor=torch.zeros(1))
+    worker_ids = []
+
+    def rendezvous(*_args, **kwargs):
+        worker_ids.append(kwargs["worker_id"])
+        return MagicMock()
+
+    with (
+        patch("modelexpress.nixl_transfer.NixlTransferManager"),
+        patch("modelexpress.client.MxClient"),
+        patch(
+            "modelexpress.refit.reshard.rendezvous.MxReshardRendezvous",
+            side_effect=rendezvous,
+        ),
+    ):
+        first = MxMegatronPublisher(
+            items=[item],
+            model_name="model",
+            server_url="mx:8001",
+            rank=0,
+            device_id=0,
+            listen_port=19000,
+            metadata_endpoint="host:19000",
+        )
+        second = MxMegatronPublisher(
+            items=[item],
+            model_name="model",
+            server_url="mx:8001",
+            rank=8,
+            device_id=0,
+            listen_port=19008,
+            metadata_endpoint="host:19008",
+        )
+
+    assert worker_ids == ["nemo-rl-trainer-0", "nemo-rl-trainer-8"]
+    first.shutdown()
+    second.shutdown()
 
 
 # --- placement -------------------------------------------------------------

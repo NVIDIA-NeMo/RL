@@ -1030,6 +1030,9 @@ class VllmGeneration(GenerationInterface):
 
     def shutdown(self) -> bool:
         """Shut down all vLLM workers and clean up resources."""
+        if getattr(self, "_shutdown_complete", False):
+            return True
+        self._shutdown_complete = True
         try:
             if self.weight_synchronizer is not None:
                 self.weight_synchronizer.shutdown()
@@ -1172,6 +1175,59 @@ class VllmGeneration(GenerationInterface):
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         return futures
+
+    def init_mx_reshard_receiver(
+        self, *, train_world_size: int, inference_world_size: int
+    ) -> list[ray.ObjectRef]:
+        """Initialize one MX receiver on every vLLM backend rank."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        method_name = (
+            "init_mx_reshard_receiver_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "init_mx_reshard_receiver"
+        )
+        total_workers = len(self.worker_group.workers)
+        workers_per_group = total_workers // self.dp_size
+        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+        return self.worker_group.run_all_workers_multiple_data(
+            method_name,
+            rank_prefix=rank_prefix_list,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            common_kwargs={
+                "train_world_size": train_world_size,
+                "inference_world_size": inference_world_size,
+            },
+        )
+
+    def update_weights_from_mx_reshard(
+        self, *, version: int
+    ) -> list[ray.ObjectRef]:
+        """Pull a stamped MX version on all vLLM replicas."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        method_name = (
+            "update_weights_from_mx_reshard_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "update_weights_from_mx_reshard"
+        )
+        return self.worker_group.run_all_workers_single_data(
+            method_name,
+            version=version,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+
+    def shutdown_mx_reshard_receiver(self) -> list[ray.ObjectRef]:
+        """Shut down MX receivers on all vLLM replicas."""
+        method_name = (
+            "shutdown_mx_reshard_receiver_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "shutdown_mx_reshard_receiver"
+        )
+        return self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

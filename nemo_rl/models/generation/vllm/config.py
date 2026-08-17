@@ -14,12 +14,26 @@
 
 from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
 
-from pydantic import BaseModel, Field, NonNegativeInt, PositiveFloat, PositiveInt
+from pydantic import (
+    BaseModel,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    model_validator,
+)
 
+from nemo_rl.distributed.mx_reshard_config import (
+    DEFAULT_PUBLISHER_LISTEN_PORT_BASE,
+    DEFAULT_RECEIVER_LISTEN_PORT_BASE,
+    LEGACY_RECEIVER_PORT_OFFSET,
+)
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 VllmRefitTransportName = Literal["s3", "zmq"]
-VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
+VllmRefitSelector = Literal[
+    "vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard", "mx_reshard"
+]
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
 
 
@@ -134,6 +148,34 @@ class VllmNixlRefitConfig(BaseModel, extra="forbid"):
     shard_expert_weights: bool = False
 
 
+class VllmMxReshardConfig(BaseModel, extra="forbid"):
+    server_url: str | None = None
+    timeout_s: PositiveFloat = 1200.0
+    publisher_listen_port_base: Annotated[int, Field(gt=0, le=65535)] = (
+        DEFAULT_PUBLISHER_LISTEN_PORT_BASE
+    )
+    receiver_listen_port_base: Annotated[int, Field(gt=0, le=65535)] = (
+        DEFAULT_RECEIVER_LISTEN_PORT_BASE
+    )
+    # Deprecated compatibility input. When supplied without a role-specific
+    # override, the receiver is shifted to a disjoint range.
+    listen_port_base: Annotated[int, Field(gt=0, le=55535)] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_legacy_listen_port_base(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or value.get("listen_port_base") is None:
+            return value
+        resolved = dict(value)
+        legacy = int(resolved["listen_port_base"])
+        resolved.setdefault("publisher_listen_port_base", legacy)
+        resolved.setdefault(
+            "receiver_listen_port_base",
+            legacy + LEGACY_RECEIVER_PORT_OFFSET,
+        )
+        return resolved
+
+
 class VllmCheckpointEnginePluginConfig(BaseModel, extra="allow"):
     update_weights_bucket_memory_ratio: Annotated[float, Field(gt=0, lt=1)] = 0.05
     release_after_refit: bool = False
@@ -142,6 +184,7 @@ class VllmCheckpointEnginePluginConfig(BaseModel, extra="allow"):
 class VllmRefitConfig(BaseModel, extra="allow"):
     sparse: VllmSparseRefitConfig = Field(default_factory=VllmSparseRefitConfig)
     nixl: VllmNixlRefitConfig = Field(default_factory=VllmNixlRefitConfig)
+    mx_reshard: VllmMxReshardConfig = Field(default_factory=VllmMxReshardConfig)
 
 
 class VllmConfig(GenerationConfig):
@@ -177,12 +220,13 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     if transport is None:
         return None
     if transport == "nccl_reshard":
-        # nccl_reshard doesn't takes refit_cfg.
+        # nccl_reshard doesn't take refit_cfg.
         return None
     if transport not in get_args(VllmRefitSelector) and ":" not in transport:
         raise ValueError(
             f"Unknown vLLM refit transport {transport!r}: expected null, "
-            "'nccl_reshard', 'vllm_s3_sparse', 'vllm_zmq_sparse', 'nixl', or a "
+            "'nccl_reshard', 'mx_reshard', 'vllm_s3_sparse', "
+            "'vllm_zmq_sparse', 'nixl', or a "
             "'module:ClassName' checkpoint-engine path."
         )
     # The encoder-cache reset is implemented only on the collective/IPC and

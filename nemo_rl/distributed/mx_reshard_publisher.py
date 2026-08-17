@@ -22,6 +22,7 @@ so no renaming happens here.
 from __future__ import annotations
 
 import re
+from inspect import signature
 from typing import Any, Callable, Iterable, Iterator
 
 from modelexpress.refit.reshard.megatron_aliases import (
@@ -31,6 +32,7 @@ from modelexpress.refit.reshard.megatron_aliases import (
 from modelexpress.refit.reshard.megatron_publisher import (
     publish_registered_shard_table,
 )
+from modelexpress.refit.reshard.rendezvous import wrap_rendezvous_blob
 
 from nemo_rl.distributed.mx_megatron_helpers import (
     MegatronRoleSpec,
@@ -60,6 +62,110 @@ class UnmappedMegatronTensor(KeyError):
     check reports a shortfall far from the cause, and with the coverage floor off
     it reports nothing at all.
     """
+
+
+class MxMegatronPublisher:
+    """Own one #635 NIXL registration, publication heartbeat, and MX client."""
+
+    def __init__(
+        self,
+        *,
+        items: list[MegatronAliasInput],
+        model_name: str,
+        server_url: str,
+        rank: int,
+        device_id: int,
+        listen_port: int,
+        metadata_endpoint: str,
+    ) -> None:
+        from modelexpress.client import MxClient
+        from modelexpress.nixl_transfer import NixlTransferManager
+        from modelexpress.refit.reshard.rendezvous import MxReshardRendezvous
+
+        worker_id = f"nemo-rl-trainer-{rank}"
+        self._items = items
+        self._metadata_endpoint = metadata_endpoint
+        self._manager = NixlTransferManager(
+            agent_name=worker_id,
+            device_id=device_id,
+            listen_port=listen_port,
+        )
+        self._manager.initialize()
+        self._client = MxClient(server_url=server_url)
+        try:
+            self._manager.register_tensors(
+                {item.name: item.tensor for item in self._items}
+            )
+            self._rendezvous = MxReshardRendezvous(
+                self._client,
+                role="trainer",
+                rank=rank,
+                model_name=model_name,
+                worker_id=worker_id,
+            )
+        except Exception:
+            self._client.close()
+            self._manager.shutdown()
+            raise
+        self._closed = False
+
+    def publish(self, version: int) -> None:
+        if self._closed:
+            raise RuntimeError("ModelExpress publisher is closed")
+        publish_megatron_hf_aliases(
+            manager=self._manager,
+            rendezvous=self._rendezvous,
+            items=self._items,
+            metadata_endpoint=self._metadata_endpoint,
+            publisher_step=version,
+        )
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._rendezvous.close()
+        finally:
+            try:
+                self._manager.shutdown()
+            finally:
+                self._client.close()
+
+
+def build_bridge_name_map(conversion_tasks: Iterable[Any]) -> dict[str, tuple[str, ...]]:
+    """Map this PP rank's unwrapped local Megatron names to ordered HF names.
+
+    ``WeightConversionTask.param_name`` is the local name emitted by this
+    rank's ``model.named_parameters()`` after the collector strips ``module.``;
+    ``global_param_name`` is intentionally not the key because PP ranks can
+    renumber local layers. Tasks with ``param_weight is None`` belong to another
+    PP rank and are excluded. QKV dictionary order is semantic, not incidental.
+    """
+    name_map: dict[str, tuple[str, ...]] = {}
+    for task in conversion_tasks:
+        if task is None or getattr(task, "param_weight", None) is None:
+            continue
+        name = str(task.param_name)
+        hf_param = getattr(task.mapping, "hf_param", None)
+        if isinstance(hf_param, str):
+            names = (hf_param,)
+        elif isinstance(hf_param, dict):
+            names = (
+                tuple(hf_param[key] for key in ("q", "k", "v"))
+                if set(hf_param) == {"q", "k", "v"}
+                else tuple(hf_param.values())
+            )
+        else:
+            continue
+        previous = name_map.get(name)
+        if previous is not None and previous != names:
+            raise ValueError(
+                f"conflicting Bridge mappings for local Megatron name {name!r}: "
+                f"{previous!r} vs {names!r}"
+            )
+        name_map[name] = names
+    return name_map
 
 
 def make_bridge_resolver(
@@ -240,6 +346,7 @@ def publish_megatron_hf_aliases(
     rendezvous: Any,
     items: list[MegatronAliasInput],
     metadata_endpoint: str,
+    publisher_step: int,
 ) -> tuple[str, list]:
     """Alias a registered Megatron layout as HF shards and publish it.
 
@@ -255,12 +362,30 @@ def publish_megatron_hf_aliases(
         raise ValueError("no alias inputs to publish")
 
     published = build_hf_aliases(items, agent_name=str(manager.agent_name))
-    source_id = publish_registered_shard_table(
-        manager=manager,
-        rendezvous=rendezvous,
-        published=published,
-        metadata_endpoint=metadata_endpoint,
-    )
+    if publisher_step < 0:
+        raise ValueError("publisher_step must be non-negative")
+
+    # ModelExpress main's rendezvous payload owns the version stamp, while the
+    # current convenience publisher does not expose it. Use MX's encoder rather
+    # than duplicating its wire format. Keep the convenience path for a future
+    # MX version that grows the parameter.
+    if "publisher_step" in signature(publish_registered_shard_table).parameters:
+        source_id = publish_registered_shard_table(
+            manager=manager,
+            rendezvous=rendezvous,
+            published=published,
+            metadata_endpoint=metadata_endpoint,
+            publisher_step=publisher_step,
+        )
+    else:
+        blob = wrap_rendezvous_blob(
+            manager.nixl_metadata,
+            str(manager.agent_name),
+            metadata_endpoint,
+            published,
+            publisher_step=publisher_step,
+        )
+        source_id = rendezvous.publish(blob)
     return source_id, published
 
 
@@ -279,7 +404,9 @@ def published_byte_count(published: Iterable[Any]) -> int:
 __all__ = [
     "PLACEMENT_REPLICATE",
     "PLACEMENT_SHARD",
+    "MxMegatronPublisher",
     "UnmappedMegatronTensor",
+    "build_bridge_name_map",
     "build_megatron_alias_inputs",
     "make_bridge_resolver",
     "publish_megatron_hf_aliases",

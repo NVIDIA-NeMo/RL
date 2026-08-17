@@ -451,6 +451,12 @@ class MegatronPolicyWorkerImpl(
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
+        if self._nixl_preinit_agent is None:
+            from nemo_rl.distributed.mx_reshard_config import (
+                maybe_preinit_mx_reshard_nixl,
+            )
+
+            self._nixl_preinit_agent = maybe_preinit_mx_reshard_nixl(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -2134,6 +2140,129 @@ class MegatronPolicyWorkerImpl(
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
         return refit_param_info_hf
+
+    @torch.no_grad()
+    def init_mx_reshard_publisher(self, train_world_size: int) -> bool:
+        """Register this rank's live Megatron shards with ModelExpress."""
+        del train_world_size  # The rendezvous rank comes from torch.distributed.
+        if getattr(self, "_mx_reshard_publisher", None) is not None:
+            return True
+
+        # Keep ModelExpress optional for every non-MX NeMo-RL environment.
+        from nemo_rl.distributed.mx_megatron_helpers import (
+            collect_megatron_publish_set,
+        )
+        from nemo_rl.distributed.mx_reshard_config import (
+            resolve_mx_reshard_publisher_listen_port_base,
+        )
+        from nemo_rl.distributed.mx_reshard_publisher import (
+            MxMegatronPublisher,
+            build_bridge_name_map,
+            build_megatron_alias_inputs,
+            make_bridge_resolver,
+        )
+        from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
+
+        refit_cfg = self.cfg["generation"].get("refit_cfg") or {}
+        mx_cfg = (
+            refit_cfg.mx_reshard
+            if hasattr(refit_cfg, "mx_reshard")
+            else refit_cfg.get("mx_reshard", {})
+        )
+        server_url = (
+            getattr(mx_cfg, "server_url", None)
+            if not isinstance(mx_cfg, dict)
+            else mx_cfg.get("server_url")
+        ) or os.environ.get("MX_SERVER_URL") or os.environ.get(
+            "MODEL_EXPRESS_URL"
+        ) or os.environ.get("MX_SERVER_ADDRESS")
+        if not server_url:
+            raise ValueError(
+                "mx_reshard requires refit_cfg.mx_reshard.server_url, "
+                "MX_SERVER_URL, MODEL_EXPRESS_URL, or MX_SERVER_ADDRESS"
+            )
+        publisher_port_base = resolve_mx_reshard_publisher_listen_port_base(mx_cfg)
+
+        rank = torch.distributed.get_rank()
+        device_id = torch.cuda.current_device()
+        model_config = get_model_config(self.model)
+        tp_size = int(self.cfg["megatron_cfg"].get("tensor_model_parallel_size", 1))
+        pp_size = int(
+            self.cfg["megatron_cfg"].get("pipeline_model_parallel_size", 1)
+        )
+        ep_size = int(self.cfg["megatron_cfg"].get("expert_model_parallel_size", 1))
+        etp_size = int(
+            self.cfg["megatron_cfg"].get("expert_tensor_parallel_size", 1)
+        )
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        etp_rank_getter = getattr(
+            parallel_state, "get_expert_tensor_parallel_rank", lambda: 0
+        )
+
+        tasks = self._build_refit_conversion_tasks()
+        name_map = build_bridge_name_map(tasks)
+
+        num_heads = getattr(model_config, "num_attention_heads", None)
+        num_kv_heads = getattr(model_config, "num_query_groups", None) or num_heads
+        head_dim = getattr(model_config, "kv_channels", None)
+        num_experts = getattr(model_config, "num_moe_experts", None)
+        publish_set = list(
+            collect_megatron_publish_set(
+                self.model,
+                tp_size=tp_size,
+                pp_size=pp_size,
+                pp_rank=pp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                tp_rank=tp_rank,
+                num_local_experts=(
+                    int(num_experts) // ep_size if num_experts is not None else None
+                ),
+                num_attention_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+            )
+        )
+        items = list(
+            build_megatron_alias_inputs(
+                publish_set,
+                resolve_hf_names=make_bridge_resolver(name_map),
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                expert_tp_size=etp_size,
+                expert_tp_rank=etp_rank_getter(),
+            )
+        )
+
+        self._mx_reshard_publisher = MxMegatronPublisher(
+            items=items,
+            model_name=self.cfg["model_name"],
+            server_url=server_url,
+            rank=rank,
+            device_id=device_id,
+            listen_port=publisher_port_base + rank,
+            metadata_endpoint=f"{_get_node_ip_local()}:{publisher_port_base + rank}",
+        )
+        return True
+
+    @torch.no_grad()
+    def publish_mx_reshard_weights(self, version: int) -> bool:
+        """Publish this rank's currently live parameter storage at ``version``."""
+        publisher = getattr(self, "_mx_reshard_publisher", None)
+        if publisher is None:
+            raise RuntimeError("ModelExpress publisher is not initialized")
+        publisher.publish(version)
+        return True
+
+    def shutdown_mx_reshard_publisher(self) -> bool:
+        """Stop the rendezvous heartbeat and release NIXL registrations."""
+        publisher = getattr(self, "_mx_reshard_publisher", None)
+        if publisher is not None:
+            publisher.shutdown()
+        self._mx_reshard_publisher = None
+        return True
 
     def _collect_mtp_metrics(
         self,

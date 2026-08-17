@@ -579,9 +579,13 @@ def collect_megatron_publish_set(
         # previous version stripped before classification and the
         # receiver saw only `expert_column` / `replicated` because
         # every TP-sharded role fell through to the default.)
-        name = (
-            raw_name[len("module.") :] if raw_name.startswith("module.") else raw_name
-        )
+        name = raw_name
+        while name.startswith("module."):
+            # Megatron can wrap a chunk more than once (for example a local
+            # Float16Module around a distributed-data-parallel module). Bridge
+            # conversion tasks are keyed from the unwrapped module, so every
+            # leading wrapper component must be removed, not only the first.
+            name = name[len("module.") :]
 
         spec = detect_megatron_role(
             raw_name,

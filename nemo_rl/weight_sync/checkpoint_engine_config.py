@@ -37,6 +37,7 @@ def checkpoint_engine_refit_config(
         refit_config is None
         or transport is None
         or transport in VLLM_SPARSE_REFIT_TRANSPORTS
+        or transport == "mx_reshard"
     ):
         return None
 

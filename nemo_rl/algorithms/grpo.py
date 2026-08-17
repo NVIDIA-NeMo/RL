@@ -393,12 +393,16 @@ def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
 def _needs_hf_refit_handshake(
     generation_backend: str,
     nccl_reshard_refit_enabled: bool,
+    mx_reshard_refit_enabled: bool,
     colocated_inference: bool,
 ) -> bool:
     """Whether setup must run the HF-schema prepare_refit_info handshake."""
     if generation_backend == "megatron":
         return False
-    return not (nccl_reshard_refit_enabled and not colocated_inference)
+    return not (
+        (nccl_reshard_refit_enabled or mx_reshard_refit_enabled)
+        and not colocated_inference
+    )
 
 
 def shutdown_environments(
@@ -1311,9 +1315,12 @@ def setup(
             )
             assert remote_transport is not None
             remote_synchronizer_cls = VllmRemoteSparseWeightSynchronizer
-        elif refit_transport is not None and refit_transport != "nccl_reshard":
-            # nccl_reshard is handled below via nccl_reshard_refit_enabled,
-            # not via checkpoint-engine.
+        elif refit_transport is not None and refit_transport not in {
+            "nccl_reshard",
+            "mx_reshard",
+        }:
+            # Native reshard transports are handled below, not via
+            # checkpoint-engine.
             checkpoint_engine_config = checkpoint_engine_refit_config(generation_config)
             assert checkpoint_engine_config is not None
 
@@ -1513,12 +1520,21 @@ def setup(
     nccl_reshard_refit_enabled = (
         generation_config.get("refit_transport") == "nccl_reshard"
     )
+    mx_reshard_refit_enabled = (
+        generation_config.get("refit_transport") == "mx_reshard"
+    )
     if nccl_reshard_refit_enabled:
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             check_nccl_reshard_refit_support,
         )
 
         check_nccl_reshard_refit_support(master_config)
+    if mx_reshard_refit_enabled:
+        from nemo_rl.weight_sync.mx_reshard_weight_synchronizer import (
+            check_mx_reshard_refit_support,
+        )
+
+        check_mx_reshard_refit_support(master_config)
 
     if generation_config.get("refit_transport") is not None and backend != "vllm":
         raise NotImplementedError(
@@ -1546,6 +1562,20 @@ def setup(
             t0 = time.perf_counter()
             policy_generation.weight_synchronizer.sync_weights()
             setup_timing_metrics.generation_init_load_time_s = time.perf_counter() - t0
+    elif mx_reshard_refit_enabled:
+        t0 = time.perf_counter()
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=False,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+        )
+        policy_generation.weight_synchronizer.init_communicator()
+        setup_timing_metrics.extras["vllm_mx_reshard_init_time_s"] = (
+            time.perf_counter() - t0
+        )
     # if it is not colocated inference, initialize collective communication for update weights
     elif (
         not colocated_inference
@@ -1625,7 +1655,10 @@ def setup(
         if getattr(
             policy_generation, "weight_synchronizer", None
         ) is None and _needs_hf_refit_handshake(
-            backend, nccl_reshard_refit_enabled, colocated_inference
+            backend,
+            nccl_reshard_refit_enabled,
+            mx_reshard_refit_enabled,
+            colocated_inference,
         ):
             state_dict_info = policy.prepare_refit_info()
             if policy_generation is not None:
