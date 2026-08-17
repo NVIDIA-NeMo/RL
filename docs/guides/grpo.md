@@ -432,19 +432,19 @@ where:
 
 ### Loss Normalization (`token_level_loss`)
 
-The formulas above are written with a bare expectation $E_t[\cdot]$, which leaves one detail unspecified: the loss is computed per token, but the optimizer needs a single number, so those per-token values have to be averaged. The `token_level_loss` parameter chooses how that average is taken. It does not change the per-token quantity itself — only how the per-token values are combined into the scalar that is differentiated.
+The formulas above are written with a bare expectation $E_t[\cdot]$, which leaves one detail unspecified: the loss is computed per token, but the optimizer needs a single number, so those per-token values have to be averaged. The `token_level_loss` parameter chooses how that average is taken. It does not change the per-token objective itself — only how the per-token values are combined into the scalar that is differentiated.
 
 There are two choices:
 
 - **`token_level_loss: true`** — average over every token in the batch. Every token counts the same, so a response contributes to the update in proportion to how many tokens it has.
 - **`token_level_loss: false`** — average within each response first, then average those per-response values. Every *response* counts the same regardless of length.
 
-Writing $\ell_{i,t}$ for the per-token quantity of token $t$ in response $o_i$, $|o_i|$ for the number of unmasked tokens in that response, and $N$ for the number of valid responses:
+Writing $\ell_{i,t}$ for the per-token objective of token $t$ in response $o_i$ — the quantity inside the expectation in the formula above — $|o_i|$ for the number of unmasked tokens in that response, and $N$ for the number of valid responses:
 
 $$
-L_{\text{token}}(\theta) = -\frac{1}{\sum_{i=1}^{N} |o_i|} \sum_{i=1}^{N} \sum_{t=1}^{|o_i|} \ell_{i,t}
+L_{\text{token}}(\theta) = \frac{1}{\sum_{i=1}^{N} |o_i|} \sum_{i=1}^{N} \sum_{t=1}^{|o_i|} \ell_{i,t}
 \qquad\qquad
-L_{\text{seq}}(\theta) = -\frac{1}{N} \sum_{i=1}^{N} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \ell_{i,t}
+L_{\text{seq}}(\theta) = \frac{1}{N} \sum_{i=1}^{N} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \ell_{i,t}
 $$
 
 Both denominators — $\sum_i |o_i|$ and $N$ — are counts over the whole global batch, not over a single microbatch. Each microbatch divides by the global count and contributes a partial sum, so the microbatch losses can simply be summed to recover the global-batch loss. See [Loss Functions](../design-docs/loss-functions.md) for how that normalization factor is computed and passed in.
@@ -464,14 +464,14 @@ That is arithmetic, not a recommendation — which weighting is preferable depen
 
 `token_level_loss` lives on `ClippedPGLossFn`, the loss shared by the policy-gradient algorithms. The table below writes out the full objective for each one under both settings. To keep the expressions readable they show the base objective only; optional terms — the KL penalty, dual clipping (`ratio_clip_c`), and the importance-sampling correction (`use_importance_sampling_correction`) — are applied on top of it and are documented in the sections that follow.
 
-Throughout, $r_{i,t} = \frac{\pi_\theta(o_{i,t})}{\pi_{\theta_{\text{old}}}(o_{i,t})}$ is the per-token probability ratio, $A_i$ is the advantage for response $i$, $\text{sg}(\cdot)$ is the stop-gradient operator, and $\varepsilon_{\text{low}}$/$\varepsilon_{\text{high}}$ are `ratio_clip_min`/`ratio_clip_max`.
+Throughout, $r_{i,t} = \frac{\pi_\theta(o_{i,t})}{\pi_{\theta_{\text{old}}}(o_{i,t})}$ is the per-token probability ratio, $A_i$ is the advantage for response $i$, $\text{sg}(\cdot)$ is the stop-gradient operator, and $\varepsilon_{\text{low}}$, $\varepsilon_{\text{high}}$ are `ratio_clip_min`/`ratio_clip_max`.
 
 | Algorithm | `token_level_loss: true` | `token_level_loss: false` |
 | --- | --- | --- |
-| **GRPO / PPO / DAPO** | $-\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ | $-\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ |
-| **CISPO** (`use_cispo: true`) | $-\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \text{sg}\big(\text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\big) A_i \log \pi_\theta(o_{i,t})$ | Not available — rejected at construction time, because CISPO is defined per token. |
-| **GSPO** (`sequence_level_importance_ratios: true`) | Not available — rejected at construction time, because the sequence-level ratio is mutually exclusive with token-level reduction. | $-\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(s_i A_i,\ \text{clip}(s_i, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$, where $s_i = \Big(\frac{\pi_\theta(o_i)}{\pi_{\theta_{\text{old}}}(o_i)}\Big)^{1/\lvert o_i\rvert}$ |
-| **REINFORCE / RLOO** (`disable_ppo_ratio: true`) | $-\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t A_i \log \pi_\theta(o_{i,t})$ | $-\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t A_i \log \pi_\theta(o_{i,t})$ |
+| **GRPO / PPO / DAPO** | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ |
+| **CISPO** (`use_cispo: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \text{sg}\big(\text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\big) A_i \log \pi_\theta(o_{i,t})$ | Not available — rejected at construction time, because CISPO is defined per token. |
+| **GSPO** (`sequence_level_importance_ratios: true`) | Not available — rejected at construction time, because the sequence-level ratio is mutually exclusive with token-level reduction. | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(s_i A_i,\ \text{clip}(s_i, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$, where $s_i = \Big(\frac{\pi_\theta(o_i)}{\pi_{\theta_{\text{old}}}(o_i)}\Big)^{1/\lvert o_i\rvert}$ |
+| **REINFORCE / RLOO** (`disable_ppo_ratio: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t A_i \log \pi_\theta(o_{i,t})$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t A_i \log \pi_\theta(o_{i,t})$ |
 
 Two notes on the table:
 
