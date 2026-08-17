@@ -29,6 +29,7 @@ policy: &POLICY_BASE
         train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
         logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
         algorithm: "modified_first_fit_decreasing"
+        microbatch_order: "packer"
         sequence_length_round: 64
 
     max_grad_norm: 1.0
@@ -39,6 +40,10 @@ policy: &POLICY_BASE
         enabled: true
         empty_unused_memory_level: 0
         activation_checkpointing: false
+        # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
+        cuda_graph_impl: "none"
+        cuda_graph_modules: []
+        cuda_graph_warmup_steps: 3
         # recompute_granularity controls activation checkpointing depth.
         # "full": recompute all activations (default, max memory savings).
         # "selective": recompute only specific modules (see recompute_modules).

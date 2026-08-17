@@ -40,7 +40,8 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-    FullyShardedDataParallel as custom_FSDP,
+    FullyShardedDataParallelV1,
+    FullyShardedDataParallelV2,
 )
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -139,16 +140,92 @@ def _model_self_packs_for_cp(model: Any) -> bool:
 
     Such models (mbridge VLM wrappers) call ``preprocess_packed_seqs`` in their
     forward, so NeMo-RL must hand them an unpacked ``[B, S]`` batch instead of
-    pre-packing + CP-sharding itself. The only such model today is mbridge's
-    Qwen3VL, which is also the only mbridge VLM that supports context
-    parallelism; classic mcore GPTModel and other VLMs do not self-pack.
+    pre-packing + CP-sharding itself. New wrappers advertise the capability
+    through ``model_owns_packing``. The Qwen3VL type check remains as a
+    compatibility fallback until that upstream model exposes the capability.
     """
     from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
     from megatron.core.utils import unwrap_model
 
     unwrapped = unwrap_model(model)
     chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
-    return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
+    return any(
+        bool(getattr(chunk, "model_owns_packing", False))
+        or isinstance(chunk, Qwen3VLModel)
+        for chunk in chunks
+    )
+
+
+def _model_self_packs_mtp_loss_mask(model: Any) -> bool:
+    """Whether a self-packing model also aligns and CP-shards MTP masks."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(
+        bool(getattr(chunk, "model_owns_mtp_loss_mask_packing", False))
+        for chunk in chunks
+    )
+
+
+def _model_slices_context_parallel_inputs(model: Any) -> bool:
+    """Whether the model consumes full THD input and slices CP after embedding."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(
+        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
+        for chunk in chunks
+    )
+
+
+def _estimate_refit_tensor_size_in_bytes(
+    param: torch.Tensor,
+    *,
+    export_dtype: torch.dtype,
+    tp_size: int,
+    ep_size: int,
+) -> int:
+    """Estimate the gathered tensor size produced by Bridge export.
+
+    Floating-point model weights are exported at the policy dtype. Integral
+    state (for example BatchNorm ``num_batches_tracked`` buffers) keeps its
+    original dtype and must not be looked up in a floating-point-only table.
+    """
+    element_size = (
+        torch.empty((), dtype=export_dtype).element_size()
+        if param.is_floating_point()
+        else param.element_size()
+    )
+    return param.numel() * tp_size * ep_size * element_size
+
+
+def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
+    """Return HF layer names whose weights originate from Megatron's MTP module.
+
+    This is required because, in some cases, only the Megatron-side name contains
+    the `mtp` string, while the HF-side name does not.
+
+    Args:
+        conversion_tasks: Megatron-Bridge ``WeightConversionTask`` list
+
+    Returns:
+        Set of HF layer names, e.g. ``{"model.layers.61", "mtp.layers.0"}``.
+    """
+    from nemo_rl.weight_sync.nccl_reshard_utils import _extract_layer_name
+
+    mtp_layers: set[str] = set()
+    for task in conversion_tasks or []:
+        if task is None:
+            continue
+        if ".mtp." in task.global_param_name or task.global_param_name.startswith(
+            "mtp."
+        ):
+            hf = task.mapping.hf_param
+            for hf_name in hf.values() if isinstance(hf, dict) else [str(hf)]:
+                mtp_layers.add(_extract_layer_name(hf_name))
+    return mtp_layers
 
 
 @contextmanager
@@ -319,6 +396,7 @@ class MegatronPolicyWorkerImpl(
         init_reference_model: bool = True,
         *,
         worker_sharding_annotations: NamedSharding,
+        skip_weight_load: bool = False,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
@@ -440,11 +518,16 @@ class MegatronPolicyWorkerImpl(
         self.megatron_cfg.validate()
 
         # Step 4: Setup Megatron model and components
+        assert not (skip_weight_load and (init_optimizer or init_reference_model)), (
+            "skip_weight_load is only valid for inference-only policies "
+            "(init_optimizer=False, init_reference_model=False)."
+        )
         model_and_optimizer_state = setup_model_and_optimizer(
             config,
             self.megatron_cfg,
             init_optimizer,
             pre_load_checkpoint_hook=getattr(self, "_pre_load_checkpoint_hook", None),
+            load_weights=not skip_weight_load,
         )
 
         self.mcore_state = model_and_optimizer_state.state
@@ -501,6 +584,38 @@ class MegatronPolicyWorkerImpl(
         # (mbridge VLM wrappers like Qwen3VL). If so, NeMo-RL must hand it an
         # unpacked [B, S] batch rather than pre-packing + CP-sharding itself.
         self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
+        self.delegate_mtp_loss_mask_to_model = _model_self_packs_mtp_loss_mask(
+            self.model
+        )
+        assert (
+            not self.delegate_mtp_loss_mask_to_model or self.delegate_pack_to_model
+        ), "A model cannot own MTP-mask packing without owning sequence packing"
+        self.model_slices_context_parallel_inputs = (
+            _model_slices_context_parallel_inputs(self.model)
+        )
+        if self.model_slices_context_parallel_inputs:
+            if self.delegate_pack_to_model:
+                raise RuntimeError(
+                    "A model cannot both own sequence packing and consume caller-packed "
+                    "full THD inputs."
+                )
+            # MTP is supported here: the caller packs the MTP loss mask onto the
+            # same full THD row as input_ids and leaves it unsharded, so the
+            # model's own post-embedding CP slice applies to both alike. See the
+            # mtp_loss_mask branch in nemo_rl.models.megatron.data.
+            if self.cfg["megatron_cfg"].get("use_fused_linear_logprobs", False):
+                raise NotImplementedError(
+                    "Nemotron Omni caller-packed THD inputs do not support "
+                    "use_fused_linear_logprobs=true."
+                )
+            virtual_pipeline_size = self.cfg["megatron_cfg"].get(
+                "virtual_pipeline_model_parallel_size"
+            )
+            if virtual_pipeline_size not in (None, 1):
+                raise NotImplementedError(
+                    "Nemotron Omni caller-packed THD inputs do not yet support "
+                    "virtual pipeline parallelism."
+                )
 
         # vars used for refit
         ## will be initialized in prepare_refit_info
@@ -703,6 +818,8 @@ class MegatronPolicyWorkerImpl(
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
                     delegate_pack_to_model=self.delegate_pack_to_model,
+                    delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+                    model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -1535,6 +1652,8 @@ class MegatronPolicyWorkerImpl(
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
             delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
         )
 
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
@@ -1752,6 +1871,8 @@ class MegatronPolicyWorkerImpl(
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
             delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
         )
 
         list_of_outputs = megatron_forward_backward(
@@ -1974,18 +2095,11 @@ class MegatronPolicyWorkerImpl(
                 # need to broadcast for other pp ranks
                 size_in_bytes = None
             else:
-                # Calculate size for this parameter
-                prec_to_bytes = {
-                    torch.bfloat16: 2,
-                    torch.float16: 2,
-                    torch.float32: 4,
-                    torch.float8_e4m3fn: 1,
-                    torch.float8_e5m2: 1,
-                    torch.uint8: 1,
-                }
-                scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
-                size_in_bytes = (
-                    param.element_size() * param.numel() * tp_size * ep_size * scale
+                size_in_bytes = _estimate_refit_tensor_size_in_bytes(
+                    param,
+                    export_dtype=self.dtype,
+                    tp_size=tp_size,
+                    ep_size=ep_size,
                 )
 
             # Broadcast size_in_bytes across pipeline parallel ranks
@@ -2312,7 +2426,18 @@ class MegatronPolicyWorkerImpl(
         # state_dict_metadata[hf_name] -> [shape, dtype]
         # At the same time, filter the params to the misc subset (packed_broadcast path).
         # misc_meta[hf_name] -> [shape, dtype]
-        from nemo_rl.weight_sync.nccl_reshard_utils import _extract_layer_prefix
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
+            _extract_layer_name,
+            _extract_layer_prefix,
+        )
+
+        # HF layers whose weights come from Megatron's MTP module. The prefix
+        # gate inside is_nccl_reshard_param only catches families whose HF
+        # names keep the bare ``mtp.`` prefix (NemotronH, Qwen3.5); DeepSeek
+        # exports MTP as trailing ``model.layers.N`` indices, so provenance is
+        # the only reliable signal. vLLM keeps the MTP drafter separate from
+        # the main model and updates it through load_weights -> misc path.
+        mtp_hf_layers_names = _collect_mtp_hf_layer_names(self.refit_conversion_tasks)
 
         layer_prefix = None
         with _meta_tensor_alloc_context():
@@ -2324,7 +2449,10 @@ class MegatronPolicyWorkerImpl(
                 _nbytes = tensor.numel() * tensor.element_size()
                 # Downsized whitelist: only FFN gate/up/down weights take the bulk
                 # nccl-reshard path; everything else -> misc (packed_broadcast).
-                if is_nccl_reshard_param(name):
+                if (
+                    is_nccl_reshard_param(name)
+                    and _extract_layer_name(name) not in mtp_hf_layers_names
+                ):
                     state_dict_metadata[name] = meta
                     _xfer_bytes += _nbytes
                     if layer_prefix is not None:
@@ -2806,7 +2934,9 @@ class MegatronPolicyWorkerImpl(
                         raise ValueError(
                             f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
                         )
-        elif isinstance(model, custom_FSDP):
+        elif isinstance(
+            model, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
+        ):
             if device == "cpu":
                 model.param_and_grad_buffer.offload_to_cpu(move_params, move_grads)
             elif device == "cuda":
@@ -2890,6 +3020,19 @@ class MegatronPolicyWorkerImpl(
                 ckpt_cfg=self.mcore_state.cfg.checkpoint,
                 blocking=True,
             )
+
+            # Onload model before saving it.
+            self.model = self.move_model(
+                self.model, "cuda", move_params=True, move_grads=False
+            )
+            if (
+                optimizer_path is not None
+                and self.optimizer is not None
+                and not self.optimizer_cpu_offload
+            ):
+                self.move_optimizer("cuda")
+            torch.cuda.synchronize()
+
             self.mcore_state.cfg.checkpoint.save = weights_path
 
             optimizer_to_save = None

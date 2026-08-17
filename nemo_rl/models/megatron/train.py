@@ -88,7 +88,8 @@ def model_forward(
     Args:
         model: The model to run forward pass on
         data_dict: Dictionary containing batch data
-        input_ids_cp_sharded: Context-parallel sharded input token IDs
+        input_ids_cp_sharded: Model-forward token IDs. Usually CP-sharded; models
+            that insert media before CP selection receive the full packed THD row.
         position_ids: Position IDs for tokens
         attention_mask: Attention mask for the sequence
         packed_seq_params: Parameters for packed sequences (optional)
@@ -132,6 +133,15 @@ def model_forward(
             **additional_kwargs,
             **multimodal_data,
         )
+
+    # A model that slices context parallelism itself returns (output,
+    # sliced_loss_mask) when it was handed a full-sequence loss_mask, so the
+    # caller can see the mask in the model's own CP-local token order. The MTP
+    # loss is computed inside the model against that mask, so only the logits
+    # are needed here. Without this the tuple reaches the loss wrapper, which
+    # calls .narrow() on it. See modeling_nemotron_omni.py return_sliced_loss_mask.
+    if isinstance(output_tensor, tuple):
+        output_tensor = output_tensor[0]
 
     return output_tensor
 

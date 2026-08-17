@@ -95,6 +95,15 @@ class PromptGroupSampler(Protocol):
         """Drop groups that can no longer be selected; clear their DP rows."""
         ...
 
+    def should_abort_inflight(
+        self,
+        *,
+        start_weight_version: int,
+        current_train_weight: int,
+    ) -> bool:
+        """Return whether an unfinished rollout can no longer be selected."""
+        ...
+
     @property
     def is_on_policy(self) -> bool:
         """True when the policy admits zero staleness (sync mode)."""
@@ -102,6 +111,10 @@ class PromptGroupSampler(Protocol):
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
+        ...
+
+    def set_dispatch_index(self, resume_from_step: int) -> None:
+        """Seed the dispatch cursor when resuming from a checkpoint."""
         ...
 
 
@@ -118,6 +131,23 @@ class BaseSampler(abc.ABC):
         # Pre-incremented before each admitted batch, so -1 lets the first
         # batch through a zero-staleness gate.
         self._dispatch_index: int = -1
+
+    def set_dispatch_index(self, resume_from_step: int) -> None:
+        """Seed the dispatch cursor when resuming from a checkpoint.
+
+        Args:
+            resume_from_step: Trainer step this run starts from — 0 for a
+                fresh run, the restored ``current_step`` when resuming. Sets
+                the cursor to ``resume_from_step - 1`` so gated ``admit`` and
+                ``InOrderSampler``'s target_step stamps line up with the
+                restored trainer version exactly as at step 0 of a fresh run.
+                Call before the first ``admit``.
+        """
+        if resume_from_step < 0:
+            raise ValueError(
+                f"resume_from_step must be non-negative, got {resume_from_step}"
+            )
+        self._dispatch_index = resume_from_step - 1
 
     # ── rollout-pump side ────────────────────────────────────────────────
     @abc.abstractmethod
@@ -154,6 +184,14 @@ class BaseSampler(abc.ABC):
         return await self._buffer.remove(stale_idxs, remove_in_dp=True)
 
     # ── derived facts ────────────────────────────────────────────────────
+    def should_abort_inflight(
+        self,
+        *,
+        start_weight_version: int,
+        current_train_weight: int,
+    ) -> bool:
+        return False
+
     @property
     def is_on_policy(self) -> bool:
         return self._eviction_window() == 0
@@ -227,6 +265,18 @@ class WindowedSampler(BaseSampler):
 
     def _eviction_window(self) -> int:
         return self.max_staleness_versions
+
+    def should_abort_inflight(
+        self,
+        *,
+        start_weight_version: int,
+        current_train_weight: int,
+    ) -> bool:
+        min_valid_version = max(
+            0,
+            current_train_weight - self.max_staleness_versions,
+        )
+        return start_weight_version < min_valid_version
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
         # Over-sampled: dispatch is bounded by buffer capacity, not by version.
@@ -479,7 +529,8 @@ def create_sampler(
         if not isinstance(sampler, PromptGroupSampler):
             raise TypeError(
                 f"{cfg.target} does not implement the PromptGroupSampler "
-                f"interface (needs admit/select/evict)"
+                f"interface (needs admit/select/evict/should_abort_inflight, "
+                f"set_dispatch_index, is_on_policy, required_buffer_capacity)"
             )
         return sampler
     raise ValueError(f"unknown sampler config {type(cfg).__name__}")
