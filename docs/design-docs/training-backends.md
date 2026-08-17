@@ -120,10 +120,11 @@ policy:
 of `1.0` fully offloads the optimizer; smaller values trade less GPU memory
 savings for more GPU-resident optimizer work. Optimizer CPU offload requires
 `use_distributed_optimizer: true`; the non-distributed mixed-precision wrapper
-is incompatible with the hybrid optimizer's parameter mapping. Enabling
-`overlap_cpu_optimizer_d2h_h2d` lets Megatron Core overlap optimizer state
-transfers with CPU optimizer updates. At high offload fractions, CPU Adam can
-dominate iteration time; enable this overlap to hide D2H and H2D transfers
+is incompatible with the hybrid optimizer's parameter mapping. The pinned
+Megatron Core version supports optimizer CPU offload only with Adam and SGD.
+Enabling `overlap_cpu_optimizer_d2h_h2d` lets Megatron Core overlap optimizer
+state transfers with CPU optimizer updates. At high offload fractions, CPU Adam
+can dominate iteration time; enable this overlap to hide D2H and H2D transfers
 behind the CPU optimizer step.
 
 Megatron Core owns optimizer state placement while this mode is enabled, so

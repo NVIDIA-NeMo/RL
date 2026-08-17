@@ -1509,13 +1509,15 @@ class TestApplyPerformanceConfig:
 class TestValidateOptimizerConfig:
     """Tests for _validate_optimizer_config function."""
 
-    def test_cpu_offload_accepts_fractional_offload(self):
-        """Fractional CPU offload is delegated to HybridDeviceOptimizer."""
+    @pytest.mark.parametrize("optimizer", ["adam", "sgd"])
+    def test_cpu_offload_accepts_fractional_offload(self, optimizer):
+        """Supported optimizers delegate fractional offload to MCore."""
         from nemo_rl.models.megatron.setup import _validate_optimizer_config
 
         config = {
             "megatron_cfg": {
                 "optimizer": {
+                    "optimizer": optimizer,
                     "use_distributed_optimizer": True,
                     "optimizer_cpu_offload": True,
                     "optimizer_offload_fraction": 0.5,
@@ -1551,6 +1553,7 @@ class TestValidateOptimizerConfig:
         config = {
             "megatron_cfg": {
                 "optimizer": {
+                    "optimizer": "adam",
                     "use_distributed_optimizer": True,
                     "optimizer_cpu_offload": True,
                     "optimizer_offload_fraction": 1.0,
@@ -1580,6 +1583,31 @@ class TestValidateOptimizerConfig:
         with pytest.raises(
             ValueError,
             match="optimizer_cpu_offload=True requires use_distributed_optimizer=True",
+        ):
+            _validate_optimizer_config(config)
+
+    @pytest.mark.parametrize("optimizer", ["lion", "muon"])
+    def test_cpu_offload_rejects_optimizers_without_hybrid_device_support(
+        self, optimizer
+    ):
+        """Pinned MCore only constructs HybridDeviceOptimizer for Adam and SGD."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "optimizer": optimizer,
+                    "use_distributed_optimizer": True,
+                    "optimizer_cpu_offload": True,
+                    "optimizer_offload_fraction": 0.5,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
+                }
+            }
+        }
+
+        with pytest.raises(
+            ValueError,
+            match="optimizer_cpu_offload=True requires optimizer to be adam or sgd",
         ):
             _validate_optimizer_config(config)
 
@@ -2155,14 +2183,9 @@ class TestCreateMegatronConfigGlooProcessGroups:
 class TestCreateMegatronConfigOptimizerOffload:
     """Tests for optimizer CPU-offload plumbing into Megatron Core."""
 
-    @pytest.mark.parametrize(
-        ("transfer_overlap", "expected_transfer_overlap"),
-        [(True, True), (None, False)],
-    )
-    def test_fraction_and_transfer_overlap_are_forwarded(
-        self, transfer_overlap, expected_transfer_overlap
-    ):
-        """NeMo RL passes hybrid optimizer settings to OptimizerConfig."""
+    @pytest.mark.parametrize("transfer_overlap", [True, False, None])
+    def test_fraction_and_transfer_overlap_are_forwarded(self, transfer_overlap):
+        """Explicit values are forwarded; omission defers to the Bridge default."""
         from nemo_rl.models.megatron.setup import _create_megatron_config
 
         optimizer_config = {
@@ -2210,10 +2233,10 @@ class TestCreateMegatronConfigOptimizerOffload:
         optimizer_kwargs = mock_optimizer_config.call_args.kwargs
         assert optimizer_kwargs["optimizer_cpu_offload"] is True
         assert optimizer_kwargs["optimizer_offload_fraction"] == 0.5
-        assert (
-            optimizer_kwargs["overlap_cpu_optimizer_d2h_h2d"]
-            is expected_transfer_overlap
-        )
+        if transfer_overlap is None:
+            assert "overlap_cpu_optimizer_d2h_h2d" not in optimizer_kwargs
+        else:
+            assert optimizer_kwargs["overlap_cpu_optimizer_d2h_h2d"] is transfer_overlap
 
 
 @pytest.mark.mcore

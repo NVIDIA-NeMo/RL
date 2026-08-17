@@ -1171,8 +1171,12 @@ def _validate_optimizer_config(config: PolicyConfig) -> None:
         raise ValueError(
             "optimizer_cpu_offload=True requires use_distributed_optimizer=True"
         )
+    if optimizer_cpu_offload and optimizer_config["optimizer"] not in {"adam", "sgd"}:
+        raise ValueError(
+            "optimizer_cpu_offload=True requires optimizer to be adam or sgd"
+        )
     if not optimizer_cpu_offload and optimizer_config.get(
-        "overlap_cpu_optimizer_d2h_h2d", False
+        "overlap_cpu_optimizer_d2h_h2d"
     ):
         raise ValueError(
             "overlap_cpu_optimizer_d2h_h2d=True requires optimizer_cpu_offload=True"
@@ -1329,7 +1333,6 @@ def _create_megatron_config(
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
-    optimizer_kwargs.setdefault("overlap_cpu_optimizer_d2h_h2d", False)
 
     # Fused linear logprobs run the decoder but read output_layer.weight directly
     # instead of calling output_layer.forward(). Megatron's distributed-optimizer
