@@ -4047,6 +4047,10 @@ def async_grpo_train(
     # SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
+    requires_initial_fp8_refit = (
+        backend == "trtllm"
+        and generation_config.get("trtllm_cfg", {}).get("precision") == "fp8"
+    )
     assert backend in ("vllm", "megatron", "trtllm") and _should_use_async_rollouts(
         master_config
     ), (
@@ -4238,13 +4242,12 @@ def async_grpo_train(
         next_nemo_gym_task_index=next_nemo_gym_task_index,
     )
 
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    # Ensure collector knows initial weight version
-    trajectory_collector.set_weight_version.remote(weight_version)
-
-    print("📦 Started continuous background trajectory collection")
+    if not requires_initial_fp8_refit:
+        # Preserve the existing overlap for generation engines that already
+        # contain usable weights when the collector starts.
+        collection_task = trajectory_collector.start_collection.remote(dataloader)
+        trajectory_collector.set_weight_version.remote(weight_version)
+        print("📦 Started continuous background trajectory collection")
 
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
@@ -4338,6 +4341,13 @@ def async_grpo_train(
             except Exception as e:
                 print(f"Error stopping replay buffer: {e}")
             return
+
+    if requires_initial_fp8_refit:
+        # The TRT-LLM FP8 engine starts with dummy weights, so no rollout may
+        # begin until the initial refit has completed successfully.
+        ray.get(trajectory_collector.set_weight_version.remote(weight_version))
+        collection_task = trajectory_collector.start_collection.remote(dataloader)
+        print("📦 Started continuous background trajectory collection")
 
     print("✅ All setup complete, starting buffer wait...")
     # Clear logger metrics at start of training
