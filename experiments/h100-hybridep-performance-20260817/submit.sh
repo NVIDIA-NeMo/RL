@@ -44,6 +44,10 @@ if [[ ${RUN_ROOT} != /* ]]; then
   echo "RUN_ROOT must be an absolute path" >&2
   exit 2
 fi
+if [[ -n ${UV_CACHE_DIR_OVERRIDE:-} && ${UV_CACHE_DIR_OVERRIDE} != /* ]]; then
+  echo "UV_CACHE_DIR_OVERRIDE must be an absolute path when set" >&2
+  exit 2
+fi
 if [[ ! -f ${CONTAINER} ]]; then
   echo "CONTAINER does not exist: ${CONTAINER}" >&2
   exit 2
@@ -109,6 +113,9 @@ export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-${HF_HOME}/cache}
 export HF_HOME
 export MOUNTS
 export NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS:-true}
+if [[ -n ${UV_CACHE_DIR_OVERRIDE:-} ]]; then
+  export UV_CACHE_DIR_OVERRIDE
+fi
 export WANDB_API_KEY
 
 sbatch_args=(

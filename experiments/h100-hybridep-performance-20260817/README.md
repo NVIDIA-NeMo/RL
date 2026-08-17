@@ -107,6 +107,8 @@ export HF_HOME=...
 export RUN_ROOT=...
 export WANDB_API_KEY=...
 export WANDB_PROJECT=...
+# Optional: reuse wheels built for the pinned HybridEP revision across jobs.
+export UV_CACHE_DIR_OVERRIDE=...
 
 experiments/h100-hybridep-performance-20260817/submit.sh --list
 experiments/h100-hybridep-performance-20260817/submit.sh \
@@ -119,4 +121,6 @@ The launcher requests all eight GPUs on every H100 node. It never embeds a
 cluster hostname, account, shared-storage path, or credential. The baseline
 recipe is materialized from commit
 `4a1454bf430624786251d14ba0197169c8e68a5c` inside the allocated job and is
-deleted on exit.
+deleted on exit. An optional absolute `UV_CACHE_DIR_OVERRIDE` is forwarded to
+`ray.sub` so a one-node dependency warmup can populate a shared wheel cache
+before large jobs allocate GPUs.
