@@ -90,6 +90,7 @@ jobs:
           REGISTRY: ${{ inputs.registry }}
           IMAGE_NAME: ${{ inputs.image-name }}
         with:
+          retries: 3
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
             const result = await github.graphql(`
