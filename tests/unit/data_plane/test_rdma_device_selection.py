@@ -107,14 +107,28 @@ def test_gid_index_left_unset_for_infiniband(fake_fabric, monkeypatch):
     pin must not be applied when IB is selected."""
     monkeypatch.delenv("MC_GID_INDEX", raising=False)
     fake_fabric(_MIXED)
-    tq_adapter._mooncake_transport_config()
+    tq_adapter._pin_roce_gid_index()
     assert "MC_GID_INDEX" not in os.environ
 
 
 def test_gid_index_pinned_for_roce(fake_fabric, monkeypatch):
     monkeypatch.delenv("MC_GID_INDEX", raising=False)
     fake_fabric({"mlx5_3": "Ethernet"})
-    tq_adapter._mooncake_transport_config()
+    tq_adapter._pin_roce_gid_index()
+    assert os.environ["MC_GID_INDEX"] == "3"
+
+
+def test_gid_index_pinned_in_every_process_not_just_the_driver(
+    fake_fabric, stub_client, monkeypatch
+):
+    """The regression this guards: the pin used to live in
+    _mooncake_transport_config, which _init_tq calls on the driver alone. A Ray
+    worker builds its own mooncake engine and never saw it, so the two sides
+    could disagree on GID index — which no RoCE QP survives."""
+    monkeypatch.delenv("MC_GID_INDEX", raising=False)
+    fake_fabric({"mlx5_0": "Ethernet", "mlx5_1": "Ethernet"})
+    # bootstrap=False is the worker path: no _init_tq, so no transport config.
+    stub_client(_mooncake_cfg())
     assert os.environ["MC_GID_INDEX"] == "3"
 
 
