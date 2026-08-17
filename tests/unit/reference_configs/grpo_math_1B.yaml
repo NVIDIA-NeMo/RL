@@ -413,6 +413,7 @@ policy:
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
       vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
       http_refit_api_key_env_var: null # Optional env var containing the internal refit API key.
+      reset_encoder_cache_after_weight_update: false # Invalidate cached multimodal encoder outputs after a successful async refit. Only safe when generation is quiesced (grpo.async_grpo.in_flight_weight_updates=false).
       http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.
       zmq_refit_server_port: null # Optional fixed ZeroMQ relay port for Kubernetes targetPorts.
     vllm_kwargs: {}
