@@ -362,6 +362,7 @@ class TestSetup:
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True
         mc.token_capture.enabled = True
+        mc.async_rl.sampler = WeightFifoSamplerConfig(max_staleness_versions=1)
         mc.data_plane.update(
             {
                 "backend": "simple",
