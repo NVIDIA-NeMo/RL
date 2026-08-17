@@ -221,34 +221,6 @@ Two things are easy to get wrong here:
   `num_last_layers_in_bf16`. `lm_head`, embeddings, and the MoE router are
   never quantized by design.
 
-### Refit
-
-- Every step streams bf16 weights from Megatron and re-quantizes them on the
-  vLLM side; scales are updated in place.
-- `VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "0"` (set in the recipes'
-  `vllm_cfg.env_vars`) is required: the FP8 patches attach to the v1 Ray
-  executor, and with the v2 default the first refit fails with
-  `'NoneType' object has no attribute 'is_mx'`.
-- Refit is the memory high-water mark of the step: vLLM re-materializes its
-  full `gpu_memory_utilization` claim on top of the trainer's residual
-  footprint, plus transient quantization buffers. The 35B recipe sets
-  `gpu_memory_utilization: 0.5` (down from the inherited 0.6) to leave that
-  headroom; raise it in small steps while watching free memory after the first
-  refit, not before it.
-
-### Grouped MoE (35B-A3B)
-
-- Megatron exports experts as grouped slabs (`mlp.experts.gate_up_proj` /
-  `mlp.experts.down_proj`, no `.weight` suffix). vLLM's fused expert loader
-  maps only the weight and has no path for per-block scales, so NeMo RL expands
-  each slab into per-expert `experts.{i}.{gate,up,down}_proj.weight` +
-  `weight_scale_inv` entries during refit, quantizing one expert at a time
-  (bounded transient memory, bitwise-identical to quantizing the whole slab).
-- Expert `out_features` / `in_features` must be 128-divisible; this is asserted
-  at refit time.
-- MXFP8 does not support grouped-MoE refit (`NotImplementedError`); use the
-  blockwise FP8 recipe for MoE models.
-
 ### Training-Side Settings That Matter
 
 - `fp8_cfg`: `fp8: e4m3`, `fp8_recipe: blockwise`, `fp8_param: false`, with
@@ -265,6 +237,12 @@ on the verification runs: 35B ~0.0024 over the first 20 steps, drifting to
 steps. The nightly thresholds (0.004 / 0.003 on the 20-step mean) are set from
 these; if you see values well above them, suspect a broken refit rather than
 FP8 noise.
+
+### Limitations
+
+- MXFP8 is not yet supported for Qwen3.5: the grouped-MoE expert refit only
+  implements blockwise FP8 (`fp8_recipe: blockwise`), and an MXFP8 refit raises
+  `NotImplementedError`.
 
 ## `flash-linear-attention` Performance
 
