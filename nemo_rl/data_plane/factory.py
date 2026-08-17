@@ -35,13 +35,12 @@ def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
     if cfg is None or not cfg["enabled"]:
         return
 
-    impl = cfg["impl"]
-    if impl == "transfer_queue":
-        from nemo_rl.data_plane.adapters.transfer_queue import maybe_configure_engine_env
+    if cfg["impl"] == "transfer_queue":
+        from nemo_rl.data_plane.adapters.transfer_queue import (
+            maybe_configure_engine_env,
+        )
 
         maybe_configure_engine_env(cfg)
-    else:
-        raise ValueError(f"unknown data_plane impl: {impl!r}")
 
 
 def build_data_plane_client(
