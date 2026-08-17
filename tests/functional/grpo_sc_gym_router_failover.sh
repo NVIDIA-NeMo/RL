@@ -31,8 +31,21 @@ RUN_LOG=$EXP_DIR/run.log
 DATA_DIR=$EXP_DIR/data
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
-# Seconds to let the run get past setup and into steady-state rollouts before killing.
-KILL_AFTER_S=${KILL_AFTER_S:-180}
+# Completed training steps to wait for before killing a shard.
+#
+# NOT a fixed sleep, which is what this originally did and why job 6251221 proved
+# nothing: generation actors exist as soon as the inference cluster is built, but
+# NeMo-Gym's _spinup runs afterwards and takes minutes. A timer started at actor
+# discovery therefore fired while the run was still in SETUP, the kill took down the
+# vLLM server Gym's policy_model process depends on, and Gym's own poll() failed the
+# run -- which the harness then reported as "died after losing one of two shards".
+# True, and completely misleading: no rollout had ever been served.
+#
+# "train step N/M" is the marker, because it is only printed once the train pump has
+# completed a step, i.e. rollouts are flowing through the router for real.
+KILL_AFTER_STEPS=${KILL_AFTER_STEPS:-3}
+# Ceiling on that wait. Generous: it covers Gym data prep, engine load and spinup.
+STEADY_STATE_WAIT_S=${STEADY_STATE_WAIT_S:-1800}
 # How long to wait for generation actors to appear.
 ACTOR_WAIT_S=${ACTOR_WAIT_S:-600}
 ACTOR_QUERY_TIMEOUT_S=${ACTOR_QUERY_TIMEOUT_S:-120}
@@ -163,11 +176,25 @@ if (( ${#ACTORS[@]} < 2 )); then
 fi
 echo "[failover] generation actors: ${ACTORS[*]}"
 
-echo "[failover] letting the run reach steady state for ${KILL_AFTER_S}s..."
-for _ in $(seq 1 "$KILL_AFTER_S"); do
+echo "[failover] waiting for ${KILL_AFTER_STEPS} training steps (up to ${STEADY_STATE_WAIT_S}s)..."
+STEPS=0
+for _ in $(seq 1 "$STEADY_STATE_WAIT_S"); do
     kill -0 $TRAIN_PID 2>/dev/null || { echo "[failover] FAIL: job died before the kill"; tail -60 "$RUN_LOG"; exit 1; }
+    STEPS=$(grep -cE "train step [0-9]+/" "$RUN_LOG" 2>/dev/null || true)
+    (( STEPS >= KILL_AFTER_STEPS )) && break
     sleep 1
 done
+
+if (( STEPS < KILL_AFTER_STEPS )); then
+    # Distinguished from a failover failure on purpose: reaching steady state is a
+    # PRECONDITION of this test, not the thing it measures. Reporting it as "the run
+    # died after losing a shard" is what made job 6251221's result unreadable.
+    echo "[failover] FAIL: only $STEPS training step(s) in ${STEADY_STATE_WAIT_S}s;"
+    echo "[failover] the run never reached steady state, so nothing about failover was tested."
+    tail -60 "$RUN_LOG"
+    exit 1
+fi
+echo "[failover] $STEPS training steps done -- rollouts are flowing through the router."
 
 VICTIM=${ACTORS[0]}
 echo "[failover] killing generation actor $VICTIM"
