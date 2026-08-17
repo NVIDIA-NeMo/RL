@@ -124,3 +124,15 @@ recipe is materialized from commit
 deleted on exit. An optional absolute `UV_CACHE_DIR_OVERRIDE` is forwarded to
 `ray.sub` so a one-node dependency warmup can populate a shared wheel cache
 before large jobs allocate GPUs.
+
+Before submitting model jobs, run `warm_hybridep_cache.sbatch` once with the
+same immutable container and cache path. It builds the pinned HybridEP wheel on
+one H100 and makes it reusable by every actor environment:
+
+```bash
+export PROJECT_ROOT=...
+export UV_CACHE_DIR_OVERRIDE=...
+
+sbatch --test-only warm_hybridep_cache.sbatch
+sbatch warm_hybridep_cache.sbatch
+```
