@@ -39,6 +39,7 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.rollouts import (
     RolloutGroupResult,
     attach_initial_nemo_gym_image_payloads,
+    nemo_gym_pad_dynamic_image_shapes,
     run_async_multi_turn_rollout_groups,
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
@@ -447,7 +448,11 @@ class AsyncTrajectoryCollector:
                 self._stamp_nemo_gym_task_indices(rollout_batch)
                 if self.master_config.grpo.deduplicate_multimodal_data:
                     attach_initial_nemo_gym_image_payloads(
-                        rollout_batch, self.processor
+                        rollout_batch,
+                        self.processor,
+                        pad_dynamic_image_shapes=nemo_gym_pad_dynamic_image_shapes(
+                            self.master_config
+                        ),
                     )
             repeated_batch = rollout_batch.repeat_interleave(
                 num_generations,

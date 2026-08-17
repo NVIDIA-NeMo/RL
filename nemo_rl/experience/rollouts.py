@@ -74,9 +74,27 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 
+def nemo_gym_pad_dynamic_image_shapes(master_config: Any) -> bool:
+    """Read ``env.nemo_gym.pad_dynamic_image_shapes``, defaulting to False.
+
+    Dynamic-resolution processors size each image independently, so a prompt
+    carrying more than one image yields a ragged ``pixel_values`` list that
+    cannot be stacked. Callers must thread this through to
+    :func:`attach_image_model_inputs_to_message` or that stack raises.
+    """
+    env_config = getattr(master_config, "env", None)
+    if not env_config or not hasattr(env_config, "get"):
+        return False
+    nemo_gym_config = env_config.get("nemo_gym")
+    if not nemo_gym_config or not hasattr(nemo_gym_config, "get"):
+        return False
+    return bool(nemo_gym_config.get("pad_dynamic_image_shapes", False))
+
+
 def attach_initial_nemo_gym_image_payloads(
     batch: BatchedDataDict[DatumSpec],
     processor: Any,
+    pad_dynamic_image_shapes: bool = False,
 ) -> None:
     """Attach initial Gym image tensors once, before prompt repeat.
 
@@ -114,6 +132,7 @@ def attach_initial_nemo_gym_image_payloads(
             user_message,
             images=images,
             processor=processor,
+            pad_dynamic_image_shapes=pad_dynamic_image_shapes,
         )
 
 

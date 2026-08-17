@@ -92,6 +92,7 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
+    nemo_gym_pad_dynamic_image_shapes,
     backfill_missing_routed_experts,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
@@ -2857,7 +2858,13 @@ def grpo_train(
                         master_config.grpo.deduplicate_multimodal_data
                         and _should_use_nemo_gym(master_config)
                     ):
-                        attach_initial_nemo_gym_image_payloads(batch, processor)
+                        attach_initial_nemo_gym_image_payloads(
+                            batch,
+                            processor,
+                            pad_dynamic_image_shapes=nemo_gym_pad_dynamic_image_shapes(
+                                master_config
+                            ),
+                        )
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
@@ -3876,7 +3883,13 @@ def validate(
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
                 if master_config.grpo.deduplicate_multimodal_data:
-                    attach_initial_nemo_gym_image_payloads(val_batch, processor)
+                    attach_initial_nemo_gym_image_payloads(
+                        val_batch,
+                        processor,
+                        pad_dynamic_image_shapes=nemo_gym_pad_dynamic_image_shapes(
+                            master_config
+                        ),
+                    )
                 generation_config = master_config.policy["generation"]
                 # Validation-only sampling (e.g. near-greedy validation);
                 # defaults to the train profile via the exemplar YAML
