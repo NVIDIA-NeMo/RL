@@ -176,6 +176,9 @@ def test_nemo_gym_subset_maps_local_rows_to_logical_siblings() -> None:
     impl._task_to_env = {"nemo_gym": env}
     impl._tokenizer = None
     impl._num_generations_per_prompt = 5
+    impl._max_gym_row_attempts = 1
+    impl._timeouts = RolloutTimeouts()
+    impl._stats = None
     impl._generation_config = {
         "temperature": 1.0,
         "top_p": 1.0,

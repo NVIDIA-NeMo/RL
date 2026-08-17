@@ -1055,6 +1055,7 @@ class TestDataPlaneCheckpoint:
                     "rollout_recovery_payload_sha256": "digest"
                 },
             ),
+            SetupTimingMetrics(),
         )
 
         asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
@@ -1083,6 +1084,7 @@ class TestDataPlaneCheckpoint:
                     "rollout_recovery_payload_sha256": "digest"
                 },
             ),
+            SetupTimingMetrics(),
         )
 
         asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
@@ -1108,6 +1110,7 @@ class TestDataPlaneCheckpoint:
                     "rollout_recovery_payload_sha256": "digest"
                 },
             ),
+            SetupTimingMetrics(),
         )
 
         with pytest.raises(RuntimeError, match="staging rows missing"):
@@ -1136,6 +1139,7 @@ class TestDataPlaneCheckpoint:
                     dp_client=dp_client,
                     rollout_manager=rollout_manager,
                 ),
+                SetupTimingMetrics(),
             )
             actor._train_steps = 1
             actor._trainer_version = 1
@@ -1200,6 +1204,7 @@ class TestDataPlaneCheckpoint:
                 tq_buffer=_FakeTQBuffer(metadata_state=replay_metadata),
                 rollout_manager=_FakeRolloutManager(ledger),
             ),
+            SetupTimingMetrics(),
         )
         actor._train_steps = 1
         actor._trainer_version = 1
