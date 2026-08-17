@@ -21,6 +21,80 @@ if [[ -z "${MC_MOONCAKE_DEVICE:-}" ]] &&
     exit 0
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMPORARY DIAGNOSTIC — REMOVE BEFORE MERGE.
+#
+# Why: the gb200 runners fail every transfer with a QP/retry error, and 100% of
+# the failing pairs are cross-rail while zero are same-rail. Cross-rail RoCE was
+# measured to be unroutable (same-rail 16.25 GB/s vs QP-to-RTR timeout), so the
+# open question is only *why mooncake draws a cross-rail pair at all*.
+#
+# Mooncake builds `preferred_hca` from `hca.numa_node == node_id` of the buffer,
+# then picks at random among the eligible rails. So a cross-rail draw needs
+# either >1 RoCE rail eligible for one NUMA node, or none (empty preferred_hca
+# falls back to every rail). On a 1 RoCE-rail-per-NUMA-node host the draw is
+# unambiguous and everything works. That mapping is what this dumps.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [tmp diag] RDMA rails ==="
+for dev in /sys/class/infiniband/*; do
+    [[ -e "$dev" ]] || continue
+    port=$dev/ports/1
+    # gid 3 is the RoCEv2 GID; its low 32 bits are the IPv4 address, so two rails
+    # on different subnets here means a cross-rail pair has no route.
+    echo "$(basename $dev)" \
+         "numa=$(cat $dev/device/numa_node 2>/dev/null || echo '?')" \
+         "link=$(cat $port/link_layer 2>/dev/null || echo '?')" \
+         "state=$(cat $port/state 2>/dev/null || echo '?')" \
+         "lid=$(cat $port/lid 2>/dev/null || echo '?')" \
+         "gid3=$(cat $port/gids/3 2>/dev/null || echo '?')"
+done
+
+echo "=== [tmp diag] RoCE rails eligible per memory-bearing NUMA node ==="
+# This is the decisive table: a host buffer can only live on a node with memory,
+# and mooncake will only prefer rails whose numa_node matches that node.
+for node in /sys/devices/system/node/node*; do
+    n=${node##*/node}
+    mem=$(grep -oP 'MemTotal:\s+\K[0-9]+' "$node/meminfo" 2>/dev/null || echo 0)
+    [[ "${mem:-0}" -gt 0 ]] || continue
+    rails=""
+    for dev in /sys/class/infiniband/*; do
+        [[ -e "$dev/device/numa_node" ]] || continue
+        [[ "$(cat "$dev/ports/1/link_layer" 2>/dev/null)" == "Ethernet" ]] || continue
+        [[ "$(cat "$dev/device/numa_node")" == "$n" ]] && rails="$rails $(basename "$dev")"
+    done
+    count=$(echo $rails | wc -w)
+    case $count in
+        0) verdict="NO LOCAL RAIL -> preferred_hca empty -> mooncake picks among ALL rails at random" ;;
+        1) verdict="unambiguous -> same-rail by construction" ;;
+        *) verdict="AMBIGUOUS -> mooncake picks among these at random -> cross-rail draws expected" ;;
+    esac
+    echo "node$n mem=${mem}kB roce=[${rails# }] n=$count $verdict"
+done
+
+echo "=== [tmp diag] device_name the adapter will pass to mooncake ==="
+# Mirrors rdma_devices() in nemo_rl/data_plane/adapters/transfer_queue.py: gate on a
+# verbs node, prefer every IB rail, fall back to every RoCE rail. Done in bash rather
+# than `uv run` so this costs nothing and cannot drag a dependency sync into the test.
+# Cross-check against the "RDMA device: <name>" lines mooncake logs during the run —
+# if they disagree, mooncake ignored the list.
+ib="" roce=""
+if compgen -G "/dev/infiniband/uverbs*" >/dev/null; then
+    for dev in /sys/class/infiniband/*; do
+        case "$(cat "$dev/ports/1/link_layer" 2>/dev/null)" in
+            InfiniBand) ib="$ib,$(basename "$dev")" ;;
+            Ethernet) roce="$roce,$(basename "$dev")" ;;
+        esac
+    done
+fi
+selected=${ib:-$roce}
+echo "MC_MOONCAKE_DEVICE=${MC_MOONCAKE_DEVICE:-(unset)} -> device_name=\"${selected#,}\""
+
+echo "=== [tmp diag] MC_* env in effect / memlock ==="
+mc_env=$(env | grep '^MC_' | sort || true)
+echo "${mc_env:-(no MC_* set)}"
+echo "memlock soft=$(ulimit -Sl) hard=$(ulimit -Hl)"
+echo "=== [tmp diag] end ==="
+
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
