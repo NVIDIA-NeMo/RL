@@ -829,7 +829,7 @@ class VllmInternalWorkerExtension:
 
             return LocalParamSpec(base=vllm_param, pre=pre, post=post)
 
-        def _mxfp8_receiver_quant_spec(
+        def _bf16_to_mxfp8_receiver_quant_spec(
             value_param: torch.Tensor,
             scale_param: torch.Tensor,
             merged_slice: tuple[slice, ...] | None,
@@ -932,7 +932,7 @@ class VllmInternalWorkerExtension:
                         f"build_hf_to_local_param_map: MXFP8 scale target "
                         f"{scale_name!r} has dtype {scale_param.dtype}, expected torch.uint8"
                     )
-                specs[hf_name] = _mxfp8_receiver_quant_spec(
+                specs[hf_name] = _bf16_to_mxfp8_receiver_quant_spec(
                     vllm_param, scale_param, merged_slice
                 )
             elif wire_dtype != vllm_param.dtype:
