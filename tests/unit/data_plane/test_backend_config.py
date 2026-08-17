@@ -14,11 +14,9 @@
 """Resolution of the per-backend sizing block.
 
 ``data_plane`` carries one block per backend (``simple:`` / ``mooncake_cpu:``)
-and only the selected one is read. Three shapes have to keep working at once:
-the nested block, the pre-nesting flat keys that shipped on main, and neither
-(meaning "this backend's defaults"). Getting the precedence wrong would
-silently run a job at the wrong RDMA segment size or with the staging pool
-off, neither of which fails loudly.
+and only the selected one is read, falling back to that backend's defaults when
+absent. Getting this wrong would silently run a job at the wrong RDMA segment
+size or with the staging pool off, neither of which fails loudly.
 """
 
 from __future__ import annotations
@@ -61,29 +59,6 @@ def test_absent_block_falls_back_to_model_defaults() -> None:
     assert resolved.global_segment_size == MooncakeCpuConfig().global_segment_size
     # The opt-out flag defaults on, so omitting it must not disable the pool.
     assert resolved.reuse_registered_buffers is True
-
-
-def test_legacy_flat_key_raises_rather_than_being_honoured() -> None:
-    """Accepting the old spelling in place would run the job on the wrong value.
-
-    A user recipe inherits the exemplar, which supplies the nested block, so a
-    surviving flat key would always lose the merge — silently. Erroring is the
-    only outcome that cannot start a job at a sizing the user did not choose.
-    """
-    cfg = _cfg("mooncake_cpu", global_segment_size=222)
-    with pytest.raises(ValueError, match="moved under data_plane.mooncake_cpu"):
-        backend_config(cfg)
-
-
-def test_legacy_flat_key_raises_even_beside_a_nested_block() -> None:
-    """This is the case that used to lose silently."""
-    cfg = _cfg(
-        "mooncake_cpu",
-        global_segment_size=333,
-        mooncake_cpu={"global_segment_size": 444},
-    )
-    with pytest.raises(ValueError, match="moved under"):
-        backend_config(cfg)
 
 
 def test_accepts_an_already_coerced_model() -> None:

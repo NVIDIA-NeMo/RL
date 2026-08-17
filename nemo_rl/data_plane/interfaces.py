@@ -112,17 +112,6 @@ class DataPlaneConfig(TypedDict):
     observability: NotRequired["ObservabilityConfig"]
 
 
-# The pre-nesting spelling, frozen: this is what shipped, not a function of
-# the models' current fields. A field added later must not gain a flat alias.
-_LEGACY_FLAT_KEYS: dict[str, tuple[str, ...]] = {
-    "simple": ("storage_capacity", "num_storage_units"),
-    "mooncake_cpu": (
-        "global_segment_size",
-        "local_buffer_size",
-        "reuse_registered_buffers",
-    ),
-}
-
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {
     "simple": SimpleStorageConfig,
     "mooncake_cpu": MooncakeCpuConfig,
@@ -136,25 +125,10 @@ def backend_config(cfg: DataPlaneConfig) -> Any:
     caller ever writes a fallback. Works whether ``cfg`` came through pydantic
     (block already coerced to a model) or as a plain dict from a test.
 
-    Raises on the pre-nesting flat spelling instead of quietly honouring it.
-    Accepting both looks friendlier but cannot work: a user recipe inherits the
-    exemplar, which now *supplies* the nested block, so after the OmegaConf
-    merge the nested values are always present and would always win — the
-    user's flat override would be dropped with no warning, leaving the job at
-    the wrong RDMA sizing. Erroring is the only option that can't run a job on
-    a value the user didn't choose.
+    Sizing is read only from the nested block. A config still using the
+    pre-nesting flat spelling gets this backend's defaults, not its own values.
     """
     backend = cfg["backend"]
-    stale = [k for k in _LEGACY_FLAT_KEYS[backend] if k in cfg]
-    if stale:
-        raise ValueError(
-            f"data_plane.{{{','.join(stale)}}} moved under data_plane.{backend}. "
-            f"Write them as `data_plane:\n  {backend}:\n    "
-            f"{stale[0]}: ...` instead. They are rejected rather than accepted "
-            "in place because the exemplar supplies the nested block, so an "
-            "inherited config would silently override the flat value."
-        )
-
     nested = cfg.get(backend) or {}
     if isinstance(nested, BaseModel):
         nested = nested.model_dump(exclude_unset=True)
