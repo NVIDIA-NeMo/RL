@@ -138,13 +138,26 @@ def _mooncake_transport_config() -> dict:
             "does see /sys/class/infiniband) — name a device with "
             "MC_MOONCAKE_DEVICE=<dev>, or use data_plane.backend='simple'."
         )
-    # rdma_devices() never mixes fabrics, so the first entry classifies them all.
-    if _link_layer(devices.split(",")[0]) == "Ethernet":
-        # GID index 3 is a RoCEv2 convention. InfiniBand numbers GIDs
-        # differently, so leave it unset there and let mooncake's own
-        # findBestGidIndex choose.
-        os.environ.setdefault("MC_GID_INDEX", "3")
     return {"protocol": "rdma", "device_name": devices}
+
+
+def _pin_roce_gid_index() -> None:
+    """Pin ``MC_GID_INDEX=3`` when the selected rails are RoCE.
+
+    GID index 3 is a RoCEv2 convention. InfiniBand numbers GIDs differently, so
+    leave it unset there and let mooncake's own ``findBestGidIndex`` choose.
+
+    This has to run in every process that builds a mooncake engine, not only the
+    driver. ``_mooncake_transport_config`` returns ``device_name``, which the TQ
+    config carries to every client, but a GID pin is process env — a Ray worker
+    never sees the driver's. ``findBestGidIndex`` was measured to pick 3 unaided
+    on the RoCE fabrics tested, so this only matters on one where it does not;
+    the two sides disagreeing on GID index is not a survivable mismatch.
+    """
+    devices = rdma_devices()
+    # rdma_devices() never mixes fabrics, so the first entry classifies them all.
+    if devices and _link_layer(devices.split(",")[0]) == "Ethernet":
+        os.environ.setdefault("MC_GID_INDEX", "3")
 
 
 # Per-slot ceiling for the staging pool: bounds resident pinned memory at
@@ -627,7 +640,7 @@ class TQDataPlaneClient(DataPlaneClient):
         """
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
-        # env vars and they can't be changed. Three per-process knobs
+        # env vars and they can't be changed. Four per-process knobs
         # needed in EVERY process that builds a TQ client (driver,
         # SyncRolloutActor, every MegatronPolicyWorker rank):
         #   1. MC_TCP_BIND_ADDRESS — Mooncake engine.so writes this into
@@ -640,7 +653,10 @@ class TQDataPlaneClient(DataPlaneClient):
         #      root cause but isn't in any published wheel yet
         #      (mooncake-transfer-engine 0.3.10.post2 was bumped before
         #      that merge). Drop this once the wheel includes the fix.
-        #   3. KV-path 1D promotion — works around TQ's
+        #   3. MC_GID_INDEX — RoCEv2 GID pin; see _pin_roce_gid_index. It
+        #      was previously set by _mooncake_transport_config, which runs
+        #      on the driver only, so no worker ever saw it.
+        #   4. KV-path 1D promotion — works around TQ's
         #      extract_field_schema schema/data mismatch for 1D fields.
         if cfg["backend"] == "mooncake_cpu":
             local_ip = _get_local_node_ip()
@@ -651,6 +667,7 @@ class TQDataPlaneClient(DataPlaneClient):
                 # IP — peers fail with "connection refused".
                 os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
             os.environ.setdefault("MC_STORE_MEMCPY", "0")
+            _pin_roce_gid_index()
             # Pin each transfer's peer rail to the local one by name.
             # Mooncake otherwise picks the peer rail at random
             # (Topology::selectDevice), and where each rail is its own subnet
