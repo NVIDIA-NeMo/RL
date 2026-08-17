@@ -695,6 +695,31 @@ def test_to_nested_wire_emits_one_row_per_logical_row_under_dedup():
     )
 
 
+def test_to_nested_wire_materializes_pad_to_max_shape():
+    """Dynamic-resolution values carry ``pad_to_max_shape``, which the wire
+    cannot round-trip (``from_nested_wire`` has no way to recover it) and
+    ``torch.nested`` jagged cannot represent (rows must agree on every dim
+    but dim 0). The write side must therefore materialize the padding."""
+    # Same rank, different trailing dims — nemotron-omni style tiles.
+    first = torch.ones(1, 3, 2, 4)
+    second = 2 * torch.ones(2, 3, 4, 2)
+    packed = PackedTensor([first, second], dim_to_pack=0, pad_to_max_shape=True)
+
+    nested, lengths = packed.to_nested_wire()
+    assert lengths.tolist() == [1, 2]
+
+    padded = torch.nested.to_padded_tensor(nested, padding=0.0)
+    # Trailing dims padded to the batch max (3, 4, 4); dim 1 is the ragged
+    # per-sample tile count, so it is the max tile count (2).
+    assert padded.shape == (2, 2, 3, 4, 4)
+
+    # Plain concat on the read side reproduces the pre-wire as_tensor().
+    assert torch.equal(
+        PackedTensor.from_nested_wire(padded, lengths).as_tensor(),
+        packed.as_tensor(),
+    )
+
+
 def test_get_multimodal_dict_missing_companion_asserts():
     """Wire-form parent without its ``__lengths`` companion must fail
     loud with a wire-contract error (not a bare KeyError deep in the

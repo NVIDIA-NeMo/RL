@@ -762,6 +762,37 @@ class PackedTensor:
         if ref is None:
             return None, None
 
+        # ``torch.nested`` jagged requires every row to agree on all dims
+        # except dim 0. Dynamic-resolution values (``pad_to_max_shape``)
+        # violate that, so materialize the padding here rather than let
+        # ``as_nested_tensor`` reject the list — and rather than let the
+        # flag be silently dropped by ``from_nested_wire``, which cannot
+        # recover it. Padding to the *global* batch max (not a per-shard
+        # max) is deliberate: every DP rank then sees identical trailing
+        # dims for the forward.
+        if self.pad_to_max_shape:
+            present = [t for t in rows if t is not None]
+            ranks = {t.ndim for t in present}
+            if len(ranks) != 1:
+                raise ValueError(
+                    "pad_to_max_shape requires tensors with the same rank, "
+                    f"but received ranks {sorted(ranks)}"
+                )
+            rank = ranks.pop()
+            max_shape = [max(t.shape[d] for t in present) for d in range(rank)]
+
+            def _pad_trailing_dims(tensor: torch.Tensor) -> torch.Tensor:
+                padding: list[int] = []
+                for dim in reversed(range(rank)):
+                    # dim 0 is the packing/ragged dim — left jagged.
+                    padding.extend(
+                        (0, 0 if dim == 0 else max_shape[dim] - tensor.shape[dim])
+                    )
+                return F.pad(tensor, padding)
+
+            rows = [None if t is None else _pad_trailing_dims(t) for t in rows]
+            ref = next(t for t in rows if t is not None)
+
         length_ints = [0 if t is None else t.shape[0] for t in rows]
         if any(t is None for t in rows):
             placeholder = torch.zeros(
@@ -787,6 +818,11 @@ class PackedTensor:
         Slices each row to its true length; entries with
         ``lengths[i] == 0`` become empty tensors and contribute nothing
         when :meth:`as_tensor` concatenates.
+
+        ``pad_to_max_shape`` is deliberately not restored: the write side
+        already materialized that padding (see :meth:`to_nested_wire`), so
+        every row here shares its trailing dims and a plain concat
+        reproduces what ``as_tensor`` would have returned.
 
         Mirrors :meth:`to_nested_wire`; both assume ``dim_to_pack=0``.
         """
