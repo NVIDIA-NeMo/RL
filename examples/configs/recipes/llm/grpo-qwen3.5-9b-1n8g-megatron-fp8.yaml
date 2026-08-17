@@ -6,6 +6,9 @@ loss_fn:
   truncated_importance_sampling_type: tis
   truncated_importance_sampling_ratio: 2
 policy:
+  # The parent recipe disables sequence packing, so the packing path's
+  # automatic FP8 padding never runs; without this, FP8 GEMMs see unaligned
+  # token counts and TE asserts (last dim must be divisible by 16).
   make_sequence_length_divisible_by: 16
   megatron_cfg:
     moe_router_dtype: fp32
