@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -27,7 +27,10 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.utils import StragglerDetector
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    PipelineOffloadManager,
+)
+from megatron.core.utils import StragglerDetector, get_model_config
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -68,6 +71,49 @@ PostProcessingFunction = Union[
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
 ]
+
+
+@contextmanager
+def suspend_activation_offload_for_forward_only(
+    model: Union[GPTModel, List[GPTModel]], forward_only: bool
+) -> Iterator[None]:
+    """Keep inference-only RL phases from consuming MCore's training warmup."""
+    if not forward_only:
+        yield
+        return
+
+    model_chunks = model if isinstance(model, list) else [model]
+    original_values: List[Tuple[Any, bool]] = []
+    seen_configs: set[int] = set()
+    for model_chunk in model_chunks:
+        model_config = get_model_config(model_chunk)
+        if id(model_config) in seen_configs:
+            continue
+        seen_configs.add(id(model_config))
+        original_value = bool(
+            getattr(model_config, "fine_grained_activation_offloading", False)
+        )
+        if original_value:
+            original_values.append((model_config, original_value))
+
+    offload_manager = PipelineOffloadManager.OFFLOAD_MGR
+    suspend_manager = bool(
+        original_values and offload_manager is not None and offload_manager.do_offload
+    )
+
+    try:
+        for model_config, _ in original_values:
+            model_config.fine_grained_activation_offloading = False
+        if suspend_manager and offload_manager is not None:
+            offload_manager.disable_offload()
+        yield
+    finally:
+        try:
+            if suspend_manager and offload_manager is not None:
+                offload_manager.enable_offload()
+        finally:
+            for model_config, original_value in original_values:
+                model_config.fine_grained_activation_offloading = original_value
 
 
 def model_forward(
@@ -366,20 +412,21 @@ def megatron_forward_backward(
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:
         clear_router_replay(model)
-    try:
-        return forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=num_microbatches,
-            seq_length=seq_length,
-            micro_batch_size=mbs,
-            decoder_seq_length=seq_length,
-            forward_only=forward_only,
-        )
-    finally:
-        if use_router_replay:
-            clear_router_replay(model)
+    with suspend_activation_offload_for_forward_only(model, forward_only):
+        try:
+            return forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=seq_length,
+                micro_batch_size=mbs,
+                decoder_seq_length=seq_length,
+                forward_only=forward_only,
+            )
+        finally:
+            if use_router_replay:
+                clear_router_replay(model)
 
 
 class LossPostProcessor:

@@ -64,7 +64,6 @@ policy:
         # Enable the appropriate reasoning parser here. Since this model is an instruct model, we comment it out.
         # reasoning_parser: deepseek_r1
     mcore_generation_config:
-      async_engine: false
       max_model_len: ${policy.max_total_sequence_length}
       cuda_graph_impl: "local"
       inference_cuda_graph_scope: "block"
