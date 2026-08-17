@@ -71,6 +71,10 @@ class TrtllmSpecificArgs(TypedDict):
     gpu_memory_utilization: NotRequired[float]
     max_model_len: int
     precision: str
+    # With precision="fp8", select MXFP8 (E4M3 + UE8M0 1x32 block scales)
+    # instead of 128x128 block FP8 for the routed experts. Changes the
+    # refit caster, the quantization_config and the required MoE backend.
+    is_mx: NotRequired[bool]
     max_batch_size: int
     max_num_tokens: int
     expose_http_server: NotRequired[bool]
