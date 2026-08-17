@@ -77,7 +77,7 @@ policy:
       kv_cache_management_mode: "persist"
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
-      refit_backend: "nvshmem"
+      refit_backend: "nccl"
       parsers: []
       expose_http_server: false
 
