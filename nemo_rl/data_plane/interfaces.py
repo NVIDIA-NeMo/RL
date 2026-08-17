@@ -39,7 +39,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PositiveInt
 from tensordict import TensorDict
 
 
@@ -77,6 +77,12 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     admitted and never shrink — so raise it only when a per-key payload (one
     sample of one field) genuinely exceeds it, not for headroom.
 
+    ``use_gdr`` switches CUDA-initialized clients to TransferQueue's GDR path,
+    where the staging buffer is GPU memory instead of host memory.
+    ``gdr_staging_buffer_mb`` is that persistent GPU capacity per active GDR
+    client. CPU-only clients (a SingleController producer, say) keep the host
+    staging pool either way.
+
     Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
     That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``, which pins each
     transfer's peer rail to the local one by name; on a rail-isolated RoCE
@@ -88,6 +94,8 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
     staging_buffer_size: int = 268435456  # 256 MiB per pool slot
+    use_gdr: bool = False
+    gdr_staging_buffer_mb: PositiveInt = 1024
 
 
 class DataPlaneConfig(TypedDict):
@@ -111,10 +119,14 @@ class DataPlaneConfig(TypedDict):
     ``backend``, ``claim_meta_poll_interval_s``.
 
     ``storage_capacity`` / ``num_storage_units`` / ``global_segment_size`` /
-    ``local_buffer_size`` used to sit at this level. A config still using that
-    spelling is not rejected — the flat key is simply never read, and
-    :func:`backend_config` resolves the nested block (or its defaults) as if it
-    were absent. See there.
+    ``local_buffer_size`` / ``reuse_registered_buffers`` used to sit at this
+    level. A config still using that spelling is not rejected — the flat
+    key is simply never read, and :func:`backend_config` resolves the
+    nested block (or its defaults) as if it were absent. See there.
+
+    The first GDR integration also spelled ``use_gdr`` and
+    ``gdr_staging_buffer_mb`` at this level. Those two are rejected rather
+    than ignored, so an old GDR recipe cannot silently run with GDR disabled.
     """
 
     enabled: bool
@@ -127,6 +139,18 @@ class DataPlaneConfig(TypedDict):
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
 
+    # The first GDR integration's deprecated flat spellings are declared only
+    # so Pydantic preserves them until ``backend_config`` can raise the
+    # migration error below. Without these entries, MasterConfig silently
+    # drops the keys during validation.
+    use_gdr: NotRequired[bool]
+    gdr_staging_buffer_mb: NotRequired[int]
+
+
+# PR #3501 introduced these at the top level before backend-specific nesting.
+# Reject that spelling for either selected backend so rebasing an existing GDR
+# recipe cannot silently disable GDR.
+_FIRST_GDR_FLAT_KEYS = ("use_gdr", "gdr_staging_buffer_mb")
 
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {
     "simple": SimpleStorageConfig,
@@ -142,9 +166,19 @@ def backend_config(cfg: DataPlaneConfig) -> Any:
     (block already coerced to a model) or as a plain dict from a test.
 
     Sizing is read only from the nested block. A config still using the
-    pre-nesting flat spelling gets this backend's defaults, not its own values.
+    pre-nesting flat sizing spelling gets this backend's defaults, not its own
+    values. The first GDR integration's flat spelling is rejected instead,
+    because otherwise an old GDR recipe would silently run with GDR disabled.
     """
     backend = cfg["backend"]
+    stale_gdr = [k for k in _FIRST_GDR_FLAT_KEYS if k in cfg]
+    if stale_gdr:
+        raise ValueError(
+            f"data_plane.{{{','.join(stale_gdr)}}} moved under "
+            "data_plane.mooncake_cpu. Update the first GDR integration's "
+            "top-level spelling before running this stack."
+        )
+
     nested = cfg.get(backend) or {}
     if isinstance(nested, BaseModel):
         nested = nested.model_dump(exclude_unset=True)

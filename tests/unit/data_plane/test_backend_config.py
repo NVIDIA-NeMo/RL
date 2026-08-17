@@ -46,12 +46,19 @@ def _cfg(backend: str, **extra) -> dict:
 def test_nested_block_is_used() -> None:
     cfg = _cfg(
         "mooncake_cpu",
-        mooncake_cpu={"global_segment_size": 111, "reuse_registered_buffers": False},
+        mooncake_cpu={
+            "global_segment_size": 111,
+            "reuse_registered_buffers": False,
+            "use_gdr": True,
+            "gdr_staging_buffer_mb": 512,
+        },
     )
     resolved = backend_config(cfg)
     assert isinstance(resolved, MooncakeCpuConfig)
     assert resolved.global_segment_size == 111
     assert resolved.reuse_registered_buffers is False
+    assert resolved.use_gdr is True
+    assert resolved.gdr_staging_buffer_mb == 512
 
 
 def test_absent_block_falls_back_to_model_defaults() -> None:
@@ -66,6 +73,18 @@ def test_absent_block_falls_back_to_model_defaults() -> None:
     assert resolved.local_buffer_size == 4294967296  # 4 GiB per client process
     # The opt-out flag defaults on, so omitting it must not disable the pool.
     assert resolved.reuse_registered_buffers is True
+    assert resolved.staging_buffer_size == 268435456  # 256 MiB per pool slot
+    # GDR is opt-in; omitting it must not turn the GPU staging path on.
+    assert resolved.use_gdr is False
+    assert resolved.gdr_staging_buffer_mb == 1024
+
+
+@pytest.mark.parametrize("backend", ["simple", "mooncake_cpu"])
+@pytest.mark.parametrize("key", ["use_gdr", "gdr_staging_buffer_mb"])
+def test_flat_gdr_key_from_first_integration_raises(backend: str, key: str) -> None:
+    """The GDR port nests the first integration's top-level settings."""
+    with pytest.raises(ValueError, match="moved under data_plane.mooncake_cpu"):
+        backend_config(_cfg(backend, **{key: True}))
 
 
 def test_accepts_an_already_coerced_model() -> None:
@@ -79,6 +98,12 @@ def test_partial_nested_block_keeps_other_defaults() -> None:
     resolved = backend_config(cfg)
     assert resolved.local_buffer_size == 7
     assert resolved.global_segment_size == MooncakeCpuConfig().global_segment_size
+
+
+def test_gdr_staging_size_rejects_invalid_values() -> None:
+    """A zero GDR buffer would only surface deep inside TransferQueue."""
+    with pytest.raises(ValueError):
+        backend_config(_cfg("mooncake_cpu", mooncake_cpu={"gdr_staging_buffer_mb": 0}))
 
 
 def test_simple_backend_nested_block_is_used() -> None:
@@ -118,3 +143,23 @@ def test_schema_validates_without_any_backend_block() -> None:
     validate, otherwise MasterConfig fails before training starts.
     """
     TypeAdapter(DataPlaneConfig).validate_python(_cfg("simple"))
+
+
+@pytest.mark.parametrize(
+    ("backend", "key", "value"),
+    [
+        ("mooncake_cpu", "use_gdr", True),
+        ("mooncake_cpu", "gdr_staging_buffer_mb", 512),
+    ],
+)
+def test_pydantic_preserves_flat_gdr_keys_for_migration_error(
+    backend: str, key: str, value: object
+) -> None:
+    """MasterConfig's TypedDict boundary must not erase old GDR keys."""
+    validated = TypeAdapter(DataPlaneConfig).validate_python(
+        _cfg(backend, **{key: value})
+    )
+
+    assert key in validated
+    with pytest.raises(ValueError, match="moved under data_plane"):
+        backend_config(validated)

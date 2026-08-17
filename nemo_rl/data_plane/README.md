@@ -436,7 +436,9 @@ data_plane:
     global_segment_size: 68719476736   # 64 GiB/process
     local_buffer_size:    4294967296   # 4 GiB/process
     reuse_registered_buffers: true     # reuse RDMA-registered buffers
-    staging_buffer_size:   268435456   # 256 MiB/pool slot; bigger transfers bypass the pool
+    staging_buffer_size:  268435456    # 256 MiB/pool slot
+    use_gdr: false                     # GPU-memory RDMA staging in CUDA clients
+    gdr_staging_buffer_mb: 1024        # persistent MiB per active GDR client
   # observability:                     # NotRequired
   #   enabled: false
 ```
@@ -447,11 +449,25 @@ this backend's defaults instead of its own values: an inherited config
 supplies the nested block, so a surviving flat key always loses the merge,
 with no warning either way.
 
+The two exceptions are `use_gdr` and `gdr_staging_buffer_mb`, which the first
+GDR integration also spelled flat. Those are rejected with a migration message
+rather than ignored, so an old GDR recipe cannot silently run with GDR
+disabled.
+
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
   and small runs.
-- **`mooncake_cpu`** — Mooncake transfer engine; higher throughput at
-  scale. Required for multi-node clusters with large bulk volume.
+- **`mooncake_cpu`** — Mooncake's RDMA-only transfer engine; higher throughput
+  at scale, and required for multi-node clusters with large bulk volume. By
+  default tensors transfer through registered CPU staging. Set
+  `mooncake_cpu.use_gdr: true` to let CUDA-initialized clients use
+  TransferQueue's GDR staging path, where the staging buffer is GPU memory;
+  CPU-only clients, such as a SingleController producer, keep CPU RDMA. Both
+  paths use the same all-rail transport selection.
+
+`gdr_staging_buffer_mb` is the persistent GPU staging capacity per active GDR
+client (default 1024 MiB). TransferQueue's pin requires it to fit the largest
+individual tensor.
 
 Capacity rule of thumb (any backend):
 
