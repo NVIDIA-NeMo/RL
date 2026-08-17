@@ -57,6 +57,51 @@ dictionaries follow the hierarchy of nested model-config objects. NeMo
 RL-specific settings such as optimizer, scheduler, checkpointing, and
 environment variables remain under their existing `megatron_cfg` sections.
 
+#### Fine-grained activation CPU offload
+
+Fine-grained activation offloading asynchronously moves selected module-input
+activations to CPU between forward and backward passes to reduce peak GPU
+memory. It is distinct from `optimizer_cpu_offload`, which moves optimizer
+states rather than activations. The following dense-model configuration is
+runnable with the Megatron backend; `core_attn` and `attn_proj` are appropriate
+for a dense Qwen model, and `attn_proj` must be paired with `core_attn`.
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true
+    cuda_graph_impl: transformer_engine
+    env_vars:
+      NVTE_CPU_OFFLOAD_V1: "1"
+    fine_grained_activation_offloading: true
+    offload_modules: ["core_attn", "attn_proj"]
+```
+
+Activation offloading requires the Transformer Engine model implementation.
+CUDA graphs are optional; this example was validated with Transformer Engine
+CUDA graphs. If graphs are enabled, pinned MCore permits `transformer_engine`
+or `full_iteration` for this dense module pair, but only the former is validated
+here. `local` CUDA graphs support only partial MoE offload (`expert_fc1`,
+`moe_act`, and `fused_group_mlp`). With the default `cuda_graph_impl: none`, no
+graph-specific restriction applies.
+
+Supported module names are `attn_norm`, `qkv_linear`, `core_attn`,
+`attn_proj`, `mlp_norm`, `expert_fc1`, `moe_act`, and `fused_group_mlp`.
+The last three are MoE-specific. `fused_group_mlp` requires the Transformer
+Engine op fuser and cannot be combined with `expert_fc1` or `moe_act`.
+
+Activation checkpointing is not blanket-incompatible with fine-grained
+activation offload. However, selective recomputation of the whole MoE module
+(`recompute_modules: ["moe"]`) conflicts with MoE-internal offload modules
+(`expert_fc1`, `moe_act`, or `fused_group_mlp`), and layer-level
+`cpu_offloading` conflicts with fine-grained activation offload. Megatron
+Bridge/Megatron-Core setup validation owns the exact compatibility checks for
+the pinned versions.
+
+Offloading saves GPU memory but adds CPU transfer and synchronization work, so
+benchmark the memory and throughput tradeoff for the target model, sequence
+length, hardware, and parallelism configuration.
+
 ### DTensor Backend
 To enable DTensor (FSDP2) training:
 
