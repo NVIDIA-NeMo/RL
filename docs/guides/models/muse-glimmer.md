@@ -141,7 +141,7 @@ this model, and the 10k runs are the ones validated deep into training — see
 through step 245, DAPO holds 0.79-0.84 through step 185. GRPO steps are ~3x faster
 (no dynamic sampling over-generation); DAPO reaches a slightly higher band.
 
-The 6k recipe is the middle ground (0.69 peak). Use the 4k recipe when you want the
+The 6k recipe is the middle ground (0.63 peak, ~0.65 by the end). Use the 4k recipe when you want the
 shortest context or fewer moving parts — it runs without context parallelism, so
 there is no ring-attention communication and no per-CP-step `dq`/`dk`/`dv` copies,
 but it is the *tightest* on memory and pays the largest truncation tax.
@@ -221,19 +221,25 @@ The two curves below cover roughly the first 70 steps of their runs, so they are
 
 ![Muse Glimmer 6k GRPO training curves](../../assets/muse-glimmer/muse_glimmer_6k_grpo_curve.png)
 
-Validation accuracy rises from 0.42 to a peak near **0.69** by step 15 and holds
-0.63-0.67. `truncation_rate` falls from 0.34 to roughly 0.05-0.15. `gen_kl_error` is
-**flat** at ~5.5e-04 throughout. Entropy dips, then recovers to 0.68 around step 43
-before settling near 0.47 — the policy keeps exploring rather than collapsing.
+Validation accuracy rises from 0.42 to a peak near **0.63** by step 35 (after a dip to
+0.54 near step 25) and holds a noisy 0.55-0.63 band through step 280, ticking up to
+~0.65 at the very end. `truncation_rate` starts near 0.3-0.48 and settles into a noisy
+0.1-0.35 band, trending down to ~0.15-0.2 by the end. `gen_kl_error` is **flat** at
+~5e-04 throughout. Entropy cycles through three rise-and-dip patterns, peaking near
+0.5-0.53 around steps 75, 150, and 205 and dipping to ~0.32-0.35 between them — the
+policy keeps exploring rather than collapsing.
 
 **4k, no CP** — shorter context.
 
 ![Muse Glimmer 4k GRPO training curves](../../assets/muse-glimmer/muse_glimmer_4k_grpo_curve.png)
 
-Validation accuracy rises from 0.22 to about **0.505** by step 55-60 and then flattens.
-`truncation_rate` starts near 0.6 — well above the 6k run — and settles around 0.15.
-`gen_kl_error` **climbs** from 5.5e-04 to 1.4e-03, and entropy falls monotonically from
-0.38 to 0.15.
+Validation accuracy rises from 0.22 to ~0.4 by step 15 and **holds a noisy 0.37-0.44
+band through step 320** — no decay, unlike unanchored runs at this length.
+`truncation_rate` starts near 0.85 — well above the 6k run — and drops into a noisy
+0.15-0.5 band within the first 50 steps, without further settling. `gen_kl_error`
+stays flat in the 4.5e-04-6e-04 range (one isolated spike to ~6.5e-04 near step 275) —
+no climb. Entropy trends upward with noise, from ~0.38 (dipping to ~0.28 around step
+80) to a 0.4-0.55 band by step 200-320.
 
 ## Known Issues
 
