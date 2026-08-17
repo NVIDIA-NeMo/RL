@@ -72,8 +72,9 @@ class MegatronGenerationMixin:
     """
 
     # Colocated-reshard hosts assign the dedicated inference-layout model here
-    # (see MegatronPolicyWorkerImpl._maybe_build_colocated_inference_model).
+    # (see MegatronPolicyWorkerImpl._build_colocated_inference_model).
     inference_model = None
+    _colocated_reshard_plan = None
 
     def _gen_model(self) -> MegatronModule:
         """The model the inference engine wraps.
@@ -409,12 +410,8 @@ class MegatronGenerationMixin:
         mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
 
         # Colocated reshard: build the dedicated inference-layout model on the first cycle.
-        if (
-            getattr(self, "_colocated_reshard_eligible", False)
-            and not self._colocated_inference_model_checked
-        ):
-            self._maybe_build_colocated_inference_model(self.cfg)
-            self._colocated_inference_model_checked = True
+        if self._colocated_reshard_plan is not None:
+            self._build_colocated_inference_model(self.cfg)
 
         gen_model = self._gen_model()
         gen_model.config.flash_decode = False
@@ -903,7 +900,7 @@ class MegatronGenerationRefitMixin:
         torch.cuda.synchronize()
 
         # The swap reads the training params as its source;
-        # under overlap_param_gather they stay stale after the optimizer step until gathered,
+        # under overlap_param_gather they stay stale after the optimizer step until gathered.
         if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
             self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
 

@@ -50,3 +50,11 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
     'max(data["train/token_mult_prob_error"]) < 1.05'
+
+# Check that colocated reshard actually took place.
+# A matched layout that requires no reshard would pass all tests.
+# While the configs we are passing guarantee reshard, this is still a useful sanity check.
+if ! grep -q "\[colocated-reshard\] building dedicated inference model" $RUN_LOG; then
+    echo "FAIL: colocated-reshard marker not found; dedicated inference model was never built"
+    exit 1
+fi

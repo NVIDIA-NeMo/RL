@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, cast
+from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy import PolicyConfig
@@ -73,14 +73,43 @@ class MCoreGenerationConfig(GenerationConfig):
 
 
 def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]:
-    """The `megatron_cfg` a dedicated inference model runs with.
-
-    Overlays the sparse `mcore_generation_config` onto `megatron_cfg`,
-    intentionally overwriting any training-side config with inference-side config.
-    """
+    """The `megatron_cfg` a dedicated inference model runs with."""
     generation_config = cast(MCoreGenerationConfig, policy_config["generation"])
     return {
         **cast(dict[str, Any], policy_config["megatron_cfg"]),
         **(generation_config.get("mcore_generation_config") or {}),
         "activation_checkpointing": False,
     }
+
+
+def dedicated_inference_megatron_cfg(
+    policy_config: PolicyConfig,
+) -> Optional[dict[str, Any]]:
+    """The `megatron_cfg` for a dedicated colocated inference model, or None.
+
+    Colocated Megatron generation shares the training model unless the resolved
+    inference layout or `transformer_impl` differs from training; then the worker
+    builds a second model and reshards into it on every wake. Inference never
+    uses CP, so CP is pinned to 1 (CP>1 training therefore always differs).
+
+    Returns None when the resolved config matches training (dual-mode: generate
+    directly on the shared training model).
+    """
+    inference_mcfg = merged_inference_megatron_cfg(policy_config)
+    inference_mcfg["context_parallel_size"] = 1
+
+    train_mcfg = cast(dict[str, Any], policy_config["megatron_cfg"])
+    layout_keys = (
+        "tensor_model_parallel_size",
+        "pipeline_model_parallel_size",
+        "expert_model_parallel_size",
+        "expert_tensor_parallel_size",
+        "context_parallel_size",
+    )
+    layout_differs = any(inference_mcfg[k] != train_mcfg[k] for k in layout_keys)
+    impl_differs = inference_mcfg.get("transformer_impl") != train_mcfg.get(
+        "transformer_impl"
+    )
+    if not (layout_differs or impl_differs):
+        return None
+    return inference_mcfg

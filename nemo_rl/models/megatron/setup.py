@@ -25,7 +25,7 @@ from typing import Any, Callable, Optional, TypeVar
 
 import torch
 from megatron.bridge import AutoBridge
-from megatron.bridge.models.model_provider import get_model
+from megatron.bridge.models.model_provider import ModelProviderMixin, get_model
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
@@ -225,11 +225,18 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.models.generation.megatron.config import (
+    dedicated_inference_megatron_cfg,
+)
 from nemo_rl.models.megatron.community_import import (
     import_model_from_hf_name,
     iter_vlm_config_overrides,
 )
-from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
+from nemo_rl.models.megatron.config import (
+    ColocatedReshardPlan,
+    ModelAndOptimizerState,
+    RuntimeConfig,
+)
 from nemo_rl.models.megatron.draft.utils import (
     build_draft_model,
     find_draft_owner_chunk,
@@ -1512,6 +1519,7 @@ def _patch_bridge_signal_handler_for_worker_threads() -> None:
 def build_inference_model(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
+    initial_model_provider: ModelProviderMixin,
 ) -> MegatronModule:
     """Build a second, inference-layout model for colocated Megatron refit.
 
@@ -1520,19 +1528,12 @@ def build_inference_model(
     Args:
         policy_cfg: The inference config
         megatron_cfg: The training config
+        initial_model_provider: Pre-wrap provider snapshot taken by `setup_model_and_optimizer`.
 
     Returns:
         The inference model module (single element; not DDP-wrapped, no optimizer).
     """
-    if megatron_cfg.dist.use_torch_fsdp2:
-        raise ValueError(
-            "A dedicated inference model (reshard) is not supported with use_torch_fsdp2 training: "
-            "DP inference disables the training model's forward pre-hooks, "
-            "which requires Megatron-core DistributedDataParallel."
-        )
-    # Derive the inference provider from the initial snapshot taken by setup_model_and_optimizer.
-    inference_provider = megatron_cfg._initial_model_provider
-    del megatron_cfg._initial_model_provider
+    inference_provider = initial_model_provider
     train_pipeline_model_parallel_size = inference_provider.pipeline_model_parallel_size
     _apply_parallelism_config(inference_provider, policy_cfg)
     _apply_moe_config(inference_provider, policy_cfg)
@@ -1744,13 +1745,43 @@ def setup_model_and_optimizer(
     megatron_cfg.peft = peft
 
     # Snapshot the provider before any runtime state is added onto it.
+    colocated_reshard_plan: Optional[ColocatedReshardPlan] = None
     generation_cfg = policy_cfg.get("generation")
     if (
-        generation_cfg is not None
+        load_optimizer
+        and generation_cfg is not None
         and generation_cfg.get("backend") == "megatron"
         and generation_cfg.get("colocated", {}).get("enabled", False)
     ):
-        megatron_cfg._initial_model_provider = copy.deepcopy(megatron_cfg.model)
+        inference_megatron_cfg = dedicated_inference_megatron_cfg(policy_cfg)
+    else:
+        inference_megatron_cfg = None
+    if inference_megatron_cfg is not None:
+        if megatron_cfg.dist.use_torch_fsdp2:
+            raise ValueError(
+                "MCore colocated reshard is not supported with use_torch_fsdp2 training: "
+                "DP inference disables the training model's forward pre-hooks, "
+                "which requires Megatron-core DistributedDataParallel."
+            )
+        vpp_size = megatron_cfg.model.virtual_pipeline_model_parallel_size
+        if vpp_size not in (None, 1):
+            raise NotImplementedError(
+                "MCore colocated reshard is not supported with virtual pipeline parallelism > 1. "
+                f"(virtual_pipeline_model_parallel_size={vpp_size})"
+            )
+        if peft is not None:
+            raise NotImplementedError(
+                "MCore colocated reshard is not supported with PEFT."
+            )
+        draft_cfg = policy_cfg.get("draft")
+        if draft_cfg is not None and draft_cfg.get("enabled"):
+            raise NotImplementedError(
+                "MCore colocated reshard is not supported with draft models."
+            )
+        colocated_reshard_plan = ColocatedReshardPlan(
+            initial_model_provider=copy.deepcopy(megatron_cfg.model),
+            inference_megatron_cfg=copy.deepcopy(inference_megatron_cfg),
+        )
 
     if megatron_cfg.peft is not None:
         pre_peft_hook = _create_peft_pre_wrap_hook(megatron_cfg, state)
@@ -1874,6 +1905,7 @@ def setup_model_and_optimizer(
         checkpointing_context,
         param_sync_func,
         draft_model=draft_model,
+        colocated_reshard_plan=colocated_reshard_plan,
     )
 
 
