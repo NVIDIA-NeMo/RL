@@ -226,6 +226,7 @@ def _capture_vllm_0251_draft_model_config(monkeypatch, target_kwargs):
     return SpeculativeConfig, target_model_config, captured
 
 
+@pytest.mark.vllm
 def test_kimi_eagle3_draft_stays_bf16_with_target_runtime_mxfp8(monkeypatch):
     speculative_config = {
         "method": "eagle3",
@@ -262,6 +263,7 @@ def test_kimi_eagle3_draft_stays_bf16_with_target_runtime_mxfp8(monkeypatch):
     assert speculative_config_obj.target_model_config is target_model_config
 
 
+@pytest.mark.vllm
 def test_external_draft_respects_explicit_quantization(monkeypatch):
     vllm_kwargs = _runtime_mxfp8_kwargs(
         {
@@ -292,6 +294,7 @@ def test_external_draft_respects_explicit_quantization(monkeypatch):
     assert speculative_config_obj.target_model_config is target_model_config
 
 
+@pytest.mark.vllm
 @pytest.mark.parametrize("method", ["mtp", "deepseek_mtp"])
 def test_native_mtp_stays_bf16_with_target_runtime_mxfp8(monkeypatch, method: str):
     vllm_kwargs = _runtime_mxfp8_kwargs(
@@ -322,6 +325,7 @@ def test_native_mtp_stays_bf16_with_target_runtime_mxfp8(monkeypatch, method: st
     assert speculative_config_obj.target_model_config is target_model_config
 
 
+@pytest.mark.vllm
 def test_native_mtp_respects_explicit_draft_quantization(monkeypatch):
     vllm_kwargs = _runtime_mxfp8_kwargs(
         {
@@ -351,6 +355,7 @@ def test_native_mtp_respects_explicit_draft_quantization(monkeypatch):
     assert speculative_config_obj.target_model_config is target_model_config
 
 
+@pytest.mark.vllm
 def test_vllm_keeps_target_dict_overrides_out_of_draft_model():
     from vllm.config.speculative import SpeculativeConfig
 
