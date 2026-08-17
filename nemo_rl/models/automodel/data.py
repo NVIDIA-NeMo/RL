@@ -25,6 +25,10 @@ from torch import nn
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    PackedTensor,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
@@ -459,6 +463,16 @@ def check_sequence_dim(
     seq_dim_size = data.get("input_ids").shape[sequence_dim]
     for k, v in data.items():
         if k in skip_set:
+            continue
+        # Multimodal fields are never sequence-aligned: dim 1 is
+        # num_images / num_patches, and packed wire companions
+        # (``<key>__lengths``) are 1-D. In-memory these ride as
+        # ``PackedTensor`` and are skipped by ``torch.is_tensor`` below, but
+        # the data-plane wire form is a plain tensor, so name it here.
+        # Mirrors ``megatron/data.py::get_and_validate_seqlen``; kept inside
+        # this helper rather than pushed onto ``skip_keys`` because all seven
+        # call sites need it and none of them should know the wire format.
+        if k in PACKED_MULTIMODAL_FIELDS or k.endswith(PackedTensor.LENGTHS_SUFFIX):
             continue
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (
