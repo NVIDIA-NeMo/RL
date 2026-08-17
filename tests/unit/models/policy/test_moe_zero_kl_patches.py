@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from nemo_rl.models.policy.workers import moe_zero_kl_patches as moe_patches
 from nemo_rl.models.policy.workers.moe_zero_kl_patches import (
     _nrl_dynamic_step_context_bookkeeping,
     _patched_unpermute,
@@ -26,6 +27,7 @@ from nemo_rl.models.policy.workers.moe_zero_kl_patches import (
     _unpermute_gather_combine_droppad,
     apply_moe_unpermute_determinism_patch,
     apply_router_replay_inference_patches,
+    configure_moe_combine_for_cuda_graph_inference,
     restore_moe_determinism_patches,
 )
 
@@ -119,6 +121,44 @@ class TestGatherCombineUnified:
         )
         assert torch.allclose(train_out, torch.tensor([[3.0], [4.0]]))
         assert torch.allclose(decode_out, torch.tensor([[3.0], [4.0]]))
+
+    def test_fixed_train_keeps_gather_droppad_decode(self, monkeypatch):
+        monkeypatch.setenv("NRL_COMBINE_IMPL", "fixed")
+        configure_moe_combine_for_cuda_graph_inference()
+        routing_map = torch.tensor([[True, False], [False, True]])
+        probs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+        with (
+            patch.object(
+                moe_patches,
+                "_unpermute_fixed_order_combine",
+                wraps=_unpermute_fixed_order_combine,
+            ) as fixed_combine,
+            patch.object(
+                moe_patches,
+                "_unpermute_gather_combine_droppad",
+                wraps=_unpermute_gather_combine_droppad,
+            ) as droppad_combine,
+        ):
+            _patched_unpermute(
+                torch.tensor([[3.0], [4.0]]),
+                torch.tensor([0, 1]),
+                torch.Size([2, 1]),
+                probs=probs,
+                routing_map=routing_map,
+                drop_and_pad=False,
+            )
+            _patched_unpermute(
+                torch.tensor([[3.0], [0.0], [4.0], [0.0]]),
+                torch.tensor([0, 0, 1, 1]),
+                torch.Size([2, 1]),
+                probs=probs,
+                routing_map=routing_map,
+                drop_and_pad=True,
+            )
+
+        fixed_combine.assert_called_once()
+        droppad_combine.assert_called_once()
 
 
 class TestApplyMoeDeterminismPatches:
