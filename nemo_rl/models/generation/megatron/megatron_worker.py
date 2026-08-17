@@ -94,6 +94,15 @@ class MegatronGenerationMixin:
         )
         from megatron.core.utils import get_attr_wrapped_model
 
+        from nemo_rl.models.megatron.router_replay import (
+            apply_router_replay_inference_patches,
+            assert_megatron_inference_router_replay_ready,
+            rebuild_global_router_replay_registry,
+            reset_moe_routing_metadata_buffer,
+            router_replay_enabled,
+            sync_model_config_for_router_replay,
+        )
+
         pg_collection = get_attr_wrapped_model(self.model, "pg_collection")
 
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
@@ -139,6 +148,11 @@ class MegatronGenerationMixin:
         if logging_step_interval is None:
             logging_step_interval = 0
 
+        if router_replay_enabled(self.cfg):
+            rebuild_global_router_replay_registry(self.model)
+            apply_router_replay_inference_patches()
+        sync_model_config_for_router_replay(self.model, self.cfg)
+
         # flashinfer's fused-RoPE kernel only dispatches fp16/bf16 q/k.
         use_flashinfer_fused_rope = self.model.config.params_dtype in (
             torch.float16,
@@ -182,6 +196,11 @@ class MegatronGenerationMixin:
 
         self.inference_context = DynamicInferenceContext(
             self.model.config, inference_config
+        )
+        if router_replay_enabled(self.cfg):
+            reset_moe_routing_metadata_buffer(self.inference_context)
+        assert_megatron_inference_router_replay_ready(
+            self.model, self.inference_context, self.cfg
         )
         self.inference_wrapped_model = GPTInferenceWrapper(
             self.model, self.inference_context

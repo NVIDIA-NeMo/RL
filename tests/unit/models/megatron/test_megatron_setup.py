@@ -2843,6 +2843,50 @@ class TestSetupReferenceModelState:
     @patch("nemo_rl.models.megatron.setup.init_checkpointing_context")
     @patch("nemo_rl.models.megatron.setup.GlobalState")
     @patch("nemo_rl.models.megatron.setup.get_model")
+    @patch("nemo_rl.models.megatron.setup.checkpoint_exists")
+    @patch("nemo_rl.models.megatron.setup.rebuild_global_router_replay_registry")
+    @patch("nemo_rl.models.megatron.setup.load_checkpoint")
+    @patch("nemo_rl.models.megatron.setup.HAVE_FSDP2", False)
+    def test_setup_reference_model_rebuilds_router_replay_when_policy_model_passed(
+        self,
+        mock_load_checkpoint,
+        mock_rebuild_global_router_replay_registry,
+        mock_checkpoint_exists,
+        mock_get_model,
+        mock_global_state,
+        mock_init_ckpt_context,
+        mock_pg_collection,
+    ):
+        """Test setup_reference_model_state restores policy RouterReplay after ref build."""
+        from nemo_rl.models.megatron.setup import setup_reference_model_state
+
+        mock_global_state.return_value = MagicMock()
+        mock_megatron_cfg = MagicMock()
+        mock_megatron_cfg.dist.use_torch_fsdp2 = False
+
+        mock_ref_model = MagicMock()
+        mock_ref_model.state_dict.return_value = {"layer1.weight": torch.tensor([1.0])}
+        mock_get_model.return_value = [mock_ref_model]
+        mock_checkpoint_exists.return_value = True
+
+        policy_model = MagicMock()
+        config = {"megatron_cfg": {"freeze_moe_router": False}}
+
+        setup_reference_model_state(
+            config=config,
+            megatron_cfg=mock_megatron_cfg,
+            pretrained_path="/path/to/pretrained",
+            policy_model=policy_model,
+        )
+
+        mock_rebuild_global_router_replay_registry.assert_called_once_with(
+            policy_model
+        )
+
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
+    @patch("nemo_rl.models.megatron.setup.init_checkpointing_context")
+    @patch("nemo_rl.models.megatron.setup.GlobalState")
+    @patch("nemo_rl.models.megatron.setup.get_model")
     @patch("nemo_rl.models.megatron.setup.clear_global_router_replay_instances")
     def test_setup_reference_model_clears_router_replay_on_get_model_error(
         self,
