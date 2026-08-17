@@ -65,15 +65,24 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     product in mind when raising them. Under-sizing surfaces as
     ``batch_get_tensor returned None``.
 
-    ``reuse_registered_buffers`` keeps a small pool of RDMA-registered buffers
-    alive instead of registering a fresh one per transfer. Costs up to ``4 x``
-    the largest per-task payload in resident pinned memory; set false to fall
-    back to upstream's per-call registration.
+    ``reuse_registered_buffers`` keeps a pool of RDMA-registered buffers alive
+    instead of registering a fresh one per transfer; set false to fall back to
+    upstream's per-call registration.
+
+    ``staging_buffer_size`` is that pool's per-slot ceiling, an order of
+    magnitude below ``local_buffer_size`` because it bounds one in-flight
+    transfer rather than a whole client's arena. A payload larger than a slot
+    bypasses the pool and registers transiently, so raising it trades resident
+    pinned memory for fewer registrations on large transfers. The pool holds one
+    slot per mooncake batch worker, so a node pays ``gpus_per_node x
+    batch_workers x staging_buffer_size`` for it. Ignored when
+    ``reuse_registered_buffers`` is false.
     """
 
     global_segment_size: int = 68719476736  # 64 GiB per client process
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
+    staging_buffer_size: int = 268435456  # 256 MiB per pool slot
 
 
 class DataPlaneConfig(TypedDict):
