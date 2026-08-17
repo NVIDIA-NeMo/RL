@@ -39,6 +39,10 @@ from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.failures import (
+    GymTransportError,
+    RolloutRedispatchExhausted,
+)
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
@@ -1259,6 +1263,7 @@ def _make_capture_manager(
     on_run=None,
     num_generations=2,
     fail_after_completions=None,
+    retry_policy: RolloutRetryPolicy | None = None,
 ):
     mgr = object.__new__(RolloutManager)
     mgr._tokenizer = None
@@ -1269,7 +1274,7 @@ def _make_capture_manager(
     mgr._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     mgr._env_handles = {"nemo_gym": _FakeGymEnvHandle()}
     mgr._weight_version = 7
-    mgr._retry_policy = RolloutRetryPolicy.single_attempt()
+    mgr._retry_policy = retry_policy or RolloutRetryPolicy.single_attempt()
     mgr._stats = RolloutStats()
     mgr._skipped_prompts = 0
 
@@ -1474,6 +1479,129 @@ class TestGenerateAndFinalizeFlow:
         (failed_ids, reason) = mgr._env_handles["nemo_gym"].failed[-1]
         assert failed_ids == [recovered.siblings[2].current_attempt.gate_rollout_id]
         assert reason == "recovery_failed"
+
+    def test_recovery_retries_infrastructure_failure_and_reuses_sealed_sibling(self):
+        attempts = 0
+
+        async def _fail_once(_sample):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise GymTransportError("generation worker died")
+
+        buf = _FakeCaptureBuffer()
+        finalizer = _FakeFinalizer()
+        mgr = _make_capture_manager(
+            buf,
+            finalizer,
+            on_run=_fail_once,
+            retry_policy=RolloutRetryPolicy.single_attempt(
+                max_infra_attempts=2,
+                backoff_base_s=0,
+            ),
+        )
+        group = mgr.recovery_ledger.reserve_group(
+            group_id="recovery-g0",
+            prompt_id="42",
+            prompt_payload=_capture_sample(),
+            expected_generations=2,
+            target_step=None,
+            start_weight_version=7,
+        )
+        mgr.recovery_ledger.mark_group_dispatched(group.group_id)
+        sealed_attempt = group.siblings[0].current_attempt
+        mgr.recovery_ledger.mark_sibling_sealed(
+            group.group_id,
+            generation_index=0,
+            gate_rollout_id=sealed_attempt.gate_rollout_id,
+            receipt={
+                "rollout_id": sealed_attempt.gate_rollout_id,
+                "manifest": [{"staging_key": "stage-0"}],
+            },
+            reward=0.5,
+        )
+        mgr.recovery_ledger.prepare_for_restart()
+
+        committed = _run(mgr.recover_group(group.group_id))
+
+        assert committed is True
+        assert attempts == 2
+        assert mgr._stats.redispatches_by_reason == {"GymTransportError": 1}
+        assert len(finalizer.calls) == 1
+        assert finalizer.calls[0][1][0] == sealed_attempt.gate_rollout_id
+        assert len(mgr.recovery_ledger) == 0
+
+    def test_recovery_raises_after_infrastructure_retry_budget_is_exhausted(self):
+        attempts = 0
+
+        async def _always_fail(_sample):
+            nonlocal attempts
+            attempts += 1
+            raise GymTransportError("generation fleet unavailable")
+
+        mgr = _make_capture_manager(
+            _FakeCaptureBuffer(),
+            _FakeFinalizer(),
+            on_run=_always_fail,
+            retry_policy=RolloutRetryPolicy.single_attempt(
+                max_infra_attempts=2,
+                backoff_base_s=0,
+            ),
+        )
+        group = mgr.recovery_ledger.reserve_group(
+            group_id="recovery-g0",
+            prompt_id="42",
+            prompt_payload=_capture_sample(),
+            expected_generations=2,
+            target_step=None,
+            start_weight_version=7,
+        )
+        mgr.recovery_ledger.mark_group_dispatched(group.group_id)
+        mgr.recovery_ledger.prepare_for_restart()
+
+        with pytest.raises(
+            RolloutRedispatchExhausted,
+            match="recovery group 'recovery-g0'.*after 2 attempt",
+        ) as exc_info:
+            _run(mgr.recover_group(group.group_id))
+
+        assert attempts == 2
+        assert isinstance(exc_info.value.__cause__, GymTransportError)
+        assert mgr._stats.redispatches_by_reason == {"GymTransportError": 1}
+
+    def test_recovery_does_not_retry_non_infrastructure_failure(self):
+        attempts = 0
+
+        async def _fail_with_data_error(_sample):
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("invalid recovered rollout")
+
+        mgr = _make_capture_manager(
+            _FakeCaptureBuffer(),
+            _FakeFinalizer(),
+            on_run=_fail_with_data_error,
+            retry_policy=RolloutRetryPolicy.single_attempt(
+                max_infra_attempts=3,
+                backoff_base_s=0,
+            ),
+        )
+        group = mgr.recovery_ledger.reserve_group(
+            group_id="recovery-g0",
+            prompt_id="42",
+            prompt_payload=_capture_sample(),
+            expected_generations=2,
+            target_step=None,
+            start_weight_version=7,
+        )
+        mgr.recovery_ledger.mark_group_dispatched(group.group_id)
+        mgr.recovery_ledger.prepare_for_restart()
+
+        with pytest.raises(RuntimeError, match="invalid recovered rollout"):
+            _run(mgr.recover_group(group.group_id))
+
+        assert attempts == 1
+        assert mgr._stats.redispatches_by_reason == {}
 
     def test_mints_ids_finalizes_and_commits(self):
         buf = _FakeCaptureBuffer()

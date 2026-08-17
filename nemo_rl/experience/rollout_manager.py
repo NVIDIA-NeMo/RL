@@ -1541,7 +1541,10 @@ class RolloutManager:
                             end_weight_version=end_version,
                         )
                     elif recover_existing_group:
-                        committed = await self.recover_group(group_id)
+                        # generate_and_push already owns the infrastructure retry
+                        # budget. Run one physical recovery attempt here so retries do
+                        # not multiply when a durable group is redispatched.
+                        committed = await self._recover_group_once(group_id)
                         if not committed:
                             raise _FinalizedGroupDropped(
                                 f"token capture: group {group_id} dropped "
@@ -1779,6 +1782,49 @@ class RolloutManager:
             print(f"fail_rollouts({group_id}) failed: {error}", flush=True)
 
     async def recover_group(self, group_id: str) -> bool:
+        """Recover a saved group with the configured infrastructure retry policy.
+
+        Each failed attempt leaves reusable sealed siblings in the recovery ledger.
+        Infrastructure failures are therefore safe to redispatch without regenerating
+        siblings that already completed. Prompt-specific and unexpected failures still
+        propagate immediately.
+
+        Returns:
+            True when canonical rows were committed. False when finalizer
+            policy deliberately dropped the restored group.
+
+        Raises:
+            RolloutRedispatchExhausted: The infrastructure retry budget ran out.
+        """
+        policy = self._retry_policy
+        infra_attempts = 0
+        last_infra_error: Optional[Exception] = None
+
+        while infra_attempts < policy.max_infra_attempts:
+            try:
+                return await self._recover_group_once(group_id)
+            except Exception as error:
+                if classify_rollout_failure(error) is not FailureClass.INFRA:
+                    raise
+                infra_attempts += 1
+                last_infra_error = error
+                if infra_attempts >= policy.max_infra_attempts:
+                    break
+                self._stats.record_redispatch(type(error).__name__)
+                await asyncio.sleep(policy.backoff_for(infra_attempts))
+
+        # The retry budget is >= 1, so the loop ran and only reaches here after an
+        # infrastructure failure consumed the final attempt.
+        assert last_infra_error is not None
+        raise RolloutRedispatchExhausted(
+            f"recovery group {group_id!r} exhausted its infrastructure retry "
+            f"budget after {infra_attempts} attempt(s) "
+            f"(max_infra_attempts_per_prompt={policy.max_infra_attempts}); "
+            f"last failure was {type(last_infra_error).__name__}: "
+            f"{last_infra_error}"
+        ) from last_infra_error
+
+    async def _recover_group_once(self, group_id: str) -> bool:
         """Redispatch missing siblings and publish one restored prompt group.
 
         Returns:
