@@ -121,7 +121,15 @@ cleanup() {
 trap cleanup EXIT
 
 # 3 GPUs: 2 generation (dp_size=2, the whole point) + 1 trainer.
-uv run "$PROJECT_ROOT/examples/run_grpo_single_controller.py" \
+#
+# PYTHONUNBUFFERED: this harness detects progress by grepping RUN_LOG, and that only
+# works if the driver actually writes to it. The actor prints with flush=True, but that
+# just reaches the DRIVER -- Ray forwards actor output there, and the driver's own stdout
+# is a redirected file, so Python block-buffers it. The chaos harness carries the same
+# line for the same reason (job 5892910); this one was written without it and job 6262310
+# paid for that exactly as predicted: the step gate saw 0 steps for 26 minutes and then
+# 150 at once, so the kill had nothing left to land on.
+PYTHONUNBUFFERED=1 uv run "$PROJECT_ROOT/examples/run_grpo_single_controller.py" \
     --config "$PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml" \
     policy.model_name=Qwen/Qwen3-0.6B \
     policy.dtensor_cfg.enabled=false \
