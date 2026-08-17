@@ -77,6 +77,11 @@ def test_register_checked_accepts_success_statuses(status) -> None:
     tq_adapter._register_checked(store, 0x1000, 4096)
 
 
+# Comfortably above every payload these tests stage, so the ceiling only
+# matters in the test that sets it explicitly.
+_MAX = 1 << 20
+
+
 def test_register_checked_raises_on_failed_registration() -> None:
     """The whole point: fail at the registration, not three retries later."""
     store = _FakeStore(fail_after=0)
@@ -112,7 +117,7 @@ def test_register_all_buffers_patch_checks_upstream_call_site(monkeypatch) -> No
 
 def test_growing_a_slot_unregisters_before_dropping_the_old_buffer() -> None:
     store = _FakeStore()
-    pool = tq_adapter._StagingPool(store, n_slots=1)
+    pool = tq_adapter._StagingPool(store, n_slots=1, max_bytes=_MAX)
 
     with pool.buffer(1024) as small:
         small_ptr = small.data_ptr()
@@ -133,7 +138,7 @@ def test_failed_growth_leaves_the_slot_empty_not_poisoned() -> None:
     -800, which retrying cannot fix.
     """
     store = _FakeStore(fail_after=0)
-    pool = tq_adapter._StagingPool(store, n_slots=1)
+    pool = tq_adapter._StagingPool(store, n_slots=1, max_bytes=_MAX)
 
     with pytest.raises(RuntimeError, match="register_buffer"):
         with pool.buffer(1024):
@@ -145,11 +150,10 @@ def test_failed_growth_leaves_the_slot_empty_not_poisoned() -> None:
         assert store.registered == {buf.data_ptr(): 1024}
 
 
-def test_oversized_transfer_bypasses_the_pool_and_unregisters(monkeypatch) -> None:
+def test_oversized_transfer_bypasses_the_pool_and_unregisters() -> None:
     """Outliers get a transient registration; it must not outlive the call."""
-    monkeypatch.setattr(tq_adapter, "_STAGING_MAX_BYTES", 4096)
     store = _FakeStore()
-    pool = tq_adapter._StagingPool(store, n_slots=1)
+    pool = tq_adapter._StagingPool(store, n_slots=1, max_bytes=4096)
 
     with pool.buffer(8192) as buf:
         assert store.registered == {buf.data_ptr(): 8192}
@@ -162,7 +166,7 @@ def test_oversized_transfer_bypasses_the_pool_and_unregisters(monkeypatch) -> No
 def test_slot_exhaustion_fails_loudly_instead_of_hanging(monkeypatch) -> None:
     """More concurrent transfers than slots must raise, not block forever."""
     monkeypatch.setattr(tq_adapter, "_STAGING_SLOT_TIMEOUT_S", 0.05)
-    pool = tq_adapter._StagingPool(_FakeStore(), n_slots=1)
+    pool = tq_adapter._StagingPool(_FakeStore(), n_slots=1, max_bytes=_MAX)
 
     with pool.buffer(1024):
         with pytest.raises(RuntimeError, match="No mooncake staging slot free"):
@@ -204,7 +208,7 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
 
     def worker() -> None:
         barrier.wait()
-        seen.append(tq_adapter._staging_pool(client, 4))
+        seen.append(tq_adapter._staging_pool(client, 4, _MAX))
 
     threads = [threading.Thread(target=worker) for _ in range(n_threads)]
     for t in threads:
