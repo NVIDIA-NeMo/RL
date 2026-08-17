@@ -1,0 +1,121 @@
+# Istvan topology A, on the main-native ModelExpress reshard arm.
+#
+#   Qwen3-30B-A3B-Instruct-2507
+#   trainer TP2 x PP1 x DP8 with EP4/ETP1 (16 GPUs)
+#     -> 4 independent vLLM replicas, each TP4 (16 GPUs)
+#
+# This is deliberately not the Dynamo variant of the same topology. That recipe
+# selects `cluster.weight_sync.method: mx`, which routes to the superseded v2
+# ModelExpress RL surface (`stream_weights_via_mx` ->
+# `modelexpress.shape_descriptors`). No such module exists in the frozen
+# candidate or its baseline parent, so that arm cannot run against either.
+#
+# Here the transport is selected by `policy.generation.refit_transport`, giving
+# the publisher/receiver pair that the two-GPU lifecycle smoke validated end to
+# end. Generation is therefore NeMo-RL-managed vLLM rather than an external
+# Dynamo deployment, because the receiver lives inside the generation worker.
+#
+# Both inference and training are inside the Ray cluster now, so cluster
+# num_nodes covers both: train_nodes = 8 - 4 = 4 nodes (16 GPUs) for the
+# trainer, and 4 nodes (16 GPUs) for the four TP4 vLLM replicas.
+#
+# Performance runs use 1 warm-up + 10 measured refits.
+
+defaults: ../../../../../examples/configs/grpo_math_qwen30ba3b_megatron.yaml
+
+grpo:
+  # One cold/warm-up cycle followed by ten measured warm refits.
+  max_num_steps: 11
+  # One generation per trainer rank keeps the batch divisible by 16.
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 2
+  max_rollout_turns: 1
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 1024
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 4
+    sequence_parallel: true
+    activation_checkpointing: true
+    empty_unused_memory_level: 1
+    checkpoint:
+      # The base config defaults this to true, which makes
+      # GlobalState.initialize_async_checkpoint_worker fork a persistent
+      # multiprocessing.Manager during worker init. That fork intermittently dies
+      # before writing its address back, and the parent then raises EOFError from
+      # reader.recv() and takes the whole run down; it cost 2 of the first 5 MoE
+      # runs here and never reproduced on the smaller dense model.
+      #
+      # `checkpointing.enabled` is false for these benchmark recipes, so no
+      # checkpoint is ever written and the async worker is pure overhead. Turning
+      # it off removes the failure mode rather than retrying around it. It is not
+      # in the refit path, so no measured number depends on it.
+      async_save: false
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      # Each node holds an address on all four RDMA rails (10.0.32/48/64/80.x),
+      # and NCCL can pair its local rail-0 HCA against a peer's rail-3 address.
+      # Those are different subnets, so RoCE never connects and the QP dies with
+      # IBV_WC_RETRY_EXC_ERR. Forbid rail crossing so each ring stays on one
+      # rail. The earlier MoE run survived without this only because its pod
+      # placement happened not to produce a rail-crossed pair; KAI reschedules,
+      # so that is luck rather than a property of the topology.
+      NCCL_CROSS_NIC: "0"
+
+  generation:
+    backend: vllm
+    max_new_tokens: 8
+    temperature: 1.0
+    top_p: 1.0
+    refit_transport: mx_reshard
+    vllm_cfg:
+      async_engine: false
+      tensor_parallel_size: 4
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+    vllm_kwargs:
+      moe_backend: triton
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 4
+
+data:
+  max_input_seq_length: 1024
+
+logger:
+  # Not the shared PVC: it is 100% full, so every write there fails with
+  # ENOSPC. Evidence is copied off the pod after the run instead.
+  log_dir: /tmp/mx-reshard-topoa
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+
+checkpointing:
+  enabled: false
