@@ -53,6 +53,15 @@ run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controll
     ++async_rl.generation_router.enabled=true \
     ++async_rl.generation_fleet_health.enabled=true
 
+# ...and the property that run CANNOT prove. It is dp_size=1, so _pick_backend has one
+# choice, the serving set never shrinks, and the no-healthy-backend path never fires: it
+# demonstrates pass-through, not failover. This one runs two generation shards, kills one
+# mid-run, and asserts the run FINISHES -- which is the entire reason the router exists.
+#
+# Needs >= 3 GPUs (2 generation + 1 trainer) and self-skips below that, so it is inert on
+# the 2-GPU L1 runners and only does its job on a larger box.
+run_test uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
+
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
 # rather than between calls. Registered because pinning the victim state -- which is what
 # makes that test reproducible at all -- would otherwise silently drop a scenario the old,
