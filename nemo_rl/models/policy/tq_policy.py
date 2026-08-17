@@ -53,19 +53,31 @@ from nemo_rl.data_plane.schema import (
     fields_with_optional_routed_experts,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.flops_tracker import get_theoretical_tflops
+from nemo_rl.utils.timer import Timer
 
-# Include-list of multimodal fields the logprob dispatch must ship so
-# the trainer's forward matches the rollout. Only ``PACKED`` fields
-# ship a companion ``__lengths`` — per-token fields are rectangular
-# and travel as plain tensors.
-_LP_MULTIMODAL_FIELDS = (
+# Include-list of multimodal fields every forward-running dispatch
+# (logprob *and* train) must ship so the trainer's forward matches the
+# rollout. Only ``PACKED`` fields ship a companion ``__lengths`` —
+# per-token fields are rectangular and travel as plain tensors.
+_WIRE_MULTIMODAL_FIELDS = (
     PER_TOKEN_MULTIMODAL_FIELDS
     | PACKED_MULTIMODAL_FIELDS
     | frozenset(PackedTensor.lengths_key(k) for k in PACKED_MULTIMODAL_FIELDS)
 )
-from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.utils.flops_tracker import get_theoretical_tflops
-from nemo_rl.utils.timer import Timer
+
+
+def _present_multimodal_fields(meta: KVBatchMeta) -> list[str]:
+    """Multimodal wire fields the rollout actually wrote for this batch.
+
+    Intersecting with ``meta.fields`` is required, not defensive: the
+    noop adapter and the TQ contract both raise on a fetch for a field
+    that was never written, and text-only runs write none of these.
+    Sorted for a deterministic field list across ranks.
+    """
+    return sorted(_WIRE_MULTIMODAL_FIELDS & set(meta.fields or ()))
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Per-stage aggregators that assemble per-rank worker results into the
@@ -305,12 +317,12 @@ class TQPolicy(Policy):
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("logprob_mb_tokens")
         # Narrow the fetch to LP_SEED_FIELDS + any multimodal fields
-        # the rollout actually wrote (filter is required — noop
-        # adapter and TQ contract both raise on unknown fields) +
-        # optional routed_experts under R3 replay.
-        present_multimodal = _LP_MULTIMODAL_FIELDS & set(meta.fields or ())
+        # the rollout actually wrote + optional routed_experts under R3
+        # replay. ``train_from_meta`` ships the same multimodal set, so
+        # the prev/ref logprobs and the training forward see identical
+        # model inputs.
         lp_fields = fields_with_optional_routed_experts(
-            [*LP_SEED_FIELDS, *present_multimodal],
+            [*LP_SEED_FIELDS, *_present_multimodal_fields(meta)],
             enabled=self._router_replay_enabled and include_router_replay,
         )
         lp_meta = replace(meta, fields=lp_fields, task_name=task_name)
@@ -414,10 +426,14 @@ class TQPolicy(Policy):
         # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
         # by workers + driver delta-writes. Caller may narrow to drop columns
         # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
+        # The multimodal add-on is per-batch, not part of the static schema:
+        # without it a VLM training forward runs image-blind while the logprob
+        # forwards saw the images.
         train_meta = replace(
             meta,
             fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
+                [*train_fields, *_present_multimodal_fields(meta)],
+                enabled=self._router_replay_enabled,
             ),
             task_name="train",
         )
@@ -541,7 +557,8 @@ class TQPolicy(Policy):
         train_meta = replace(
             meta,
             fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                [*DP_TRAIN_FIELDS, *_present_multimodal_fields(meta)],
+                enabled=self._router_replay_enabled,
             ),
             task_name="train",
         )

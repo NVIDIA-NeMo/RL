@@ -973,6 +973,15 @@ class BatchedDataDict(UserDict, Generic[DictT]):
     def truncate_tensors(self, dim: int, truncated_len: int):
         """Truncates tensors in this dict of a given dim to a given length."""
         for k, v in self.items():
+            # Packed multimodal fields are not sequence-aligned — their
+            # dim 1 is patch/image count — so narrowing them to the token
+            # seqlen silently corrupts images (or raises when the patch
+            # count is smaller than the seqlen). The in-memory
+            # ``PackedTensor`` form is skipped by ``torch.is_tensor``
+            # below, but the data-plane wire form is a plain tensor plus
+            # a 1-D ``<key>__lengths`` companion, so name both here.
+            if k in PACKED_MULTIMODAL_FIELDS or k.endswith(PackedTensor.LENGTHS_SUFFIX):
+                continue
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
                 self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)
 

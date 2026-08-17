@@ -118,6 +118,11 @@ PACKED_MULTIMODAL_FIELDS = frozenset(
         "video_grid_thw",
         "second_per_grid_ts",
         "input_features",
+        # nemotron-omni: per-image [H, W] and the RADIO temporal-patching
+        # frame count. Coupled with pixel_values (see
+        # ``batched_data_dict._COUPLED_MULTIMODAL_KEYS``); both pack on dim 0.
+        "imgs_sizes",
+        "num_frames",
     }
 )
 
