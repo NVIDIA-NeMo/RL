@@ -185,9 +185,10 @@ class GDPOAdvantageEstimator:
             prompt_ids: Tensor identifying which prompt each sample belongs to (for per-prompt baselines).
             rewards: Unused; for interface consistency.
             repeated_batch: Batch containing named reward component keys (e.g. reward/correctness, reward/format).
-                Keyword-only in practice and required by GDPO; it carries a default
-                solely so the signature does not require more than the shared
-                ``AdvantageEstimator`` contract.
+                Required, and checked below. It carries a default only so this
+                signature does not demand more than the shared
+                ``AdvantageEstimator`` contract, which promises every estimator
+                no more than prompt_ids/rewards/mask.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
             **kwargs: Additional arguments (unused).
 
@@ -520,6 +521,19 @@ class GeneralizedAdvantageEstimator:
           (default: gae_lambda)
         When none of these are set, this is standard GAE.
 
+        Args:
+            prompt_ids: Tensor identifying which prompt each sample belongs to.
+            rewards: Sequence-level rewards, shape [batch_size].
+            mask: Response token mask, shape [batch_size, seq_len].
+            values: Value predictions, shape [batch_size, response_length].
+                Required, and checked below. It carries a default only so this
+                signature does not demand more than the shared
+                ``AdvantageEstimator`` contract, which promises every estimator
+                no more than prompt_ids/rewards/mask.
+            reference_logprobs: Reference-policy logprobs, for KL-in-reward.
+            logprobs: Current-policy logprobs, for KL-in-reward.
+            **kwargs: Additional arguments (unused).
+
         Returns:
             AdvantageResult with ``advantages`` and ``returns``, each of shape
             [batch_size, seq_len].
@@ -590,9 +604,6 @@ class GeneralizedAdvantageEstimator:
         Args:
             token_level_rewards: Per-token rewards, shape [batch_size, response_length].
             values: Value predictions, shape [batch_size, response_length].
-                Required by GAE; it carries a default solely so the signature
-                does not require more than the shared ``AdvantageEstimator``
-                contract, and is checked explicitly below.
             mask: Response token mask, shape [batch_size, response_length].
             gae_lambda: Override for self.gae_lambda.  Can be a scalar or a
                 per-sample tensor of shape [batch_size] (VAPO length-adaptive).
