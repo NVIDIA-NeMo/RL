@@ -435,26 +435,37 @@ data_plane:
     reuse_registered_buffers: true     # reuse RDMA-registered buffers
     cpu_staging_slots: 4                # lazily allocated registered host slots
     cpu_staging_buffer_mb: 256          # maximum MiB per host slot
+    use_gdr: false                      # GPU-memory RDMA staging in CUDA clients
+    gdr_staging_buffer_mb: 1024         # persistent MiB per active GDR client
   # observability:                     # NotRequired
   #   enabled: false
 ```
 
-These keys used to sit directly under `data_plane:`. That spelling is
-rejected with a migration message rather than silently accepted — an
-inherited config supplies the nested block, so a surviving flat key
-would always lose the merge without warning.
+The nested blocks are the only source of backend sizing. Legacy flat
+simple/CPU sizing keys are ignored. The first GDR integration's flat
+`use_gdr` and `gdr_staging_buffer_mb` spellings are rejected with a migration
+message so an old GDR recipe cannot silently run with GDR disabled.
 
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
   and small runs.
-- **`mooncake_cpu`** — Mooncake's RDMA-only transfer engine; tensors transfer
-  through registered CPU staging. Higher throughput at scale and required for
-  multi-node clusters with large bulk volume.
+- **`mooncake_cpu`** — Mooncake's RDMA-only transfer engine. By default,
+  tensors transfer through registered CPU staging. Set
+  `mooncake_cpu.use_gdr: true` to let CUDA-initialized clients use
+  TransferQueue's GDR staging path. CPU-only clients, such as a
+  SingleController producer, continue to use CPU RDMA. Both paths retain the
+  same all-InfiniBand-rail (or RoCE-only fallback) transport selection.
 
 The CPU staging pool grows lazily up to
 `cpu_staging_slots × cpu_staging_buffer_mb` per client process. The
 defaults preserve four 256 MiB slots; setting the values to `1` and `1024`
-selects one 1 GiB slot for a controlled experiment.
+selects one 1 GiB slot for a controlled experiment. These settings continue to
+apply to CPU-only clients in a mixed CPU-producer/GDR-receiver run.
+
+`gdr_staging_buffer_mb` is the positive persistent GPU staging capacity per
+active CUDA client and defaults to 1024 MiB. In a mixed CPU-producer/GDR-receiver
+flow, the current TransferQueue pin requires it to fit the largest individual
+tensor.
 
 Capacity rule of thumb (any backend):
 

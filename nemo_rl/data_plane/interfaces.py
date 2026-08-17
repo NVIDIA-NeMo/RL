@@ -71,6 +71,10 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     slots grow lazily, so their product is the maximum pinned host-memory cost
     per client. Set ``reuse_registered_buffers=false`` to fall back to
     upstream's per-call registration.
+
+    ``use_gdr`` switches CUDA-initialized clients to TransferQueue's GDR path.
+    ``gdr_staging_buffer_mb`` is the positive persistent GPU staging capacity
+    per active GDR client.
     """
 
     global_segment_size: int = 68719476736  # 64 GiB per client process
@@ -78,6 +82,8 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     reuse_registered_buffers: bool = True
     cpu_staging_slots: PositiveInt = 4
     cpu_staging_buffer_mb: PositiveInt = 256
+    use_gdr: bool = False
+    gdr_staging_buffer_mb: PositiveInt = 1024
 
 
 class DataPlaneConfig(TypedDict):
@@ -100,9 +106,10 @@ class DataPlaneConfig(TypedDict):
 
     ``storage_capacity`` / ``num_storage_units`` / ``global_segment_size`` /
     ``local_buffer_size`` / ``reuse_registered_buffers`` used to sit at this
-    level. :func:`backend_config` rejects them with a migration message rather
-    than accepting both spellings — see there for why silently accepting them
-    would be worse than erroring.
+    level; the nested-only sizing contract ignores those old spellings. The
+    first GDR integration also spelled ``use_gdr`` and
+    ``gdr_staging_buffer_mb`` there. :func:`backend_config` rejects those two
+    GDR spellings so an old recipe cannot silently run with GDR disabled.
     """
 
     enabled: bool
@@ -115,6 +122,18 @@ class DataPlaneConfig(TypedDict):
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
 
+    # The first GDR integration's deprecated flat spellings are declared only
+    # so Pydantic preserves them until ``backend_config`` can raise the
+    # migration error below. Without these entries, MasterConfig silently
+    # drops the keys during validation.
+    use_gdr: NotRequired[bool]
+    gdr_staging_buffer_mb: NotRequired[int]
+
+
+# PR #3501 introduced these at the top level before backend-specific nesting.
+# Reject that spelling for either selected backend so rebasing an existing GDR
+# recipe cannot silently disable GDR.
+_FIRST_GDR_FLAT_KEYS = ("use_gdr", "gdr_staging_buffer_mb")
 
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {
     "simple": SimpleStorageConfig,
@@ -130,9 +149,19 @@ def backend_config(cfg: DataPlaneConfig) -> Any:
     (block already coerced to a model) or as a plain dict from a test.
 
     Sizing is read only from the nested block. A config still using the
-    pre-nesting flat spelling gets this backend's defaults, not its own values.
+    pre-nesting flat sizing spelling gets this backend's defaults, not its own
+    values. The first GDR integration's flat spelling is rejected instead,
+    because otherwise an old GDR recipe would silently run with GDR disabled.
     """
     backend = cfg["backend"]
+    stale_gdr = [k for k in _FIRST_GDR_FLAT_KEYS if k in cfg]
+    if stale_gdr:
+        raise ValueError(
+            f"data_plane.{{{','.join(stale_gdr)}}} moved under "
+            "data_plane.mooncake_cpu. Update the first GDR integration's "
+            "top-level spelling before running this stack."
+        )
+
     nested = cfg.get(backend) or {}
     if isinstance(nested, BaseModel):
         nested = nested.model_dump(exclude_unset=True)

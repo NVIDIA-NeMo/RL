@@ -524,6 +524,8 @@ data_plane:
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
     cpu_staging_slots: 4              # lazily allocated registered host slots
     cpu_staging_buffer_mb: 256        # maximum MiB per host slot
+    use_gdr: false                    # GPU-memory RDMA staging in CUDA clients
+    gdr_staging_buffer_mb: 1024       # persistent MiB per active GDR client
   # observability:                    # NotRequired
   #   enabled: false
 

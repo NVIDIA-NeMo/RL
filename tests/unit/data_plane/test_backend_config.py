@@ -50,6 +50,8 @@ def test_nested_block_is_used() -> None:
             "reuse_registered_buffers": False,
             "cpu_staging_slots": 1,
             "cpu_staging_buffer_mb": 1024,
+            "use_gdr": True,
+            "gdr_staging_buffer_mb": 512,
         },
     )
     resolved = backend_config(cfg)
@@ -58,6 +60,8 @@ def test_nested_block_is_used() -> None:
     assert resolved.reuse_registered_buffers is False
     assert resolved.cpu_staging_slots == 1
     assert resolved.cpu_staging_buffer_mb == 1024
+    assert resolved.use_gdr is True
+    assert resolved.gdr_staging_buffer_mb == 512
 
 
 def test_absent_block_falls_back_to_model_defaults() -> None:
@@ -68,6 +72,16 @@ def test_absent_block_falls_back_to_model_defaults() -> None:
     assert resolved.reuse_registered_buffers is True
     assert resolved.cpu_staging_slots == 4
     assert resolved.cpu_staging_buffer_mb == 256
+    assert resolved.use_gdr is False
+    assert resolved.gdr_staging_buffer_mb == 1024
+
+
+@pytest.mark.parametrize("backend", ["simple", "mooncake_cpu"])
+@pytest.mark.parametrize("key", ["use_gdr", "gdr_staging_buffer_mb"])
+def test_flat_gdr_key_from_first_integration_raises(backend: str, key: str) -> None:
+    """The GDR port nests the first integration's top-level settings."""
+    with pytest.raises(ValueError, match="moved under data_plane.mooncake_cpu"):
+        backend_config(_cfg(backend, **{key: True}))
 
 
 def test_accepts_an_already_coerced_model() -> None:
@@ -88,6 +102,7 @@ def test_partial_nested_block_keeps_other_defaults() -> None:
     [
         ("cpu_staging_slots", 0),
         ("cpu_staging_buffer_mb", 0),
+        ("gdr_staging_buffer_mb", 0),
     ],
 )
 def test_staging_sizes_reject_invalid_values(field: str, value: int) -> None:
@@ -128,3 +143,23 @@ def test_schema_validates_without_any_backend_block() -> None:
     validate, otherwise MasterConfig fails before training starts.
     """
     TypeAdapter(DataPlaneConfig).validate_python(_cfg("simple"))
+
+
+@pytest.mark.parametrize(
+    ("backend", "key", "value"),
+    [
+        ("mooncake_cpu", "use_gdr", True),
+        ("mooncake_cpu", "gdr_staging_buffer_mb", 512),
+    ],
+)
+def test_pydantic_preserves_flat_gdr_keys_for_migration_error(
+    backend: str, key: str, value: object
+) -> None:
+    """MasterConfig's TypedDict boundary must not erase old GDR keys."""
+    validated = TypeAdapter(DataPlaneConfig).validate_python(
+        _cfg(backend, **{key: value})
+    )
+
+    assert key in validated
+    with pytest.raises(ValueError, match="moved under data_plane"):
+        backend_config(validated)
