@@ -521,6 +521,7 @@ def test_token_capture_reserves_entire_batch_before_dispatch() -> None:
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._inflight_rollouts = 0
+    ctrl._inflight_by_group_id = {}
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
     ctrl._current_epoch = 0

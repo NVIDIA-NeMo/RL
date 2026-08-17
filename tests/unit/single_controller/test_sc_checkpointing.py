@@ -1888,7 +1888,8 @@ class TestReplayBufferPersistence:
                 ),
                 "start_weight": 0,
                 "end_weight": 0,
-                "target_step": i,
+                # Windowed checkpoints do not stamp exact trainer targets.
+                "target_step": None,
                 "group_id": f"g{i}",
             }
             for i in range(2)
