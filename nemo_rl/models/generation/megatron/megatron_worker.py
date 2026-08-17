@@ -414,6 +414,8 @@ class MegatronGenerationMixin:
             self._build_colocated_inference_model(self.cfg)
 
         gen_model = self._gen_model()
+        # `flash_decode` selects Megatron Inference's deprecated static-batching decode path,
+        # which would cause an assertion error if taken.
         gen_model.config.flash_decode = False
         if self.is_generation_colocated and self.inference_model is None:
             self.model = self.move_model(
