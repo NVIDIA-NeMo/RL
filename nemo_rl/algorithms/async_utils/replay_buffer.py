@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import gc
 import hashlib
 import json
 import math
@@ -1017,22 +1016,25 @@ class TQReplayBuffer:
         self,
         group_id: str,
         meta: KVBatchMeta,
+        fields: Any,
         group_min_wv: int,
         group_max_wv: int,
         *,
         staging_keys: Optional[list[str]] = None,
     ) -> KVBatchMeta:
-        """Mark a slot ready from finalizer output (token-capture mode).
+        """Publish finalizer output and mark its slot ready atomically for saves.
 
-        Unlike :meth:`commit`, the canonical rows are already in TQ — the
-        finalizer tensorized and put them — so this only fills the slot.
+        The finalizer only builds and verifies the canonical payload. This
+        method owns the canonical TQ write, local replay-index transition, and
+        best-effort staging cleanup under the shared checkpoint barrier.
         The slot's effective version is the group's OLDEST call version
         (``group_min_wv``): staleness accounting stays conservative when a
         rollout straddles a refit.
 
         Args:
             group_id: group_id returned by the matching reserve call.
-            meta: KVBatchMeta the finalizer built over its published rows.
+            meta: KVBatchMeta describing the canonical rows.
+            fields: Canonical tensor payload built by the finalizer.
             group_min_wv: Oldest weight version any call in the group used.
             group_max_wv: Newest weight version any call in the group used.
             staging_keys: The group's staged delta keys, recorded so
@@ -1041,21 +1043,107 @@ class TQReplayBuffer:
         Raises:
             ValueError: group_id has no live slot (removed or never reserved).
         """
-        try:
-            idx = self._group_ids.index(group_id)
-        except ValueError:
+        if group_id not in self._group_ids:
             raise ValueError(
                 f"TQReplayBuffer.commit_finalized: group {group_id} has no "
                 "live slot (evicted or never reserved)"
-            ) from None
-        self.meta_list[idx] = meta
-        self.start_weight_list[idx] = group_min_wv
-        self.end_weight_list[idx] = group_max_wv
-        self.ready_list[idx] = True
-        self._staging_keys_list[idx] = (
-            list(staging_keys) if staging_keys is not None else None
-        )
-        return meta
+            )
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint barrier before committing finalized samples"
+            )
+
+        async with self._data_plane_checkpoint_barrier.mutation():
+            try:
+                await call_data_plane(
+                    self._dp_client,
+                    "put_samples",
+                    sample_ids=list(meta.sample_ids),
+                    partition_id=self._partition_id,
+                    fields=fields,
+                    tags=(
+                        [dict(tag) for tag in meta.tags]
+                        if meta.tags is not None
+                        else None
+                    ),
+                )
+                try:
+                    idx = self._group_ids.index(group_id)
+                except ValueError:
+                    raise ValueError(
+                        f"TQReplayBuffer.commit_finalized: group {group_id} "
+                        "was evicted during the canonical write"
+                    ) from None
+            except BaseException as commit_error:
+                try:
+                    await self._clear_samples_unlocked(sample_ids=list(meta.sample_ids))
+                except BaseException as rollback_error:
+                    if isinstance(commit_error, asyncio.CancelledError):
+                        raise commit_error from rollback_error
+                    raise BaseExceptionGroup(
+                        "finalized commit and canonical rollback both failed "
+                        f"for group_id={group_id!r}",
+                        [commit_error, rollback_error],
+                    )
+                raise
+
+            self.meta_list[idx] = meta
+            self.start_weight_list[idx] = group_min_wv
+            self.end_weight_list[idx] = group_max_wv
+            self.ready_list[idx] = True
+            self._staging_keys_list[idx] = (
+                list(staging_keys) if staging_keys is not None else None
+            )
+
+            if staging_keys and self._staging_partition_id is not None:
+                try:
+                    await call_data_plane(
+                        self._dp_client,
+                        "clear_samples",
+                        offload_sync=True,
+                        sample_ids=list(staging_keys),
+                        partition_id=self._staging_partition_id,
+                    )
+                except Exception as error:  # noqa: BLE001 - TTL is the backstop
+                    print(
+                        "TQReplayBuffer.commit_finalized: staging cleanup "
+                        f"failed for group {group_id}: {error}",
+                        flush=True,
+                    )
+                else:
+                    try:
+                        live_idx = self._group_ids.index(group_id)
+                    except ValueError:
+                        pass
+                    else:
+                        self._staging_keys_list[live_idx] = None
+            return meta
+
+    async def abort_finalized(self, group_id: str, *, staging_keys: list[str]) -> bool:
+        """Clear known staged rows and drop an unready finalized slot."""
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint barrier before aborting finalized samples"
+            )
+        async with self._data_plane_checkpoint_barrier.mutation():
+            try:
+                idx = self._group_ids.index(group_id)
+            except ValueError:
+                return False
+            if self.ready_list[idx]:
+                return False
+            if staging_keys and self._staging_partition_id is not None:
+                await call_data_plane(
+                    self._dp_client,
+                    "clear_samples",
+                    offload_sync=True,
+                    sample_ids=list(staging_keys),
+                    partition_id=self._staging_partition_id,
+                )
+            self._delete_slot(idx)
+            return True
 
     def abort(self, group_id: str) -> bool:
         """Drop an unready slot whose dispatch failed or was cancelled.
@@ -1138,8 +1226,10 @@ class TQReplayBuffer:
                 sample_ids=dropped_sample_ids,
             )
             if dropped_staging_keys and self._staging_partition_id is not None:
-                await self._call_dp(
+                await call_data_plane(
+                    self._dp_client,
                     "clear_samples",
+                    offload_sync=True,
                     sample_ids=dropped_staging_keys,
                     partition_id=self._staging_partition_id,
                 )
@@ -1335,6 +1425,11 @@ class TQReplayBuffer:
             self.target_step_list.append(group["target_step"])
             self.ready_list.append(True)
             self._group_ids.append(group["group_id"])
+            # Native recovery restores training-ready canonical groups only.
+            # Their capture attempts were finalized and staged rows were
+            # cleared before the checkpoint cut.
+            self._rollout_ids_list.append(None)
+            self._staging_keys_list.append(None)
 
         print(
             f"📦 Restored {len(groups)} replay group(s) from checkpoint",

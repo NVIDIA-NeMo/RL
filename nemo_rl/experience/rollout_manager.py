@@ -1307,8 +1307,7 @@ class RolloutManager:
             else:
                 group_id = str(uuid.uuid4())
                 rollout_ids = [
-                    f"{group_id}_g{i}"
-                    for i in range(self._num_generations_per_prompt)
+                    f"{group_id}_g{i}" for i in range(self._num_generations_per_prompt)
                 ]
                 self._tq_buffer.reserve(
                     weight_version=start_version,
@@ -1457,13 +1456,19 @@ class RolloutManager:
         )
         record.rollout_metrics.update(finalized.metrics)
         if finalized.dropped:
+            await self._tq_buffer.abort_finalized(
+                group_id, staging_keys=finalized.staging_keys
+            )
             raise RuntimeError(
                 f"token capture: group {group_id} dropped "
                 "(min_valid_fraction_per_group)"
             )
+        assert finalized.meta is not None
+        assert finalized.fields is not None
         await self._tq_buffer.commit_finalized(
             group_id,
             finalized.meta,
+            finalized.fields,
             finalized.group_min_wv,
             finalized.group_max_wv,
             staging_keys=finalized.staging_keys,

@@ -19,13 +19,14 @@ per rollout, fetch the staged rows the receipt manifest names through the
 shape/mask/finite-logprob checks, length chaining, weight-version tag
 equality), then delegate semantics to Gym's pure ``linearize``
 (``main_chain_only`` + ``terminal_hint``). Any rejection becomes a masked
-placeholder row — the group always publishes exactly N rows so GRPO group
-shape survives; validity folds into ``sample_mask`` (no new train field) and
+placeholder row — the group always builds exactly N rows so GRPO group shape
+survives; validity folds into ``sample_mask`` (no new train field) and
 placeholders copy ``prompt_ids_for_adv`` from a valid sibling so per-prompt
 baselines stay well-formed.
 
-The finalizer is the only reader of the staging partition and clears a
-group's staged rows after its canonical rows are durably published.
+The finalizer is the only reader of the staging partition. It returns the
+canonical tensor payload and staging keys to the replay buffer, which owns
+publication, index mutation, and cleanup under the checkpoint barrier.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from typing import Any, Optional
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+from nemo_rl.data_plane.tq_token_sink import TQTokenSource
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.row_dump import maybe_dump_train_rows
 from nemo_rl.models.generation.interfaces import (
@@ -70,6 +71,7 @@ class FinalizedGroup:
     """What ``finalize_group`` hands back for ``commit_finalized``."""
 
     meta: Optional[KVBatchMeta]
+    fields: Optional[Any]
     group_min_wv: int
     group_max_wv: int
     staging_keys: list[str]
@@ -80,7 +82,7 @@ class FinalizedGroup:
 
 
 class BlackboxFinalizer:
-    """Receipts -> verified rows -> N-row publish, off the generation hot path."""
+    """Receipts -> verified canonical rows, off the generation hot path."""
 
     def __init__(
         self,
@@ -93,7 +95,6 @@ class BlackboxFinalizer:
         min_valid_fraction_per_group: Optional[float],
         router_replay_enabled: bool = False,
     ) -> None:
-        self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_token_id = int(pad_token_id)
         self._mixed_weight_version_policy = mixed_weight_version_policy
@@ -103,10 +104,11 @@ class BlackboxFinalizer:
         # carries routes; placeholder-only groups need it to shape their
         # sentinel tensors consistently with the model.
         self._routed_dims: Optional[tuple[int, int]] = None
-        self._source = TQTokenSource(dp_client, staging_partition=staging_partition)
-        # The sink's clear() is the staging-partition delete; no staging
-        # writes happen here.
-        self._staging = TQTokenSink(dp_client, staging_partition=staging_partition)
+        self._source = TQTokenSource(
+            dp_client,
+            staging_partition=staging_partition,
+            include_routed_experts=router_replay_enabled,
+        )
 
     # ── per rollout ─────────────────────────────────────────────────────────
 
@@ -238,7 +240,7 @@ class BlackboxFinalizer:
         *,
         fallback_weight_version: int,
     ) -> FinalizedGroup:
-        """Publish exactly N canonical rows for one prompt group.
+        """Build exactly N canonical rows for one prompt group.
 
         Blocking (TQ round trips); run via ``asyncio.to_thread`` from the
         dispatch task. ``fallback_weight_version`` stamps a group none of
@@ -280,13 +282,13 @@ class BlackboxFinalizer:
             self._min_valid_fraction is not None
             and valid_fraction < self._min_valid_fraction
         ):
-            self._clear_staging(staging_keys)
             metrics["finalize/group_dropped"] = 1.0
             return FinalizedGroup(
                 meta=None,
+                fields=None,
                 group_min_wv=group_min_wv,
                 group_max_wv=group_max_wv,
-                staging_keys=[],
+                staging_keys=staging_keys,
                 metrics=metrics,
                 dropped=True,
             )
@@ -339,13 +341,13 @@ class BlackboxFinalizer:
                     "unknown yet",
                     flush=True,
                 )
-                self._clear_staging(staging_keys)
                 metrics["finalize/group_dropped"] = 1.0
                 return FinalizedGroup(
                     meta=None,
+                    fields=None,
                     group_min_wv=group_min_wv,
                     group_max_wv=group_max_wv,
-                    staging_keys=[],
+                    staging_keys=staging_keys,
                     metrics=metrics,
                     dropped=True,
                 )
@@ -366,15 +368,6 @@ class BlackboxFinalizer:
             "canonical sample ids must equal the gate-registered rollout ids: "
             f"{sample_ids} != {rollout_ids}"
         )
-        self._call_dp(
-            "put_samples",
-            sample_ids=sample_ids,
-            partition_id=self._partition_id,
-            fields=fields,
-            tags=tags,
-        )
-        self._clear_staging(staging_keys)
-
         meta = KVBatchMeta(
             partition_id=self._partition_id,
             task_name="train",
@@ -385,10 +378,10 @@ class BlackboxFinalizer:
         )
         return FinalizedGroup(
             meta=meta,
+            fields=fields,
             group_min_wv=group_min_wv,
             group_max_wv=group_max_wv,
-            # Already cleared; nothing left for eviction to clear.
-            staging_keys=[],
+            staging_keys=staging_keys,
             metrics=metrics,
         )
 
@@ -463,23 +456,3 @@ class BlackboxFinalizer:
                 sentinel_tokens / covered_tokens
             )
         return routed
-
-    def _clear_staging(self, staging_keys: list[str]) -> None:
-        if not staging_keys:
-            return
-        try:
-            self._staging.clear(staging_keys)
-        except Exception as error:  # noqa: BLE001 — cleanup must not fail the group; TTL sweeps leftovers
-            print(
-                f"  finalize: staging clear failed ({error}); TTL will sweep",
-                flush=True,
-            )
-
-    def _call_dp(self, method_name: str, **kwargs: Any) -> Any:
-        import ray
-
-        method = getattr(self._dp_client, method_name)
-        remote = getattr(method, "remote", None)
-        if remote is not None:
-            return ray.get(remote(**kwargs))
-        return method(**kwargs)

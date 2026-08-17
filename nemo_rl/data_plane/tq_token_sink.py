@@ -32,6 +32,7 @@ so the finalizer's digest recomputation over fetched values is byte-exact.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 import ray
@@ -43,6 +44,8 @@ from nemo_gym.token_id_capture.staging.records import (
     StagedCallSnapshot,
     StageResult,
 )
+
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 
 STAGING_FIELDS = [
     "token_ids_delta",
@@ -185,9 +188,18 @@ class TQTokenSource:
     skip.
     """
 
-    def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
+    def __init__(
+        self,
+        dp_client: Any,
+        *,
+        staging_partition: str,
+        include_routed_experts: bool = False,
+    ) -> None:
         self._dp_client = dp_client
         self._staging_partition = staging_partition
+        self._fields = list(STAGING_FIELDS)
+        if include_routed_experts:
+            self._fields.append(ROUTED_EXPERTS_FIELD)
 
     def fetch(self, staging_keys: list[str]) -> list[StagedCallSnapshot]:
         snapshots: list[StagedCallSnapshot] = []
@@ -199,7 +211,7 @@ class TQTokenSource:
                     "get_samples",
                     sample_ids=[key],
                     partition_id=self._staging_partition,
-                    select_fields=STAGING_FIELDS,
+                    select_fields=self._fields,
                 )
                 snapshots.append(_row_to_snapshot(call_id, row))
             except KeyError:
@@ -219,6 +231,12 @@ def _row_to_snapshot(call_id: str, row: Any) -> StagedCallSnapshot:
 
     prev_len = int(_leaf("prev_len")[0].item())
     weight_version: Optional[int] = int(_leaf("weight_version")[0].item())
+    extras: Optional[dict[str, Any]] = None
+    if ROUTED_EXPERTS_FIELD in row.keys():
+        routed_experts = row[ROUTED_EXPERTS_FIELD]
+        if routed_experts.dim() > 3:
+            routed_experts = routed_experts[0]
+        extras = {ROUTED_EXPERTS_FIELD: routed_experts.tolist()}
     return StagedCallSnapshot(
         call_id=call_id,
         prev_len=prev_len,
@@ -226,4 +244,5 @@ def _row_to_snapshot(call_id: str, row: Any) -> StagedCallSnapshot:
         token_mask_delta=[float(m) for m in _leaf("token_mask_delta").tolist()],
         logprobs_delta=[float(p) for p in _leaf("generation_logprobs_delta").tolist()],
         weight_version=weight_version,
+        extras=extras,
     )

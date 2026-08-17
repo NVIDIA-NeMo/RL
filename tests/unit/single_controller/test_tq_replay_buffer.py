@@ -755,6 +755,8 @@ class TestTQReplayBufferStateDict:
         assert [meta.sample_ids for meta in restored_buf.meta_list] == [
             list(meta.sample_ids) for meta in metas
         ]
+        assert restored_buf._rollout_ids_list == [None, None]
+        assert restored_buf._staging_keys_list == [None, None]
         assert restored_dp.put_calls == []
 
     def test_round_trip_preserves_end_weight_and_target_step(self):
@@ -910,12 +912,14 @@ class TestTQReplayBufferTokenCaptureMode:
     """
 
     def _make_capture_buffer(self, dp) -> TQReplayBuffer:
-        return TQReplayBuffer(
+        buffer = TQReplayBuffer(
             dp,
             partition_id="rollout_data",
             pad_value_dict={"token_ids": 0},
             staging_partition_id="rollout_staging",
         )
+        buffer.set_data_plane_checkpoint_barrier(DataPlaneCheckpointBarrier())
+        return buffer
 
     def test_reserve_records_rollout_ids(self):
         buf = self._make_capture_buffer(MultiPartitionFakeDataPlaneClient())
@@ -929,7 +933,6 @@ class TestTQReplayBufferTokenCaptureMode:
         dp = MultiPartitionFakeDataPlaneClient()
         buf = self._make_capture_buffer(dp)
         group_id = buf.reserve(weight_version=4, rollout_ids=["r0", "r1"])
-        # The finalizer published its own rows; commit_finalized only fills the slot.
         meta = KVBatchMeta(
             partition_id="rollout_data",
             task_name=None,
@@ -940,6 +943,7 @@ class TestTQReplayBufferTokenCaptureMode:
             buf.commit_finalized(
                 group_id,
                 meta,
+                {"payload": "canonical"},
                 group_min_wv=3,
                 group_max_wv=5,
                 staging_keys=["r0/c1", "r0/c2", "r1/c1"],
@@ -949,9 +953,54 @@ class TestTQReplayBufferTokenCaptureMode:
         assert buf.start_weight_list == [3]  # oldest call version, not reserve-time 4
         assert buf.end_weight_list == [5]
         assert buf.meta_list[0] is meta
-        assert buf._staging_keys_list == [["r0/c1", "r0/c2", "r1/c1"]]
-        # No tensorize/put happened here.
-        assert dp.rows_by_partition.get("rollout_data") is None
+        assert buf._staging_keys_list == [None]
+        assert set(dp.rows_by_partition["rollout_data"]) == set(meta.sample_ids)
+        assert (
+            "rollout_staging",
+            ["r0/c1", "r0/c2", "r1/c1"],
+        ) in dp.clear_calls_by_partition
+
+    def test_commit_finalized_waits_for_active_checkpoint(self):
+        async def exercise() -> None:
+            dp = MultiPartitionFakeDataPlaneClient()
+            checkpoint_barrier = DataPlaneCheckpointBarrier()
+            buf = TQReplayBuffer(
+                dp,
+                partition_id="rollout_data",
+                pad_value_dict={"token_ids": 0},
+                staging_partition_id="rollout_staging",
+            )
+            buf.set_data_plane_checkpoint_barrier(checkpoint_barrier)
+            group_id = buf.reserve(weight_version=2, rollout_ids=["r0"])
+            meta = KVBatchMeta(
+                partition_id="rollout_data",
+                task_name="train",
+                sample_ids=[f"{group_id}_g0"],
+                fields=["input_ids"],
+                sequence_lengths=[1],
+                tags=[{"weight_version": 2}],
+            )
+
+            async with checkpoint_barrier.checkpoint():
+                commit_task = asyncio.create_task(
+                    buf.commit_finalized(
+                        group_id,
+                        meta,
+                        {"input_ids": torch.ones((1, 1), dtype=torch.long)},
+                        group_min_wv=2,
+                        group_max_wv=2,
+                        staging_keys=["r0/c1"],
+                    )
+                )
+                await asyncio.sleep(0)
+                assert dp.rows_by_partition.get("rollout_data") is None
+                assert buf.ready_list == [False]
+
+            await commit_task
+            assert set(dp.rows_by_partition["rollout_data"]) == set(meta.sample_ids)
+            assert buf.ready_list == [True]
+
+        asyncio.run(exercise())
 
     def test_commit_finalized_raises_for_evicted_slot(self):
         buf = self._make_capture_buffer(MultiPartitionFakeDataPlaneClient())
@@ -959,7 +1008,9 @@ class TestTQReplayBufferTokenCaptureMode:
             partition_id="rollout_data", task_name=None, sample_ids=[], fields=None
         )
         with pytest.raises(ValueError, match="no live slot"):
-            _run(buf.commit_finalized("ghost", meta, group_min_wv=0, group_max_wv=0))
+            _run(
+                buf.commit_finalized("ghost", meta, {}, group_min_wv=0, group_max_wv=0)
+            )
 
     def test_abort_drops_unready_slot_only(self):
         dp = MultiPartitionFakeDataPlaneClient()
@@ -981,6 +1032,20 @@ class TestTQReplayBufferTokenCaptureMode:
         assert buf.abort("ghost") is False
         assert buf.size() == 1
 
+    def test_abort_finalized_clears_staging_under_barrier(self):
+        dp = MultiPartitionFakeDataPlaneClient()
+        buf = self._make_capture_buffer(dp)
+        group_id = buf.reserve(weight_version=1, rollout_ids=["r0"])
+        dp.rows_by_partition["rollout_staging"] = {"r0/c1": {}}
+
+        assert _run(buf.abort_finalized(group_id, staging_keys=["r0/c1"]))
+        assert buf.size() == 0
+        assert dp.rows_by_partition["rollout_staging"] == {}
+        assert (
+            "rollout_staging",
+            ["r0/c1"],
+        ) in dp.clear_calls_by_partition
+
     def test_remove_clears_staging_rows_alongside_canonical(self):
         dp = MultiPartitionFakeDataPlaneClient()
         buf = self._make_capture_buffer(dp)
@@ -995,6 +1060,7 @@ class TestTQReplayBufferTokenCaptureMode:
             buf.commit_finalized(
                 group_id,
                 meta,
+                {},
                 group_min_wv=1,
                 group_max_wv=1,
                 staging_keys=["r0/c1", "r0/c2"],
@@ -1010,6 +1076,7 @@ class TestTQReplayBufferTokenCaptureMode:
         buf = TQReplayBuffer(
             dp, partition_id="rollout_data", pad_value_dict={"token_ids": 0}
         )
+        buf.set_data_plane_checkpoint_barrier(DataPlaneCheckpointBarrier())
         group_id = buf.reserve(weight_version=1)
         meta = KVBatchMeta(
             partition_id="rollout_data",
@@ -1017,7 +1084,7 @@ class TestTQReplayBufferTokenCaptureMode:
             sample_ids=[f"{group_id}_g0"],
             fields=None,
         )
-        _run(buf.commit_finalized(group_id, meta, group_min_wv=1, group_max_wv=1))
+        _run(buf.commit_finalized(group_id, meta, {}, group_min_wv=1, group_max_wv=1))
         _run(buf.remove([0], remove_in_dp=True))
         partitions_cleared = {p for p, _ in dp.clear_calls_by_partition}
         assert partitions_cleared == {"rollout_data"}

@@ -16,10 +16,10 @@
 
 Drives the S1 golden call sequences end to end: stage the fixture's delta
 rows via TQTokenSink, hand the fixture receipt to the finalizer, and require
-the published canonical rows to match the fixture's frozen training row.
+the rebuilt canonical rows to match the fixture's frozen training row.
 Every rejection path (missing rows, digest corruption, poisoned receipts)
-must yield a masked placeholder — always N rows — and the group publisher's
-min/max weight versions and staging cleanup must hold.
+must yield a masked placeholder — always N rows — while preserving group
+min/max weight versions and leaving publication to the replay buffer.
 
 Marked nemo_gym (run with ``--nemo-gym-only``): the finalizer delegates
 rebuild semantics to Gym's staging package.
@@ -183,7 +183,7 @@ def _fetch_rows(tq_client, sample_ids):
     )
 
 
-def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions):
+def test_finalize_group_builds_n_rows_with_placeholder(tq_client, partitions):
     group_id = "grp1"
     receipt, expected = _stage_fixture(
         tq_client, "worked_example", rollout_id=f"{group_id}_g0"
@@ -201,12 +201,13 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     )
     assert not finalized.dropped
     assert finalized.meta is not None
+    assert finalized.fields is not None
     assert finalized.meta.sample_ids == rollout_ids
     # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
     assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5
 
-    rows = _fetch_rows(tq_client, rollout_ids)
+    rows = finalized.fields
     sample_mask = torch.as_tensor(rows["sample_mask"]).flatten()
     assert sample_mask.tolist() == [1.0, 0.0]
     valid_len = len(expected.token_ids)
@@ -223,9 +224,11 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     rewards = torch.as_tensor(rows["total_reward"]).flatten()
     assert rewards.tolist() == [1.0, 0.0]
 
-    # The finalizer cleared its staged rows after publishing.
-    with pytest.raises(KeyError):
-        finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
+    # Publication and cleanup are owned by the checkpoint-aware replay buffer.
+    assert finalized.staging_keys == [receipt["manifest"][0]["staging_key"]]
+    assert finalizer._source.fetch(finalized.staging_keys)
+    with pytest.raises((KeyError, RuntimeError, ValueError)):
+        _fetch_rows(tq_client, rollout_ids)
 
 
 def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):
@@ -241,6 +244,7 @@ def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):
     )
     assert finalized.dropped
     assert finalized.meta is None
+    assert finalized.fields is None
     assert (finalized.group_min_wv, finalized.group_max_wv) == (3, 3)
     with pytest.raises((KeyError, RuntimeError, ValueError)):
         rows = _fetch_rows(tq_client, rollout_ids)
@@ -248,7 +252,7 @@ def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):
 
 
 # ---------------------------------------------------------------------------
-# Router replay (R3): routed_experts rebuilt from staged extras and published
+# Router replay (R3): routed_experts rebuilt from staged extras
 # ---------------------------------------------------------------------------
 
 _R3_PARTITION = "rollout_data_fin_r3_test"
@@ -321,7 +325,7 @@ def _gym_linearize_supports_routes() -> bool:
     not _gym_linearize_supports_routes(),
     reason="Gym pin predates LinearizedRow.routed_experts (Gym PR #2278 R3 follow-up)",
 )
-def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
+def test_finalize_group_builds_routed_experts(tq_client, r3_partitions):
     group_id = "grpr3"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
     receipt, expected, routes_by_call = _stage_fixture_with_routes(
@@ -345,15 +349,13 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
         fallback_weight_version=9,
     )
     assert not finalized.dropped
+    assert finalized.meta is not None
+    assert finalized.fields is not None
     assert "routed_experts" in finalized.meta.fields
     assert finalized.metrics["finalize/routed_experts_row_coverage"] == 1.0
     assert finalized.metrics["finalize/routed_experts_sentinel_token_fraction"] == 0.0
 
-    rows = tq_client.get_samples(
-        sample_ids=rollout_ids,
-        partition_id=_R3_PARTITION,
-        select_fields=["routed_experts", "input_lengths"],
-    )
+    rows = finalized.fields
     # Valid row: the delivered chain's staged extras, concatenated in chain
     # order (the golden fixture is a single linear chain).
     expected_routes = [
