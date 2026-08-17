@@ -111,7 +111,9 @@ def test_matching_version_is_forwarded_with_timeout():
     raw.update_weights.return_value = {"step": 9}
 
     assert wrapper.update_weights(9) == {"step": 9}
-    rendezvous.discover_trainers.assert_called_once_with(16, timeout=77.0)
+    rendezvous.discover_trainers.assert_called_once_with(
+        16, timeout=77.0, with_tensors=False
+    )
     raw.update_weights.assert_called_once_with(9, timeout=77.0)
 
 
@@ -166,3 +168,55 @@ def test_shutdown_releases_manager_and_both_clients():
     manager.shutdown.assert_called_once()
     receiver_client.close.assert_called_once()
     client.close.assert_called_once()
+
+
+def test_quorum_skips_shard_tables_it_does_not_need():
+    """The version check needs one integer per rank, not the geometry. MX keeps the
+    geometry from its own one-time prepare, so fetching it per step rebuilds an
+    identical table every refit."""
+    wrapper, raw, _, _, _, rendezvous, *_ = _build_receiver()
+    rendezvous.discover_trainers.return_value = [
+        SimpleNamespace(publisher_step=2) for _ in range(16)
+    ]
+    raw.update_weights.return_value = {"step": 2}
+
+    wrapper.update_weights(2)
+
+    rendezvous.discover_trainers.assert_called_once_with(
+        16, timeout=77.0, with_tensors=False
+    )
+
+
+def test_quorum_falls_back_when_mx_predates_the_flag(capsys):
+    """The two changes need not land in lockstep, so an MX without the flag must
+    still work rather than fail every refit with a TypeError."""
+    wrapper, raw, _, _, _, rendezvous, *_ = _build_receiver()
+    payloads = [SimpleNamespace(publisher_step=5, tensors=(1, 2)) for _ in range(16)]
+
+    def only_old_signature(count, timeout=None, with_tensors=None):
+        if with_tensors is not None:
+            raise TypeError("unexpected keyword argument 'with_tensors'")
+        return payloads
+
+    rendezvous.discover_trainers.side_effect = only_old_signature
+    raw.update_weights.return_value = {"step": 5}
+
+    assert wrapper.update_weights(5) == {"step": 5}
+    record = json.loads(capsys.readouterr().out.split("MX_RECV_PHASE ", 1)[1])
+    assert record["tensors_seen"] == 32
+
+
+def test_recorded_entry_count_is_preferred_over_the_built_table(capsys):
+    """On the quorum path the table is deliberately absent, so the count has to
+    come from the payload's own tally or the metric silently reads zero."""
+    wrapper, raw, _, _, _, rendezvous, *_ = _build_receiver()
+    rendezvous.discover_trainers.return_value = [
+        SimpleNamespace(publisher_step=6, tensors=[], entry_count=lambda: 4922)
+        for _ in range(16)
+    ]
+    raw.update_weights.return_value = {"step": 6}
+
+    wrapper.update_weights(6)
+
+    record = json.loads(capsys.readouterr().out.split("MX_RECV_PHASE ", 1)[1])
+    assert record["tensors_seen"] == 16 * 4922

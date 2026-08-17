@@ -87,10 +87,7 @@ class MxVllmReshardReceiver:
         # trainer rank, and each response carries that rank's whole shard table,
         # so it scales with sources rather than with bytes moved.
         discover_t0 = time.perf_counter()
-        payloads = self._rendezvous.discover_trainers(
-            self._num_trainer_sources,
-            timeout=self._timeout,
-        )
+        payloads = self._discover_for_quorum()
         discover_s = time.perf_counter() - discover_t0
         observed = [payload.publisher_step for payload in payloads]
         if len(observed) != self._num_trainer_sources or any(
@@ -106,6 +103,30 @@ class MxVllmReshardReceiver:
         self._report_phases(version, discover_s, install_s, payloads)
         return result
 
+    def _discover_for_quorum(self) -> list:
+        """Discover trainer ranks for the version check only.
+
+        This check needs one integer per rank. It does not read shard geometry --
+        MX's own receiver discovers that once in ``_prepare`` and keeps it -- so
+        asking for the shard tables here rebuilds, every step, a table that is
+        identical every step. On Qwen3-30B-A3B that is 78,760 entries across 16
+        ranks, and skipping the rebuild removes ~0.8 s of a ~5.2 s check.
+
+        Falls back to the full fetch against an MX that predates the flag, so this
+        does not have to land in lockstep with the client change.
+        """
+        try:
+            return self._rendezvous.discover_trainers(
+                self._num_trainer_sources,
+                timeout=self._timeout,
+                with_tensors=False,
+            )
+        except TypeError:
+            return self._rendezvous.discover_trainers(
+                self._num_trainer_sources,
+                timeout=self._timeout,
+            )
+
     def _report_phases(
         self,
         version: int,
@@ -120,8 +141,17 @@ class MxVllmReshardReceiver:
         AttributeError on any payload shape that lacked it, which would abort a
         refit that had already succeeded.
         """
+        def entries(payload) -> int:
+            # Prefer the recorded count: the quorum path deliberately does not
+            # build the shard tables, so len(payload.tensors) would read 0 and
+            # hide the figure that showed this cost tracks source count.
+            counter = getattr(payload, "entry_count", None)
+            if callable(counter):
+                return int(counter())
+            return len(getattr(payload, "tensors", ()) or ())
+
         try:
-            tensors_seen = sum(len(getattr(p, "tensors", ()) or ()) for p in payloads)
+            tensors_seen = sum(entries(p) for p in payloads)
         except TypeError:
             tensors_seen = -1
         try:
