@@ -48,6 +48,39 @@ def test_run_grpo_dispatches_both_trainers():
     assert _select_trainer(cfg_sync) is grpo_train_sync
 
 
+def test_sync_trainer_is_call_compatible_with_legacy_trainer():
+    """Both trainers must accept the same call, because the VLM launcher
+    picks one at runtime and passes a single fixed kwarg set.
+
+    Caught a real break: ``run_vlm_grpo`` passes ``processor=`` (VLM-only),
+    which ``grpo_train_sync`` did not accept — so every
+    ``data_plane.enabled=true`` VLM run died with ``TypeError:
+    grpo_train_sync() got an unexpected keyword argument 'processor'``
+    after full model load. A signature check is cheap; the e2e that
+    surfaces it costs two nodes and ~12 minutes of setup.
+    """
+    import inspect
+
+    from nemo_rl.algorithms.grpo import grpo_train
+    from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+
+    legacy = inspect.signature(grpo_train).parameters
+    sync = inspect.signature(grpo_train_sync).parameters
+
+    missing = [
+        name
+        for name, p in legacy.items()
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        and name not in sync
+    ]
+    assert not missing, (
+        f"grpo_train_sync is missing parameters the launchers pass to "
+        f"grpo_train: {missing}. Add them (even if only for parity) or the "
+        f"data_plane dispatch breaks at runtime."
+    )
+
+
 def test_sync_trainer_rejects_message_level_advantage_penalties():
     from nemo_rl.algorithms.grpo import GRPOConfig, MasterConfig
     from nemo_rl.algorithms.grpo_sync import (

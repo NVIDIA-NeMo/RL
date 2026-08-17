@@ -37,6 +37,8 @@ import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
+    from transformers import AutoProcessor
+
     from nemo_rl.models.policy.tq_policy import TQPolicy
 
 import numpy as np
@@ -392,6 +394,13 @@ def grpo_train_sync(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    # Unused here, and present only so the shared VLM launcher can pass one
+    # fixed kwarg set to whichever trainer ``_select_trainer`` returns.
+    # ``grpo_train``'s sole use of it is
+    # ``attach_initial_nemo_gym_image_payloads``, gated on
+    # ``grpo.deduplicate_multimodal_data`` — which ``setup()`` already rejects
+    # for ``data_plane.enabled=true`` via ``_validate_multimodal_dedup_capability``.
+    processor: Optional["AutoProcessor"] = None,
 ) -> None:
     """Run GRPO training algorithm — TransferQueue-mediated.
 
@@ -429,7 +438,7 @@ def grpo_train_sync(
     # vLLM CUDA-graph / KV-cache state and yields a step-1
     # token_mult_prob_error spike that converges by step 3.
     POLICY_GENERATION_STALE = _initial_policy_generation_stale(
-        policy_generation, grpo_save_state["current_step"]
+        policy_generation, grpo_save_state.total_steps
     )
     assert policy_generation is not None
 
