@@ -320,3 +320,38 @@ class TestWrongPathFaultToleranceIsRejected:
         del cfg.env
         assert not hasattr(cfg, "env")
         validate_single_controller_config(cfg)
+
+
+class TestPolicyRouterPortAndTimeoutValidation:
+    def test_a_transposed_port_range_is_rejected(self):
+        """Otherwise it surfaces as 'empty range for randrange()' far from the typo."""
+        with pytest.raises(ValidationError, match="port_range_low"):
+            PolicyRouterConfig(port_range_low=6099, port_range_high=6000)
+
+    def test_an_equal_port_range_is_rejected(self):
+        with pytest.raises(ValidationError, match="port_range_low"):
+            PolicyRouterConfig(port_range_low=6000, port_range_high=6000)
+
+    def test_the_connect_timeout_defaults_well_below_the_backend_timeout(self):
+        """A handshake to a local vLLM is ms-or-never; the generation is minutes."""
+        cfg = PolicyRouterConfig()
+        assert cfg.connect_timeout_s == 5.0
+        assert cfg.connect_timeout_s < cfg.backend_timeout_s
+
+    def test_a_connect_timeout_beyond_the_total_is_rejected(self):
+        with pytest.raises(ValidationError, match="connect_timeout_s"):
+            PolicyRouterConfig(connect_timeout_s=100.0, backend_timeout_s=10.0)
+
+
+class TestFleetHealthSelectionIsNotAdvertisedBeyondWhatItDoes:
+    def test_an_unimplemented_selection_mode_is_rejected(self):
+        """Nothing dispatches on this value, so accepting round_robin would silently
+        hand the caller least_outstanding anyway -- the failure mode on_dead_shard's
+        Literal already exists to prevent."""
+        with pytest.raises(ValidationError):
+            FleetHealthConfig(selection="round_robin")
+
+    def test_the_implemented_mode_is_accepted(self):
+        assert FleetHealthConfig(selection="least_outstanding").selection == (
+            "least_outstanding"
+        )

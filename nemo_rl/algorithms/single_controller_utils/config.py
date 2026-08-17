@@ -172,8 +172,10 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # shard from re-entering rotation on one lucky probe.
     healthy_threshold: PositiveInt = 2
     # How a shard is chosen. least_outstanding steers away from a slow or wedged shard
-    # without needing that diagnosed first.
-    selection: Literal["least_outstanding", "round_robin"] = "least_outstanding"
+    # without needing that diagnosed first. A Literal of one, like on_dead_shard below:
+    # nothing dispatches on this value, so accepting "round_robin" would silently give
+    # the caller least_outstanding anyway.
+    selection: Literal["least_outstanding"] = "least_outstanding"
     # What to do once a shard is quarantined. Recovery modes arrive with the
     # communicator rebuild.
     on_dead_shard: Literal["fail_fast"] = "fail_fast"
@@ -215,10 +217,36 @@ class PolicyRouterConfig(BaseModel, extra="allow"):
     # URL Gym holds never changes.
     port_range_low: PositiveInt = 6000
     port_range_high: PositiveInt = 6099
-    # Router -> backend deadline. This is the timeout Gym's own client never sets.
+    # Router -> backend deadline, covering the whole generation. This is the timeout
+    # Gym's own client never sets.
     backend_timeout_s: PositiveFloat = 600.0
+    # TCP handshake deadline, separate from the generation deadline above. A connect to
+    # a local vLLM either completes in milliseconds or never will, so giving it the full
+    # backend budget only means a black-holed SYN parks the rollout for that long.
+    connect_timeout_s: PositiveFloat = 5.0
     # Status returned when no shard is eligible.
     no_healthy_backend_status: PositiveInt = 409
+
+    @model_validator(mode="after")
+    def _check_port_range(self) -> "PolicyRouterConfig":
+        if self.port_range_low >= self.port_range_high:
+            raise ValueError(
+                f"async_rl.policy_router.port_range_low ({self.port_range_low}) must be "
+                f"< port_range_high ({self.port_range_high}). Transposed, this surfaces "
+                "at setup as 'ValueError: empty range for randrange()' from deep inside "
+                "port allocation, far from the typo."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_connect_timeout_fits(self) -> "PolicyRouterConfig":
+        if self.connect_timeout_s > self.backend_timeout_s:
+            raise ValueError(
+                f"async_rl.policy_router.connect_timeout_s ({self.connect_timeout_s}) "
+                f"exceeds backend_timeout_s ({self.backend_timeout_s}), so the total "
+                "deadline would expire before the handshake one could ever fire."
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_status_is_not_retried_by_gym(self) -> "PolicyRouterConfig":
