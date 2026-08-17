@@ -1335,10 +1335,10 @@ class DTensorPolicyWorkerImpl(
         if need_top_k_or_top_p_filtering(self.sampling_params):
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
             # The narrowed mask cannot travel with prev_logprobs today:
-            # LogprobOutputSpec carries logprobs only. The curr side folds its
-            # own narrowing into token_mask, which covers the reduction; a
-            # prev-side -inf at a position the curr side kept is left for a
-            # follow-up that widens the spec.
+            # LogprobOutputSpec carries logprobs only. The curr side publishes its
+            # narrowing as curr_logprobs_keep_mask, which covers the actor reduction; a
+            # prev-side -inf at a position the curr side kept is left for a follow-up
+            # that widens the spec.
             token_logprobs, _ = mask_out_neg_inf_logprobs(
                 token_logprobs, mask, "prev_logprobs"
             )
