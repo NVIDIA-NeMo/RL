@@ -9,9 +9,8 @@ that is unrelated to the policy update.
 
 Router Replay is disabled by default. It is not needed for dense models. In
 the current NeMo RL integration, Router Replay is wired and tested for
-Megatron MoE policy training with vLLM rollout generation. Other
-inference/generation backends are not wired into this path and have not been
-tested with Router Replay.
+Megatron MoE policy training with vLLM or colocated Megatron rollout
+generation.
 
 ## Configuration
 
@@ -39,6 +38,10 @@ The native async TransferQueue path uses the SingleController entrypoint with:
 ```text
 examples/configs/recipes/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml
 ```
+
+With `policy.generation.backend: megatron`, NeMo RL enables
+`moe_enable_routing_replay`, sets `moe_router_fusion=False`, and packs each
+sample's `routing_indices` into `routed_experts` for train/logprob replay.
 
 ## Validation
 
@@ -121,6 +124,9 @@ When fallback is used, the vLLM worker emits a `R3 router replay fallback:` warn
 to the run log naming the affected sample count and missing token-route count.
 Fallback should normally be absent or rare; frequent warnings mean a meaningful
 share of token routes used Megatron's normal router instead of replay.
+
+On the colocated Megatron inference path, missing `routing_indices` fails at
+pack time instead of using this sentinel fallback.
 
 The generation backend also computes
 `r3/routed_experts_fallback_token_route_fraction`, but no training loop currently
