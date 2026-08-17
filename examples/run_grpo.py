@@ -108,7 +108,9 @@ def main() -> None:
         )
 
     with rl_init_timer.time("ray_connect"):
-        init_ray()
+        # data_plane_cfg: backend engine knobs must reach every worker via the
+        # runtime_env snapshot init_ray takes; see init_ray's docstring.
+        init_ray(data_plane_cfg=config.data_plane)
 
     # setup tokenizer
     with rl_init_timer.time("tokenizer"):
