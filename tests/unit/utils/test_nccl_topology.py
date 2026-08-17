@@ -16,7 +16,6 @@ import json
 import os
 import subprocess
 import sys
-
 from pathlib import Path
 
 from nemo_rl.utils.nccl_topology import (
