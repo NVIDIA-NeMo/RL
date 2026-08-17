@@ -102,36 +102,6 @@ def test_transport_config_is_rdma_and_carries_all_rails(fake_fabric):
     assert cfg["device_name"] == tq_adapter.rdma_devices()
 
 
-def test_gid_index_left_unset_for_infiniband(fake_fabric, monkeypatch):
-    """GID 3 is a RoCEv2 convention; IB numbers GIDs differently, so the
-    pin must not be applied when IB is selected."""
-    monkeypatch.delenv("MC_GID_INDEX", raising=False)
-    fake_fabric(_MIXED)
-    tq_adapter._pin_roce_gid_index()
-    assert "MC_GID_INDEX" not in os.environ
-
-
-def test_gid_index_pinned_for_roce(fake_fabric, monkeypatch):
-    monkeypatch.delenv("MC_GID_INDEX", raising=False)
-    fake_fabric({"mlx5_3": "Ethernet"})
-    tq_adapter._pin_roce_gid_index()
-    assert os.environ["MC_GID_INDEX"] == "3"
-
-
-def test_gid_index_pinned_in_every_process_not_just_the_driver(
-    fake_fabric, stub_client, monkeypatch
-):
-    """The regression this guards: the pin used to live in
-    _mooncake_transport_config, which _init_tq calls on the driver alone. A Ray
-    worker builds its own mooncake engine and never saw it, so the two sides
-    could disagree on GID index — which no RoCE QP survives."""
-    monkeypatch.delenv("MC_GID_INDEX", raising=False)
-    fake_fabric({"mlx5_0": "Ethernet", "mlx5_1": "Ethernet"})
-    # bootstrap=False is the worker path: no _init_tq, so no transport config.
-    stub_client(_mooncake_cfg())
-    assert os.environ["MC_GID_INDEX"] == "3"
-
-
 def test_raises_when_no_device_since_mooncake_is_rdma_only(fake_fabric):
     fake_fabric(_MIXED, uverbs=False)
     with pytest.raises(RuntimeError, match="requires RDMA"):
@@ -169,8 +139,9 @@ def stub_client(monkeypatch):
     return _build
 
 
-def test_peer_rail_is_pinned_to_the_local_rail(stub_client):
+def test_peer_rail_is_pinned_to_the_local_rail(stub_client, monkeypatch):
     """Same-rail pairing keeps every rail in use instead of narrowing to one."""
+    monkeypatch.delenv("MC_ENABLE_DEST_DEVICE_AFFINITY", raising=False)
     stub_client(_mooncake_cfg())
     assert os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
 
@@ -182,7 +153,12 @@ def test_peer_rail_pairing_is_overridable(stub_client, monkeypatch):
     assert os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "0"
 
 
-def test_peer_rail_pairing_not_applied_to_simple_backend(stub_client):
-    """The knob is mooncake-only; `simple` never touches RDMA."""
+def test_peer_rail_pairing_not_applied_to_simple_backend(stub_client, monkeypatch):
+    """The knob is mooncake-only; `simple` never touches RDMA.
+
+    delenv first: the assertion is that *we* do not set it, not that the machine
+    running the tests happens to have it unset.
+    """
+    monkeypatch.delenv("MC_ENABLE_DEST_DEVICE_AFFINITY", raising=False)
     stub_client({**_mooncake_cfg(), "backend": "simple"})
     assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ

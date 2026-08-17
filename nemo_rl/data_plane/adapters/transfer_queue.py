@@ -141,23 +141,51 @@ def _mooncake_transport_config() -> dict:
     return {"protocol": "rdma", "device_name": devices}
 
 
-def _pin_roce_gid_index() -> None:
-    """Pin ``MC_GID_INDEX=3`` when the selected rails are RoCE.
+def maybe_configure_engine_env(cfg: DataPlaneConfig) -> None:
+    """Set the mooncake knobs that must be identical in every process.
 
-    GID index 3 is a RoCEv2 convention. InfiniBand numbers GIDs differently, so
-    leave it unset there and let mooncake's own ``findBestGidIndex`` choose.
+    No-op unless the backend is ``mooncake_cpu``; ``simple`` has no engine.
 
-    This has to run in every process that builds a mooncake engine, not only the
-    driver. ``_mooncake_transport_config`` returns ``device_name``, which the TQ
-    config carries to every client, but a GID pin is process env — a Ray worker
-    never sees the driver's. ``findBestGidIndex`` was measured to pick 3 unaided
-    on the RoCE fabrics tested, so this only matters on one where it does not;
-    the two sides disagreeing on GID index is not a survivable mismatch.
+    Call this on the driver **before** ``init_ray()``. Mooncake reads these once,
+    when its engine comes up, so they have to be in place before any process
+    creates one — and they must agree across processes, because the two ends of a
+    transfer each pick a rail and a pair that disagrees is not a slow path, it is
+    an unroutable one wherever each rail is its own subnet.
+
+    Uniformity comes from Ray: ``init_ray`` snapshots ``dict(os.environ)`` into
+    ``runtime_env["env_vars"]`` and passes it to every worker (see
+    ``nemo_rl/distributed/virtual_cluster.py``). Setting these from
+    ``TQDataPlaneClient.__init__`` instead is too late for that snapshot — it runs
+    well after ``ray.init()`` — and it cannot reach the engines TransferQueue
+    creates lazily from its own API (``_maybe_create_tq_client``, called by
+    ``get_data``/``put``/…), which never go through this adapter at all.
+
+    ``setdefault`` throughout, so an operator can still override any of them from
+    the launch environment; because this runs once on the driver before the
+    snapshot, an override stays uniform too.
+
+    ``MC_TCP_BIND_ADDRESS`` is deliberately *not* set here — it must differ per
+    node, and is force-assigned per process in ``TQDataPlaneClient.__init__``.
+
+    ``MC_GID_INDEX`` is deliberately *not* set either. Mooncake documents it as an
+    escape hatch for when GID auto-detection fails ("set if GID is all zeros"),
+    and says the right value is "1, or 2, 3 depending on network" — so a
+    hardcoded index is a per-fabric assumption. Its ``findBestGidIndex`` walks the
+    port's GID table and was measured to select the same RoCEv2 entry unaided
+    (identical throughput pinned vs auto), and being per-device it cannot
+    disagree between processes. Pinning the wrong index would break every rail at
+    once, which is worse than what this function is here to prevent.
     """
-    devices = rdma_devices()
-    # rdma_devices() never mixes fabrics, so the first entry classifies them all.
-    if devices and _link_layer(devices.split(",")[0]) == "Ethernet":
-        os.environ.setdefault("MC_GID_INDEX", "3")
+    if cfg["backend"] != "mooncake_cpu":
+        return
+    # See TQDataPlaneClient.__init__ for why the LOCAL_MEMCPY fast path is off.
+    os.environ.setdefault("MC_STORE_MEMCPY", "0")
+    # Pin each transfer's peer rail to the local one by name. Mooncake otherwise
+    # picks the peer independently (Topology::selectDevice), and where each rail
+    # is its own subnet a cross-rail pair has no route. Mooncake recommends this
+    # for rail-optimized topologies generally, and its own deployment example
+    # sets it as a pod-level variable, i.e. uniformly, for the same reason.
+    os.environ.setdefault("MC_ENABLE_DEST_DEVICE_AFFINITY", "1")
 
 
 # Per-slot ceiling for the staging pool: bounds resident pinned memory at
@@ -640,7 +668,7 @@ class TQDataPlaneClient(DataPlaneClient):
         """
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
-        # env vars and they can't be changed. Four per-process knobs
+        # env vars and they can't be changed. Three per-process knobs
         # needed in EVERY process that builds a TQ client (driver,
         # SyncRolloutActor, every MegatronPolicyWorker rank):
         #   1. MC_TCP_BIND_ADDRESS — Mooncake engine.so writes this into
@@ -653,10 +681,7 @@ class TQDataPlaneClient(DataPlaneClient):
         #      root cause but isn't in any published wheel yet
         #      (mooncake-transfer-engine 0.3.10.post2 was bumped before
         #      that merge). Drop this once the wheel includes the fix.
-        #   3. MC_GID_INDEX — RoCEv2 GID pin; see _pin_roce_gid_index. It
-        #      was previously set by _mooncake_transport_config, which runs
-        #      on the driver only, so no worker ever saw it.
-        #   4. KV-path 1D promotion — works around TQ's
+        #   3. KV-path 1D promotion — works around TQ's
         #      extract_field_schema schema/data mismatch for 1D fields.
         if cfg["backend"] == "mooncake_cpu":
             local_ip = _get_local_node_ip()
@@ -666,16 +691,11 @@ class TQDataPlaneClient(DataPlaneClient):
                 # be a no-op and the actor would announce the driver's
                 # IP — peers fail with "connection refused".
                 os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
-            os.environ.setdefault("MC_STORE_MEMCPY", "0")
-            _pin_roce_gid_index()
-            # Pin each transfer's peer rail to the local one by name.
-            # Mooncake otherwise picks the peer rail at random
-            # (Topology::selectDevice), and where each rail is its own subnet
-            # — the RoCE-only gb200 CI runners — a cross-rail pair has no
-            # route. Mooncake recommends this for rail-optimized topologies
-            # generally, so it is not conditioned on RoCE. setdefault: a
-            # fully-routable fabric can set 0 to regain cross-rail failover.
-            os.environ.setdefault("MC_ENABLE_DEST_DEVICE_AFFINITY", "1")
+            # Normally a no-op: the launcher already set these before
+            # init_ray(), so Ray's env snapshot carried them here. Repeated for
+            # processes that never saw that snapshot — a client built outside
+            # the launcher path, or a unit test.
+            maybe_configure_engine_env(cfg)
             # Both must run before the first get, in every process with a TQ
             # client. The registration check is unconditional: it also covers
             # the two bytes workers the staging patch leaves untouched, which
