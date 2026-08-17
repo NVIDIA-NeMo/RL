@@ -13,15 +13,14 @@
 # limitations under the License.
 
 import argparse
-from dataclasses import asdict
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import re
 import shlex
-from typing import Literal, Mapping
 
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Literal, Mapping
 
 _DEVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 _INTEGER_FIELD_PATTERN = re.compile(r"^-?[0-9]+$")
@@ -49,6 +48,13 @@ class _HcaEntry:
     @property
     def selection_key(self) -> str:
         return f"{self.name}:{self.port}" if self.port is not None else self.name
+
+    @property
+    def topology_key(self) -> str:
+        port = "" if self.port is None else str(self.port)
+        rail = -1 if self.rail is None else self.rail
+        plane = -1 if self.plane is None else self.plane
+        return f"{self.name}:{port}:{rail}:{plane}"
 
 
 @dataclass(frozen=True)
@@ -258,8 +264,12 @@ def diagnose_topology(
         raise ValueError("An expected or UCX HCA list is required for comparison")
 
     candidate = _parse_device_list(candidate_text)
-    current_set = {entry.selection_key for entry in current}
-    candidate_set = {entry.selection_key for entry in candidate}
+    if candidate_source == "expected":
+        current_set = {entry.topology_key for entry in current}
+        candidate_set = {entry.topology_key for entry in candidate}
+    else:
+        current_set = {entry.selection_key for entry in current}
+        candidate_set = {entry.selection_key for entry in candidate}
     nccl_only = tuple(sorted(current_set - candidate_set))
     candidate_only = tuple(sorted(candidate_set - current_set))
 
@@ -323,12 +333,25 @@ def diagnose_topology(
                     "device sets were not compared",
                 ),
             )
+        mismatch_warnings: tuple[str, ...] = ()
+        if nccl_only or candidate_only:
+            source_description = (
+                "trusted expected HCA list"
+                if candidate_source == "expected"
+                else "UCX HCA list"
+            )
+            mismatch_warnings = (f"NCCL_IB_HCA differs from the {source_description}",)
+        current_warnings = (
+            _device_validation_errors(current, inventory) if current_is_exact else ()
+        )
+        warnings = current_warnings + mismatch_warnings
         return TopologyDiagnostic(
-            status="warning" if nccl_only or candidate_only else "ok",
+            status="warning" if warnings else "ok",
             replacement=None,
             nccl_only=nccl_only,
             candidate_only=candidate_only,
             candidate_source=candidate_source,
+            warnings=warnings,
         )
     if effective_action != "repair" or (
         candidate_source == "ucx" and repair_source != "ucx"

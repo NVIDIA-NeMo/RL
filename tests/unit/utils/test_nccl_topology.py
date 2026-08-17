@@ -14,9 +14,10 @@
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+
+from pathlib import Path
 
 from nemo_rl.utils.nccl_topology import (
     RdmaDevice,
@@ -67,6 +68,8 @@ def test_warn_reports_mismatch_without_replacing_nccl_selection() -> None:
     assert result.replacement is None
     assert result.nccl_only == ("service0:1",)
     assert result.candidate_only == ("data1:1",)
+    assert result.warnings
+    assert "NCCL_IB_HCA differs" in result.warnings[0]
 
 
 def test_repair_refuses_inactive_candidate_port() -> None:
@@ -151,6 +154,25 @@ def test_auto_repairs_when_cluster_provides_expected_hcas() -> None:
     assert result.replacement == "=data0:1,data1:1"
 
 
+def test_auto_repairs_trusted_expected_rail_and_plane_mapping() -> None:
+    inventory = {
+        "data0": RdmaDevice(name="data0", ports=(1,), active_ports=(1,)),
+        "data1": RdmaDevice(name="data1", ports=(1,), active_ports=(1,)),
+    }
+
+    result = diagnose_topology(
+        action="auto",
+        nccl_ib_hca="=data0:1:0:1,data1:1:0:0",
+        ucx_net_devices=None,
+        expected_hcas="=data0:1:0:0,data1:1:0:1",
+        repair_source=None,
+        inventory=inventory,
+    )
+
+    assert result.status == "repaired"
+    assert result.replacement == "=data0:1:0:0,data1:1:0:1"
+
+
 def test_auto_keeps_matching_exact_selection_unchanged() -> None:
     inventory = {
         "data0": RdmaDevice(name="data0", ports=(1,), active_ports=(1,)),
@@ -168,6 +190,34 @@ def test_auto_keeps_matching_exact_selection_unchanged() -> None:
 
     assert result.status == "ok"
     assert result.replacement is None
+
+
+def test_trusted_expected_comparison_normalizes_omitted_topology_fields() -> None:
+    inventory = {
+        "data0": RdmaDevice(name="data0", ports=(1,), active_ports=(1,)),
+    }
+
+    omitted_rail_and_plane = diagnose_topology(
+        action="auto",
+        nccl_ib_hca="=data0:1",
+        ucx_net_devices=None,
+        expected_hcas="=data0:1:-1:-1",
+        repair_source=None,
+        inventory=inventory,
+    )
+    omitted_plane = diagnose_topology(
+        action="auto",
+        nccl_ib_hca="=data0:1:0",
+        ucx_net_devices=None,
+        expected_hcas="=data0:1:0:-1",
+        repair_source=None,
+        inventory=inventory,
+    )
+
+    assert omitted_rail_and_plane.status == "ok"
+    assert omitted_rail_and_plane.replacement is None
+    assert omitted_plane.status == "ok"
+    assert omitted_plane.replacement is None
 
 
 def test_off_skips_without_requiring_network_configuration() -> None:
@@ -231,6 +281,40 @@ def test_auto_warns_when_current_hca_is_missing_and_no_repair_source_exists() ->
     assert result.warnings == ("HCA 'missing0' does not exist",)
 
 
+def test_warn_reports_missing_current_hca_when_ucx_candidate_matches() -> None:
+    result = diagnose_topology(
+        action="warn",
+        nccl_ib_hca="=missing0:1",
+        ucx_net_devices="missing0:1",
+        expected_hcas=None,
+        repair_source=None,
+        inventory={},
+    )
+
+    assert result.status == "warning"
+    assert result.replacement is None
+    assert result.warnings == ("HCA 'missing0' does not exist",)
+
+
+def test_auto_reports_inactive_current_port_when_ucx_candidate_matches() -> None:
+    inventory = {
+        "data0": RdmaDevice(name="data0", ports=(1,), active_ports=()),
+    }
+
+    result = diagnose_topology(
+        action="auto",
+        nccl_ib_hca="=data0:1",
+        ucx_net_devices="data0:1",
+        expected_hcas=None,
+        repair_source=None,
+        inventory=inventory,
+    )
+
+    assert result.status == "warning"
+    assert result.replacement is None
+    assert result.warnings == ("HCA 'data0' port 1 is not active",)
+
+
 def test_strict_rejects_missing_hca_in_current_exact_selection() -> None:
     inventory = {
         "data0": RdmaDevice(name="data0", ports=(1,), active_ports=(1,)),
@@ -262,6 +346,26 @@ def test_strict_rejects_mismatch_with_trusted_expected_hcas() -> None:
         nccl_ib_hca="=data0:1,service0:1",
         ucx_net_devices=None,
         expected_hcas="=data0:1,data1:1",
+        repair_source=None,
+        inventory=inventory,
+    )
+
+    assert result.status == "error"
+    assert result.replacement is None
+    assert result.errors == ("NCCL_IB_HCA differs from the trusted expected HCA list",)
+
+
+def test_strict_rejects_trusted_expected_rail_and_plane_mismatch() -> None:
+    inventory = {
+        "data0": RdmaDevice(name="data0", ports=(1,), active_ports=(1,)),
+        "data1": RdmaDevice(name="data1", ports=(1,), active_ports=(1,)),
+    }
+
+    result = diagnose_topology(
+        action="strict",
+        nccl_ib_hca="=data0:1:0:1,data1:1:0:0",
+        ucx_net_devices=None,
+        expected_hcas="=data0:1:0:0,data1:1:0:1",
         repair_source=None,
         inventory=inventory,
     )
@@ -436,3 +540,48 @@ def test_cli_writes_error_report_for_invalid_expected_hca_selector(
     assert report["status"] == "error"
     assert report["errors"] == ["Invalid HCA device list: '=invalid device:1'"]
     assert env_path.read_text() == ""
+
+
+def test_cli_auto_emits_warning_for_untrusted_ucx_mismatch(tmp_path: Path) -> None:
+    for name in ("data0", "data1", "service0"):
+        port_root = tmp_path / "sys" / "class" / "infiniband" / name / "ports" / "1"
+        port_root.mkdir(parents=True)
+        (port_root / "state").write_text("4: ACTIVE\n")
+    report_path = tmp_path / "report.json"
+    env_path = tmp_path / "repair.env"
+    environment = os.environ.copy()
+    environment.pop("NRL_NCCL_EXPECTED_HCAS", None)
+    environment.pop("NRL_NCCL_HCA_REPAIR_SOURCE", None)
+    environment.update(
+        {
+            "NRL_NCCL_TOPOLOGY_ACTION": "auto",
+            "NCCL_IB_HCA": "=data0:1,service0:1",
+            "UCX_NET_DEVICES": "data0:1,data1:1",
+        }
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "nemo_rl.utils.nccl_topology",
+            "--sysfs-root",
+            str(tmp_path / "sys"),
+            "--node-rank",
+            "4",
+            "--report",
+            str(report_path),
+            "--env-file",
+            str(env_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0
+    assert "[NRL NCCL topology][WARN]" in completed.stdout
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "warning"
+    assert report["warnings"]
