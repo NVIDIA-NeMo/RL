@@ -29,6 +29,8 @@ Guards the silent-drop regression class that motivated the PR.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from nemo_rl.data.multimodal_utils import (
@@ -38,6 +40,7 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
+from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import keys_from_uids, register_train_partition
@@ -200,3 +203,103 @@ def test_vlm_wire_roundtrip_through_noop_data_plane():
     # into the multimodal dict.
     assert "input_ids" not in mm_wrapped
     assert "token_mask" not in mm_wrapped
+
+
+# ── Dispatch field selection (logprob vs train parity) ──────────────────
+
+
+def _stub_tq_policy(monkeypatch, captured: dict[str, KVBatchMeta]):
+    """A ``TQPolicy`` with only the surface the dispatch bodies touch.
+
+    ``shard_meta_for_dp`` is stubbed to record the meta each dispatch
+    builds, so the assertions are on the real field-selection code
+    rather than a reimplementation of it.
+    """
+    from nemo_rl.models.policy import tq_policy as tq_policy_mod
+
+    def fake_shard(meta, **kwargs):
+        captured[meta.task_name] = meta
+        return [meta], None
+
+    monkeypatch.setattr(tq_policy_mod, "shard_meta_for_dp", fake_shard)
+
+    # ``Policy.shutdown`` short-circuits on a policy with no ``worker_group``,
+    # but the dispatch bodies need one, so that escape hatch is unavailable
+    # here. Drop the destructor instead: this object never owned Ray workers
+    # or a TQ client, so running live teardown on it at GC is simply wrong.
+    # Faking ``shutdown``/``dp_client`` would work too, but it would report a
+    # successful shutdown that never happened and would silently absorb any
+    # future change to the real teardown contract.
+    class _StubTQPolicy(tq_policy_mod.TQPolicy):
+        __del__ = None  # type: ignore[assignment]
+
+    pol = object.__new__(_StubTQPolicy)
+    pol.cfg = {}
+    pol._router_replay_enabled = False
+    pol.flops_tracker = None
+    pol.sharding_annotations = SimpleNamespace(get_axis_size=lambda _axis: 1)
+    pol.worker_group = SimpleNamespace(
+        run_all_workers_sharded_data=lambda *a, **k: [],
+        get_all_worker_results=lambda _futures: [
+            {"global_loss": 0.0, "grad_norm": 0.0, "all_mb_metrics": {}}
+        ],
+    )
+    return pol
+
+
+def test_train_dispatch_ships_the_same_multimodal_fields_as_logprob(monkeypatch):
+    """The training forward must see the images the logprob forwards saw.
+
+    ``DP_TRAIN_FIELDS`` is a static text-only schema, so without the
+    per-batch multimodal add-on the GRPO update would run image-blind
+    against prev/ref logprobs that were computed *with* images — a
+    silent objective mismatch, not a crash.
+    """
+    mm_fields = [
+        "pixel_values",
+        PackedTensor.lengths_key("pixel_values"),
+        "image_grid_thw",
+        PackedTensor.lengths_key("image_grid_thw"),
+        "mm_token_type_ids",
+    ]
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="rollout",
+        sample_ids=["a", "b"],
+        fields=["input_ids", "input_lengths", "token_mask", *mm_fields],
+        sequence_lengths=[8, 8],
+    )
+
+    captured: dict[str, KVBatchMeta] = {}
+    pol = _stub_tq_policy(monkeypatch, captured)
+
+    pol.get_logprobs_from_meta(meta)
+    pol.train_from_meta(meta, loss_fn=None, gbs=2, mbs=1)
+
+    lp_fields = set(captured["prev_lp"].fields)
+    train_fields = set(captured["train"].fields)
+    assert set(mm_fields) <= lp_fields
+    assert set(mm_fields) <= train_fields
+    assert lp_fields & set(mm_fields) == train_fields & set(mm_fields)
+
+
+def test_text_only_dispatch_requests_no_multimodal_fields(monkeypatch):
+    """Text-only runs never write the multimodal columns; requesting
+    them would raise at the adapter, so the add-on must stay empty."""
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="rollout",
+        sample_ids=["a", "b"],
+        fields=["input_ids", "input_lengths", "token_mask"],
+        sequence_lengths=[8, 8],
+    )
+
+    captured: dict[str, KVBatchMeta] = {}
+    pol = _stub_tq_policy(monkeypatch, captured)
+
+    pol.get_logprobs_from_meta(meta)
+    pol.train_from_meta(meta, loss_fn=None, gbs=2, mbs=1)
+
+    all_mm = PACKED_MULTIMODAL_FIELDS | PER_TOKEN_MULTIMODAL_FIELDS
+    assert not (set(captured["prev_lp"].fields) & all_mm)
+    assert not (set(captured["train"].fields) & all_mm)

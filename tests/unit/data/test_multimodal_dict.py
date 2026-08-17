@@ -111,6 +111,32 @@ def test_truncate_tensors_with_packed_data():
     assert batch["image_features"].as_tensor().shape == (5, 6, 128, 4, 2, 2)
 
 
+def test_truncate_tensors_skips_wire_form_multimodal():
+    """Dynamic batching narrows dim 1 to the microbatch seqlen. The
+    data-plane wire form of a packed multimodal field is a plain tensor
+    whose dim 1 is patch count, not seqlen — narrowing it would corrupt
+    the images (or raise when patches < seqlen)."""
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(8).reshape(2, 4),
+            # [B, max_patches, feat] — 3 patches, fewer than seqlen=4.
+            "pixel_values": torch.randn(2, 3, 16),
+            PackedTensor.lengths_key("pixel_values"): torch.tensor(
+                [3, 2], dtype=torch.int32
+            ),
+            # Per-token multimodal IS sequence-aligned and must truncate.
+            "mm_token_type_ids": torch.ones((2, 4), dtype=torch.long),
+        }
+    )
+
+    batch.truncate_tensors(dim=1, truncated_len=2)
+
+    assert torch.equal(batch["input_ids"], torch.tensor([[0, 1], [4, 5]]))
+    assert batch["mm_token_type_ids"].shape == (2, 2)
+    assert batch["pixel_values"].shape == (2, 3, 16)
+    assert batch[PackedTensor.lengths_key("pixel_values")].shape == (2,)
+
+
 def test_multiturn_rollout_with_packed_data():
     """Test multiturn conversations with packed multimodal data."""
     message_log_1 = [
