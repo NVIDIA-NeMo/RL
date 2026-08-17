@@ -273,6 +273,11 @@ class VllmGeneration(GenerationInterface):
         # shard selection stays health-blind, which is the historical behaviour.
         self.fleet_monitor: Optional[GenerationFleetHealth] = None
         self.fleet_selector: Optional[HealthyShardSelector] = None
+        # Declared here rather than springing into existence in set_refit_membership.
+        # None means "no shard has been lost", which is the state for the whole life of
+        # any run that never loses one -- so absence is a real value, not a missing one,
+        # and it should not be discovered with getattr at the read site.
+        self._refit_membership: Optional["RefitMembership"] = None
 
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
@@ -638,46 +643,6 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
-    def restart_shard(self, shard_idx: int) -> Optional[str]:
-        """Rebuild one data-parallel shard's workers and bring its engine back up.
-
-        Blocking and slow -- it reloads the model -- so callers run it off the control
-        loop. Only this shard's workers are touched; the rest of the fleet keeps serving
-        throughout.
-
-        Mirrors the startup sequence (`create workers -> load_model -> post_init ->
-        report URL`) rather than inventing a shorter one, because anything the deferred-
-        load path does at startup is equally required for a replacement.
-
-        Returns:
-            The replacement's OpenAI base URL, or None for a sync engine that exposes no
-            HTTP server. **The URL is expected to differ from the old one**: the new
-            engine binds its own port, so callers must publish it rather than assume the
-            fleet's URL list is still accurate.
-        """
-        if not self.worker_group or not self.worker_group.workers:
-            raise RuntimeError("Worker group is not initialized")
-
-        leader_idx = self.worker_group.get_dp_leader_worker_idx(shard_idx)
-        # A shard is model_parallel_size workers; all of them died with the engine.
-        worker_indices = range(leader_idx, leader_idx + self.model_parallel_size)
-        for worker_idx in worker_indices:
-            self.worker_group.recreate_worker(worker_idx)
-
-        leader = self.worker_group.workers[leader_idx]
-        ray.get(leader.load_model.remote())
-        method_name = (
-            "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
-        )
-        ray.get(getattr(leader, method_name).remote())
-
-        if not self.cfg["vllm_cfg"]["async_engine"]:
-            return None
-        url = ray.get(leader.report_dp_openai_server_base_url.remote())
-        if shard_idx < len(self.dp_openai_server_base_urls):
-            self.dp_openai_server_base_urls[shard_idx] = url
-        return url
-
     def set_refit_membership(self, membership: "RefitMembership") -> None:
         """Record which shards take part in refits from now on.
 
@@ -697,19 +662,21 @@ class VllmGeneration(GenerationInterface):
         """
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
-        membership = getattr(self, "_refit_membership", None)
-        shard_indices = (
-            range(self.dp_size) if membership is None else membership.shard_prefixes
-        )
-        # get_dp_leader_worker_idx rather than shard_idx * workers_per_shard: the group
-        # owns the shard-to-worker mapping, and reproducing it by arithmetic here would
-        # be a second source of truth that silently disagrees if the layout ever changes.
-        return [
-            self.worker_group.workers[
-                self.worker_group.get_dp_leader_worker_idx(shard_idx)
-            ]
-            for shard_idx in shard_indices
-        ]
+        workers = self.worker_group.workers
+        membership = self._refit_membership
+        if membership is None:
+            per_shard = len(workers) // self.dp_size
+            return [workers[idx * per_shard] for idx in range(self.dp_size)]
+        leaders = []
+        for shard_idx in membership.shard_prefixes:
+            leader_idx = shard_idx * membership.workers_per_shard
+            if leader_idx >= len(workers):
+                raise RuntimeError(
+                    f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
+                    f"{len(workers)} workers"
+                )
+            leaders.append(workers[leader_idx])
+        return leaders
 
     def rebuild_collective(
         self, membership: "RefitMembership", ip: str, port: int
@@ -736,9 +703,14 @@ class VllmGeneration(GenerationInterface):
         workers = self.worker_group.workers
         futures: list[ray.ObjectRef] = []
         for shard_idx, rank_prefix in membership.shard_prefixes.items():
-            leader = workers[self.worker_group.get_dp_leader_worker_idx(shard_idx)]
+            leader_idx = shard_idx * membership.workers_per_shard
+            if leader_idx >= len(workers):
+                raise RuntimeError(
+                    f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
+                    f"{len(workers)} workers"
+                )
             futures.append(
-                getattr(leader, method_name).remote(
+                getattr(workers[leader_idx], method_name).remote(
                     rank_prefix=rank_prefix,
                     ip=ip,
                     port=port,
@@ -1302,7 +1274,7 @@ class VllmGeneration(GenerationInterface):
         workers = self.worker_group.workers
         futures: list[ray.ObjectRef] = []
         for shard_idx, rank_prefix in membership.shard_prefixes.items():
-            leader = workers[self.worker_group.get_dp_leader_worker_idx(shard_idx)]
+            leader = workers[shard_idx * membership.workers_per_shard]
             futures.append(
                 getattr(leader, method_name).remote(
                     rank_prefix=rank_prefix,

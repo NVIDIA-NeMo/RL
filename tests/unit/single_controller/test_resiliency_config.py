@@ -397,3 +397,33 @@ class TestRenamedBlocksAreRejected:
         assert cfg.generation_fleet_health.enabled
         assert cfg.generation_router.enabled
         assert cfg.stall_watchdog.stall_timeout_s == 600.0
+
+
+class TestRouterDeadlineFitsInsideTheRollout:
+    """backend_timeout_s bounds one HTTP call; rollout_timeout_s bounds the whole stream."""
+
+    def test_a_router_deadline_past_the_rollout_deadline_is_rejected(self):
+        with pytest.raises(ValidationError, match="backend_timeout_s"):
+            AsyncRLConfig(
+                generation_router={"enabled": True, "backend_timeout_s": 600.0},
+                rollout_failure={"nemo_gym": {"rollout_timeout_s": 300.0}},
+            )
+
+    def test_a_router_deadline_inside_it_is_accepted(self):
+        cfg = AsyncRLConfig(
+            generation_router={"enabled": True, "backend_timeout_s": 120.0},
+            rollout_failure={"nemo_gym": {"rollout_timeout_s": 300.0}},
+        )
+        assert cfg.generation_router.backend_timeout_s == 120.0
+
+    def test_an_unset_rollout_deadline_imposes_no_constraint(self):
+        """rollout_timeout_s defaults to None -- disabled -- so there is nothing to fit in."""
+        cfg = AsyncRLConfig(generation_router={"enabled": True})
+        assert cfg.rollout_failure.nemo_gym.rollout_timeout_s is None
+
+    def test_a_disabled_router_imposes_no_constraint(self):
+        cfg = AsyncRLConfig(
+            generation_router={"enabled": False, "backend_timeout_s": 600.0},
+            rollout_failure={"nemo_gym": {"rollout_timeout_s": 60.0}},
+        )
+        assert cfg.generation_router.enabled is False

@@ -356,6 +356,33 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         return self
 
     @model_validator(mode="after")
+    def _check_router_deadline_fits_inside_the_rollout(self) -> "AsyncRLConfig":
+        """The router's per-request deadline must not outlast the whole rollout's.
+
+        ``backend_timeout_s`` bounds ONE HTTP call; ``rollout_timeout_s`` bounds the whole
+        prompt-group stream, which is many of them. Set the inner one larger and it can
+        never fire: the rollout deadline always expires first, so the timeout the router
+        exists to add is dead config -- the silent no-op shape this series exists to
+        remove. It is also the wrong failure to surface, because the rollout layer reports
+        the group while the router could have named the backend.
+        """
+        rollout_timeout_s = self.rollout_failure.nemo_gym.rollout_timeout_s
+        if (
+            self.generation_router.enabled
+            and rollout_timeout_s is not None
+            and self.generation_router.backend_timeout_s > rollout_timeout_s
+        ):
+            raise ValueError(
+                "async_rl.generation_router.backend_timeout_s "
+                f"({self.generation_router.backend_timeout_s}) exceeds "
+                "async_rl.rollout_failure.nemo_gym.rollout_timeout_s "
+                f"({rollout_timeout_s}), which bounds the whole prompt-group stream that "
+                "request belongs to. The rollout deadline would always fire first and the "
+                "router's would never fire at all."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _check_stall_watchdog_outlasts_rollouts(self) -> "AsyncRLConfig":
         # A rollout that is merely slow already has its own deadline; the watchdog must
         # give it a chance to fire first, or every long rollout reads as a stall.
