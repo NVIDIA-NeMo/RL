@@ -1125,6 +1125,37 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
 
+    megatron_cfg = config["megatron_cfg"]
+    fine_grained_activation_offloading = megatron_cfg.get(
+        "fine_grained_activation_offloading"
+    )
+
+    if fine_grained_activation_offloading is False:
+        # Preserve the legacy exemplar's disabled/null semantics and clear any
+        # enabled state carried by a provider or checkpoint.
+        model_cfg.fine_grained_activation_offloading = False
+        model_cfg.offload_modules = []
+    elif fine_grained_activation_offloading:
+        offload_modules = megatron_cfg.get("offload_modules")
+        if not isinstance(offload_modules, list) or not offload_modules:
+            raise ValueError(
+                "offload_modules must be a non-empty list when "
+                "fine_grained_activation_offloading is True."
+            )
+        moe_only_modules = {"expert_fc1", "moe_act", "fused_group_mlp"}
+        invalid_dense_modules = moe_only_modules.intersection(offload_modules)
+        if (
+            invalid_dense_modules
+            and getattr(model_cfg, "num_moe_experts", None) is None
+        ):
+            raise ValueError(
+                "A MoE-only offload module requires a MoE model "
+                "(num_moe_experts must not be None): "
+                f"{sorted(invalid_dense_modules)}."
+            )
+        model_cfg.fine_grained_activation_offloading = True
+        model_cfg.offload_modules = offload_modules
+
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
     """Validate optimizer configuration."""

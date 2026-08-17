@@ -532,8 +532,9 @@ async def generate_responses_async(
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
     # Check if this is a supported inference engine with async generation enabled.
-    # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``; vLLM and
-    # Megatron expose ``cfg`` and gate on their respective ``async_engine`` flag.
+    # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``;
+    # vLLM exposes ``cfg`` and gates on ``vllm_cfg.async_engine``;
+    # TRT-LLM requires its flag; the Megatron backend is always async.
     vllm_cfg = getattr(policy_generation, "cfg", None)
     sglang_cfg = getattr(policy_generation, "sglang_cfg", None)
     generation_config = vllm_cfg or sglang_cfg or {}
@@ -552,19 +553,15 @@ async def generate_responses_async(
         )
         use_async_generation = True
     elif backend == "megatron":
-        use_async_generation = bool(
-            generation_config.get("mcore_generation_config", {}).get(
-                "async_engine", False
-            )
-        )
+        # The Megatron backend always uses the async engine.
+        use_async_generation = True
     else:
         use_async_generation = False
 
     assert use_async_generation and hasattr(policy_generation, "generate_async"), (
         "Async generation is not enabled. For SGLang, set "
         "policy.generation.use_async_rollouts=True. For vLLM, set "
-        "policy.generation.vllm_cfg.async_engine=True. For Megatron, set "
-        "policy.generation.mcore_generation_config.async_engine=True. The "
+        "policy.generation.vllm_cfg.async_engine=True. The "
         "generation backend must also implement generate_async."
     )
 
