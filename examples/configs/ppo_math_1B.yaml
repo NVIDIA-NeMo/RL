@@ -128,6 +128,15 @@ policy:
     enabled: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
+    # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when enabled; null disables module selection. Common
+    # examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"]. Supported
+    # names depend on the pinned Megatron-LM version and are validated by MCore.
+    # "attn_proj" requires "core_attn". See the latest upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
     converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
@@ -317,6 +326,15 @@ value:
     enabled: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
+    # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when enabled; null disables module selection. Common
+    # examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"]. Supported
+    # names depend on the pinned Megatron-LM version and are validated by MCore.
+    # "attn_proj" requires "core_attn". See the latest upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
