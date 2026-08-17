@@ -16,7 +16,7 @@ import os
 import socket
 import sys
 import time
-from typing import Any, NamedTuple, NotRequired, Optional, TypedDict
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, Optional, TypedDict
 
 import ray
 from ray.util.placement_group import (
@@ -26,6 +26,9 @@ from ray.util.placement_group import (
     remove_placement_group,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+if TYPE_CHECKING:
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -236,7 +239,8 @@ def _get_free_consecutive_ports_local(
 
 
 def init_ray(
-    log_dir: Optional[str] = None, data_plane_cfg: Optional[Any] = None
+    log_dir: Optional[str] = None,
+    data_plane_cfg: Optional["DataPlaneConfig"] = None,
 ) -> None:
     """Initialise Ray.
 
@@ -246,14 +250,11 @@ def init_ray(
 
     Args:
         log_dir: Optional directory to store Ray logs and temp files.
-        data_plane_cfg: Optional data-plane config. Its backend may need engine
-            env vars that must be identical in every process; they are applied
-            here because the ``dict(os.environ)`` snapshot below is what carries
-            them to the workers. Configuring them any later leaves workers
-            disagreeing with the driver. Passed from the launcher rather than
-            read globally so this stays a pure function of its arguments.
+        data_plane_cfg: Optional data-plane config, passed by launchers that
+            enable it. Its backend's engine env vars are applied here because the
+            ``dict(os.environ)`` snapshot below is what carries them to workers;
+            see :func:`~nemo_rl.data_plane.factory.maybe_configure_data_plane_env`.
     """
-    # Before the snapshot, for the reason in the docstring.
     from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 
     maybe_configure_data_plane_env(data_plane_cfg)

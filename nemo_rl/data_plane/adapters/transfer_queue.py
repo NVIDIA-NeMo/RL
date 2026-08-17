@@ -145,46 +145,27 @@ def maybe_configure_engine_env(cfg: DataPlaneConfig) -> None:
     """Set the mooncake knobs that must be identical in every process.
 
     No-op unless the backend is ``mooncake_cpu``; ``simple`` has no engine.
+    Must run before ``init_ray`` — see :func:`maybe_configure_data_plane_env`.
 
-    Call this on the driver **before** ``init_ray()``. Mooncake reads these once,
-    when its engine comes up, so they have to be in place before any process
-    creates one — and they must agree across processes, because the two ends of a
-    transfer each pick a rail and a pair that disagrees is not a slow path, it is
-    an unroutable one wherever each rail is its own subnet.
+    Only knobs that must agree cluster-wide belong here. ``MC_TCP_BIND_ADDRESS``
+    does not: it must differ per node, so it is force-assigned per process in
+    :class:`TQDataPlaneClient`. Nor does ``MC_GID_INDEX``: mooncake documents it
+    as an escape hatch for failed GID auto-detection whose correct value depends
+    on the network, so pinning one would break every rail at once where it is
+    wrong, and its ``findBestGidIndex`` is per-device and cannot disagree.
 
-    Uniformity comes from Ray: ``init_ray`` snapshots ``dict(os.environ)`` into
-    ``runtime_env["env_vars"]`` and passes it to every worker (see
-    ``nemo_rl/distributed/virtual_cluster.py``). Setting these from
-    ``TQDataPlaneClient.__init__`` instead is too late for that snapshot — it runs
-    well after ``ray.init()`` — and it cannot reach the engines TransferQueue
-    creates lazily from its own API (``_maybe_create_tq_client``, called by
-    ``get_data``/``put``/…), which never go through this adapter at all.
-
-    ``setdefault`` throughout, so an operator can still override any of them from
-    the launch environment; because this runs once on the driver before the
-    snapshot, an override stays uniform too.
-
-    ``MC_TCP_BIND_ADDRESS`` is deliberately *not* set here — it must differ per
-    node, and is force-assigned per process in ``TQDataPlaneClient.__init__``.
-
-    ``MC_GID_INDEX`` is deliberately *not* set either. Mooncake documents it as an
-    escape hatch for when GID auto-detection fails ("set if GID is all zeros"),
-    and says the right value is "1, or 2, 3 depending on network" — so a
-    hardcoded index is a per-fabric assumption. Its ``findBestGidIndex`` walks the
-    port's GID table and was measured to select the same RoCEv2 entry unaided
-    (identical throughput pinned vs auto), and being per-device it cannot
-    disagree between processes. Pinning the wrong index would break every rail at
-    once, which is worse than what this function is here to prevent.
+    ``setdefault`` so the launch environment can still override; running once on
+    the driver keeps an override uniform too.
     """
     if cfg["backend"] != "mooncake_cpu":
         return
     # See TQDataPlaneClient.__init__ for why the LOCAL_MEMCPY fast path is off.
     os.environ.setdefault("MC_STORE_MEMCPY", "0")
-    # Pin each transfer's peer rail to the local one by name. Mooncake otherwise
-    # picks the peer independently (Topology::selectDevice), and where each rail
-    # is its own subnet a cross-rail pair has no route. Mooncake recommends this
-    # for rail-optimized topologies generally, and its own deployment example
-    # sets it as a pod-level variable, i.e. uniformly, for the same reason.
+    # Pair each transfer's peer rail with the local one by name. Mooncake
+    # otherwise picks the peer independently (Topology::selectDevice), and where
+    # each rail is its own subnet a cross-rail pair has no route. Mooncake
+    # recommends this for rail-optimized topologies and sets it as a pod-level
+    # variable in its own deployment example, i.e. uniformly, for this reason.
     os.environ.setdefault("MC_ENABLE_DEST_DEVICE_AFFINITY", "1")
 
 
