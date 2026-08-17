@@ -173,6 +173,8 @@ def _runtime_mxfp8_kwargs(speculative_config):
 
 
 def _capture_vllm_0251_draft_model_config(monkeypatch, target_kwargs):
+    # Keep the vLLM stack optional for unit-test shards that do not install it.
+    from transformers import PretrainedConfig
     from vllm.config import speculative as speculative_module
     from vllm.config.speculative import SpeculativeConfig
 
@@ -182,6 +184,10 @@ def _capture_vllm_0251_draft_model_config(monkeypatch, target_kwargs):
     def fake_model_config(**kwargs):
         captured.update(kwargs)
         model_type = "deepseek_mtp" if kwargs["model"] == "target-model" else "qwen3"
+        hf_config = PretrainedConfig()
+        hf_config.architectures = ["DraftForCausalLM"]
+        hf_config.model_type = model_type
+        hf_config.vocab_size = 32000
         normalized_kwargs = {
             **kwargs,
             "max_model_len": kwargs.get("max_model_len") or target_max_model_len,
@@ -189,10 +195,7 @@ def _capture_vllm_0251_draft_model_config(monkeypatch, target_kwargs):
         return SimpleNamespace(
             **normalized_kwargs,
             architectures=["DraftForCausalLM"],
-            hf_config=SimpleNamespace(
-                architectures=["DraftForCausalLM"],
-                model_type=model_type,
-            ),
+            hf_config=hf_config,
             get_vocab_size=lambda: 32000,
             verify_with_parallel_config=lambda _parallel_config: None,
         )
@@ -208,6 +211,7 @@ def _capture_vllm_0251_draft_model_config(monkeypatch, target_kwargs):
         "create_draft_parallel_config",
         staticmethod(lambda *_args, **_kwargs: SimpleNamespace()),
     )
+    monkeypatch.setattr(SpeculativeConfig, "update_arch_", lambda _self: None)
 
     target_model_config = SimpleNamespace(
         model="target-model",
