@@ -734,7 +734,11 @@ def send_hf_buckets_via_ipc_actor_impl(
     engine_idx = worker_state.get("_ipc_engine_index")
 
     if gather_group is None or gather_src is None or engine_idx is None:
-        # Placeholder rank: must not participate in the per-engine gather.
+        # Placeholder rank: skips the gather, but must still drain the iterator.
+        # It lazily drives export_hf_weights, whose PP broadcast and TP gather
+        # are collective over the whole trainer world.
+        for _bucket in bucket_iterator:
+            del _bucket
         return None
 
     if weight_version is None:
@@ -1044,12 +1048,19 @@ def broadcast_hf_buckets_via_distributed_impl(
                 )
                 for engine in rollout_engines
             ]
-            handles = [
-                dist.broadcast(tensor.data, 0, group=model_update_group, async_op=True)
+            # broadcast needs contiguous buffers; AutoBridge yields views. Held
+            # in a list because with async_op=True they must outlive wait().
+            send_buffers = [
+                tensor.data if tensor.data.is_contiguous() else tensor.data.contiguous()
                 for _, tensor in bucket
+            ]
+            handles = [
+                dist.broadcast(buffer, 0, group=model_update_group, async_op=True)
+                for buffer in send_buffers
             ]
             for handle in handles:
                 handle.wait()
+            del send_buffers
             ray.get(refs)
         finally:
             ray.get(rollout_engine_lock.release.remote())
