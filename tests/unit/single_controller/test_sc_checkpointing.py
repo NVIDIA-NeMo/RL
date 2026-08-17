@@ -223,9 +223,13 @@ class _FakeDPClient:
 class _FakeWeightSynchronizer:
     def __init__(self) -> None:
         self.sync_count = 0
+        self.shutdown_count = 0
 
     def sync_weights(self, *, kv_scales: Any = None) -> None:
         self.sync_count += 1
+
+    def shutdown(self) -> None:
+        self.shutdown_count += 1
 
 
 class _FakeRolloutManager:
@@ -1132,6 +1136,8 @@ class TestReplayBufferPersistence:
         # Each restored group holds one _buffer_capacity permit.
         assert actor._buffer_capacity._value == 4 - 3
         assert result["train_steps"] == 0
+        # run()'s finally must tear the synchronizer down exactly once.
+        assert actor._weight_synchronizer.shutdown_count == 1
 
     def test_restored_permits_are_released_by_a_live_pump(self, tmp_path):
         # The restore takes one capacity permit per group; a running pump must

@@ -40,6 +40,10 @@ policy: &POLICY_BASE
         enabled: true
         empty_unused_memory_level: 0
         activation_checkpointing: false
+        # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
+        cuda_graph_impl: "none"
+        cuda_graph_modules: []
+        cuda_graph_warmup_steps: 3
         # recompute_granularity controls activation checkpointing depth.
         # "full": recompute all activations (default, max memory savings).
         # "selective": recompute only specific modules (see recompute_modules).

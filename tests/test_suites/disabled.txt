@@ -13,3 +13,11 @@ tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
 # spare. Move to nightly.txt once a real run confirms it converges and the
 # budget has room.
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-circle-click-2n8g-megatron-tp2ep8.v1.sh
+
+# Nemotron Super Omni: 16-node topology, and the checkpoint and multimodal Gym
+# blend are too large to ship with the repo, so these are invoked manually via
+# examples/nemo_gym/nemotron-3-super-omni/super_omni_launch.sh rather than run
+# in a nightly suite.
+tests/test_suites/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.sh
+tests/test_suites/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp.v1.sh
+tests/test_suites/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp-specdec.v1.sh
