@@ -103,22 +103,45 @@ class MxVllmReshardReceiver:
         install_t0 = time.perf_counter()
         result = self._receiver.update_weights(version, timeout=self._timeout)
         install_s = time.perf_counter() - install_t0
-        print(
-            "MX_RECV_PHASE "
-            + json.dumps(
-                {
-                    "schema": "mx-recv-phase-v1",
-                    "step": version,
-                    "rank": self._global_rank,
-                    "discover_s": round(discover_s, 6),
-                    "mx_update_s": round(install_s, 6),
-                    "tensors_seen": sum(len(p.tensors) for p in payloads),
-                    "trainer_sources": len(payloads),
-                }
-            ),
-            flush=True,
-        )
+        self._report_phases(version, discover_s, install_s, payloads)
         return result
+
+    def _report_phases(
+        self,
+        version: int,
+        discover_s: float,
+        install_s: float,
+        payloads: list,
+    ) -> None:
+        """Emit the phase split, and never let doing so break a refit.
+
+        Telemetry must not be able to fail the operation it measures. The first
+        version of this read ``payload.tensors`` directly and raised
+        AttributeError on any payload shape that lacked it, which would abort a
+        refit that had already succeeded.
+        """
+        try:
+            tensors_seen = sum(len(getattr(p, "tensors", ()) or ()) for p in payloads)
+        except TypeError:
+            tensors_seen = -1
+        try:
+            print(
+                "MX_RECV_PHASE "
+                + json.dumps(
+                    {
+                        "schema": "mx-recv-phase-v1",
+                        "step": version,
+                        "rank": self._global_rank,
+                        "discover_s": round(discover_s, 6),
+                        "mx_update_s": round(install_s, 6),
+                        "tensors_seen": tensors_seen,
+                        "trainer_sources": len(payloads),
+                    }
+                ),
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001 - reporting is never worth a failed refit
+            pass
 
     def shutdown(self) -> None:
         """Release #635's receiver-owned NIXL manager and both gRPC clients."""

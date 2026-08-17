@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -112,6 +113,48 @@ def test_matching_version_is_forwarded_with_timeout():
     assert wrapper.update_weights(9) == {"step": 9}
     rendezvous.discover_trainers.assert_called_once_with(16, timeout=77.0)
     raw.update_weights.assert_called_once_with(9, timeout=77.0)
+
+
+def test_phase_telemetry_cannot_fail_a_successful_refit(capsys):
+    """Reporting must never break the operation it measures.
+
+    The phase split reads fields off the rendezvous payloads, and an earlier
+    version accessed ``payload.tensors`` directly. Any payload shape without that
+    field then raised AttributeError *after* the weights had already installed,
+    turning a successful refit into a failed one.
+    """
+    wrapper, raw, _, _, _, rendezvous, *_ = _build_receiver()
+    # Payloads carry the version stamp but no shard table, which is exactly the
+    # shape that used to abort the refit.
+    rendezvous.discover_trainers.return_value = [
+        SimpleNamespace(publisher_step=9) for _ in range(16)
+    ]
+    raw.update_weights.return_value = {"step": 9}
+
+    assert wrapper.update_weights(9) == {"step": 9}
+
+    record = json.loads(capsys.readouterr().out.split("MX_RECV_PHASE ", 1)[1])
+    assert record["step"] == 9
+    assert record["rank"] == 3
+    assert record["trainer_sources"] == 16
+    # Absent shard tables count as zero rather than aborting.
+    assert record["tensors_seen"] == 0
+    assert record["discover_s"] >= 0.0 and record["mx_update_s"] >= 0.0
+
+
+def test_phase_telemetry_counts_shard_table_entries(capsys):
+    """``tensors_seen`` is what showed the quorum cost scales with source count
+    rather than bytes moved, so it has to actually count."""
+    wrapper, raw, _, _, _, rendezvous, *_ = _build_receiver()
+    rendezvous.discover_trainers.return_value = [
+        SimpleNamespace(publisher_step=4, tensors=tuple(range(100))) for _ in range(16)
+    ]
+    raw.update_weights.return_value = {"step": 4}
+
+    wrapper.update_weights(4)
+
+    record = json.loads(capsys.readouterr().out.split("MX_RECV_PHASE ", 1)[1])
+    assert record["tensors_seen"] == 1600
 
 
 def test_shutdown_releases_manager_and_both_clients():
