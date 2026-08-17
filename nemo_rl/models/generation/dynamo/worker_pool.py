@@ -37,7 +37,7 @@ _WORKER_FQN = "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker"
 
 
 def _vllm_port_for_node_slot(node_slot: int) -> int:
-    """Return vLLM's deterministic node-local rendezvous port."""
+    """Return vLLM's node-local scan base with 100 ports of headroom."""
     return DEFAULT_VLLM_PORT_RANGE_LOW + node_slot * DEFAULT_VLLM_PORTS_PER_ENGINE
 
 
@@ -69,6 +69,12 @@ class FixedDynamoWorkerPool:
     @property
     def size(self) -> int:
         return len(self._workers)
+
+    def is_alive(self) -> bool:
+        """Return whether every managed vLLM subprocess is still alive."""
+        return bool(self._workers) and all(
+            ray.get([worker.is_alive.remote() for worker in self._workers])
+        )
 
     def start(self) -> None:
         if self._workers:

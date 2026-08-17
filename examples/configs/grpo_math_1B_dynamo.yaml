@@ -71,7 +71,6 @@ policy:
       pipeline_parallel_size: 1
       expert_parallel_size: 1
       precision: bfloat16
-      load_format: dummy
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
       kv_cache_dtype: auto

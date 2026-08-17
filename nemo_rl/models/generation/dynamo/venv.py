@@ -23,8 +23,6 @@ def get_dynamo_venv_dir() -> Path:
     configured = os.environ.get("NEMO_RL_DYNAMO_VENV_DIR")
     if configured:
         return Path(configured).expanduser().resolve()
-    if os.environ.get("NRL_CONTAINER") == "1":
-        return Path("/opt/dynamo_venv")
     repo_root = Path(__file__).resolve().parents[4]
     return repo_root / "venvs" / "dynamo"
 

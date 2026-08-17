@@ -19,6 +19,23 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+import aiohttp
+
+
+def _decode_json_object(body: bytes) -> dict[str, Any]:
+    """Decode an HTTP response body using the shared Dynamo error contract."""
+    try:
+        decoded = json.loads(body)
+    except json.JSONDecodeError:
+        return {
+            "status": "error",
+            "json_decode_error": True,
+            "raw": body.decode("utf-8", "replace"),
+        }
+    if not isinstance(decoded, dict):
+        return {"status": "error", "raw": repr(decoded)}
+    return decoded
+
 
 def http_post_json(
     url: str, payload: dict[str, Any], timeout_s: float
@@ -42,17 +59,30 @@ def http_post_json(
             "status": "error",
             "transport_error": f"{type(error).__name__}: {error}",
         }
+    return _decode_json_object(body)
+
+
+async def async_http_post_json(
+    url: str, payload: dict[str, Any], timeout_s: float
+) -> dict[str, Any]:
+    """POST JSON without blocking the rollout actor event loop."""
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
     try:
-        decoded = json.loads(body)
-    except json.JSONDecodeError:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload) as response:
+                body = await response.read()
+                if response.status >= 400:
+                    return {
+                        "status": "error",
+                        "http_status": response.status,
+                        "raw": body.decode("utf-8", "replace"),
+                    }
+    except (aiohttp.ClientError, TimeoutError) as error:
         return {
             "status": "error",
-            "json_decode_error": True,
-            "raw": body.decode("utf-8", "replace"),
+            "transport_error": f"{type(error).__name__}: {error}",
         }
-    if not isinstance(decoded, dict):
-        return {"status": "error", "raw": repr(decoded)}
-    return decoded
+    return _decode_json_object(body)
 
 
 def format_dynamo_error(response: dict[str, Any]) -> str:

@@ -30,6 +30,7 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
     _managed_namespace,
 )
+from nemo_rl.models.generation.dynamo.venv import get_dynamo_venv_dir
 from nemo_rl.models.generation.dynamo.worker_pool import (
     FixedDynamoWorkerPool,
     _vllm_port_for_node_slot,
@@ -191,22 +192,41 @@ def test_managed_service_and_frontend_environments_are_runtime_owned(
     runtime._manager_env = {
         "DYN_NAMESPACE": "managed",
         "DYN_DISCOVERY_BACKEND": "etcd",
+        "ETCD_ENDPOINTS": "http://managed-etcd:2379",
+        "NATS_SERVER": "nats://managed-nats:4222",
     }
     monkeypatch.setenv("DYN_NAMESPACE", "stale")
     monkeypatch.setenv("DYN_STALE_SETTING", "remove-me")
+    monkeypatch.setenv("ETCD_ENDPOINTS", "http://stale-etcd:2379")
+    monkeypatch.setenv("ETCD_STALE_SETTING", "remove-me")
+    monkeypatch.setenv("NATS_SERVER", "nats://stale-nats:4222")
+    monkeypatch.setenv("NATS_STALE_SETTING", "remove-me")
     monkeypatch.setenv("NCCL_DEBUG", "INFO")
 
     service_env = runtime._service_env()
     assert service_env["DYN_NAMESPACE"] == "managed"
     assert service_env["DYN_DISCOVERY_BACKEND"] == "etcd"
     assert "DYN_STALE_SETTING" not in service_env
+    assert service_env["ETCD_ENDPOINTS"] == "http://managed-etcd:2379"
+    assert service_env["NATS_SERVER"] == "nats://managed-nats:4222"
+    assert "ETCD_STALE_SETTING" not in service_env
+    assert "NATS_STALE_SETTING" not in service_env
     assert service_env["NCCL_DEBUG"] == "INFO"
-    assert service_env["ALLOW_NONE_AUTHENTICATION"] == "yes"
+    assert "ALLOW_NONE_AUTHENTICATION" not in service_env
 
     frontend_env = runtime._frontend_env()
     assert frontend_env["DYN_TOKENIZER"] == "fastokens"
     assert frontend_env["DYN_TOKENIZER_CACHE"] == "1"
     assert frontend_env["DYN_TOKENIZER_CACHE_BYTES"] == "4096"
+
+
+def test_dynamo_venv_uses_explicit_env_or_repository_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("NEMO_RL_DYNAMO_VENV_DIR", "/custom/dynamo")
+    assert get_dynamo_venv_dir() == Path("/custom/dynamo")
+
+    monkeypatch.delenv("NEMO_RL_DYNAMO_VENV_DIR")
+    monkeypatch.setenv("NRL_CONTAINER", "1")
+    assert get_dynamo_venv_dir().parts[-2:] == ("venvs", "dynamo")
 
 
 def test_vllm_node_local_port_bands_are_deterministic() -> None:
@@ -242,7 +262,7 @@ def test_startup_failure_cleans_up_partial_worker_pool(monkeypatch, tmp_path) ->
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.managed_runtime._get_free_port_local",
-        lambda low, high: next(ports),
+        lambda low, high, **kwargs: next(ports),
     )
 
     def start_etcd():
@@ -341,23 +361,12 @@ def test_reservation_records_and_cleans_registered_process_group(monkeypatch) ->
 
 
 def test_reservation_selects_a_free_nonexcluded_system_port(monkeypatch) -> None:
-    class FakeSocket:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-        @staticmethod
-        def bind(address):
-            if address[1] == 4000:
-                raise OSError("host service")
-
     reservation_cls = DynamoGpuReservation.__ray_metadata__.modified_class
     reservation = reservation_cls()
+    calls = []
     monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.dynamo_worker.socket.socket",
-        lambda *args, **kwargs: FakeSocket(),
+        "nemo_rl.models.generation.dynamo.dynamo_worker._get_free_port_local",
+        lambda low, high, **kwargs: calls.append((low, high, kwargs)) or 4002,
     )
 
     assert (
@@ -368,11 +377,30 @@ def test_reservation_selects_a_free_nonexcluded_system_port(monkeypatch) -> None
         )
         == 4002
     )
-    with pytest.raises(RuntimeError, match="No free managed Dynamo system port"):
-        reservation.select_free_port(
-            port_range_low=4000,
-            port_range_high=4002,
-            excluded_ports=[4001],
+    assert calls == [
+        (
+            4000,
+            4003,
+            {"max_retries": None, "excluded_ports": {4001}},
+        )
+    ]
+
+
+def test_worker_argument_validation_has_startup_timeout(monkeypatch) -> None:
+    worker_cls = DynamoVllmWorker.__ray_metadata__.modified_class
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker.subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("validator", kwargs["timeout"])
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="startup_timeout_s=7"):
+        worker_cls._validate_argv(
+            "/opt/dynamo_venv/bin/python",
+            ["--model", "model"],
+            {},
+            timeout_s=7,
         )
 
 
@@ -385,6 +413,8 @@ def test_worker_registers_process_group_immediately_after_launch(monkeypatch) ->
             return None
 
         def bind(self, address):
+            if address[1] == 7000:
+                raise AssertionError("VLLM_PORT must not be probed")
             return None
 
     process = SimpleNamespace(pid=4321)
@@ -761,6 +791,7 @@ def test_frontend_waits_for_model_after_endpoint_registration(monkeypatch) -> No
     runtime._frontend_port = 3000
     runtime._frontend_process = _FakeProcess()
     runtime._namespace = "nemo-rl-test"
+    runtime._pool = SimpleNamespace(is_alive=lambda: True)
     health = {
         "instances": [
             {
@@ -800,3 +831,37 @@ def test_frontend_waits_for_model_after_endpoint_registration(monkeypatch) -> No
         "http://127.0.0.1:3000/health",
         "http://127.0.0.1:3000/v1/models",
     ]
+
+
+def test_frontend_wait_fails_immediately_when_worker_exits(monkeypatch) -> None:
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=_config())
+    runtime._frontend_port = 3000
+    runtime._frontend_process = _FakeProcess()
+    runtime._pool = SimpleNamespace(is_alive=lambda: False)
+
+    with pytest.raises(RuntimeError, match="worker exited while the frontend"):
+        runtime._wait_for_frontend(expected_workers=1)
+
+
+def test_frontend_logs_resolved_tokenizer_environment(monkeypatch, capsys) -> None:
+    config = _config()
+    config["dynamo_cfg"]["frontend_args"].update(
+        {"tokenizer": "fastokens", "tokenizer_cache": True}
+    )
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=config)
+    runtime._frontend_port = 3000
+    runtime._namespace = "nemo-rl-test"
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.get_dynamo_python",
+        lambda: "/opt/dynamo_venv/bin/python",
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.subprocess.Popen",
+        lambda *args, **kwargs: _FakeProcess(),
+    )
+
+    runtime._start_frontend()
+
+    output = capsys.readouterr().out
+    assert "DYN_TOKENIZER': 'fastokens" in output
+    assert "<redacted>" not in output

@@ -21,7 +21,6 @@ from typing import Any
 from nemo_rl.models.generation.dynamo.config import (
     DYNAMO_VLLM_FLAGS,
     DynamoCfg,
-    DynamoVllmConfig,
 )
 
 _MANAGED_FLAGS = {
@@ -245,11 +244,6 @@ def build_dynamo_frontend_argv(
         source="dynamo_cfg.frontend_args.extra_cli_args",
     )
     return builder.argv
-
-
-def validate_managed_vllm_config(vllm_cfg: Mapping[str, Any]) -> None:
-    """Validate settings whose meaning differs between NeMo-RL and Dynamo."""
-    DynamoVllmConfig.model_validate(vllm_cfg)
 
 
 def build_managed_worker_env(

@@ -271,6 +271,9 @@ class DynamoConfig(BaseModel, extra="allow"):
     @model_validator(mode="after")
     def _validate_backend_boundary(self) -> "DynamoConfig":
         extra = self.model_extra or {}
+        # Shared GRPO YAML inheritance supplies mcore_generation_config and
+        # refit_cfg. Managed Dynamo uses vLLM arguments and the collective
+        # synchronizer instead, so these two sections are intentionally ignored.
         for backend_cfg in ("sglang_cfg", "trtllm_cfg"):
             if extra.get(backend_cfg):
                 raise ValueError(
@@ -319,11 +322,10 @@ class DynamoConfig(BaseModel, extra="allow"):
                         f"policy.generation.{source}.{field} must be 1 when "
                         "backend='dynamo'; managed refit rank geometry is TP × PP"
                     )
-        for field in ("stop_strings", "stop_token_ids"):
-            values = extra.get(field)
-            if values is not None and len(values) > 4:
-                raise ValueError(
-                    f"policy.generation.{field} supports at most 4 values when "
-                    "backend='dynamo'"
-                )
+        stop_strings = extra.get("stop_strings")
+        if stop_strings is not None and len(stop_strings) > 32:
+            raise ValueError(
+                "policy.generation.stop_strings supports at most 32 values when "
+                "backend='dynamo'"
+            )
         return self

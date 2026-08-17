@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
+from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
@@ -29,7 +30,13 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry(
     monkeypatch.setenv("HF_HOME", "/hf-home")
     config = _load_recipe()
     generation = config["policy"]["generation"]
-    validated = DynamoConfig.model_validate(generation)
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+    configured_generation = configure_generation_config(generation, Tokenizer())
+    validated = DynamoConfig.model_validate(configured_generation)
 
     assert config["policy"]["model_name"] == (
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
@@ -80,7 +87,8 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry(
 
 
 def test_recipe_and_driver_have_no_removed_swe_modes() -> None:
-    text = RECIPE.read_text(encoding="utf-8") + DRIVER.read_text(encoding="utf-8")
+    recipe_text = RECIPE.read_text(encoding="utf-8")
+    text = recipe_text + DRIVER.read_text(encoding="utf-8")
     for forbidden in (
         "/lustre/",
         "/path/to",
@@ -94,6 +102,7 @@ def test_recipe_and_driver_have_no_removed_swe_modes() -> None:
         "USES_SANDBOX",
     ):
         assert forbidden.lower() not in text.lower()
+    assert "load_format:" not in recipe_text
     assert "--require-tag-prefix generation_metrics/" in text
     assert "project: nemo-rl" in text
     assert "Expected step ${MAX_STEPS}" in text

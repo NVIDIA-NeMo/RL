@@ -100,8 +100,6 @@ def _patch_runtime(
     workers: list[dict[str, Any]] | None = None,
     calls: list[str] | None = None,
 ) -> None:
-    from nemo_rl.models.generation.dynamo import managed_runtime
-
     endpoints = workers or [
         {"instance_id": "worker-0", "system_url": "http://10.0.0.2:4000"}
     ]
@@ -127,7 +125,7 @@ def _patch_runtime(
         def shutdown(self):
             events.append("shutdown")
 
-    monkeypatch.setattr(managed_runtime, "ManagedDynamoRuntime", FakeRuntime)
+    monkeypatch.setattr(generation_module, "ManagedDynamoRuntime", FakeRuntime)
 
 
 def _data() -> BatchedDataDict:
@@ -165,6 +163,8 @@ def test_runtime_start_world_size_sender_geometry_and_shutdown(monkeypatch) -> N
     generation = DynamoGeneration(cluster=object(), config=_config(tp=2))
 
     assert calls[:2] == ["init", "start"]
+    assert generation.frontend_url == "http://10.0.0.1:3000/v1"
+    assert generation.dp_openai_server_base_urls == [None]
     assert generation.get_inference_world_size() == 4
     sender = generation.get_collective_sender_spec()
     assert sender.nccl_peer == "vllm"
@@ -181,11 +181,11 @@ def test_blocking_generate_is_rejected_and_async_generation_uses_http(
     _patch_runtime(monkeypatch)
     requests = []
 
-    def fake_post(url, payload, timeout_s):
+    async def fake_post(url, payload, timeout_s):
         requests.append((url, payload, timeout_s))
         return _completion_response([8, 9])
 
-    monkeypatch.setattr(generation_module, "http_post_json", fake_post)
+    monkeypatch.setattr(generation_module, "async_http_post_json", fake_post)
     generation = DynamoGeneration(cluster=object(), config=_config())
     with pytest.raises(NotImplementedError, match="generate_async"):
         generation.generate(_data())
@@ -222,11 +222,19 @@ def test_finish_generation_invalidates_sync_rollout_cache(monkeypatch) -> None:
 def test_merged_stop_strings_enforce_dynamo_limit(monkeypatch) -> None:
     _patch_runtime(monkeypatch)
     config = _config()
-    config["stop_strings"] = ["a", "b"]
+    config["stop_strings"] = [f"configured-{index}" for index in range(16)]
     generation = DynamoGeneration(cluster=object(), config=config)
 
-    with pytest.raises(ValueError, match="at most 4 stop strings"):
-        generation._merge_stop_strings([["c", "d", "e"]])
+    assert (
+        len(
+            generation._merge_stop_strings(
+                [[f"request-{index}" for index in range(16)]]
+            )
+        )
+        == 32
+    )
+    with pytest.raises(ValueError, match="at most 32 stop strings"):
+        generation._merge_stop_strings([[f"request-{index}" for index in range(17)]])
 
 
 def test_token_wrapper_is_used_for_nemo_gym(monkeypatch) -> None:
@@ -293,6 +301,7 @@ def test_refit_rank_offsets_update_and_pickled_cache_invalidation(monkeypatch) -
     assert all(call["timeout_s"] == 10 for call in update_calls)
 
     restored = pickle.loads(pickle.dumps(generation))
+    assert restored.frontend_url == generation.frontend_url
     monkeypatch.setattr(
         refit_module._post_worker_route,
         "remote",
@@ -369,22 +378,28 @@ def test_native_refit_transaction_keeps_cache_mode_external(monkeypatch) -> None
 
 
 def test_metrics_parser_and_sampler_aliases() -> None:
-    parsed = parse_prometheus_metrics(
-        'dynamo_component_inflight_requests{worker="0"} 3\n'
-        'dynamo_component_inflight_requests{worker="1"} 2\n'
-        "dynamo_work_handler_queue_depth 1\n"
-        "python_gc_objects_collected_total 10\n"
-    )
     sampler = DynamoMetricsSampler(
         [{"instance_id": "a", "system_url": "http://worker:4000"}],
         interval_s=1,
         include_prefixes=None,
         exclude_prefixes=None,
     )
+    parsed = parse_prometheus_metrics(
+        "vllm_num_requests_running 3\n"
+        "vllm_num_requests_waiting 2\n"
+        "vllm_kv_cache_usage_perc 0.5\n"
+        "vllm:generation_tokens_total 7\n"
+        "python_gc_objects_collected_total 10\n",
+        sampler._include_prefixes,
+        sampler._exclude_prefixes,
+    )
     sampler._samples = {name: {0: [value]} for name, value in parsed.items()}
     metrics = sampler.snapshot()
-    assert metrics["inflight_batch_sizes"] == {0: [5.0]}
-    assert metrics["num_pending_samples"] == {0: [1.0]}
+    assert metrics["inflight_batch_sizes"] == {0: [3.0]}
+    assert metrics["num_pending_samples"] == {0: [2.0]}
+    assert metrics["kv_cache_usage_perc"] == {0: [0.5]}
+    assert metrics["generation_tokens"] == {0: [7.0]}
+    assert "python_gc_objects_collected_total" not in parsed
 
 
 def test_metrics_http_errors_are_ignored(monkeypatch) -> None:
@@ -429,19 +444,25 @@ def test_completion_retry_eventually_succeeds(monkeypatch) -> None:
         [{"status": "error", "http_status": 503}, _completion_response([8])]
     )
     calls = []
-    monkeypatch.setattr(
-        generation_module,
-        "http_post_json",
-        lambda *args: calls.append(args) or next(responses),
-    )
-    monkeypatch.setattr(generation_module.time, "sleep", lambda _: None)
+
+    async def fake_post(*args):
+        calls.append(args)
+        return next(responses)
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(generation_module, "async_http_post_json", fake_post)
+    monkeypatch.setattr(generation_module.asyncio, "sleep", no_sleep)
     generation = DynamoGeneration(cluster=object(), config=_config())
 
-    token_ids, _, _ = generation._post_completion_request(
-        prompt_token_ids=[1],
-        greedy=False,
-        stop_strings=None,
-        max_new_tokens=1,
+    token_ids, _, _ = asyncio.run(
+        generation._post_completion_request(
+            prompt_token_ids=[1],
+            greedy=False,
+            stop_strings=None,
+            max_new_tokens=1,
+        )
     )
 
     assert token_ids == [8]
@@ -454,20 +475,68 @@ def test_completion_retry_stops_on_nonretryable_or_exhaustion(
 ) -> None:
     _patch_runtime(monkeypatch)
     calls = []
-    monkeypatch.setattr(
-        generation_module,
-        "http_post_json",
-        lambda *args: calls.append(args) or {"status": "error", "http_status": status},
-    )
-    monkeypatch.setattr(generation_module.time, "sleep", lambda _: None)
+
+    async def fake_post(*args):
+        calls.append(args)
+        return {"status": "error", "http_status": status}
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(generation_module, "async_http_post_json", fake_post)
+    monkeypatch.setattr(generation_module.asyncio, "sleep", no_sleep)
     generation = DynamoGeneration(cluster=object(), config=_config())
 
     with pytest.raises(RuntimeError, match=f"HTTP {status}"):
-        generation._post_completion_request(
-            prompt_token_ids=[1],
-            greedy=False,
-            stop_strings=None,
-            max_new_tokens=1,
+        asyncio.run(
+            generation._post_completion_request(
+                prompt_token_ids=[1],
+                greedy=False,
+                stop_strings=None,
+                max_new_tokens=1,
+            )
         )
 
     assert len(calls) == (1 if status == 400 else generation_module._HTTP_MAX_ATTEMPTS)
+
+
+def test_direct_completions_are_not_limited_by_default_thread_pool(
+    monkeypatch,
+) -> None:
+    _patch_runtime(monkeypatch)
+    request_count = 40
+    entered_count = 0
+    all_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_post(*args):
+        nonlocal entered_count
+        entered_count += 1
+        if entered_count == request_count:
+            all_entered.set()
+        await release.wait()
+        return _completion_response([8])
+
+    monkeypatch.setattr(generation_module, "async_http_post_json", fake_post)
+    generation = DynamoGeneration(cluster=object(), config=_config())
+
+    async def run_requests():
+        tasks = [
+            asyncio.create_task(
+                generation._post_completion_request(
+                    prompt_token_ids=[1],
+                    greedy=False,
+                    stop_strings=None,
+                    max_new_tokens=1,
+                )
+            )
+            for _ in range(request_count)
+        ]
+        await asyncio.wait_for(all_entered.wait(), timeout=1)
+        release.set()
+        return await asyncio.gather(*tasks)
+
+    responses = asyncio.run(run_requests())
+
+    assert entered_count == request_count
+    assert len(responses) == request_count

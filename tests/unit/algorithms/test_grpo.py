@@ -76,6 +76,7 @@ from nemo_rl.environments.interfaces import (
 )
 from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollouts import calculate_rewards
+from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
@@ -2323,6 +2324,10 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         "num_nodes": 1,
     }
     config["env"]["should_use_nemo_gym"] = True
+    tokenizer = MagicMock()
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    config["policy"]["generation"] = configure_generation_config(generation, tokenizer)
     master_config = MasterConfig.model_validate(config)
 
     cluster_instances = []
@@ -2360,6 +2365,7 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     class DummyDynamoGeneration:
         weight_synchronizer = None
         dp_openai_server_base_urls = ["http://dynamo-wrapper.example/v1"]
+        frontend_url = "http://dynamo-frontend.example/v1"
 
         def __init__(self, *, cluster, config, tokenizer, tokenizer_config):
             dynamo_init(
@@ -2391,7 +2397,6 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
 
     dataset = MagicMock()
     dataset.__len__.return_value = 2
-    tokenizer = MagicMock()
     result = setup(master_config, tokenizer, dataset, None)
 
     train_cluster, inference_cluster = cluster_instances

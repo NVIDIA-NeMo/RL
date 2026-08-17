@@ -182,33 +182,64 @@ def _bind_socket_in_range(
     sock: socket.socket,
     port_range_low: int,
     port_range_high: int,
-    max_retries: int = 50,
+    max_retries: int | None = 50,
+    excluded_ports: set[int] | None = None,
 ) -> int:
     """Try to bind *sock* to a random port in [port_range_low, port_range_high).
 
-    Raises ``RuntimeError`` after *max_retries* failed attempts.
+    When *max_retries* is ``None``, try every non-excluded port once. Otherwise,
+    preserve the existing bounded random-retry behavior.
     """
     import random
 
-    for _ in range(max_retries):
-        port = random.randint(port_range_low, port_range_high - 1)
-        try:
-            sock.bind(("", port))
-            return port
-        except OSError:
-            continue
+    excluded = excluded_ports or set()
+    if max_retries is None:
+        candidates = [
+            port
+            for port in range(port_range_low, port_range_high)
+            if port not in excluded
+        ]
+        random.shuffle(candidates)
+        for port in candidates:
+            try:
+                sock.bind(("", port))
+                return port
+            except OSError:
+                continue
+        retry_description = f"all {len(candidates)} available ports"
+    else:
+        for _ in range(max_retries):
+            port = random.randint(port_range_low, port_range_high - 1)
+            if port in excluded:
+                continue
+            try:
+                sock.bind(("", port))
+                return port
+            except OSError:
+                continue
+        retry_description = f"{max_retries} attempts"
+
     raise RuntimeError(
         f"Could not find a free port in range [{port_range_low}, {port_range_high}) "
-        f"after {max_retries} attempts."
+        f"after {retry_description}."
     )
 
 
 def _get_free_port_local(
     port_range_low: int = DEFAULT_MASTER_PORT_RANGE_LOW,
     port_range_high: int = DEFAULT_MASTER_PORT_RANGE_HIGH,
+    *,
+    max_retries: int | None = 50,
+    excluded_ports: set[int] | None = None,
 ) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        port = _bind_socket_in_range(s, port_range_low, port_range_high)
+        port = _bind_socket_in_range(
+            s,
+            port_range_low,
+            port_range_high,
+            max_retries=max_retries,
+            excluded_ports=excluded_ports,
+        )
         s.listen(1)
 
     return port

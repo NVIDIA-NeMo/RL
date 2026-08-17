@@ -15,8 +15,7 @@
 
 import asyncio
 import logging
-import time
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 
 import ray
 import torch
@@ -25,9 +24,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
 from nemo_rl.models.generation.dynamo.http_client import (
+    async_http_post_json,
     format_dynamo_error,
-    http_post_json,
 )
+from nemo_rl.models.generation.dynamo.managed_runtime import ManagedDynamoRuntime
 from nemo_rl.models.generation.dynamo.metrics import DynamoMetricsSampler
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
 from nemo_rl.models.generation.dynamo.token_wrapper import DynamoTokenWrapperServer
@@ -40,9 +40,6 @@ from nemo_rl.models.generation.interfaces import (
 )
 
 LOGGER = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    from nemo_rl.models.generation.dynamo.managed_runtime import ManagedDynamoRuntime
 
 _HTTP_MAX_ATTEMPTS = 3
 _HTTP_RETRY_DELAY_S = 1.0
@@ -176,15 +173,11 @@ class DynamoGeneration(GenerationInterface):
                         "policy.tokenizer.chat_template_kwargs must be a dictionary."
                     )
                 tokenizer_chat_template_kwargs = dict(chat_template_kwargs)
-        from nemo_rl.models.generation.dynamo.managed_runtime import (
-            ManagedDynamoRuntime,
-        )
-
         if cluster is None:
             raise RuntimeError(
                 "Managed Dynamo requires a non-colocated inference RayVirtualCluster."
             )
-        self._managed_runtime: Optional["ManagedDynamoRuntime"] = ManagedDynamoRuntime(
+        self._managed_runtime: Optional[ManagedDynamoRuntime] = ManagedDynamoRuntime(
             cluster=cluster,
             config=self.cfg,
         )
@@ -223,7 +216,7 @@ class DynamoGeneration(GenerationInterface):
                     flush=True,
                 )
             else:
-                self.dp_openai_server_base_urls = [url]
+                self.dp_openai_server_base_urls = [None]
                 print(f"  [Dynamo] Forwarding rollouts to {url}", flush=True)
 
             if vllm_cfg.enable_vllm_metrics_logger:
@@ -244,6 +237,13 @@ class DynamoGeneration(GenerationInterface):
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         return True
+
+    @property
+    def frontend_url(self) -> str:
+        """Return the internal managed Dynamo OpenAI frontend URL."""
+        if not self._dynamo_frontend_base_url:
+            raise RuntimeError("DynamoGeneration does not have a frontend URL.")
+        return self._dynamo_frontend_base_url
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Invalidate cached rollout state after synchronous generation."""
@@ -327,10 +327,7 @@ class DynamoGeneration(GenerationInterface):
         validated_config = DynamoConfig.model_validate(self.cfg)
         self._dynamo_cfg = validated_config.dynamo_cfg
         self.dp_openai_server_base_urls = state["dp_openai_server_base_urls"]
-        frontend_url = state.get(
-            "_dynamo_frontend_base_url",
-            self.dp_openai_server_base_urls[0],
-        )
+        frontend_url = state["_dynamo_frontend_base_url"]
         if not isinstance(frontend_url, str) or not frontend_url:
             raise RuntimeError("Pickled DynamoGeneration has no frontend URL.")
         self._dynamo_frontend_base_url = frontend_url
@@ -364,9 +361,9 @@ class DynamoGeneration(GenerationInterface):
                 else:
                     stop_set.update(sample_stop_strings)
 
-        if len(stop_set) > 4:
+        if len(stop_set) > 32:
             raise ValueError(
-                "Dynamo supports at most 4 stop strings after merging configured "
+                "Dynamo supports at most 32 stop strings after merging configured "
                 "and per-sample values"
             )
         return list(stop_set) if stop_set else None
@@ -437,7 +434,7 @@ class DynamoGeneration(GenerationInterface):
                 f"vllm_cfg.max_model_len: {response_length} > {max_model_len}"
             )
 
-    def _post_completion_request(
+    async def _post_completion_request(
         self,
         *,
         prompt_token_ids: list[int],
@@ -454,7 +451,11 @@ class DynamoGeneration(GenerationInterface):
         )
         response: dict[str, Any] = {}
         for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
-            response = http_post_json(request_url, payload, self._request_timeout_s())
+            response = await async_http_post_json(
+                request_url,
+                payload,
+                self._request_timeout_s(),
+            )
             if not _is_retryable_http_response(response):
                 break
             if attempt == _HTTP_MAX_ATTEMPTS:
@@ -466,7 +467,7 @@ class DynamoGeneration(GenerationInterface):
                 _HTTP_RETRY_DELAY_S,
                 format_dynamo_error(response),
             )
-            time.sleep(_HTTP_RETRY_DELAY_S)
+            await asyncio.sleep(_HTTP_RETRY_DELAY_S)
         return _parse_dynamo_completion_response(response, request_url=request_url)
 
     def _single_sample_output(
@@ -579,8 +580,11 @@ class DynamoGeneration(GenerationInterface):
 
         allowed_new_tokens = self._allowed_new_tokens(input_length)
         input_ids = input_ids_batch[sample_idx]
-        generated_token_ids, generated_logprobs, truncated = await asyncio.to_thread(
-            self._post_completion_request,
+        (
+            generated_token_ids,
+            generated_logprobs,
+            truncated,
+        ) = await self._post_completion_request(
             prompt_token_ids=self._prompt_token_ids(data, sample_idx),
             greedy=greedy,
             stop_strings=final_stop_strings,

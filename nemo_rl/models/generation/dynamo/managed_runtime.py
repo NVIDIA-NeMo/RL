@@ -117,14 +117,14 @@ class ManagedDynamoRuntime:
         used_ports: set[int] = set()
 
         def allocate_port(*, low: int, high: int) -> int:
-            for _ in range(high - low):
-                candidate = _get_free_port_local(low, high)
-                if candidate not in used_ports:
-                    used_ports.add(candidate)
-                    return candidate
-            raise RuntimeError(
-                f"Could not allocate a distinct managed Dynamo port in [{low}, {high})"
+            port = _get_free_port_local(
+                low,
+                high,
+                max_retries=None,
+                excluded_ports=used_ports,
             )
+            used_ports.add(port)
+            return port
 
         self._etcd_port = allocate_port(
             low=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
@@ -205,10 +205,9 @@ class ManagedDynamoRuntime:
         env = {
             key: value
             for key, value in os.environ.items()
-            if not key.startswith("DYN_")
+            if not key.startswith(("DYN_", "ETCD_", "NATS_"))
         }
         env.update(self._manager_env)
-        env["ALLOW_NONE_AUTHENTICATION"] = "yes"
         return env
 
     def _frontend_env(self) -> dict[str, str]:
@@ -314,8 +313,7 @@ class ManagedDynamoRuntime:
             if key.startswith("DYN_TOKENIZER")
         }
         print(
-            "  [Dynamo] frontend tokenizer environment="
-            f"{redact_environment(tokenizer_env)!r}",
+            f"  [Dynamo] frontend tokenizer environment={tokenizer_env!r}",
             flush=True,
         )
         self._frontend_process = subprocess.Popen(
@@ -330,6 +328,11 @@ class ManagedDynamoRuntime:
         last_counts = (0, 0)
         last_models: set[str] = set()
         while time.monotonic() < deadline:
+            if self._pool is None or not self._pool.is_alive():
+                raise RuntimeError(
+                    "A Ray-managed Dynamo vLLM worker exited while the frontend "
+                    "was waiting for model registration."
+                )
             if (
                 self._frontend_process is not None
                 and self._frontend_process.poll() is not None

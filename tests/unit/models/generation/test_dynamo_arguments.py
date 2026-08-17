@@ -24,7 +24,6 @@ from nemo_rl.models.generation.dynamo.arguments import (
     build_managed_worker_env,
     redact_argv,
     redact_environment,
-    validate_managed_vllm_config,
 )
 from nemo_rl.models.generation.dynamo.config import (
     DynamoCfg,
@@ -195,12 +194,19 @@ def test_config_rejects_parallel_dimensions_outside_tp_pp(field, source) -> None
         DynamoConfig.model_validate(config)
 
 
-@pytest.mark.parametrize("field", ["stop_strings", "stop_token_ids"])
-def test_config_rejects_more_than_four_stop_conditions(field) -> None:
-    config = _config(**{field: list(range(5))})
+def test_config_rejects_more_than_32_stop_strings() -> None:
+    config = _config(stop_strings=[str(index) for index in range(33)])
 
-    with pytest.raises(ValidationError, match=f"{field} supports at most 4"):
+    with pytest.raises(ValidationError, match="stop_strings supports at most 32"):
         DynamoConfig.model_validate(config)
+
+
+def test_config_does_not_limit_stop_token_ids() -> None:
+    config = _config(stop_token_ids=list(range(33)))
+
+    assert DynamoConfig.model_validate(config).model_extra["stop_token_ids"] == list(
+        range(33)
+    )
 
 
 def test_configure_generation_config_selects_dynamo_load_format() -> None:
@@ -210,6 +216,8 @@ def test_configure_generation_config_selects_dynamo_load_format() -> None:
 
     training = _config(stop_token_ids=None)
     evaluation = _config(stop_token_ids=None)
+    del training["vllm_cfg"]["load_format"]
+    del evaluation["vllm_cfg"]["load_format"]
 
     assert (
         configure_generation_config(training, Tokenizer())["vllm_cfg"]["load_format"]
@@ -229,9 +237,11 @@ def test_worker_argv_translates_structured_fields_and_warns_unclassified() -> No
         {"tool_call_parser": "qwen3_coder", "reasoning_parser": "nemotron_nano"}
     )
     cfg = DynamoCfg.model_validate(config)
-    vllm_cfg = _config()["vllm_cfg"] | {"unclassified_field": 1}
+    generation_config = _config()
+    generation_config["vllm_cfg"]["unclassified_field"] = 1
     with pytest.warns(UserWarning, match="unclassified_field"):
-        validate_managed_vllm_config(vllm_cfg)
+        validated = DynamoConfig.model_validate(generation_config)
+    vllm_cfg = validated.vllm_cfg.model_dump()
     argv = build_dynamo_vllm_argv(
         model_name="model",
         namespace="nemo-rl-1",
@@ -251,11 +261,12 @@ def test_worker_argv_translates_structured_fields_and_warns_unclassified() -> No
 
 
 def test_worker_argv_rejects_replaced_and_managed_options() -> None:
+    generation_config = _config()
+    generation_config["vllm_cfg"]["http_server_serving_chat_kwargs"] = {
+        "tool_parser": "x"
+    }
     with pytest.raises(ValueError, match="worker_args.custom_jinja_template"):
-        validate_managed_vllm_config(
-            _config()["vllm_cfg"]
-            | {"http_server_serving_chat_kwargs": {"tool_parser": "x"}}
-        )
+        DynamoConfig.model_validate(generation_config)
     config = _dynamo_cfg()
     config["worker_args"]["extra_cli_args"] = ["--model", "other"]
     with pytest.raises(ValueError, match="--model is set by both"):
@@ -267,6 +278,20 @@ def test_worker_argv_rejects_replaced_and_managed_options() -> None:
             vllm_kwargs={},
             dynamo_cfg=DynamoCfg.model_validate(config),
         )
+
+
+def test_config_accepts_inherited_unused_sections() -> None:
+    config = _config(
+        mcore_generation_config={"some_shared_setting": True},
+        refit_cfg={"some_shared_setting": True},
+    )
+
+    validated = DynamoConfig.model_validate(config)
+
+    assert validated.model_extra["mcore_generation_config"] == {
+        "some_shared_setting": True
+    }
+    assert validated.model_extra["refit_cfg"] == {"some_shared_setting": True}
 
 
 def test_frontend_argv_and_environment_are_runtime_owned() -> None:

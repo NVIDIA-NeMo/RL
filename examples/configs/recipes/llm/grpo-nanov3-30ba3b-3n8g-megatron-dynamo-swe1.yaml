@@ -115,7 +115,6 @@ policy:
       expert_parallel_size: 4
       precision: bfloat16
       gpu_memory_utilization: 0.85
-      load_format: dummy
       enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
       env_vars: null

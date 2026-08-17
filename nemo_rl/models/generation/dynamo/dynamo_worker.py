@@ -25,7 +25,7 @@ from typing import Any
 
 import ray
 
-from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from nemo_rl.models.generation.dynamo.arguments import (
     build_dynamo_vllm_argv,
     build_managed_worker_env,
@@ -66,19 +66,11 @@ class DynamoGpuReservation:  # pragma: no cover
         excluded_ports: list[int],
     ) -> int:
         """Select an unused node-local port from a half-open range."""
-        excluded = set(excluded_ports)
-        for port in range(port_range_low, port_range_high):
-            if port in excluded:
-                continue
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                    probe.bind(("0.0.0.0", port))
-            except OSError:
-                continue
-            return port
-        raise RuntimeError(
-            "No free managed Dynamo system port is available in "
-            f"[{port_range_low}, {port_range_high})."
+        return _get_free_port_local(
+            port_range_low,
+            port_range_high,
+            max_retries=None,
+            excluded_ports=set(excluded_ports),
         )
 
     def register_process_group(self, pid: int) -> bool:
@@ -133,17 +125,13 @@ class DynamoVllmWorker:  # pragma: no cover
         self._system_port = system_port
         self._vllm_port = vllm_port
         self._process: subprocess.Popen | None = None
-        for env_name, port in (
-            ("DYN_SYSTEM_PORT", system_port),
-            ("VLLM_PORT", vllm_port),
-        ):
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                    probe.bind(("0.0.0.0", port))
-            except OSError as exc:
-                raise RuntimeError(
-                    f"{env_name} {port} is unavailable for {group_name}."
-                ) from exc
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("0.0.0.0", system_port))
+        except OSError as exc:
+            raise RuntimeError(
+                f"DYN_SYSTEM_PORT {system_port} is unavailable for {group_name}."
+            ) from exc
 
         validated_config = DynamoConfig.model_validate(config)
         dynamo_cfg = validated_config.dynamo_cfg
@@ -174,7 +162,12 @@ class DynamoVllmWorker:  # pragma: no cover
             vllm_kwargs=vllm_kwargs,
             dynamo_cfg=dynamo_cfg,
         )
-        self._validate_argv(dynamo_python, argv, worker_env)
+        self._validate_argv(
+            dynamo_python,
+            argv,
+            worker_env,
+            timeout_s=startup_timeout_s,
+        )
 
         command = [dynamo_python, "-m", "dynamo.vllm", *argv]
         relevant_env = {
@@ -207,26 +200,38 @@ class DynamoVllmWorker:  # pragma: no cover
 
     @staticmethod
     def _validate_argv(
-        dynamo_python: str, argv: list[str], env: dict[str, str]
+        dynamo_python: str,
+        argv: list[str],
+        env: dict[str, str],
+        *,
+        timeout_s: float,
     ) -> None:
         validator = Path(__file__).with_name("validate_dynamo_vllm_args.py")
-        result = subprocess.run(
-            [
-                dynamo_python,
-                str(validator),
-                json.dumps(argv),
-                json.dumps(
-                    {
-                        "buffer_size_bytes": VLLM_PACKED_BUFFER_SIZE_BYTES,
-                        "num_buffers": VLLM_PACKED_NUM_BUFFERS,
-                    }
-                ),
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        command = [
+            dynamo_python,
+            str(validator),
+            json.dumps(argv),
+            json.dumps(
+                {
+                    "buffer_size_bytes": VLLM_PACKED_BUFFER_SIZE_BYTES,
+                    "num_buffers": VLLM_PACKED_NUM_BUFFERS,
+                }
+            ),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                "Resolved dynamo.vllm argument validation exceeded "
+                f"startup_timeout_s={timeout_s}."
+            ) from error
         if result.returncode != 0:
             raise RuntimeError(
                 "Resolved dynamo.vllm arguments failed validation: "

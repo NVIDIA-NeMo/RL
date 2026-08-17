@@ -15,12 +15,10 @@
 """Validate a resolved ``dynamo.vllm`` argv without starting an engine."""
 
 import json
-import os
 import sys
 
 
 def main() -> None:
-    os.environ.setdefault("PYTHONHASHSEED", "0")
     if len(sys.argv) != 3:
         raise SystemExit(
             "usage: validate_dynamo_vllm_args.py '<json argv>' '<json packed geometry>'"

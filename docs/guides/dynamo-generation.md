@@ -111,6 +111,24 @@ Service ports and the namespace are runtime-owned rather than public config.
 | Managed runtime | Consumed or enforced by NeMo RL rather than forwarded | HTTP-wrapper enablement, metrics sampling, processed rollout logprobs |
 | Inapplicable | Ignored because the managed path owns that behavior | async mode, progress bars, NeMo RL HTTP/ZMQ refit ports |
 
+The shared GRPO base config also supplies `mcore_generation_config` and
+`refit_cfg`. Dynamo accepts these inherited sections but does not use them;
+worker arguments come from `vllm_cfg`, and refit uses the collective weight
+synchronizer.
+
+Enable and filter worker telemetry with both managed configuration sections:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 1.0
+    dynamo_cfg:
+      metrics_include_prefixes: null  # null selects the curated defaults
+      metrics_exclude_prefixes: null  # null excludes python_ and process_
+```
+
 The NCCL sender also selects vLLM's peer protocol: the policy publishes both
 the raw NeMo RL unique ID and vLLM's pickled `ncclUniqueId`, then uses the
 all-reduce warmup expected by `PyNcclCommunicator`. This protocol choice and

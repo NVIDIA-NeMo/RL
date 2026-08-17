@@ -1499,8 +1499,7 @@ def setup(
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
         print(
-            "  ✓ Using Dynamo backend "
-            f"(frontend: {policy_generation.dp_openai_server_base_urls[0]})",
+            f"  ✓ Using Dynamo backend (frontend: {policy_generation.frontend_url})",
             flush=True,
         )
 
