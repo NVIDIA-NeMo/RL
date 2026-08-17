@@ -433,6 +433,8 @@ data_plane:
     global_segment_size: 68719476736   # 64 GiB/process
     local_buffer_size:    4294967296   # 4 GiB/process
     reuse_registered_buffers: true     # reuse RDMA-registered buffers
+    cpu_staging_slots: 4                # lazily allocated registered host slots
+    cpu_staging_buffer_mb: 256          # maximum MiB per host slot
   # observability:                     # NotRequired
   #   enabled: false
 ```
@@ -445,8 +447,14 @@ would always lose the merge without warning.
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
   and small runs.
-- **`mooncake_cpu`** — Mooncake transfer engine; higher throughput at
-  scale. Required for multi-node clusters with large bulk volume.
+- **`mooncake_cpu`** — Mooncake's RDMA-only transfer engine; tensors transfer
+  through registered CPU staging. Higher throughput at scale and required for
+  multi-node clusters with large bulk volume.
+
+The CPU staging pool grows lazily up to
+`cpu_staging_slots × cpu_staging_buffer_mb` per client process. The
+defaults preserve four 256 MiB slots; setting the values to `1` and `1024`
+selects one 1 GiB slot for a controlled experiment.
 
 Capacity rule of thumb (any backend):
 

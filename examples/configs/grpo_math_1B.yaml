@@ -545,6 +545,8 @@ data_plane:
     global_segment_size: 68719476736 # 64 GiB/process
     local_buffer_size:    4294967296 # 4 GiB/process
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
+    cpu_staging_slots: 4              # lazily allocated registered host slots
+    cpu_staging_buffer_mb: 256        # maximum MiB per host slot
   # observability:                    # NotRequired
   #   enabled: false
 

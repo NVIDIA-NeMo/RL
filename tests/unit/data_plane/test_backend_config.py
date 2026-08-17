@@ -45,12 +45,19 @@ def _cfg(backend: str, **extra) -> dict:
 def test_nested_block_is_used() -> None:
     cfg = _cfg(
         "mooncake_cpu",
-        mooncake_cpu={"global_segment_size": 111, "reuse_registered_buffers": False},
+        mooncake_cpu={
+            "global_segment_size": 111,
+            "reuse_registered_buffers": False,
+            "cpu_staging_slots": 1,
+            "cpu_staging_buffer_mb": 1024,
+        },
     )
     resolved = backend_config(cfg)
     assert isinstance(resolved, MooncakeCpuConfig)
     assert resolved.global_segment_size == 111
     assert resolved.reuse_registered_buffers is False
+    assert resolved.cpu_staging_slots == 1
+    assert resolved.cpu_staging_buffer_mb == 1024
 
 
 def test_absent_block_falls_back_to_model_defaults() -> None:
@@ -59,6 +66,8 @@ def test_absent_block_falls_back_to_model_defaults() -> None:
     assert resolved.global_segment_size == MooncakeCpuConfig().global_segment_size
     # The opt-out flag defaults on, so omitting it must not disable the pool.
     assert resolved.reuse_registered_buffers is True
+    assert resolved.cpu_staging_slots == 4
+    assert resolved.cpu_staging_buffer_mb == 256
 
 
 def test_accepts_an_already_coerced_model() -> None:
@@ -72,6 +81,18 @@ def test_partial_nested_block_keeps_other_defaults() -> None:
     resolved = backend_config(cfg)
     assert resolved.local_buffer_size == 7
     assert resolved.global_segment_size == MooncakeCpuConfig().global_segment_size
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("cpu_staging_slots", 0),
+        ("cpu_staging_buffer_mb", 0),
+    ],
+)
+def test_staging_sizes_reject_invalid_values(field: str, value: int) -> None:
+    with pytest.raises(ValueError):
+        backend_config(_cfg("mooncake_cpu", mooncake_cpu={field: value}))
 
 
 @pytest.mark.parametrize(

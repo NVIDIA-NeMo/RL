@@ -23,12 +23,15 @@ it needs an RDMA device to reproduce: the pool's contract is with
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
 import pytest
 
 from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+_DEFAULT_MAX_BYTES = 256 * 1024 * 1024
 
 
 class _FakeStore:
@@ -112,7 +115,7 @@ def test_register_all_buffers_patch_checks_upstream_call_site(monkeypatch) -> No
 
 def test_growing_a_slot_unregisters_before_dropping_the_old_buffer() -> None:
     store = _FakeStore()
-    pool = tq_adapter._StagingPool(store, n_slots=1)
+    pool = tq_adapter._StagingPool(store, n_slots=1, max_bytes=_DEFAULT_MAX_BYTES)
 
     with pool.buffer(1024) as small:
         small_ptr = small.data_ptr()
@@ -133,7 +136,7 @@ def test_failed_growth_leaves_the_slot_empty_not_poisoned() -> None:
     -800, which retrying cannot fix.
     """
     store = _FakeStore(fail_after=0)
-    pool = tq_adapter._StagingPool(store, n_slots=1)
+    pool = tq_adapter._StagingPool(store, n_slots=1, max_bytes=_DEFAULT_MAX_BYTES)
 
     with pytest.raises(RuntimeError, match="register_buffer"):
         with pool.buffer(1024):
@@ -145,24 +148,29 @@ def test_failed_growth_leaves_the_slot_empty_not_poisoned() -> None:
         assert store.registered == {buf.data_ptr(): 1024}
 
 
-def test_oversized_transfer_bypasses_the_pool_and_unregisters(monkeypatch) -> None:
-    """Outliers get a transient registration; it must not outlive the call."""
-    monkeypatch.setattr(tq_adapter, "_STAGING_MAX_BYTES", 4096)
+def test_configured_max_bytes_controls_pooled_vs_transient_registration() -> None:
+    """The configured bound, rather than the old 256 MiB constant, controls reuse."""
     store = _FakeStore()
-    pool = tq_adapter._StagingPool(store, n_slots=1)
+    pool = tq_adapter._StagingPool(store, n_slots=1, max_bytes=4096)
+
+    with pool.buffer(4096) as pooled:
+        pooled_ptr = pooled.data_ptr()
+    assert store.registered == {pooled_ptr: 4096}
 
     with pool.buffer(8192) as buf:
-        assert store.registered == {buf.data_ptr(): 8192}
         oversized_ptr = buf.data_ptr()
+        assert store.registered == {pooled_ptr: 4096, oversized_ptr: 8192}
 
     assert store.unregistered == [oversized_ptr]
-    assert store.registered == {}
+    assert store.registered == {pooled_ptr: 4096}
 
 
 def test_slot_exhaustion_fails_loudly_instead_of_hanging(monkeypatch) -> None:
     """More concurrent transfers than slots must raise, not block forever."""
     monkeypatch.setattr(tq_adapter, "_STAGING_SLOT_TIMEOUT_S", 0.05)
-    pool = tq_adapter._StagingPool(_FakeStore(), n_slots=1)
+    pool = tq_adapter._StagingPool(
+        _FakeStore(), n_slots=1, max_bytes=_DEFAULT_MAX_BYTES
+    )
 
     with pool.buffer(1024):
         with pytest.raises(RuntimeError, match="No mooncake staging slot free"):
@@ -190,9 +198,9 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
     constructed: list[object] = []
     original_init = tq_adapter._StagingPool.__init__
 
-    def slow_init(self, store, n_slots):  # type: ignore[no-untyped-def]
+    def slow_init(self, store, n_slots, max_bytes):  # type: ignore[no-untyped-def]
         time.sleep(0.05)  # widen the check-then-set window
-        original_init(self, store, n_slots)
+        original_init(self, store, n_slots=n_slots, max_bytes=max_bytes)
         constructed.append(self)
 
     monkeypatch.setattr(tq_adapter._StagingPool, "__init__", slow_init)
@@ -204,7 +212,9 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
 
     def worker() -> None:
         barrier.wait()
-        seen.append(tq_adapter._staging_pool(client, 4))
+        seen.append(
+            tq_adapter._staging_pool(client, n_slots=4, max_bytes=_DEFAULT_MAX_BYTES)
+        )
 
     threads = [threading.Thread(target=worker) for _ in range(n_threads)]
     for t in threads:
@@ -215,3 +225,34 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
     assert len(constructed) == 1
     assert len(seen) == n_threads
     assert all(pool is client._nrl_staging for pool in seen)
+
+
+def test_client_forwards_configured_pool_shape(monkeypatch) -> None:
+    """The nested config must control the patch, not only document the knobs."""
+    seen: dict[str, int] = {}
+    monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
+    monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
+    monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
+    monkeypatch.setattr(
+        tq_adapter,
+        "_patch_mooncake_staging_buffers",
+        lambda **kwargs: seen.update(kwargs),
+    )
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+
+    tq_adapter.TQDataPlaneClient(
+        {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "mooncake_cpu",
+            "claim_meta_poll_interval_s": 0.5,
+            "mooncake_cpu": {
+                "reuse_registered_buffers": True,
+                "cpu_staging_slots": 1,
+                "cpu_staging_buffer_mb": 1024,
+            },
+        },
+        bootstrap=False,
+    )
+
+    assert seen == {"n_slots": 1, "max_bytes": 1024 * 1024 * 1024}

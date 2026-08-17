@@ -169,11 +169,6 @@ def maybe_configure_engine_env(cfg: DataPlaneConfig) -> None:
     os.environ.setdefault("MC_ENABLE_DEST_DEVICE_AFFINITY", "1")
 
 
-# Per-slot ceiling for the staging pool: bounds resident pinned memory at
-# n_slots x this x procs-per-node (8 GiB on an 8-GPU node). Larger transfers
-# bypass the pool.
-_STAGING_MAX_BYTES = 256 * 1024 * 1024
-
 # A slot is held for exactly one transfer, so waiting minutes for one means
 # this process runs more concurrent transfers than the pool has slots — not
 # that a transfer is slow. Fail with that diagnosis rather than block forever.
@@ -219,8 +214,9 @@ class _StagingPool:
     """RDMA-registered host buffers, owned by one mooncake client.
 
     Not thread-local: the ``ThreadPoolExecutor`` is rebuilt inside each
-    get/put, so thread-local buffers would be discarded every call. Sized to
-    the executor width so no worker normally waits for a slot.
+    get/put, so thread-local buffers would be discarded every call. The slot
+    count is configurable; fewer slots trade concurrency for a smaller set of
+    long-lived memory registrations.
 
     A slot's buffer is registered for as long as the pool holds it. The
     invariant that matters is the converse: **no buffer is ever freed while
@@ -228,19 +224,20 @@ class _StagingPool:
     the allocator immediately hands to the next caller.
     """
 
-    def __init__(self, store: Any, n_slots: int) -> None:
+    def __init__(self, store: Any, *, n_slots: int, max_bytes: int) -> None:
         self._store = store
         self._free: SimpleQueue = SimpleQueue()
         for _ in range(n_slots):
             self._free.put(None)  # allocated on first use
         self._n_slots = n_slots
+        self._max_bytes = max_bytes
 
     @contextlib.contextmanager
     def buffer(self, nbytes: int):
         # Outliers bypass the pool: slots only ever grow, so admitting one
         # long-sequence sample would pin that size in every slot for the
         # rest of the run. Registering it transiently is the cheaper trade.
-        if nbytes > _STAGING_MAX_BYTES:
+        if nbytes > self._max_bytes:
             tmp = torch.empty(nbytes, dtype=torch.uint8)
             _register_checked(self._store, tmp.data_ptr(), tmp.nbytes)
             try:
@@ -253,10 +250,10 @@ class _StagingPool:
         except Empty:
             raise RuntimeError(
                 f"No mooncake staging slot free after {_STAGING_SLOT_TIMEOUT_S}s. "
-                f"The pool has {self._n_slots} slots, sized to one TQ worker "
-                "pool, so this means overlapping put/get calls in this process. "
-                "Set data_plane.mooncake_cpu.reuse_registered_buffers=false to "
-                "fall back to upstream's per-call registration."
+                f"The pool has {self._n_slots} configured slots, so concurrent "
+                "put/get work in this process exceeded that limit. Increase "
+                "data_plane.mooncake_cpu.cpu_staging_slots or set "
+                "reuse_registered_buffers=false to use per-call registration."
             ) from None
         try:
             if buf is None or buf.nbytes < nbytes:
@@ -274,7 +271,7 @@ class _StagingPool:
             self._free.put(buf)
 
 
-def _staging_pool(client: Any, n_slots: int) -> _StagingPool:
+def _staging_pool(client: Any, *, n_slots: int, max_bytes: int) -> _StagingPool:
     """Return ``client``'s pool, building it at most once across threads.
 
     Locked because ``put``/``get`` drive the thread workers from a
@@ -289,7 +286,9 @@ def _staging_pool(client: Any, n_slots: int) -> _StagingPool:
     with _staging_pool_lock:
         pool = getattr(client, "_nrl_staging", None)
         if pool is None:
-            pool = client._nrl_staging = _StagingPool(client._store, n_slots)
+            pool = client._nrl_staging = _StagingPool(
+                client._store, n_slots=n_slots, max_bytes=max_bytes
+            )
         return pool
 
 
@@ -322,14 +321,15 @@ def _patch_mooncake_register_check() -> None:
     cls._nrl_register_checked = True
 
 
-def _patch_mooncake_staging_buffers() -> None:
+def _patch_mooncake_staging_buffers(*, n_slots: int, max_bytes: int) -> None:
     """Reuse RDMA-registered host buffers for mooncake tensor GETs and PUTs.
 
     Upstream's thread workers allocate a fresh destination per call and
     register/unregister it on the critical path. Pinning pages for DMA costs
     several times the wire time for the same bytes, and because the buffers
     are freed each call the pointers are always new, so nothing can be
-    cached. This keeps a small pool of registered buffers alive instead.
+    cached. This keeps ``n_slots`` registered buffers of at most ``max_bytes``
+    alive instead; larger individual groups retain the transient path.
 
     Monkey-patched because TransferQueue is pinned by git SHA in
     ``pyproject.toml``. Returns early, leaving upstream behaviour intact, if
@@ -356,17 +356,15 @@ def _patch_mooncake_staging_buffers() -> None:
     ):
         return
 
-    n_slots = getattr(_mc, "MAX_BATCH_WORKER_THREADS", 4)
-
     def _get_tensors_thread_worker(
         self, batch_keys, batch_shapes, batch_dtypes, indexes
     ):  # type: ignore[no-untyped-def]
-        pool = _staging_pool(self, n_slots)
+        pool = _staging_pool(self, n_slots=n_slots, max_bytes=max_bytes)
         batch_nbytes = get_nbytes(batch_dtypes, batch_shapes)
         tensors: list[Any] = [None] * len(batch_keys)
         # Split the payload to fit a bounded buffer rather than sizing the
         # buffer to the payload — this is what keeps the pool footprint fixed.
-        for idxs in split_by_bytes(batch_nbytes, _STAGING_MAX_BYTES):
+        for idxs in split_by_bytes(batch_nbytes, max_bytes):
             g_keys = [batch_keys[i] for i in idxs]
             g_nbytes = [batch_nbytes[i] for i in idxs]
             offsets, total = _aligned_offsets(g_nbytes)
@@ -387,10 +385,10 @@ def _patch_mooncake_staging_buffers() -> None:
 
     def _put_tensors_thread_worker(self, batch_keys, batch_tensors):  # type: ignore[no-untyped-def]
         """PUT direction of the GET patch: stage into the pooled buffer, then transfer."""
-        pool = _staging_pool(self, n_slots)
+        pool = _staging_pool(self, n_slots=n_slots, max_bytes=max_bytes)
         contiguous = [t.contiguous() for t in batch_tensors]
         nbytes = [t.nbytes for t in contiguous]
-        for idxs in split_by_bytes(nbytes, _STAGING_MAX_BYTES):
+        for idxs in split_by_bytes(nbytes, max_bytes):
             g_nbytes = [nbytes[i] for i in idxs]
             offsets, total = _aligned_offsets(g_nbytes)
             with pool.buffer(total) as buf:
@@ -665,6 +663,7 @@ class TQDataPlaneClient(DataPlaneClient):
         #   3. KV-path 1D promotion — works around TQ's
         #      extract_field_schema schema/data mismatch for 1D fields.
         if cfg["backend"] == "mooncake_cpu":
+            mooncake_cfg = backend_config(cfg)
             local_ip = _get_local_node_ip()
             if local_ip:
                 # Force-assign per-process: Ray actors inherit env vars
@@ -685,8 +684,11 @@ class TQDataPlaneClient(DataPlaneClient):
             # Opt-out flag, defaulted on MooncakeCpuConfig rather than here:
             # an absent mooncake_cpu block means "this backend's defaults",
             # so the pool is on unless a config deliberately turns it off.
-            if backend_config(cfg).reuse_registered_buffers:
-                _patch_mooncake_staging_buffers()
+            if mooncake_cfg.reuse_registered_buffers:
+                _patch_mooncake_staging_buffers(
+                    n_slots=int(mooncake_cfg.cpu_staging_slots),
+                    max_bytes=int(mooncake_cfg.cpu_staging_buffer_mb) * 1024 * 1024,
+                )
 
         # Workaround for TQ KVStorageManager's 1D-field schema/data
         # mismatch (only `mooncake_cpu` goes through that path; `simple`

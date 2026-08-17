@@ -39,7 +39,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PositiveInt
 from tensordict import TensorDict
 
 
@@ -65,15 +65,19 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     product in mind when raising them. Under-sizing surfaces as
     ``batch_get_tensor returned None``.
 
-    ``reuse_registered_buffers`` keeps a small pool of RDMA-registered buffers
-    alive instead of registering a fresh one per transfer. Costs up to ``4 x``
-    the largest per-task payload in resident pinned memory; set false to fall
-    back to upstream's per-call registration.
+    ``reuse_registered_buffers`` keeps a small pool of RDMA-registered host
+    buffers alive instead of registering a fresh one per CPU transfer.
+    ``cpu_staging_slots`` and ``cpu_staging_buffer_mb`` bound that pool;
+    slots grow lazily, so their product is the maximum pinned host-memory cost
+    per client. Set ``reuse_registered_buffers=false`` to fall back to
+    upstream's per-call registration.
     """
 
     global_segment_size: int = 68719476736  # 64 GiB per client process
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
+    cpu_staging_slots: PositiveInt = 4
+    cpu_staging_buffer_mb: PositiveInt = 256
 
 
 class DataPlaneConfig(TypedDict):
