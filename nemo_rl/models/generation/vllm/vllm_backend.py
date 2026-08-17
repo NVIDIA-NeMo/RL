@@ -884,12 +884,33 @@ class VllmInternalWorkerExtension:
 
         return _model_uses_unquantized_flashinfer_trtllm(self.model_runner.model)
 
-    def _validate_weight_update_compatibility(self) -> None:
+    def _validate_weight_update_compatibility(
+        self, transport: WeightUpdateTransport | None = None
+    ) -> None:
         """Reject unsupported native layerwise refit combinations."""
-        if (
-            self._uses_unquantized_flashinfer_trtllm()
-            and self._mtp_drafter_refit_enabled()
-        ):
+        if not self._uses_unquantized_flashinfer_trtllm():
+            return
+
+        if transport == "nccl_reshard":
+            realized_placements = {
+                getattr(
+                    getattr(module, "expert_map_manager", None),
+                    "placement_strategy",
+                    getattr(module, "expert_placement_strategy", "linear"),
+                )
+                for module in _unquantized_flashinfer_trtllm_modules(
+                    self.model_runner.model
+                )
+            }
+            unsupported_placements = sorted(realized_placements - {"linear"})
+            if unsupported_placements:
+                raise RuntimeError(
+                    "Unquantized FlashInfer TRTLLM nccl_reshard refit requires "
+                    "linear expert placement; realized "
+                    f"{unsupported_placements!r}"
+                )
+
+        if self._mtp_drafter_refit_enabled():
             raise RuntimeError(
                 "Unquantized FlashInfer TRTLLM refit does not yet support "
                 "a co-trained MTP drafter"
@@ -905,7 +926,7 @@ class VllmInternalWorkerExtension:
         subsequent exception therefore marks this worker permanently unusable.
         """
         if self._uses_unquantized_flashinfer_trtllm():
-            self._validate_weight_update_compatibility()
+            self._validate_weight_update_compatibility(transport)
             previous_failure = self._nrl_layerwise_reload_failure
             if previous_failure is not None:
                 raise RuntimeError(
@@ -1162,6 +1183,8 @@ class VllmInternalWorkerExtension:
         Done once ahead of refit; the cached mapping is reused by every
         ``nccl_reshard_refit`` call.
         """
+        self._validate_weight_update_compatibility("nccl_reshard")
+
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             restore_refit_info_placements,
         )

@@ -213,47 +213,32 @@ def _get_mesh_coords(mesh, rank):
 
 
 def _compute_shard_slices(global_shape, mesh_shape, mesh_coords, placements):
-    """Return the slice of the global tensor this rank owns."""
+    """Return the slice of the global tensor this rank owns.
+
+    Match DTensor's sequential ``torch.chunk`` semantics, including uneven
+    shards, so staging buffers agree with the exact-transfer implementation.
+    """
     slices = [slice(None) for _ in range(len(global_shape))]
 
     shard_map = {}
     for mesh_dim, placement in enumerate(placements):
         if isinstance(placement, Shard):
-            shard_map.setdefault(placement.dim, []).append(
-                (mesh_dim, mesh_shape[mesh_dim], mesh_coords[mesh_dim])
-            )
+            shard_map.setdefault(placement.dim, []).append(mesh_dim)
 
-    for tensor_dim, shard_info in shard_map.items():
-        shard_info.sort(key=lambda item: item[0])
-        num_chunks = 1
-        for _, size, _ in shard_info:
-            num_chunks *= size
-
-        total_size = int(global_shape[tensor_dim])
-        base = total_size // num_chunks
-        remainder = total_size % num_chunks
-        sizes = [base + 1 if i < remainder else base for i in range(num_chunks)]
-
-        strides = []
-        running = 1
-        for _, size, _ in reversed(shard_info):
-            strides.append(running)
-            running *= size
-        strides.reverse()
-
-        # linear_index = this rank's flat chunk number among num_chunks.
-        # (example: tp coord 2 * stride 1 -> linear_index = 2.)
-        linear_index = 0
-        for (mesh_dim, size, coord), stride in zip(shard_info, strides):
+    for tensor_dim, mesh_dims in shard_map.items():
+        start = 0
+        local_size = int(global_shape[tensor_dim])
+        for mesh_dim in mesh_dims:
+            size = int(mesh_shape[mesh_dim])
+            coord = int(mesh_coords[mesh_dim])
             if coord >= size:
                 raise ValueError(f"Invalid mesh coord {coord} for mesh dim {mesh_dim}.")
-            linear_index += coord * stride
-
-        # This rank owns chunk `linear_index`; its slice starts past every
-        # earlier chunk. (example: start = 64+64 = 128, end = 192 -> [128:192].)
-        start = sum(sizes[:linear_index])
-        end = start + sizes[linear_index]
-        slices[tensor_dim] = slice(start, end)
+            chunk_size = (local_size + size - 1) // size if local_size else 0
+            relative_start = min(local_size, coord * chunk_size)
+            remaining = max(0, local_size - relative_start)
+            local_size = min(chunk_size, remaining)
+            start += relative_start
+        slices[tensor_dim] = slice(start, start + local_size)
 
     return slices
 
