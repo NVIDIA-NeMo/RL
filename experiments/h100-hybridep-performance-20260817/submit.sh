@@ -56,6 +56,15 @@ if ! git -C "${PROJECT_ROOT}" cat-file -e "${BASELINE_COMMIT}^{commit}"; then
   echo "BASELINE_COMMIT is unavailable: ${BASELINE_COMMIT}" >&2
   exit 2
 fi
+if [[ -n $(git -C "${PROJECT_ROOT}" status --porcelain) ]]; then
+  echo "Launcher requires a clean source tree" >&2
+  exit 2
+fi
+if git -C "${PROJECT_ROOT}" submodule status --recursive | grep -Eq '^[+-U]'; then
+  echo "Launcher requires submodules at their recorded revisions" >&2
+  exit 2
+fi
+expected_source_commit=$(git -C "${PROJECT_ROOT}" rev-parse HEAD)
 
 row=$(awk -F $'\t' -v id="${run_id}" '
   NR > 1 && $1 == id { print; found = 1 }
@@ -72,6 +81,23 @@ config_path="${PROJECT_ROOT}/${config_rel}"
 if [[ ! -f ${config_path} ]]; then
   echo "Missing recipe: ${config_path}" >&2
   exit 2
+fi
+
+model_overrides=""
+if [[ ${model_family} == "DeepSeek-V3" ]]; then
+  : "${NRL_DEEPSEEK_V3_BF16_CKPT:?Set NRL_DEEPSEEK_V3_BF16_CKPT to the converted BF16 checkpoint}"
+  if [[ ${NRL_DEEPSEEK_V3_BF16_CKPT} != /* ]]; then
+    echo "NRL_DEEPSEEK_V3_BF16_CKPT must be an absolute path" >&2
+    exit 2
+  fi
+  if [[ ! -d ${NRL_DEEPSEEK_V3_BF16_CKPT} ]]; then
+    echo "DeepSeek-V3 checkpoint does not exist: ${NRL_DEEPSEEK_V3_BF16_CKPT}" >&2
+    exit 2
+  fi
+  printf -v checkpoint_q '%q' "${NRL_DEEPSEEK_V3_BF16_CKPT}"
+  model_overrides=" \\
+  policy.model_name=${checkpoint_q} \\
+  policy.tokenizer.name=${checkpoint_q}"
 fi
 
 expected_nodes=$(awk '
@@ -95,7 +121,22 @@ else
   config_setup="config_path=\"${config_path}\""
 fi
 
-command="${config_setup}
+source_guard="actual_source_commit=\$(git -C \"${PROJECT_ROOT}\" rev-parse HEAD)
+if [[ \${actual_source_commit} != \"${expected_source_commit}\" ]]; then
+  echo \"source revision changed after submission\" >&2
+  exit 2
+fi
+if [[ -n \$(git -C \"${PROJECT_ROOT}\" status --porcelain) ]]; then
+  echo \"source tree changed after submission\" >&2
+  exit 2
+fi
+if git -C \"${PROJECT_ROOT}\" submodule status --recursive | grep -Eq '^[+-U]'; then
+  echo \"submodule revision changed after submission\" >&2
+  exit 2
+fi"
+
+command="${source_guard}
+${config_setup}
 UV_NO_SYNC=1 uv run examples/run_grpo.py \\
   --config \"\${config_path}\" \\
   grpo.max_num_steps=${max_steps} \\
@@ -104,7 +145,7 @@ UV_NO_SYNC=1 uv run examples/run_grpo.py \\
   logger.wandb_enabled=True \\
   logger.wandb.project=\"${WANDB_PROJECT}\" \\
   logger.wandb.name=\"${run_id}\" \\
-  logger.monitor_gpus=True"
+  logger.monitor_gpus=True${model_overrides}"
 
 export BASE_LOG_DIR="${run_dir}/ray"
 export CONTAINER

@@ -10,8 +10,10 @@ configuration.
 ## Fixed software stack
 
 Both comparison arms use the same NeMo-RL source revision, container, model
-checkpoint, dataset, node count, GPU count, scheduler placement, and random
-configuration. The experiment branch combines:
+checkpoint, dataset, requested H100 topology, node count, GPU count, and random
+configuration. The launcher requires a clean source tree at submission and
+rejects a queued job if the source or submodule revision changes before it
+starts. The experiment branch combines:
 
 - the latest `main` revision at experiment creation;
 - the x86 HybridEP dependency pin from PR #3436;
@@ -64,10 +66,14 @@ recipes rely on the Megatron-LM uneven-dispatch padding path.
 2. Run matched 20-step baseline and HybridEP jobs for the four canonical sync
    recipes.
 3. Run three-step HybridEP smoke jobs for the remaining ten recipes to detect
-   OOMs and startup/runtime failures without duplicating every large baseline.
-4. Average performance metrics over optimizer steps 2 through 20, inclusive.
-   If a job records fewer steps, report the exact observed window and do not
-   compare it as a completed 20-step result.
+   startup OOMs and initialization failures without duplicating every large
+   baseline. A three-step pass is not reported as long-run OOM clearance.
+4. Keep each recipe's inherited validation schedule unchanged so the default
+   runtime path, including validation at Steps 10 and 20, is exercised.
+5. Compute steady-state training performance over Steps 2 through 20 excluding
+   validation Steps 10 and 20. Report validation-inclusive operational step
+   time separately. If a job records fewer steps, report the exact observed
+   window and do not compare it as a completed 20-step result.
 
 ## Recorded metrics
 
@@ -76,14 +82,22 @@ recipes rely on the Megatron-LM uneven-dispatch padding path.
 - end-to-end step time;
 - end-to-end throughput in tokens/second/GPU;
 - policy-training and log-probability time/throughput when logged; and
+- valid-token counts, reward, loss, and generation-KL sanity checks; and
 - W&B run URL for reproducibility.
 
 The primary speedup calculations are:
 
 ```text
-step-time speedup = baseline E2E time / HybridEP E2E time
-throughput gain   = (HybridEP throughput / baseline throughput - 1) * 100
+aggregate throughput = sum(valid tokens) / sum(E2E step time) / GPU count
+step-time speedup     = baseline E2E time / HybridEP E2E time
+throughput gain       = (HybridEP throughput / baseline throughput - 1) * 100
 ```
+
+Per-step throughput means and dispersion are secondary diagnostics. A speedup
+is interpreted only when both arms complete the same step window, process
+comparable valid-token counts, and show no reward/loss/generation-KL anomaly.
+One allocation per arm is directional evidence; allocation-to-allocation
+variance is called out rather than inferred from within-run step samples.
 
 ## Reproducibility and security
 
@@ -109,6 +123,8 @@ export WANDB_API_KEY=...
 export WANDB_PROJECT=...
 # Optional: reuse wheels built for the pinned HybridEP revision across jobs.
 export UV_CACHE_DIR_OVERRIDE=...
+# Required only by DeepSeek-V3 rows.
+export NRL_DEEPSEEK_V3_BF16_CKPT=...
 
 experiments/h100-hybridep-performance-20260817/submit.sh --list
 experiments/h100-hybridep-performance-20260817/submit.sh \
@@ -123,7 +139,10 @@ recipe is materialized from commit
 `4a1454bf430624786251d14ba0197169c8e68a5c` inside the allocated job and is
 deleted on exit. An optional absolute `UV_CACHE_DIR_OVERRIDE` is forwarded to
 `ray.sub` so a one-node dependency warmup can populate a shared wheel cache
-before large jobs allocate GPUs.
+before large jobs allocate GPUs. DeepSeek-V3 rows require an absolute converted
+BF16 checkpoint path and pass it to both `policy.model_name` and
+`policy.tokenizer.name`; without that prerequisite the launcher exits before
+submission rather than misclassifying a placeholder-config failure as an OOM.
 
 `validate_recipes.py` provides the same resolved-config gate without depending
 on the pytest console entrypoint. Run it inside the selected container before
