@@ -142,8 +142,7 @@ policy:
   max_total_sequence_length: 512
   precision: "bfloat16"
   logprob_chunk_size: null
-  offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation offloads the optimizer before refit (see offload_optimizer_for_refit)
-  offload_optimizer_for_refit: true # Offload the optimizer state to CPU around each colocated-generation refit; configs that do not inherit this default keep the optimizer on GPU (needs the extra headroom)
+  offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
 
   dtensor_cfg:
     _v2: true

@@ -359,7 +359,7 @@ def validate_and_set_config(
     # Optimizer configuration
     optimizer_cpu_offload = config["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
     offload_optimizer_for_logprob = config["offload_optimizer_for_logprob"]
-    offload_optimizer_for_refit = bool(config.get("offload_optimizer_for_refit"))
+    offload_optimizer_for_refit = bool(config.get("offload_optimizer_for_refit", True))
 
     # Reward models are not yet supported with Megatron.
     if "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]:

@@ -102,7 +102,6 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
-  offload_optimizer_for_refit: true # Offload the optimizer state to CPU around each colocated-generation refit; configs that do not inherit this default keep the optimizer on GPU (needs the extra headroom)
 
   dtensor_cfg:
     _v2: true

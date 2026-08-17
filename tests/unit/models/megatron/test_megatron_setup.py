@@ -2150,7 +2150,7 @@ class TestValidateAndSetConfig:
                 )
 
                 assert runtime_config.is_generation_colocated is True
-                assert runtime_config.offload_optimizer_for_refit is False
+                assert runtime_config.offload_optimizer_for_refit is True
 
 
 @pytest.mark.mcore
