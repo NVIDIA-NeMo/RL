@@ -77,17 +77,23 @@ echo "=== [tmp diag] device_name the adapter will pass to mooncake ==="
 # than `uv run` so this costs nothing and cannot drag a dependency sync into the test.
 # Cross-check against the "RDMA device: <name>" lines mooncake logs during the run —
 # if they disagree, mooncake ignored the list.
-ib="" roce=""
-if compgen -G "/dev/infiniband/uverbs*" >/dev/null; then
-    for dev in /sys/class/infiniband/*; do
-        case "$(cat "$dev/ports/1/link_layer" 2>/dev/null)" in
-            InfiniBand) ib="$ib,$(basename "$dev")" ;;
-            Ethernet) roce="$roce,$(basename "$dev")" ;;
-        esac
-    done
+if [[ -n "${MC_MOONCAKE_DEVICE:-}" ]]; then
+    # The override wins and is passed through verbatim, list or not.
+    selected="$MC_MOONCAKE_DEVICE"
+else
+    ib="" roce=""
+    if compgen -G "/dev/infiniband/uverbs*" >/dev/null; then
+        for dev in /sys/class/infiniband/*; do
+            case "$(cat "$dev/ports/1/link_layer" 2>/dev/null)" in
+                InfiniBand) ib="$ib,$(basename "$dev")" ;;
+                Ethernet) roce="$roce,$(basename "$dev")" ;;
+            esac
+        done
+    fi
+    selected=${ib:-$roce}
+    selected=${selected#,}
 fi
-selected=${ib:-$roce}
-echo "MC_MOONCAKE_DEVICE=${MC_MOONCAKE_DEVICE:-(unset)} -> device_name=\"${selected#,}\""
+echo "MC_MOONCAKE_DEVICE=${MC_MOONCAKE_DEVICE:-(unset)} -> device_name=\"${selected}\""
 
 echo "=== [tmp diag] MC_* env in effect / memlock ==="
 mc_env=$(env | grep '^MC_' | sort || true)
