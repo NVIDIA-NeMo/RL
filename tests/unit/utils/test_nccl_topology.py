@@ -16,11 +16,17 @@ import json
 import os
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import pytest
 
 from nemo_rl.utils.nccl_topology import (
     RdmaDevice,
+    _write_text_atomically,
     diagnose_topology,
+    main,
     read_rdma_inventory,
 )
 
@@ -170,6 +176,46 @@ def test_auto_repairs_trusted_expected_rail_and_plane_mapping() -> None:
 
     assert result.status == "repaired"
     assert result.replacement == "=data0:1:0:0,data1:1:0:1"
+
+
+def test_auto_rejects_plane_id_with_nccl_reserved_bit() -> None:
+    inventory = {
+        "data0": RdmaDevice(name="data0", ports=(1,), active_ports=(1,)),
+    }
+
+    result = diagnose_topology(
+        action="auto",
+        nccl_ib_hca="=data0:1",
+        ucx_net_devices=None,
+        expected_hcas="=data0:1:0:16384",
+        repair_source=None,
+        inventory=inventory,
+    )
+
+    assert result.status == "error"
+    assert result.replacement is None
+    assert result.errors == ("NCCL cannot use plane ID 16384",)
+
+
+def test_auto_rejects_more_than_twelve_user_defined_planes() -> None:
+    inventory = {
+        f"data{index}": RdmaDevice(name=f"data{index}", ports=(1,), active_ports=(1,))
+        for index in range(13)
+    }
+    expected_hcas = "=" + ",".join(f"data{index}:1:0:{index}" for index in range(13))
+
+    result = diagnose_topology(
+        action="auto",
+        nccl_ib_hca="=data0:1",
+        ucx_net_devices=None,
+        expected_hcas=expected_hcas,
+        repair_source=None,
+        inventory=inventory,
+    )
+
+    assert result.status == "error"
+    assert result.replacement is None
+    assert result.errors == ("NCCL supports at most 12 user-defined plane IDs; got 13",)
 
 
 def test_auto_keeps_matching_exact_selection_unchanged() -> None:
@@ -333,6 +379,52 @@ def test_strict_rejects_missing_hca_in_current_exact_selection() -> None:
     assert result.errors == ("HCA 'missing0' does not exist",)
 
 
+def test_strict_rejects_non_exact_selector_without_comparison_source() -> None:
+    inventory = {
+        "data0": RdmaDevice(name="data0", ports=(1,), active_ports=(1,)),
+    }
+
+    result = diagnose_topology(
+        action="strict",
+        nccl_ib_hca="data",
+        ucx_net_devices=None,
+        expected_hcas=None,
+        repair_source=None,
+        inventory=inventory,
+    )
+
+    assert result.status == "error"
+    assert result.replacement is None
+    assert result.errors == ("NCCL_IB_HCA must be an exact include selector",)
+
+
+@pytest.mark.parametrize(
+    ("repair_source", "expected_error"),
+    [
+        ("ucx", "NRL_NCCL_HCA_REPAIR_SOURCE=ucx requires UCX_NET_DEVICES"),
+        ("ucxx", "Unsupported HCA repair source: 'ucxx'"),
+    ],
+)
+def test_auto_rejects_invalid_or_missing_ucx_repair_source_configuration(
+    repair_source: str,
+    expected_error: str,
+) -> None:
+    inventory = {
+        "data0": RdmaDevice(name="data0", ports=(1,), active_ports=(1,)),
+    }
+
+    with pytest.raises(ValueError) as error:
+        diagnose_topology(
+            action="auto",
+            nccl_ib_hca="=data0:1",
+            ucx_net_devices=None,
+            expected_hcas=None,
+            repair_source=repair_source,
+            inventory=inventory,
+        )
+    assert str(error.value) == expected_error
+
+
 def test_strict_rejects_mismatch_with_trusted_expected_hcas() -> None:
     inventory = {
         "data0": RdmaDevice(name="data0", ports=(1,), active_ports=(1,)),
@@ -442,6 +534,30 @@ def test_read_rdma_inventory_collects_ports_netdevs_and_pci_bdf(
     }
 
 
+def test_atomic_writes_do_not_share_temporary_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "report.json"
+    barrier = threading.Barrier(2)
+    original_replace = Path.replace
+
+    def synchronized_replace(source: Path, target: Path) -> Path:
+        barrier.wait(timeout=5)
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", synchronized_replace)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(_write_text_atomically, destination, content)
+            for content in ("first", "second")
+        ]
+        for future in futures:
+            future.result()
+
+    assert destination.read_text() in {"first", "second"}
+
+
 def test_cli_default_auto_writes_sourceable_repair_and_json_report(
     tmp_path: Path,
 ) -> None:
@@ -452,6 +568,12 @@ def test_cli_default_auto_writes_sourceable_repair_and_json_report(
     report_path = tmp_path / "report.json"
     env_path = tmp_path / "repair.env"
     environment = os.environ.copy()
+    for variable in (
+        "NRL_NCCL_TOPOLOGY_ACTION",
+        "NRL_NCCL_EXPECTED_HCAS",
+        "NRL_NCCL_HCA_REPAIR_SOURCE",
+    ):
+        environment.pop(variable, None)
     environment.update(
         {
             "NCCL_IB_HCA": "=data0:1,service0:1",
@@ -503,22 +625,19 @@ def test_cli_default_auto_writes_sourceable_repair_and_json_report(
 
 def test_cli_writes_error_report_for_invalid_expected_hca_selector(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     report_path = tmp_path / "report.json"
     env_path = tmp_path / "repair.env"
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "NCCL_IB_HCA": "=data0:1",
-            "NRL_NCCL_EXPECTED_HCAS": "=invalid device:1",
-        }
-    )
+    monkeypatch.delenv("NRL_NCCL_TOPOLOGY_ACTION", raising=False)
+    monkeypatch.delenv("UCX_NET_DEVICES", raising=False)
+    monkeypatch.delenv("NRL_NCCL_HCA_REPAIR_SOURCE", raising=False)
+    monkeypatch.setenv("NCCL_IB_HCA", "=data0:1")
+    monkeypatch.setenv("NRL_NCCL_EXPECTED_HCAS", "=invalid device:1")
 
-    completed = subprocess.run(
+    exit_code = main(
         [
-            sys.executable,
-            "-m",
-            "nemo_rl.utils.nccl_topology",
             "--sysfs-root",
             str(tmp_path / "sys"),
             "--node-rank",
@@ -527,43 +646,38 @@ def test_cli_writes_error_report_for_invalid_expected_hca_selector(
             str(report_path),
             "--env-file",
             str(env_path),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
+        ]
     )
 
-    assert completed.returncode == 2
+    assert exit_code == 2
+    assert (
+        "[NRL NCCL topology][ERROR] Invalid HCA device list" in capsys.readouterr().out
+    )
     report = json.loads(report_path.read_text())
     assert report["status"] == "error"
     assert report["errors"] == ["Invalid HCA device list: '=invalid device:1'"]
     assert env_path.read_text() == ""
 
 
-def test_cli_auto_emits_warning_for_untrusted_ucx_mismatch(tmp_path: Path) -> None:
+def test_cli_auto_emits_warning_for_untrusted_ucx_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     for name in ("data0", "data1", "service0"):
         port_root = tmp_path / "sys" / "class" / "infiniband" / name / "ports" / "1"
         port_root.mkdir(parents=True)
         (port_root / "state").write_text("4: ACTIVE\n")
     report_path = tmp_path / "report.json"
     env_path = tmp_path / "repair.env"
-    environment = os.environ.copy()
-    environment.pop("NRL_NCCL_EXPECTED_HCAS", None)
-    environment.pop("NRL_NCCL_HCA_REPAIR_SOURCE", None)
-    environment.update(
-        {
-            "NRL_NCCL_TOPOLOGY_ACTION": "auto",
-            "NCCL_IB_HCA": "=data0:1,service0:1",
-            "UCX_NET_DEVICES": "data0:1,data1:1",
-        }
-    )
+    monkeypatch.delenv("NRL_NCCL_EXPECTED_HCAS", raising=False)
+    monkeypatch.delenv("NRL_NCCL_HCA_REPAIR_SOURCE", raising=False)
+    monkeypatch.setenv("NRL_NCCL_TOPOLOGY_ACTION", "auto")
+    monkeypatch.setenv("NCCL_IB_HCA", "=data0:1,service0:1")
+    monkeypatch.setenv("UCX_NET_DEVICES", "data0:1,data1:1")
 
-    completed = subprocess.run(
+    exit_code = main(
         [
-            sys.executable,
-            "-m",
-            "nemo_rl.utils.nccl_topology",
             "--sysfs-root",
             str(tmp_path / "sys"),
             "--node-rank",
@@ -572,15 +686,11 @@ def test_cli_auto_emits_warning_for_untrusted_ucx_mismatch(tmp_path: Path) -> No
             str(report_path),
             "--env-file",
             str(env_path),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
+        ]
     )
 
-    assert completed.returncode == 0
-    assert "[NRL NCCL topology][WARN]" in completed.stdout
+    assert exit_code == 0
+    assert "[NRL NCCL topology][WARN]" in capsys.readouterr().out
     report = json.loads(report_path.read_text())
     assert report["status"] == "warning"
     assert report["warnings"]

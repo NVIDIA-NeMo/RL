@@ -191,7 +191,9 @@ sbatch ray.sub \
     guarantees that `UCX_NET_DEVICES` is the authoritative GPU-data HCA list.
     This lets `auto` normalize that list into NCCL's exact-match syntax after
     validating every device and port. Without this declaration, a NCCL/UCX
-    mismatch produces a warning and is not automatically changed.
+    mismatch produces a warning and is not automatically changed. Declaring
+    `ucx` without `UCX_NET_DEVICES`, or using an unsupported source value,
+    fails validation before Ray starts.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
 * - `NODE_MANAGER_PORT=1301`

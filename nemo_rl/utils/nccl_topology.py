@@ -17,12 +17,15 @@ import json
 import os
 import re
 import shlex
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, Mapping
 
 _DEVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 _INTEGER_FIELD_PATTERN = re.compile(r"^-?[0-9]+$")
+_NCCL_IB_PLANE_VIRTUAL_BIT = 1 << 14
+_NCCL_MAX_USER_DEFINED_PLANES = 12
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,23 @@ def _device_validation_errors(
             errors.append(f"HCA {entry.name!r} has no active port")
         if entry.port is not None and entry.port not in device.active_ports:
             errors.append(f"HCA {entry.name!r} port {entry.port} is not active")
+        if (
+            entry.plane is not None
+            and entry.plane != -1
+            and entry.plane & _NCCL_IB_PLANE_VIRTUAL_BIT
+        ):
+            errors.append(f"NCCL cannot use plane ID {entry.plane}")
+    plane_ids = {
+        entry.plane
+        for entry in devices
+        if entry.plane is not None and entry.plane != -1
+    }
+    if len(plane_ids) > _NCCL_MAX_USER_DEFINED_PLANES:
+        errors.append(
+            "NCCL supports at most "
+            f"{_NCCL_MAX_USER_DEFINED_PLANES} user-defined plane IDs; "
+            f"got {len(plane_ids)}"
+        )
     return tuple(errors)
 
 
@@ -190,6 +210,15 @@ def diagnose_topology(
             candidate_only=(),
             candidate_source=None,
         )
+    if repair_source not in {None, "ucx"}:
+        raise ValueError(f"Unsupported HCA repair source: {repair_source!r}")
+    if (
+        action in {"auto", "repair"}
+        and repair_source == "ucx"
+        and not ucx_net_devices
+        and not expected_hcas
+    ):
+        raise ValueError("NRL_NCCL_HCA_REPAIR_SOURCE=ucx requires UCX_NET_DEVICES")
     if (
         action == "auto"
         and not nccl_ib_hca
@@ -209,7 +238,16 @@ def diagnose_topology(
         current = _parse_device_list(nccl_ib_hca)
     else:
         current = ()
-    if action == "strict" and current_is_exact:
+    if action == "strict":
+        if not current_is_exact:
+            return TopologyDiagnostic(
+                status="error",
+                replacement=None,
+                nccl_only=(),
+                candidate_only=(),
+                candidate_source=None,
+                errors=("NCCL_IB_HCA must be an exact include selector",),
+            )
         current_errors = _device_validation_errors(current, inventory)
         if current_errors:
             return TopologyDiagnostic(
@@ -282,15 +320,6 @@ def diagnose_topology(
                 candidate_only=candidate_only,
                 candidate_source=candidate_source,
                 errors=candidate_errors,
-            )
-        if not current_is_exact:
-            return TopologyDiagnostic(
-                status="error",
-                replacement=None,
-                nccl_only=(),
-                candidate_only=(),
-                candidate_source=candidate_source,
-                errors=("NCCL_IB_HCA must be an exact include selector",),
             )
         if nccl_only or candidate_only:
             source_description = (
@@ -386,9 +415,17 @@ def diagnose_topology(
 
 def _write_text_atomically(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_name(f".{path.name}.tmp")
-    temporary_path.write_text(content)
-    temporary_path.replace(path)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", prefix=f".{path.name}.", dir=path.parent, delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(content)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _build_report(
