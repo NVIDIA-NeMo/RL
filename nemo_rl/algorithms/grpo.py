@@ -2036,9 +2036,10 @@ def _apply_configured_message_level_advantage_penalties(
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
-    SGLang only uses async rollouts when explicitly configured with
-    ``policy.generation.use_async_rollouts``. vLLM and Megatron use async
-    rollouts when their respective ``async_engine`` config is enabled.
+    SGLang only uses async rollouts when configured with ``policy.generation.use_async_rollouts``.
+    vLLM uses async rollouts when ``vllm_cfg.async_engine`` is enabled.
+    TRT-LLM always requires ``trtllm_cfg.async_engine=true``.
+    Megatron Inference always use async rollouts and does not need a parameter.
     """
     generation_config = master_config.policy["generation"]
     if generation_config is None:
@@ -2060,7 +2061,11 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
 
     if backend == "megatron":
         mcore_cfg = generation_config.get("mcore_generation_config", {})
-        return mcore_cfg.get("async_engine", False)
+        assert mcore_cfg.get("async_engine") is None, (
+            "Megatron Inference always uses the async engine. The parameter "
+            "policy.generation.mcore_generation_config.async_engine was removed."
+        )
+        return True
 
     return False
 
@@ -2131,12 +2136,10 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
         return should_use_nemo_gym
 
     # Validate the setup for training with NeMo-Gym.
-    # Megatron Inference is exempt: there is no difference between its sync and async engines.
     generation_config = master_config.policy["generation"]
-    if generation_config["backend"] != "megatron":
-        assert _should_use_async_rollouts(master_config), (
-            "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
-        )
+    assert _should_use_async_rollouts(master_config), (
+        "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
+    )
 
     # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
     if generation_config["backend"] == "vllm":
@@ -4120,12 +4123,13 @@ def async_grpo_train(
     # SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron", "trtllm") and _should_use_async_rollouts(
-        master_config
-    ), (
-        "Async GRPO requires an async vLLM, Megatron, or TRT-LLM generation engine. "
-        "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
-        "policy.generation.mcore_generation_config.async_engine=true (Megatron), or "
+    assert backend in ("vllm", "megatron", "trtllm"), (
+        "Async GRPO supports the vLLM, Megatron, and TRT-LLM generation backends; "
+        f"got policy.generation.backend={backend!r}."
+    )
+    assert _should_use_async_rollouts(master_config), (
+        "Async GRPO requires an async generation engine. Set "
+        "policy.generation.vllm_cfg.async_engine=true (vLLM) or "
         "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM)."
     )
     assert master_config.loss_fn.use_importance_sampling_correction, (
