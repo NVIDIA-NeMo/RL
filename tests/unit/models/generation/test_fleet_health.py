@@ -288,3 +288,86 @@ class TestMetrics:
         monitor.mark_loaded(0)
         monitor.report_refit(0, weight_version=11)
         assert monitor.as_metrics()["fleet/shard_weight_version/0"] == 11.0
+
+
+class TestReportedFailureStreak:
+    """Failures seen on real requests, counted apart from probe failures.
+
+    This is the wedged-engine case, and the reason the two streaks cannot share a
+    counter: a wedged vLLM keeps answering ``is_alive`` from a perfectly healthy worker
+    process, so every probe succeeds while every generation fails.
+    """
+
+    def test_reported_failures_condemn_a_shard_that_still_answers_probes(self):
+        """The regression: ok-probes used to reset the streak, so this never fired.
+
+        report_failure delegated to record_probe(ok=False), and record_probe(ok=True)
+        zeroes the shared counter. A wedged shard answering a probe between each failure
+        therefore never reached unhealthy_threshold, which is precisely the shard the
+        reporting path exists to catch.
+        """
+        monitor = _monitor(unhealthy_threshold=3)
+        for _ in range(3):
+            monitor.record_probe(0, ok=True)  # the wedge answers every probe
+            monitor.report_failure(0, RuntimeError("generation never returned"))
+        assert monitor.state_of(0) is ShardState.DEAD
+        assert 0 not in monitor.serving_shards()
+
+    def test_one_reported_failure_only_makes_a_shard_suspect(self):
+        monitor = _monitor(unhealthy_threshold=3)
+        monitor.report_failure(1, RuntimeError("boom"))
+        assert monitor.state_of(1) is ShardState.SUSPECT
+        assert 1 in monitor.serving_shards(), "suspect shards still take traffic"
+
+    def test_a_successful_generation_clears_the_streak(self):
+        """Without this the counter is monotonic and every shard eventually dies."""
+        monitor = _monitor(unhealthy_threshold=3)
+        monitor.report_failure(2, RuntimeError("boom"))
+        monitor.report_failure(2, RuntimeError("boom"))
+        monitor.report_success(2)
+        monitor.report_failure(2, RuntimeError("boom"))
+        monitor.report_failure(2, RuntimeError("boom"))
+        assert monitor.state_of(2) is not ShardState.DEAD
+
+    def test_a_refit_clears_the_streak(self):
+        """A refit means a fresh engine; its predecessor's failures are not evidence."""
+        monitor = _monitor(unhealthy_threshold=3)
+        monitor.report_failure(3, RuntimeError("boom"))
+        monitor.report_failure(3, RuntimeError("boom"))
+        monitor.report_refit(3, weight_version=7)
+        monitor.report_failure(3, RuntimeError("boom"))
+        monitor.report_failure(3, RuntimeError("boom"))
+        assert monitor.state_of(3) is not ShardState.DEAD
+
+    def test_a_probe_failure_and_a_reported_failure_are_independent(self):
+        """Two failure kinds, two budgets: neither can quietly spend the other's."""
+        monitor = _monitor(unhealthy_threshold=3)
+        _fail(monitor, 0, times=2)
+        monitor.report_failure(0, RuntimeError("boom"))
+        monitor.report_failure(0, RuntimeError("boom"))
+        assert monitor.state_of(0) is ShardState.SUSPECT
+
+    def test_reports_are_ignored_once_a_shard_has_left_the_serving_set(self):
+        """A late report must not disturb a shard the ledger has already condemned."""
+        monitor = _monitor(unhealthy_threshold=2)
+        _fail(monitor, 1, times=2)
+        assert monitor.state_of(1) is ShardState.DEAD
+        monitor.report_failure(1, RuntimeError("late report"))
+        assert monitor.state_of(1) is ShardState.DEAD
+
+
+class TestBaseUrlLookup:
+    def test_a_known_url_maps_back_to_its_shard(self):
+        monitor = GenerationFleetMonitor(
+            shard_count=2,
+            policy=FleetHealthPolicy(),
+            base_urls=["http://a:1/v1", "http://b:2/v1"],
+        )
+        assert monitor.shard_for_base_url("http://b:2/v1") == 1
+
+    def test_an_unknown_url_maps_to_nothing(self):
+        """The router may report a backend the ledger no longer tracks."""
+        monitor = GenerationFleetMonitor(
+            shard_count=1, policy=FleetHealthPolicy(), base_urls=["http://a:1/v1"]
+        )
+        assert monitor.shard_for_base_url("http://gone:9/v1") is None

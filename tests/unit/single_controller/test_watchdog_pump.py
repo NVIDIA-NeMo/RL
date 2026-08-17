@@ -89,7 +89,6 @@ def _make_controller(
     # These tests cover stall detection, not fleet health or gym routing.
     ctrl._fleet_monitor = None
     ctrl._policy_router = None
-    ctrl._pushed_membership_epoch = -1
     return ctrl
 
 

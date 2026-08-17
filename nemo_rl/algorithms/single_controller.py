@@ -143,8 +143,6 @@ class SingleControllerActor:
         # therefore degrades to the documented off state rather than to a broken one.
         self._fleet_monitor = getattr(actor_args, "fleet_monitor", None)
         self._policy_router = getattr(actor_args, "policy_router", None)
-        # Forces the first reconcile: the router starts believing every backend serves.
-        self._pushed_membership_epoch: int = -1
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -797,6 +795,21 @@ class SingleControllerActor:
             metrics["rollout/train_steps"] = float(self._train_steps)
             if self._fleet_monitor is not None:
                 metrics.update(self._fleet_monitor.as_metrics())
+            if self._policy_router is not None:
+                # router/* counters are exactly what you want when a backend starts
+                # failing; computed since P2 landed but never published until now.
+                # Best-effort like the membership push: a router being recreated must
+                # not cost a metrics tick.
+                try:
+                    metrics.update(
+                        await self._ray_get(self._policy_router.metrics.remote())
+                    )
+                except Exception as error:  # noqa: BLE001 - metrics are advisory
+                    print(
+                        f"watchdog: router metrics unavailable this tick: "
+                        f"{type(error).__name__}: {error}",
+                        flush=True,
+                    )
             self._logger.log_metrics(metrics, step=self._train_steps)
 
             if watchdog_cfg.gym_subprocess_check:
@@ -850,10 +863,23 @@ class SingleControllerActor:
         while True:
             await asyncio.sleep(interval_s)
             await self._probe_generation_fleet()
-            # Pushed here rather than on the watchdog's clock so a membership change
-            # reaches the router at detection speed. Epoch-gated, so an unchanged
-            # serving set costs nothing.
-            await self._push_router_membership()
+            # Both of these are best-effort: they talk to a max_restarts=-1 actor that
+            # may be mid-recreation, and run() awaits this task and re-raises, so an
+            # unguarded RayActorError here would end the training job over a push that
+            # the next tick would have retried anyway. GenerationFleetExhausted from the
+            # watchdog stays the only fatal path -- the same bounded-failure contract
+            # _check_env_health follows.
+            try:
+                await self._drain_router_failures()
+                # Pushed here rather than on the watchdog's clock so a membership change
+                # reaches the router at detection speed.
+                await self._push_router_membership()
+            except Exception as error:  # noqa: BLE001 - best-effort, retried next tick
+                print(
+                    f"fleet probe: router update failed, retrying next tick: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
 
     async def _probe_generation_fleet(self) -> None:
         """Ask every serving generation shard whether it is still alive.
@@ -905,21 +931,48 @@ class SingleControllerActor:
         or a restarted router, which comes up believing every backend serves -- converges
         on the next tick without sequence numbers or replay.
 
-        Re-pushed whenever the membership epoch has moved. The epoch tracks the serving
-        set, not per-shard state, so a shard merely going SUSPECT does not churn the
-        router.
+        Pushed unconditionally, not gated on the membership epoch moving. The gate looked
+        free -- an unchanged serving set costs nothing to skip -- but it made the router's
+        own restart unrecoverable: a recreated actor rebuilds ``_serving`` as *every*
+        backend, while the epoch it was last pushed at has not moved, so the gate blocked
+        every corrective push and Gym routed to a quarantined shard for the rest of the
+        run. The payload is a short list of strings on a probe-interval timer; the gate
+        bought nothing and cost the guarantee both docstrings advertised.
+
+        It is also what makes the router's reflex drop safe: dropping a failing backend
+        locally is only correct because a later push puts it back.
         """
         if self._policy_router is None or self._fleet_monitor is None:
-            return
-        epoch = self._fleet_monitor.membership_epoch
-        if epoch == self._pushed_membership_epoch:
             return
         await self._ray_get(
             self._policy_router.set_serving_backends.remote(
                 self._fleet_monitor.serving_base_urls()
             )
         )
-        self._pushed_membership_epoch = epoch
+
+    async def _drain_router_failures(self) -> None:
+        """Fold the router's observed backend failures into the fleet ledger.
+
+        The router is the only component that sees a *wedged* engine: it answers
+        ``is_alive`` from a healthy worker process, so no probe can condemn it. The
+        router holds no monitor reference by design -- membership flows one way -- so it
+        counts failures per backend URL and this drains them here, on the tick that
+        already talks to it.
+        """
+        if self._policy_router is None or self._fleet_monitor is None:
+            return
+        counts: dict[str, int] = await self._ray_get(
+            self._policy_router.drain_backend_failures.remote()
+        )
+        for url, count in counts.items():
+            shard_idx = self._fleet_monitor.shard_for_base_url(url)
+            if shard_idx is None:
+                continue
+            for _ in range(count):
+                self._fleet_monitor.report_failure(
+                    shard_idx,
+                    RuntimeError(f"router: {count} failed request(s) to {url}"),
+                )
 
     async def _check_env_health(self, timeout_s: float) -> list[str]:
         """Ask each environment actor that exposes a health check whether it is whole.

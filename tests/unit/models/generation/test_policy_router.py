@@ -87,9 +87,13 @@ class _Harness:
             host="127.0.0.1",
             port=self.port,
             backend_timeout_s=router_kwargs.pop("backend_timeout_s", 5.0),
+            connect_timeout_s=router_kwargs.pop("connect_timeout_s", 2.0),
             no_healthy_backend_status=router_kwargs.pop(
                 "no_healthy_backend_status", 409
             ),
+            # On by default here: the reflex drop is the behaviour under test in most of
+            # these cases, and a real run only enables the router alongside fleet health.
+            health_managed=router_kwargs.pop("health_managed", True),
             **router_kwargs,
         )
         self._runner: web.AppRunner | None = None
@@ -257,6 +261,7 @@ class TestUrlStability:
             host="10.0.0.5",
             port=6000,
             backend_timeout_s=1.0,
+            connect_timeout_s=1.0,
             no_healthy_backend_status=409,
         )
         assert router.base_url() == "http://10.0.0.5:6000/v1"
@@ -273,6 +278,7 @@ class TestUrlStability:
             host="10.0.0.5",
             port=6000,
             backend_timeout_s=1.0,
+            connect_timeout_s=1.0,
             no_healthy_backend_status=409,
         )
         assert (
@@ -298,5 +304,192 @@ class TestUrlStability:
                 host="127.0.0.1",
                 port=1,
                 backend_timeout_s=1.0,
+                connect_timeout_s=1.0,
                 no_healthy_backend_status=409,
             )
+
+
+class _HangingBackend(_Backend):
+    """Accepts the connection and never answers -- a wedged vLLM engine.
+
+    The failure the probe cannot see: the worker process is alive and answers is_alive,
+    so only a real request reveals it.
+    """
+
+    def __init__(self, name: str, *, delay_s: float = 2.0):
+        super().__init__(name)
+        self.delay_s = delay_s
+
+    async def start(self) -> None:
+        app = web.Application()
+
+        async def _handle(request: web.Request) -> web.Response:
+            self.requests.append((request.method, request.path, await request.read()))
+            await asyncio.sleep(self.delay_s)
+            return web.Response(status=200, body=b"never gets here")
+
+        app.router.add_route("*", "/{tail:.*}", _handle)
+        self._runner = web.AppRunner(app, access_log=None)
+        await self._runner.setup()
+        await web.TCPSite(self._runner, "127.0.0.1", self.port).start()
+
+
+class TestBackendErrorHandling:
+    """What the router answers when a backend fails, and why the status matters.
+
+    Left to aiohttp, a wedged backend produces 504 -- which is in NeMo-Gym's rate-limit
+    retry subset, where Gym raises its own retry ceiling on every attempt. That is an
+    unbounded retry loop at backend_timeout_s per turn: exactly the hang the
+    no_healthy_backend_status validator exists to prevent, arriving through the error
+    path the validator never covered.
+    """
+
+    def test_a_wedged_backend_is_answered_500_and_never_504(self):
+        wedged, healthy = _HangingBackend("wedged"), _Backend("healthy")
+
+        async def _main():
+            async with _Harness([wedged, healthy], backend_timeout_s=0.5) as harness:
+                harness.router.set_serving_backends([wedged.url, healthy.url])
+                # Force the wedged one to be picked: least-outstanding breaks a tie by
+                # URL, and both are 127.0.0.1 on arbitrary ports.
+                harness.router._inflight[healthy.url] = 1
+                status, _, _ = await harness.call("/v1/chat/completions")
+                assert status != 504, "504 puts Gym in an unbounded retry loop"
+                # 500 is in Gym's *bounded* retry set, so Gym re-sends this one call and
+                # the next pick lands on a healthy shard -- the rollout keeps its turns.
+                assert status == 500
+
+        asyncio.run(_main())
+
+    def test_a_dead_backend_is_answered_500(self):
+        dead, healthy = _Backend("dead"), _Backend("healthy")
+
+        async def _main():
+            # dead is never started, so connecting to it is refused.
+            async with _Harness([healthy]) as harness:
+                harness.router._all_backends.append(dead.url)
+                harness.router._inflight[dead.url] = 0
+                harness.router._backend_failures[dead.url] = 0
+                harness.router.set_serving_backends([dead.url, healthy.url])
+                # Force the dead one: least-outstanding breaks the 0-0 tie by URL.
+                harness.router._inflight[healthy.url] = 1
+                status, _, _ = await harness.call("/v1/chat/completions")
+                assert status == 500
+
+        asyncio.run(_main())
+
+    def test_the_failing_backend_leaves_the_serving_set(self):
+        """The reflex. Without it least-outstanding returns the corpse to inflight=0 and
+        picks it for every subsequent request -- worse than the round-robin replaced."""
+        wedged, healthy = _HangingBackend("wedged"), _Backend("healthy")
+
+        async def _main():
+            async with _Harness([wedged, healthy], backend_timeout_s=0.5) as harness:
+                harness.router.set_serving_backends([wedged.url, healthy.url])
+                # Force the wedged one to be picked first: least-outstanding breaks the
+                # 0-0 tie by URL, and both are 127.0.0.1 on arbitrary ports.
+                harness.router._inflight[healthy.url] = 1
+                await harness.call("/v1/chat/completions")
+                assert wedged.url not in harness.router._serving
+                assert healthy.url in harness.router._serving, (
+                    "the drop is surgical -- healthy backends keep serving"
+                )
+
+        asyncio.run(_main())
+
+    def test_the_reflex_is_disarmed_without_fleet_health(self):
+        """No monitor means no membership push, so a local drop would be permanent.
+
+        A few transient blips would then drain the fleet to nothing with no way back.
+        """
+        wedged, healthy = _HangingBackend("wedged"), _Backend("healthy")
+
+        async def _main():
+            async with _Harness(
+                [wedged, healthy], backend_timeout_s=0.5, health_managed=False
+            ) as harness:
+                harness.router.set_serving_backends([wedged.url])
+                status, _, _ = await harness.call("/v1/chat/completions")
+                assert status == 500, "still a deliberate status, just no drop"
+                assert wedged.url in harness.router._serving
+
+        asyncio.run(_main())
+
+    def test_the_last_backend_failing_falls_back_to_the_no_healthy_status(self):
+        """Once the drop empties the fleet, 500 would tell Gym to retry into nothing."""
+        wedged = _HangingBackend("wedged")
+
+        async def _main():
+            async with _Harness([wedged], backend_timeout_s=0.5) as harness:
+                status, _, _ = await harness.call("/v1/chat/completions")
+                assert status == 409
+
+        asyncio.run(_main())
+
+    def test_failures_are_counted_per_backend_and_drained_once(self):
+        """The bridge to the ledger: the router counts, the controller's tick reports."""
+        wedged, healthy = _HangingBackend("wedged"), _Backend("healthy")
+
+        async def _main():
+            async with _Harness([wedged, healthy], backend_timeout_s=0.5) as harness:
+                harness.router.set_serving_backends([wedged.url])
+                await harness.call("/v1/chat/completions")
+                drained = harness.router.drain_backend_failures()
+                assert drained == {wedged.url: 1}
+                assert harness.router.drain_backend_failures() == {}, "drain resets"
+
+        asyncio.run(_main())
+
+    def test_backend_errors_are_published_as_a_metric(self):
+        wedged = _HangingBackend("wedged")
+
+        async def _main():
+            async with _Harness([wedged], backend_timeout_s=0.5) as harness:
+                await harness.call("/v1/chat/completions")
+                assert harness.router.metrics()["router/backend_error_total"] == 1.0
+
+        asyncio.run(_main())
+
+
+class TestPortBinding:
+    def test_a_port_conflict_fails_loudly_at_construction(self):
+        """Bound on the calling thread precisely so this raises where setup can see it.
+
+        Bound inside the daemon thread instead, EADDRINUSE killed that thread while
+        base_url() -- a pure string format -- kept handing Gym a URL nobody listened on,
+        and Gym retried the refused connection in an uncapped loop.
+        """
+        import socket
+
+        holder = socket.socket()
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        port = holder.getsockname()[1]
+        try:
+            router = PolicyRouterImpl(
+                backend_urls=["http://a:1/v1"],
+                host="127.0.0.1",
+                port=port,
+                backend_timeout_s=1.0,
+                connect_timeout_s=1.0,
+                no_healthy_backend_status=409,
+            )
+            with pytest.raises(OSError):
+                router.serve_in_background()
+        finally:
+            holder.close()
+
+
+class TestUnknownUrlDiagnostic:
+    def test_a_push_of_unknown_urls_is_reported(self, capsys):
+        """Silent filtering would show up only as permanent 409s with no explanation."""
+        router = PolicyRouterImpl(
+            backend_urls=["http://a:1/v1"],
+            host="127.0.0.1",
+            port=6000,
+            backend_timeout_s=1.0,
+            connect_timeout_s=1.0,
+            no_healthy_backend_status=409,
+        )
+        router.set_serving_backends(["http://a:1/v1", "http://typo:9/v1"])
+        assert "http://typo:9/v1" in capsys.readouterr().out

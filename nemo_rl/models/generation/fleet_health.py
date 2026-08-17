@@ -72,6 +72,11 @@ class ShardHealth:
     state: ShardState = ShardState.HEALTHY
     consecutive_probe_failures: int = 0
     consecutive_probe_successes: int = 0
+    # Failures observed on real generation requests, counted separately from probe
+    # failures on purpose. A wedged engine keeps answering ``is_alive``, so folding
+    # these into the probe streak lets every ok-probe reset them and the shard never
+    # reaches unhealthy_threshold. Only report_success (or a refit) clears this.
+    consecutive_reported_failures: int = 0
     restart_attempts: int = 0
     # Trainer weight version this shard was last refit to.
     weight_version: int = 0
@@ -250,8 +255,45 @@ class GenerationFleetMonitor:
         The adapters are the only components actually issuing generation requests, so
         they see failures a liveness probe cannot -- a shard that answers ``/health``
         and still errors on every generation.
+
+        Counted on its own streak rather than folded into :meth:`record_probe`. That
+        used to be the implementation, and it could not condemn the very shard it exists
+        for: a wedged engine answers ``is_alive``, so an ok-probe every
+        ``probe_interval_s`` reset the shared counter, and reported failures only
+        accumulated if ``unhealthy_threshold`` of them landed inside one probe window.
+        Under load they do; under a trickle the shard oscillated HEALTHY<->SUSPECT
+        forever. A streak that only a *successful generation* clears says what is
+        actually meant: this shard has failed N requests in a row.
         """
-        self.record_probe(shard_idx, ok=False, error=f"{type(error).__name__}: {error}")
+        shard = self._shards[shard_idx]
+        if shard.state not in _SERVING_STATES:
+            return
+        shard.consecutive_reported_failures += 1
+        shard.last_error = f"{type(error).__name__}: {error}"
+        if shard.consecutive_reported_failures >= self._policy.unhealthy_threshold:
+            self._transition(shard, ShardState.DEAD)
+        elif shard.state is ShardState.HEALTHY:
+            self._transition(shard, ShardState.SUSPECT)
+
+    def report_success(self, shard_idx: int) -> None:
+        """Record a generation that completed on this shard.
+
+        The reset half of :meth:`report_failure`. Without it the reported streak is
+        monotonic and every shard eventually reaches ``unhealthy_threshold`` given a long
+        enough run, however healthy it is.
+        """
+        self._shards[shard_idx].consecutive_reported_failures = 0
+
+    def shard_for_base_url(self, url: str) -> Optional[int]:
+        """Reverse the shard -> base URL mapping, for failures reported by URL.
+
+        The NeMo-Gym router knows its backends only as URLs; the ledger keys everything
+        by shard index.
+        """
+        for shard in self._shards.values():
+            if shard.base_url == url:
+                return shard.dp_shard_idx
+        return None
 
     def mark_restarting(self, shard_idx: int) -> None:
         """A replacement engine is being brought up for a dead shard."""
@@ -279,6 +321,9 @@ class GenerationFleetMonitor:
         shard.weight_version = weight_version
         shard.consecutive_probe_failures = 0
         shard.consecutive_probe_successes = 0
+        # A refit means a fresh engine holding current weights; whatever it failed at
+        # before is not evidence against what it is now.
+        shard.consecutive_reported_failures = 0
         shard.last_ok_at = self._clock()
         self._transition(shard, ShardState.HEALTHY)
 
