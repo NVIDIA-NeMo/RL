@@ -66,6 +66,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.rollout_timing import NemoGymRolloutTiming
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
@@ -250,6 +251,7 @@ class _FakeRolloutManager:
     def __init__(self) -> None:
         self.weight_versions: list[int] = []
         self._tq_buffer = None
+        self.rollout_timing = NemoGymRolloutTiming()
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)

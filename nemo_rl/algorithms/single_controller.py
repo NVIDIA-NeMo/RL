@@ -768,6 +768,7 @@ class SingleControllerActor:
                 timing_metrics, step=self._train_steps, prefix="timing/train"
             )
             await self._report_generation_saturation()
+            self._log_rollout_postprocess_share()
             self._timer.reset()
 
             # min sample version refers to the version each consumed sample was
@@ -951,15 +952,34 @@ class SingleControllerActor:
 
         await asyncio.to_thread(self._gen.clear_logger_metrics)
 
-    async def _telemetry_report_pump(self) -> None:
-        """Print engine saturation on a fixed cadence, independent of step boundaries.
+    def _log_rollout_postprocess_share(self) -> None:
+        """Log how NeMo-Gym rollout time splits between awaiting and postprocessing.
 
-        The step-close reporter above only runs when a step closes, so a run that stalls
+        ``NemoGym.run_rollouts`` decodes and tensorizes each result inline, on the
+        same event loop it awaits the next one from, so this share is what says
+        whether that inline work is worth moving off the actor -- and it is the
+        number to check before raising the fan-in onto a single actor.
+
+        The totals are cumulative over the run (see NemoGymRolloutTiming), so
+        reading a window means differencing the series rather than trusting one
+        point. Empty on the native rollout path, which has no Gym postprocess.
+        """
+        summary = self._rollout_manager.rollout_timing.summarize()
+        if not summary:
+            return
+        self._logger.log_metrics(
+            summary, step=self._train_steps, prefix="rollout/nemo_gym"
+        )
+
+    async def _telemetry_report_pump(self) -> None:
+        """Print telemetry on a fixed cadence, independent of step boundaries.
+
+        The step-close reporters above only run when a step closes, so a run that stalls
         before completing one emits nothing at all -- precisely the run where the numbers
         decide what to do next. This closes that gap on stdout only: with no step to log
-        against there is no meaningful step index, and writing the same ``generation/``
-        keys from two places at one step index would just have the last writer win.
-        Nothing is cleared here either, so the step-close reporting is unaffected.
+        against there is no meaningful step index, and writing the same keys from two
+        places at one step index would just have the last writer win. Nothing is cleared
+        here either, so the step-close reporting is unaffected.
 
         Never exits, including on error. It is one of the tasks ``run`` waits on, so
         returning would be read as a pump finishing and would stop the training loop over
@@ -968,6 +988,21 @@ class SingleControllerActor:
         collect: Optional[asyncio.Task[dict[str, dict[int, list[Any]]]]] = None
         while True:
             await asyncio.sleep(_TELEMETRY_REPORT_SECONDS)
+
+            # Reported first, and before anything can `continue`: these totals are
+            # local state, so unlike engine saturation they survive a generation
+            # fleet that is unreachable or is collecting no metrics at all.
+            rollout_summary = self._rollout_manager.rollout_timing.summarize()
+            if rollout_summary:
+                print(
+                    f"gym rollout phases (train_step={self._train_steps}): "
+                    f"await_results={rollout_summary['await_results']:.2f}s "
+                    f"postprocess_results={rollout_summary['postprocess_results']:.2f}s "
+                    f"postprocess_results_pct="
+                    f"{rollout_summary['postprocess_results_pct']:.2f} "
+                    f"groups={int(rollout_summary['groups'])}",
+                    flush=True,
+                )
 
             if collect is None:
                 collect = asyncio.create_task(

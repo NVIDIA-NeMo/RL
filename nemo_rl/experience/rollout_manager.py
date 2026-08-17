@@ -47,6 +47,7 @@ from nemo_rl.experience.rollouts import (
     _tensorize_by_key,
     calculate_rewards,
 )
+from nemo_rl.experience.rollout_timing import NemoGymRolloutTiming
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationDatumSpec,
@@ -1100,6 +1101,7 @@ class RolloutManager:
             else RolloutRetryPolicy.single_attempt()
         )
         self._stats = RolloutStats()
+        self._rollout_timing = NemoGymRolloutTiming()
 
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
@@ -1141,6 +1143,11 @@ class RolloutManager:
     def stats(self) -> RolloutStats:
         """Counters describing retry/skip activity so far."""
         return self._stats
+
+    @property
+    def rollout_timing(self) -> NemoGymRolloutTiming:
+        """NeMo-Gym rollout phase times pooled over the groups committed so far."""
+        return self._rollout_timing
 
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
@@ -1294,6 +1301,10 @@ class RolloutManager:
                 raise
 
             self._stats.committed += 1
+            # Pooled here rather than returned, because commit keeps only the
+            # tensors: this is the last point at which a group's rollout metrics
+            # exist at all.
+            self._rollout_timing.add(record.rollout_metrics)
             return RolloutOutcome.COMMITTED
 
         # The infrastructure budget ran out. The same failure followed the prompt across

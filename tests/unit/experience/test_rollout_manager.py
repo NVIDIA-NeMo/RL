@@ -45,6 +45,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutStats,
 )
+from nemo_rl.experience.rollout_timing import NemoGymRolloutTiming
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -114,11 +115,22 @@ class _FakeBuffer:
         return 1
 
 
+class _FakeRecord:
+    """Stand-in for PromptGroupRecord: a name to assert on, plus pooled metrics."""
+
+    def __init__(self, name: str, rollout_metrics: dict | None = None) -> None:
+        self.name = name
+        self.rollout_metrics = rollout_metrics if rollout_metrics is not None else {}
+
+    def __repr__(self) -> str:
+        return f"_FakeRecord({self.name!r})"
+
+
 class _FakeImpl:
     """Stand-in for AsyncRolloutImpl that returns a sentinel record."""
 
-    def __init__(self, record="sentinel-record", on_run=None) -> None:
-        self._record = record
+    def __init__(self, record="sentinel-record", on_run=None, rollout_metrics=None):
+        self._record = _FakeRecord(record, rollout_metrics)
         self._on_run = on_run
 
     async def run_rollout(self, input_sample):
@@ -147,6 +159,7 @@ def _make_manager(
         else RolloutRetryPolicy.single_attempt()
     )
     mgr._stats = RolloutStats()
+    mgr._rollout_timing = NemoGymRolloutTiming()
     mgr._skipped_prompts = 0
     return mgr
 
@@ -240,7 +253,7 @@ class TestGenerateAndPushFlow:
         assert len(buf.commit_calls) == 1
         gid, record, start_v, end_v = buf.commit_calls[0]
         assert gid in buf._slots
-        assert record == "r0"
+        assert record.name == "r0"
         assert start_v == 0
         assert end_v == 0
 
@@ -276,6 +289,38 @@ class TestGenerateAndPushFlow:
         _, _, start_v, end_v = buf.commit_calls[0]
         assert start_v == 7
         assert end_v == 7
+
+    def test_gym_phase_times_are_pooled_at_commit(self):
+        """commit keeps only the tensors, so this is the last look at the metrics."""
+        buf = _FakeBuffer()
+        impl = _FakeImpl(
+            rollout_metrics={
+                "timing/rollout/await_results": 8.0,
+                "timing/rollout/postprocess_results": 2.0,
+            }
+        )
+        mgr = _make_manager(buf, impl)
+
+        _run(mgr.generate_and_push({"prompt": "p"}))
+        _run(mgr.generate_and_push({"prompt": "p"}))
+
+        summary = mgr.rollout_timing.summarize()
+        assert summary["groups"] == 2.0
+        assert summary["postprocess_results_pct"] == 20.0
+
+    def test_a_failed_rollout_contributes_no_phase_times(self):
+        """Only committed groups have phase times worth pooling."""
+
+        async def _fail_rollout(_sample):
+            raise RuntimeError("injected rollout failure")
+
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(on_run=_fail_rollout))
+
+        with pytest.raises(RuntimeError):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert mgr.rollout_timing.summarize() == {}
 
     def test_concurrent_dispatch_preserves_reserve_order(self):
         """Two concurrent generate_and_push calls must reserve before either commits.

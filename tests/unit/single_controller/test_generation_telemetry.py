@@ -30,6 +30,7 @@ from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     _summarize_generation_saturation,
 )
+from nemo_rl.experience.rollout_timing import NemoGymRolloutTiming
 
 
 class TestSummarizeGenerationSaturation:
@@ -63,12 +64,26 @@ class TestSummarizeGenerationSaturation:
         assert summary == {"kv_cache_usage_mean": 0.5, "kv_cache_usage_max": 0.75}
 
 
-def _make_controller(get_logger_metrics):
+def _make_controller(get_logger_metrics, rollout_timing=None):
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._gen = SimpleNamespace(get_logger_metrics=get_logger_metrics)
+    ctrl._rollout_manager = SimpleNamespace(
+        rollout_timing=rollout_timing or NemoGymRolloutTiming()
+    )
     ctrl._train_steps = 0
     return ctrl
+
+
+def _gym_timing(await_seconds: float, postprocess_seconds: float):
+    timing = NemoGymRolloutTiming()
+    timing.add(
+        {
+            "timing/rollout/await_results": await_seconds,
+            "timing/rollout/postprocess_results": postprocess_seconds,
+        }
+    )
+    return timing
 
 
 async def _run_ticks(ctrl, seconds: float):
@@ -131,3 +146,68 @@ class TestTelemetryReportPump:
         finally:
             # Let the blocked worker thread exit so it does not outlive the test.
             release.set()
+
+    def test_rollout_phases_survive_an_unreachable_generation_fleet(
+        self, capsys, monkeypatch
+    ):
+        """These totals are local state, so they must not ride on the engine fetch."""
+        monkeypatch.setattr(sc, "_TELEMETRY_REPORT_SECONDS", 0.001)
+
+        def _unreachable():
+            raise RuntimeError("worker is gone")
+
+        ctrl = _make_controller(
+            _unreachable,
+            rollout_timing=_gym_timing(await_seconds=75.0, postprocess_seconds=25.0),
+        )
+
+        asyncio.run(_run_ticks(ctrl, 0.05))
+
+        out = capsys.readouterr().out
+        assert "gym rollout phases" in out
+        assert "postprocess_results_pct=25.00" in out
+
+    def test_the_native_rollout_path_reports_no_phases(self, capsys, monkeypatch):
+        """Only NeMo-Gym has an inline postprocess to account for."""
+        monkeypatch.setattr(sc, "_TELEMETRY_REPORT_SECONDS", 0.001)
+        ctrl = _make_controller(lambda: {"num_pending_samples": {0: [12, 12]}})
+
+        asyncio.run(_run_ticks(ctrl, 0.05))
+
+        out = capsys.readouterr().out
+        assert "gym rollout phases" not in out
+        assert "engine saturation" in out
+
+
+class TestLogRolloutPostprocessShare:
+    def _controller(self, rollout_timing):
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._rollout_manager = SimpleNamespace(rollout_timing=rollout_timing)
+        ctrl._train_steps = 7
+        ctrl._logger = SimpleNamespace(
+            logged=[],
+            log_metrics=lambda metrics, step, prefix: ctrl._logger.logged.append(
+                (metrics, step, prefix)
+            ),
+        )
+        return ctrl
+
+    def test_the_share_is_logged_as_a_series(self):
+        ctrl = self._controller(
+            _gym_timing(await_seconds=80.0, postprocess_seconds=20.0)
+        )
+
+        ctrl._log_rollout_postprocess_share()
+
+        metrics, step, prefix = ctrl._logger.logged[0]
+        assert metrics["postprocess_results_pct"] == 20.0
+        assert step == 7
+        assert prefix == "rollout/nemo_gym"
+
+    def test_nothing_is_logged_before_a_gym_group_lands(self):
+        ctrl = self._controller(NemoGymRolloutTiming())
+
+        ctrl._log_rollout_postprocess_share()
+
+        assert ctrl._logger.logged == []

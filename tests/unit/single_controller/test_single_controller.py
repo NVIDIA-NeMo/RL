@@ -32,6 +32,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.rollout_timing import NemoGymRolloutTiming
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
@@ -376,6 +377,8 @@ def _train_pump_controller(*, sampler) -> object:
         clear_logger_metrics=lambda: None,
     )
     ctrl._loss_fn = None
+    # No group has landed, so the step-close postprocess-share report no-ops too.
+    ctrl._rollout_manager = SimpleNamespace(rollout_timing=NemoGymRolloutTiming())
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
     ctrl._trainer_version = 0

@@ -54,6 +54,7 @@ from nemo_rl.experience.rollout_manager import (
     _Deadline,
     _gather_cancelling_siblings,
 )
+from nemo_rl.experience.rollout_timing import NemoGymRolloutTiming
 from nemo_rl.utils.timer import Timer
 
 
@@ -176,6 +177,7 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
         else RolloutRetryPolicy.single_attempt()
     )
     manager._stats = RolloutStats()
+    manager._rollout_timing = NemoGymRolloutTiming()
     manager._skipped_prompts = 0
     return manager
 
