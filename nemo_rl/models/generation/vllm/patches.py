@@ -19,7 +19,6 @@ from contextlib import contextmanager
 from importlib.util import find_spec
 from typing import Any, Callable, get_args
 
-
 _VLLM_SPECULATIVE_PATCH_LOCK = threading.Lock()
 _VLLM_SPECULATIVE_POST_INIT: Callable[[Any], Any] | None = None
 
