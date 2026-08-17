@@ -144,3 +144,6 @@ export UV_CACHE_DIR_OVERRIDE=...
 sbatch --test-only warm_hybridep_cache.sbatch
 sbatch warm_hybridep_cache.sbatch
 ```
+
+Container staging itself is CPU-only. Submit `stage_enroot_image.sbatch` to a
+CPU partition so a long layer extraction cannot reserve an idle GPU.
