@@ -1,18 +1,24 @@
 #!/bin/bash
-# SingleController + NeMo-Gym: the router must let Gym survive a dead shard.
+# SingleController + NeMo-Gym: kill one of two generation shards and see what holds.
 #
 # The deliberate inverse of grpo_dp_single_controller_chaos.sh. That one runs a
 # single-shard fleet and asserts a BOUNDED FAILURE -- there is nowhere to fail over to,
-# so the right outcome is a fast, attributable abort. This one runs TWO generation shards
-# and asserts SURVIVAL: kill one, and the run finishes because the fleet ledger
-# quarantines it and stops pushing its URL to the router.
+# so the right outcome is a fast, attributable abort. This one runs TWO shards, so
+# something can be routed around.
 #
-# That property -- "NeMo-Gym never has to fail over, because it holds one NeMo-RL-owned
-# URL" -- is the entire reason the router exists, and it had no functional coverage:
-# grpo_async_gym_single_controller.sh runs gpus_per_node=1, tensor_parallel_size=1, so
-# dp_size=1. With one backend _pick_backend has one choice, set_serving_backends never
-# sees a shrinking set, and the no-healthy-backend path never fires. That lane proves
-# pass-through and nothing else.
+# What it asserts depends on EXPECT (see below), because the two halves of the property
+# land in different parts of the stack. Fleet health + the router give you
+# QUARANTINE: the ledger condemns the dead shard and its URL stops being pushed, so
+# NeMo-Gym is never handed the corpse. They do NOT give you SURVIVAL -- the next weight
+# refit still broadcasts to the rank that died and hangs inside NCCL. Continuing past
+# that needs the communicator rebuild from the elastic-recovery part of the stack.
+# Asserting survival here would be asserting a property this code does not implement.
+#
+# The quarantine half is the entire reason the router exists and had no functional
+# coverage at all: grpo_async_gym_single_controller.sh runs gpus_per_node=1,
+# tensor_parallel_size=1, so dp_size=1. With one backend _pick_backend has one choice,
+# set_serving_backends never sees a shrinking set, and the no-healthy-backend path never
+# fires. That lane proves pass-through and nothing else.
 #
 # Needs >= 3 GPUs (2 generation + 1 trainer) and self-skips below that rather than
 # passing vacuously -- a green tick on a 2-GPU runner would be worse than no test.
@@ -46,6 +52,20 @@ export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 KILL_AFTER_STEPS=${KILL_AFTER_STEPS:-3}
 # Ceiling on that wait. Generous: it covers Gym data prep, engine load and spinup.
 STEADY_STATE_WAIT_S=${STEADY_STATE_WAIT_S:-1800}
+# What this run is allowed to prove, which differs by where in the stack it runs.
+#   quarantine (default) -- the ledger condemns the dead shard and the router's serving
+#                           set shrinks, i.e. NeMo-Gym stops being handed the corpse.
+#                           That is everything fleet health + the router deliver.
+#   survival             -- and the run then continues to completion. That needs the
+#                           communicator rebuild from the elastic-recovery part of the
+#                           stack: without it the next weight refit broadcasts to a rank
+#                           that no longer exists and hangs inside NCCL, so the run wedges
+#                           with the stall watchdog warning (observed: job 6258553).
+EXPECT=${EXPECT:-quarantine}
+# How long to wait for the ledger to condemn the killed shard.
+QUARANTINE_WAIT_S=${QUARANTINE_WAIT_S:-300}
+# Watchdog ticks to let pass so the post-quarantine metrics are published and flushed.
+METRICS_SETTLE_S=${METRICS_SETTLE_S:-90}
 # How long to wait for generation actors to appear.
 ACTOR_WAIT_S=${ACTOR_WAIT_S:-600}
 ACTOR_QUERY_TIMEOUT_S=${ACTOR_QUERY_TIMEOUT_S:-120}
@@ -223,34 +243,74 @@ VICTIM=${ACTORS[0]}
 echo "[failover] killing generation actor $VICTIM"
 kill -9 "$VICTIM" 2>/dev/null || true
 
-echo "[failover] waiting for the run to finish on the surviving shard..."
-set +e
-wait $TRAIN_PID
-RUN_RC=$?
-set -e
+# The ledger condemning the shard is the first thing to establish either way: without it
+# the kill landed somewhere irrelevant and nothing below means anything.
+echo "[failover] waiting up to ${QUARANTINE_WAIT_S}s for the shard to be quarantined..."
+QUARANTINED=0
+for _ in $(seq 1 "$QUARANTINE_WAIT_S"); do
+    if grep -qE "gen_fleet: shard [0-9]+ (healthy|suspect) -> dead" "$RUN_LOG"; then
+        QUARANTINED=1
+        break
+    fi
+    sleep 1
+done
 
-if (( RUN_RC != 0 )); then
-    echo "[failover] FAIL: the run died after losing one of two shards (rc=$RUN_RC)."
-    echo "[failover] Surviving on N-1 shards is the property under test."
-    tail -80 "$RUN_LOG"
-    exit 1
-fi
-
-# The run completing is necessary but not sufficient: it must have completed *because*
-# the shard was quarantined and traffic moved, not because the kill missed.
-grep -qE "gen_gen_fleet: shard [0-9]+ (healthy|suspect) -> dead" "$RUN_LOG" || {
-    echo "[failover] FAIL: no shard was quarantined -- the kill did not land where it matters."
+if (( QUARANTINED == 0 )); then
+    echo "[failover] FAIL: no shard was quarantined in ${QUARANTINE_WAIT_S}s --"
+    echo "[failover] the kill did not land where it matters."
     grep -iE "gen_fleet|router" "$RUN_LOG" | tail -30
     exit 1
-}
-echo "[failover] shard quarantined, run completed on the survivor."
+fi
+echo "[failover] shard quarantined:"
+grep -oE "gen_fleet: shard [0-9]+ [a-z]+ -> [a-z]+" "$RUN_LOG" | sed 's/^/[failover]   /'
+
+if [[ "$EXPECT" == "survival" ]]; then
+    echo "[failover] EXPECT=survival: waiting for the run to finish on the survivor..."
+    set +e
+    wait $TRAIN_PID
+    RUN_RC=$?
+    set -e
+    if (( RUN_RC != 0 )); then
+        echo "[failover] FAIL: the run died after losing one of two shards (rc=$RUN_RC)."
+        echo "[failover] Surviving on N-1 shards is the property under test here."
+        tail -80 "$RUN_LOG"
+        exit 1
+    fi
+    echo "[failover] run completed on the survivor."
+else
+    # EXPECT=quarantine. Deliberately does NOT wait for completion, because on this part
+    # of the stack it cannot come: the refit still broadcasts to the rank that just died
+    # and hangs inside NCCL, so the rollout pump stays parked behind _rollout_permitted
+    # and the stall watchdog warns forever. Job 6258553 sat exactly there for 33 minutes.
+    # Rebuilding the communicator over the survivors is the elastic-recovery PR's job.
+    echo "[failover] EXPECT=quarantine: letting the watchdog publish, then stopping the run."
+    sleep "$METRICS_SETTLE_S"
+    kill -TERM $TRAIN_PID 2>/dev/null || true
+    for _ in $(seq 1 30); do kill -0 $TRAIN_PID 2>/dev/null || break; sleep 1; done
+    kill -9 $TRAIN_PID 2>/dev/null || true
+    wait $TRAIN_PID 2>/dev/null || true
+fi
 
 uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 
-# gen_kl_error is the assertion that earns its keep: it compares vLLM's logprobs against
-# the trainer's recomputation, so a router that corrupted or truncated a response during
-# the failover would blow it up. A run that merely completes would not prove the payload
-# survived the hop.
-uv run tests/check_metrics.py "$JSON_METRICS" \
-    'median(data["train/gen_kl_error"]) < 1.3' \
-    'max(data["train/reward"]) > 0'
+# gen_kl_error compares vLLM's logprobs against the trainer's recomputation, so a router
+# that corrupted or truncated a response would blow it up. A run that merely survives
+# would not prove the payload came through the extra hop intact.
+COMMON_CHECKS=(
+    'median(data["train/gen_kl_error"]) < 1.3'
+    # The router-level property this test exists for: the serving set actually shrank, so
+    # NeMo-Gym stops being handed the dead backend. Asserted on the router's own counter
+    # rather than on a log line, because that counter is what routing reads.
+    'min(data["router/serving_backends"]) == 1'
+    'max(data["gen_fleet/shards/dead"]) >= 1'
+)
+
+if [[ "$EXPECT" == "survival" ]]; then
+    uv run tests/check_metrics.py "$JSON_METRICS" \
+        "${COMMON_CHECKS[@]}" \
+        'max(data["train/reward"]) > 0'
+else
+    uv run tests/check_metrics.py "$JSON_METRICS" "${COMMON_CHECKS[@]}"
+fi
+
+echo "[failover] PASS (EXPECT=$EXPECT)"

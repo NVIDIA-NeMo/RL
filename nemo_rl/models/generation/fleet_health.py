@@ -419,7 +419,7 @@ class GenerationFleetHealth:
         previous = shard.state
         shard.state = new_state
         print(
-            f"gen_gen_fleet: shard {shard.dp_shard_idx} {previous.value} -> {new_state.value}"
+            f"gen_fleet: shard {shard.dp_shard_idx} {previous.value} -> {new_state.value}"
             + (f" ({shard.last_error})" if shard.last_error else ""),
             flush=True,
         )

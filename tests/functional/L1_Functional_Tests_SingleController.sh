@@ -56,11 +56,26 @@ run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controll
 # ...and the property that run CANNOT prove. It is dp_size=1, so _pick_backend has one
 # choice, the serving set never shrinks, and the no-healthy-backend path never fires: it
 # demonstrates pass-through, not failover. This one runs two generation shards, kills one
-# mid-run, and asserts the run FINISHES -- which is the entire reason the router exists.
+# mid-run, and asserts the serving set shrinks so NeMo-Gym stops being handed the corpse.
+#
+# EXPECT defaults to quarantine deliberately. Surviving the loss needs the communicator
+# rebuild that lands later in this stack -- without it the next refit broadcasts to the
+# dead rank and hangs in NCCL (job 6258553 sat there for 33 minutes). Asserting survival
+# here would assert a property this part does not implement.
 #
 # Needs >= 3 GPUs (2 generation + 1 trainer) and self-skips below that, so it is inert on
 # the 2-GPU L1 runners and only does its job on a larger box.
 run_test uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
+
+# ...and now the other half, which only this part of the stack can satisfy. Same kill,
+# but the run must CONTINUE: reconcile_communicator rebuilds the refit group over the
+# survivors, so the broadcast no longer addresses the rank that died. Before this, that
+# refit hung inside NCCL and the run wedged with the stall watchdog warning -- quarantine
+# without recovery (job 6258553).
+#
+# The Gym-path counterpart of grpo_sc_generation_shard_recovery.sh, which covers the same
+# recovery on the native path.
+run_test env EXPECT=survival uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
 # Full mode only: kills a generation shard and asserts the run carries on. Needs >= 3
 # GPUs so that losing a shard still leaves a fleet, and self-skips below that rather
 # than passing vacuously.
