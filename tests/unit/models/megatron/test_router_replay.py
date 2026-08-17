@@ -56,6 +56,19 @@ def test_validate_router_replay_config_allows_prefix_cache_default():
 
 
 @pytest.mark.mcore
+def test_validate_router_replay_config_allows_megatron_backend():
+    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
+
+    config = {
+        "router_replay": {"enabled": True},
+        "generation": {"backend": "megatron"},
+        "megatron_cfg": {"enabled": True},
+    }
+
+    validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
 def test_normalize_routed_experts_dense_batch_uses_seq_major_order():
     from nemo_rl.models.megatron.router_replay import (
         _normalize_routed_experts_for_mcore,

@@ -229,6 +229,7 @@ from nemo_rl.models.megatron.draft.utils import (
 )
 from nemo_rl.models.megatron.router_replay import (
     clear_global_router_replay_instances,
+    rebuild_global_router_replay_registry,
     router_replay_enabled,
     validate_router_replay_config,
 )
@@ -834,7 +835,12 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
+
+    # Enable the dynamic-inference engine's MoE routing recorder when router replay (R3)
+    # is on, so the Megatron-inference generate path produces routing_indices to replay.
     model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
+    if router_replay_enabled(config):
+        model_cfg.moe_router_fusion = False
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -1657,6 +1663,7 @@ def setup_reference_model_state(
     megatron_cfg: ConfigContainer,
     pretrained_path: str,
     pre_load_checkpoint_hook: Optional[Callable] = None,
+    policy_model: Optional[Any] = None,
 ) -> dict:
     """Setup the reference model for inference and return its state dict."""
     # Create reference checkpoint config
@@ -1786,7 +1793,10 @@ def setup_reference_model_state(
         else:
             print("Reference model not loaded")
     finally:
-        clear_global_router_replay_instances()
+        if policy_model is not None:
+            rebuild_global_router_replay_registry(policy_model)
+        else:
+            clear_global_router_replay_instances()
 
     return reference_state_dict
 

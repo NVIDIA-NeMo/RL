@@ -18,9 +18,15 @@ import inspect
 import os
 from collections.abc import Iterable
 from functools import wraps
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+    from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+        TextGenerationController,
+    )
 
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
@@ -50,6 +56,58 @@ def configure_vllm_for_router_replay(config: PolicyConfig) -> None:
     vllm_kwargs["enable_return_routed_experts"] = True
 
 
+def sync_model_config_for_router_replay(model: Any, config: PolicyConfig) -> None:
+    """Ensure the built mcore model config enables inference routing recording."""
+    if not router_replay_enabled(config):
+        return
+    model_config = _unwrap_model_config(model)
+    if model_config is None:
+        return
+    model_config.moe_enable_routing_replay = True
+    # Fused TE top-k bypasses RouterReplay.RECORD; force the replay-capable path.
+    model_config.moe_router_fusion = False
+
+
+def assert_megatron_inference_router_replay_ready(
+    model: Any, inference_context: Any, config: PolicyConfig
+) -> None:
+    """Fail fast when router replay is on but the inference engine cannot record routing."""
+    if not router_replay_enabled(config):
+        return
+
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    model_config = getattr(model, "config", None)
+    if model_config is None or not getattr(
+        model_config, "moe_enable_routing_replay", False
+    ):
+        raise RuntimeError(
+            "policy.router_replay.enabled=true requires model.config."
+            "moe_enable_routing_replay=True before Megatron inference starts."
+        )
+
+    if getattr(model_config, "num_moe_experts", None) in (None, 0):
+        raise RuntimeError(
+            "policy.router_replay.enabled=true requires a MoE model with "
+            "num_moe_experts > 0."
+        )
+
+    if not RouterReplay.global_router_replay_instances:
+        raise RuntimeError(
+            "policy.router_replay.enabled=true but no RouterReplay instances "
+            "were registered on the model. Ensure setup_model_config applied "
+            "moe_enable_routing_replay before the model was built."
+        )
+
+    if getattr(inference_context, "moe_routing_metadata", None) is None:
+        raise RuntimeError(
+            "policy.router_replay.enabled=true but the Megatron dynamic "
+            "inference context has no moe_routing_metadata. The inference "
+            "engine was likely initialized before moe_enable_routing_replay "
+            "was enabled; restart the job after enabling router replay."
+        )
+
+
 def validate_router_replay_config(config: PolicyConfig) -> None:
     if not router_replay_enabled(config):
         return
@@ -57,8 +115,11 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
     generation = config.get("generation") or {}
     megatron_cfg = config.get("megatron_cfg") or {}
 
-    if generation.get("backend") != "vllm":
-        raise ValueError("router_replay.enabled requires vLLM generation.")
+    generation_backend = generation.get("backend")
+    if generation_backend not in ("vllm", "megatron"):
+        raise ValueError(
+            "router_replay.enabled requires vLLM or Megatron generation."
+        )
     if not megatron_cfg.get("enabled", False):
         raise ValueError("router_replay.enabled requires the Megatron policy backend.")
 
@@ -102,8 +163,37 @@ def _unwrap_model_config(model: Any) -> Optional[Any]:
     return None
 
 
+def _hybrid_moe_layer_numbers(hybrid_layer_pattern: str, num_layers: int) -> list[int]:
+    # Deferred import: megatron.core is only available inside the Megatron worker venv.
+    from megatron.core.models.hybrid.hybrid_layer_allocation import (
+        Symbols,
+        parse_hybrid_pattern,
+    )
+
+    main_pattern = parse_hybrid_pattern(hybrid_layer_pattern).main_pattern or ""
+    # '|' marks a pipeline-stage boundary, not a layer; every other symbol occupies one slot.
+    layer_symbols = [symbol for symbol in main_pattern if symbol != Symbols.PIPE]
+    if len(layer_symbols) != num_layers:
+        raise ValueError(
+            f"hybrid_layer_pattern main segment has {len(layer_symbols)} layers "
+            f"but num_layers={num_layers} (pattern={hybrid_layer_pattern!r})"
+        )
+    return [
+        layer_idx + 1
+        for layer_idx, symbol in enumerate(layer_symbols)
+        if symbol == Symbols.MOE
+    ]
+
+
 def _global_moe_layer_numbers(model_config: Any) -> list[int]:
     num_layers = int(getattr(model_config, "num_layers"))
+
+    # Hybrid Mamba/attention models place MoE layers via 'E' symbols of hybrid_layer_pattern
+    # and leave moe_layer_freq at its default of 1, which would wrongly claim every layer is MoE.
+    hybrid_layer_pattern = getattr(model_config, "hybrid_layer_pattern", None)
+    if hybrid_layer_pattern:
+        return _hybrid_moe_layer_numbers(hybrid_layer_pattern, num_layers)
+
     moe_layer_freq = getattr(model_config, "moe_layer_freq", 1)
 
     if isinstance(moe_layer_freq, int):
@@ -530,3 +620,192 @@ def clear_global_router_replay_instances() -> None:
     from megatron.core.transformer.moe.router_replay import RouterReplay
 
     RouterReplay.clear_global_router_replay_instances()
+
+
+def rebuild_global_router_replay_registry(model: Any) -> None:
+    """Re-register policy RouterReplay instances after a temporary model build.
+
+    Reference-model setup builds a throwaway Megatron model whose RouterReplay
+    objects register globally, then clears the global list. Megatron inference
+    recording uses that global list, so we must restore the live policy model's
+    instances before generation starts.
+    """
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+    from megatron.core.utils import unwrap_model
+
+    instances = _router_replay_instances_for_model(unwrap_model(model))
+    if not instances:
+        return
+
+    RouterReplay.clear_global_router_replay_instances()
+    # Preserve module-walk order to match RouterReplay() instantiation order.
+    RouterReplay.global_router_replay_instances.extend(
+        replay_instance for replay_instance, _ in instances
+    )
+
+
+def reset_moe_routing_metadata_buffer(inference_context: Any) -> None:
+    """Drop cached MoE routing CUDA-graph buffers so they resize to the live registry."""
+    metadata = getattr(inference_context, "moe_routing_metadata", None)
+    if metadata is None:
+        return
+    metadata.routing_indices_buffer = None
+    metadata.num_moe_layers = None
+
+
+_DYNAMIC_STEP_BOOKKEEPING_ORIG = None
+_ASYNC_BOOKKEEP_ORIG = None
+_ROUTER_REPLAY_INFERENCE_PATCHED = False
+
+
+def _nrl_dynamic_step_context_bookkeeping(
+    self: TextGenerationController,
+) -> Dict[str, Any]:
+    """Reconstruct MoE routing for finished requests before KV blocks are released."""
+    from torch.cuda.nvtx import range_pop, range_push
+
+    context = self.inference_wrapped_model.inference_context
+    active_request_count = context.total_request_count - context.paused_request_count
+    active_request_slice = slice(context.paused_request_count, context.total_request_count)
+
+    range_push("transfer_samples_to_cpu")
+    sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
+        active_request_count
+    )
+    range_pop()
+
+    range_push("active_request_mask")
+    active_request_ids = context.request_ids[active_request_slice].long()
+    active_sequence_lengths = context.get_active_sequence_lengths()
+    active_sequence_lengths += 1
+    max_sequence_lengths = context.get_max_sequence_lengths()
+
+    active_request_mask = (
+        sampled_tokens_cpu
+        != context.active_request_metadata["termination_id"][:active_request_count]
+    ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+
+    if self._get_stop_word_finished_ids_callback is not None:
+        request_ids_list = active_request_ids.tolist()
+        stop_word_finished_ids = self._get_stop_word_finished_ids_callback(
+            request_ids_list
+        )
+        if stop_word_finished_ids:
+            for idx, request_id in enumerate(request_ids_list):
+                if request_id in stop_word_finished_ids:
+                    active_request_mask[idx] = 0
+
+    finished_idxs = (
+        torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
+        + context.paused_request_count
+    )
+    finished_request_ids = context.request_ids[finished_idxs]
+
+    finished_routing_indices: Dict[int, Any] = {}
+    if context.moe_enable_routing_replay and finished_idxs.numel() > 0:
+        for fidx in finished_idxs.tolist():
+            req_id = int(context.request_ids[fidx].item())
+            blocks = context.request_to_kv_block_ids[fidx]
+            valid = blocks[blocks >= 0].tolist()
+            if not valid:
+                continue
+            total_tokens = int(
+                active_sequence_lengths[fidx - context.paused_request_count].item()
+            )
+            routing = context.kv_block_allocator.reconstruct_routing_from_blocks(
+                valid, total_tokens - 1
+            )
+            if routing is not None:
+                finished_routing_indices[req_id] = routing
+
+    new_sample_copy = sampled_tokens_cpu.clone()
+    range_pop()
+
+    range_push("update_requests")
+    update_result = context.update_requests(
+        active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
+    )
+    range_pop()
+
+    return {
+        "active_request_ids": active_request_ids,
+        "finished_request_ids": finished_request_ids,
+        "sample": sampled_tokens_cpu,
+        "finished_routing_indices": finished_routing_indices,
+        **(update_result or {}),
+    }
+
+
+async def _nrl_async_bookkeep(
+    self: DynamicInferenceEngine,
+    step_result: Optional[Dict[str, Any]],
+    context_state: Dict[str, Any],
+    step_time: float,
+):
+    """Apply pre-reconstructed routing before upstream post_process."""
+    if step_result is not None:
+        finished_routing_indices = step_result.get("finished_routing_indices")
+        if finished_routing_indices:
+            for request_id, routing in finished_routing_indices.items():
+                if request_id in self.requests:
+                    self.get_request(request_id).routing_indices = routing
+        step_result = dict(step_result)
+        step_result.pop("finished_routing_block_ids", None)
+    assert _ASYNC_BOOKKEEP_ORIG is not None
+    return await _ASYNC_BOOKKEEP_ORIG(self, step_result, context_state, step_time)
+
+
+def apply_router_replay_inference_patches() -> None:
+    """Patch dynamic inference for early router-replay reconstruction."""
+    global _DYNAMIC_STEP_BOOKKEEPING_ORIG, _ASYNC_BOOKKEEP_ORIG, _ROUTER_REPLAY_INFERENCE_PATCHED
+    if _ROUTER_REPLAY_INFERENCE_PATCHED:
+        return
+    try:
+        from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+        from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+            TextGenerationController,
+        )
+    except ImportError:
+        print(
+            "router_replay: Megatron inference modules are not importable; "
+            "skipping router-replay inference patches."
+        )
+        return
+
+    _DYNAMIC_STEP_BOOKKEEPING_ORIG = (
+        TextGenerationController._dynamic_step_context_bookkeeping
+    )
+    TextGenerationController._dynamic_step_context_bookkeeping = (
+        _nrl_dynamic_step_context_bookkeeping
+    )
+
+    _ASYNC_BOOKKEEP_ORIG = DynamicInferenceEngine.async_bookkeep
+    DynamicInferenceEngine.async_bookkeep = _nrl_async_bookkeep
+
+    _ROUTER_REPLAY_INFERENCE_PATCHED = True
+    print(
+        "[router_replay] patched TextGenerationController."
+        "_dynamic_step_context_bookkeeping and DynamicInferenceEngine.async_bookkeep "
+        "for early router-replay routing reconstruction."
+    )
+
+
+def restore_router_replay_inference_patches() -> None:
+    """Restore Megatron inference entry points patched by this module (for tests)."""
+    global _DYNAMIC_STEP_BOOKKEEPING_ORIG, _ASYNC_BOOKKEEP_ORIG, _ROUTER_REPLAY_INFERENCE_PATCHED
+    if not _ROUTER_REPLAY_INFERENCE_PATCHED:
+        return
+    from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+    from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+        TextGenerationController,
+    )
+
+    if _DYNAMIC_STEP_BOOKKEEPING_ORIG is not None:
+        TextGenerationController._dynamic_step_context_bookkeeping = (
+            _DYNAMIC_STEP_BOOKKEEPING_ORIG
+        )
+    if _ASYNC_BOOKKEEP_ORIG is not None:
+        DynamicInferenceEngine.async_bookkeep = _ASYNC_BOOKKEEP_ORIG
+    _DYNAMIC_STEP_BOOKKEEPING_ORIG = None
+    _ASYNC_BOOKKEEP_ORIG = None
+    _ROUTER_REPLAY_INFERENCE_PATCHED = False
