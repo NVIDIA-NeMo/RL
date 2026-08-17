@@ -824,7 +824,7 @@ class TestNativeTQRecoverySetup:
         restored_metadata = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
             policy,
             last_checkpoint_path=str(checkpoint_path),
-            save_state={"current_step": 3, "current_epoch": 1},
+            save_state=_save_state(),
             partition_id="rollout_data",
             sampler_name="windowed",
         )
