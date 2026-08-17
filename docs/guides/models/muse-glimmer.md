@@ -214,9 +214,6 @@ Validation accuracy reaches ~0.84 by step 20 and **holds 0.79-0.84 through step 
 the policy keeps exploring. Steps are ~3x slower than GRPO because dynamic sampling
 over-generates (`batch_multiplier: 3`) to fill each batch with mixed-outcome prompts.
 
-The two curves below cover roughly the first 70 steps of their runs, so they are
-**partial runs**, not completed ones.
-
 **6k, CP4** — the middle ground.
 
 ![Muse Glimmer 6k GRPO training curves](../../assets/muse-glimmer/muse_glimmer_6k_grpo_curve.png)
