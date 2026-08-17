@@ -93,24 +93,30 @@ jobs:
           retries: 3
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
-            const result = await github.graphql(`
-              query($owner: String!, $repo: String!) {
-                repository(owner: $owner, name: $repo) {
-                  pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
-                    nodes {
-                      number
+            let nodes = [];
+            try {
+              const result = await github.graphql(`
+                query($owner: String!, $repo: String!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                      nodes {
+                        number
+                      }
                     }
                   }
                 }
-              }
-            `, { owner, repo });
+              `, { owner, repo });
+              nodes = result.repository.pullRequests.nodes;
+            } catch (error) {
+              core.warning(`Could not query recent PR cache refs; continuing with the standard caches: ${error.message}`);
+            }
 
-            const refs = result.repository.pullRequests.nodes
+            const refs = nodes
               .map(({ number }) => `type=registry,ref=${process.env.REGISTRY}/${process.env.IMAGE_NAME}:${number}-buildcache,mode=max`)
               .join("\n");
 
             core.setOutput("cache-from", refs);
-            core.info(`Found ${result.repository.pullRequests.nodes.length} recently merged PR cache refs.`);
+            core.info(`Found ${nodes.length} recently merged PR cache refs.`);
 
       - name: Compute build metadata
         id: build_meta
