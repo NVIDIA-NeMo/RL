@@ -27,11 +27,13 @@ recipe.
 > state-dict adapter. A follow-up PR will add and validate the AutoModel recipe
 > and nightly coverage.
 
-## Nightly Smoke Recipe
+## Nightly Recipe
 
-The recipe uses two nodes with eight GPUs per node, a 512-token total sequence
-length, and a deliberately small rollout batch. The nightly driver runs one
-training step.
+The recipe inherits the Qwen3.5-9B Megatron GRPO defaults, including a
+4,096-token maximum sequence length. It uses two nodes with eight GPUs per
+node, 16 prompts per step, eight generations per prompt, and a global training
+batch size of 128. The nightly driver runs 10 training steps with checkpointing
+enabled, saving at step 10.
 
 | Algorithm | Backend | Scale | Recipe |
 | --- | --- | --- | --- |
@@ -44,5 +46,5 @@ uv run examples/run_grpo.py \
   --config examples/configs/recipes/llm/grpo-qwen3.8-27b-2n8g-megatron.yaml
 ```
 
-For a real training run, increase the sequence length, rollout batch, and step
-count for the target workload, then validate convergence separately.
+This remains a functional validation recipe rather than a convergence recipe;
+validate longer training separately for the target workload.
