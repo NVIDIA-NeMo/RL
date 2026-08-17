@@ -95,6 +95,27 @@ echo "${mc_env:-(no MC_* set)}"
 echo "memlock soft=$(ulimit -Sl) hard=$(ulimit -Hl)"
 echo "=== [tmp diag] end ==="
 
+# TEMPORARY, pairs with the block above. TransferQueue starts mooncake_master
+# (which also hosts the HTTP metadata server on :50050) with its stdout and
+# stderr redirected to /tmp/mooncake_master.log, so none of it reaches the CI
+# log. When the store fails with rc=-200 / "Couldn't connect to <ip>:50050",
+# that file holds the only account of why -- TQ waits a flat 3s and checks the
+# process is alive, never that the port accepts connections. Dump it on exit so
+# it survives the failing run.
+dump_mooncake_master_log() {
+    echo "=== [tmp diag] /tmp/mooncake_master.log ==="
+    if [[ -f /tmp/mooncake_master.log ]]; then
+        tail -60 /tmp/mooncake_master.log
+    else
+        echo "(absent -- mooncake_master was never started)"
+    fi
+    echo "=== [tmp diag] listeners on 50050/50051 ==="
+    # ss and netstat are both often missing from the image; /proc always works.
+    # Ports are hex in /proc/net/tcp: 50050=C382, 50051=C383.
+    grep -iE ':(C382|C383) ' /proc/net/tcp 2>/dev/null || echo "(no listener on 50050/50051)"
+}
+trap dump_mooncake_master_log EXIT
+
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
