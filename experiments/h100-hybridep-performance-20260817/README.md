@@ -92,3 +92,31 @@ W&B project from environment variables. Reports must not contain private host
 aliases, filesystem paths, scheduler metadata, credentials, or job IDs. Public
 artifacts may include Git commit SHAs, recipe names, hardware type, aggregate
 metrics, and W&B links explicitly approved for sharing.
+
+## Launcher
+
+`matrix.tsv` defines the four A/B pairs and ten additional smoke runs.
+`submit.sh` validates the selected recipe and requires all infrastructure values
+through the environment:
+
+```bash
+export SBATCH_ACCOUNT=...
+export CONTAINER=...
+export MOUNTS=...
+export HF_HOME=...
+export RUN_ROOT=...
+export WANDB_API_KEY=...
+export WANDB_PROJECT=...
+
+experiments/h100-hybridep-performance-20260817/submit.sh --list
+experiments/h100-hybridep-performance-20260817/submit.sh \
+  qwen3-30b-baseline --test-only
+experiments/h100-hybridep-performance-20260817/submit.sh \
+  qwen3-30b-baseline
+```
+
+The launcher requests all eight GPUs on every H100 node. It never embeds a
+cluster hostname, account, shared-storage path, or credential. The baseline
+recipe is materialized from commit
+`4a1454bf430624786251d14ba0197169c8e68a5c` inside the allocated job and is
+deleted on exit.
