@@ -71,15 +71,15 @@ from nemo_rl.experience.rollout_manager import (
 from nemo_rl.experience.rollouts import should_mask_flagged_samples
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
-    GenerationFleetMonitor,
+    GenerationFleetHealth,
     HealthyShardSelector,
+)
+from nemo_rl.models.generation.generation_router import (
+    GenerationRouterActor,
+    GenerationRouterImpl,
 )
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
-)
-from nemo_rl.models.generation.policy_router import (
-    PolicyRouterActor,
-    PolicyRouterImpl,
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -118,13 +118,13 @@ class SingleControllerActorArgs:
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
     # Defaulted fields must follow the required ones above, so these two stay last.
-    # None when async_rl.fleet_health is disabled; the SingleController drives the
+    # None when async_rl.generation_fleet_health is disabled; the SingleController drives the
     # probe loop when it is present.
-    fleet_monitor: Optional[GenerationFleetMonitor] = None
-    # None unless async_rl.policy_router is enabled; the SingleController pushes the
+    fleet_monitor: Optional[GenerationFleetHealth] = None
+    # None unless async_rl.generation_router is enabled; the SingleController pushes the
     # serving backend set to it. Parameterized with the Impl class because the decorated
-    # PolicyRouterActor name is an ActorClass instance, not a type.
-    policy_router: Optional[ray.actor.ActorHandle[PolicyRouterImpl]] = None
+    # GenerationRouterActor name is an ActorClass instance, not a type.
+    generation_router: Optional[ray.actor.ActorHandle[GenerationRouterImpl]] = None
 
 
 def _build_clusters(
@@ -384,18 +384,18 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
 
 def _maybe_attach_fleet_health(
     generation: Any, master_config: MasterConfig
-) -> Optional[GenerationFleetMonitor]:
+) -> Optional[GenerationFleetHealth]:
     """Route generation through fleet health, when it is enabled and supported.
 
     Returns:
         The monitor the SingleController should drive, or None when fleet health is
         disabled or the backend does not support it.
     """
-    fleet_config = master_config.async_rl.fleet_health
+    fleet_config = master_config.async_rl.generation_fleet_health
     if not fleet_config.enabled:
         return None
 
-    monitor = GenerationFleetMonitor(
+    monitor = GenerationFleetHealth(
         shard_count=generation.worker_group.dp_size,
         policy=FleetHealthPolicy(
             unhealthy_threshold=fleet_config.unhealthy_threshold,
@@ -423,32 +423,32 @@ def _shard_base_urls(generation: Any) -> Optional[list[Optional[str]]]:
     return urls
 
 
-def _maybe_start_policy_router(generation: Any, master_config: MasterConfig) -> Any:
+def _maybe_start_generation_router(generation: Any, master_config: MasterConfig) -> Any:
     """Start the NeMo-Gym-facing router, if enabled.
 
     Returns:
         The router actor handle, or None when the router is disabled.
     """
-    router_config = master_config.async_rl.policy_router
+    router_config = master_config.async_rl.generation_router
     if not router_config.enabled:
         return None
 
-    if not master_config.async_rl.fleet_health.enabled:
+    if not master_config.async_rl.generation_fleet_health.enabled:
         # Legitimate, but the operator should know what they are not getting: nothing
         # ever calls set_serving_backends, so the router stays health-blind for the run.
         # It still delivers the stable URL Gym never re-resolves, a backend deadline Gym
         # sets nowhere, and least-outstanding balancing -- just no failover.
         print(
-            "⚠️  async_rl.policy_router.enabled=true with fleet_health.enabled=false: "
+            "⚠️  async_rl.generation_router.enabled=true with generation_fleet_health.enabled=false: "
             "the router will never receive a serving-set update, so it cannot route "
-            "around a dead shard. Enable async_rl.fleet_health for failover.",
+            "around a dead shard. Enable async_rl.generation_fleet_health for failover.",
             flush=True,
         )
 
     backend_urls = [url for url in (generation.dp_openai_server_base_urls or []) if url]
     if not backend_urls:
         raise ValueError(
-            "async_rl.policy_router.enabled=true requires generation backends that "
+            "async_rl.generation_router.enabled=true requires generation backends that "
             "expose OpenAI-compatible servers; none were reported. This needs the vllm "
             "backend with async_engine and expose_http_server enabled."
         )
@@ -458,7 +458,7 @@ def _maybe_start_policy_router(generation: Any, master_config: MasterConfig) -> 
     port = _get_free_port_local(
         router_config.port_range_low, router_config.port_range_high
     )
-    router = PolicyRouterActor.options(  # type: ignore[attr-defined]
+    router = GenerationRouterActor.options(  # type: ignore[attr-defined]
         scheduling_strategy=NodeAffinitySchedulingStrategy(
             node_id=ray.get_runtime_context().get_node_id(), soft=False
         )
@@ -472,7 +472,7 @@ def _maybe_start_policy_router(generation: Any, master_config: MasterConfig) -> 
         # Only a monitor-driven run ever pushes membership, and the router's reflex drop
         # of a failing backend is only safe because a later push restores it. Without
         # one, arming the reflex would retire backends permanently.
-        health_managed=master_config.async_rl.fleet_health.enabled,
+        health_managed=master_config.async_rl.generation_fleet_health.enabled,
     )
     # Resolve the URL now so the driver fails here rather than inside Gym if the actor
     # could not start. The router binds its socket inside __init__, so a port conflict
@@ -619,7 +619,7 @@ def setup_single_controller(
     # restructure leaves `generation` as None at this point, and the router needs a
     # live generation to front. None is also the correct value whenever the router
     # is disabled or NeMo-Gym is not in play -- it is Gym that needs one stable URL.
-    policy_router = None
+    generation_router = None
 
     def _build_generation_then_trainer(
         defer_generation_model_load: bool, generation=None
@@ -659,12 +659,12 @@ def setup_single_controller(
 
         return generation, trainer, time_metrics
 
-    if not use_nemo_gym and master_config.async_rl.policy_router.enabled:
+    if not use_nemo_gym and master_config.async_rl.generation_router.enabled:
         # The router exists to hand NeMo-Gym one URL; the native path calls generation
         # over Ray and never sees it. Silently ignoring the flag would be the opposite of
-        # how fleet_health treats an unsupported backend.
+        # how generation_fleet_health treats an unsupported backend.
         raise ValueError(
-            "async_rl.policy_router.enabled=true has no effect on the native rollout "
+            "async_rl.generation_router.enabled=true has no effect on the native rollout "
             "path: the router fronts NeMo-Gym's HTTP traffic, and this run does not use "
             "NeMo-Gym. Set env.should_use_nemo_gym=true, or disable the router."
         )
@@ -678,7 +678,7 @@ def setup_single_controller(
         )
         defer_generation_model_load = True
         # Before the Gym task is built, so Gym can be handed the router's single URL.
-        policy_router = _maybe_start_policy_router(generation, master_config)
+        generation_router = _maybe_start_generation_router(generation, master_config)
         # add nemo_gym spinup task
         build_tasks["nemo_gym"] = partial(
             _spinup_gym,
@@ -686,8 +686,8 @@ def setup_single_controller(
             # The whole point of the router: Gym holds one NeMo-RL-owned URL and
             # never has to fail over, which is the thing it cannot do.
             base_urls=(
-                [ray.get(policy_router.base_url.remote())]
-                if policy_router is not None
+                [ray.get(generation_router.base_url.remote())]
+                if generation_router is not None
                 else generation.dp_openai_server_base_urls
             ),
         )
@@ -828,6 +828,6 @@ def setup_single_controller(
         save_state=save_state,
         last_checkpoint_path=last_checkpoint_path,
         fleet_monitor=fleet_monitor,
-        policy_router=policy_router,
+        generation_router=generation_router,
     )
     return actor_args, setup_timing_metrics

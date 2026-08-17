@@ -33,7 +33,7 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.fleet_health import (
-    GenerationFleetMonitor,
+    GenerationFleetHealth,
     HealthyShardSelector,
 )
 from nemo_rl.models.generation.interfaces import (
@@ -268,9 +268,9 @@ class VllmGeneration(GenerationInterface):
         # when no fleet selector is attached.
         self.current_generate_dp_shard_idx = 0
 
-        # Set by attach_fleet_health when async_rl.fleet_health is enabled. While None,
+        # Set by attach_fleet_health when async_rl.generation_fleet_health is enabled. While None,
         # shard selection stays health-blind, which is the historical behaviour.
-        self.fleet_monitor: Optional[GenerationFleetMonitor] = None
+        self.fleet_monitor: Optional[GenerationFleetHealth] = None
         self.fleet_selector: Optional[HealthyShardSelector] = None
 
         if defer_model_load:
@@ -813,7 +813,7 @@ class VllmGeneration(GenerationInterface):
 
     def attach_fleet_health(
         self,
-        monitor: GenerationFleetMonitor,
+        monitor: GenerationFleetHealth,
         selector: HealthyShardSelector,
     ) -> None:
         """Route generation through fleet health from now on.

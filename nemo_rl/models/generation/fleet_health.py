@@ -94,7 +94,7 @@ class GenerationFleetExhausted(RuntimeError):
 
 @dataclass
 class FleetHealthPolicy:
-    """Thresholds resolved from ``async_rl.fleet_health``.
+    """Thresholds resolved from ``async_rl.generation_fleet_health``.
 
     Mirrors :class:`nemo_rl.experience.rollout_manager.RolloutTimeouts` in shape: an
     internal dataclass so the BaseModel stays the single home for user-facing defaults.
@@ -119,7 +119,7 @@ class FleetHealthPolicy:
             )
 
 
-class GenerationFleetMonitor:
+class GenerationFleetHealth:
     """Tracks per-shard health and exposes the current serving set.
 
     Args:
@@ -201,18 +201,18 @@ class GenerationFleetMonitor:
     def as_metrics(self) -> dict[str, float]:
         """Flatten into a metric dict for the SingleController logger."""
         metrics = {
-            f"fleet/shards/{state.value}": float(count)
+            f"gen_fleet/shards/{state.value}": float(count)
             for state, count in self.counts_by_state().items()
         }
-        metrics["fleet/membership_epoch"] = float(self._membership_epoch)
-        metrics["fleet/serving_shards"] = float(len(self.serving_shards()))
+        metrics["gen_fleet/membership_epoch"] = float(self._membership_epoch)
+        metrics["gen_fleet/serving_shards"] = float(len(self.serving_shards()))
         for shard in self._shards.values():
-            metrics[f"fleet/restart_attempts/{shard.dp_shard_idx}"] = float(
+            metrics[f"gen_fleet/restart_attempts/{shard.dp_shard_idx}"] = float(
                 shard.restart_attempts
             )
             # Catches a STALE shard that somehow served: a serving shard whose weight
             # version trails the trainer is a correctness bug, not a capacity problem.
-            metrics[f"fleet/shard_weight_version/{shard.dp_shard_idx}"] = float(
+            metrics[f"gen_fleet/shard_weight_version/{shard.dp_shard_idx}"] = float(
                 shard.weight_version
             )
         return metrics
@@ -356,7 +356,7 @@ class GenerationFleetMonitor:
         previous = shard.state
         shard.state = new_state
         print(
-            f"fleet: shard {shard.dp_shard_idx} {previous.value} -> {new_state.value}"
+            f"gen_fleet: shard {shard.dp_shard_idx} {previous.value} -> {new_state.value}"
             + (f" ({shard.last_error})" if shard.last_error else ""),
             flush=True,
         )
@@ -378,7 +378,7 @@ class HealthyShardSelector:
     that to be diagnosed first.
     """
 
-    monitor: GenerationFleetMonitor
+    monitor: GenerationFleetHealth
     _inflight: dict[int, int] = field(default_factory=dict)
 
     def next_shard(self) -> int:

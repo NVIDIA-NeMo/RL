@@ -27,15 +27,15 @@ from nemo_rl.experience.failures import NoHealthyShards
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetExhausted,
-    GenerationFleetMonitor,
+    GenerationFleetHealth,
     HealthyShardSelector,
     ShardState,
 )
 
 
-def _monitor(shard_count=4, **policy_kwargs) -> GenerationFleetMonitor:
+def _monitor(shard_count=4, **policy_kwargs) -> GenerationFleetHealth:
     ticks = iter(range(10_000))
-    return GenerationFleetMonitor(
+    return GenerationFleetHealth(
         shard_count=shard_count,
         policy=FleetHealthPolicy(**policy_kwargs),
         clock=lambda: float(next(ticks)),
@@ -83,8 +83,12 @@ class TestProbeTransitions:
         monitor.record_probe(1, ok=True)
         assert monitor.state_of(1) is ShardState.SUSPECT
 
-    def test_reported_failures_count_the_same_as_probe_failures(self):
-        """Adapters see failures a liveness probe cannot."""
+    def test_reported_failures_use_the_same_threshold(self):
+        """Adapters see failures a liveness probe cannot.
+
+        Same threshold, separate streak -- see TestReportedFailureStreak for why the
+        counters cannot be shared.
+        """
         monitor = _monitor(unhealthy_threshold=2)
         monitor.report_failure(2, ConnectionResetError("boom"))
         monitor.report_failure(2, ConnectionResetError("boom"))
@@ -261,11 +265,11 @@ class TestPolicyValidation:
 
     def test_shard_count_must_be_positive(self):
         with pytest.raises(ValueError, match="shard_count must be >= 1"):
-            GenerationFleetMonitor(shard_count=0, policy=FleetHealthPolicy())
+            GenerationFleetHealth(shard_count=0, policy=FleetHealthPolicy())
 
     def test_base_urls_must_match_shard_count(self):
         with pytest.raises(ValueError, match="2 entries for 3 shards"):
-            GenerationFleetMonitor(
+            GenerationFleetHealth(
                 shard_count=3, policy=FleetHealthPolicy(), base_urls=["a", "b"]
             )
 
@@ -275,10 +279,10 @@ class TestMetrics:
         monitor = _monitor(shard_count=3, unhealthy_threshold=1)
         _fail(monitor, 0, times=1)
         metrics = monitor.as_metrics()
-        assert metrics["fleet/shards/dead"] == 1.0
-        assert metrics["fleet/shards/healthy"] == 2.0
-        assert metrics["fleet/serving_shards"] == 2.0
-        assert metrics["fleet/membership_epoch"] >= 1.0
+        assert metrics["gen_fleet/shards/dead"] == 1.0
+        assert metrics["gen_fleet/shards/healthy"] == 2.0
+        assert metrics["gen_fleet/serving_shards"] == 2.0
+        assert metrics["gen_fleet/membership_epoch"] >= 1.0
 
     def test_per_shard_weight_version_is_published(self):
         """A serving shard whose version trails the trainer is a correctness bug."""
@@ -287,7 +291,7 @@ class TestMetrics:
         monitor.mark_restarting(0)
         monitor.mark_loaded(0)
         monitor.report_refit(0, weight_version=11)
-        assert monitor.as_metrics()["fleet/shard_weight_version/0"] == 11.0
+        assert monitor.as_metrics()["gen_fleet/shard_weight_version/0"] == 11.0
 
 
 class TestReportedFailureStreak:
@@ -358,7 +362,7 @@ class TestReportedFailureStreak:
 
 class TestBaseUrlLookup:
     def test_a_known_url_maps_back_to_its_shard(self):
-        monitor = GenerationFleetMonitor(
+        monitor = GenerationFleetHealth(
             shard_count=2,
             policy=FleetHealthPolicy(),
             base_urls=["http://a:1/v1", "http://b:2/v1"],
@@ -367,7 +371,7 @@ class TestBaseUrlLookup:
 
     def test_an_unknown_url_maps_to_nothing(self):
         """The router may report a backend the ledger no longer tracks."""
-        monitor = GenerationFleetMonitor(
+        monitor = GenerationFleetHealth(
             shard_count=1, policy=FleetHealthPolicy(), base_urls=["http://a:1/v1"]
         )
         assert monitor.shard_for_base_url("http://gone:9/v1") is None

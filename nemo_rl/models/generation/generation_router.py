@@ -36,6 +36,11 @@ Two properties make this safe to put in Gym's critical path:
 Deliberately *not* a redirect. Handing Gym a 307 would put its socket back on a vLLM
 endpoint directly, so a backend dying mid-request would drop it into the same uncapped
 retry loop this exists to avoid.
+
+One thing this trades away: Gym's selection is *sticky* round-robin -- a session keeps its
+backend -- so per-request least-outstanding gives up prefix-cache affinity across the
+turns of a multi-turn rollout. That is a real cost, not purely a defect being fixed, and
+it is worth measuring before enabling this on a multi-turn workload.
 """
 
 from __future__ import annotations
@@ -57,7 +62,7 @@ _SKIPPED_RESPONSE_HEADERS = frozenset(
 _STREAM_CHUNK_BYTES = 64 * 1024
 
 
-class PolicyRouterImpl:
+class GenerationRouterImpl:
     """Routing logic and HTTP server, split out so it is testable without Ray."""
 
     def __init__(
@@ -72,7 +77,7 @@ class PolicyRouterImpl:
         health_managed: bool = False,
     ) -> None:
         if not backend_urls:
-            raise ValueError("PolicyRouter requires at least one backend URL")
+            raise ValueError("GenerationRouter requires at least one backend URL")
         self._all_backends = list(backend_urls)
         # Starts as every backend: a restarted router has no health history, and routing
         # to a shard that turns out to be dead is self-correcting on the next push.
@@ -84,7 +89,7 @@ class PolicyRouterImpl:
         self._backend_timeout_s = backend_timeout_s
         self._connect_timeout_s = connect_timeout_s
         self._no_healthy_backend_status = no_healthy_backend_status
-        # Whether a GenerationFleetMonitor is driving set_serving_backends. It gates the
+        # Whether a GenerationFleetHealth is driving set_serving_backends. It gates the
         # reflex drop in _handle: dropping a backend locally is only safe because a later
         # membership push puts it back. With no monitor nothing ever pushes, so the drop
         # would be permanent and a few transient blips would drain the fleet to nothing.
@@ -130,7 +135,7 @@ class PolicyRouterImpl:
         The router sees failures no liveness probe can -- a wedged engine answers
         ``is_alive`` from a healthy worker process. It holds no monitor reference by
         design, so instead of reporting, it counts, and the controller's probe tick
-        drains these into ``GenerationFleetMonitor.report_failure``.
+        drains these into ``GenerationFleetHealth.report_failure``.
         """
         counts = {url: n for url, n in self._backend_failures.items() if n}
         for url in counts:
@@ -349,7 +354,7 @@ class PolicyRouterImpl:
 
 
 @ray.remote(num_cpus=1, num_gpus=0, max_restarts=-1)  # pragma: no cover
-class PolicyRouterActor(PolicyRouterImpl):
+class GenerationRouterActor(GenerationRouterImpl):
     """Ray actor wrapper. Everything it needs is built in ``__init__``.
 
     ``max_restarts=-1`` is only meaningful because of that: Ray recreates a restarted

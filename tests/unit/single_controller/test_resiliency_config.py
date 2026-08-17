@@ -29,8 +29,8 @@ from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     FleetHealthConfig,
+    GenerationRouterConfig,
     MasterConfig,
-    PolicyRouterConfig,
     RolloutFailureConfig,
     WatchdogConfig,
     validate_single_controller_config,
@@ -54,7 +54,7 @@ class TestDefaultsAreInert:
         assert cfg.nemo_gym.max_row_attempts == 3
 
     def test_watchdog_has_documented_defaults(self):
-        cfg = AsyncRLConfig().watchdog
+        cfg = AsyncRLConfig().stall_watchdog
         assert cfg.interval_s == 30.0
         assert cfg.stall_timeout_s == 600.0
         assert cfg.stall_action == "warn"
@@ -142,9 +142,9 @@ class TestWatchdogValidation:
             WatchdogConfig(stall_action="explode")
 
 
-class TestPolicyRouterValidation:
+class TestGenerationRouterValidation:
     def test_the_default_status_is_outside_gyms_retry_set(self):
-        assert PolicyRouterConfig().no_healthy_backend_status == 409
+        assert GenerationRouterConfig().no_healthy_backend_status == 409
 
     @pytest.mark.parametrize("status", [429, 500, 502, 503, 504, 520])
     def test_a_status_gym_retries_is_rejected(self, status):
@@ -156,24 +156,24 @@ class TestPolicyRouterValidation:
         at config load rather than discovered in production.
         """
         with pytest.raises(ValidationError, match="NeMo-Gym retries internally"):
-            PolicyRouterConfig(no_healthy_backend_status=status)
+            GenerationRouterConfig(no_healthy_backend_status=status)
 
     @pytest.mark.parametrize("status", [400, 404, 409, 418, 422])
     def test_other_client_errors_are_allowed(self, status):
         assert (
-            PolicyRouterConfig(
+            GenerationRouterConfig(
                 no_healthy_backend_status=status
             ).no_healthy_backend_status
             == status
         )
 
     def test_it_is_off_by_default(self):
-        assert AsyncRLConfig().policy_router.enabled is False
+        assert AsyncRLConfig().generation_router.enabled is False
 
 
 class TestFleetHealthValidation:
     def test_it_is_off_by_default(self):
-        assert AsyncRLConfig().fleet_health.enabled is False
+        assert AsyncRLConfig().generation_fleet_health.enabled is False
 
     def test_a_probe_timeout_that_outlasts_the_interval_is_rejected(self):
         """Otherwise probes overlap and a slow fleet reads as a dead one."""
@@ -206,7 +206,7 @@ class TestWatchdogVersusRolloutTimeout:
     def _cfg(block, key, deadline, stall_timeout_s):
         return AsyncRLConfig(
             rollout_failure={block: {key: deadline}},
-            watchdog={"interval_s": 30.0, "stall_timeout_s": stall_timeout_s},
+            stall_watchdog={"interval_s": 30.0, "stall_timeout_s": stall_timeout_s},
         )
 
     @pytest.mark.parametrize(("block", "key"), DEADLINES)
@@ -221,11 +221,14 @@ class TestWatchdogVersusRolloutTimeout:
 
     @pytest.mark.parametrize(("block", "key"), DEADLINES)
     def test_a_longer_watchdog_is_accepted(self, block, key):
-        assert self._cfg(block, key, 900.0, 1200.0).watchdog.stall_timeout_s == 1200.0
+        assert (
+            self._cfg(block, key, 900.0, 1200.0).stall_watchdog.stall_timeout_s
+            == 1200.0
+        )
 
     @pytest.mark.parametrize(("block", "key"), DEADLINES)
     def test_a_disabled_deadline_imposes_no_constraint(self, block, key):
-        assert self._cfg(block, key, None, 60.0).watchdog.stall_timeout_s == 60.0
+        assert self._cfg(block, key, None, 60.0).stall_watchdog.stall_timeout_s == 60.0
 
     @pytest.mark.parametrize(("block", "key"), DEADLINES)
     @pytest.mark.parametrize("value", [0.0, -1.0])
@@ -322,25 +325,25 @@ class TestWrongPathFaultToleranceIsRejected:
         validate_single_controller_config(cfg)
 
 
-class TestPolicyRouterPortAndTimeoutValidation:
+class TestGenerationRouterPortAndTimeoutValidation:
     def test_a_transposed_port_range_is_rejected(self):
         """Otherwise it surfaces as 'empty range for randrange()' far from the typo."""
         with pytest.raises(ValidationError, match="port_range_low"):
-            PolicyRouterConfig(port_range_low=6099, port_range_high=6000)
+            GenerationRouterConfig(port_range_low=6099, port_range_high=6000)
 
     def test_an_equal_port_range_is_rejected(self):
         with pytest.raises(ValidationError, match="port_range_low"):
-            PolicyRouterConfig(port_range_low=6000, port_range_high=6000)
+            GenerationRouterConfig(port_range_low=6000, port_range_high=6000)
 
     def test_the_connect_timeout_defaults_well_below_the_backend_timeout(self):
         """A handshake to a local vLLM is ms-or-never; the generation is minutes."""
-        cfg = PolicyRouterConfig()
+        cfg = GenerationRouterConfig()
         assert cfg.connect_timeout_s == 5.0
         assert cfg.connect_timeout_s < cfg.backend_timeout_s
 
     def test_a_connect_timeout_beyond_the_total_is_rejected(self):
         with pytest.raises(ValidationError, match="connect_timeout_s"):
-            PolicyRouterConfig(connect_timeout_s=100.0, backend_timeout_s=10.0)
+            GenerationRouterConfig(connect_timeout_s=100.0, backend_timeout_s=10.0)
 
 
 class TestFleetHealthSelectionIsNotAdvertisedBeyondWhatItDoes:
@@ -355,3 +358,34 @@ class TestFleetHealthSelectionIsNotAdvertisedBeyondWhatItDoes:
         assert FleetHealthConfig(selection="least_outstanding").selection == (
             "least_outstanding"
         )
+
+
+class TestRenamedBlocksAreRejected:
+    """The old block names parsed fine under extra="allow" and then did nothing.
+
+    async_rl.watchdog in particular shipped in the containment PR, so a config in the
+    wild can carry it -- and silently losing stall detection is exactly the failure mode
+    this series exists to remove.
+    """
+
+    @pytest.mark.parametrize(
+        ("old", "new"),
+        [
+            ("watchdog", "stall_watchdog"),
+            ("fleet_health", "generation_fleet_health"),
+            ("policy_router", "generation_router"),
+        ],
+    )
+    def test_the_previous_block_names_are_rejected_not_ignored(self, old, new):
+        with pytest.raises(ValidationError, match=new):
+            AsyncRLConfig(**{old: {"enabled": True}})
+
+    def test_the_new_names_are_accepted(self):
+        cfg = AsyncRLConfig(
+            stall_watchdog={"interval_s": 30.0, "stall_timeout_s": 600.0},
+            generation_fleet_health={"enabled": True},
+            generation_router={"enabled": True},
+        )
+        assert cfg.generation_fleet_health.enabled
+        assert cfg.generation_router.enabled
+        assert cfg.stall_watchdog.stall_timeout_s == 600.0

@@ -33,7 +33,7 @@ import pytest
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
-    GenerationFleetMonitor,
+    GenerationFleetHealth,
     ShardState,
 )
 
@@ -52,7 +52,7 @@ class _Remote:
 
 
 class _FakeRouter:
-    """Stands in for the PolicyRouterActor handle."""
+    """Stands in for the GenerationRouterActor handle."""
 
     def __init__(self, *, failures=None, push_error=None):
         self.pushes: list[list[str]] = []
@@ -79,14 +79,16 @@ def _urls(n):
 def _controller(*, shard_count=3, router=None, unhealthy_threshold=3):
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._fleet_monitor = GenerationFleetMonitor(
+    ctrl._gen_fleet = GenerationFleetHealth(
         shard_count=shard_count,
         policy=FleetHealthPolicy(unhealthy_threshold=unhealthy_threshold),
         base_urls=_urls(shard_count),
     )
-    ctrl._policy_router = router
+    ctrl._generation_router = router
     ctrl._async_cfg = SimpleNamespace(
-        fleet_health=SimpleNamespace(probe_interval_s=0.001, probe_timeout_s=1.0)
+        generation_fleet_health=SimpleNamespace(
+            probe_interval_s=0.001, probe_timeout_s=1.0
+        )
     )
     return ctrl
 
@@ -115,8 +117,8 @@ class TestMembershipPush:
         router = _FakeRouter()
         ctrl = _controller(router=router)
         for _ in range(3):
-            ctrl._fleet_monitor.record_probe(1, ok=False, error="gone")
-        assert ctrl._fleet_monitor.state_of(1) is ShardState.DEAD
+            ctrl._gen_fleet.record_probe(1, ok=False, error="gone")
+        assert ctrl._gen_fleet.state_of(1) is ShardState.DEAD
         asyncio.run(ctrl._push_router_membership())
         # The router restarts here -- Ray re-runs __init__, serving = every backend.
         # The corrective push must still arrive, which is the whole regression.
@@ -127,7 +129,7 @@ class TestMembershipPush:
         router = _FakeRouter()
         ctrl = _controller(router=router)
         for _ in range(3):
-            ctrl._fleet_monitor.record_probe(2, ok=False, error="gone")
+            ctrl._gen_fleet.record_probe(2, ok=False, error="gone")
         asyncio.run(ctrl._push_router_membership())
         assert _urls(3)[2] not in router.pushes[-1]
 
@@ -135,8 +137,8 @@ class TestMembershipPush:
         """SUSPECT is 'failing probes, not yet condemned' -- it still takes traffic."""
         router = _FakeRouter()
         ctrl = _controller(router=router)
-        ctrl._fleet_monitor.record_probe(0, ok=False, error="blip")
-        assert ctrl._fleet_monitor.state_of(0) is ShardState.SUSPECT
+        ctrl._gen_fleet.record_probe(0, ok=False, error="blip")
+        assert ctrl._gen_fleet.state_of(0) is ShardState.SUSPECT
         asyncio.run(ctrl._push_router_membership())
         assert router.pushes[-1] == _urls(3)
 
@@ -151,20 +153,20 @@ class TestFailureDrain:
         router = _FakeRouter(failures={_urls(3)[1]: 1})
         ctrl = _controller(router=router)
         asyncio.run(ctrl._drain_router_failures())
-        assert ctrl._fleet_monitor.state_of(1) is ShardState.SUSPECT
+        assert ctrl._gen_fleet.state_of(1) is ShardState.SUSPECT
 
     def test_enough_router_failures_condemn_the_shard(self):
         router = _FakeRouter(failures={_urls(3)[1]: 3})
         ctrl = _controller(router=router, unhealthy_threshold=3)
         asyncio.run(ctrl._drain_router_failures())
-        assert ctrl._fleet_monitor.state_of(1) is ShardState.DEAD
+        assert ctrl._gen_fleet.state_of(1) is ShardState.DEAD
 
     def test_an_unknown_backend_url_is_skipped(self):
         """The router may still hold a URL the ledger no longer tracks."""
         router = _FakeRouter(failures={"http://stale:1/v1": 5})
         ctrl = _controller(router=router)
         asyncio.run(ctrl._drain_router_failures())  # must not raise
-        assert ctrl._fleet_monitor.serving_shards() == [0, 1, 2]
+        assert ctrl._gen_fleet.serving_shards() == [0, 1, 2]
 
 
 class TestPumpContainment:
@@ -181,7 +183,7 @@ class TestPumpContainment:
         ctrl._probe_generation_fleet = _noop
 
         async def _main():
-            task = asyncio.ensure_future(ctrl._fleet_probe_pump())
+            task = asyncio.ensure_future(ctrl._gen_fleet_probe_pump())
             await asyncio.sleep(0.02)
             still_running = not task.done()
             task.cancel()

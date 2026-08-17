@@ -402,12 +402,12 @@ class GenerationInterface(ABC):
         interface. Same shape as the refit hooks above.
 
         Args:
-            monitor: ``GenerationFleetMonitor`` owning shard eligibility, which the
+            monitor: ``GenerationFleetHealth`` owning shard eligibility, which the
                 backend also reports observed failures and successes to.
             selector: ``HealthyShardSelector`` picking among the serving shards.
         """
         raise NotImplementedError(
-            "async_rl.fleet_health.enabled=true is not supported for the "
+            "async_rl.generation_fleet_health.enabled=true is not supported for the "
             f"{type(self).__name__} generation backend"
         )
 

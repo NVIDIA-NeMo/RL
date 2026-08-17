@@ -34,7 +34,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.failures import GenerationUnavailable, NoHealthyShards
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
-    GenerationFleetMonitor,
+    GenerationFleetHealth,
     HealthyShardSelector,
     ShardState,
 )
@@ -80,8 +80,8 @@ def _make_generation(dp_size: int, fail_on_workers=()) -> VllmGeneration:
     return gen
 
 
-def _attach(gen: VllmGeneration, **policy_kwargs) -> GenerationFleetMonitor:
-    monitor = GenerationFleetMonitor(
+def _attach(gen: VllmGeneration, **policy_kwargs) -> GenerationFleetHealth:
+    monitor = GenerationFleetHealth(
         shard_count=gen.worker_group.dp_size,
         policy=FleetHealthPolicy(**policy_kwargs),
     )
@@ -192,7 +192,7 @@ class TestWithFleetHealth:
 
     def test_attach_rejects_a_mismatched_shard_count(self):
         gen = _make_generation(dp_size=4)
-        monitor = GenerationFleetMonitor(shard_count=2, policy=FleetHealthPolicy())
+        monitor = GenerationFleetHealth(shard_count=2, policy=FleetHealthPolicy())
         with pytest.raises(ValueError, match="tracks 2 shards"):
             gen.attach_fleet_health(monitor, HealthyShardSelector(monitor=monitor))
 

@@ -29,7 +29,7 @@ import asyncio
 import pytest
 from aiohttp import ClientSession, web
 
-from nemo_rl.models.generation.policy_router import PolicyRouterImpl
+from nemo_rl.models.generation.generation_router import GenerationRouterImpl
 
 
 def _free_port() -> int:
@@ -82,7 +82,7 @@ class _Harness:
     def __init__(self, backends, **router_kwargs):
         self.backends = backends
         self.port = _free_port()
-        self.router = PolicyRouterImpl(
+        self.router = GenerationRouterImpl(
             backend_urls=[b.url for b in backends],
             host="127.0.0.1",
             port=self.port,
@@ -256,7 +256,7 @@ class TestNoHealthyBackend:
 
 class TestUrlStability:
     def test_the_advertised_url_carries_the_v1_suffix_gym_expects(self):
-        router = PolicyRouterImpl(
+        router = GenerationRouterImpl(
             backend_urls=["http://a:1/v1"],
             host="10.0.0.5",
             port=6000,
@@ -282,8 +282,8 @@ class TestUrlStability:
             no_healthy_backend_status=409,
         )
         assert (
-            PolicyRouterImpl(**kwargs).base_url()
-            == PolicyRouterImpl(**kwargs).base_url()
+            GenerationRouterImpl(**kwargs).base_url()
+            == GenerationRouterImpl(**kwargs).base_url()
         )
 
     @pytest.mark.parametrize(
@@ -295,11 +295,11 @@ class TestUrlStability:
         ],
     )
     def test_paths_map_onto_the_backend_correctly(self, backend, path, expected):
-        assert PolicyRouterImpl._target_url(backend, path) == expected
+        assert GenerationRouterImpl._target_url(backend, path) == expected
 
     def test_construction_requires_a_backend(self):
         with pytest.raises(ValueError, match="at least one backend"):
-            PolicyRouterImpl(
+            GenerationRouterImpl(
                 backend_urls=[],
                 host="127.0.0.1",
                 port=1,
@@ -466,7 +466,7 @@ class TestPortBinding:
         holder.listen(1)
         port = holder.getsockname()[1]
         try:
-            router = PolicyRouterImpl(
+            router = GenerationRouterImpl(
                 backend_urls=["http://a:1/v1"],
                 host="127.0.0.1",
                 port=port,
@@ -483,7 +483,7 @@ class TestPortBinding:
 class TestUnknownUrlDiagnostic:
     def test_a_push_of_unknown_urls_is_reported(self, capsys):
         """Silent filtering would show up only as permanent 409s with no explanation."""
-        router = PolicyRouterImpl(
+        router = GenerationRouterImpl(
             backend_urls=["http://a:1/v1"],
             host="127.0.0.1",
             port=6000,

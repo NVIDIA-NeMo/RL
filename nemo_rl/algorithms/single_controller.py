@@ -85,11 +85,11 @@ class SingleControllerActor:
       - _train_pump:    claims DataPlane meta, trains, clears consumed rows,
                         then runs _sync_weights (drain gate + weight
                         synchronization) inline after each optimizer step
-      - _watchdog_pump: publishes rollout counters and reports stalls or
+      - _stall_watchdog_pump: publishes rollout counters and reports stalls or
                         unhealthy environments, which are the failures that
                         otherwise produce no signal at all
 
-    Plus _fleet_probe_pump when fleet health is enabled, which probes generation
+    Plus _gen_fleet_probe_pump when fleet health is enabled, which probes generation
     shard liveness on its own, much shorter clock.
 
     All other actors are passive — they expose methods and wait to be called.
@@ -141,8 +141,8 @@ class SingleControllerActor:
         # These two keep the getattr for a genuinely different reason: None is a
         # meaningful value meaning "feature off", and it is also their default. Absence
         # therefore degrades to the documented off state rather than to a broken one.
-        self._fleet_monitor = getattr(actor_args, "fleet_monitor", None)
-        self._policy_router = getattr(actor_args, "policy_router", None)
+        self._gen_fleet = getattr(actor_args, "fleet_monitor", None)
+        self._generation_router = getattr(actor_args, "generation_router", None)
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -243,14 +243,14 @@ class SingleControllerActor:
         # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
-        watchdog_task = asyncio.create_task(self._watchdog_pump())
+        watchdog_task = asyncio.create_task(self._stall_watchdog_pump())
         tasks = [rollout_task, train_task, watchdog_task]
         # Only with fleet health on. Created unconditionally it would be a timer firing
         # every probe_interval_s for every run that does not use the feature, which is
         # the default.
         probe_task = (
-            asyncio.create_task(self._fleet_probe_pump())
-            if self._fleet_monitor is not None
+            asyncio.create_task(self._gen_fleet_probe_pump())
+            if self._gen_fleet is not None
             else None
         )
         if probe_task is not None:
@@ -755,7 +755,7 @@ class SingleControllerActor:
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
 
-    async def _watchdog_pump(self) -> None:
+    async def _stall_watchdog_pump(self) -> None:
         """Report rollout health, and detect stalls nothing else catches.
 
         Progress is the pair (committed groups, completed train steps) rather than a
@@ -773,7 +773,7 @@ class SingleControllerActor:
         What separates a real stall from an idle gap is whether work remains, so that
         is what is checked instead.
         """
-        watchdog_cfg = self._async_cfg.watchdog
+        watchdog_cfg = self._async_cfg.stall_watchdog
         max_num_steps = self._master_config.grpo.max_num_steps
         last_progress = (-1, -1)
         last_progress_at = time.monotonic()
@@ -793,16 +793,16 @@ class SingleControllerActor:
             metrics["rollout/inflight"] = float(self._inflight_rollouts)
             metrics["rollout/idle_s"] = idle_s
             metrics["rollout/train_steps"] = float(self._train_steps)
-            if self._fleet_monitor is not None:
-                metrics.update(self._fleet_monitor.as_metrics())
-            if self._policy_router is not None:
+            if self._gen_fleet is not None:
+                metrics.update(self._gen_fleet.as_metrics())
+            if self._generation_router is not None:
                 # router/* counters are exactly what you want when a backend starts
                 # failing; computed since P2 landed but never published until now.
                 # Best-effort like the membership push: a router being recreated must
                 # not cost a metrics tick.
                 try:
                     metrics.update(
-                        await self._ray_get(self._policy_router.metrics.remote())
+                        await self._ray_get(self._generation_router.metrics.remote())
                     )
                 except Exception as error:  # noqa: BLE001 - metrics are advisory
                     print(
@@ -825,10 +825,10 @@ class SingleControllerActor:
                         )
                     print(f"WARNING: environment health -- {detail}", flush=True)
 
-            if self._fleet_monitor is not None:
+            if self._gen_fleet is not None:
                 # Raises once too few shards remain for the run to be worth continuing.
                 # Checked after publishing so the final state is on record.
-                self._fleet_monitor.raise_if_exhausted()
+                self._gen_fleet.raise_if_exhausted()
 
             work_remains = self._train_steps < max_num_steps
             if work_remains and idle_s > watchdog_cfg.stall_timeout_s:
@@ -843,7 +843,7 @@ class SingleControllerActor:
                     raise RolloutStall(message)
                 print(f"WARNING: rollout stall -- {message}", flush=True)
 
-    async def _fleet_probe_pump(self) -> None:
+    async def _gen_fleet_probe_pump(self) -> None:
         """Probe the generation fleet on its own clock.
 
         Separate from the watchdog because the two cadences answer different questions.
@@ -859,7 +859,7 @@ class SingleControllerActor:
         saw an empty absent set and did nothing. Arithmetic, not a race -- it could never
         have worked. Job 5925668.
         """
-        interval_s = self._async_cfg.fleet_health.probe_interval_s
+        interval_s = self._async_cfg.generation_fleet_health.probe_interval_s
         while True:
             await asyncio.sleep(interval_s)
             await self._probe_generation_fleet()
@@ -900,10 +900,10 @@ class SingleControllerActor:
         ``probe_timeout_s < probe_interval_s``, which silently assumes one probe per
         tick. Concurrent, a round is bounded by ``probe_timeout_s`` at any fleet size.
         """
-        if self._fleet_monitor is None:
+        if self._gen_fleet is None:
             return
 
-        fleet_cfg = self._async_cfg.fleet_health
+        fleet_cfg = self._async_cfg.generation_fleet_health
         worker_group = self._gen.worker_group
 
         async def probe(shard_idx: int) -> None:
@@ -914,15 +914,13 @@ class SingleControllerActor:
                     timeout=fleet_cfg.probe_timeout_s,
                 )
             except (Exception, asyncio.TimeoutError) as error:
-                self._fleet_monitor.record_probe(
+                self._gen_fleet.record_probe(
                     shard_idx, ok=False, error=f"{type(error).__name__}: {error}"
                 )
             else:
-                self._fleet_monitor.record_probe(shard_idx, ok=True)
+                self._gen_fleet.record_probe(shard_idx, ok=True)
 
-        await asyncio.gather(
-            *(probe(idx) for idx in self._fleet_monitor.serving_shards())
-        )
+        await asyncio.gather(*(probe(idx) for idx in self._gen_fleet.serving_shards()))
 
     async def _push_router_membership(self) -> None:
         """Tell the NeMo-Gym router which backends are currently serving.
@@ -942,11 +940,11 @@ class SingleControllerActor:
         It is also what makes the router's reflex drop safe: dropping a failing backend
         locally is only correct because a later push puts it back.
         """
-        if self._policy_router is None or self._fleet_monitor is None:
+        if self._generation_router is None or self._gen_fleet is None:
             return
         await self._ray_get(
-            self._policy_router.set_serving_backends.remote(
-                self._fleet_monitor.serving_base_urls()
+            self._generation_router.set_serving_backends.remote(
+                self._gen_fleet.serving_base_urls()
             )
         )
 
@@ -959,17 +957,17 @@ class SingleControllerActor:
         counts failures per backend URL and this drains them here, on the tick that
         already talks to it.
         """
-        if self._policy_router is None or self._fleet_monitor is None:
+        if self._generation_router is None or self._gen_fleet is None:
             return
         counts: dict[str, int] = await self._ray_get(
-            self._policy_router.drain_backend_failures.remote()
+            self._generation_router.drain_backend_failures.remote()
         )
         for url, count in counts.items():
-            shard_idx = self._fleet_monitor.shard_for_base_url(url)
+            shard_idx = self._gen_fleet.shard_for_base_url(url)
             if shard_idx is None:
                 continue
             for _ in range(count):
-                self._fleet_monitor.report_failure(
+                self._gen_fleet.report_failure(
                     shard_idx,
                     RuntimeError(f"router: {count} failed request(s) to {url}"),
                 )

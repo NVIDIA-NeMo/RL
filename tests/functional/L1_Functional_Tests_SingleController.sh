@@ -50,8 +50,8 @@ run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chao
 # against the trainer's recomputation, so a proxy that corrupts or truncates a response
 # blows it up. A run that merely completes would not prove the payload survived the hop.
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh \
-    ++async_rl.policy_router.enabled=true \
-    ++async_rl.fleet_health.enabled=true
+    ++async_rl.generation_router.enabled=true \
+    ++async_rl.generation_fleet_health.enabled=true
 
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
 # rather than between calls. Registered because pinning the victim state -- which is what
