@@ -35,6 +35,38 @@ the generation backend; both Megatron and DTensor policy workers can send
 weights. Sparse delta is currently limited to GRPO. NIXL is initialized by the
 GRPO and distillation setup paths; PPO currently requires colocated generation.
 
+### TRT-LLM Qwen3.5 Routed-Expert FP8
+
+TRT-LLM supports online block-FP8 refit for Qwen3.5 MoE rollouts. Policy
+training remains in BF16, and this setting does not change optimizer-state
+precision. During each refit, NeMo RL converts only the routed-expert weights
+to E4M3 with 128x128 blocks and FP32 scales; attention, routers, shared experts,
+embeddings, and the output head remain in BF16.
+
+This path starts from a BF16 policy checkpoint. Direct loading of a
+pre-quantized ModelOpt FP8 checkpoint is outside its scope.
+
+Enable the path with:
+
+```yaml
+policy:
+  generation:
+    trtllm_cfg:
+      precision: fp8
+```
+
+This path currently accepts only checkpoints whose Transformers `model_type`
+is `qwen3_5_moe`. NeMo RL initializes the TRT-LLM model with `load_format` set
+to `dummy`, then populates it from the first BF16 policy refit. The TRTLLM MoE
+backend is required to preserve FP32 block scales; MXFP8/E8M0 scales are not
+used.
+
+The installed TRT-LLM must provide the incremental-refit lifecycle APIs
+`begin_update_weights`, `finalize_update_weights`, `abort_update_weights`, and
+`WorkerExtension.finalize_weight_update`. NeMo RL fails during setup if any of
+these APIs are unavailable. Supporting another model architecture requires a
+model-specific quantization filter and weight mapper.
+
 ## Minimal Configuration
 
 Colocated refit needs no transport configuration:
