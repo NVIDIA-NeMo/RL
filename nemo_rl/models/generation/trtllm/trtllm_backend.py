@@ -33,6 +33,7 @@ import zmq
 from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
+from nemo_rl.models.generation.trtllm.quantization import fp8 as fp8_quantization
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -54,6 +55,27 @@ def _call_model_loader_hook_if_available(model_loader: Any, hook_name: str) -> b
         return False
     hook()
     return True
+
+
+def _require_fp8_refit_hooks(model_loader: Any) -> None:
+    """Require TRT-LLM hooks for transactional Qwen3.5 FP8 refits."""
+    required_hooks = (
+        "begin_update_weights",
+        "finalize_update_weights",
+        "abort_update_weights",
+    )
+    missing_hooks = [
+        hook_name
+        for hook_name in required_hooks
+        if not callable(getattr(model_loader, hook_name, None))
+    ]
+    if not callable(getattr(WorkerExtension, "finalize_weight_update", None)):
+        missing_hooks.append("WorkerExtension.finalize_weight_update")
+    if missing_hooks:
+        raise RuntimeError(
+            "Qwen3.5 FP8 refit requires TRT-LLM weight-update hooks. "
+            f"Missing APIs: {missing_hooks}."
+        )
 
 
 class NcclExtension(WorkerExtension):
@@ -111,6 +133,10 @@ class NcclExtension(WorkerExtension):
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         self.state_dict_info = state_dict_info
+        model = self.engine.model_engine.model
+        if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
+            fp8_quantization.validate_fused_expert_layout(state_dict_info)
+            _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
 
     def _finalize_weight_update(self) -> None:
         """Finalize refit using TRT-LLM's CUDA-graph-safe path when available."""
@@ -136,6 +162,34 @@ class NcclExtension(WorkerExtension):
                 module, "_weights_removed", False
             ):
                 module.post_load_weights()
+
+    def _ensure_refit_usable(self) -> None:
+        failure = getattr(self, "_fp8_refit_failure", None)
+        if failure is not None:
+            raise RuntimeError(
+                "This TRT-LLM worker is unusable after a failed partial FP8 "
+                f"refit and must be restarted. Original failure: {failure}"
+            )
+
+    def _abort_weight_update_after_failure(
+        self, model: Any, model_loader: Any, error: Exception
+    ) -> None:
+        fp8_refit_failed = fp8_quantization.is_quantized_expert_refit(
+            model.model_config.quant_config
+        )
+        if fp8_refit_failed:
+            # Record poisoning before abort: abort itself may fail, but this
+            # worker must never serve with partially updated FP8 weights.
+            self._fp8_refit_failure = repr(error)
+        try:
+            _call_model_loader_hook_if_available(model_loader, "abort_update_weights")
+        finally:
+            if fp8_refit_failed:
+                raise RuntimeError(
+                    "Partial Qwen3.5 FP8 refit failed after runtime weights may have "
+                    "been modified. The TRT-LLM worker is poisoned and must be "
+                    "restarted."
+                ) from error
 
     # ------------------------------------------------------------------ #
     #  NCCL weight receive + reload
@@ -165,11 +219,21 @@ class NcclExtension(WorkerExtension):
         )
         model_engine = self.engine.model_engine
         model = model_engine.model
+        self._ensure_refit_usable()
 
         def load_model_weight_func(weight_list):
+            if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
+                weights = fp8_quantization.load_weights(
+                    weight_list,
+                    is_mx=fp8_quantization.is_mxfp8_model(
+                        model.model_config.quant_config
+                    ),
+                )
+            else:
+                weights = dict(weight_list)
             model_engine.model_loader.reload(
                 model,
-                dict(weight_list),
+                weights,
                 allow_partial_loading=True,
             )
 
@@ -199,8 +263,8 @@ class NcclExtension(WorkerExtension):
 
                 self.engine.reset_prefix_cache()
             except Exception as e:
-                _call_model_loader_hook_if_available(
-                    model_engine.model_loader, "abort_update_weights"
+                self._abort_weight_update_after_failure(
+                    model, model_engine.model_loader, e
                 )
                 print(f"Error in NcclExtension.update_weights_from_collective: {e}")
                 return False
@@ -238,6 +302,7 @@ class NcclExtension(WorkerExtension):
         )
         model_engine = self.engine.model_engine
         model = model_engine.model
+        self._ensure_refit_usable()
 
         buffer = None
         weights = None
@@ -281,6 +346,18 @@ class NcclExtension(WorkerExtension):
                     "Likely stale state_dict_info (wrong shape/dtype for some key)."
                 )
 
+                if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
+                    weights = fp8_quantization.load_weights(
+                        weights.items(),
+                        is_mx=fp8_quantization.is_mxfp8_model(
+                            model.model_config.quant_config
+                        ),
+                    )
+                    # Qwen3.5's mapper may retain split QKVZ/BA tensors until a
+                    # later IPC chunk completes the fusion group. Detach those
+                    # views before ACK lets the trainer reuse its transport buffer.
+                    weights = fp8_quantization.clone_mapper_staging_weights(weights)
+
                 model_engine.model_loader.reload(
                     model,
                     weights,
@@ -302,8 +379,8 @@ class NcclExtension(WorkerExtension):
             torch.cuda.empty_cache()
             return True
         except Exception as e:
-            _call_model_loader_hook_if_available(
-                model_engine.model_loader, "abort_update_weights"
+            self._abort_weight_update_after_failure(
+                model, model_engine.model_loader, e
             )
             print(
                 f"Error in NcclExtension.update_weights_via_ipc_zmq: {e}\n"
