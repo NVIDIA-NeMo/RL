@@ -273,6 +273,11 @@ class VllmGeneration(GenerationInterface):
         # shard selection stays health-blind, which is the historical behaviour.
         self.fleet_monitor: Optional[GenerationFleetHealth] = None
         self.fleet_selector: Optional[HealthyShardSelector] = None
+        # Declared here rather than springing into existence in set_refit_membership.
+        # None means "no shard has been lost", which is the state for the whole life of
+        # any run that never loses one -- so absence is a real value, not a missing one,
+        # and it should not be discovered with getattr at the read site.
+        self._refit_membership: Optional["RefitMembership"] = None
 
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
@@ -658,7 +663,7 @@ class VllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
         workers = self.worker_group.workers
-        membership = getattr(self, "_refit_membership", None)
+        membership = self._refit_membership
         if membership is None:
             per_shard = len(workers) // self.dp_size
             return [workers[idx * per_shard] for idx in range(self.dp_size)]

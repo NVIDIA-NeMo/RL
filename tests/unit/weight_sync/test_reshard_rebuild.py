@@ -73,6 +73,10 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
         cfg={"vllm_cfg": {"async_engine": False}},
         worker_group=SimpleNamespace(workers=workers, dp_size=dp_size),
         dp_size=dp_size,
+        # Declared, because VllmGeneration declares it. It used to be read with a getattr
+        # default, which meant this fake could omit it and still pass -- the getattr was
+        # covering for the fake rather than for a genuinely optional field.
+        _refit_membership=None,
     )
     for name in (
         "rebuild_collective",
