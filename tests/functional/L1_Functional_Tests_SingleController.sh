@@ -56,7 +56,12 @@ run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controll
 # ...and the property that run CANNOT prove. It is dp_size=1, so _pick_backend has one
 # choice, the serving set never shrinks, and the no-healthy-backend path never fires: it
 # demonstrates pass-through, not failover. This one runs two generation shards, kills one
-# mid-run, and asserts the run FINISHES -- which is the entire reason the router exists.
+# mid-run, and asserts the serving set shrinks so NeMo-Gym stops being handed the corpse.
+#
+# EXPECT defaults to quarantine deliberately. Surviving the loss needs the communicator
+# rebuild that lands later in this stack -- without it the next refit broadcasts to the
+# dead rank and hangs in NCCL (job 6258553 sat there for 33 minutes). Asserting survival
+# here would assert a property this part does not implement.
 #
 # Needs >= 3 GPUs (2 generation + 1 trainer) and self-skips below that, so it is inert on
 # the 2-GPU L1 runners and only does its job on a larger box.
