@@ -248,10 +248,20 @@ def main() -> None:
                 )
     finally:
         shutdown_environments(task_to_env, val_task_to_env)
+        # Do not defer distributed worker teardown to Python finalizers. Ray may
+        # already be finalizing its core worker by then, and a destructor-triggered
+        # RPC can attempt to initialize it a second time and abort the driver. A
+        # failed run must still reach this path, otherwise the NIXL agents are
+        # only torn down once `sys.meta_path` is gone. Each teardown is guarded so
+        # a failure in one still lets the other run.
         try:
             policy_generation.shutdown()
         except Exception as error:
             print(f"Error shutting down generation: {error}", flush=True)
+        try:
+            policy.shutdown()
+        except Exception as error:
+            print(f"Error shutting down policy: {error}", flush=True)
 
 
 if __name__ == "__main__":
