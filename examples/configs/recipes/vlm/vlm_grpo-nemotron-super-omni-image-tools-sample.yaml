@@ -22,7 +22,7 @@ checkpointing:
 
 policy:
   train_global_batch_size: 256
-  max_total_sequence_length: 16384
+  max_total_sequence_length: 32768
   megatron_cfg:
     scheduler:
       lr_decay_iters: 1
@@ -30,7 +30,7 @@ policy:
   generation:
     vllm_kwargs:
       limit_mm_per_prompt:
-        image: 12
+        image: 21
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}

@@ -11,7 +11,7 @@ one pivot row:
     expected_action                = the tool call demonstrated at that turn
 
 The rollout is a single model call at that state; the verifier
-(resources_servers/image_tools_pivot) scores the emitted tool call against
+(resources_servers/image_tools) scores the emitted tool call against
 `expected_action`.
 
 Input row schema (one JSON object per line):
@@ -25,8 +25,8 @@ placeholder count equals len(image) for every row).
 Usage:
     python tools/convert_sft_to_image_pivot.py \
         --input  /path/to/train.jsonl \
-        --out-train resources_servers/image_tools_pivot/data/train.jsonl \
-        --out-val   resources_servers/image_tools_pivot/data/validation.jsonl
+        --out-train resources_servers/image_tools/data/train.jsonl \
+        --out-val   resources_servers/image_tools/data/validation.jsonl
 """
 
 from __future__ import annotations
