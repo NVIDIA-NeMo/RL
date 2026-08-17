@@ -40,7 +40,7 @@ import asyncio
 from functools import partial
 from typing import Any, Optional
 
-from nemo_rl.models.generation.fleet_health import GenerationFleetMonitor, ShardState
+from nemo_rl.models.generation.fleet_health import GenerationFleetHealth, ShardState
 
 
 class EngineSupervisor:
@@ -49,7 +49,7 @@ class EngineSupervisor:
     def __init__(
         self,
         generation: Any,
-        monitor: GenerationFleetMonitor,
+        monitor: GenerationFleetHealth,
     ) -> None:
         self._generation = generation
         self._monitor = monitor

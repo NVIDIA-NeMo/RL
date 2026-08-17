@@ -28,7 +28,7 @@ import pytest
 
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
-    GenerationFleetMonitor,
+    GenerationFleetHealth,
     ShardState,
 )
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
@@ -304,15 +304,15 @@ class TestOtherTransportsAreUnaffected:
         assert _Transport().reconcile_communicator([0, 1]) is False
 
 
-def _monitor(shard_count: int = 3) -> GenerationFleetMonitor:
-    return GenerationFleetMonitor(
+def _monitor(shard_count: int = 3) -> GenerationFleetHealth:
+    return GenerationFleetHealth(
         shard_count=shard_count,
         policy=FleetHealthPolicy(),
         base_urls=[f"http://h:{8000 + i}/v1" for i in range(shard_count)],
     )
 
 
-def _condemn(monitor: GenerationFleetMonitor, shard_idx: int) -> None:
+def _condemn(monitor: GenerationFleetHealth, shard_idx: int) -> None:
     """Drive a shard to DEAD the way the fleet actually does.
 
     One failure only makes a shard SUSPECT -- reaching DEAD takes
@@ -378,7 +378,7 @@ class TestControllerCallSite:
         from nemo_rl.algorithms.single_controller import SingleControllerActor
 
         ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-        ctrl._fleet_monitor = monitor
+        ctrl._gen_fleet = monitor
         ctrl._weight_synchronizer = synchronizer
         return ctrl
 

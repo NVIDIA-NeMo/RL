@@ -38,7 +38,7 @@ from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
-    GenerationFleetMonitor,
+    GenerationFleetHealth,
     ShardState,
 )
 
@@ -92,7 +92,9 @@ def _make_controller(
     ctrl = object.__new__(controller_cls)
     ctrl._async_cfg = SimpleNamespace(
         recompute_kv_cache_after_weight_updates=False,
-        fleet_health=SimpleNamespace(probe_timeout_s=1.0, probe_interval_s=0.01),
+        generation_fleet_health=SimpleNamespace(
+            probe_timeout_s=1.0, probe_interval_s=0.01
+        ),
     )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
@@ -101,11 +103,11 @@ def _make_controller(
     if with_monitor:
         # unhealthy_threshold well above anything a single probe round could reach, so a
         # DEAD verdict here can only have come from the conclusive path.
-        monitor = GenerationFleetMonitor(
+        monitor = GenerationFleetHealth(
             shard_count=shard_count,
             policy=FleetHealthPolicy(unhealthy_threshold=99, min_healthy_shards=1),
         )
-    ctrl._fleet_monitor = monitor
+    ctrl._gen_fleet = monitor
 
     sync = _Synchronizer(failure, rebuild_succeeds=rebuild_succeeds)
     sync.bind(monitor)

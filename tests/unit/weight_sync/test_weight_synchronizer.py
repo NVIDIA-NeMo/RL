@@ -69,9 +69,9 @@ def _mock_generation(**overrides):
     gen.update_weights_from_collective.return_value = [MagicMock()]
     gen.get_rollout_engine_urls.return_value = ["http://localhost:30000"]
     gen.init_collective.return_value = [MagicMock()]
-    # Real numbers, not MagicMocks: the collective synchronizer records the membership it
-    # built over so a later reconcile can tell "unchanged" from "a shard left or came
-    # back", and that arithmetic needs an actual shard count.
+    # Real numbers, not MagicMocks: both NCCL transports derive their refit membership
+    # from dp_size and the worker count, so bare MagicMocks reach the rank arithmetic and
+    # fail there, on a comparison, several frames from the cause.
     gen.worker_group.dp_size = 2
     gen.worker_group.workers = [MagicMock(), MagicMock()]
     for k, v in overrides.items():
@@ -463,6 +463,9 @@ class TestNcclReshardWeightSynchronizer:
         policy.prepare_nccl_reshard_refit_info.return_value = refit_info
         gen = _mock_generation()
         gen.init_nccl_reshard_comm_group.return_value = [MagicMock()]
+        # tp_size=4 over a 4-GPU generation world -> one DP shard.
+        gen.worker_group.dp_size = 1
+        gen.worker_group.workers = [MagicMock() for _ in range(4)]
         train_cluster = _mock_cluster(world_size=2)
         train_cluster.num_gpus_per_node = 8
         train_cluster.get_available_address_and_port.return_value = (

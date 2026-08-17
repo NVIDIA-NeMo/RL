@@ -50,8 +50,17 @@ run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chao
 # against the trainer's recomputation, so a proxy that corrupts or truncates a response
 # blows it up. A run that merely completes would not prove the payload survived the hop.
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh \
-    ++async_rl.policy_router.enabled=true \
-    ++async_rl.fleet_health.enabled=true
+    ++async_rl.generation_router.enabled=true \
+    ++async_rl.generation_fleet_health.enabled=true
+
+# ...and the property that run CANNOT prove. It is dp_size=1, so _pick_backend has one
+# choice, the serving set never shrinks, and the no-healthy-backend path never fires: it
+# demonstrates pass-through, not failover. This one runs two generation shards, kills one
+# mid-run, and asserts the run FINISHES -- which is the entire reason the router exists.
+#
+# Needs >= 3 GPUs (2 generation + 1 trainer) and self-skips below that, so it is inert on
+# the 2-GPU L1 runners and only does its job on a larger box.
+run_test uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
 # Full mode only: kills a generation shard and asserts the run carries on. Needs >= 3
 # GPUs so that losing a shard still leaves a fleet, and self-skips below that rather
 # than passing vacuously.

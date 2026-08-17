@@ -34,7 +34,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.failures import GenerationUnavailable, NoHealthyShards
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
-    GenerationFleetMonitor,
+    GenerationFleetHealth,
     HealthyShardSelector,
     ShardState,
 )
@@ -80,8 +80,8 @@ def _make_generation(dp_size: int, fail_on_workers=()) -> VllmGeneration:
     return gen
 
 
-def _attach(gen: VllmGeneration, **policy_kwargs) -> GenerationFleetMonitor:
-    monitor = GenerationFleetMonitor(
+def _attach(gen: VllmGeneration, **policy_kwargs) -> GenerationFleetHealth:
+    monitor = GenerationFleetHealth(
         shard_count=gen.worker_group.dp_size,
         policy=FleetHealthPolicy(**policy_kwargs),
     )
@@ -192,6 +192,89 @@ class TestWithFleetHealth:
 
     def test_attach_rejects_a_mismatched_shard_count(self):
         gen = _make_generation(dp_size=4)
-        monitor = GenerationFleetMonitor(shard_count=2, policy=FleetHealthPolicy())
+        monitor = GenerationFleetHealth(shard_count=2, policy=FleetHealthPolicy())
         with pytest.raises(ValueError, match="tracks 2 shards"):
             gen.attach_fleet_health(monitor, HealthyShardSelector(monitor=monitor))
+
+
+class _HangingWorkerGroup(_WorkerGroup):
+    """A worker whose result never materialises -- a wedged engine under a live actor.
+
+    The process is fine and answers is_alive; only the generation never returns. This is
+    the failure the fleet-health docstrings cite to justify reactive reporting.
+    """
+
+    def run_single_worker_single_data(self, *, method_name, worker_idx, data, greedy):
+        del method_name, data, greedy
+        self.dispatched.append(worker_idx)
+        return _never_returns()
+
+
+async def _never_returns():
+    async def _ref():
+        await asyncio.sleep(3600)
+
+    yield _ref()
+
+
+class TestGenerationTimeoutIsReported:
+    """A timeout used to raise a bare RuntimeError from inside the try.
+
+    The `except ray.exceptions.RayError` handler that reports to the ledger therefore
+    never saw it, so a wedged shard was never condemned -- and because the finally
+    releases its inflight slot, it dropped back to 0 and became the *preferred* next
+    pick, at NRL_VLLM_ASYNC_TIMEOUT_SECONDS per visit.
+    """
+
+    @staticmethod
+    def _stub_ray_cancel(monkeypatch):
+        # The real path cancels a Ray object-ref generator; the fake here is a plain
+        # async generator, which ray.cancel rejects. Irrelevant to what is under test.
+        monkeypatch.setattr(ray, "cancel", lambda *_a, **_k: None)
+
+    def test_a_timeout_is_reported_to_the_ledger(self, monkeypatch):
+        self._stub_ray_cancel(monkeypatch)
+        monkeypatch.setenv("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "0.05")
+        gen = _make_generation(dp_size=2)
+        gen.worker_group = _HangingWorkerGroup(dp_size=2)
+        monitor = _attach(gen, unhealthy_threshold=3)
+
+        with pytest.raises(GenerationUnavailable):
+            _generate(gen)
+
+        assert any(
+            shard.consecutive_reported_failures == 1 for shard in monitor.snapshot()
+        ), "the wedged shard must have been reported"
+
+    def test_a_timeout_is_typed_as_infrastructure(self, monkeypatch):
+        """Bare RuntimeError classifies DATA and would burn the per-prompt data budget."""
+        self._stub_ray_cancel(monkeypatch)
+        monkeypatch.setenv("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "0.05")
+        gen = _make_generation(dp_size=1)
+        gen.worker_group = _HangingWorkerGroup(dp_size=1)
+        _attach(gen)
+
+        with pytest.raises(GenerationUnavailable, match="did not return within"):
+            _generate(gen)
+
+    def test_repeated_timeouts_condemn_the_shard(self, monkeypatch):
+        self._stub_ray_cancel(monkeypatch)
+        monkeypatch.setenv("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "0.05")
+        gen = _make_generation(dp_size=1)
+        gen.worker_group = _HangingWorkerGroup(dp_size=1)
+        monitor = _attach(gen, unhealthy_threshold=2)
+
+        for _ in range(2):
+            with pytest.raises(GenerationUnavailable):
+                _generate(gen)
+        assert monitor.state_of(0) is ShardState.DEAD
+
+    def test_a_successful_generation_clears_the_reported_streak(self):
+        """Otherwise the streak is monotonic and a healthy shard eventually dies."""
+        gen = _make_generation(dp_size=1)
+        monitor = _attach(gen, unhealthy_threshold=3)
+        monitor.report_failure(0, RuntimeError("earlier blip"))
+        assert monitor.snapshot()[0].consecutive_reported_failures == 1
+
+        _generate(gen)
+        assert monitor.snapshot()[0].consecutive_reported_failures == 0

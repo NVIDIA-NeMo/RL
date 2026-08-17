@@ -140,7 +140,7 @@ class WeightSynchronizer(ABC):
 
         Args:
             absent_shards: shard indices whose process cannot take part in a collective
-                (see ``GenerationFleetMonitor.absent_shards``). Note this is not the
+                (see ``GenerationFleetHealth.absent_shards``). Note this is not the
                 complement of the serving set: a shard withheld from traffic may still be
                 alive and able to refit.
 

@@ -30,13 +30,13 @@ import pytest
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
-    GenerationFleetMonitor,
+    GenerationFleetHealth,
     ShardState,
 )
 
 
-def _monitor(shard_count=3, **policy_kwargs) -> GenerationFleetMonitor:
-    return GenerationFleetMonitor(
+def _monitor(shard_count=3, **policy_kwargs) -> GenerationFleetHealth:
+    return GenerationFleetHealth(
         shard_count=shard_count,
         policy=FleetHealthPolicy(**policy_kwargs),
         base_urls=[f"http://h:{8000 + i}/v1" for i in range(shard_count)],
@@ -271,7 +271,7 @@ class TestPromotionIsWiredUp:
         from nemo_rl.algorithms.single_controller import SingleControllerActor
 
         ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-        ctrl._fleet_monitor = monitor
+        ctrl._gen_fleet = monitor
         ctrl._trainer_version = trainer_version
         return ctrl
 

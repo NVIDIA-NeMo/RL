@@ -32,6 +32,7 @@ from omegaconf import OmegaConf
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
     MasterConfig,
+    WatchdogConfig,
     setup_single_controller,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -143,7 +144,7 @@ def main() -> None:
         setup_timing_metrics=setup_timing_metrics,
     )
     try:
-        result = _run_with_liveness_watch(sc, config.async_rl.watchdog)
+        result = _run_with_controller_liveness_watch(sc, config.async_rl.stall_watchdog)
         print(f"SC run complete: {result}")
     finally:
         # Drain env actors before generation to avoid in-flight requests during shutdown.
@@ -167,7 +168,9 @@ def main() -> None:
                 print(f"{resource_name} shutdown failed: {e}")
 
 
-def _run_with_liveness_watch(sc: Any, watchdog_config: Any) -> Any:
+def _run_with_controller_liveness_watch(
+    sc: ray.actor.ActorHandle, watchdog_config: WatchdogConfig
+) -> dict[str, Any]:
     """Await the SC run, polling ping() so a frozen event loop cannot hide.
 
     The in-actor watchdog is an asyncio task on the SC's own event loop, so it cannot
