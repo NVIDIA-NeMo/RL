@@ -116,6 +116,8 @@ policy:
     cuda_graph_impl: "none"
     cuda_graph_modules: []
     cuda_graph_warmup_steps: 3
+    fine_grained_activation_offloading: false
+    offload_modules: null
     recompute_granularity: "full"
     recompute_modules: null
     tensor_model_parallel_size: 1

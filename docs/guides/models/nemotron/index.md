@@ -17,6 +17,9 @@ For the full list of supported models, see
   (CLEVR-CoGenT and MMPR-Tiny recipes).
 - **[Nemotron 3 Super](nemotron-3-super.md)** — the multi-stage Nemotron 3
   Super post-training recipe (RLVR, SWE, and RLHF stages).
+- **[Nemotron 3 Super Omni Image MOPD](nemotron-3-super-omni-mopd.md)** — image
+  on-policy distillation for the Super Omni vision-language model with a
+  non-colocated teacher (10-node production recipe plus a 4-node smoke).
 - **[Nemotron 3 Ultra](nemotron-3-ultra.md)** — RLVR, teacher training, and
   MOPD stages on GB200 NVL72 hardware.
 - **[Nemotron 3.5 Lightning](nemotron-3.5-lightning.md)** — RLVR with NeMo Gym
