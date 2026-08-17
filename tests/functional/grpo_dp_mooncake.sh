@@ -115,12 +115,28 @@ dump_mooncake_master_log() {
     else
         echo "(absent -- mooncake_master was never started)"
     fi
+    echo "=== [tmp diag] mooncake_master process state ==="
+    # Distinguishes "never started" from "started then died" from "alive but not
+    # serving" -- TQ only ever checks the process is alive 3s after spawning it.
+    if pgrep -f "[m]ooncake_master" >/dev/null 2>&1; then
+        pgrep -af "[m]ooncake_master"
+    else
+        echo "(no mooncake_master process alive at exit)"
+    fi
     echo "=== [tmp diag] listeners on 50050/50051 ==="
     # ss and netstat are both often missing from the image; /proc always works.
-    # Ports are hex in /proc/net/tcp: 50050=C382, 50051=C383.
+    # Ports are hex in /proc/net/tcp: 50050=C382, 50051=C383. State 0A = LISTEN.
     grep -iE ':(C382|C383) ' /proc/net/tcp 2>/dev/null || echo "(no listener on 50050/50051)"
 }
 trap dump_mooncake_master_log EXIT
+
+# TransferQueue logs the whole mooncake bootstrap at INFO -- which process starts
+# mooncake_master, its PID, whether it killed a pre-existing one, and whether it
+# attached to an existing controller instead of initialising. get_logger() defaults
+# to WARNING (transfer_queue/utils/logging_utils.py), so none of that reaches CI:
+# the failing job contains zero mooncake_master lines. Without it there is no way
+# to tell "never started" from "started and died".
+export TQ_LOGGING_LEVEL=INFO
 
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
