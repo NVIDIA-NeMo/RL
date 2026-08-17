@@ -17,6 +17,33 @@ from typing import Any, Literal, NotRequired, TypedDict
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
+class SglangQuantizationConfig(TypedDict, total=False):
+    """SGLang weight precision. Only BF16 on this layer."""
+
+    scheme: Literal["bf16"]
+
+
+SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16"})
+
+
+def get_sglang_quantization_scheme(quantization_config: dict[str, Any] | None) -> str:
+    """Return the configured SGLang weight precision.
+
+    Absent or empty means BF16; a non-empty block must declare a supported
+    ``scheme`` so a typo raises instead of silently falling back.
+    """
+    if not quantization_config:
+        return "bf16"
+
+    scheme = quantization_config.get("scheme")
+    if scheme not in SUPPORTED_SGLANG_QUANTIZATION_SCHEMES:
+        supported = ", ".join(sorted(SUPPORTED_SGLANG_QUANTIZATION_SCHEMES))
+        raise ValueError(
+            f"SGLang quantization.scheme must be one of {{{supported}}}, got {scheme!r}."
+        )
+    return scheme
+
+
 class SGLangServerConfig(TypedDict):
     # When True, sets SGLang `enable_memory_saver=True` so weights/KV can be released
     # during training and re-acquired before generation.
@@ -74,6 +101,9 @@ class SglangSpecificArgs(TypedDict):
     # sites have a single sglang namespace instead of three sibling fields.
     sglang_server_config: SGLangServerConfig
     sglang_router_config: SGLangRouterConfig
+
+    # Weight precision for rollout/refit; absent means BF16.
+    quantization: NotRequired[SglangQuantizationConfig]
 
     # Path to model weights (local folder or HF repo id).
     model_path: NotRequired[str]
