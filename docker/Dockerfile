@@ -37,9 +37,12 @@ export TZ=America/Los_Angeles
 
 apt-get update
 apt-get install -y --no-install-recommends \
+    binutils \
     jq \
     curl \
     git \
+    libnl-3-200 \
+    libnl-route-3-200 \
     rsync \
     wget \
     less \
@@ -88,6 +91,34 @@ ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 
+FROM base AS build_hybridep_rdma_core
+
+# HybridEP's multi-node extension requires rdma-core headers and libraries at
+# both wheel-build and runtime JIT time. Keep this in a separate stage so the
+# compiler toolchain is not carried into the release image and the v60 build is
+# cached independently from Python dependency changes.
+ARG RDMA_CORE_REF=v60.0
+ARG MAX_JOBS=8
+RUN <<"EOF" bash -exu -o pipefail
+apt-get update
+apt-get install -y --no-install-recommends \
+    build-essential \
+    libnl-3-dev \
+    libnl-route-3-dev \
+    libudev-dev \
+    ninja-build \
+    pkg-config
+git clone --depth 1 --branch "${RDMA_CORE_REF}" \
+    https://github.com/linux-rdma/rdma-core.git /opt/rdma-core
+(
+    cd /opt/rdma-core
+    MAX_JOBS="${MAX_JOBS}" sh build.sh
+)
+test -f /opt/rdma-core/build/lib/libibverbs.so
+test -f /opt/rdma-core/build/lib/libmlx5.so
+EOF
+
+
 FROM base AS hermetic
 
 WORKDIR /opt/nemo-rl
@@ -110,12 +141,17 @@ ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
 ARG BASE_IMAGE
 ARG UV_VERSION
+ARG DEEPEP_CUDA_ARCH_LIST="9.0 10.0"
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
-# Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
-ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+# Build HybridEP with the multi-node RDMA backend. HYBRID_EP_MULTINODE is a
+# DeepEP build-time switch; RDMA_CORE_HOME is also embedded into its JIT
+# compiler and must remain available in the release image.
+ENV HYBRID_EP_MULTINODE=1
+ENV RDMA_CORE_HOME=/opt/rdma-core/build
+ENV TORCH_CUDA_ARCH_LIST=${DEEPEP_CUDA_ARCH_LIST}
 
 # Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
 ENV CUDA_HOME=/usr/local/cuda
@@ -123,6 +159,8 @@ ENV CUDA_HOME=/usr/local/cuda
 ## CUDA 13 moved standard library headers under include/cccl; expose that path so
 ## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
+
+COPY --from=build_hybridep_rdma_core /opt/rdma-core /opt/rdma-core
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
@@ -135,6 +173,12 @@ COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh \
     --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
+# Multi-node HybridEP links against libnvidia-ml. Use the distro development
+# package only while building the wheel; the NVIDIA runtime must inject the
+# host driver library into the final container.
+apt-get update
+apt-get install -y --no-install-recommends libnvidia-ml-dev
+
 CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}" | md5sum | cut -c1-12)
 SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
 if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
@@ -144,6 +188,11 @@ elif [ -n "$SEED_KEY" ]; then
     mkdir -p /root/.cache/uv
     rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
 fi
+
+# DeepEP's wheel cache key does not encode HYBRID_EP_MULTINODE,
+# RDMA_CORE_HOME, or the CUDA architecture list. Never reuse a wheel that may
+# have been compiled by a single-node or different-architecture image build.
+uv cache clean deep-ep || true
 
 uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
@@ -161,6 +210,14 @@ fi
 
 # The venv is symlinked to avoid bloating the layer size
 uv sync --link-mode symlink --locked --no-install-project
+
+# The NVSHMEM wheel contains only the versioned host-library soname. HybridEP's
+# fabric-handle runtime also opens the unversioned name.
+NVSHMEM_LIB=$(/opt/nemo_rl_venv/bin/python -c 'import importlib.util, pathlib; spec = importlib.util.find_spec("nvidia.nvshmem"); print(pathlib.Path(spec.submodule_search_locations[0]) / "lib")')
+NVSHMEM_HOST=$(find "$NVSHMEM_LIB" -maxdepth 1 -name 'libnvshmem_host.so.*' \( -type f -o -type l \) | sort -V | tail -n 1)
+test -n "$NVSHMEM_HOST"
+ln -sfn "$(basename "$NVSHMEM_HOST")" "$NVSHMEM_LIB/libnvshmem_host.so"
+
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     uv sync --link-mode symlink --locked --extra vllm --no-install-project
 fi
@@ -177,6 +234,13 @@ uv sync --link-mode symlink --locked --all-groups --no-install-project
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 
 echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
+
+# Do not retain distro NVML packages: they can shadow the host driver and make
+# nvidia-smi hang when the image is launched through Pyxis/Enroot.
+apt-get purge -y libnvidia-ml-dev
+apt-get autoremove -y
+apt-get clean
+rm -rf /var/lib/apt/lists/*
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -242,6 +306,36 @@ if [[ -n "$NEGATIVE_FILTERS" ]]; then
 else
     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
 fi
+EOF
+
+# Each Ray worker owns an isolated venv. Add the NVSHMEM compatibility symlink
+# to every venv containing DeepEP, then prove that the HybridEP extension was
+# linked against the rdma-core tree baked above. Importing the extension is
+# deferred to the GPU runtime, where the host NVML library is injected.
+RUN <<"EOF" bash -euo pipefail
+mapfile -t DEEPEP_PYTHONS < <(
+    find /opt/ray_venvs -mindepth 3 -maxdepth 3 -path '*/bin/python' \( -type f -o -type l \) |
+        while read -r python; do
+            if "$python" -c 'import importlib.metadata; importlib.metadata.version("deep-ep")' >/dev/null 2>&1; then
+                echo "$python"
+            fi
+        done
+)
+test "${#DEEPEP_PYTHONS[@]}" -gt 0
+
+for python in "${DEEPEP_PYTHONS[@]}"; do
+    NVSHMEM_LIB=$(
+        "$python" -c 'import importlib.util, pathlib; spec = importlib.util.find_spec("nvidia.nvshmem"); print(pathlib.Path(spec.submodule_search_locations[0]) / "lib")'
+    )
+    NVSHMEM_HOST=$(find "$NVSHMEM_LIB" -maxdepth 1 -name 'libnvshmem_host.so.*' \( -type f -o -type l \) | sort -V | tail -n 1)
+    test -n "$NVSHMEM_HOST"
+    ln -sfn "$(basename "$NVSHMEM_HOST")" "$NVSHMEM_LIB/libnvshmem_host.so"
+
+    HYBRID_EP_SO=$(
+        "$python" -c 'import importlib.util; spec = importlib.util.find_spec("hybrid_ep_cpp"); assert spec is not None; print(spec.origin)'
+    )
+    readelf -d "$HYBRID_EP_SO" | grep -F "$RDMA_CORE_HOME/lib"
+done
 EOF
 
 # Generate container fingerprint for frozen environment support
