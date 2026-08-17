@@ -125,6 +125,14 @@ deleted on exit. An optional absolute `UV_CACHE_DIR_OVERRIDE` is forwarded to
 `ray.sub` so a one-node dependency warmup can populate a shared wheel cache
 before large jobs allocate GPUs.
 
+`validate_recipes.py` provides the same resolved-config gate without depending
+on the pytest console entrypoint. Run it inside the selected container before
+the GPU model jobs:
+
+```bash
+python experiments/h100-hybridep-performance-20260817/validate_recipes.py
+```
+
 Before submitting model jobs, run `warm_hybridep_cache.sbatch` once with the
 same immutable container and cache path. It builds the pinned HybridEP wheel on
 one H100 and makes it reusable by every actor environment:
