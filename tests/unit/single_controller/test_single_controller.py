@@ -364,6 +364,10 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler
     ctrl._buffer = _EmptyBuffer()
+    # Read only by the select-stall warning, which reports what the pump is
+    # waiting on.
+    ctrl._inflight_rollouts = 0
+    ctrl._rollout_manager = SimpleNamespace(stats=SimpleNamespace(skipped=0))
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._rollout_exhausted.set()
@@ -409,6 +413,78 @@ def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:
         ),
     ):
         asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+
+async def _spin_train_pump(ctrl, seconds: float) -> None:
+    """Run the pump against a sampler that never selects, then stop it.
+
+    The pump only returns once a step closes or rollout is exhausted, and this is
+    the case where neither happens.
+    """
+    task = asyncio.ensure_future(ctrl._train_pump())
+    await asyncio.sleep(seconds)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+class TestSelectStallWarning:
+    """The stall the watchdog cannot see.
+
+    Its idle timer resets on every commit, so a fleet that keeps rolling out into a
+    step that never fills reads as healthy there while this pump spins in silence.
+    """
+
+    def _stalling_controller(self, monkeypatch, *, warn_after: float = 0.01):
+        monkeypatch.setattr(single_controller, "_SELECT_STALL_WARN_SECONDS", warn_after)
+        ctrl = _train_pump_controller(sampler=_EmptySampler())
+        # Not exhausted: the pump waits rather than returning, which is the wedge.
+        ctrl._rollout_exhausted.clear()
+        return ctrl
+
+    def test_a_pump_that_selects_nothing_says_so(self, capsys, monkeypatch) -> None:
+        ctrl = self._stalling_controller(monkeypatch)
+        ctrl._inflight_rollouts = 5
+        ctrl._rollout_manager.stats.skipped = 3
+
+        asyncio.run(_spin_train_pump(ctrl, 0.05))
+
+        out = capsys.readouterr().out
+        assert "train_pump selected no group" in out
+        # The four numbers that separate a short-batch wedge from starvation at
+        # the concurrency gate.
+        assert "0/2 groups" in out
+        assert "0 buffered" in out
+        assert "5 rollouts in flight" in out
+        assert "3 prompts skipped" in out
+
+    def test_the_threshold_escalates_instead_of_printing_every_tick(
+        self, capsys, monkeypatch
+    ) -> None:
+        """The pump retries every 5ms; one line per retry would bury the log.
+
+        The k-th warning waits k thresholds, so over a window of 5 thresholds this
+        prints about 5 lines where the pump retried about 20 times.
+        """
+        ctrl = self._stalling_controller(monkeypatch, warn_after=0.02)
+
+        asyncio.run(_spin_train_pump(ctrl, 0.1))
+
+        warnings = capsys.readouterr().out.count("train_pump selected no group")
+        assert 1 <= warnings <= 6, f"printed {warnings} warnings in 100ms"
+
+    def test_a_pump_still_making_progress_stays_quiet(
+        self, capsys, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(single_controller, "_SELECT_STALL_WARN_SECONDS", 30.0)
+        ctrl = _train_pump_controller(sampler=_EmptySampler())
+        ctrl._rollout_exhausted.clear()
+
+        asyncio.run(_spin_train_pump(ctrl, 0.05))
+
+        assert "train_pump selected no group" not in capsys.readouterr().out
 
 
 def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
