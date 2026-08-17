@@ -204,6 +204,18 @@ if (( STEPS < KILL_AFTER_STEPS )); then
 fi
 echo "[failover] $STEPS training steps done -- rollouts are flowing through the router."
 
+# Checked here as well as at the kill site, because discovery sits between the two and
+# its own liveness check fires first. In job 6262310 that turned "the run already
+# finished" into "job died before any actor appeared" -- true, but it sends you looking
+# at Ray instead of at the clock.
+TOTAL_STEPS=$(grep -oE "train step [0-9]+/[0-9]+" "$RUN_LOG" | tail -1 | sed -E "s|.*/||")
+if [[ -n "$TOTAL_STEPS" ]] && (( STEPS > TOTAL_STEPS - 5 )); then
+    echo "[failover] FAIL: the step gate opened at $STEPS of $TOTAL_STEPS -- the run had"
+    echo "[failover] already finished, so there is nothing left to kill. Usually means the"
+    echo "[failover] run log is arriving in bursts (is PYTHONUNBUFFERED=1 still set?)."
+    exit 1
+fi
+
 
 # Discovered AFTER the run is confirmed training, not before. Each attempt is a full
 # ray.init round trip, and running this first put minutes of latency ahead of the kill --
