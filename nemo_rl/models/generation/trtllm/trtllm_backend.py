@@ -57,8 +57,8 @@ def _call_model_loader_hook_if_available(model_loader: Any, hook_name: str) -> b
     return True
 
 
-def _require_fp8_refit_lifecycle(model_loader: Any) -> None:
-    """Require the Qwen3.5 incremental-refit APIs from the target TRT-LLM."""
+def _require_fp8_refit_hooks(model_loader: Any) -> None:
+    """Require TRT-LLM hooks for transactional Qwen3.5 FP8 refits."""
     required_hooks = (
         "begin_update_weights",
         "finalize_update_weights",
@@ -73,8 +73,8 @@ def _require_fp8_refit_lifecycle(model_loader: Any) -> None:
         missing_hooks.append("WorkerExtension.finalize_weight_update")
     if missing_hooks:
         raise RuntimeError(
-            "Qwen3.5 FP8 refit requires the target TRT-LLM incremental-refit "
-            f"lifecycle. Missing APIs: {missing_hooks}."
+            "Qwen3.5 FP8 refit requires TRT-LLM weight-update hooks. "
+            f"Missing APIs: {missing_hooks}."
         )
 
 
@@ -135,8 +135,8 @@ class NcclExtension(WorkerExtension):
         self.state_dict_info = state_dict_info
         model = self.engine.model_engine.model
         if fp8_quantization.is_fp8_model(model.model_config.quant_config):
-            fp8_quantization.validate_qwen35_fused_expert_layout(state_dict_info)
-            _require_fp8_refit_lifecycle(self.engine.model_engine.model_loader)
+            fp8_quantization.validate_fused_expert_layout(state_dict_info)
+            _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
 
     def _finalize_weight_update(self) -> None:
         """Finalize refit using TRT-LLM's CUDA-graph-safe path when available."""
@@ -346,9 +346,7 @@ class NcclExtension(WorkerExtension):
                     # Qwen3.5's mapper may retain split QKVZ/BA tensors until a
                     # later IPC chunk completes the fusion group. Detach those
                     # views before ACK lets the trainer reuse its transport buffer.
-                    weights = fp8_quantization.clone_qwen35_mapper_staging_weights(
-                        weights
-                    )
+                    weights = fp8_quantization.clone_mapper_staging_weights(weights)
 
                 model_engine.model_loader.reload(
                     model,

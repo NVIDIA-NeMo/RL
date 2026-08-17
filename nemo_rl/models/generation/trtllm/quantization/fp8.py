@@ -74,10 +74,10 @@ _SPLIT_LINEAR_ATTN_RE = re.compile(
 )
 
 
-def validate_qwen35_fused_expert_layout(
+def validate_fused_expert_layout(
     state_dict_info: dict[str, Any],
 ) -> None:
-    """Validate the fused trainer layout before the first refit."""
+    """Validate Qwen3.5's fused routed-expert layout before the first refit."""
     layouts: dict[str, dict[str, tuple[int, ...]]] = {}
     for name, metadata in state_dict_info.items():
         match = _FUSED_EXPERT_RE.fullmatch(name)
@@ -319,7 +319,7 @@ def _insert_quantized_projection(
     _insert_unique(output, scale_name, scale_inv)
 
 
-def clone_qwen35_mapper_staging_weights(
+def clone_mapper_staging_weights(
     weights: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     """Detach split linear-attention tensors that the mapper may retain.

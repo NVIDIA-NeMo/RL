@@ -84,14 +84,15 @@ def test_model_loader_lifecycle_hooks_are_optional(hook_name, is_available):
         hook.assert_not_called()
 
 
-def test_fp8_prepare_refit_info_requires_incremental_lifecycle(monkeypatch):
+def test_fp8_refit_hooks(monkeypatch):
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
     extension, _, model, _, _ = _extension(backend)
     model.model_config = SimpleNamespace(quant_config=object())
     extension.engine.model_engine.model_loader = SimpleNamespace()
     monkeypatch.setattr(backend.fp8_quantization, "is_fp8_model", lambda _: True)
-    with pytest.raises(RuntimeError, match="incremental-refit lifecycle"):
+    # A missing hook could leave only part of the model updated after a failure.
+    with pytest.raises(RuntimeError, match="weight-update hooks"):
         extension.prepare_refit_info(
             {
                 "model.layers.0.mlp.experts.gate_up_proj": (

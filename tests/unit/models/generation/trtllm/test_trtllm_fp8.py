@@ -21,7 +21,7 @@ from nemo_rl.models.generation.trtllm.quantization.fp8 import (
     configure_fp8_llm_kwargs,
     configure_fp8_moe_backend,
     load_weights,
-    validate_qwen35_fused_expert_layout,
+    validate_fused_expert_layout,
 )
 
 pytestmark = pytest.mark.trtllm
@@ -40,29 +40,29 @@ def _block_matrix(values: list[list[float]]) -> torch.Tensor:
     )
 
 
-def test_validate_qwen35_fused_expert_layout():
+def test_fused_expert_layout():
     prefix = "model.layers.0.mlp.experts"
     valid = {
         f"{prefix}.gate_up_proj": (torch.Size([256, 1024, 2048]), torch.bfloat16),
         f"{prefix}.down_proj": (torch.Size([256, 2048, 512]), torch.bfloat16),
     }
 
-    validate_qwen35_fused_expert_layout(valid)
+    validate_fused_expert_layout(valid)
 
     valid[f"{prefix}.gate_up_proj"] = (
         torch.Size([256, 2048, 1024]),
         torch.bfloat16,
     )
     with pytest.raises(ValueError, match=r"gate_up_proj=\[E,2I,H\]"):
-        validate_qwen35_fused_expert_layout(valid)
+        validate_fused_expert_layout(valid)
 
 
-def test_validate_qwen35_fused_expert_layout_requires_experts():
+def test_missing_expert_layout():
     with pytest.raises(ValueError, match="No Qwen3.5 fused routed-expert weights"):
-        validate_qwen35_fused_expert_layout({})
+        validate_fused_expert_layout({})
 
 
-def test_configure_fp8_llm_kwargs_preserves_qwen35_model_overrides():
+def test_fp8_config_preserves_overrides():
     llm_kwargs = {
         "dtype": "fp8",
         "model_kwargs": {"pretrained_config": {"num_hidden_layers": 4}},
@@ -167,7 +167,7 @@ def test_block_fp8_handles_batched_non_aligned_zero_weights():
     assert torch.equal(scale_inv, torch.ones_like(scale_inv))
 
 
-def test_qwen35_only_routed_experts_become_hf_fp8_weights_and_scales():
+def test_routed_expert_conversion():
     prefix = "model.language_model.layers.3.mlp.experts"
     gate = torch.stack([_block_matrix([[1.0, 2.0]]), _block_matrix([[3.0, 4.0]])])
     up = torch.stack([_block_matrix([[5.0, 6.0]]), _block_matrix([[7.0, 8.0]])])
