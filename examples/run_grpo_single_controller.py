@@ -115,7 +115,9 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
-    init_ray()
+    # data_plane_cfg: backend engine knobs must reach every worker via the
+    # runtime_env snapshot init_ray takes; see init_ray's docstring.
+    init_ray(data_plane_cfg=config.data_plane)
 
     tokenizer = get_tokenizer(config.policy["tokenizer"])
     assert config.policy["generation"] is not None, (
