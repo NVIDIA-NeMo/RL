@@ -32,6 +32,11 @@ srun \
   --container-workdir="${PROJECT_ROOT}" \
   bash -lc '
     set -euo pipefail
+    export HYBRID_EP_MULTINODE=1
+    export MAX_JOBS="${MAX_JOBS:-8}"
+    export RDMA_CORE_HOME=/usr
+    export TORCH_CUDA_ARCH_LIST=9.0
+    export USE_NIXL=0
     export UV_CACHE_DIR=/root/.cache/uv
     warm_venv="/tmp/hybridep-cache-warm-${SLURM_JOB_ID}"
     export UV_PROJECT_ENVIRONMENT="${warm_venv}"

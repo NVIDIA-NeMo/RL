@@ -169,8 +169,17 @@ def test_queued_job_rejects_source_revision_change(tmp_path: Path) -> None:
 def test_hybridep_warmup_uses_locked_mcore_resolution() -> None:
     script = WARMUP_SCRIPT.read_text()
 
+    assert "export HYBRID_EP_MULTINODE=1" in script
+    assert "export TORCH_CUDA_ARCH_LIST=9.0" in script
     assert "uv sync" in script
     assert "--locked" in script
     assert "--extra mcore" in script
     assert 'UV_PROJECT_ENVIRONMENT="${warm_venv}"' in script
     assert "import torch; print" not in script
+
+
+def test_h100_submission_builds_multinode_hybridep_for_hopper() -> None:
+    script = SUBMIT_SCRIPT.read_text()
+
+    assert "export HYBRID_EP_MULTINODE=1" in script
+    assert "export TORCH_CUDA_ARCH_LIST=9.0" in script
