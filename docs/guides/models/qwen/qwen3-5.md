@@ -174,6 +174,98 @@ uv run examples/run_grpo.py \
   --config examples/configs/recipes/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml
 ```
 
+## FP8 Rollout and Training
+
+Two recipes run Qwen3.5 with FP8 on both sides — blockwise FP8 vLLM rollouts
+(DeepGEMM) and blockwise FP8 Megatron training (Transformer Engine):
+[`grpo-qwen3.5-9b-1n8g-megatron-fp8.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron-fp8.yaml)
+and
+[`grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8.yaml).
+General FP8 background lives in [FP8 Quantization](../../../fp8.md); the notes
+below are the Qwen3.5-specific sharp edges.
+
+### Block Layout and Shape Constraints
+
+- Weights are quantized in `[128, 128]` blocks (e4m3) with one fp32
+  `weight_scale_inv` per block; activations are quantized in per-token groups
+  of 128. Any tensor that is fed to an FP8 GEMM must have dimensions divisible
+  by 128 — tensors that don't fit must be excluded (next section).
+- The recipes set `make_sequence_length_divisible_by: 16` so training-side FP8
+  GEMMs see aligned sequence dimensions.
+- The KV cache stays bf16 in these recipes (`kv_cache_dtype` is left at
+  `auto`).
+
+### Weights That Must Stay in bf16
+
+The recipes exclude four keyword groups via
+`policy.generation.vllm_cfg.quantization_ignored_layer_kws`:
+
+```yaml
+quantization_ignored_layer_kws:
+  - linear_attn.conv1d    # GDN conv kernel: last dim is 4, not a 128-block GEMM
+  - linear_attn.in_proj_a # GDN projections whose shapes don't align to the
+  - linear_attn.in_proj_b # 128x128 block grid
+  - visual                # vision tower: intermediate_size 4304 = 16 x 269
+```
+
+Two things are easy to get wrong here:
+
+- **`visual` must be excluded even for text-only training.** Qwen3.5-Base
+  checkpoints use the VL architecture, and vLLM profiles VL models with a dummy
+  multimodal forward at engine init. With a quantized vision tower the job
+  crashes before the first step with
+  `the last dimension of x 4304 must be divisible by group_size 128`.
+- Excluded layers are built unquantized inside vLLM, and the refit path detects
+  that and streams them through as bf16 automatically — this also covers whole
+  expert layers excluded via `num_first_layers_in_bf16` /
+  `num_last_layers_in_bf16`. `lm_head`, embeddings, and the MoE router are
+  never quantized by design.
+
+### Refit
+
+- Every step streams bf16 weights from Megatron and re-quantizes them on the
+  vLLM side; scales are updated in place.
+- `VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "0"` (set in the recipes'
+  `vllm_cfg.env_vars`) is required: the FP8 patches attach to the v1 Ray
+  executor, and with the v2 default the first refit fails with
+  `'NoneType' object has no attribute 'is_mx'`.
+- Refit is the memory high-water mark of the step: vLLM re-materializes its
+  full `gpu_memory_utilization` claim on top of the trainer's residual
+  footprint, plus transient quantization buffers. The 35B recipe sets
+  `gpu_memory_utilization: 0.5` (down from the inherited 0.6) to leave that
+  headroom; raise it in small steps while watching free memory after the first
+  refit, not before it.
+
+### Grouped MoE (35B-A3B)
+
+- Megatron exports experts as grouped slabs (`mlp.experts.gate_up_proj` /
+  `mlp.experts.down_proj`, no `.weight` suffix). vLLM's fused expert loader
+  maps only the weight and has no path for per-block scales, so NeMo RL expands
+  each slab into per-expert `experts.{i}.{gate,up,down}_proj.weight` +
+  `weight_scale_inv` entries during refit, quantizing one expert at a time
+  (bounded transient memory, bitwise-identical to quantizing the whole slab).
+- Expert `out_features` / `in_features` must be 128-divisible; this is asserted
+  at refit time.
+- MXFP8 does not support grouped-MoE refit (`NotImplementedError`); use the
+  blockwise FP8 recipe for MoE models.
+
+### Training-Side Settings That Matter
+
+- `fp8_cfg`: `fp8: e4m3`, `fp8_recipe: blockwise`, `fp8_param: false`, with
+  `NVTE_FP8_BLOCK_SCALING_FP32_SCALES: "1"` in `megatron_cfg.env_vars`.
+- `use_precision_aware_optimizer: false` and `moe_router_dtype: fp32`.
+- `freeze_config` freezes the vision tower — required for text-only training on
+  the VL architecture (see [Model Quirks](../../../model-quirks.md)).
+
+### Expected Numerics
+
+`train/gen_kl_error` (vLLM FP8 rollout logprobs vs Megatron logprobs) measured
+on the verification runs: 35B ~0.0024 over the first 20 steps, drifting to
+~0.0031 mean / 0.0050 max over 126 steps; 9B ~0.0014 first-20, ~0.0018 over 586
+steps. The nightly thresholds (0.004 / 0.003 on the 20-step mean) are set from
+these; if you see values well above them, suspect a broken refit rather than
+FP8 noise.
+
 ## `flash-linear-attention` Performance
 
 Qwen3.5 relies on `flash-linear-attention` (FLA) and `causal-conv1d` kernels for
