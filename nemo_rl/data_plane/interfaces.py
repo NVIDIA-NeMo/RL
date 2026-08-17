@@ -69,14 +69,11 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     instead of registering a fresh one per transfer; set false to fall back to
     upstream's per-call registration.
 
-    ``staging_buffer_size`` is that pool's per-slot ceiling, an order of
-    magnitude below ``local_buffer_size`` because it bounds one in-flight
-    transfer rather than a whole client's arena. A payload larger than a slot
-    bypasses the pool and registers transiently, so raising it trades resident
-    pinned memory for fewer registrations on large transfers. The pool holds one
-    slot per mooncake batch worker, so a node pays ``gpus_per_node x
-    batch_workers x staging_buffer_size`` for it. Ignored when
-    ``reuse_registered_buffers`` is false.
+    ``staging_buffer_size`` is that pool's per-slot ceiling. It is a pooling
+    threshold, not a size limit: a bigger payload still transfers, just with a
+    transient registration. Slots ratchet — they grow to the largest payload
+    admitted and never shrink — so raise it only when a per-key payload (one
+    sample of one field) genuinely exceeds it, not for headroom.
     """
 
     global_segment_size: int = 68719476736  # 64 GiB per client process
