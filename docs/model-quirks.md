@@ -82,9 +82,9 @@ This matters only for custom configs.
 
 The Megatron backend has its own `freeze_config` at a different path
 (`policy.megatron_cfg.freeze_config`) with **different keys** than the
-AutoModel version above — the dict is forwarded to the Megatron-Bridge model
-provider's `freeze()` API, so the keys follow the provider signature and vary
-by model family (audio-capable providers add e.g. `freeze_audio_model`):
+AutoModel version above — the dict is forwarded to the Megatron model's
+`freeze()` method, so the keys follow that model's signature and vary
+by model family (audio-capable models add e.g. `freeze_audio_model`):
 
 ```yaml
 policy:
@@ -96,5 +96,5 @@ policy:
 ```
 
 The two configs are not interchangeable: copying the AutoModel keys
-(`freeze_vision_tower` / `freeze_audio_tower`) here raises a `TypeError` from
-the provider.
+(`freeze_vision_tower` / `freeze_audio_tower`) here raises a `TypeError`
+from the model's `freeze()`.
