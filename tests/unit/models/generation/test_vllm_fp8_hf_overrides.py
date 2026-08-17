@@ -177,12 +177,17 @@ def _capture_vllm_0251_draft_model_config(monkeypatch, target_kwargs):
     from vllm.config.speculative import SpeculativeConfig
 
     captured = {}
+    target_max_model_len = 4096
 
     def fake_model_config(**kwargs):
         captured.update(kwargs)
         model_type = "deepseek_mtp" if kwargs["model"] == "target-model" else "qwen3"
-        return SimpleNamespace(
+        normalized_kwargs = {
             **kwargs,
+            "max_model_len": kwargs.get("max_model_len") or target_max_model_len,
+        }
+        return SimpleNamespace(
+            **normalized_kwargs,
             architectures=["DraftForCausalLM"],
             hf_config=SimpleNamespace(
                 architectures=["DraftForCausalLM"],
@@ -214,7 +219,7 @@ def _capture_vllm_0251_draft_model_config(monkeypatch, target_kwargs):
         dtype="bfloat16",
         seed=0,
         tokenizer_revision=None,
-        max_model_len=4096,
+        max_model_len=target_max_model_len,
         enforce_eager=False,
         max_logprobs=20,
         config_format="auto",
