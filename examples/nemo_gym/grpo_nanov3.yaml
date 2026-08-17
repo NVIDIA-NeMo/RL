@@ -245,7 +245,6 @@ policy:
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
       refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nccl".
-      async_engine: true
       expose_http_server: true
       enable_prefix_caching: true
       parsers:
