@@ -186,7 +186,18 @@ def test_h100_submission_builds_multinode_hybridep_for_hopper() -> None:
     assert "export NVTE_CUDA_ARCHS=90" in script
     assert "export TORCH_CUDA_ARCH_LIST=9.0" in script
     assert "export NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS:-false}" in script
-    assert 'export NEMO_RL_VENV_DIR=\\"${run_dir}/venvs\\"' in script
+    assert 'venv_dir=${NEMO_RL_VENV_DIR_OVERRIDE:-${run_dir}/venvs}' in script
+    assert "export NEMO_RL_VENV_DIR=${venv_dir_q}" in script
+
+
+def test_submission_rejects_relative_actor_venv_override(tmp_path: Path) -> None:
+    repo, environment = _build_test_repo(tmp_path, "Qwen3-30B-A3B")
+    environment["NEMO_RL_VENV_DIR_OVERRIDE"] = "relative/venvs"
+
+    result = _launch(repo, environment)
+
+    assert result.returncode != 0
+    assert "NEMO_RL_VENV_DIR_OVERRIDE must be an absolute path" in result.stderr
 
 
 def test_shared_uv_cache_does_not_shadow_the_container_bootstrap_cache() -> None:

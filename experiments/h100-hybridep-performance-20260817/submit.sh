@@ -48,6 +48,10 @@ if [[ -n ${UV_CACHE_DIR_OVERRIDE:-} && ${UV_CACHE_DIR_OVERRIDE} != /* ]]; then
   echo "UV_CACHE_DIR_OVERRIDE must be an absolute path when set" >&2
   exit 2
 fi
+if [[ -n ${NEMO_RL_VENV_DIR_OVERRIDE:-} && ${NEMO_RL_VENV_DIR_OVERRIDE} != /* ]]; then
+  echo "NEMO_RL_VENV_DIR_OVERRIDE must be an absolute path when set" >&2
+  exit 2
+fi
 uv_cache_setup=""
 if [[ -n ${UV_CACHE_DIR_OVERRIDE:-} ]]; then
   printf -v uv_cache_dir_q '%q' "${UV_CACHE_DIR_OVERRIDE}"
@@ -116,6 +120,8 @@ fi
 
 run_dir="${RUN_ROOT}/${run_id}"
 mkdir -p "${run_dir}"
+venv_dir=${NEMO_RL_VENV_DIR_OVERRIDE:-${run_dir}/venvs}
+printf -v venv_dir_q '%q' "${venv_dir}"
 
 if [[ ${arm} == "baseline" ]]; then
   config_setup="baseline_root=\"${run_dir}/baseline-${BASELINE_COMMIT}\"
@@ -151,7 +157,7 @@ command="${source_guard}
 ${ray_version_guard}
 ${config_setup}
 ${uv_cache_setup}
-export NEMO_RL_VENV_DIR=\"${run_dir}/venvs\"
+export NEMO_RL_VENV_DIR=${venv_dir_q}
 UV_NO_SYNC=1 uv run examples/run_grpo.py \\
   --config \"\${config_path}\" \\
   grpo.max_num_steps=${max_steps} \\

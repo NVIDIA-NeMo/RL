@@ -133,6 +133,8 @@ export WANDB_API_KEY=...
 export WANDB_PROJECT=...
 # Optional: reuse wheels built for the pinned HybridEP revision across jobs.
 export UV_CACHE_DIR_OVERRIDE=...
+# Optional: reuse a fully materialized actor environment across matched arms.
+export NEMO_RL_VENV_DIR_OVERRIDE=...
 # Required only by DeepSeek-V3 rows.
 export NRL_DEEPSEEK_V3_BF16_CKPT=...
 
@@ -154,7 +156,11 @@ nightly image's bootstrap cache while still reusing the pinned HybridEP wheel
 in driver and actor environments. Before launching Ray actors, the launcher
 also verifies that the Ray version in `uv.lock` matches the nightly image's
 bootstrap Ray version. This prevents a mixed-version Ray cluster from being
-mistaken for a model or HybridEP failure. DeepSeek-V3 rows require an absolute
+mistaken for a model or HybridEP failure. An absolute
+`NEMO_RL_VENV_DIR_OVERRIDE` can select a prebuilt, verified actor environment;
+using the same immutable environment for both arms avoids concurrent partial
+environment construction and keeps the software stack matched. DeepSeek-V3
+rows require an absolute
 converted BF16 checkpoint path and pass it to both `policy.model_name` and
 `policy.tokenizer.name`; without that prerequisite the launcher exits before
 submission rather than misclassifying a placeholder-config failure as an OOM.
