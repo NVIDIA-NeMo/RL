@@ -48,6 +48,31 @@ def test_run_grpo_dispatches_both_trainers():
     assert _select_trainer(cfg_sync) is grpo_train_sync
 
 
+def test_run_vlm_grpo_dispatches_both_trainers():
+    """Same invariant for the VLM launcher's copy of the dispatch.
+
+    ``run_vlm_grpo`` duplicates ``run_grpo``'s ``_select_trainer`` verbatim,
+    and only the ``run_grpo`` copy was pinned — so the VLM dispatch could
+    drift silently. That is not hypothetical: this launcher is the one that
+    shipped the ``processor=`` TypeError.
+    """
+    import sys
+
+    sys.path.insert(0, str(REPO / "examples"))
+    try:
+        from run_vlm_grpo import _select_trainer
+    finally:
+        sys.path.pop(0)
+    from nemo_rl.algorithms.grpo import MasterConfig, grpo_train
+    from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+
+    cfg_legacy = MasterConfig.model_construct(data_plane=None)
+    assert _select_trainer(cfg_legacy) is grpo_train
+
+    cfg_sync = MasterConfig.model_construct(data_plane={"enabled": True})
+    assert _select_trainer(cfg_sync) is grpo_train_sync
+
+
 def test_sync_trainer_is_call_compatible_with_legacy_trainer():
     """Both trainers must accept the same call, because the VLM launcher
     picks one at runtime and passes a single fixed kwarg set.
@@ -64,21 +89,25 @@ def test_sync_trainer_is_call_compatible_with_legacy_trainer():
     from nemo_rl.algorithms.grpo import grpo_train
     from nemo_rl.algorithms.grpo_sync import grpo_train_sync
 
-    legacy = inspect.signature(grpo_train).parameters
-    sync = inspect.signature(grpo_train_sync).parameters
+    # Mirror of the call in examples/run_vlm_grpo.py::main — 12 positional
+    # args (policy .. master_config) plus the VLM-only ``processor`` kwarg.
+    # Asserted via ``bind`` rather than as full signature parity: parity
+    # would force every future grpo_train parameter to be mirrored into
+    # grpo_train_sync as dead weight, which is a cost the dispatch does not
+    # actually impose. Only the shape the launchers really pass matters.
+    launcher_args = (None,) * 12
+    launcher_kwargs = {"processor": None}
 
-    missing = [
-        name
-        for name, p in legacy.items()
-        if p.kind
-        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-        and name not in sync
-    ]
-    assert not missing, (
-        f"grpo_train_sync is missing parameters the launchers pass to "
-        f"grpo_train: {missing}. Add them (even if only for parity) or the "
-        f"data_plane dispatch breaks at runtime."
-    )
+    for fn in (grpo_train, grpo_train_sync):
+        try:
+            inspect.signature(fn).bind(*launcher_args, **launcher_kwargs)
+        except TypeError as e:
+            raise AssertionError(
+                f"{fn.__module__}.{fn.__name__} cannot accept the call made by "
+                f"examples/run_vlm_grpo.py: {e}. Both trainers must bind the "
+                f"same launcher call, or the data_plane dispatch fails at "
+                f"runtime after a full model load."
+            ) from e
 
 
 def test_sync_trainer_rejects_message_level_advantage_penalties():
