@@ -390,7 +390,6 @@ def create_app(
             stop_token_ids=stop_token_ids,
             max_tokens=max_tokens,
         )
-        )
 
         try:
             output = await llm.generate_async(
