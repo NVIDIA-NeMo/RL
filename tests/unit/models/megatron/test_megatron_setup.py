@@ -2276,7 +2276,10 @@ class TestValidateAndSetConfig:
     )
     @patch.dict(os.environ, {}, clear=True)
     def test_generation_refit_environment(self, backend, colocated, expected_cumem):
-        from nemo_rl.models.megatron.setup import validate_and_set_config
+        from nemo_rl.models.megatron.setup import (
+            configure_refit_environment,
+            validate_and_set_config,
+        )
 
         config = {
             "generation": {
@@ -2295,6 +2298,8 @@ class TestValidateAndSetConfig:
             },
             "offload_optimizer_for_logprob": False,
         }
+
+        configure_refit_environment(config)
 
         with patch(
             "nemo_rl.models.megatron.setup.setup_model_config"

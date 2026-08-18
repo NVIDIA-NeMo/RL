@@ -1340,7 +1340,7 @@ def _make_noncolocated_setup_config(
                     "pipeline_parallel_size": 1,
                 },
                 "vllm_kwargs": {},
-                "sglang_cfg": {},
+                "sglang_cfg": {"quantization": {"scheme": "bf16"}},
             },
         },
         value={
@@ -1466,12 +1466,22 @@ def _run_noncolocated_setup(monkeypatch, config):
     policy_factory = MagicMock(return_value=policy)
     value_factory = MagicMock(return_value=value_model)
     generation_factory = MagicMock(return_value=generation)
+    weight_sync = MagicMock()
+    weight_sync_factory = MagicMock(return_value=weight_sync)
+    generation_factory.weight_sync = weight_sync
+    generation_factory.weight_sync_factory = weight_sync_factory
     ray_get = MagicMock(side_effect=lambda futures: futures)
 
     monkeypatch.setattr(ppo_mod, "RayVirtualCluster", DummyCluster)
     monkeypatch.setattr(ppo_mod, "Policy", policy_factory)
     monkeypatch.setattr(ppo_mod, "Value", value_factory)
-    monkeypatch.setattr(ppo_mod, "VllmGeneration", generation_factory)
+    generation_cls = (
+        "SGLangGeneration"
+        if config.policy["generation"]["backend"] == "sglang"
+        else "VllmGeneration"
+    )
+    monkeypatch.setattr(ppo_mod, generation_cls, generation_factory)
+    monkeypatch.setattr(ppo_mod, "create_weight_synchronizer", weight_sync_factory)
     monkeypatch.setattr(ppo_mod.ray, "get", ray_get)
 
     result = ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
@@ -1980,6 +1990,39 @@ def test_colocated_setup_keeps_single_cluster_and_skips_collective(monkeypatch):
     policy.init_collective.assert_not_called()
     generation.init_collective.assert_not_called()
     ray_get.assert_not_called()
+
+
+def test_colocated_sglang_setup_attaches_weight_synchronizer(monkeypatch):
+    """PPO uses the SGLang synchronizer instead of the legacy refit branch."""
+    from nemo_rl.algorithms import ppo as ppo_mod
+
+    config = _make_noncolocated_setup_config(backend="sglang")
+    config.policy["generation"]["colocated"] = {
+        "enabled": True,
+        "resources": {"num_nodes": None, "gpus_per_node": None},
+    }
+    config.policy["refit_buffer_size_gb"] = 1.5
+
+    result, _, policy, generation, _, _, generation_factory, _ = (
+        _run_noncolocated_setup(monkeypatch, config)
+    )
+
+    synchronizer = generation_factory.weight_sync
+    generation_factory.weight_sync_factory.assert_called_once_with(
+        policy=policy,
+        generation=generation,
+        generation_backend="sglang",
+        colocated=True,
+        refit_buffer_size_gb=1.5,
+    )
+    assert generation.weight_synchronizer is synchronizer
+    synchronizer.init_communicator.assert_called_once_with()
+    policy.prepare_refit_info.assert_not_called()
+    generation.prepare_refit_info.assert_not_called()
+    assert result[3][0] is result[3][1]
+
+    ppo_mod.refit_policy_generation(policy, generation, True)
+    synchronizer.sync_weights.assert_called_once_with(timer=None, kv_scales=None)
 
 
 def test_noncolocated_vllm_multi_node_cluster_and_collective_sizes(monkeypatch):
