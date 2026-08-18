@@ -47,7 +47,7 @@ jobs:
     steps:
       - name: Wait for and download artifact
         id: find-artifact
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
             const artifactName = ${{ toJSON(inputs.artifact_name) }};
@@ -165,7 +165,7 @@ jobs:
 
       - name: Comment on PR
         if: steps.find-artifact.outputs.artifact_found == 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
             const commentBody = ${{ toJSON(steps.extract-comment.outputs.COMMENT_BODY) }};

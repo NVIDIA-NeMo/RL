@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
 
 from pydantic import BaseModel, Field, NonNegativeInt, PositiveFloat, PositiveInt
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 VllmRefitTransportName = Literal["s3", "zmq"]
+VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
+VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
 
 
 class VllmSpecificArgs(TypedDict):
@@ -32,6 +34,15 @@ class VllmSpecificArgs(TypedDict):
     async_engine: bool
     load_format: NotRequired[str]
     precision: NotRequired[str]
+    # Whether vLLM returns logprobs before or after generation-time logit
+    # processors. RL policy recomputation uses raw model logits, so recipes
+    # with generation-time processors should request ``raw_logprobs`` when
+    # comparing generation and policy logprobs.
+    logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
+    # Cap each request's generated tokens so the training prompt plus response
+    # fits within max_model_len. This is needed when multimodal processing makes
+    # the training prompt longer than its text-only representation.
+    cap_max_tokens_to_context: NotRequired[bool]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
@@ -45,6 +56,9 @@ class VllmSpecificArgs(TypedDict):
     expose_http_server: NotRequired[bool]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
+    # Invalidate weight-dependent multimodal encoder outputs after a successful
+    # async refit. Enable only when generation is quiesced during weight updates.
+    reset_encoder_cache_after_weight_update: NotRequired[bool]
     # Fixed internal refit endpoint port for stable Kubernetes targetPorts.
     http_refit_server_port: NotRequired[int | None]
     # Fixed ZeroMQ relay port for stable Kubernetes targetPorts.
@@ -100,7 +114,7 @@ class VllmRefitTuningConfig(BaseModel, extra="allow"):
     partition_workers: PositiveInt = 8
 
 
-class VllmRefitConfig(BaseModel, extra="allow"):
+class VllmSparseRefitConfig(BaseModel, extra="allow"):
     delta_compression: VllmDeltaCompressionConfig = Field(
         default_factory=VllmDeltaCompressionConfig
     )
@@ -111,11 +125,32 @@ class VllmRefitConfig(BaseModel, extra="allow"):
     request_timeout_s: PositiveFloat = 600.0
 
 
+class VllmNixlRefitConfig(BaseModel, extra="forbid"):
+    update_weights_bucket_memory_ratio: Annotated[float, Field(gt=0, lt=1)] = 0.05
+    device: str = "cuda"
+    backend_name: str = "UCX"
+    backend_init_params: dict[str, Any] | None = None
+    release_after_refit: bool = False
+    shard_expert_weights: bool = False
+
+
+class VllmCheckpointEnginePluginConfig(BaseModel, extra="allow"):
+    update_weights_bucket_memory_ratio: Annotated[float, Field(gt=0, lt=1)] = 0.05
+    release_after_refit: bool = False
+
+
+class VllmRefitConfig(BaseModel, extra="allow"):
+    sparse: VllmSparseRefitConfig = Field(default_factory=VllmSparseRefitConfig)
+    nixl: VllmNixlRefitConfig = Field(default_factory=VllmNixlRefitConfig)
+
+
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
-    # Null uses NCCL; remote sparse refit supports S3 or ZeroMQ value planes.
-    refit_transport: NotRequired[Literal["vllm_s3_sparse", "vllm_zmq_sparse"] | None]
+    # Null uses the topology default (IPC colocated, NCCL non-colocated).
+    # Built-ins select sparse delta over S3/ZeroMQ or NIXL.
+    # A custom checkpoint engine may use a ``module:ClassName`` selector.
+    refit_transport: NotRequired[VllmRefitSelector | str | None]
     refit_cfg: NotRequired[VllmRefitConfig | None]
 
     # quantization config
@@ -124,13 +159,54 @@ class VllmConfig(GenerationConfig):
     # NVFP4 kernels and stream packed quantized weights instead of fake-quant
     # modules. This is intended for ModelOpt NVFP4 rollout experiments.
     real_quant: NotRequired[bool]
+    # CPU offload remains the default. Disabling it is supported only for
+    # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
+    real_quant_export_cpu_offload: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
 
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
-    """Resolve sparse-refit defaults into the generation config."""
-    if config.get("refit_transport") is None:
+    """Validate the selected refit transport and resolve its scoped defaults."""
+    if cast(dict[str, Any], config).get("checkpoint_engine") is not None:
+        raise ValueError(
+            "policy.generation.checkpoint_engine was replaced by "
+            "policy.generation.refit_transport='nixl' and "
+            "policy.generation.refit_cfg.nixl."
+        )
+    transport = config.get("refit_transport")
+    if transport is None:
         return None
+    if transport == "nccl_reshard":
+        # nccl_reshard doesn't takes refit_cfg.
+        return None
+    if transport not in get_args(VllmRefitSelector) and ":" not in transport:
+        raise ValueError(
+            f"Unknown vLLM refit transport {transport!r}: expected null, "
+            "'nccl_reshard', 'vllm_s3_sparse', 'vllm_zmq_sparse', 'nixl', or a "
+            "'module:ClassName' checkpoint-engine path."
+        )
+    # The encoder-cache reset is implemented only on the collective/IPC and
+    # nccl_reshard async refit paths (both returned above). Fail loudly rather
+    # than let other transports silently keep stale multimodal encoder outputs
+    # across weight updates. Some callers re-validate partial generation
+    # configs (e.g. worker-side NIXL setup), so vllm_cfg may be absent here.
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg and vllm_cfg.get("reset_encoder_cache_after_weight_update"):
+        raise ValueError(
+            "vllm_cfg.reset_encoder_cache_after_weight_update is not supported "
+            f"with refit_transport={transport!r}: this transport's refit path "
+            "does not reset the multimodal encoder cache, so stale vision "
+            "embeddings would silently survive weight updates. Supported "
+            "transports: null (collective/IPC) and 'nccl_reshard'."
+        )
     refit_config = VllmRefitConfig.model_validate(config.get("refit_cfg") or {})
+    if ":" in transport:
+        plugin_config = (refit_config.model_extra or {}).get(transport)
+        if plugin_config is None:
+            raise ValueError(
+                f"Custom checkpoint-engine transport {transport!r} requires "
+                f"policy.generation.refit_cfg[{transport!r}]."
+            )
+        VllmCheckpointEnginePluginConfig.model_validate(plugin_config)
     config["refit_cfg"] = refit_config
     return refit_config

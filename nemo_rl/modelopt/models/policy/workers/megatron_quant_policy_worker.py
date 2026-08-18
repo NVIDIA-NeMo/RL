@@ -415,7 +415,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         enabled = 0
         with_amax = 0
         positive_amax = 0
-        for _, module in self.model.named_modules():
+        kv_amax = {}
+        for name, module in self.model.named_modules():
             if isinstance(module, TensorQuantizer):
                 total += 1
                 if module.is_enabled:
@@ -424,11 +425,14 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                         with_amax += 1
                         if (module.amax > 0).all():
                             positive_amax += 1
+                        if name.endswith(("k_bmm_quantizer", "v_bmm_quantizer")):
+                            kv_amax[name] = module.amax.detach().cpu().clone()
         return {
             "total": total,
             "enabled": enabled,
             "with_amax": with_amax,
             "positive_amax": positive_amax,
+            "kv_amax": kv_amax,
         }
 
     def generate(self, **kwargs):
@@ -487,10 +491,11 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         if ignore is None:
             ignore = DEFAULT_NVFP4_IGNORE
         mode = self._get_real_quant_mode()
+        export_cpu_offload = generation_cfg["real_quant_export_cpu_offload"]
         yield from self.megatron_bridge.export_hf_weights_modelopt(
             [self.model],
             quant_mode="nvfp4" if mode == "w4a4" else "w4a16_nvfp4",
-            cpu=True,
+            cpu=export_cpu_offload,
             show_progress=False,
             conversion_tasks=self.refit_conversion_tasks,
             ignore_patterns=ignore,

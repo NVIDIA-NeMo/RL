@@ -26,6 +26,9 @@ from nemo_rl.models.generation.constants import (
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
+from nemo_rl.weight_sync.checkpoint_engine_config import (
+    checkpoint_engine_refit_config,
+)
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 
@@ -36,7 +39,7 @@ def create_weight_synchronizer(
     colocated: bool,
     train_cluster: Optional[Any] = None,
     inference_cluster: Optional[Any] = None,
-    refit_buffer_size_gb: Optional[int] = None,
+    refit_buffer_size_gb: Optional[float | int] = None,
 ) -> WeightSynchronizer:
     """Create the appropriate WeightSynchronizer for the given deployment.
 
@@ -63,6 +66,30 @@ def create_weight_synchronizer(
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
 
+    checkpoint_engine_config = checkpoint_engine_refit_config(generation.cfg)
+    if checkpoint_engine_config is not None:
+        if colocated:
+            raise ValueError(
+                "checkpoint-engine refit is only supported for non-colocated "
+                "generation. Set policy.generation.colocated.enabled=false or "
+                "set policy.generation.refit_transport=null."
+            )
+        if generation_backend != VLLM_BACKEND:
+            raise NotImplementedError(
+                "checkpoint-engine non-colocated refit is only supported for "
+                f"the vLLM generation backend, got {generation_backend!r}. "
+                "Support for other generation backends is tracked in "
+                "https://github.com/NVIDIA-NeMo/RL/issues/3288."
+            )
+
+        from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
+            CheckpointEngineWeightSynchronizer,
+        )
+
+        return CheckpointEngineWeightSynchronizer(
+            policy, generation, checkpoint_engine_config
+        )
+
     if refit_buffer_size_gb is not None and refit_buffer_size_gb <= 0:
         raise ValueError("refit_buffer_size_gb must be > 0")
 
@@ -75,6 +102,18 @@ def create_weight_synchronizer(
             raise ValueError(
                 "train_cluster and inference_cluster are required "
                 "for non-colocated weight synchronization."
+            )
+
+        if generation.cfg.get("refit_transport") == "nccl_reshard":
+            from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+                NcclReshardWeightSynchronizer,
+            )
+
+            return NcclReshardWeightSynchronizer(
+                policy=policy,
+                generation=generation,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
             )
 
         from nemo_rl.weight_sync.collective_weight_synchronizer import (

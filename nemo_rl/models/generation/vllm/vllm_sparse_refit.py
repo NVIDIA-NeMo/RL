@@ -36,7 +36,10 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
-from nemo_rl.models.generation.vllm.config import VllmRefitConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmRefitConfig,
+    VllmSparseRefitConfig,
+)
 from nemo_rl.utils import weight_transfer_sparse_codec as sparse_codec
 from nemo_rl.utils.weight_transfer_http import (
     G_VLLM_REFIT_API_KEY_HEADER,
@@ -104,9 +107,8 @@ class VllmSparseRefitReceiver:
 
     def __init__(self, worker: Any) -> None:
         self._worker = worker
-        self._refit_config = VllmRefitConfig.model_validate(
-            worker.cfg.get("refit_cfg") or {}
-        )
+        refit_config = VllmRefitConfig.model_validate(worker.cfg.get("refit_cfg") or {})
+        self._refit_config: VllmSparseRefitConfig = refit_config.sparse
         tuning = self._refit_config.tuning
         self._refit_apply_queue_condition = threading.Condition()
         self._refit_apply_executor = ThreadPoolExecutor(

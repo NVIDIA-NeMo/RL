@@ -7,12 +7,18 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
+  val_start_at: -1
   val_at_start: true
   val_at_end: false
   overlong_filtering: false
   advantage_clip_low: null
   advantage_clip_high: null
   max_val_samples: null   # inferred from size of val dataset. for multi evals, repeat val ds via `num_repeats` in `ng_prepare_data`.
+  val_num_generations_per_prompt: 1
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: null
   seed: 42
   use_dynamic_sampling: false
@@ -47,8 +53,9 @@ grpo:
     enabled: false # Set to true to enable async training mode
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
+    max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates
 
 loss_fn:
   reference_policy_kl_penalty: 0
@@ -221,6 +228,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
@@ -291,13 +301,14 @@ env:
   should_use_nemo_gym: true
   # true: skip expensive train_data_step*.jsonl; false: write jsonl (heavy). Prefer true if disk is tight.
   should_log_nemo_gym_responses: true
+  # false: ignore env mask_sample flags so the loss trains on every sample.
+  should_mask_flagged_samples: true
   nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
     # Port range for Gym HTTP servers, kept below the OS ephemeral range
     # (below the 9000 ephemeral floor on some GB200 nodes) and non-overlapping with NeMo
     # RL (3000-4999) or vLLM (7000-8999). See ray.sub for the full port layout.
     port_range_low: 5000
     port_range_high: 5999
-    rollout_max_attempts_to_avoid_lp_nan: 1
     is_trajectory_collection: false  # Set this to true to enable trajectory collection (no training). You may also want to increase `policy.generation.vllm_cfg.gpu_memory_utilization`
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
@@ -332,6 +343,7 @@ logger:
   wandb:
     project: "grpo-workplace-assistant"
     name: "nemotron-nano-v2-9b-workplace-assistant"
+    log_nemo_gym_full_result_tables: false
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-workplace-assistant"
