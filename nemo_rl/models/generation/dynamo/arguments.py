@@ -268,7 +268,8 @@ def build_managed_worker_env(
     env = {
         key: value
         for key, value in base_env.items()
-        if not key.startswith("DYN_") and key not in reserved_env_keys
+        if not key.startswith(("DYN_", "ETCD_", "NATS_"))
+        and key not in reserved_env_keys
     }
     env.update(configured_env)
     env.update(manager_env)

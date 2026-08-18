@@ -302,12 +302,28 @@ def test_frontend_argv_and_environment_are_runtime_owned() -> None:
     assert _flag_value(argv, "--router-mode") == "kv"
 
     env = build_managed_worker_env(
-        base_env={"DYN_NAMESPACE": "stale", "NCCL_DEBUG": "INFO"},
+        base_env={
+            "DYN_NAMESPACE": "stale",
+            "ETCD_ENDPOINTS": "http://stale-etcd:2379",
+            "ETCD_USERNAME": "stale-user",
+            "NATS_SERVER": "nats://stale-nats:4222",
+            "NATS_AUTH_TOKEN": "stale-token",
+            "NCCL_DEBUG": "INFO",
+        },
         configured_env={"NCCL_IB_DISABLE": "0"},
-        manager_env={"DYN_NAMESPACE": "owned", "DYN_SYSTEM_PORT": "4000"},
+        manager_env={
+            "DYN_NAMESPACE": "owned",
+            "DYN_SYSTEM_PORT": "4000",
+            "ETCD_ENDPOINTS": "http://managed-etcd:2379",
+            "NATS_SERVER": "nats://managed-nats:4222",
+        },
     )
     assert env["DYN_NAMESPACE"] == "owned"
     assert env["DYN_SYSTEM_PORT"] == "4000"
+    assert env["ETCD_ENDPOINTS"] == "http://managed-etcd:2379"
+    assert env["NATS_SERVER"] == "nats://managed-nats:4222"
+    assert "ETCD_USERNAME" not in env
+    assert "NATS_AUTH_TOKEN" not in env
     with pytest.raises(ValueError, match="VLLM_PORT"):
         build_managed_worker_env(
             base_env={},

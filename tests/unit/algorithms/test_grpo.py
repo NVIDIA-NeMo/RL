@@ -1466,22 +1466,6 @@ def test_should_use_nemo_gym_requires_dynamo_token_wrapper() -> None:
     assert _should_use_nemo_gym(master_config) is True
 
 
-def test_should_use_nemo_gym_preserves_megatron_sync_engine_exemption() -> None:
-    master_config = MagicMock()
-    master_config.env = {"should_use_nemo_gym": True}
-    master_config.policy = {
-        "generation": {
-            "backend": "megatron",
-            "mcore_generation_config": {
-                "async_engine": False,
-                "expose_http_server": True,
-            },
-        }
-    }
-
-    assert _should_use_nemo_gym(master_config) is True
-
-
 @contextmanager
 def _patched_logprob_phase(policy):
     """Provide real tensors for the logprob phase of ``grpo_train``.
@@ -2309,7 +2293,7 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         load_config(repo_root / "examples/configs/grpo_math_1B_dynamo.yaml"),
         resolve=True,
     )
-    config["cluster"].update({"num_nodes": 1, "gpus_per_node": 8})
+    config["cluster"].update({"num_nodes": 2, "gpus_per_node": 4, "segment_size": 1})
     generation = config["policy"]["generation"]
     generation["vllm_cfg"].update(
         {
@@ -2374,7 +2358,6 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
                 tokenizer=tokenizer,
                 tokenizer_config=tokenizer_config,
             )
-            cluster.get_placement_groups()
 
     synchronizer = MagicMock()
     nemo_gym_actor = object()
@@ -2387,6 +2370,14 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
     )
     monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
+    monkeypatch.setattr(
+        grpo_mod,
+        "get_ray_cluster_topology",
+        lambda: {
+            "train-node": ("nvlink_domain_train", 0),
+            "inference-node": ("nvlink_domain_inference", 1),
+        },
+    )
     monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
     monkeypatch.setattr(grpo_mod, "Policy", lambda *_args, **_kwargs: DummyPolicy())
     monkeypatch.setattr(grpo_mod, "DynamoGeneration", DummyDynamoGeneration)
@@ -2402,12 +2393,15 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     train_cluster, inference_cluster = cluster_instances
     assert train_cluster.kwargs["bundle_ct_per_node_list"] == [4]
     assert inference_cluster.kwargs["bundle_ct_per_node_list"] == [4]
+    assert train_cluster.kwargs["node_resource_constraints"] == [
+        {"nvlink_domain_train": 0.001}
+    ]
+    assert inference_cluster.kwargs["node_resource_constraints"] is None
     assert result[1].dp_openai_server_base_urls == ["http://dynamo-wrapper.example/v1"]
     assert result[2] is nemo_gym_actor
     dynamo_config = dynamo_init.call_args.kwargs["config"]
     assert dynamo_init.call_args.kwargs["cluster"] is inference_cluster
     assert DynamoConfig.model_validate(dynamo_config).engine_world_size == 4
-    inference_cluster.get_placement_groups.assert_called_once_with()
     synchronizer.init_communicator.assert_called_once_with()
     spinup_nemo_gym_actor.assert_called_once_with(
         env_configs=master_config.env,

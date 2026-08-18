@@ -385,10 +385,11 @@ def test_metrics_parser_and_sampler_aliases() -> None:
         exclude_prefixes=None,
     )
     parsed = parse_prometheus_metrics(
-        "vllm_num_requests_running 3\n"
-        "vllm_num_requests_waiting 2\n"
-        "vllm_kv_cache_usage_perc 0.5\n"
-        "vllm:generation_tokens_total 7\n"
+        'vllm:num_requests_running{model_name="model",engine="0"} 3\n'
+        'vllm:num_requests_waiting{model_name="model",engine="0"} 2\n'
+        'vllm:kv_cache_usage_perc{model_name="model",engine="0"} 0.5\n'
+        'vllm:generation_tokens_total{model_name="model",engine="0"} 7\n'
+        'vllm:gpu_cache_usage_perc{model_name="model",engine="0"} 0.9\n'
         "python_gc_objects_collected_total 10\n",
         sampler._include_prefixes,
         sampler._exclude_prefixes,
@@ -399,6 +400,7 @@ def test_metrics_parser_and_sampler_aliases() -> None:
     assert metrics["num_pending_samples"] == {0: [2.0]}
     assert metrics["kv_cache_usage_perc"] == {0: [0.5]}
     assert metrics["generation_tokens"] == {0: [7.0]}
+    assert "vllm_gpu_cache_usage_perc" not in parsed
     assert "python_gc_objects_collected_total" not in parsed
 
 
