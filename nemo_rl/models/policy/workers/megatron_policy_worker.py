@@ -3542,6 +3542,40 @@ class MegatronPolicyWorkerImpl(
 
             if self.should_disable_forward_pre_hook:
                 self.disable_forward_pre_hook()
+
+            # Return cached-but-unused blocks to the driver before the save.
+            # torch_dist checkpointing opens with a save-planning gather_object
+            # over the default process group (Megatron's torch.py passes
+            # process_group=None into save_state_dict_async_plan, and
+            # _DistWrapper.gather_object forwards that). On a NCCL default group
+            # that gather is a device collective, and NCCL allocates its buffers
+            # with its own cudaMalloc rather than through PyTorch's caching
+            # allocator -- so memory the allocator is merely holding is
+            # unreachable to it. When the device is full the cudaMalloc fails and
+            # NCCL reports it as the opaque "NCCL Error 1: unhandled cuda error",
+            # with no torch OOM anywhere, because torch never requested memory.
+            #
+            # Observed on job 2724162: every training rank sat at 277.5 GiB of
+            # 277.5 GiB when the step-5 save fired, and the run died in exactly
+            # that gather. Mirrors what nccl_reshard_refit and
+            # prepare_for_lp_inference already do before their own large NCCL
+            # phases; this path was the one that skipped it.
+            gc.collect()
+            _free_before = torch.cuda.mem_get_info()[0]
+            torch.cuda.empty_cache()
+            _free_after = torch.cuda.mem_get_info()[0]
+            _gib = 1024**3
+            # Logged because the failure this guards against is silent: NCCL
+            # reports a failed cudaMalloc only as "unhandled cuda error", so
+            # without these numbers a recurrence gives nothing to reason from.
+            print(
+                f"[CKPT_MEM] rank={torch.distributed.get_rank()} "
+                f"device-free before={_free_before / _gib:.1f} GiB "
+                f"after={_free_after / _gib:.1f} GiB "
+                f"reclaimed={(_free_after - _free_before) / _gib:.1f} GiB",
+                flush=True,
+            )
+
             save_checkpoint(
                 state=self.mcore_state,
                 model=[self.model],
