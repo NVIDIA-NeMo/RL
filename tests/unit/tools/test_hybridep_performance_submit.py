@@ -185,3 +185,11 @@ def test_h100_submission_builds_multinode_hybridep_for_hopper() -> None:
     assert "export HYBRID_EP_MULTINODE=1" in script
     assert "export NVTE_CUDA_ARCHS=90" in script
     assert "export TORCH_CUDA_ARCH_LIST=9.0" in script
+
+
+def test_shared_uv_cache_does_not_shadow_the_container_bootstrap_cache() -> None:
+    script = SUBMIT_SCRIPT.read_text()
+
+    assert 'uv_cache_setup="export UV_CACHE_DIR=${uv_cache_dir_q}"' in script
+    assert "unset UV_CACHE_DIR_OVERRIDE" in script
+    assert "export UV_CACHE_DIR_OVERRIDE" not in script

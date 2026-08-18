@@ -48,6 +48,11 @@ if [[ -n ${UV_CACHE_DIR_OVERRIDE:-} && ${UV_CACHE_DIR_OVERRIDE} != /* ]]; then
   echo "UV_CACHE_DIR_OVERRIDE must be an absolute path when set" >&2
   exit 2
 fi
+uv_cache_setup=""
+if [[ -n ${UV_CACHE_DIR_OVERRIDE:-} ]]; then
+  printf -v uv_cache_dir_q '%q' "${UV_CACHE_DIR_OVERRIDE}"
+  uv_cache_setup="export UV_CACHE_DIR=${uv_cache_dir_q}"
+fi
 if [[ ! -f ${CONTAINER} ]]; then
   echo "CONTAINER does not exist: ${CONTAINER}" >&2
   exit 2
@@ -137,6 +142,7 @@ fi"
 
 command="${source_guard}
 ${config_setup}
+${uv_cache_setup}
 UV_NO_SYNC=1 uv run examples/run_grpo.py \\
   --config \"\${config_path}\" \\
   grpo.max_num_steps=${max_steps} \\
@@ -160,9 +166,11 @@ export NVTE_CUDA_ARCHS=90
 export RDMA_CORE_HOME=/usr
 export TORCH_CUDA_ARCH_LIST=9.0
 export USE_NIXL=0
-if [[ -n ${UV_CACHE_DIR_OVERRIDE:-} ]]; then
-  export UV_CACHE_DIR_OVERRIDE
-fi
+# ray.sub mounts UV_CACHE_DIR_OVERRIDE over /root/.cache/uv before Ray starts.
+# Nightly system venvs can contain symlinks into the image-owned cache, so that
+# mount would break the Ray bootstrap. Select the shared cache in the driver;
+# init_ray then propagates it to every worker runtime environment.
+unset UV_CACHE_DIR_OVERRIDE
 export WANDB_API_KEY
 
 sbatch_args=(
