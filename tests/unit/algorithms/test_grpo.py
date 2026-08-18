@@ -2615,6 +2615,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
 
     class DummySGLangGeneration:
         num_gpus_per_engine = 1
+        pause_generation_mode = "retract"
         cfg: dict = {}
         weight_synchronizer = None
 
@@ -2656,6 +2657,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         "resources": {"gpus_per_node": None, "num_nodes": None},
     }
     master_config.policy["generation"]["sglang_cfg"] = {
+        "quantization": {"scheme": "bf16"},
         "gpus_per_server": 1,
         "dp_size": 1,
         "pp_size": 1,

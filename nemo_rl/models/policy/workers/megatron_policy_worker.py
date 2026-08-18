@@ -77,6 +77,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
     build_inference_model,
+    configure_refit_environment,
     finalize_megatron_setup,
     handle_model_import,
     setup_distributed,
@@ -461,6 +462,9 @@ class MegatronPolicyWorkerImpl(
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
+
+        # NCCL caches NCCL_CUMEM_ENABLE process-wide on first communicator init.
+        configure_refit_environment(config)
 
         # Step 1: Setup distributed
         setup_distributed()
