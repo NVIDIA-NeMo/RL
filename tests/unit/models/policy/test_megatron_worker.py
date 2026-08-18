@@ -46,6 +46,32 @@ from tests.unit.test_utils import SimpleLossFn
 pytestmark = pytest.mark.mcore
 
 
+def test_refit_environment_is_configured_before_distributed_setup():
+    source_path = (
+        Path(__file__).parents[4]
+        / "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    init = next(
+        node
+        for class_node in tree.body
+        if isinstance(class_node, ast.ClassDef)
+        and class_node.name == "MegatronPolicyWorkerImpl"
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    call_lines = {
+        node.func.id: node.lineno
+        for node in ast.walk(init)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"configure_refit_environment", "setup_distributed"}
+    }
+
+    assert set(call_lines) == {"configure_refit_environment", "setup_distributed"}
+    assert call_lines["configure_refit_environment"] < call_lines["setup_distributed"]
+
+
 def test_model_owned_packing_capability_is_detected():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         _model_self_packs_for_cp,
