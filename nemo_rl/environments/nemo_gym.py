@@ -17,7 +17,7 @@ import subprocess
 import sys
 import uuid
 from collections import Counter
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict
@@ -168,6 +168,9 @@ class NemoGymConfig(TypedDict):
     pad_dynamic_image_shapes: NotRequired[
         bool
     ]  # Normalize heterogeneous image tensors while retaining exact imgs_sizes
+
+
+TokenSourceFactory = Callable[[], Any]
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -468,25 +471,40 @@ def _token_capture_metrics(
 
 def _build_token_capture_source(
     global_config_dict: Any,
+    token_source_factory: TokenSourceFactory | None = None,
 ) -> tuple[Any, list[Path]]:
-    """Build the source NeMo-RL uses with Gym's low-level rollout API."""
+    """Build the source owned by the NeMo-RL rollout actor."""
     # NeMo Gym is optional outside the Gym environment path.
-    from nemo_gym.token_id_capture import TokenCaptureStore, installed_token_source
+    from nemo_gym.token_id_capture import TokenCaptureStore, TokenSource
     from nemo_gym.token_id_capture.config import TokenIdCaptureConfig
     from nemo_gym.token_id_capture.consumer import token_id_capture_dirs_from_config
 
     capture_config = TokenIdCaptureConfig.model_validate(global_config_dict)
     capture_dirs = token_id_capture_dirs_from_config(global_config_dict)
     if not capture_config.enabled:
+        if token_source_factory is not None:
+            raise ValueError(
+                "A token source factory requires token_id_capture.enabled=true."
+            )
         return None, capture_dirs
 
-    source = capture_config.build_source() or installed_token_source()
+    if capture_config.token_id_capture.source is not None:
+        raise ValueError(
+            "NeMo-RL does not construct framework TokenSource implementations from Gym config. "
+            "Pass token_source_factory to spinup_nemo_gym_actor instead."
+        )
+
+    source = token_source_factory() if token_source_factory is not None else None
+    if source is not None and not isinstance(source, TokenSource):
+        raise TypeError(
+            "token_source_factory must return a nemo_gym.token_id_capture.TokenSource."
+        )
     if source is None and capture_dirs:
         source = TokenCaptureStore(capture_dirs[0])
     if source is None:
         raise ValueError(
             "NeMo-RL owns token-capture finalization when it calls run_examples directly. "
-            "Configure token_id_capture.dir or token_id_capture.source."
+            "Configure token_id_capture.dir or pass token_source_factory to spinup_nemo_gym_actor."
         )
     return source, capture_dirs
 
@@ -495,8 +513,13 @@ def _build_token_capture_source(
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
-    def __init__(self, cfg: NemoGymConfig):
+    def __init__(
+        self,
+        cfg: NemoGymConfig,
+        token_source_factory: TokenSourceFactory | None = None,
+    ):
         self.cfg = cfg
+        self._token_source_factory = token_source_factory
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -646,6 +669,7 @@ Depending on your data shape, you may want to change these values."""
         self._token_capture_source, self._token_capture_dirs = (
             _build_token_capture_source(
                 self._resolved_gym_config,
+                self._token_source_factory,
             )
         )
 
@@ -1249,6 +1273,7 @@ def spinup_nemo_gym_actor(
     enable_router_replay: bool,
     routed_experts_dtype: str,
     use_fastokens: bool,
+    token_source_factory: TokenSourceFactory | None = None,
 ) -> Any:
     """Spin up the NeMo-Gym actor against the given generation server URLs.
 
@@ -1267,6 +1292,9 @@ def spinup_nemo_gym_actor(
             resolved by the caller from the model's expert count.
         use_fastokens: Forwarded from policy.tokenizer.use_fastokens so the rollout actor
             patches its tokenizer consistently with the driver.
+        token_source_factory: Framework-owned factory.
+            It executes inside the NeMo-Gym actor.
+            Leave it unset to use Gym's file-backed source.
 
     Returns:
         The spun-up NemoGym Ray actor handle (_spinup already awaited).
@@ -1330,6 +1358,9 @@ def spinup_nemo_gym_actor(
         },
     }
 
-    actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
+    actor = NemoGym.options(**nemo_gym_opts).remote(
+        nemo_gym_cfg,
+        token_source_factory,
+    )
     ray.get(actor._spinup.remote())
     return actor

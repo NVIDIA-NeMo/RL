@@ -13,6 +13,8 @@
 # limitations under the License.
 import asyncio
 import json
+import multiprocessing
+import os
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -64,6 +66,27 @@ class _ConfiguredTokenSource:
 
     async def close(self) -> None:
         return None
+
+
+class _ConfiguredTokenSourceFactory:
+    def __init__(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+
+    def __call__(self) -> _ConfiguredTokenSource:
+        return _ConfiguredTokenSource(self.endpoint)
+
+
+def _build_source_in_consumer_process(factory, queue) -> None:
+    source, directories = _build_token_capture_source(
+        {
+            "token_id_capture": {
+                "enabled": True,
+                "rebuild_response": False,
+            }
+        },
+        factory,
+    )
+    queue.put((os.getpid(), source.endpoint, directories))
 
 
 def test_extract_reward_components():
@@ -920,21 +943,52 @@ def test_build_token_capture_source_uses_the_default_file_store(tmp_path):
     assert directories == [tmp_path]
 
 
-def test_build_token_capture_source_loads_a_framework_data_plane():
+def test_build_token_capture_source_uses_a_framework_owned_factory():
     source, directories = _build_token_capture_source(
         {
             "token_id_capture": {
                 "enabled": True,
-                "source": f"{__name__}:_ConfiguredTokenSource",
-                "source_kwargs": {"endpoint": "transfer-queue://tokens"},
                 "rebuild_response": False,
             }
-        }
+        },
+        _ConfiguredTokenSourceFactory(endpoint="transfer-queue://tokens"),
     )
 
     assert isinstance(source, _ConfiguredTokenSource)
     assert source.endpoint == "transfer-queue://tokens"
     assert directories == []
+
+
+def test_framework_source_factory_runs_in_the_consumer_process():
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    process = context.Process(
+        target=_build_source_in_consumer_process,
+        args=(_ConfiguredTokenSourceFactory("transfer-queue://tokens"), queue),
+    )
+
+    process.start()
+    process.join(timeout=60)
+
+    assert process.exitcode == 0
+    child_pid, endpoint, directories = queue.get(timeout=10)
+    assert child_pid != os.getpid()
+    assert endpoint == "transfer-queue://tokens"
+    assert directories == []
+
+
+def test_build_token_capture_source_rejects_framework_imports_in_gym_config():
+    with pytest.raises(ValueError, match="Pass token_source_factory"):
+        _build_token_capture_source(
+            {
+                "token_id_capture": {
+                    "enabled": True,
+                    "source": f"{__name__}:_ConfiguredTokenSource",
+                    "source_kwargs": {"endpoint": "transfer-queue://tokens"},
+                    "rebuild_response": True,
+                }
+            }
+        )
 
 
 @pytest.mark.asyncio
