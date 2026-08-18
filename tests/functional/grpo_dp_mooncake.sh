@@ -32,6 +32,13 @@ rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
+# transfer_max_retries=10 (upstream default 3, see MooncakeCpuConfig in
+# nemo_rl/data_plane/interfaces.py): the gb200 CI runners have 2 RoCE rails
+# per NUMA node, and MC_ENABLE_DEST_DEVICE_AFFINITY has no measurable effect
+# in the pinned TransferQueue/mooncake wheels, so a same-NUMA cross-rail peer
+# draw is possible on any given attempt. Retries were measured to shrink the
+# failing set each round rather than get stuck on one, so more attempts
+# converge the residual failure rate toward zero.
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
     policy.model_name=Qwen/Qwen3-0.6B \
@@ -51,6 +58,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     data_plane.backend=mooncake_cpu \
     data_plane.mooncake_cpu.global_segment_size=4294967296 \
     data_plane.mooncake_cpu.local_buffer_size=1073741824 \
+    data_plane.mooncake_cpu.transfer_max_retries=10 \
     $@ \
     2>&1 | tee $RUN_LOG
 
