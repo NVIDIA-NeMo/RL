@@ -25,8 +25,13 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
-from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
+from nemo_rl.models.generation.megatron.config import (
+    MCoreGenerationConfig,
+    dedicated_inference_megatron_cfg,
+    merged_inference_megatron_cfg,
+)
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy.lm_policy import Policy
@@ -36,7 +41,40 @@ class MegatronGeneration(GenerationInterface):
     """Generation interface backed by Megatron (colocated or non-colocated)."""
 
     @staticmethod
+    def effective_megatron_cfg(config: PolicyConfig) -> dict[str, Any]:
+        """The megatron_cfg the generation workers actually run with.
+
+        Colocated generation shares the training model, so the training
+        values apply; non-colocated builds a dedicated policy with
+        mcore_generation_config merged on top. Always returns a fresh dict.
+        """
+        if config["generation"]["colocated"]["enabled"]:
+            return dict(config["megatron_cfg"])
+        return merged_inference_megatron_cfg(config)
+
+    @classmethod
+    def nvlink_domain_span(cls, config: PolicyConfig) -> int:
+        """Largest GPU group requiring full NVLink connectivity.
+
+        Colocated reshard hosts a second, inference-layout model on the same ranks.
+        """
+        layouts = [cls.effective_megatron_cfg(config)]
+        if config["generation"]["colocated"]["enabled"]:
+            inference_mcfg = dedicated_inference_megatron_cfg(config)
+            if inference_mcfg is not None:
+                layouts.append(inference_mcfg)
+        return max(
+            max(
+                mcfg["tensor_model_parallel_size"] * mcfg["context_parallel_size"],
+                mcfg.get("expert_tensor_parallel_size", 1)
+                * mcfg.get("expert_model_parallel_size", 1),
+            )
+            for mcfg in layouts
+        )
+
+    @classmethod
     def init_cluster_placement_groups(
+        cls,
         cluster: RayVirtualCluster,
         config: PolicyConfig,
     ) -> None:
@@ -46,16 +84,10 @@ class MegatronGeneration(GenerationInterface):
             cluster: The inference `RayVirtualCluster`.
             config: The full `PolicyConfig` (megatron parallelism + colocation).
         """
-        megatron_cfg = config["megatron_cfg"]
-        model_parallel_size = (
-            megatron_cfg["tensor_model_parallel_size"]
-            * megatron_cfg["pipeline_model_parallel_size"]
-            * megatron_cfg["context_parallel_size"]
-        )
         colocated = config["generation"]["colocated"]["enabled"]
         cluster._init_placement_groups(
             strategy=None if colocated else "PACK",
-            use_unified_pg=model_parallel_size > cluster.num_gpus_per_node,
+            use_unified_pg=cls.nvlink_domain_span(config) > cluster.num_gpus_per_node,
         )
 
     def __init__(
@@ -67,6 +99,7 @@ class MegatronGeneration(GenerationInterface):
         name_prefix: str = "megatron_generation",
         processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
+        skip_weight_load: bool = False,
     ):
         """Initialize a MegatronGeneration instance.
 
@@ -80,12 +113,16 @@ class MegatronGeneration(GenerationInterface):
             name_prefix: Prefix for naming the worker group (non-colocated only).
             processor: Optional processor for VLMs (non-colocated only).
             weights_path: Optional path to model weights (non-colocated only).
+            skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
         """
         # Import here to avoid circular imports
         from nemo_rl.models.policy.lm_policy import Policy
 
         assert (cluster is None) != (policy is None), (
             "Provide exactly one of `cluster` or `policy`."
+        )
+        assert not (skip_weight_load and policy is not None), (
+            "skip_weight_load only applies to the dedicated inference policy."
         )
 
         # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
@@ -94,6 +131,8 @@ class MegatronGeneration(GenerationInterface):
         self.cfg: MCoreGenerationConfig = config["generation"]
         # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
+        # Installed by setup via create_weight_synchronizer.
+        self.weight_synchronizer: Optional["WeightSynchronizer"] = None
 
         if policy is not None:
             # Reuse the existing training policy.
@@ -106,9 +145,10 @@ class MegatronGeneration(GenerationInterface):
 
         # Stand up a dedicated inference-only policy.
         self._owns_policy = True
-        self._policy_config["megatron_cfg"].update(self.cfg["mcore_generation_config"])
-        # Activation checkpointing is not compatible or useful in inference.
-        self._policy_config["megatron_cfg"]["activation_checkpointing"] = False
+        self._policy_config = {
+            **config,
+            "megatron_cfg": self.effective_megatron_cfg(config),
+        }
         # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.
         self.init_cluster_placement_groups(cluster, self._policy_config)
         self._policy = Policy(
@@ -120,6 +160,7 @@ class MegatronGeneration(GenerationInterface):
             init_optimizer=False,
             init_reference_model=False,
             weights_path=weights_path,
+            skip_weight_load=skip_weight_load,
         )
 
         # Start the persistent inference engine + HTTP server during construction.
@@ -141,7 +182,8 @@ class MegatronGeneration(GenerationInterface):
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             train_world_size: Number of training workers (used to offset ranks).
-            refit_backend: Copy service backend ("gloo", "nccl", or "nvshmem").
+            refit_backend: Copy service backend ("gloo" or "nccl";
+                "nvshmem" is currently broken and warns at setup).
 
         Returns:
             List of Ray ObjectRefs for the collective init futures.

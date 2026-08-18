@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple, Optional
 
 import torch
+from megatron.bridge.models.model_provider import ModelProviderMixin
 from megatron.bridge.training.config import ConfigContainer
 from megatron.bridge.training.state import GlobalState
 from megatron.core.optimizer import MegatronOptimizer
@@ -37,9 +39,24 @@ class RuntimeConfig(NamedTuple):
     dtype: torch.dtype
     optimizer_cpu_offload: bool
     offload_optimizer_for_logprob: bool
+    offload_optimizer_for_refit: bool
     is_generation_colocated: Optional[bool]
     sampling_params: Optional[TrainingSamplingParams]
     final_padded_vocab_size: int
+
+
+@dataclass
+class ColocatedReshardPlan:
+    """Setup-time plan for building the dedicated colocated inference model.
+
+    Produced by `setup_model_and_optimizer` when the inference and training layouts differ.
+    Consumed by the first `prepare_for_generation` call.
+    """
+
+    # Pre-wrap provider snapshot; build_inference_model mutates it to the inference layout.
+    initial_model_provider: ModelProviderMixin
+    # The resolved megatron_cfg the inference model runs with.
+    inference_megatron_cfg: dict[str, Any]
 
 
 ## returned from setup_model_and_optimizer
@@ -57,3 +74,4 @@ class ModelAndOptimizerState(NamedTuple):
     checkpointing_context: dict[str, Any]
     param_sync_func: Optional[Callable]
     draft_model: Optional[MegatronModule] = None
+    colocated_reshard_plan: Optional[ColocatedReshardPlan] = None

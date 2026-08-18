@@ -1,4 +1,10 @@
+---
+orphan: true
+---
+
 # Nemotron 3 Super
+
+> **Note:** This document has moved and will be deprecated here. See the new location: https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/models/nemotron/nemotron-3-super.md
 
 **Technical Report:** [NVIDIA Nemotron-3-Super Technical Report](https://research.nvidia.com/labs/nemotron/files/NVIDIA-Nemotron-3-Super-Technical-Report.pdf)
 

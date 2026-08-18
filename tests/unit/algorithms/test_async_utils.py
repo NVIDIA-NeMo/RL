@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ import asyncio
 import os
 import tempfile
 import threading
+import time
 import unittest.mock as mock
 from types import SimpleNamespace
 
@@ -41,45 +42,16 @@ from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
     MasterConfig,
-    _get_next_nemo_gym_task_index,
     add_grpo_token_loss_masks_and_generation_logprobs,
     extract_initial_prompt_messages,
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
-
-
-@pytest.mark.parametrize(
-    ("rollouts_state", "replay_buffer_state", "expected"),
-    [
-        (None, None, 0),
-        ({"next_ng_task_index": 20}, None, 20),
-        (
-            {"next_ng_task_index": 8},
-            {
-                "trajectories": [
-                    {"_ng_task_index": 4},
-                    {"_ng_task_index": 12},
-                    {},
-                ]
-            },
-            13,
-        ),
-        (
-            {"next_ng_task_index": 20},
-            {"trajectories": [{"_ng_task_index": 12}]},
-            20,
-        ),
-    ],
-)
-def test_get_next_nemo_gym_task_index(rollouts_state, replay_buffer_state, expected):
-    assert (
-        _get_next_nemo_gym_task_index(rollouts_state, replay_buffer_state) == expected
-    )
 
 
 @ray.remote(num_cpus=0)
@@ -355,6 +327,66 @@ class TestReplayBufferImplCheckpointing:
                     "last_target_weight_already_generated": 1,
                 }
             )
+
+    def test_local_actor_side_checkpoint_preserves_compact_media_and_resume_metadata(
+        self, tmp_path
+    ):
+        checkpoint_path = tmp_path / "replay_buffer.pt"
+        compact_media_row = PackedTensor(
+            torch.tensor([[1.0, 2.0]]), dim_to_pack=0
+        ).enable_deduplication()
+        compact_media = PackedTensor.concat([compact_media_row] * 2)
+        source = ReplayBufferImpl(max_size=10)
+        assert (
+            source.add(
+                {
+                    "batch": {"pixel_values": compact_media},
+                    "rollout_metrics": {},
+                    "_ng_task_index": 7,
+                },
+                weight_version=4,
+                target_weight_version=5,
+            )
+            == "success"
+        )
+        assert (
+            source.add(
+                {
+                    "batch": {"data": "stale"},
+                    "rollout_metrics": {},
+                    "_ng_task_index": 41,
+                },
+                weight_version=0,
+                target_weight_version=5,
+            )
+            == "success"
+        )
+
+        assert source.save_to_path(str(checkpoint_path)) == 2
+
+        restored = ReplayBufferImpl(max_size=10)
+        metadata = restored.load_from_path(
+            str(checkpoint_path),
+            num_prompts_per_step=1,
+            current_training_step=5,
+            max_age_steps=1,
+        )
+
+        # Metadata accounts for every saved task index, including trajectories
+        # discarded during resume cleanup, so an index is never reused.
+        assert metadata == {
+            "num_trajectories": 2,
+            "next_ng_task_index": 42,
+        }
+        assert restored.size() == 1
+        restored_state = restored.state_dict()
+        restored_media = restored_state["trajectories"][0]["batch"]["pixel_values"]
+        assert len(restored_media) == 2
+        assert len(restored_media.tensors) == 1
+        torch.testing.assert_close(
+            restored_media.as_tensor(),
+            torch.tensor([[1.0, 2.0], [1.0, 2.0]]),
+        )
 
 
 class TestReplayBuffer:
@@ -1006,39 +1038,53 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
-    def test_replay_buffer_checkpoint_with_torch_save(self):
-        """Test that state_dict can be saved and loaded with torch.save/load."""
+    def test_replay_buffer_checkpoint_with_torch_save(self, tmp_path):
+        """Actor-side compact replay checkpoint survives a config flag flip."""
         buffer1 = ReplayBuffer.remote(max_size=10)
+        pixel_row = PackedTensor(
+            torch.tensor([[1.0, 2.0]]), dim_to_pack=0
+        ).enable_deduplication()
 
         trajectory = {
             "batch": {
                 "token_ids": torch.tensor([1, 2, 3]),
                 "rewards": torch.tensor([0.5]),
+                "pixel_values": PackedTensor.concat([pixel_row] * 2),
             },
             "rollout_metrics": {"reward": 1.0, "length": 10},
             "timestamp": 12345.0,
+            "_ng_task_index": 11,
         }
         ray.get(
             buffer1.add.remote(trajectory, weight_version=5, target_weight_version=6)
         )
 
-        state = ray.get(buffer1.state_dict.remote())
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-            torch.save(state, f.name)
-            checkpoint_path = f.name
+        checkpoint_path = tmp_path / "replay_buffer.pt"
+        assert ray.get(buffer1.save_to_path.remote(str(checkpoint_path))) == 1
 
         ray.kill(buffer1)
 
-        loaded_state = torch.load(checkpoint_path, weights_only=False)
         buffer2 = ReplayBuffer.remote(max_size=10)
-        ray.get(buffer2.load_state_dict.remote(loaded_state))
+        restore_metadata = ray.get(buffer2.load_from_path.remote(str(checkpoint_path)))
 
+        assert restore_metadata == {
+            "num_trajectories": 1,
+            "next_ng_task_index": 12,
+        }
         assert ray.get(buffer2.size.remote()) == 1
         debug_info = ray.get(buffer2.get_debug_info.remote())
         assert debug_info["trajectory_versions"] == [5]
         assert debug_info["target_weight_versions"] == [6]
+        restored_state = ray.get(buffer2.state_dict.remote())
+        restored_media = restored_state["trajectories"][0]["batch"]["pixel_values"]
+        assert restored_media.deduplication_enabled
+        assert len(restored_media) == 2
+        assert len(restored_media.tensors) == 1
+        torch.testing.assert_close(
+            restored_media.as_tensor(),
+            torch.tensor([[1.0, 2.0], [1.0, 2.0]]),
+        )
 
-        os.unlink(checkpoint_path)
         ray.kill(buffer2)
 
     def test_resume_deadlock_precondition_detectable(self):
@@ -1107,7 +1153,10 @@ class TestAsyncTrajectoryCollector:
     """Test cases for AsyncTrajectoryCollector."""
 
     def create_local_collector(
-        self, replay_buffer=None, next_nemo_gym_task_index: int = 0
+        self,
+        replay_buffer=None,
+        next_nemo_gym_task_index: int = 0,
+        max_generation_failures: int = 0,
     ):
         """Create a non-Ray collector instance for unit-testing local state."""
         collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
@@ -1115,6 +1164,7 @@ class TestAsyncTrajectoryCollector:
         mock_tokenizer = mock.MagicMock()
         task_to_env = {}
         master_config = self.create_mock_config()
+        master_config.grpo.async_grpo.max_generation_failures = max_generation_failures
         if replay_buffer is None:
             replay_buffer = mock.MagicMock()
 
@@ -1158,6 +1208,31 @@ class TestAsyncTrajectoryCollector:
         assert status["data_exhausted"] is True
         assert status["errored"] is False
         assert status["running"] is False
+
+    @pytest.mark.asyncio
+    async def test_drain_payload_metrics_returns_collector_interval(self, monkeypatch):
+        collector = self.create_local_collector()
+        collector.master_config.grpo.debug_payload_metrics = True
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector."
+            "drain_multimodal_payload_metrics",
+            lambda: {
+                "payload_bytes/nemo_gym_return/serialized": 180,
+                "payload_bytes/nemo_gym_return/serialized_mean_per_call": 90,
+                "payload_bytes/nemo_gym_return/physical_media": 30,
+                "payload_bytes/nemo_gym_return/logical_media": 150,
+                "payload_counts/nemo_gym_return/calls": 2,
+                "payload_ratio/nemo_gym_return/physical_to_logical": 0.2,
+            },
+        )
+
+        metrics = await collector.drain_payload_metrics()
+
+        assert metrics["payload_counts/nemo_gym_return/calls"] == 2
+        assert metrics["payload_bytes/nemo_gym_return/serialized_mean_per_call"] == 90
+        assert metrics["payload_bytes/nemo_gym_return/physical_media"] == 30
+        assert metrics["payload_bytes/nemo_gym_return/logical_media"] == 150
+        assert metrics["payload_ratio/nemo_gym_return/physical_to_logical"] == 0.2
 
     def test_collection_loop_marks_errored_on_crash(self):
         """A crash sets errored (not data_exhausted) so driver guards fail fast."""
@@ -1205,7 +1280,10 @@ class TestAsyncTrajectoryCollector:
                 num_prompts_per_step=2,
                 num_generations_per_prompt=3,
                 max_rollout_turns=1,
-                async_grpo=AsyncGRPOConfig.model_construct(max_trajectory_age_steps=2),
+                async_grpo=AsyncGRPOConfig.model_construct(
+                    max_trajectory_age_steps=2,
+                    max_generation_failures=0,
+                ),
             ),
             policy={
                 "max_total_sequence_length": 512,
@@ -1423,7 +1501,8 @@ class TestAsyncTrajectoryCollector:
             def slice(self, start, end):
                 return self
 
-            def repeat_interleave(self, repeats):
+            def repeat_interleave(self, repeats, *, share_immutable_media=False):
+                assert not share_immutable_media
                 return self
 
         class FailingThread:
@@ -1487,6 +1566,7 @@ class TestAsyncTrajectoryCollector:
 
         target_weight = 7
         collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.master_config.grpo.deduplicate_multimodal_data = True
         collector.running = True
 
         def reserve_target(generation_weight_version):
@@ -1898,6 +1978,186 @@ class TestAsyncTrajectoryCollector:
         ray.kill(buffer)
         ray.kill(mock_env)
 
+    @pytest.mark.parametrize("max_generation_failures", [0, 2])
+    def test_batch_worker_failure_surfaces_after_threshold(
+        self, monkeypatch, max_generation_failures
+    ):
+        """Consecutive batch-worker failures become sticky past the limit."""
+        collector = self.create_local_collector(
+            max_generation_failures=max_generation_failures
+        )
+        collector.running = True
+        target_weight = 7
+
+        outcomes = []
+        if max_generation_failures > 0:
+            outcomes.append(ValueError("pre-reset failure"))
+        outcomes.append(None)
+        outcomes.extend(
+            ValueError(f"backend failed {failure_index}")
+            for failure_index in range(max_generation_failures + 2)
+        )
+
+        async def collect_rollout_batch(**kwargs):
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", collect_rollout_batch)
+
+        def run_worker(*, expect_generation_wake):
+            collector._generation_limit_cleared.clear()
+            collector._generating_targets.add(target_weight)
+            asyncio.run(
+                collector._run_rollout_batch_worker(
+                    repeated_batch=None,
+                    generation_weight_version=4,
+                    target_weight_version=target_weight,
+                    num_generations=1,
+                    use_nemo_gym=False,
+                )
+            )
+            assert target_weight not in collector._generating_targets
+            assert (
+                collector._generation_limit_cleared.is_set() is expect_generation_wake
+            )
+
+        collector.check_health()
+
+        if max_generation_failures > 0:
+            run_worker(expect_generation_wake=True)
+            assert collector._failure_count == 1
+            collector.check_health()
+
+        run_worker(expect_generation_wake=False)
+        assert collector._failure_count == 0
+        collector.check_health()
+
+        for failure_index in range(max_generation_failures + 1):
+            run_worker(expect_generation_wake=True)
+            if failure_index < max_generation_failures:
+                collector.check_health()
+
+        expected_count = max_generation_failures + 1
+        with pytest.raises(RuntimeError) as exc_info:
+            collector.check_health()
+
+        error_message = str(exc_info.value)
+        assert f"{expected_count} batch-worker failure(s)" in error_message
+        assert f"max_generation_failures={max_generation_failures}" in error_message
+        assert "native batch worker" in error_message
+        assert "generation_weight=4" in error_message
+        assert "target_weight=7" in error_message
+        assert (
+            f"ValueError('backend failed {max_generation_failures}')" in error_message
+        )
+        assert "Worker traceback:" in error_message
+        assert "Traceback (most recent call last):" in error_message
+
+        first_fatal_error = exc_info.value
+        run_worker(expect_generation_wake=True)
+        assert collector._failure_count == expected_count + 1
+
+        with pytest.raises(RuntimeError, match="target_weight=7") as repeated_exc_info:
+            collector.check_health()
+
+        assert repeated_exc_info.value is not first_fatal_error
+        assert str(repeated_exc_info.value) == error_message
+
+    def test_tolerated_worker_failure_wakes_gap_fill_pause(self, monkeypatch):
+        """A failed worker releases and wakes a max-age-one target for gap fill."""
+        collector = self.create_local_collector(max_generation_failures=3)
+        collector.master_config.grpo.async_grpo.max_trajectory_age_steps = 1
+        collector.current_weight_version = 4
+        collector.running = True
+        collector.dataloader = [{"batch": 0}]
+        target_weight = 5
+        collector._generating_targets.add(target_weight)
+        collector._last_limit_warning_version = collector.current_weight_version
+
+        release_target = collector._release_target
+
+        def release_before_wake(target_weight_version):
+            assert not collector._generation_limit_cleared.is_set()
+            release_target(target_weight_version)
+
+        monkeypatch.setattr(collector, "_release_target", release_before_wake)
+
+        monkeypatch.setattr(
+            collector,
+            "_should_pause_for_generation_limits",
+            lambda: target_weight in collector._generating_targets,
+        )
+
+        gap_fill_started = threading.Event()
+
+        def process_gap_fill(batch):
+            assert target_weight not in collector._generating_targets
+            gap_fill_started.set()
+
+        monkeypatch.setattr(collector, "_process_batch", process_gap_fill)
+
+        async def fail_rollout_batch(**kwargs):
+            raise ValueError("worker exhausted retries")
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", fail_rollout_batch)
+
+        collection_thread = threading.Thread(target=collector._collection_loop)
+        collection_thread.start()
+        deadline = time.monotonic() + 1
+        while collector._generation_limit_cleared.is_set():
+            assert time.monotonic() < deadline, "collection loop did not enter pause"
+            time.sleep(0.01)
+        assert not gap_fill_started.is_set()
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=None,
+                generation_weight_version=4,
+                target_weight_version=target_weight,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert gap_fill_started.wait(timeout=1)
+        collection_thread.join(timeout=1)
+        assert not collection_thread.is_alive()
+        assert collector._failure_count == 1
+        collector.check_health()
+
+    def test_worker_shutdown_error_is_not_counted(self, monkeypatch):
+        """An in-flight worker stopping after exhaustion is not a generation failure."""
+        collector = self.create_local_collector(max_generation_failures=0)
+        collector.running = False
+        collector.data_exhausted = True
+        target_weight = 7
+        collector._generating_targets.add(target_weight)
+        collector._inflight_threads.add(threading.current_thread())
+        collector._generation_limit_cleared.clear()
+
+        async def fail_during_shutdown(**kwargs):
+            raise RuntimeError("Trajectory collection stopped before enqueue completed")
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", fail_during_shutdown)
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=None,
+                generation_weight_version=4,
+                target_weight_version=target_weight,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert collector._failure_count == 0
+        assert collector._fatal_error_message is None
+        assert not collector._generation_limit_cleared.is_set()
+        assert target_weight not in collector._generating_targets
+        assert threading.current_thread() not in collector._inflight_threads
+        collector.check_health()
+
 
 class TestAsyncUtilsIntegration:
     """Integration tests for async utilities working together."""
@@ -1909,7 +2169,10 @@ class TestAsyncUtilsIntegration:
                 num_prompts_per_step=2,
                 num_generations_per_prompt=2,
                 max_rollout_turns=1,
-                async_grpo=AsyncGRPOConfig.model_construct(max_trajectory_age_steps=1),
+                async_grpo=AsyncGRPOConfig.model_construct(
+                    max_trajectory_age_steps=1,
+                    max_generation_failures=0,
+                ),
             ),
             policy={
                 "max_total_sequence_length": 512,

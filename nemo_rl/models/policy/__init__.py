@@ -215,6 +215,9 @@ class SequencePackingConfig(TypedDict):
     # Not required because some algorithms like SFT don't calculate log probs
     logprob_mb_tokens: NotRequired[int]
     algorithm: str
+    # Preserve the packer's order (or omit for backward compatibility), or
+    # execute each DP rank's assigned bins largest-first for allocator reuse.
+    microbatch_order: NotRequired[Literal["packer", "largest_first"]]
 
 
 class RewardModelConfig(TypedDict):
@@ -325,6 +328,10 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
+    # Arbitrary model-provider attributes applied recursively to the Megatron
+    # Bridge model config before model instantiation. Keys must match configurable
+    # provider fields and must not duplicate first-class megatron_cfg fields.
+    model_overrides: NotRequired[dict[str, Any]]
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
@@ -344,6 +351,15 @@ class MegatronConfig(TypedDict):
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int
+    # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
+    # provider's checkpoint/default value.
+    radio_force_cpe_eval_mode: NotRequired[bool]
+    # Nemotron Omni tower freeze booleans. Omit any field to retain the model
+    # provider's checkpoint/default value.
+    freeze_vision_model: NotRequired[bool]
+    freeze_vision_projection: NotRequired[bool]
+    freeze_sound_encoder: NotRequired[bool]
+    freeze_sound_projection: NotRequired[bool]
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool
@@ -386,11 +402,32 @@ class MegatronConfig(TypedDict):
     # CUDA-graph implementation.
     # Options: 'none', 'local', 'transformer_engine', 'full_iteration'.
     cuda_graph_impl: NotRequired[str]
+    # Training capture regions supported by Megatron-Core: attn, mlp, moe,
+    # moe_router, moe_preprocess, and mamba. An empty list captures whole layers.
+    # Scoped training capture requires the transformer_engine implementation.
+    cuda_graph_modules: NotRequired[str | list[str]]
+    # Number of training warmup steps before CUDA Graph capture. This is inactive
+    # when cuda_graph_impl is 'none'; the Megatron-Core default is 3.
+    cuda_graph_warmup_steps: NotRequired[int]
     # When True, each expert sees a fixed number of tokens for cuda-graph capture.
     # Required when cuda_graph_impl= 'local' with transformer_impl != 'inference_optimized'.
     moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Offload specific module activations to CPU to reduce peak GPU memory.
+    # Works with both dense and MoE models. Different from
+    # optimizer_cpu_offload which offloads optimizer states.
+    # Requires transformer_engine. For TE >= 2.10.0 also requires
+    # NVTE_CPU_OFFLOAD_V1=1 in the environment (validated by
+    # Megatron-Bridge at runtime).
+    fine_grained_activation_offloading: NotRequired[bool]
+    # Modules to offload when fine_grained_activation_offloading is True.
+    # Required (no default). Common examples: "core_attn", "attn_proj",
+    # "expert_fc1", and "moe_act". Supported names depend on the pinned
+    # Megatron-LM version and are validated by MCore. "attn_proj" requires
+    # "core_attn". See the latest upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: NotRequired[list[str] | None]
     # Create gloo process groups during Megatron distributed init.
     # Omitted: use the Megatron Bridge default.
     use_gloo_process_groups: NotRequired[bool]
@@ -559,3 +596,5 @@ class PolicyConfig(TypedDict):
     # If true, use standard Megatron layer specs while keeping ModelOpt
     # quantization enabled. Useful for faster QARL runs and logged in configs.
     disable_modelopt_layer_spec: NotRequired[bool]
+
+    is_vlm: NotRequired[bool]
