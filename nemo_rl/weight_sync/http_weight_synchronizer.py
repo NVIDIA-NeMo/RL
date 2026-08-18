@@ -103,9 +103,6 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
     def is_stale(self) -> bool:
         return self._stale
 
-    def mark_stale(self) -> None:
-        self._stale = True
-
     def init_communicator(self) -> None:
         initialize_refit_metadata(self._policy, self._generation)
 
