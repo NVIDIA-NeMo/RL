@@ -220,7 +220,9 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -235,7 +237,9 @@ class ColocatablePolicyInterface(PolicyInterface):
         raise NotImplementedError
 
     def nccl_reshard_refit(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
     ) -> list[ray.ObjectRef]:
         """Sync weights to generation workers via the NCCL-reshard path."""
         raise NotImplementedError
