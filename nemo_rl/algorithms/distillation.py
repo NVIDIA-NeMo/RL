@@ -54,6 +54,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -633,7 +634,7 @@ def setup(
 # ===============================================================================
 
 
-def distillation_train(
+def _distillation_train_impl(
     student_policy: ColocatablePolicyInterface,
     teacher_policy: ColocatablePolicyInterface,
     student_generation: Optional[GenerationInterface],
@@ -1129,6 +1130,42 @@ def distillation_train(
     # without this the daemon finalization thread could be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
+
+
+def distillation_train(
+    student_policy: ColocatablePolicyInterface,
+    teacher_policy: ColocatablePolicyInterface,
+    student_generation: Optional[GenerationInterface],
+    dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: DistillationLossFn,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    distillation_save_state: DistillationSaveState,
+    master_config: MasterConfig,
+) -> None:
+    """Run distillation training and always tear down its environments."""
+    try:
+        _distillation_train_impl(
+            student_policy,
+            teacher_policy,
+            student_generation,
+            dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            distillation_save_state,
+            master_config,
+        )
+    finally:
+        shutdown_environments(task_to_env, val_task_to_env)
 
 
 def validate(

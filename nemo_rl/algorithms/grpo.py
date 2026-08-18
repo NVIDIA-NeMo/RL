@@ -86,6 +86,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
@@ -2653,7 +2654,7 @@ def _validation_early_stop_message(
     )
 
 
-def grpo_train(
+def _grpo_train_impl(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
@@ -3786,6 +3787,42 @@ def grpo_train(
     # so without this the daemon finalization thread would be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
+
+
+def grpo_train(
+    policy: ColocatablePolicyInterface,
+    policy_generation: Optional[GenerationInterface],
+    wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: LossFunction,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    grpo_save_state: GRPOSaveState,
+    master_config: MasterConfig,
+    processor: Optional[AutoProcessor] = None,
+) -> None:
+    """Run GRPO training and always tear down its environments."""
+    try:
+        _grpo_train_impl(
+            policy,
+            policy_generation,
+            wrapped_dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            grpo_save_state,
+            master_config,
+            processor,
+        )
+    finally:
+        shutdown_environments(task_to_env, val_task_to_env)
 
 
 def validate(
@@ -5346,21 +5383,7 @@ def async_grpo_train(
         except Exception as e:
             print(f"Error stopping replay buffer: {e}")
 
-        # Environments must be shut down before generation workers because
-        # they may have in-flight HTTP requests to vLLM HTTP endpoints.
-        # Killing generation first leaves environments retrying dead connections.
-        for env_dict in (task_to_env, val_task_to_env):
-            if env_dict is None:
-                continue
-            for task_name, env in env_dict.items():
-                print(f"🛑 Shutting down environment {task_name}...")
-                try:
-                    ray.get(env.shutdown.remote(), timeout=10)
-                except Exception:
-                    try:
-                        ray.kill(env)
-                    except Exception as e:
-                        print(f"Error shutting down environment {task_name}: {e}")
+        shutdown_environments(task_to_env, val_task_to_env)
 
         print("🛑 Shutting down generation workers...")
         try:

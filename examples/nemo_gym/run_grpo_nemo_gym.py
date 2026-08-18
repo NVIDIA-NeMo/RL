@@ -42,6 +42,7 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
@@ -267,15 +268,18 @@ The validation set you pass in will directly be used for validation with no addi
     val_task_to_env = task_to_env
 
     if is_trajectory_collection:
-        collect_trajectories(
-            policy=policy,
-            policy_generation=policy_generation,
-            val_dataloader=val_dataloader,
-            tokenizer=tokenizer,
-            val_task_to_env=val_task_to_env,
-            logger=logger,
-            master_config=master_config,
-        )
+        try:
+            collect_trajectories(
+                policy=policy,
+                policy_generation=policy_generation,
+                val_dataloader=val_dataloader,
+                tokenizer=tokenizer,
+                val_task_to_env=val_task_to_env,
+                logger=logger,
+                master_config=master_config,
+            )
+        finally:
+            shutdown_environments(task_to_env, val_task_to_env)
     # Check if async mode is enabled
     elif config.grpo.async_grpo.enabled:
         # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
