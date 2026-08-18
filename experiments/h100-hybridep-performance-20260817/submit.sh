@@ -118,9 +118,8 @@ run_dir="${RUN_ROOT}/${run_id}"
 mkdir -p "${run_dir}"
 
 if [[ ${arm} == "baseline" ]]; then
-  config_setup="baseline_config=\"${PROJECT_ROOT}/examples/configs/recipes/llm/performance/.${recipe}.baseline-\${SLURM_JOB_ID}.yaml\"
+  config_setup="baseline_config=\"${run_dir}/baseline-${BASELINE_COMMIT}-${recipe}\"
 git -C \"${PROJECT_ROOT}\" show \"${BASELINE_COMMIT}:${config_rel}\" > \"\${baseline_config}\"
-trap 'rm -f -- \"\${baseline_config}\"' EXIT
 config_path=\"\${baseline_config}\""
 else
   config_setup="config_path=\"${config_path}\""

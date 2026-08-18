@@ -193,3 +193,13 @@ def test_shared_uv_cache_does_not_shadow_the_container_bootstrap_cache() -> None
     assert 'uv_cache_setup="export UV_CACHE_DIR=${uv_cache_dir_q}"' in script
     assert "unset UV_CACHE_DIR_OVERRIDE" in script
     assert "export UV_CACHE_DIR_OVERRIDE" not in script
+
+
+def test_baseline_config_is_materialized_outside_the_source_tree() -> None:
+    script = SUBMIT_SCRIPT.read_text()
+
+    assert (
+        'baseline_config=\\"${run_dir}/baseline-${BASELINE_COMMIT}-${recipe}\\"'
+        in script
+    )
+    assert "performance/.${recipe}.baseline" not in script
