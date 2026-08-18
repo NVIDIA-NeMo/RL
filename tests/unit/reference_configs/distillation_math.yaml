@@ -66,6 +66,7 @@ policy: &POLICY_BASE
         train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
         logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
         algorithm: "modified_first_fit_decreasing"
+        microbatch_order: "packer"
         sequence_length_round: 64
 
     max_grad_norm: 1.0
@@ -93,6 +94,11 @@ policy: &POLICY_BASE
         force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
         activation_checkpointing: false
+        cuda_graph_impl: "none"
+        cuda_graph_modules: []
+        cuda_graph_warmup_steps: 3
+        fine_grained_activation_offloading: false
+        offload_modules: null
         recompute_granularity: "full"
         recompute_modules: null
         tensor_model_parallel_size: 2
@@ -190,12 +196,16 @@ policy: &POLICY_BASE
         temperature: 1.0
         top_p: 1.0
         top_k: null
+        val_temperature: ${.temperature}
+        val_top_p: ${.top_p}
+        val_top_k: ${.top_k}
         stop_token_ids: null
         stop_strings: null
         vllm_cfg:
             async_engine: false
             precision: ${...precision}
             kv_cache_dtype: "auto"
+            logprobs_mode: processed_logprobs
             tensor_parallel_size: 1
             pipeline_parallel_size: 1
             expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP

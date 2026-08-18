@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import hashlib
 import json
 import os
 import threading
 import time
 import warnings
+from collections.abc import Mapping
+from dataclasses import fields, is_dataclass, replace
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -55,6 +58,7 @@ from megatron.bridge.training.setup import (
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
+from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -67,6 +71,8 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
 
 _HF_CONFIG_PATCHED = False
+
+_NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT = "expanded_sequence_v1"
 
 
 def _patch_hf_config_double_instantiation():
@@ -218,7 +224,10 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.megatron.community_import import import_model_from_hf_name
+from nemo_rl.models.megatron.community_import import (
+    import_model_from_hf_name,
+    iter_vlm_config_overrides,
+)
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
 from nemo_rl.models.megatron.draft.utils import (
     build_draft_model,
@@ -230,7 +239,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
     validate_router_replay_config,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_megatron_checkpoint_dir,
@@ -623,6 +632,19 @@ def setup_model_config(
             )
             raise
 
+    # Construct the final provider with model-only overrides before applying
+    # NeMo-RL's first-class Megatron settings. Conflicts are rejected so the
+    # provider and the user-facing config cannot disagree about the same field.
+    model_overrides = config["megatron_cfg"].get("model_overrides")
+    if model_overrides:
+        _validate_model_override_conflicts(config["megatron_cfg"], model_overrides)
+        if not is_dataclass(model_cfg):
+            raise TypeError(
+                "model_overrides requires a dataclass-backed Megatron Bridge "
+                f"model config, got {type(model_cfg).__name__}."
+            )
+        model_cfg = _merge_model_overrides(model_cfg, model_overrides)
+
     # Apply parallelism settings
     _apply_parallelism_config(model_cfg, config)
 
@@ -645,13 +667,25 @@ def setup_model_config(
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
 
+    # Provider objects loaded from checkpoint metadata otherwise retain the
+    # serialized defaults. Apply explicit recipe controls before model
+    # construction so RADIO positional encoding and frozen towers are stable
+    # and consistent between logprob and training passes.
+    for vlm_key, vlm_value in iter_vlm_config_overrides(config["megatron_cfg"]):
+        if not hasattr(model_cfg, vlm_key):
+            raise ValueError(
+                f"megatron_cfg set '{vlm_key}' but {type(model_cfg).__name__} has no "
+                "such field; this provider does not support that tower control."
+            )
+        setattr(model_cfg, vlm_key, vlm_value)
+
     # Validate chunking configuration
     _validate_chunking_config(config)
 
-    # For megatron_lm, finalize the model config after all settings have been applied.
-    # (For megatron_bridge/hf, the provider was already finalized before the checkpoint
-    # was saved to run_config.yaml, so finalize() is not called here for those paths.)
-    if fmt == "megatron_lm":
+    # Reconstructed providers must be finalized so derived fields reflect the
+    # merged config. Without overrides, preserve the existing checkpoint-load
+    # behavior: only megatron_lm providers need finalization here.
+    if fmt == "megatron_lm" or model_overrides:
         model_cfg.finalize()
 
     model_cfg.__post_init__()
@@ -693,6 +727,108 @@ def setup_model_config(
     _validate_dtype_config(dtype, megatron_cfg.model, megatron_cfg.optimizer)
 
     return megatron_cfg, model_cfg
+
+
+def _validate_model_override_conflicts(
+    megatron_cfg: Mapping[str, Any], overrides: dict[str, Any]
+) -> None:
+    """Reject overrides that duplicate first-class NeMo-RL Megatron settings."""
+    first_class_fields = (set(MegatronConfig.__annotations__) | set(megatron_cfg)) - {
+        "model_overrides"
+    }
+    conflicts = sorted(set(overrides) & first_class_fields)
+    if not conflicts:
+        return
+
+    conflict_paths = ", ".join(
+        f"policy.megatron_cfg.model_overrides.{name} conflicts with "
+        f"policy.megatron_cfg.{name}"
+        for name in conflicts
+    )
+    raise ValueError(
+        "model_overrides is only for Megatron Bridge model fields without a "
+        f"first-class NeMo-RL setting; {conflict_paths}. Set the first-class "
+        "field directly instead."
+    )
+
+
+def _merge_model_overrides(
+    target: Any,
+    overrides: dict[str, Any],
+    path: str = "policy.megatron_cfg.model_overrides",
+) -> Any:
+    """Construct a model config with recursively merged user overrides.
+
+    Dataclass-backed config objects are reconstructed with ``dataclasses.replace``
+    so the returned provider is the canonical object later stored and serialized
+    by Megatron Bridge's ``ConfigContainer``. Nested mappings and config objects
+    are copied before updates; the input provider is never mutated.
+
+    Args:
+        target: Model provider, nested config object, or mapping to merge.
+        overrides: YAML-derived override hierarchy.
+        path: User-facing config path used in error messages.
+
+    Returns:
+        A new config object or mapping containing the merged values.
+
+    Raises:
+        AttributeError: If an override does not match an object attribute.
+    """
+    if isinstance(target, Mapping):
+        merged_mapping = dict(target)
+        for name, value in overrides.items():
+            override_path = f"{path}.{name}"
+            current_value = target.get(name)
+            merged_mapping[name] = _merge_model_override_value(
+                current_value, value, override_path
+            )
+        return merged_mapping
+
+    # Explicitly collect the allowed fields so we can trace a potential
+    # error back to the config / override path that triggered it.
+    dataclass_init_fields = None
+    if is_dataclass(target):
+        dataclass_init_fields = {field.name for field in fields(target) if field.init}
+
+    updates = {}
+    for name, value in overrides.items():
+        override_path = f"{path}.{name}"
+        if dataclass_init_fields is not None:
+            attribute_exists = name in dataclass_init_fields
+        else:
+            attribute_exists = hasattr(target, name)
+        if not attribute_exists:
+            raise AttributeError(
+                f"{override_path} does not match a configurable field on "
+                f"Megatron Bridge config {type(target).__name__}."
+            )
+
+        current_value = getattr(target, name)
+        updates[name] = _merge_model_override_value(current_value, value, override_path)
+
+    if dataclass_init_fields is not None:
+        return replace(target, **updates)
+
+    merged_object = copy.copy(target)
+    for name, value in updates.items():
+        setattr(merged_object, name, value)
+    return merged_object
+
+
+def _merge_model_override_value(
+    current_value: Any, override_value: Any, path: str
+) -> Any:
+    """Merge one override value, descending into config hierarchies as needed."""
+    if not isinstance(override_value, dict):
+        return override_value
+    if (
+        isinstance(current_value, Mapping)
+        or is_dataclass(current_value)
+        or hasattr(current_value, "__dict__")
+    ):
+        return _merge_model_overrides(current_value, override_value, path)
+    return override_value
 
 
 def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -920,9 +1056,26 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.use_fused_weighted_squared_relu = config["megatron_cfg"][
         "use_fused_weighted_squared_relu"
     ]
-    # Optional explicit attention backend override for environments where
-    # TE auto backend probing is unstable.
+    # NeMo-RL can pack multiple expanded Omni examples into one THD tensor.
+    # Flash attention does not support the resulting padded multi-row layout,
+    # so the canonical expanded-sequence contract must use backend dispatch.
     attention_backend = config["megatron_cfg"].get("attention_backend")
+    if (
+        getattr(model_cfg, "nemotron_omni_contract", None)
+        == _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT
+    ):
+        if attention_backend == "flash":
+            raise ValueError(
+                "Nemotron Omni's expanded-sequence contract does not support "
+                "attention_backend='flash' in NeMo-RL because packed batches can "
+                "contain multiple padded THD rows. Use attention_backend='auto' "
+                "or omit the setting."
+            )
+        if attention_backend is None:
+            attention_backend = "auto"
+
+    # Optional explicit attention backend override for other models, and the
+    # required auto selection for canonical Nemotron Omni.
     if attention_backend is not None:
         for _nvte_var in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
             os.environ.pop(_nvte_var, None)
@@ -945,6 +1098,12 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             model_cfg.inference_cuda_graph_scope = InferenceCudaGraphScope[
                 config["megatron_cfg"]["inference_cuda_graph_scope"]
             ]
+    if "cuda_graph_modules" in config["megatron_cfg"]:
+        set_cuda_graph_modules(model_cfg, config["megatron_cfg"]["cuda_graph_modules"])
+    if "cuda_graph_warmup_steps" in config["megatron_cfg"]:
+        model_cfg.cuda_graph_warmup_steps = config["megatron_cfg"][
+            "cuda_graph_warmup_steps"
+        ]
 
     # Use the graph-safe TE RNG tracker for either training graphs or inference graphs.
     if "generation" in config and config["generation"] is not None:
@@ -965,6 +1124,37 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             model_cfg.fp8_param = fp8_cfg["fp8_param"]
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
+
+    megatron_cfg = config["megatron_cfg"]
+    fine_grained_activation_offloading = megatron_cfg.get(
+        "fine_grained_activation_offloading"
+    )
+
+    if fine_grained_activation_offloading is False:
+        # Preserve the legacy exemplar's disabled/null semantics and clear any
+        # enabled state carried by a provider or checkpoint.
+        model_cfg.fine_grained_activation_offloading = False
+        model_cfg.offload_modules = []
+    elif fine_grained_activation_offloading:
+        offload_modules = megatron_cfg.get("offload_modules")
+        if not isinstance(offload_modules, list) or not offload_modules:
+            raise ValueError(
+                "offload_modules must be a non-empty list when "
+                "fine_grained_activation_offloading is True."
+            )
+        moe_only_modules = {"expert_fc1", "moe_act", "fused_group_mlp"}
+        invalid_dense_modules = moe_only_modules.intersection(offload_modules)
+        if (
+            invalid_dense_modules
+            and getattr(model_cfg, "num_moe_experts", None) is None
+        ):
+            raise ValueError(
+                "A MoE-only offload module requires a MoE model "
+                "(num_moe_experts must not be None): "
+                f"{sorted(invalid_dense_modules)}."
+            )
+        model_cfg.fine_grained_activation_offloading = True
+        model_cfg.offload_modules = offload_modules
 
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
@@ -1295,6 +1485,7 @@ def setup_model_and_optimizer(
     get_position_embedding_ranks=None,
     pre_load_checkpoint_hook: Optional[Callable] = None,
     additional_pre_wrap_hooks: Optional[list[Callable]] = None,
+    load_weights: bool = True,
 ):
     state = GlobalState()
     _patch_bridge_signal_handler_for_worker_threads()
@@ -1387,6 +1578,14 @@ def setup_model_and_optimizer(
                 # Handle VLM models
                 if hasattr(model_module, "thinker"):
                     model_module = model_module.thinker
+                # NemotronVLModel / NemotronOmniModel wrap the GPT under
+                # `.llava_model.language_model`; unwrap that layer first so the
+                # generic `.language_model.decoder.layers` walk below finds the
+                # MoE router.
+                if getattr(model_module, "llava_model", None) is not None and hasattr(
+                    model_module.llava_model, "language_model"
+                ):
+                    model_module = model_module.llava_model
                 if hasattr(model_module, "language_model"):
                     model_module = model_module.language_model
                 for layer in model_module.decoder.layers:
@@ -1478,7 +1677,9 @@ def setup_model_and_optimizer(
     print("Model, optimizer, and learning rate scheduler built")
     torch.distributed.barrier()
 
-    if megatron_cfg.peft is not None:
+    if not load_weights:
+        should_load_checkpoint = False
+    elif megatron_cfg.peft is not None:
         should_load_checkpoint = resume_checkpoint_exists
         if should_load_checkpoint:
             # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states

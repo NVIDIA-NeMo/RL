@@ -65,6 +65,7 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
+from nemo_rl.models.automodel.data import filter_multimodal_kwargs_for_model
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
@@ -783,6 +784,9 @@ class DTensorPolicyWorkerImpl(
                         vlm_kwargs = mb.get_multimodal_dict(
                             as_tensors=True, device=input_ids.device
                         )
+                        vlm_kwargs = filter_multimodal_kwargs_for_model(
+                            self.model, vlm_kwargs
+                        )
                         if len(vlm_kwargs) > 0:
                             position_ids = None
                             assert not self.cfg["dtensor_cfg"]["sequence_parallel"], (
@@ -1088,6 +1092,7 @@ class DTensorPolicyWorkerImpl(
                 vlm_kwargs = lp_batch.get_multimodal_dict(
                     as_tensors=True, device=input_ids.device
                 )
+                vlm_kwargs = filter_multimodal_kwargs_for_model(self.model, vlm_kwargs)
 
                 batch_size, seq_len = input_ids.shape
                 if self.enable_seq_packing:
@@ -1532,6 +1537,7 @@ class DTensorPolicyWorkerImpl(
                 vlm_kwargs = lp_batch.get_multimodal_dict(
                     as_tensors=True, device=input_ids.device
                 )
+                vlm_kwargs = filter_multimodal_kwargs_for_model(self.model, vlm_kwargs)
                 batch_size, seq_len = input_ids.shape
 
                 # Store original shapes for unpacking later

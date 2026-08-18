@@ -53,7 +53,6 @@ policy:
     real_quant: false
     vllm_cfg:
       tensor_parallel_size: 4
-      enable_prefix_caching: false
       enable_vllm_metrics_logger: false
       env_vars:
         VLLM_USE_RAY_V2_EXECUTOR_BACKEND: 1
