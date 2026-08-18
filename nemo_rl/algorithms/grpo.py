@@ -1140,6 +1140,22 @@ def setup(
                 )
             mcore_cfg["kv_cache_management_mode"] = "recompute"
 
+    # inference_optimized layers hard-require sequence parallelism with TP>1
+    # (asserted at model build). Enable it here, driver-side, so the logged
+    # and checkpointed config reflects the effective value.
+    if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
+        megatron_cfg = policy_config["megatron_cfg"]
+        if (
+            megatron_cfg.get("transformer_impl") == "inference_optimized"
+            and megatron_cfg["tensor_model_parallel_size"] > 1
+            and not megatron_cfg["sequence_parallel"]
+        ):
+            megatron_cfg["sequence_parallel"] = True
+            print(
+                "Auto-enabling `policy.megatron_cfg.sequence_parallel=True`: "
+                "transformer_impl=inference_optimized requires it with TP>1."
+            )
+
     # Define initialization functions that will be used in all paths
     init_reference_model = loss_config.reference_policy_kl_penalty > 0
 
@@ -4239,7 +4255,7 @@ def async_grpo_train(
 
     assert (not colocated_inference) or (
         isinstance(policy_generation, MegatronGeneration)
-    ), "Colocated async GRPO is unsupported for the desired generation backend."
+    ), "Colocated async GRPO is only supported for the Megatron generation backend."
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -4432,9 +4448,9 @@ def async_grpo_train(
                 processor=processor,
             )
             initial_val_metrics = val_metrics
-            # Colocated engine stays alive across steps (preserves KV cache).
-            if not colocated_inference:
-                policy_generation.finish_generation()
+            # A colocated engine keeps serving between phases (preserves its
+            # KV/prefix cache); the backend makes that call, not the loop.
+            policy_generation.finish_generation(for_training=False)
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
             if master_config.grpo.debug_payload_metrics:
@@ -4821,15 +4837,12 @@ def async_grpo_train(
                     train_data.to("cpu")
 
                 generation_logger_metrics = None
-                if colocated_inference:
+                if policy_generation.blocks_training():
                     print("⏸️ Pausing colocated engine + collector for training...")
                     with timer.time("exposed_generation"):
                         ray.get(trajectory_collector.prepare_for_refit.remote())
-                    if policy_generation is not None:
-                        generation_logger_metrics = (
-                            policy_generation.get_logger_metrics()
-                        )
-                    policy_generation.finish_generation()
+                    generation_logger_metrics = policy_generation.get_logger_metrics()
+                    policy_generation.finish_generation(for_training=True)
 
                 # Training phase (same as sync version)
                 skip_prev_logprobs, skip_reference_logprobs = (
@@ -5083,8 +5096,12 @@ def async_grpo_train(
                             logger=logger,
                             processor=processor,
                         )
-                        if not colocated_inference or will_save_checkpoint:
-                            policy_generation.finish_generation()
+                        # Save-bound steps need the GPUs for checkpointing,
+                        # so the engine must stand down; otherwise a colocated
+                        # engine keeps serving (backend's call).
+                        policy_generation.finish_generation(
+                            for_training=will_save_checkpoint
+                        )
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"
                         )

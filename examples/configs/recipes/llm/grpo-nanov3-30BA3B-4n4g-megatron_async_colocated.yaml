@@ -37,8 +37,6 @@ policy:
     enabled: false
   generation:
     backend: megatron
-    mcore_generation_config:
-      async_engine: true
 logger:
   log_dir: logs/grpo-nanov3-30BA3B-4n4g-megatron_async_colocated
   wandb_enabled: true

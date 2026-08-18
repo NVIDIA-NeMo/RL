@@ -23,6 +23,9 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.megatron.config import (
+    dedicated_inference_megatron_cfg,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.weight_sync.megatron_weight_synchronizer import (
@@ -384,16 +387,34 @@ async def test_megatron_policy_generation_async(cluster, test_input_data, tokeni
 @pytest.mark.mcore
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize(
-    "transformer_impl", ["transformer_engine", "inference_optimized"]
+    "train_impl, gen_impl",
+    [
+        ("transformer_engine", "transformer_engine"),
+        ("transformer_engine", "inference_optimized"),
+        ("inference_optimized", "inference_optimized"),
+    ],
 )
 def test_megatron_generation_colocated(
-    cluster, test_input_data, tokenizer, transformer_impl
+    cluster, test_input_data, tokenizer, train_impl, gen_impl
 ):
     """Colocated Megatron generation: wrap an existing training policy without owning it."""
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["colocated"]["enabled"] = True
-    config["generation"]["mcore_generation_config"]["expose_http_server"] = True
-    config["megatron_cfg"]["transformer_impl"] = transformer_impl
+    # Eager engine startup (expose_http_server) flips MLM's process-wide
+    # InferenceMode on at construction; the legs that train before any
+    # generate/suspend cycle must construct engine-less.
+    expose_http_server = (
+        train_impl == "transformer_engine" and gen_impl == "transformer_engine"
+    )
+    config["generation"]["mcore_generation_config"]["expose_http_server"] = (
+        expose_http_server
+    )
+    # Matched impls => reshardless colocated (shared model; the
+    # inference_optimized pair trains through the TE parent path); differing
+    # impls => the worker builds a dedicated resharded inference model on
+    # the shared GPUs.
+    config["megatron_cfg"]["transformer_impl"] = train_impl
+    config["generation"]["mcore_generation_config"]["transformer_impl"] = gen_impl
 
     # construction guard: exactly one of `cluster` / `policy` is required
     with pytest.raises(AssertionError):
@@ -415,14 +436,22 @@ def test_megatron_generation_colocated(
         assert "max_tokens" not in config["megatron_cfg"]
         assert config["megatron_cfg"] == megatron_cfg_before
 
-        # setup() hands dp_openai_server_base_urls to NeMo Gym right after
-        # construction, so the colocated constructor must have collected them.
-        assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
-        assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
+        # The selector: matched impls => reshardless (no dedicated model).
+        assert (dedicated_inference_megatron_cfg(config) is None) == (
+            train_impl == gen_impl
+        )
 
-        if transformer_impl == "inference_optimized":
-            # Dual-mode: the same shared model must run the trainable TE
-            # fallback (train step, finite loss) before fast-path generation.
+        if expose_http_server:
+            # setup() hands dp_openai_server_base_urls to NeMo Gym right after
+            # construction, so the colocated constructor must have collected them.
+            assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
+            assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
+
+        if gen_impl == "inference_optimized":
+            # Both inference_optimized legs take a train step (finite loss)
+            # before the engine ever starts; the reshard leg then generates
+            # on the dedicated model built at first wake, the matched-impl
+            # leg directly on the shared training model.
             torch.manual_seed(42)
             train_data = BatchedDataDict(
                 {
@@ -436,7 +465,7 @@ def test_megatron_generation_colocated(
             policy.prepare_for_training()
             loss = policy.train(train_data, SimpleLossFn())["loss"]
             assert not torch.isnan(loss).any() and not torch.isinf(loss).any(), (
-                f"dual-mode train step produced bad loss: {loss}"
+                f"pre-generation train step produced bad loss: {loss}"
             )
             policy.finish_training()
 
@@ -444,6 +473,36 @@ def test_megatron_generation_colocated(
         mg.prepare_for_generation()
         outputs = mg.generate(test_input_data, greedy=True)
         _assert_valid_generation_output(outputs, test_input_data)
+
+        if train_impl == "inference_optimized":
+            # 3490-review follow-up: bound token mult-prob error on the
+            # matched-impl leg — generation and recomputed policy logprobs
+            # run the same inference kernels on the same shared weights.
+            # Greedy must be off: processed logprobs are ~0 under top_k=1.
+            sampled = mg.generate(test_input_data, greedy=False)
+            fprop_data = BatchedDataDict(
+                {
+                    "input_ids": sampled["output_ids"],
+                    "input_lengths": sampled["unpadded_sequence_lengths"],
+                }
+            )
+            policy.prepare_for_lp_inference()
+            lp_logprobs = policy.get_logprobs(fprop_data)["logprobs"]
+            gen_mask = torch.zeros_like(sampled["logprobs"], dtype=torch.bool)
+            for i, (start, end) in enumerate(
+                zip(
+                    test_input_data["input_lengths"],
+                    sampled["unpadded_sequence_lengths"],
+                )
+            ):
+                gen_mask[i, start:end] = True
+            abs_diff = (sampled["logprobs"] - lp_logprobs).abs().masked_select(gen_mask)
+            avg_prob_mult_error = torch.exp(abs_diff).mean()
+            assert avg_prob_mult_error <= 1.05, (
+                f"matched-impl inference_optimized: generation logprobs "
+                f"diverge from policy logprobs (avg prob mult error "
+                f"{avg_prob_mult_error:.4f})"
+            )
 
         # ownership guard: shutdown is a no-op, so the wrapped policy keeps generating
         assert mg.shutdown() is True
