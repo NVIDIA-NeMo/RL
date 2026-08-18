@@ -221,11 +221,12 @@ uv venv</code></pre>
     <tr>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
         <strong>Run GRPO (DTensor)</strong>
-        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run python examples/run_grpo.py</code></pre>
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run python examples/run_grpo.py &#92;
+--config examples/configs/grpo_math_1B.yaml</code></pre>
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
         <strong>Run GRPO (Megatron)</strong>
-        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run examples/run_grpo.py &#92;
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run python examples/run_grpo.py &#92;
 --config examples/configs/grpo_math_1B_megatron.yaml</code></pre>
       </td>
     </tr>
