@@ -87,13 +87,10 @@ class EvalDataConfig(ResponseDatasetConfig):
         include_single_letter_instruction: Daily-Omni only. Set to false so the
             eval ``prompt_file`` dictates answer formatting instead of the
             training-only single-letter instruction.
+        language: MMLU language code such as ``"EN-US"`` or ``"ZH-CN"``.
     """
 
     max_input_seq_length: int
     repeat: NotRequired[int]
     include_single_letter_instruction: NotRequired[bool]
-
-
-# Backward-compatible public alias for downstream imports. Internal code should
-# use EvalDataConfig directly.
-EvalDataConfigType = EvalDataConfig
+    language: NotRequired[str]

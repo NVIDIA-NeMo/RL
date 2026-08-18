@@ -23,8 +23,6 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class GPQADataset(RawDataset):
-    default_processor = "multichoice_qa_processor"
-
     def __init__(
         self,
         variant: Literal["diamond", "main"] = "diamond",
@@ -36,12 +34,12 @@ class GPQADataset(RawDataset):
 
         dataset = load_dataset("Idavidrein/gpqa", f"gpqa_{variant}", split="train")
         self.dataset = dataset.map(
-            self._rekey,
+            self.format_data,
             remove_columns=dataset.column_names,
         )
         self.val_dataset = None
 
-    def _rekey(self, data: dict[str, Any]) -> dict[str, Any]:
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         choices = [
             data["Correct Answer"],
             data["Incorrect Answer 1"],

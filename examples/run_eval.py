@@ -26,6 +26,7 @@ from nemo_rl.data.datasets import (
     AllTaskProcessedDataset,
     is_multimodal_response_dataset,
     load_response_dataset,
+    validate_eval_data_config,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.utils import create_env
@@ -93,6 +94,7 @@ def main():
         config = OmegaConf.merge(config, override_conf)
 
     config = OmegaConf.to_container(config, resolve=True)
+    validate_eval_data_config(config["data"])
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 

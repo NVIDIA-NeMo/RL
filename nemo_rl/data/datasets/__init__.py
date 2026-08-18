@@ -17,6 +17,7 @@ from nemo_rl.data.datasets.processed_dataset import AllTaskProcessedDataset
 from nemo_rl.data.datasets.response_datasets import (
     is_multimodal_response_dataset,
     load_response_dataset,
+    validate_eval_data_config,
 )
 from nemo_rl.data.datasets.utils import (
     assert_no_double_bos,
@@ -30,6 +31,7 @@ __all__ = [
     "load_preference_dataset",
     "load_response_dataset",
     "is_multimodal_response_dataset",
+    "validate_eval_data_config",
     "assert_no_double_bos",
     "extract_necessary_env_names",
     "merge_datasets",

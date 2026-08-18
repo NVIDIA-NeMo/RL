@@ -109,10 +109,10 @@ score=0.1000 (3.0/30)
 - [AIME-2024, AIME-2025, and AIME-2026](../../nemo_rl/data/datasets/response_datasets/aime.py): the corresponding `data.dataset_name` values are `"AIME2024"`, `"AIME2025"`, and `"AIME2026"`.
 - [GPQA and GPQA-diamond](../../nemo_rl/data/datasets/response_datasets/gpqa.py): the corresponding `data.dataset_name` values are `"gpqa"` and `"gpqa_diamond"`.
 - [MATH and MATH-500](../../nemo_rl/data/datasets/response_datasets/math.py): the corresponding `data.dataset_name` values are `"math"` and `"math500"`.
-- [MMLU](../../nemo_rl/data/datasets/response_datasets/mmlu.py): this also includes MMMLU (Multilingual MMLU). When `data.dataset_name` is set to `mmlu`, the English version is used. For another language, set `data.dataset_name` to `mmlu_{language}`, where `language` is one of `["AR-XY", "BN-BD", "DE-DE", "EN-US", "ES-LA", "FR-FR", "HI-IN", "ID-ID", "IT-IT", "JA-JP", "KO-KR", "PT-BR", "ZH-CN", "SW-KE", "YO-NG"]`.
+- [MMLU](../../nemo_rl/data/datasets/response_datasets/mmlu.py): this also includes MMMLU (Multilingual MMLU). Keep `data.dataset_name` set to `mmlu` and select another language with `data.language`, which accepts one of `["AR-XY", "BN-BD", "DE-DE", "EN-US", "ES-LA", "FR-FR", "HI-IN", "ID-ID", "IT-IT", "JA-JP", "KO-KR", "PT-BR", "ZH-CN", "SW-KE", "YO-NG"]`. It defaults to `"EN-US"`.
 - [MMLU-Pro](../../nemo_rl/data/datasets/response_datasets/mmlu_pro.py): the corresponding `data.dataset_name` is `"mmlu_pro"`.
 - [MMAU](../../nemo_rl/data/datasets/response_datasets/mmau.py): the corresponding `data.dataset_name` values are `"mmau"` and `"TwinkStart/MMAU"`.
 - [Daily-Omni](../../nemo_rl/data/datasets/response_datasets/daily_omni.py): the corresponding `data.dataset_name` is `"daily-omni"`.
 
 Evaluation and training use the same response dataset registry. More details can be found in [load_response_dataset](../../nemo_rl/data/datasets/response_datasets/__init__.py).
-Each built-in dataset selects its default data processor, so custom eval configs do not need to duplicate the `processor` field. Set it explicitly only when intentionally overriding that default.
+Evaluation configs set `data.processor` explicitly so this migration does not change the processor defaults used by training datasets.

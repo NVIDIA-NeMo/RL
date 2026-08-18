@@ -40,8 +40,6 @@ MMLULanguage = Literal[
 
 
 class MMLUDataset(RawDataset):
-    default_processor = "multichoice_qa_processor"
-
     def __init__(self, language: MMLULanguage = "EN-US", **kwargs):
         self.task_name = f"MMLU_{language}"
 

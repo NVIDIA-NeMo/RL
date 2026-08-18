@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
 from functools import partial
 
 from nemo_rl.data import ResponseDatasetConfig
@@ -64,6 +65,22 @@ from nemo_rl.data.datasets.utils import (
     warn_on_unsupported_dataset_config_keys,
 )
 
+MULTIMODAL_DATASETS = {
+    "audiomcq",
+    "avqa",
+    "clevr-cogent",
+    "daily-omni",
+    "geometry3k",
+    "intent-bench",
+    "intent-train",
+    "mmau",
+    "TwinkStart/MMAU",
+    "mmpr-tiny",
+    "refcoco",
+}
+
+LEGACY_EVAL_DATA_KEYS = frozenset({"file_format", "problem_key", "solution_key"})
+
 DATASET_REGISTRY = {
     # built-in datasets
     "audiomcq": AudioMCQDataset,
@@ -87,22 +104,7 @@ DATASET_REGISTRY = {
     "math500": partial(MathDataset, variant="math_500_test"),
     "mmau": MMAUDataset,
     "TwinkStart/MMAU": MMAUDataset,
-    "mmlu": partial(MMLUDataset, language="EN-US"),
-    "mmlu_AR-XY": partial(MMLUDataset, language="AR-XY"),
-    "mmlu_BN-BD": partial(MMLUDataset, language="BN-BD"),
-    "mmlu_DE-DE": partial(MMLUDataset, language="DE-DE"),
-    "mmlu_EN-US": partial(MMLUDataset, language="EN-US"),
-    "mmlu_ES-LA": partial(MMLUDataset, language="ES-LA"),
-    "mmlu_FR-FR": partial(MMLUDataset, language="FR-FR"),
-    "mmlu_HI-IN": partial(MMLUDataset, language="HI-IN"),
-    "mmlu_ID-ID": partial(MMLUDataset, language="ID-ID"),
-    "mmlu_IT-IT": partial(MMLUDataset, language="IT-IT"),
-    "mmlu_JA-JP": partial(MMLUDataset, language="JA-JP"),
-    "mmlu_KO-KR": partial(MMLUDataset, language="KO-KR"),
-    "mmlu_PT-BR": partial(MMLUDataset, language="PT-BR"),
-    "mmlu_ZH-CN": partial(MMLUDataset, language="ZH-CN"),
-    "mmlu_SW-KE": partial(MMLUDataset, language="SW-KE"),
-    "mmlu_YO-NG": partial(MMLUDataset, language="YO-NG"),
+    "mmlu": MMLUDataset,
     "mmlu_pro": MMLUProDataset,
     "HelpSteer3": HelpSteer3Dataset,
     "intent-train": IntentTrainDataset,
@@ -139,19 +141,19 @@ def _resolve_response_dataset_factory(dataset_name: str):
 
 
 def is_multimodal_response_dataset(dataset_name: str) -> bool:
-    """Return whether a response dataset requires a multimodal processor.
+    """Return whether a built-in response dataset is multimodal."""
+    return dataset_name in MULTIMODAL_DATASETS
 
-    Built-in and external dataset classes declare this capability through the
-    ``RawDataset.is_multimodal`` class attribute. For a ``partial`` registry
-    entry, the capability is read from the underlying dataset class.
-    """
-    dataset_factory = _resolve_response_dataset_factory(dataset_name)
-    dataset_type = (
-        dataset_factory.func
-        if isinstance(dataset_factory, partial)
-        else dataset_factory
+
+def validate_eval_data_config(data_config: Mapping[str, object]) -> None:
+    """Reject the legacy local-eval keys with an actionable migration message."""
+    legacy_keys = sorted(LEGACY_EVAL_DATA_KEYS.intersection(data_config))
+    assert not legacy_keys, (
+        f"Legacy evaluation data keys are no longer supported: {legacy_keys}. "
+        "Use data.dataset_name=ResponseDataset together with data.data_path, "
+        "data.input_key, and data.output_key. See the migration guide in "
+        "https://github.com/NVIDIA-NeMo/RL/pull/3039."
     )
-    return bool(getattr(dataset_type, "is_multimodal", False))
 
 
 def load_response_dataset(data_config: ResponseDatasetConfig):
@@ -167,6 +169,7 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
        without editing ``nemo_rl``.
     3. Otherwise, raise ``ValueError`` with a helpful message.
     """
+    validate_eval_data_config(data_config)
     dataset_name = data_config["dataset_name"]
 
     dataset_class = _resolve_response_dataset_factory(dataset_name)
@@ -206,6 +209,7 @@ __all__ = [
     "IntentBenchDataset",
     "IntentTrainDataset",
     "MathDataset",
+    "MULTIMODAL_DATASETS",
     "MMAUDataset",
     "MMPRTinyDataset",
     "MMLUDataset",
@@ -223,4 +227,5 @@ __all__ = [
     "Tulu3SftMixtureDataset",
     "is_multimodal_response_dataset",
     "load_response_dataset",
+    "validate_eval_data_config",
 ]

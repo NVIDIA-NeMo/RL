@@ -2,4 +2,5 @@
 defaults: "mmlu.yaml"
 
 data:
-  dataset_name: "mmlu_ZH-CN"
+  dataset_name: "mmlu"
+  language: "ZH-CN"

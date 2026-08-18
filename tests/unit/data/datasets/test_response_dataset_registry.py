@@ -39,6 +39,7 @@ from nemo_rl.data.datasets.response_datasets import (
     DATASET_REGISTRY as RESPONSE_REGISTRY,
 )
 from nemo_rl.data.datasets.response_datasets import (
+    MULTIMODAL_DATASETS,
     is_multimodal_response_dataset,
     load_response_dataset,
 )
@@ -46,7 +47,6 @@ from nemo_rl.data.datasets.utils import (
     resolve_external_dataset_class,
     warn_on_unsupported_dataset_config_keys,
 )
-from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
 class _StubResponseDataset:
@@ -143,7 +143,6 @@ def test_eval_datasets_are_available_from_response_registry():
         "math",
         "math500",
         "mmlu",
-        "mmlu_ZH-CN",
         "mmlu_pro",
         "mmau",
         "TwinkStart/MMAU",
@@ -152,18 +151,12 @@ def test_eval_datasets_are_available_from_response_registry():
     assert expected_names <= RESPONSE_REGISTRY.keys()
 
 
-@pytest.mark.parametrize("dataset_name", sorted(RESPONSE_REGISTRY))
-def test_every_registry_entry_declares_valid_capabilities(dataset_name):
-    factory = RESPONSE_REGISTRY[dataset_name]
-    dataset_cls = factory.func if isinstance(factory, functools.partial) else factory
-
-    assert dataset_cls.default_processor in PROCESSOR_REGISTRY, (
-        f"{dataset_name} -> {dataset_cls.__name__} declares "
-        f"default_processor={dataset_cls.default_processor!r} not in "
-        "PROCESSOR_REGISTRY"
-    )
-    assert isinstance(dataset_cls.is_multimodal, bool)
-    assert is_multimodal_response_dataset(dataset_name) is dataset_cls.is_multimodal
+def test_multimodal_dataset_names_are_centralized():
+    assert MULTIMODAL_DATASETS <= RESPONSE_REGISTRY.keys()
+    for dataset_name in RESPONSE_REGISTRY:
+        assert is_multimodal_response_dataset(dataset_name) is (
+            dataset_name in MULTIMODAL_DATASETS
+        )
 
 
 @pytest.mark.parametrize("name", ["aime2024", "aime2025", "aime2026"])
