@@ -24,7 +24,7 @@ import ray
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG, ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.experience.row_dump import maybe_dump_train_rows
@@ -765,7 +765,6 @@ class TQReplayBuffer:
                 fields=fields,
                 tags=tags,
             )
-
             # mirrors kv_first_write
             lengths = train_batch["input_lengths"]
             meta = KVBatchMeta(
@@ -862,6 +861,30 @@ class TQReplayBuffer:
                 f"TQReplayBuffer.commit_finalized: group {group_id} has no "
                 "live slot (evicted or never reserved)"
             ) from None
+        tagged_plans = [
+            tag[ROUTE_PLAN_TAG] for tag in (meta.tags or []) if ROUTE_PLAN_TAG in tag
+        ]
+        if tagged_plans:
+            if len(tagged_plans) != len(meta.sample_ids):
+                raise ValueError(
+                    "commit_finalized received mixed deferred/direct route plans"
+                )
+            from nemo_rl.experience.route_plan import decode_route_plan
+
+            plan_cleanup_keys = {
+                key
+                for encoded in tagged_plans
+                for key in decode_route_plan(encoded).cleanup_staging_keys
+            }
+            provided_staging_keys = list(staging_keys or [])
+            if len(provided_staging_keys) != len(set(provided_staging_keys)):
+                raise ValueError("commit_finalized staging_keys contains duplicates")
+            if set(provided_staging_keys) != plan_cleanup_keys:
+                raise ValueError(
+                    "commit_finalized staging ownership does not match route plans: "
+                    f"provided={sorted(provided_staging_keys)!r}, "
+                    f"planned={sorted(plan_cleanup_keys)!r}"
+                )
         self.meta_list[idx] = meta
         self.start_weight_list[idx] = group_min_wv
         self.end_weight_list[idx] = group_max_wv
@@ -875,9 +898,10 @@ class TQReplayBuffer:
         """Drop an unready slot whose dispatch failed or was cancelled.
 
         Token-capture mode; called from the failed dispatch path.
-        No DataPlane rows are cleared: an unready slot published no canonical
-        rows, and its staged deltas (keys unknown before a receipt) are swept
-        by the staging TTL backstop.
+        No DataPlane rows are cleared here. Callers with sealed receipts must
+        clear their deterministic canonical IDs and full staging manifests
+        before dropping this ownership record. Before receipt sealing, orphan
+        cleanup remains an explicit controlled-validation limitation.
 
         Returns:
             True when a slot was dropped; False when the group_id has no
@@ -935,20 +959,38 @@ class TQReplayBuffer:
             staging_keys = self._staging_keys_list[i]
             if staging_keys:
                 dropped_staging_keys.extend(staging_keys)
-            self._delete_slot(i)
 
         if remove_in_dp:
-            await self._call_dp(
-                "clear_samples",
-                sample_ids=dropped_sample_ids,
-                partition_id=self._partition_id,
-            )
+            if dropped_sample_ids:
+                try:
+                    await self._call_dp(
+                        "clear_samples",
+                        sample_ids=dropped_sample_ids,
+                        partition_id=self._partition_id,
+                    )
+                except Exception as error:
+                    raise RuntimeError(
+                        "canonical cleanup failed; retained replay-buffer ownership "
+                        f"partition={self._partition_id!r}, "
+                        f"sample_ids={dropped_sample_ids!r}"
+                    ) from error
             if dropped_staging_keys and self._staging_partition_id is not None:
-                await self._call_dp(
-                    "clear_samples",
-                    sample_ids=dropped_staging_keys,
-                    partition_id=self._staging_partition_id,
-                )
+                try:
+                    await self._call_dp(
+                        "clear_samples",
+                        sample_ids=dropped_staging_keys,
+                        partition_id=self._staging_partition_id,
+                    )
+                except Exception as error:
+                    raise RuntimeError(
+                        "staging cleanup failed; retained replay-buffer ownership "
+                        f"partition={self._staging_partition_id!r}, "
+                        f"staging_keys={dropped_staging_keys!r}; canonical rows "
+                        "may already be cleared"
+                    ) from error
+
+        for i in drop_idxs:
+            self._delete_slot(i)
 
         return len(drop_idxs)
 

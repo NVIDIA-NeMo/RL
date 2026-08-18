@@ -27,6 +27,9 @@ rebuild semantics to Gym's staging package.
 
 from __future__ import annotations
 
+from collections import Counter
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -41,8 +44,15 @@ from nemo_gym.token_id_capture.staging.conformance.kit import (  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     STAGING_FIELDS,
     TQTokenSink,
+    TQTokenSource,
 )
+from nemo_rl.data_plane.schema import (  # noqa: E402
+    ROUTE_PASSTHROUGH_FLAG,
+    ROUTE_PLAN_TAG,
+)
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
 from nemo_rl.experience.blackbox_finalizer import BlackboxFinalizer  # noqa: E402
+from nemo_rl.experience.route_plan import decode_route_plan  # noqa: E402
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -403,3 +413,155 @@ def test_finalize_group_router_replay_without_routes_fails_loudly(
             [1.0],
             fallback_weight_version=9,
         )
+
+
+# ---------------------------------------------------------------------------
+# Deferred router replay: canonical small rows + strict plans, worker assembly
+# ---------------------------------------------------------------------------
+
+_R3_DEFERRED_PARTITION = "rollout_data_fin_r3_deferred_test"
+_R3_DEFERRED_STAGING = "rollout_staging_fin_r3_deferred_test"
+
+
+@pytest.fixture()
+def r3_deferred_partitions(tq_client):
+    from nemo_rl.data_plane.tq_token_sink import ROUTED_EXPERTS_FIELD
+
+    tq_client.register_partition(
+        partition_id=_R3_DEFERRED_STAGING,
+        fields=list(STAGING_FIELDS) + [ROUTED_EXPERTS_FIELD],
+        num_samples=64,
+        consumer_tasks=["finalize", "prev_lp", "train"],
+    )
+    tq_client.register_partition(
+        partition_id=_R3_DEFERRED_PARTITION,
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "generation_logprobs",
+            "token_mask",
+            "sample_mask",
+            "prompt_ids_for_adv",
+            "total_reward",
+        ],
+        num_samples=64,
+        consumer_tasks=["train"],
+    )
+    yield
+    tq_client.clear_samples(sample_ids=None, partition_id=_R3_DEFERRED_STAGING)
+    tq_client.clear_samples(sample_ids=None, partition_id=_R3_DEFERRED_PARTITION)
+
+
+def _stage_deferred_fixture(tq_client, *, rollout_id: str):
+    fixture = dict(load_fixture("worked_example"))
+    fixture["rollout_id"] = rollout_id
+    records, _, receipt, row = build_fixture_artifacts(fixture)
+    sink = TQTokenSink(tq_client, staging_partition=_R3_DEFERRED_STAGING)
+    routes_by_call = {}
+    for idx, record in enumerate(records):
+        routes = _routes_for_delta(idx, len(record.token_ids_delta))
+        routes_by_call[record.call_id] = routes
+        staged = record.model_copy(update={"extras": {"routed_experts": routes}})
+        assert sink.stage(staged).ok
+    return receipt.model_dump(), row, routes_by_call
+
+
+class _DeferredRouteWorker(TQWorkerMixin):
+    def __init__(self, client):
+        self._dp_client = client
+        self._route_fallback_counts = Counter()
+
+    def _routed_experts_dimensions(self) -> tuple[int, int]:
+        return 2, 2
+
+
+def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
+    tq_client, r3_deferred_partitions
+):
+    group_id = "grpr3deferred"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, expected, routes_by_call = _stage_deferred_fixture(
+        tq_client, rollout_id=rollout_ids[0]
+    )
+    finalizer = BlackboxFinalizer(
+        tq_client,
+        partition_id=_R3_DEFERRED_PARTITION,
+        staging_partition=_R3_DEFERRED_STAGING,
+        pad_token_id=PAD,
+        mixed_weight_version_policy="allow",
+        min_valid_fraction_per_group=None,
+        router_replay_enabled=True,
+        defer_routed_experts_to_policy=True,
+    )
+
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],
+        [1.0, 0.0],
+        fallback_weight_version=9,
+    )
+
+    assert finalized.meta is not None
+    assert "routed_experts" not in finalized.meta.fields
+    assert len(finalized.staging_keys) == len(receipt["manifest"])
+    plans = [decode_route_plan(tag[ROUTE_PLAN_TAG]) for tag in finalized.meta.tags]
+    assert plans[0].expected_token_length == len(expected.token_ids)
+    assert set(plans[0].cleanup_staging_keys) == set(finalized.staging_keys)
+    assert not plans[1].spans
+    # Deferred finalization deliberately retains staging through consumption.
+    source = TQTokenSource(tq_client, staging_partition=_R3_DEFERRED_STAGING)
+    assert len(source.fetch_for_finalization(finalized.staging_keys)) == len(
+        finalized.staging_keys
+    )
+
+    worker_meta = replace(
+        finalized.meta,
+        extra_info={ROUTE_PASSTHROUGH_FLAG: True},
+        task_name="train",
+    )
+    materialized = _DeferredRouteWorker(tq_client)._fetch(
+        worker_meta,
+        dp_aligned_seq_len=False,
+    )
+    expected_routes = [
+        route for call_id in expected.call_ids for route in routes_by_call[call_id]
+    ]
+    valid_len = len(expected.token_ids)
+    assert materialized["routed_experts"][0, :valid_len].tolist() == expected_routes
+    assert bool(materialized["routed_experts"][1].eq(-1).all())
+
+
+@pytest.mark.parametrize("bad_routed_len", [-1, 999])
+def test_deferred_finalizer_rejects_invalid_routed_len(
+    tq_client, r3_deferred_partitions, bad_routed_len
+):
+    from dataclasses import replace as dataclass_replace
+
+    rollout_id = "bad_route_len_g0"
+    receipt, _, _ = _stage_deferred_fixture(tq_client, rollout_id=rollout_id)
+    finalizer = BlackboxFinalizer(
+        tq_client,
+        partition_id=_R3_DEFERRED_PARTITION,
+        staging_partition=_R3_DEFERRED_STAGING,
+        pad_token_id=PAD,
+        mixed_weight_version_policy="allow",
+        min_valid_fraction_per_group=None,
+        router_replay_enabled=True,
+        defer_routed_experts_to_policy=True,
+    )
+    fetched = finalizer._source.fetch_for_finalization(
+        [record["staging_key"] for record in receipt["manifest"]]
+    )
+    fetched[0] = dataclass_replace(fetched[0], routed_len=bad_routed_len)
+
+    class _InjectedSource:
+        def fetch_for_finalization(self, staging_keys):
+            del staging_keys
+            return fetched
+
+    finalizer._source = _InjectedSource()
+    row = finalizer.finalize_rollout(rollout_id, receipt, reward=0.0)
+
+    assert not row.valid
+    assert (row.rejection_reason or "").startswith("routed_len_mismatch")

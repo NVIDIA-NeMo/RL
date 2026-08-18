@@ -122,6 +122,18 @@ def _global_moe_layer_numbers(model_config: Any) -> list[int]:
     return [layer_idx + 1 for layer_idx, is_moe in enumerate(pattern) if is_moe]
 
 
+def router_replay_dimensions(model_config: Any) -> tuple[int, int]:
+    """Return model-owned ``(num_moe_layers, top_k)`` route dimensions."""
+    num_moe_layers = len(_global_moe_layer_numbers(model_config))
+    top_k = int(getattr(model_config, "moe_router_topk"))
+    if num_moe_layers <= 0 or top_k <= 0:
+        raise ValueError(
+            "router replay requires positive route dimensions, got "
+            f"num_moe_layers={num_moe_layers}, top_k={top_k}"
+        )
+    return num_moe_layers, top_k
+
+
 def _router_replay_instances_for_model(model: Any) -> list[tuple[Any, int]]:
     instances: list[tuple[Any, int]] = []
     seen: set[int] = set()

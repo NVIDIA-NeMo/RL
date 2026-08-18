@@ -24,20 +24,32 @@ shape survives; validity folds into ``sample_mask`` (no new train field) and
 placeholders copy ``prompt_ids_for_adv`` from a valid sibling so per-prompt
 baselines stay well-formed.
 
-The finalizer is the only reader of the staging partition and clears a
-group's staged rows after its canonical rows are durably published.
+In deferred-route mode the finalizer reads only small columns, publishes a
+strict route plan beside each canonical row, and leaves staged route fragments
+live until policy consumption completes. The direct-route rollback path keeps
+the prior finalizer-side materialization behavior.
 """
 
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+from nemo_rl.experience.route_plan import (
+    ROUTE_PLAN_SCHEMA_VERSION,
+    RouteAssemblyPlan,
+    RouteSpan,
+    classify_route_span,
+    encode_route_plan,
+    encoded_route_plan_size_bytes,
+)
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.row_dump import maybe_dump_train_rows
 from nemo_rl.models.generation.interfaces import (
@@ -63,6 +75,7 @@ class FinalizedRollout:
     # Router replay (R3): [len(token_ids)][num_moe_layers][topk] from the
     # rebuilt chain; None when the rollout staged no extras.
     routed_experts: Optional[list] = None
+    route_plan: Optional[RouteAssemblyPlan] = None
 
 
 @dataclass
@@ -92,6 +105,7 @@ class BlackboxFinalizer:
         mixed_weight_version_policy: str,
         min_valid_fraction_per_group: Optional[float],
         router_replay_enabled: bool = False,
+        defer_routed_experts_to_policy: bool = False,
     ) -> None:
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -99,6 +113,12 @@ class BlackboxFinalizer:
         self._mixed_weight_version_policy = mixed_weight_version_policy
         self._min_valid_fraction = min_valid_fraction_per_group
         self._router_replay_enabled = router_replay_enabled
+        self._defer_routed_experts_to_policy = defer_routed_experts_to_policy
+        if self._defer_routed_experts_to_policy and not self._router_replay_enabled:
+            raise ValueError(
+                "defer_routed_experts_to_policy requires router replay to be enabled"
+            )
+        self._staging_partition = staging_partition
         # (num_moe_layers, topk), learned from the first rebuilt row that
         # carries routes; placeholder-only groups need it to shape their
         # sentinel tensors consistently with the model.
@@ -152,11 +172,42 @@ class BlackboxFinalizer:
             return rejected("capture_poisoned", staging_keys)
         if not parsed.manifest:
             return rejected("empty_manifest", staging_keys)
+        if len(set(staging_keys)) != len(staging_keys):
+            return rejected(
+                "duplicate_staging_key",
+                list(dict.fromkeys(staging_keys)),
+            )
+        records_by_call = {record.call_id: record for record in parsed.manifest}
+        if len(records_by_call) != len(parsed.manifest):
+            return rejected("duplicate_manifest_call_id", staging_keys)
 
         try:
-            snapshots = self._source.fetch(staging_keys)
+            fetched = (
+                self._source.fetch_for_finalization(staging_keys)
+                if self._defer_routed_experts_to_policy
+                else None
+            )
+            snapshots = (
+                [item.snapshot for item in fetched]
+                if fetched is not None
+                else self._source.fetch(staging_keys)
+            )
         except KeyError as error:
             return rejected(f"missing_staging_row:{error}", staging_keys)
+        except (TypeError, ValueError) as error:
+            return rejected(f"invalid_staging_row:{error}", staging_keys)
+        fetched_by_call = {}
+        if fetched is not None:
+            for record, item in zip(parsed.manifest, fetched):
+                if item.staging_key != record.staging_key:
+                    return rejected(
+                        f"staging_key_mismatch:{record.call_id}", staging_keys
+                    )
+                if item.snapshot.call_id != record.call_id:
+                    return rejected(f"call_id_mismatch:{record.call_id}", staging_keys)
+                fetched_by_call[record.call_id] = item
+            if len(fetched_by_call) != len(fetched):
+                return rejected("duplicate_fetched_call_id", staging_keys)
 
         for record, snapshot in zip(parsed.manifest, snapshots):
             if not (
@@ -204,11 +255,56 @@ class BlackboxFinalizer:
             )
         except (RebuildError, NotImplementedError) as error:
             return rejected(f"rebuild_failed:{error}", staging_keys)
-
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
         if self._mixed_weight_version_policy == "reject" and min_wv != max_wv:
             return rejected(f"mixed_weight_versions:{min_wv}..{max_wv}", staging_keys)
+
+        route_plan = None
+        if self._router_replay_enabled and self._defer_routed_experts_to_policy:
+            link_spans = row.link_spans
+            if link_spans is None:
+                return rejected("missing_link_spans", staging_keys)
+            route_spans: list[RouteSpan] = []
+            seen_span_call_ids: set[str] = set()
+            for call_id, carry_len, generation_len in link_spans:
+                if call_id in seen_span_call_ids:
+                    return rejected(f"duplicate_route_span:{call_id}", staging_keys)
+                seen_span_call_ids.add(call_id)
+                record = records_by_call.get(call_id)
+                item = fetched_by_call.get(call_id)
+                if record is None or item is None:
+                    return rejected(f"route_span_identity:{call_id}", staging_keys)
+                if item.routed_len not in (0, record.delta_len):
+                    return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
+                if generation_len < 0 or generation_len > record.delta_len:
+                    return rejected(
+                        f"route_generation_span_mismatch:{call_id}", staging_keys
+                    )
+                if carry_len < 0:
+                    return rejected(
+                        f"route_carry_span_mismatch:{call_id}", staging_keys
+                    )
+                span = RouteSpan(
+                    staging_key=record.staging_key,
+                    carry_len=int(carry_len),
+                    generation_len=int(generation_len),
+                    staged_route_len=item.routed_len,
+                )
+                classify_route_span(span)
+                route_spans.append(span)
+            if sum(span.carry_len + span.generation_len for span in route_spans) != len(
+                row.token_ids
+            ):
+                return rejected("route_span_length_mismatch", staging_keys)
+            route_plan = RouteAssemblyPlan(
+                schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+                staging_partition=self._staging_partition,
+                spans=tuple(route_spans),
+                cleanup_staging_keys=tuple(staging_keys),
+                expected_token_length=len(row.token_ids),
+            )
+            encode_route_plan(route_plan)
 
         return FinalizedRollout(
             rollout_id=rollout_id,
@@ -224,7 +320,12 @@ class BlackboxFinalizer:
             max_wv=max_wv,
             # getattr: pre-R3 Gym pins' LinearizedRow has no routed_experts;
             # capture-R3 then degrades to the sentinel/group-drop path.
-            routed_experts=getattr(row, "routed_experts", None),
+            routed_experts=(
+                None
+                if self._defer_routed_experts_to_policy
+                else getattr(row, "routed_experts", None)
+            ),
+            route_plan=route_plan,
         )
 
     # ── per group ───────────────────────────────────────────────────────────
@@ -248,10 +349,12 @@ class BlackboxFinalizer:
         assert len(rollout_ids) == len(receipts) == len(rewards), (
             "rollout_ids, receipts, and rewards must be parallel"
         )
+        _group_t0 = time.perf_counter()
         rows = [
             self.finalize_rollout(rollout_id, receipt, reward=reward)
             for rollout_id, receipt, reward in zip(rollout_ids, receipts, rewards)
         ]
+        _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
         valid_rows = [row for row in rows if row.valid]
         staging_keys = [key for row in rows for key in row.staging_keys]
         metrics = {
@@ -291,6 +394,7 @@ class BlackboxFinalizer:
                 dropped=True,
             )
 
+        _tensorize_t0 = time.perf_counter()
         # Placeholders borrow a valid sibling's prompt ids so per-prompt
         # baselines group correctly; an all-placeholder group uses a single
         # pad token (its rows all carry sample_mask 0 and never train).
@@ -326,9 +430,9 @@ class BlackboxFinalizer:
             "prompt_ids_for_adv": prompt_ids_for_adv,
             "total_reward": rewards_t,
         }
-        if self._router_replay_enabled:
+        if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
             has_routed_row = any(r.valid and r.routed_experts for r in rows)
-            if not has_routed_row and self._routed_dims is None:
+            if not has_routed_row and self._routed_dims is None and not valid_rows:
                 # Nothing to learn (L, K) from yet — e.g. an all-poisoned
                 # group before the first healthy rollout. Dropping loses no
                 # training signal (no valid rows or routes) and keeps the
@@ -355,6 +459,32 @@ class BlackboxFinalizer:
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=group_min_wv, group_id=group_id
         )
+        if self._defer_routed_experts_to_policy:
+            encoded_sizes = 0
+            span_count = 0
+            for tag, row, expected_length in zip(tags, rows, seq_lens):
+                plan = row.route_plan
+                if plan is None:
+                    plan = RouteAssemblyPlan(
+                        schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+                        staging_partition=self._staging_partition,
+                        spans=(),
+                        cleanup_staging_keys=tuple(row.staging_keys),
+                        expected_token_length=expected_length,
+                    )
+                encoded = encode_route_plan(plan)
+                tag[ROUTE_PLAN_TAG] = encoded
+                encoded_sizes += encoded_route_plan_size_bytes(plan)
+                span_count += len(plan.spans)
+            metrics["finalize/route_plan_span_count"] = float(span_count)
+            metrics["finalize/route_plan_encoded_bytes"] = float(encoded_sizes)
+            valid_route_rows = sum(
+                1 for row in valid_rows if row.route_plan and row.route_plan.spans
+            )
+            if valid_rows:
+                metrics["finalize/routed_experts_row_coverage"] = (
+                    valid_route_rows / len(valid_rows)
+                )
         maybe_dump_train_rows(
             source="finalizer",
             group_id=group_id,
@@ -366,6 +496,8 @@ class BlackboxFinalizer:
             "canonical sample ids must equal the gate-registered rollout ids: "
             f"{sample_ids} != {rollout_ids}"
         )
+        _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
+        _put_t0 = time.perf_counter()
         self._call_dp(
             "put_samples",
             sample_ids=sample_ids,
@@ -373,8 +505,19 @@ class BlackboxFinalizer:
             fields=fields,
             tags=tags,
         )
-        self._clear_staging(staging_keys)
-
+        _put_ms = (time.perf_counter() - _put_t0) * 1000.0
+        _clear_ms = 0.0
+        if not self._defer_routed_experts_to_policy:
+            _clear_t0 = time.perf_counter()
+            self._clear_staging(staging_keys)
+            _clear_ms = (time.perf_counter() - _clear_t0) * 1000.0
+        # Per-step W&B breakdown of training-row assembly (capture arm) rides
+        # FinalizedGroup.metrics into the controller's rollout metrics.
+        metrics["row_assembly/rollouts_ms"] = _rollouts_ms
+        metrics["row_assembly/tensorize_ms"] = _tensorize_ms
+        metrics["row_assembly/tq_put_ms"] = _put_ms
+        if not self._defer_routed_experts_to_policy:
+            metrics["row_assembly/clear_staging_ms"] = _clear_ms
         meta = KVBatchMeta(
             partition_id=self._partition_id,
             task_name="train",
@@ -387,8 +530,7 @@ class BlackboxFinalizer:
             meta=meta,
             group_min_wv=group_min_wv,
             group_max_wv=group_max_wv,
-            # Already cleared; nothing left for eviction to clear.
-            staging_keys=[],
+            staging_keys=(staging_keys if self._defer_routed_experts_to_policy else []),
             metrics=metrics,
         )
 
@@ -469,11 +611,11 @@ class BlackboxFinalizer:
             return
         try:
             self._staging.clear(staging_keys)
-        except Exception as error:  # noqa: BLE001 — cleanup must not fail the group; TTL sweeps leftovers
-            print(
-                f"  finalize: staging clear failed ({error}); TTL will sweep",
-                flush=True,
-            )
+        except Exception as error:
+            raise RuntimeError(
+                "finalizer staging cleanup failed for known keys "
+                f"partition={self._staging_partition!r}, keys={staging_keys!r}"
+            ) from error
 
     def _call_dp(self, method_name: str, **kwargs: Any) -> Any:
         import ray

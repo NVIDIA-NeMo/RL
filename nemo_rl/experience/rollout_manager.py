@@ -16,7 +16,7 @@ import asyncio
 import copy
 import json
 import uuid
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -43,6 +43,9 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+if TYPE_CHECKING:
+    from nemo_rl.experience.finalizer_actor import FinalizationRequest
 
 
 class AsyncRolloutImpl:
@@ -840,7 +843,11 @@ class RolloutManager:
             "generate_and_push requires tq_buffer to be set at __init__"
         )
         if self._finalizer is not None:
-            await self._generate_and_finalize(input_sample, target_step=target_step)
+            await self._generate_and_finalize(
+                input_sample,
+                target_step=target_step,
+                inflight_registry=inflight_registry,
+            )
             return
         start_version = self._weight_version
         group_id = self._tq_buffer.reserve(
@@ -877,7 +884,11 @@ class RolloutManager:
             raise
 
     async def _generate_and_finalize(
-        self, input_sample: DatumSpec, *, target_step: Optional[int] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        target_step: Optional[int] = None,
+        inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
     ) -> None:
         """Token-capture dispatch: receipts in, canonical rows via the finalizer.
 
@@ -899,7 +910,15 @@ class RolloutManager:
             rollout_ids=rollout_ids,
         )
         try:
-            record = await self.run_rollout(input_sample, rollout_ids=rollout_ids)
+            if inflight_registry is not None:
+                current_task = asyncio.current_task()
+                assert current_task is not None
+                inflight_registry[group_id] = (current_task, start_version)
+            try:
+                record = await self.run_rollout(input_sample, rollout_ids=rollout_ids)
+            finally:
+                if inflight_registry is not None:
+                    inflight_registry.pop(group_id, None)
             receipts = [c.env_extras.get("ng_receipt") for c in record.completions]
             rewards = [float(c.reward) for c in record.completions]
             finalized = await asyncio.to_thread(
@@ -935,6 +954,77 @@ class RolloutManager:
                     await nemo_gym_env.fail_rollouts.remote(
                         rollout_ids, reason="dispatch_failed"
                     )
-                except Exception as error:  # noqa: BLE001 — TTL is the backstop
-                    print(f"fail_rollouts({group_id}) failed: {error}", flush=True)
+                except Exception as error:
+                    raise RuntimeError(
+                        "failed to close Gym rollout ownership after dispatch "
+                        f"failure for group {group_id!r}"
+                    ) from error
+            raise
+
+    async def generate_for_finalization(
+        self,
+        input_sample: DatumSpec,
+        *,
+        target_step: Optional[int] = None,
+        inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
+    ) -> "FinalizationRequest":
+        """Run capture generation and return a metadata-only actor request.
+
+        The replay-buffer slot remains reserved and unready. The caller owns
+        finalizer submission and must either commit the returned group or stop
+        the validation run on an unknown publication outcome.
+        """
+        from nemo_rl.experience.finalizer_actor import FinalizationRequest
+
+        assert self._tq_buffer is not None, (
+            "generate_for_finalization requires tq_buffer to be set at __init__"
+        )
+        if self._finalizer is not None:
+            raise RuntimeError(
+                "generate_for_finalization cannot be combined with a local finalizer"
+            )
+        start_version = self._weight_version
+        group_id = str(uuid.uuid4())
+        rollout_ids = tuple(
+            f"{group_id}_g{i}" for i in range(self._num_generations_per_prompt)
+        )
+        self._tq_buffer.reserve(
+            weight_version=start_version,
+            target_step=target_step,
+            group_id=group_id,
+            rollout_ids=list(rollout_ids),
+        )
+        try:
+            if inflight_registry is not None:
+                current_task = asyncio.current_task()
+                assert current_task is not None
+                inflight_registry[group_id] = (current_task, start_version)
+            try:
+                record = await self.run_rollout(
+                    input_sample,
+                    rollout_ids=list(rollout_ids),
+                )
+            finally:
+                if inflight_registry is not None:
+                    inflight_registry.pop(group_id, None)
+            receipts = tuple(c.env_extras.get("ng_receipt") for c in record.completions)
+            rewards = tuple(float(c.reward) for c in record.completions)
+            request = FinalizationRequest(
+                group_id=group_id,
+                rollout_ids=rollout_ids,
+                receipts=receipts,
+                rewards=rewards,
+                fallback_weight_version=start_version,
+            )
+            from nemo_rl.experience.finalizer_actor import assert_metadata_only
+
+            assert_metadata_only(request)
+            return request
+        except BaseException:
+            self._tq_buffer.abort(group_id)
+            nemo_gym_env = self._env_handles.get("nemo_gym")
+            if nemo_gym_env is not None:
+                await nemo_gym_env.fail_rollouts.remote(
+                    list(rollout_ids), reason="dispatch_failed"
+                )
             raise

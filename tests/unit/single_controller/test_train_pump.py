@@ -342,6 +342,7 @@ def test_train_pump_drives_mcore_training_step(
             rollout_manager=rollout_manager,
             tq_buffer=tq_buffer,
             partition_id=_PARTITION_ID,
+            finalizer_actors=[],
         )
         ctrl = _RecordingSingleControllerActor.remote(
             metric_log_handle=log,

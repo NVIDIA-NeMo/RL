@@ -93,6 +93,7 @@ class SingleControllerActorArgs:
     rollout_manager: RolloutManager
     tq_buffer: TQReplayBuffer
     partition_id: str
+    finalizer_actors: list[Any]
 
 
 def _build_clusters(
@@ -640,18 +641,25 @@ def setup_single_controller(
             DP_TRAIN_FIELDS,
             fields_with_optional_routed_experts,
         )
-        from nemo_rl.data_plane.tq_token_sink import (
+        from nemo_rl.data_plane.schema import (
             ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
         )
         from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
 
         r3_enabled = router_replay_enabled(master_config.policy)
+        if token_capture_cfg.defer_routed_experts_to_policy and not r3_enabled:
+            raise ValueError(
+                "token_capture.defer_routed_experts_to_policy requires "
+                "policy.router_replay.enabled=true"
+            )
         group_size = grpo_config.num_generations_per_prompt
         num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
         dp_client.register_partition(
             partition_id=partition_id,
             fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=r3_enabled
+                DP_TRAIN_FIELDS,
+                enabled=r3_enabled
+                and not token_capture_cfg.defer_routed_experts_to_policy,
             ),
             num_samples=num_rollout_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
@@ -662,7 +670,7 @@ def setup_single_controller(
             fields=list(STAGING_FIELDS)
             + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
             num_samples=num_rollout_samples,
-            consumer_tasks=["finalize"],
+            consumer_tasks=["finalize", "prev_lp", "train"],
         )
         # Host Gym's capture core in every vLLM DP leader (in-worker DP
         # client + TQTokenSink + the single install_capture call), and give
@@ -718,18 +726,40 @@ def setup_single_controller(
         ),
     )
     finalizer = None
+    finalizer_actors: list[Any] = []
     if token_capture_cfg.enabled:
         from nemo_rl.experience.blackbox_finalizer import BlackboxFinalizer
 
-        finalizer = BlackboxFinalizer(
-            dp_client,
-            partition_id=partition_id,
-            staging_partition=token_capture_cfg.staging_partition,
-            pad_token_id=pad_id,
-            mixed_weight_version_policy=token_capture_cfg.mixed_weight_version_policy,
-            min_valid_fraction_per_group=token_capture_cfg.min_valid_fraction_per_group,
-            router_replay_enabled=router_replay_enabled(policy_config),
-        )
+        if token_capture_cfg.finalizer_actor_pool_enabled:
+            from nemo_rl.experience.finalizer_actor import (
+                FinalizerActorConfig,
+                create_finalizer_actors,
+            )
+
+            finalizer_actors = create_finalizer_actors(
+                dp_config,
+                FinalizerActorConfig(
+                    partition_id=partition_id,
+                    staging_partition=token_capture_cfg.staging_partition,
+                    pad_token_id=pad_id,
+                    mixed_weight_version_policy=token_capture_cfg.mixed_weight_version_policy,
+                    min_valid_fraction_per_group=token_capture_cfg.min_valid_fraction_per_group,
+                    router_replay_enabled=router_replay_enabled(policy_config),
+                    defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
+                ),
+                num_workers=token_capture_cfg.num_finalizer_workers,
+            )
+        else:
+            finalizer = BlackboxFinalizer(
+                dp_client,
+                partition_id=partition_id,
+                staging_partition=token_capture_cfg.staging_partition,
+                pad_token_id=pad_id,
+                mixed_weight_version_policy=token_capture_cfg.mixed_weight_version_policy,
+                min_valid_fraction_per_group=token_capture_cfg.min_valid_fraction_per_group,
+                router_replay_enabled=router_replay_enabled(policy_config),
+                defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
+            )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -765,5 +795,6 @@ def setup_single_controller(
         rollout_manager=rollout_manager,
         tq_buffer=tq_buffer,
         partition_id=partition_id,
+        finalizer_actors=finalizer_actors,
     )
     return actor_args, setup_timing_metrics
