@@ -23,12 +23,14 @@ business logic. Backend init is lifted from
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import socket
 import subprocess
 import time
 import warnings
 from importlib import resources
+from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -469,6 +471,7 @@ class TQDataPlaneClient(DataPlaneClient):
         # is unaffected). Writer unsqueezes 1D → (N, 1) on put; reader
         # squeezes the trailing 1 back on get. Drop when upstream TQ
         # unifies the schema/data shapes for 1D fields.
+        self._backend = cfg["backend"]
         self._promote_1d = cfg["backend"] == "mooncake_cpu"
 
         if bootstrap:
@@ -477,6 +480,22 @@ class TQDataPlaneClient(DataPlaneClient):
             _connect_existing()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
+        # TQ restore is non-transactional and requires a globally clean system.
+        # This process-local guard catches incorrect ordering through this
+        # adapter; setup must still ensure no other client has touched TQ.
+        self._data_operations_started = False
+
+    def _mark_data_operation_started(self) -> None:
+        """Make a later checkpoint load fail instead of mixing TQ states."""
+        self._data_operations_started = True
+
+    def _require_clean_for_load(self) -> None:
+        """Reject restore after this client has performed a data operation."""
+        if self._data_operations_started:
+            raise RuntimeError(
+                "load_checkpoint requires a clean TQ client before any "
+                "register, claim, get, list, put, clear, or consumption operation"
+            )
 
     # ── (A) task-mediated ───────────────────────────────────────────────
 
@@ -509,6 +528,7 @@ class TQDataPlaneClient(DataPlaneClient):
         # stale metadata from a previous registration.
         if not fields:
             return
+        self._mark_data_operation_started()
         schema_key = (
             f"__schema__:{partition_id}:{os.getpid()}:{id(self)}:{time.time_ns()}"
         )
@@ -534,6 +554,7 @@ class TQDataPlaneClient(DataPlaneClient):
         blocking: bool = True,
         timeout_s: float = 60.0,
     ) -> KVBatchMeta:
+        self._mark_data_operation_started()
         client = tq.get_client()
         deadline = time.time() + max(0.0, timeout_s)
         sampling_config: dict[str, Any] = {}
@@ -605,6 +626,7 @@ class TQDataPlaneClient(DataPlaneClient):
     def check_consumption_status(
         self, partition_id: str, task_names: list[str]
     ) -> bool:
+        self._mark_data_operation_started()
         client = tq.get_client()
         for t in task_names:
             if not client.check_consumption_status(
@@ -646,6 +668,7 @@ class TQDataPlaneClient(DataPlaneClient):
             wire_fields = detached_fields
             field_names = [str(key) for key in detached_fields.keys()]
 
+        self._mark_data_operation_started()
         # TQ's wire vocabulary is `keys=` — translation point.
         tq.kv_batch_put(
             keys=list(sample_ids),
@@ -670,6 +693,7 @@ class TQDataPlaneClient(DataPlaneClient):
     ) -> TensorDict:
         if not sample_ids:
             return TensorDict({}, batch_size=(0,))
+        self._mark_data_operation_started()
         td = tq.kv_batch_get(
             keys=list(sample_ids),
             partition_id=partition_id,
@@ -677,9 +701,16 @@ class TQDataPlaneClient(DataPlaneClient):
         )
         return _from_wire(td)
 
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        """List TQ keys in ``partition_id`` without fetching tensor payloads."""
+        self._mark_data_operation_started()
+        listing = tq.kv_list(partition_id=partition_id)
+        return sorted(listing.get(partition_id, {}).keys())
+
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         cleared_via_none = sample_ids is None
         if sample_ids is None:
+            self._mark_data_operation_started()
             # No local state — ask TQ's controller for the current key
             # set in this partition. ``kv_list`` errors propagate; we
             # don't want a network blip to silently turn into "cleared
@@ -701,10 +732,55 @@ class TQDataPlaneClient(DataPlaneClient):
                     stacklevel=2,
                 )
             return
+        self._mark_data_operation_started()
         # TQ's wire vocabulary is `keys=` — translation point.
         tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    def save_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Save TQ controller metadata and storage data."""
+        if self._backend == "mooncake_cpu":
+            raise NotImplementedError(
+                "TQ checkpointing is not supported for the mooncake_cpu "
+                "backend: MooncakeStorageManager cannot persist its in-memory "
+                "rows, so TQ would silently create a metadata-only checkpoint."
+            )
+        _connect_existing()
+        tq.save_checkpoint(checkpoint_dir, metadata=metadata)
+
+    def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
+        """Restore TQ state after initialization and before data operations.
+
+        The local lifecycle guard cannot observe operations issued by another
+        TQ client, so the recovery coordinator must also guarantee globally
+        clean setup ordering.
+        """
+        if self._backend == "mooncake_cpu":
+            raise NotImplementedError(
+                "TQ checkpoint restore is not supported for the mooncake_cpu "
+                "backend because its in-memory rows cannot be restored."
+            )
+        self._require_clean_for_load()
+        # Validate the adapter-owned metadata before starting TQ's
+        # non-transactional storage/controller restore.
+        metadata_path = Path(checkpoint_dir) / "metadata.json"
+        with metadata_path.open() as metadata_file:
+            checkpoint_metadata = json.load(metadata_file)
+        user_metadata = checkpoint_metadata.get("user_metadata", {})
+        if not isinstance(user_metadata, dict):
+            raise ValueError("TQ checkpoint user_metadata must be a dictionary")
+        _connect_existing()
+        # A failed TQ load may have partially modified distributed storage, so
+        # this client is no longer safe for a retry even when an error escapes.
+        self._mark_data_operation_started()
+        tq.load_checkpoint(checkpoint_dir)
+        return dict(user_metadata)
 
     def close(self) -> None:
         if self._closed:

@@ -22,6 +22,7 @@ import pytest
 import torch
 
 import nemo_rl.algorithms.single_controller as single_controller
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
@@ -136,6 +137,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         inference_cluster=None,
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
+        data_plane_checkpoint_metadata=None,
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
@@ -193,6 +195,7 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
         env_handles={},
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
+        data_plane_checkpoint_metadata=None,
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
@@ -374,6 +377,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],

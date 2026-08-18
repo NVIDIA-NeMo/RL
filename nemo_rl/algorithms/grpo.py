@@ -315,6 +315,9 @@ class GRPOSaveState:
     total_steps: int
     total_valid_tokens: int  # Track total number of non-padding tokens during training
     val_reward: float  # May be removed when no validation metrics are available
+    # SC may advance the policy version independently from the optimizer-step
+    # counter. None preserves compatibility with checkpoints predating it.
+    trainer_version: Optional[int] = None
     # SingleController only: name of the sampler that wrote the replay buffer,
     # used to gate the SC buffer restore. None on checkpoints from the other
     # algorithms and from SC runs that predate this field.
@@ -329,6 +332,7 @@ def _initial_grpo_save_state() -> GRPOSaveState:
         total_steps=0,
         total_valid_tokens=0,
         val_reward=-99999999.0,
+        trainer_version=None,
         sampler_name=None,
     )
 

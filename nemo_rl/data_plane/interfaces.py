@@ -37,9 +37,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
 from tensordict import TensorDict
+
+DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
 
 
 class DataPlaneConfig(TypedDict):
@@ -58,6 +61,13 @@ class DataPlaneConfig(TypedDict):
     ``backend == "mooncake_cpu"``; the simple backend ignores them.
     They are required (not NotRequired) so the YAML carries the full
     schema and there are no hidden Python defaults.
+
+    ``checkpointing_enabled`` opts SingleController into saving required TQ
+    state inside its checkpoint bundle. Samplers that support replay-buffer
+    recovery pair the native snapshot with a metadata-only local index; other
+    samplers save it in shadow mode. Other algorithm entrypoints do not consume
+    this field. It is optional because existing configs predate data-plane
+    checkpointing; exemplar configs carry the recommended default explicitly.
     """
 
     enabled: bool
@@ -68,6 +78,7 @@ class DataPlaneConfig(TypedDict):
     claim_meta_poll_interval_s: float
     global_segment_size: int
     local_buffer_size: int
+    checkpointing_enabled: NotRequired[bool]
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
@@ -259,7 +270,8 @@ class DataPlaneClient(ABC):
     B. *Direct-by-key* — used by stages that already know the exact uids
        (e.g. driver-side fan-out to DP ranks):
        :meth:`put_samples`, :meth:`get_samples`, :meth:`clear_samples`.
-    C. *Lifecycle* — :meth:`close`.
+    C. *Lifecycle* — :meth:`save_checkpoint`, :meth:`load_checkpoint`, and
+       :meth:`close`.
 
     Stage-completion signal: there is intentionally no ``mark_consumed``.
     The authoritative signal in TransferQueue is *field production* —
@@ -412,6 +424,22 @@ class DataPlaneClient(ABC):
         """
 
     @abstractmethod
+    def list_sample_ids(self, partition_id: str) -> list[str]:
+        """List the sample IDs currently stored in a partition.
+
+        This metadata-only operation is intended for recovery validation and
+        reconciliation. It must not fetch tensor payloads or advance consumer
+        cursors.
+
+        Args:
+            partition_id: Partition whose stored keys should be listed.
+
+        Returns:
+            Stable, sorted sample IDs. An unknown or empty partition returns
+            an empty list.
+        """
+
+    @abstractmethod
     def clear_samples(
         self,
         sample_ids: list[str] | None,
@@ -441,6 +469,44 @@ class DataPlaneClient(ABC):
         """
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    @abstractmethod
+    def save_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist the complete data-plane state to ``checkpoint_dir``.
+
+        The checkpoint must include both data and the implementation's
+        scheduling/consumption metadata. Callers must serialize checkpoint
+        saves and prevent destructive operations such as clears until this
+        method returns.
+
+        Args:
+            checkpoint_dir: New durable directory for this checkpoint.
+            metadata: Optional JSON-compatible recovery metadata.
+        """
+
+    @abstractmethod
+    def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
+        """Restore a complete data-plane checkpoint.
+
+        The data-plane implementation must already be initialized, but no data
+        operations may have run before restore. Implementations must reject a
+        load after operations through the same client; callers must also ensure
+        that no other client has modified shared data-plane state.
+
+        Args:
+            checkpoint_dir: Directory previously written by
+                :meth:`save_checkpoint`.
+
+        Returns:
+            User metadata supplied to :meth:`save_checkpoint`. The caller may
+            validate this metadata, but restoring data-plane state does not
+            restore the surrounding controller or trainer state.
+        """
 
     @abstractmethod
     def close(self) -> None:

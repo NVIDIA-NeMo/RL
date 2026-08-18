@@ -44,6 +44,7 @@ import importlib
 from typing import (
     Annotated,
     Callable,
+    ClassVar,
     Literal,
     Optional,
     Protocol,
@@ -109,11 +110,14 @@ class PromptGroupSampler(Protocol):
         """True when the policy admits zero staleness (sync mode)."""
         ...
 
+    supports_buffer_checkpoint: ClassVar[bool]
+    """Whether completed buffered groups can be restored safely."""
+
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
         ...
 
-    def set_dispatch_index(self, resume_from_step: int) -> None:
+    def set_dispatch_index(self, resume_from_trainer_version: int) -> None:
         """Seed the dispatch cursor when resuming from a checkpoint."""
         ...
 
@@ -126,28 +130,30 @@ class BaseSampler(abc.ABC):
     select-finalize / weight-window-evict helpers.
     """
 
+    supports_buffer_checkpoint: ClassVar[bool] = False
+
     def __init__(self, buffer: TQReplayBuffer) -> None:
         self._buffer = buffer
         # Pre-incremented before each admitted batch, so -1 lets the first
         # batch through a zero-staleness gate.
         self._dispatch_index: int = -1
 
-    def set_dispatch_index(self, resume_from_step: int) -> None:
+    def set_dispatch_index(self, resume_from_trainer_version: int) -> None:
         """Seed the dispatch cursor when resuming from a checkpoint.
 
         Args:
-            resume_from_step: Trainer step this run starts from — 0 for a
-                fresh run, the restored ``current_step`` when resuming. Sets
-                the cursor to ``resume_from_step - 1`` so gated ``admit`` and
-                ``InOrderSampler``'s target_step stamps line up with the
-                restored trainer version exactly as at step 0 of a fresh run.
-                Call before the first ``admit``.
+            resume_from_trainer_version: Trainer weight version this run starts
+                from — 0 for a fresh run, the restored trainer version when
+                resuming. Sets the cursor to one before that version so gated
+                ``admit`` and ``InOrderSampler`` target-step stamps line up with
+                the restored trainer version. Call before the first ``admit``.
         """
-        if resume_from_step < 0:
+        if resume_from_trainer_version < 0:
             raise ValueError(
-                f"resume_from_step must be non-negative, got {resume_from_step}"
+                "resume_from_trainer_version must be non-negative, got "
+                f"{resume_from_trainer_version}"
             )
-        self._dispatch_index = resume_from_step - 1
+        self._dispatch_index = resume_from_trainer_version - 1
 
     # ── rollout-pump side ────────────────────────────────────────────────
     @abc.abstractmethod
@@ -246,6 +252,9 @@ class WindowedSampler(BaseSampler):
     within ``[train_weight - max_staleness_versions, train_weight]``, optionally
     freshest-first.
     """
+
+    # Ungated restored groups are ordinary in-window candidates.
+    supports_buffer_checkpoint: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -465,7 +474,10 @@ class InOrderSamplerConfig(BaseModel, extra="allow"):
 class CustomSamplerConfig(BaseModel, extra="allow"):
     name: Literal["custom"] = "custom"
     # "module:ClassName" of a PromptGroupSampler defined outside this repo.
-    # Extra keys are forwarded to the constructor (after ``buffer``).
+    # Extra keys are forwarded to the constructor (after ``buffer``). The
+    # target class must declare a boolean ``supports_buffer_checkpoint`` class
+    # attribute so setup can validate recovery requirements before allocating
+    # cluster resources.
     target: str
 
 
@@ -501,36 +513,84 @@ def required_buffer_capacity_for_config(
     return None
 
 
+def _custom_sampler_class(cfg: CustomSamplerConfig) -> type:
+    """Import and return a custom sampler class without constructing it."""
+    module_name, sep, class_name = cfg.target.partition(":")
+    if not sep:
+        raise ValueError(
+            f"custom sampler target must be 'module:ClassName', got {cfg.target!r}"
+        )
+    sampler_cls = getattr(importlib.import_module(module_name), class_name)
+    if not isinstance(sampler_cls, type):
+        raise TypeError(f"custom sampler target is not a class: {cfg.target!r}")
+    return sampler_cls
+
+
+def sampler_supports_buffer_checkpoint(cfg: SamplerConfig) -> bool:
+    """Return a sampler class's static replay-checkpoint capability.
+
+    Custom classes are imported but not instantiated, allowing setup to fail
+    before allocating cluster resources or triggering constructor side effects.
+    """
+    sampler_cls: type
+    if isinstance(cfg, WindowedSamplerConfig):
+        sampler_cls = WindowedSampler
+    elif isinstance(cfg, WeightFifoSamplerConfig):
+        sampler_cls = WeightFifoSampler
+    elif isinstance(cfg, InOrderSamplerConfig):
+        sampler_cls = InOrderSampler
+    elif isinstance(cfg, CustomSamplerConfig):
+        sampler_cls = _custom_sampler_class(cfg)
+    else:
+        raise ValueError(f"unknown sampler config {type(cfg).__name__}")
+
+    capability = getattr(sampler_cls, "supports_buffer_checkpoint", None)
+    if not isinstance(capability, bool):
+        raise TypeError(
+            f"{sampler_cls.__name__}.supports_buffer_checkpoint must be a "
+            f"boolean class attribute, got {capability!r}"
+        )
+    return capability
+
+
 def create_sampler(
     buffer: TQReplayBuffer,
     cfg: SamplerConfig,
 ) -> PromptGroupSampler:
-    """Build a sampler from its config (or import one by FQN)."""
+    """Build a sampler from its config (or import one by FQN).
+
+    Args:
+        buffer: Shared TQReplayBuffer holding the candidate slots.
+        cfg: Discriminated sampler config selecting the policy.
+    """
+    sampler: PromptGroupSampler
     if isinstance(cfg, WindowedSamplerConfig):
-        return WindowedSampler(
+        sampler = WindowedSampler(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             sample_freshest_first=cfg.sample_freshest_first,
         )
-    if isinstance(cfg, WeightFifoSamplerConfig):
-        return WeightFifoSampler(
-            buffer, max_staleness_versions=cfg.max_staleness_versions
+    elif isinstance(cfg, WeightFifoSamplerConfig):
+        sampler = WeightFifoSampler(
+            buffer,
+            max_staleness_versions=cfg.max_staleness_versions,
         )
-    if isinstance(cfg, InOrderSamplerConfig):
-        return InOrderSampler(buffer, max_lookahead_versions=cfg.max_lookahead_versions)
-    if isinstance(cfg, CustomSamplerConfig):
-        module_name, sep, class_name = cfg.target.partition(":")
-        if not sep:
-            raise ValueError(
-                f"custom sampler target must be 'module:ClassName', got {cfg.target!r}"
-            )
-        sampler_cls = getattr(importlib.import_module(module_name), class_name)
+    elif isinstance(cfg, InOrderSamplerConfig):
+        sampler = InOrderSampler(
+            buffer,
+            max_lookahead_versions=cfg.max_lookahead_versions,
+        )
+    elif isinstance(cfg, CustomSamplerConfig):
+        sampler_cls = _custom_sampler_class(cfg)
+        sampler_supports_buffer_checkpoint(cfg)
         sampler = sampler_cls(buffer, **(cfg.model_extra or {}))
         if not isinstance(sampler, PromptGroupSampler):
             raise TypeError(
                 f"{cfg.target} does not implement the PromptGroupSampler "
                 f"interface (needs admit/select/evict/should_abort_inflight, "
-                f"set_dispatch_index, is_on_policy, required_buffer_capacity)"
+                f"set_dispatch_index, is_on_policy, supports_buffer_checkpoint, "
+                f"required_buffer_capacity)"
             )
-        return sampler
-    raise ValueError(f"unknown sampler config {type(cfg).__name__}")
+    else:
+        raise ValueError(f"unknown sampler config {type(cfg).__name__}")
+    return sampler

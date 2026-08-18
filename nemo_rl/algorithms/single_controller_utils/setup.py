@@ -32,7 +32,16 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DATA_PLANE_CHECKPOINT_DIR,
+    LEGACY_REPLAY_BUFFER_FILENAME,
+    REPLAY_BUFFER_METADATA_FILENAME,
+    REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+    TQReplayBuffer,
+)
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    sampler_supports_buffer_checkpoint,
+)
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _create_advantage_estimator,
@@ -53,7 +62,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
-from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
+from nemo_rl.data_plane import (
+    DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
+    DataPlaneClient,
+    build_data_plane_client,
+)
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
@@ -102,6 +115,94 @@ class SingleControllerActorArgs:
     partition_id: str
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
+    data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None
+
+
+def _maybe_restore_native_data_plane_checkpoint(
+    policy: TQPolicy,
+    *,
+    last_checkpoint_path: Optional[str],
+    save_state: GRPOSaveState,
+    partition_id: str,
+    sampler_name: str,
+) -> Optional[dict[str, Any]]:
+    """Load and validate an authoritative native TQ checkpoint when present.
+
+    The metadata-only replay sidecar is the format marker. Checkpoints without
+    any replay artifact resume trainer state with an empty replay buffer;
+    legacy tensor-bearing replay files are rejected rather than silently
+    ignored. Rollout tensors are never serialized into a controller-side
+    replay checkpoint.
+    """
+    if last_checkpoint_path is None:
+        return None
+    checkpoint_path = Path(last_checkpoint_path)
+    replay_metadata_path = checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME
+    if not replay_metadata_path.is_file():
+        legacy_replay_path = checkpoint_path / LEGACY_REPLAY_BUFFER_FILENAME
+        if legacy_replay_path.is_file():
+            raise RuntimeError(
+                "Checkpoint contains legacy replay_buffer.pt state, which "
+                "predates authoritative native TQ replay recovery. Resume it "
+                "with the older implementation or explicitly start without "
+                "restoring buffered rollouts."
+            )
+        return None
+
+    data_plane_path = checkpoint_path / DATA_PLANE_CHECKPOINT_DIR
+    if not data_plane_path.is_dir():
+        raise FileNotFoundError(
+            "Metadata-only replay checkpoint requires a matching native TQ "
+            f"checkpoint at {data_plane_path}"
+        )
+
+    print(f"📦 Restoring native TQ checkpoint: {data_plane_path}", flush=True)
+    metadata = policy.load_data_plane_checkpoint(data_plane_path)
+    if not isinstance(metadata, dict):
+        raise TypeError(
+            "Native TQ checkpoint load must return a metadata dictionary, "
+            f"got {type(metadata).__name__}"
+        )
+    expected_values: dict[str, Any] = {
+        "data_plane_checkpoint_schema_version": (DATA_PLANE_CHECKPOINT_SCHEMA_VERSION),
+        "single_controller_train_steps": save_state.current_step,
+        "single_controller_trainer_version": (
+            save_state.trainer_version
+            if save_state.trainer_version is not None
+            else save_state.current_step
+        ),
+        "single_controller_epoch": save_state.current_epoch,
+        "partition_id": partition_id,
+        "sampler_name": sampler_name,
+        "mode": "authoritative",
+        "replay_metadata_schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+    }
+    mismatches = {
+        key: {"checkpoint": metadata.get(key), "expected": expected}
+        for key, expected in expected_values.items()
+        if metadata.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(
+            "Native TQ checkpoint metadata does not match the trainer "
+            f"checkpoint: {mismatches}"
+        )
+    manifest_digest = metadata.get("replay_manifest_digest")
+    if not isinstance(manifest_digest, str) or not manifest_digest:
+        raise ValueError(
+            "Native TQ checkpoint metadata is missing replay_manifest_digest"
+        )
+    group_count = metadata.get("replay_group_count")
+    if not isinstance(group_count, int) or group_count < 0:
+        raise ValueError(
+            "Native TQ checkpoint metadata has invalid replay_group_count: "
+            f"{group_count!r}"
+        )
+    print(
+        f"📦 Native TQ checkpoint restored and validated: groups={group_count}",
+        flush=True,
+    )
+    return metadata
 
 
 def _build_clusters(
@@ -411,6 +512,22 @@ def setup_single_controller(
             "master_config.data_plane.enabled=True. The async-RL "
             "SingleController path is built on the TransferQueue data plane."
         )
+    if dp_config.get("checkpointing_enabled") and dp_config["backend"] != "simple":
+        raise NotImplementedError(
+            "SingleController data-plane checkpointing currently requires "
+            "data_plane.backend='simple'; Mooncake storage cannot be restored "
+            "by TQ v0.1.9."
+        )
+    if (
+        master_config.checkpointing["enabled"]
+        and sampler_supports_buffer_checkpoint(master_config.async_rl.sampler)
+        and not dp_config.get("checkpointing_enabled")
+    ):
+        raise ValueError(
+            "SingleController checkpointing with a replay-checkpoint-capable "
+            "sampler requires data_plane.checkpointing_enabled=true so "
+            "completed, unconsumed rollouts are recoverable."
+        )
 
     assert generation_config is not None, (
         "single_controller_utils.setup requires policy.generation in master_config"
@@ -591,6 +708,17 @@ def setup_single_controller(
         setup_timing_metrics.policy_init_time_s = trainer_time
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
 
+    # Native TQ restore must run through the trainer's bootstrap client before
+    # the normal SC data-plane client is created or any rollout/train data-plane
+    # operation starts.
+    data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
+        trainer,
+        last_checkpoint_path=last_checkpoint_path,
+        save_state=save_state,
+        partition_id=partition_id,
+        sampler_name=master_config.async_rl.sampler.name,
+    )
+
     if use_nemo_gym:
         env_handles["nemo_gym"], gym_time = results["nemo_gym"]
         setup_timing_metrics.nemo_gym_init_time_s = gym_time
@@ -677,5 +805,6 @@ def setup_single_controller(
         partition_id=partition_id,
         save_state=save_state,
         last_checkpoint_path=last_checkpoint_path,
+        data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
     )
     return actor_args, setup_timing_metrics

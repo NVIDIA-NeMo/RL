@@ -33,6 +33,7 @@ import warnings
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Optional
 
 import ray
@@ -133,6 +134,10 @@ class TQPolicy(Policy):
         )
 
     # ── lifecycle ──────────────────────────────────────────────────────
+
+    def load_data_plane_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
+        """Restore TQ through the clean bootstrap client during SC setup."""
+        return self.dp_client.load_checkpoint(checkpoint_dir)
 
     def shutdown(self) -> bool:  # type: ignore[override]
         """Close the TQ client before shutting down the worker group."""

@@ -56,6 +56,7 @@ run_test env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/grpo_
 
 # Checkpoint save/restore (upstream #3429).
 run_test uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
+run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
