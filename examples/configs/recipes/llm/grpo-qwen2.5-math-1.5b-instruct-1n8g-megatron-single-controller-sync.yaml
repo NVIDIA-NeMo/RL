@@ -6,7 +6,7 @@ logger:
   wandb:
     name: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync
 
-# SC does not support validation and checkpointing yet.
+# SC does not support validation yet.
 grpo:
   # Null out the legacy async_grpo block inherited from grpo_math_1B.yaml:
   # SC reads async_rl instead, and the entrypoint raises if this block is set.
