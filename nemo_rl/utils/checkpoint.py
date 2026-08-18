@@ -172,6 +172,10 @@ class CheckpointingConfig(TypedDict):
         buffer starts empty and a frontier-aligned resume regenerates the
         whole buffered window fresh instead of reusing completed (and
         therefore short-rollout-biased) groups.
+    resume_if_exists (bool): Whether to resume from checkpoints already present in
+        checkpoint_dir. When false, existing checkpoints are moved under
+        checkpoint_dir/run_<n>/ and the run starts cold, so the same
+        checkpoint_dir can be reused without deleting the previous run by hand.
     """
 
     enabled: bool
@@ -187,6 +191,7 @@ class CheckpointingConfig(TypedDict):
     save_optimizer: NotRequired[bool]  # Default: True
     save_data_plane: NotRequired[bool]
     load_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
+    resume_if_exists: NotRequired[bool]  # Default: True
 
 
 _AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
@@ -253,11 +258,55 @@ class CheckpointManager:
         self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
         self.save_optimizer = config["save_optimizer"]
 
+        # A config written before this option existed simply has no key, and the
+        # long-standing behaviour is to resume, so only an explicit false archives.
+        if "resume_if_exists" in config and not config["resume_if_exists"]:
+            self._archive_existing_checkpoints()
+
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None
         self._pending_checkpoint_path: Optional[Path] = None
         self._finalize_error: Optional[Exception] = None
         self._delete_executor = ThreadPoolExecutor(max_workers=1)
+
+    def _archive_existing_checkpoints(self) -> None:
+        """Move existing checkpoints aside so this run starts cold.
+
+        Called when ``resume_if_exists`` is false. Checkpoints are moved under
+        ``checkpoint_dir/run_<n>/`` rather than deleted, so nothing is lost and the
+        same ``checkpoint_dir`` can be reused across experiments without clearing it
+        by hand. ``run_<n>`` does not match the ``step_<digits>`` pattern that
+        checkpoint discovery globs for, so the archived run stays on disk while being
+        invisible to resumption.
+
+        This runs whatever ``enabled`` is set to, because resumption itself does not
+        depend on ``enabled``: leaving the checkpoints in place would silently resume
+        the run the user just asked to start fresh.
+        """
+        step_dirs = [
+            path
+            for path in self.checkpoint_dir.glob("step_*")
+            if path.is_dir() and re.fullmatch(r"step_\d+", path.name)
+        ]
+        if not step_dirs:
+            return
+
+        previous_runs = [
+            int(path.name.split("_")[1])
+            for path in self.checkpoint_dir.glob("run_*")
+            if path.is_dir() and re.fullmatch(r"run_\d+", path.name)
+        ]
+        archive_dir = self.checkpoint_dir / f"run_{max(previous_runs, default=-1) + 1}"
+        archive_dir.mkdir(parents=True)
+        for step_dir in sorted(step_dirs):
+            step_dir.rename(archive_dir / step_dir.name)
+
+        warnings.warn(
+            f"checkpointing.resume_if_exists is false, so {len(step_dirs)} existing "
+            f"checkpoint(s) in {self.checkpoint_dir} were moved to {archive_dir} and "
+            f"this run starts from scratch. Set resume_if_exists to true to resume "
+            f"from them instead."
+        )
 
     @staticmethod
     def get_resume_paths(
