@@ -21,3 +21,5 @@ tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-circle-click-2n8g-megatron-t
 tests/test_suites/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.sh
 tests/test_suites/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp.v1.sh
 tests/test_suites/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp-specdec.v1.sh
+tests/test_suites/vlm/mopd-nemotron-super-omni-120ba12b-10n8g-megatron-tp8ep16cp2-async-gym.v1.sh
+tests/test_suites/vlm/mopd-nemotron-super-omni-120ba12b-4n8g-smoke.v1.sh
