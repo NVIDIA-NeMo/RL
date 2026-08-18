@@ -187,10 +187,12 @@ def apply_fp8_patches(self, fp8_config):
 
 
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
-    config = AutoConfig.from_pretrained(model_name)
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
+    if vllm_cfg.get("is_mx") and not use_fp8_weights:
+        raise ValueError("is_mx=True requires precision='fp8'")
+    config = AutoConfig.from_pretrained(model_name)
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
     # Validate configuration: kv_cache_dtype
@@ -442,7 +444,13 @@ def _is_fp8_weight(name, model):
 
 
 def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a checkpoint-layout weight and sanitize zero E8M0 scales."""
+    """Quantize a checkpoint-layout weight for MXFP8 weight loading and refit.
+
+    FlashInfer represents all-zero blocks with E8M0 scale byte 0. Replace those
+    scale entries with byte 1 because the TRTLLM kernel does not accept byte 0;
+    the represented values remain zero because every quantized value in each
+    affected block is zero.
+    """
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         mxfp8_e4m3_quantize,
     )

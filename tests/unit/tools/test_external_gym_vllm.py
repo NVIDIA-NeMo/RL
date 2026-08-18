@@ -564,9 +564,7 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
                 srun_blocks.append("\n".join(current_block))
                 current_block = []
 
-    assert len(srun_blocks) == 4
-    pool_preflight = next(block for block in srun_blocks if "import ray, vllm" in block)
-    lb_preflight = next(block for block in srun_blocks if "import aiohttp" in block)
+    assert len(srun_blocks) == 2
     replica_launch = next(block for block in srun_blocks if "VLLM_SERVER_BODY" in block)
     lb_launch = next(
         block
@@ -574,18 +572,16 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
         if "lb_watchdog.sh" in block and "--output=" in block
     )
 
-    for block in (pool_preflight, replica_launch):
-        assert "--het-group=1" in block
-        assert '-A "${SLURM_JOB_ACCOUNT}"' not in block
-        assert '-p "${SLURM_JOB_PARTITION}"' not in block
-    for block in (lb_preflight, lb_launch):
-        assert "--het-group=0" in block
-        assert '-A "${SLURM_JOB_ACCOUNT}"' in block
-        assert '-p "${SLURM_JOB_PARTITION}"' in block
+    assert "--het-group=1" in replica_launch
+    assert '-A "${SLURM_JOB_ACCOUNT}"' not in replica_launch
+    assert '-p "${SLURM_JOB_PARTITION}"' not in replica_launch
+    assert "--het-group=0" in lb_launch
+    assert '-A "${SLURM_JOB_ACCOUNT}"' in lb_launch
+    assert '-p "${SLURM_JOB_PARTITION}"' in lb_launch
 
-    assert 'preflight_labels+=("${display_names[${pool}]} container")' in source
-    assert 'preflight_labels+=("load balancer container")' in source
-    assert "${preflight_labels[${preflight_index}]}" in source
+    assert "preflight" not in source.lower()
+    assert "import ray, vllm" not in source
+    assert "import aiohttp" not in source
     assert 'export "${pool}_ENV_VARS=$(pool_value "${pool}" ENV_VARS)"' in source
     assert 'export "${pool}_VLLM_ARGS=$(pool_value "${pool}" VLLM_ARGS)"' in source
     assert 'SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source

@@ -416,16 +416,13 @@ def test_non_gated_receiver_builds_up_only_w13_group(
         for expert in range(2)
         for projection in ("up", "down")
     }
-    base_map = backend.HFToLocalParamMap(
-        specs={
-            grouped_up: backend.LocalParamSpec(base=torch.empty(0)),
-            grouped_down: backend.LocalParamSpec(base=torch.empty(0)),
-        }
+    packed_up = torch.nn.Parameter(
+        torch.empty(2, 32, 8, dtype=torch.uint8),
+        requires_grad=False,
     )
-    monkeypatch.setattr(
-        backend.VllmInternalWorkerExtension,
-        "build_hf_to_local_param_map",
-        lambda _self, _refit_info: base_map,
+    packed_down = torch.nn.Parameter(
+        torch.empty(2, 16, 16, dtype=torch.uint8),
+        requires_grad=False,
     )
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
@@ -435,23 +432,37 @@ def test_non_gated_receiver_builds_up_only_w13_group(
 
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.device = torch.device("cpu")
+    extension.model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            named_parameters=lambda: [
+                (f"{prefix}.w13_weight", packed_up),
+                (f"{prefix}.w2_weight", packed_down),
+            ],
+            named_modules=lambda: [],
+        )
+    )
     extension._nrl_bf16_nvfp4_names = frozenset(expert_names)
     extension._nrl_bf16_nvfp4_projection_families = {prefix: "non_gated"}
     mesh = SimpleNamespace(mesh=torch.empty(1))
     placement = SimpleNamespace(dim=None)
     refit_info = {
+        "gen_tp_size": 1,
         "layer_names": ["model.layers.0"],
         "per_layer_params": {
             "model.layers.0": [
                 {
                     "name": grouped_up,
                     "global_shape": (2, 32, 16),
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "up_proj",
                     "dst_mesh_info": mesh,
                     "dst_placements": (placement,),
                 },
                 {
                     "name": grouped_down,
                     "global_shape": (2, 16, 32),
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "down_proj",
                     "dst_mesh_info": mesh,
                     "dst_placements": (placement,),
                 },
@@ -462,6 +473,22 @@ def test_non_gated_receiver_builds_up_only_w13_group(
     result = extension.build_hf_to_local_param_map(refit_info)
 
     assert set(result.specs) == {grouped_up, grouped_down}
+    up_spec = result.get(grouped_up)
+    down_spec = result.get(grouped_down)
+    assert up_spec is not None and up_spec.pre is not None and up_spec.post is not None
+    assert (
+        down_spec is not None
+        and down_spec.pre is not None
+        and down_spec.post is not None
+    )
+    assert up_spec.base.dtype == torch.uint8
+    assert down_spec.base.dtype == torch.uint8
+    up_ctx = up_spec.pre(up_spec.base)
+    down_ctx = down_spec.pre(down_spec.base)
+    assert up_ctx.buf.shape == (2, 32, 16)
+    assert down_ctx.buf.shape == (2, 16, 32)
+    assert up_ctx.buf.dtype == torch.bfloat16
+    assert down_ctx.buf.dtype == torch.bfloat16
     assert extension._nrl_bf16_nvfp4_group_members == {
         f"{prefix}.w13": (grouped_up,),
         f"{prefix}.w2": (grouped_down,),
@@ -470,6 +497,14 @@ def test_non_gated_receiver_builds_up_only_w13_group(
         f"{prefix}.w13": "non_gated",
         f"{prefix}.w2": "non_gated",
     }
+
+    unselected_extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    unselected_extension.device = torch.device("cpu")
+    unselected_extension.model_runner = extension.model_runner
+    unselected_extension._nrl_bf16_nvfp4_names = frozenset()
+    unselected_extension._nrl_bf16_nvfp4_projection_families = {}
+    with pytest.raises(ValueError, match="wire dtype torch.bfloat16 does not match"):
+        unselected_extension.build_hf_to_local_param_map(refit_info)
 
 
 def test_non_gated_receiver_serializes_each_expert_without_gate(

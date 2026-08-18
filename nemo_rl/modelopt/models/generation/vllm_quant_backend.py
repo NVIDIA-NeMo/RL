@@ -754,6 +754,31 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 "vLLM expert parallelism is unsupported"
             )
 
+    def _allows_receiver_dtype_conversion(
+        self,
+        param_info: dict[str, Any],
+        wire_dtype: torch.dtype,
+        target_dtype: torch.dtype,
+    ) -> bool:
+        if (
+            not self._is_real_quant_model()
+            or wire_dtype != torch.bfloat16
+            or target_dtype != torch.uint8
+        ):
+            return False
+
+        name = str(param_info["name"])
+        match = _GROUPED_ROUTED_EXPERT_WEIGHT_RE.fullmatch(name)
+        if match is None:
+            return False
+        prefix = match.group("prefix")
+        original_names = {
+            f"{prefix}.{expert_id}.{match.group('projection')}_proj.weight"
+            for expert_id in range(int(param_info["global_shape"][0]))
+        }
+        selected_names = getattr(self, "_nrl_bf16_nvfp4_names", frozenset())
+        return bool(original_names.intersection(selected_names))
+
     def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
         """Replace routed-expert destinations with BF16 receive scratch specs."""
         base_map = super().build_hf_to_local_param_map(refit_info)

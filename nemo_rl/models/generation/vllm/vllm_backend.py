@@ -808,6 +808,15 @@ class VllmInternalWorkerExtension:
             self.nccl_reshard_refit_info
         )
 
+    def _allows_receiver_dtype_conversion(
+        self,
+        param_info: dict[str, Any],
+        wire_dtype: torch.dtype,
+        target_dtype: torch.dtype,
+    ) -> bool:
+        """Return whether a subclass will replace a mismatched receive spec."""
+        return False
+
     def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
         """Build the vLLM-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
 
@@ -829,7 +838,7 @@ class VllmInternalWorkerExtension:
 
             return LocalParamSpec(base=vllm_param, pre=pre, post=post)
 
-        def _mxfp8_receiver_quant_spec(
+        def _bf16_to_mxfp8_receiver_quant_spec(
             value_param: torch.Tensor,
             scale_param: torch.Tensor,
             merged_slice: tuple[slice, ...] | None,
@@ -878,6 +887,11 @@ class VllmInternalWorkerExtension:
                 if isinstance(wire_dtype_value, torch.dtype)
                 else _STR_TO_DTYPE.get(wire_dtype_value)
             )
+            if wire_dtype is None:
+                raise ValueError(
+                    f"build_hf_to_local_param_map: unsupported wire dtype "
+                    f"{wire_dtype_value!r} for {hf_name!r}"
+                )
             if wire_dtype == torch.bfloat16 and vllm_param.dtype == torch.float8_e4m3fn:
                 vllm_name = vllm_names_by_id.get(id(vllm_param))
                 if vllm_name is None:
@@ -885,12 +899,21 @@ class VllmInternalWorkerExtension:
                         f"build_hf_to_local_param_map: resolved vLLM target for "
                         f"{hf_name!r} is not a registered model parameter"
                     )
-                scale_name = vllm_name + "_scale_from_checkpoint"
-                scale_param = vllm_params.get(scale_name)
+                scale_names = (
+                    vllm_name + "_scale_from_checkpoint",
+                    vllm_name + "_scale",
+                )
+                scale_name = next(
+                    (name for name in scale_names if name in vllm_params), None
+                )
+                scale_param = (
+                    vllm_params.get(scale_name) if scale_name is not None else None
+                )
                 if scale_param is None:
                     raise ValueError(
                         f"build_hf_to_local_param_map: MXFP8 target {vllm_name!r} "
-                        f"for {hf_name!r} has no scale parameter {scale_name!r}"
+                        f"for {hf_name!r} has no scale parameter among "
+                        f"{scale_names!r}"
                     )
                 value_region = (
                     vllm_param if merged_slice is None else vllm_param[merged_slice]
@@ -918,8 +941,19 @@ class VllmInternalWorkerExtension:
                         f"build_hf_to_local_param_map: MXFP8 scale target "
                         f"{scale_name!r} has dtype {scale_param.dtype}, expected torch.uint8"
                     )
-                specs[hf_name] = _mxfp8_receiver_quant_spec(
+                specs[hf_name] = _bf16_to_mxfp8_receiver_quant_spec(
                     vllm_param, scale_param, merged_slice
+                )
+            elif wire_dtype != vllm_param.dtype and not (
+                self._allows_receiver_dtype_conversion(
+                    param_info_by_name[hf_name],
+                    wire_dtype,
+                    vllm_param.dtype,
+                )
+            ):
+                raise ValueError(
+                    f"build_hf_to_local_param_map: wire dtype {wire_dtype} does not "
+                    f"match target dtype {vllm_param.dtype} for {hf_name!r}"
                 )
             else:
                 specs[hf_name] = (
@@ -1135,6 +1169,7 @@ class VllmInternalWorkerExtension:
             streams = [torch.cuda.Stream() for _ in range(num_streams)]
             events = {}
             for idx, (stage, params) in enumerate(stage_params.items()):
+                # synchronize the last run in the same stream
                 if (idx - num_streams) in events:
                     events[idx - num_streams].synchronize()
                 stage_stream = streams[idx % num_streams]
@@ -1160,15 +1195,20 @@ class VllmInternalWorkerExtension:
                     f"{time.perf_counter() - misc_t0:.2f}s",
                     flush=True,
                 )
+            torch.cuda.empty_cache()
+
+            # Finalize post-load weight processing: dense Linear + attention/MLA,
+            # the per-MoE-backend w13 layout (FlashInfer CUTLASS/TRTLLM) that the
+            # canonical [gate; up] bulk write above defers to here, and the MTP
+            # drafter's mirror of the same. The FP8 KV-cache per-layer k/v scales
+            # are finalized by the lifecycle on exit.
             finalize()
 
-        torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
         return True
 
     def _receive_and_load_misc_params(self) -> None:
         """Receive misc params via packed_broadcast and load via vLLM."""
-        from nemo_rl.weight_sync.nccl_reshard_utils import _STR_TO_DTYPE
-
         misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
         if not misc_meta:
             return
