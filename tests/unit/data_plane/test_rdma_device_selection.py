@@ -37,12 +37,11 @@ def fake_fabric(monkeypatch):
                 return ["/dev/infiniband/uverbs0"] if uverbs else []
             return [f"/sys/class/infiniband/{d}/ports/1/link_layer" for d in layers]
 
+        def fake_read_text(path, *args, **kwargs):
+            return layers[path.parents[2].name]
+
         monkeypatch.setattr(tq_adapter.glob, "glob", fake_glob)
-        monkeypatch.setattr(
-            tq_adapter,
-            "_link_layer",
-            lambda name: layers[name],
-        )
+        monkeypatch.setattr(tq_adapter.Path, "read_text", fake_read_text)
         monkeypatch.setattr(os, "environ", dict(os.environ))
         monkeypatch.delenv("MC_MOONCAKE_DEVICE", raising=False)
 

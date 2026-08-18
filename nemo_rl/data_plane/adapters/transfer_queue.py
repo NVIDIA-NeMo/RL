@@ -78,18 +78,6 @@ def _get_local_node_ip() -> str:
         return ""
 
 
-def _link_layer(device: str) -> str:
-    """Return ``device``'s port-1 link layer — ``InfiniBand``, ``Ethernet``, ``""``."""
-    try:
-        return (
-            Path(f"/sys/class/infiniband/{device}/ports/1/link_layer")
-            .read_text()
-            .strip()
-        )
-    except OSError:
-        return ""
-
-
 def rdma_devices() -> str:
     """Return this host's RDMA devices as mooncake's comma-separated list.
 
@@ -114,7 +102,10 @@ def rdma_devices() -> str:
     ib, roce = [], []
     for path in sorted(glob.glob("/sys/class/infiniband/mlx5_*/ports/1/link_layer")):
         name = Path(path).parents[2].name
-        layer = _link_layer(name)
+        try:
+            layer = Path(path).read_text().strip()
+        except OSError:
+            continue
         if layer == "InfiniBand":
             ib.append(name)
         elif layer == "Ethernet":
@@ -352,7 +343,9 @@ def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
     ):
         return
 
-    n_slots = getattr(_mc, "MAX_BATCH_WORKER_THREADS", 4)
+    n_slots = getattr(_mc, "MAX_BATCH_WORKER_THREADS", None)
+    if n_slots is None:
+        return
 
     def _get_tensors_thread_worker(
         self, batch_keys, batch_shapes, batch_dtypes, indexes

@@ -29,14 +29,11 @@ smoke / smoke-backend / smoke-1d / obj-backend / mix-e2e today).
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
-from nemo_rl.data_plane.adapters.transfer_queue import rdma_devices
 
-from ._rollout_shapes import mooncake_available
+from ._rollout_shapes import mooncake_available, rdma_available
 
 
 def _make_tq_cfg(backend: str) -> dict:
@@ -78,14 +75,11 @@ def _session_tq_client_mooncake_cpu():
     # sets NEMO_RL_REQUIRE_MOONCAKE=1 on runners that have one, which turns
     # this skip into a failure — otherwise losing the device passthrough would
     # silently drop mooncake coverage and still go green.
-    if not rdma_devices():
-        detail = (
+    if not rdma_available():
+        pytest.skip(
             "no usable mlx5 RDMA device — mooncake_cpu requires RDMA "
             "(set MC_MOONCAKE_DEVICE=<dev> to override)"
         )
-        if os.environ.get("NEMO_RL_REQUIRE_MOONCAKE") == "1":
-            raise RuntimeError(detail)
-        pytest.skip(detail)
     client = build_data_plane_client(_make_tq_cfg("mooncake_cpu"))
     yield client
     client.close()
