@@ -29,3 +29,5 @@ env:
       - resources_servers/mcqa/configs/mcqa.yaml
       - resources_servers/gui_coordinate/configs/gui_coordinate.yaml
       - resources_servers/string_match/configs/string_match.yaml
+      - resources_servers/circle_click/configs/circle_click.yaml
+      - resources_servers/circle_count/configs/circle_count.yaml

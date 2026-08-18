@@ -406,7 +406,32 @@ def test_build_hf_to_local_param_map_rejects_trtllm_tensor_sharding():
         ext.build_hf_to_local_param_map(refit_info)
 
 
-def test_nccl_reshard_lifecycle_initializes_only_trtllm_moe_modules(monkeypatch):
+def test_prepare_nccl_reshard_refit_info_validates_before_building_map(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext._validate_weight_update_compatibility = MagicMock(
+        side_effect=RuntimeError("unsupported weight update")
+    )
+    ext.build_hf_to_local_param_map = MagicMock()
+    restore_refit_info_placements = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.weight_sync.nccl_reshard_utils.restore_refit_info_placements",
+        restore_refit_info_placements,
+    )
+
+    with pytest.raises(RuntimeError, match="unsupported weight update"):
+        ext.prepare_nccl_reshard_refit_info({"layer_names": []})
+
+    ext._validate_weight_update_compatibility.assert_called_once_with("nccl_reshard")
+    restore_refit_info_placements.assert_not_called()
+    ext.build_hf_to_local_param_map.assert_not_called()
+    assert not hasattr(ext, "nccl_reshard_refit_info")
+
+
+def test_nccl_reshard_lifecycle_repeats_for_trtllm_moe_modules(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     model = SimpleNamespace()
@@ -421,7 +446,7 @@ def test_nccl_reshard_lifecycle_initializes_only_trtllm_moe_modules(monkeypatch)
     ext.model_config = model_config
     ext.device = torch.device("cpu")
     ext._uses_unquantized_flashinfer_trtllm = lambda: True
-    ext._validate_weight_update_compatibility = lambda: None
+    ext._validate_weight_update_compatibility = lambda _transport=None: None
     ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
 
     monkeypatch.setattr(
@@ -445,13 +470,18 @@ def test_nccl_reshard_lifecycle_initializes_only_trtllm_moe_modules(monkeypatch)
         ),
     )
 
-    with ext._weight_update_lifecycle("nccl_reshard") as finalize:
-        call_order.append("transfer")
-        finalize()
+    for cycle in range(2):
+        with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+            call_order.append(("transfer", cycle))
+            finalize()
 
     assert call_order == [
         ("initialize", trtllm_moe),
-        "transfer",
+        ("transfer", 0),
+        ("finalize", model, model_config),
+        "mtp",
+        ("initialize", trtllm_moe),
+        ("transfer", 1),
         ("finalize", model, model_config),
         "mtp",
     ]
