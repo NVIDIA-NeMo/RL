@@ -609,6 +609,11 @@ class DTensorPolicyWorkerImpl(
         check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        self._assert_model_onloaded(
+            "train",
+            "prepare_for_training",
+            params_may_be_offloaded=self.cpu_offload,
+        )
         self.timer.start("train")
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
@@ -1035,6 +1040,11 @@ class DTensorPolicyWorkerImpl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self._assert_model_onloaded(
+            "get_logprobs",
+            "prepare_for_lp_inference",
+            params_may_be_offloaded=self.cpu_offload,
+        )
         self.timer.start("get_logprobs")
         logprob_batch_size = (
             micro_batch_size
@@ -1345,6 +1355,11 @@ class DTensorPolicyWorkerImpl(
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
     @wrap_with_nvtx_name("dtensor_policy_worker/score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
+        self._assert_model_onloaded(
+            "score",
+            "prepare_for_lp_inference",
+            params_may_be_offloaded=self.cpu_offload,
+        )
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
         sequence_dim = 1
@@ -1487,6 +1502,11 @@ class DTensorPolicyWorkerImpl(
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
+        self._assert_model_onloaded(
+            "get_topk_logits",
+            "prepare_for_lp_inference",
+            params_may_be_offloaded=self.cpu_offload,
+        )
         self.timer.start("get_topk_logits")
         topk_batch_size = (
             micro_batch_size
