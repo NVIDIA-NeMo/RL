@@ -10,9 +10,9 @@
 </div>
 
 ## 📣 News
-*[08/12/2026]MuseGlimmer RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/muse-glimmer-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/muse-glimmer-support/docs/guides/models/muse-glimmer.md). 
-*[08/11/2026]Nemotron-3.5-lightning is released. Trained natively using NeMo RL. Check out [reproducible recipes][https://github.com/NVIDIA-NeMo/RL/tree/main/examples/nemo_gym/nemotron-3.5-lightning]
-*[07/25/2026] [Release v0.7.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.7.0): PPO, MOPD, Cross-tokenizer, Router-replay, CISPO, model support for Qwen3 Omni, Nemotron-nano-Omni, Gemm4, GLIM5.1 and many more!
+* [08/12/2026] MuseGlimmer RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/muse-glimmer-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/muse-glimmer-support/docs/guides/models/muse-glimmer.md).
+* [08/11/2026] Nemotron-3.5-lightning is released. Trained natively using NeMo RL. Check out [reproducible recipes](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/nemo_gym/nemotron-3.5-lightning).
+* [07/25/2026] [Release v0.7.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.7.0): PPO, MOPD, Cross-tokenizer, Router-replay, CISPO, model support for Qwen3 Omni, Nemotron-nano-Omni, Gemm4, GLIM5.1 and many more!
 * [06/12/2026] [Minimax-M3](https://github.com/NVIDIA-NeMo/RL/tree/minimax-m3) Day 0 support by NeMo RL! More details on the [accuracy verifications](https://github.com/NVIDIA-NeMo/RL/blob/minimax-m3/docs/guides/minimax-m3.md). Thank you [vLLM for the shoutout](https://x.com/vllm_project/status/2065445062423826534
 ).
 * [06/04/2026] [Nemotron-3-Ultra](https://research.nvidia.com/labs/nemotron/Nemotron-3-Ultra/) was trained with NeMo-RL! Follow [this guide](https://github.com/NVIDIA-NeMo/RL/blob/ultra-v3/docs/guides/nemotron-3-ultra.md) to explore the post-training recipe.
