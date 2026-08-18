@@ -77,6 +77,8 @@ TokenizerType = PreTrainedTokenizerBase
 def attach_initial_nemo_gym_image_payloads(
     batch: BatchedDataDict[DatumSpec],
     processor: Any,
+    *,
+    pad_dynamic_image_shapes: bool = False,
 ) -> None:
     """Attach initial Gym image tensors once, before prompt repeat.
 
@@ -85,6 +87,11 @@ def attach_initial_nemo_gym_image_payloads(
     prompt batch, allowing ``repeat_interleave(..., share_immutable_media=True)``
     to retain one physical processor output per prompt. Flag-off runs never call
     this helper.
+
+    ``pad_dynamic_image_shapes`` mirrors the per-turn attach inside the NeMo-Gym
+    actor. It only matters for a turn carrying more than one image at differing
+    resolutions, where the processor returns a ragged CHW list; without it the
+    processor is asked to stack those and raises before the shapes are read.
     """
     for message_log, extra_env_info in zip(
         batch["message_log"], batch["extra_env_info"]
@@ -114,6 +121,7 @@ def attach_initial_nemo_gym_image_payloads(
             user_message,
             images=images,
             processor=processor,
+            pad_dynamic_image_shapes=pad_dynamic_image_shapes,
         )
 
 

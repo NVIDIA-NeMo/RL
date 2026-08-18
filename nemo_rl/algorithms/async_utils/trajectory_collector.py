@@ -30,6 +30,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
+    get_pad_dynamic_image_shapes,
 )
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
@@ -520,7 +521,11 @@ class AsyncTrajectoryCollector:
                 self._stamp_nemo_gym_task_indices(rollout_batch)
                 if self._deduplicate_multimodal_data:
                     attach_initial_nemo_gym_image_payloads(
-                        rollout_batch, self.processor
+                        rollout_batch,
+                        self.processor,
+                        pad_dynamic_image_shapes=get_pad_dynamic_image_shapes(
+                            self.master_config
+                        ),
                     )
             repeated_batch = rollout_batch.repeat_interleave(
                 num_generations,

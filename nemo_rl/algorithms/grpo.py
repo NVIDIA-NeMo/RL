@@ -2224,6 +2224,19 @@ def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConf
     return EffortLevelsConfig.model_validate(effort_dict)
 
 
+def get_pad_dynamic_image_shapes(master_config: MasterConfig) -> bool:
+    """Return env.nemo_gym's pad_dynamic_image_shapes, defaulting to off.
+
+    The NeMo-Gym actor reads this from its own config for the per-turn attach.
+    The initial-payload attach runs in the driver instead, so it has to be read
+    here and passed down, or multi-image prompts would be processed under
+    different rules on the two paths.
+    """
+    if "nemo_gym" not in master_config.env:
+        return False
+    return bool(master_config.env["nemo_gym"].get("pad_dynamic_image_shapes"))
+
+
 def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch.Tensor:
     """Right-zero-pad teacher logprobs ``[B, teacher_S]`` to ``train_S``.
 
@@ -2841,7 +2854,13 @@ def grpo_train(
                         master_config.grpo.deduplicate_multimodal_data
                         and should_use_nemo_gym(master_config)
                     ):
-                        attach_initial_nemo_gym_image_payloads(batch, processor)
+                        attach_initial_nemo_gym_image_payloads(
+                            batch,
+                            processor,
+                            pad_dynamic_image_shapes=get_pad_dynamic_image_shapes(
+                                master_config
+                            ),
+                        )
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
@@ -3865,7 +3884,13 @@ def validate(
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if should_use_nemo_gym(master_config):
                 if master_config.grpo.deduplicate_multimodal_data:
-                    attach_initial_nemo_gym_image_payloads(val_batch, processor)
+                    attach_initial_nemo_gym_image_payloads(
+                        val_batch,
+                        processor,
+                        pad_dynamic_image_shapes=get_pad_dynamic_image_shapes(
+                            master_config
+                        ),
+                    )
                 generation_config = master_config.policy["generation"]
                 # Validation-only sampling (e.g. near-greedy validation);
                 # defaults to the train profile via the exemplar YAML
