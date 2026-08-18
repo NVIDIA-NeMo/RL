@@ -6,14 +6,16 @@ loss_fn:
   truncated_importance_sampling_type: tis
   truncated_importance_sampling_ratio: 2
 policy:
-  # Unlike the bf16 parent, train packed: the packing path pads each packed
-  # microbatch to the FP8 block multiple automatically, which the plain path
-  # has no mechanism for.
+  # Unlike the bf16 parent, train packed (dense FP8 microbatches; the FP8
+  # sequence alignment is carried by make_sequence_length_divisible_by below
+  # either way).
   sequence_packing:
     enabled: true
-  # TP4 + sequence_parallel: packing requires this to be a multiple of TP
-  # (the inherited root default binds to the dtensor TP, which is 1 here).
-  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  # Qwen3.5 self-packs sequences inside the model (delegate_pack_to_model),
+  # which bypasses the packing path's automatic FP8 padding — individual
+  # sequences must carry the TE alignment themselves: 8 (fwd product per TP
+  # shard) x TP4 = 32, which also covers the wgrad token dim (%16).
+  make_sequence_length_divisible_by: 32
   megatron_cfg:
     moe_router_dtype: fp32
     freeze_config:

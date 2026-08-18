@@ -190,10 +190,14 @@ below are the Qwen3.5-specific sharp edges.
   `weight_scale_inv` per block; activations are quantized in per-token groups
   of 128. Any tensor that is fed to an FP8 GEMM must have dimensions divisible
   by 128 — tensors that don't fit must be excluded (next section).
-- Both recipes train with sequence packing, where each packed microbatch is
-  padded to the FP8 block multiple automatically — no manual sequence-length
-  alignment is needed. (The 9B recipe enables packing explicitly; its bf16
-  parent trains unpacked.)
+- Both recipes train with sequence packing, but Qwen3.5 packs sequences inside
+  the model (`delegate_pack_to_model`) rather than in the data pipeline, which
+  bypasses the packing path's automatic FP8 padding of packed microbatches.
+  The recipes therefore set `policy.make_sequence_length_divisible_by`
+  (16 for the 35B recipe, 32 for the 9B recipe = `8 x TP`, which also covers
+  the wgrad token dim) so every tensor-parallel shard of a packed bin meets
+  the FP8 GEMM dimension requirements. (The 9B recipe enables packing
+  explicitly; its bf16 parent trains unpacked.)
 - The KV cache stays bf16 in these recipes (`kv_cache_dtype` is left at
   `auto`).
 

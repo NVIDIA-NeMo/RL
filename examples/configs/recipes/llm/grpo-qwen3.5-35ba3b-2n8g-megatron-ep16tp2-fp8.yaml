@@ -6,6 +6,11 @@ loss_fn:
   truncated_importance_sampling_type: tis
   truncated_importance_sampling_ratio: 2
 policy:
+  # Qwen3.5 self-packs sequences inside the model (delegate_pack_to_model),
+  # which bypasses the packing path's automatic FP8 padding — individual
+  # sequences must carry the TE alignment themselves: 8 (fwd product per TP
+  # shard) x TP2 = 16, which also covers the wgrad token dim (%16).
+  make_sequence_length_divisible_by: 16
   megatron_cfg:
     context_parallel_size: 1
     moe_router_dtype: fp32
