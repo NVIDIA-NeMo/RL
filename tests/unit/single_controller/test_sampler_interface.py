@@ -162,7 +162,7 @@ class TestFactory:
             (InOrderSamplerConfig(), True),
             (
                 CustomSamplerConfig(target=f"{__name__}:EchoSampler"),
-                False,
+                True,
             ),
         ],
     )
