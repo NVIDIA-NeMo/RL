@@ -26,8 +26,8 @@ import pytest
 import torch
 from torch.distributed._tensor import Replicate, Shard
 
-from nemo_rl.weight_sync.xferdtensor import get_local_shard_slices
 from nemo_rl.weight_sync import xferdtensor_python as impl
+from nemo_rl.weight_sync.xferdtensor import get_local_shard_slices
 
 
 class _Mesh:
