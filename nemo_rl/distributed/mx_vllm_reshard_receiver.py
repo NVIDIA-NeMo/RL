@@ -45,6 +45,9 @@ class MxVllmReshardReceiver:
         self._num_trainer_sources = num_trainer_sources
         self._timeout = timeout
         self._global_rank = global_rank
+        # Held for parameter-equality verification, which needs the live params
+        # both before and after an install. MX's receiver keeps its own reference.
+        self._model = model
         self._client = MxClient(server_url=server_url)
         self._rendezvous = MxReshardRendezvous(
             self._client,
@@ -97,9 +100,22 @@ class MxVllmReshardReceiver:
                 f"ModelExpress publisher version mismatch: requested {version}, "
                 f"observed {observed}"
             )
+        from nemo_rl.distributed import mx_refit_verify
+
+        verifying = mx_refit_verify.enabled()
+        before = mx_refit_verify.fingerprint_model(self._model) if verifying else {}
+
         install_t0 = time.perf_counter()
         result = self._receiver.update_weights(version, timeout=self._timeout)
         install_s = time.perf_counter() - install_t0
+
+        if verifying and before:
+            mx_refit_verify.report(
+                version,
+                self._global_rank,
+                before,
+                mx_refit_verify.fingerprint_model(self._model),
+            )
         self._report_phases(version, discover_s, install_s, payloads)
         return result
 
