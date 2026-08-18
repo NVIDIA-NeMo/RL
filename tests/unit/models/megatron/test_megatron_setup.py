@@ -1509,23 +1509,42 @@ class TestApplyPerformanceConfig:
 class TestValidateOptimizerConfig:
     """Tests for _validate_optimizer_config function."""
 
-    def test_cpu_offload_requires_full_fraction(self):
-        """Test that CPU offload requires offload_fraction=1.0."""
+    @pytest.mark.parametrize("optimizer", ["adam", "sgd"])
+    def test_cpu_offload_accepts_fractional_offload(self, optimizer):
+        """Supported optimizers delegate fractional offload to MCore."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "optimizer": optimizer,
+                    "use_distributed_optimizer": True,
+                    "optimizer_cpu_offload": True,
+                    "optimizer_offload_fraction": 0.5,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
+                }
+            }
+        }
+
+        _validate_optimizer_config(config)
+
+    @pytest.mark.parametrize("fraction", [-0.1, 0.0, 1.1])
+    def test_cpu_offload_rejects_invalid_fraction(self, fraction):
+        """Enabled CPU offload requires a fraction in the interval (0, 1]."""
         from nemo_rl.models.megatron.setup import _validate_optimizer_config
 
         config = {
             "megatron_cfg": {
                 "optimizer": {
                     "optimizer_cpu_offload": True,
-                    "optimizer_offload_fraction": 0.5,
+                    "optimizer_offload_fraction": fraction,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
                 }
             }
         }
 
-        with pytest.raises(AssertionError) as exc_info:
+        with pytest.raises(ValueError, match=r"0 < optimizer_offload_fraction <= 1"):
             _validate_optimizer_config(config)
-
-        assert "optimizer_offload_fraction=1.0" in str(exc_info.value)
 
     def test_cpu_offload_with_full_fraction(self):
         """Test that CPU offload works with full fraction."""
@@ -1534,14 +1553,63 @@ class TestValidateOptimizerConfig:
         config = {
             "megatron_cfg": {
                 "optimizer": {
+                    "optimizer": "adam",
+                    "use_distributed_optimizer": True,
                     "optimizer_cpu_offload": True,
                     "optimizer_offload_fraction": 1.0,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
                 }
             }
         }
 
         # Should not raise
         _validate_optimizer_config(config)
+
+    def test_cpu_offload_requires_distributed_optimizer(self):
+        """CPU offload is unsupported by the non-distributed BF16 wrapper."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "use_distributed_optimizer": False,
+                    "optimizer_cpu_offload": True,
+                    "optimizer_offload_fraction": 0.5,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
+                }
+            }
+        }
+
+        with pytest.raises(
+            ValueError,
+            match="optimizer_cpu_offload=True requires use_distributed_optimizer=True",
+        ):
+            _validate_optimizer_config(config)
+
+    @pytest.mark.parametrize("optimizer", ["lion", "muon"])
+    def test_cpu_offload_rejects_optimizers_without_hybrid_device_support(
+        self, optimizer
+    ):
+        """Pinned MCore only constructs HybridDeviceOptimizer for Adam and SGD."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "optimizer": optimizer,
+                    "use_distributed_optimizer": True,
+                    "optimizer_cpu_offload": True,
+                    "optimizer_offload_fraction": 0.5,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
+                }
+            }
+        }
+
+        with pytest.raises(
+            ValueError,
+            match="optimizer_cpu_offload=True requires optimizer to be adam or sgd",
+        ):
+            _validate_optimizer_config(config)
 
     def test_no_cpu_offload(self):
         """Test configuration without CPU offload."""
@@ -1552,12 +1620,49 @@ class TestValidateOptimizerConfig:
                 "optimizer": {
                     "optimizer_cpu_offload": False,
                     "optimizer_offload_fraction": 0.5,  # Should be ignored
+                    "overlap_cpu_optimizer_d2h_h2d": False,
                 }
             }
         }
 
         # Should not raise
         _validate_optimizer_config(config)
+
+    def test_missing_transfer_overlap_uses_disabled_default(self):
+        """Older configs may omit the newly exposed transfer-overlap setting."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "use_distributed_optimizer": True,
+                    "optimizer_cpu_offload": False,
+                    "optimizer_offload_fraction": 0.0,
+                }
+            }
+        }
+
+        _validate_optimizer_config(config)
+
+    def test_transfer_overlap_requires_cpu_offload(self):
+        """Transfer overlap is invalid when CPU offload is disabled."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "optimizer_cpu_offload": False,
+                    "optimizer_offload_fraction": 0.0,
+                    "overlap_cpu_optimizer_d2h_h2d": True,
+                }
+            }
+        }
+
+        with pytest.raises(
+            ValueError,
+            match="overlap_cpu_optimizer_d2h_h2d=True requires optimizer_cpu_offload=True",
+        ):
+            _validate_optimizer_config(config)
 
 
 @pytest.mark.mcore
@@ -2072,6 +2177,66 @@ class TestCreateMegatronConfigGlooProcessGroups:
             dist_config.use_gloo_process_groups
             == DistributedInitConfig().use_gloo_process_groups
         )
+
+
+@pytest.mark.mcore
+class TestCreateMegatronConfigOptimizerOffload:
+    """Tests for optimizer CPU-offload plumbing into Megatron Core."""
+
+    @pytest.mark.parametrize("transfer_overlap", [True, False, None])
+    def test_fraction_and_transfer_overlap_are_forwarded(self, transfer_overlap):
+        """Explicit values are forwarded; omission defers to the Bridge default."""
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        optimizer_config = {
+            "use_distributed_optimizer": True,
+            "optimizer_cpu_offload": True,
+            "optimizer_offload_fraction": 0.5,
+        }
+        if transfer_overlap is not None:
+            optimizer_config["overlap_cpu_optimizer_d2h_h2d"] = transfer_overlap
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": optimizer_config,
+                "scheduler": {},
+                "distributed_data_parallel_config": {
+                    "overlap_param_gather": False,
+                    "grad_reduce_in_fp32": False,
+                    "overlap_grad_reduce": False,
+                    "data_parallel_sharding_strategy": "optim_grads_params",
+                },
+                "train_iters": 10,
+            },
+            "train_global_batch_size": 8,
+        }
+
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer"),
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch(
+                "nemo_rl.models.megatron.setup.OptimizerConfig"
+            ) as mock_optimizer_config,
+            patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig"),
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+            )
+
+        optimizer_kwargs = mock_optimizer_config.call_args.kwargs
+        assert optimizer_kwargs["optimizer_cpu_offload"] is True
+        assert optimizer_kwargs["optimizer_offload_fraction"] == 0.5
+        if transfer_overlap is None:
+            assert "overlap_cpu_optimizer_d2h_h2d" not in optimizer_kwargs
+        else:
+            assert optimizer_kwargs["overlap_cpu_optimizer_d2h_h2d"] is transfer_overlap
 
 
 @pytest.mark.mcore
