@@ -44,6 +44,7 @@ project-includes = [
   "examples/custom_parallel/custom_parallel.py",
   "examples/custom_parallel/llama_nemotron_super_49b_custom_plan.py",
   "examples/modelopt/export_quantized_to_hf.py",
+  "examples/nemo_gym/nemotron-3-super-omni/prepare_circle_count_mopd_data.py",
   "nemo_rl/algorithms/__init__.py",
   "nemo_rl/algorithms/advantage_estimator.py",
   "nemo_rl/algorithms/async_utils/__init__.py",

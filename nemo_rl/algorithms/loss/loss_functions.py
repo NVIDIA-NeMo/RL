@@ -203,7 +203,7 @@ class ClippedPGLossFn(LossFunction):
     - KL(π_θ || π_ref) is the KL divergence between the current policy and reference policy (Schulman Approx.)
 
     For REINFORCE/RLOO (when disable_ppo_ratio=True), the formula simplifies to:
-    L(θ) = E_t [ π_θ(a_t|s_t) * A_t ] - β * KL(π_θ || π_ref)
+    L(θ) = E_t [ log π_θ(a_t|s_t) * A_t ] - β * KL(π_θ || π_ref)
 
     Formula (CISPO):
     L(θ) = E_t [ sg(clip(r_t(θ), 1-ε_low, 1+ε_high)) * A_t * log π_θ(a_t|s_t) ]
