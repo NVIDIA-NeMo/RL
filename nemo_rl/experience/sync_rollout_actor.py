@@ -214,6 +214,8 @@ class SyncRolloutActor:
             …) — stays on the driver, never crosses an actor boundary.
         """
         # Lazy imports keep rollout-specific dependencies off the actor startup path.
+        # ``_policy_dtype`` sizes the VLM pixel tensors below.
+        from nemo_rl.algorithms.grpo import _policy_dtype
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import (
             MESSAGE_LOG_BULK_FIELDS,
@@ -318,7 +320,15 @@ class SyncRolloutActor:
         )
         if ROUTED_EXPERTS_FIELD in flat:
             bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
-        for k, v in flat.get_multimodal_dict(as_tensors=False).items():
+        # ``pixel_dtype`` mirrors the legacy analogs (``grpo._build_async_grpo_train_data``
+        # and the sync train-data builders): cast pixels to the policy precision
+        # once here, at the same point they'd be cast in-memory. No worker
+        # re-applies it, so without this the largest column crosses the wire in
+        # fp32 where legacy shipped bf16. ``PackedTensor.to_dtype`` leaves
+        # integer segments (grid_thw / imgs_sizes / num_frames) untouched.
+        for k, v in flat.get_multimodal_dict(
+            as_tensors=False, pixel_dtype=_policy_dtype(cfg.policy)
+        ).items():
             for wk, wv in encode_multimodal_for_wire(k, v):
                 bulk_batch[wk] = wv
         # ``content`` (raw assistant text per sample) — rides TQ as a

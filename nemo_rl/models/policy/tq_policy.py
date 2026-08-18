@@ -239,12 +239,16 @@ class TQPolicy(TQDriverMixin, Policy):
     ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
-        Logprob workers need only LP_SEED_FIELDS — narrow the meta's
-        field list so ``_fetch`` doesn't pull rollout-only payload (e.g.
-        multimodal). The same shape is used for both prev_lp and ref_lp.
-        Workers compute the per-token tensor and commit it to TQ via the
-        leader-rank ``_write_back_result_field``; the Ray return is
-        always None, so this dispatcher just waits for completion.
+        Logprob workers fetch ``LP_SEED_FIELDS`` plus the multimodal
+        columns the rollout actually wrote (:func:`_present_multimodal_fields`),
+        so prev/ref logprobs see the same model inputs as the training
+        forward — ``train_from_meta`` ships that same set. Narrowing the
+        meta's field list still keeps rollout-only payload (message-log
+        bulk, ``content``) in TQ. The same shape is used for both prev_lp
+        and ref_lp. Workers compute the per-token tensor and commit it to
+        TQ via the leader-rank ``_write_back_result_field``; the Ray
+        return is always None, so this dispatcher just waits for
+        completion.
         """
         spa, dba = self._packing_args("logprob_mb_tokens")
         # Narrow the fetch to LP_SEED_FIELDS + any multimodal fields
