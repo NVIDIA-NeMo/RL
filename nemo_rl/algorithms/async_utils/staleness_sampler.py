@@ -113,6 +113,10 @@ class PromptGroupSampler(Protocol):
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
         ...
 
+    def set_dispatch_index(self, resume_from_step: int) -> None:
+        """Seed the dispatch cursor when resuming from a checkpoint."""
+        ...
+
 
 class BaseSampler(abc.ABC):
     """Shared machinery for the built-in policies.
@@ -127,6 +131,23 @@ class BaseSampler(abc.ABC):
         # Pre-incremented before each admitted batch, so -1 lets the first
         # batch through a zero-staleness gate.
         self._dispatch_index: int = -1
+
+    def set_dispatch_index(self, resume_from_step: int) -> None:
+        """Seed the dispatch cursor when resuming from a checkpoint.
+
+        Args:
+            resume_from_step: Trainer step this run starts from — 0 for a
+                fresh run, the restored ``current_step`` when resuming. Sets
+                the cursor to ``resume_from_step - 1`` so gated ``admit`` and
+                ``InOrderSampler``'s target_step stamps line up with the
+                restored trainer version exactly as at step 0 of a fresh run.
+                Call before the first ``admit``.
+        """
+        if resume_from_step < 0:
+            raise ValueError(
+                f"resume_from_step must be non-negative, got {resume_from_step}"
+            )
+        self._dispatch_index = resume_from_step - 1
 
     # ── rollout-pump side ────────────────────────────────────────────────
     @abc.abstractmethod
@@ -508,7 +529,8 @@ def create_sampler(
         if not isinstance(sampler, PromptGroupSampler):
             raise TypeError(
                 f"{cfg.target} does not implement the PromptGroupSampler "
-                "interface (needs admit/select/evict/should_abort_inflight)"
+                f"interface (needs admit/select/evict/should_abort_inflight, "
+                f"set_dispatch_index, is_on_policy, required_buffer_capacity)"
             )
         return sampler
     raise ValueError(f"unknown sampler config {type(cfg).__name__}")
