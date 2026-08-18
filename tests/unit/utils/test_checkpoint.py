@@ -1325,3 +1325,88 @@ class TestFTKeepLatestK:
 
         # top-2 by metric -> {1, 2}; ft latest-2 -> {5, 6}; union -> {1, 2, 5, 6}.
         assert self._remaining_steps(checkpoint_dir) == [1, 2, 5, 6]
+
+
+def _write_checkpoints(manager, steps):
+    """Create finalized checkpoints at the given steps."""
+    for step in steps:
+        tmp_dir = manager.init_tmp_checkpoint(step, {"loss": 0.5})
+        manager.finalize_checkpoint(tmp_dir)
+
+
+def test_resume_if_exists_absent_keeps_resuming(checkpoint_config, checkpoint_dir):
+    """A config predating the option must behave exactly as before."""
+    assert "resume_if_exists" not in checkpoint_config
+    _write_checkpoints(CheckpointManager(checkpoint_config), [1, 2])
+
+    manager = CheckpointManager(checkpoint_config)
+
+    assert Path(manager.get_latest_checkpoint_path()).name == "step_2"
+    assert not list(checkpoint_dir.glob("run_*"))
+
+
+def test_resume_if_exists_true_keeps_resuming(checkpoint_config, checkpoint_dir):
+    _write_checkpoints(CheckpointManager(checkpoint_config), [1, 2])
+
+    manager = CheckpointManager({**checkpoint_config, "resume_if_exists": True})
+
+    assert Path(manager.get_latest_checkpoint_path()).name == "step_2"
+    assert not list(checkpoint_dir.glob("run_*"))
+
+
+def test_resume_if_exists_false_archives_and_cold_starts(
+    checkpoint_config, checkpoint_dir
+):
+    _write_checkpoints(CheckpointManager(checkpoint_config), [1, 2])
+
+    with pytest.warns(UserWarning, match="resume_if_exists"):
+        manager = CheckpointManager({**checkpoint_config, "resume_if_exists": False})
+
+    # The new run sees no checkpoints to resume from...
+    assert manager.get_latest_checkpoint_path() is None
+    assert not list(checkpoint_dir.glob("step_*"))
+    # ...but nothing was destroyed.
+    archived = sorted(p.name for p in (checkpoint_dir / "run_0").iterdir())
+    assert archived == ["step_1", "step_2"]
+    assert json.loads(
+        (checkpoint_dir / "run_0" / "step_2" / "training_info.json").read_text()
+    ) == {"loss": 0.5}
+
+
+def test_resume_if_exists_false_is_a_noop_without_checkpoints(
+    checkpoint_config, checkpoint_dir
+):
+    manager = CheckpointManager({**checkpoint_config, "resume_if_exists": False})
+
+    assert manager.get_latest_checkpoint_path() is None
+    assert not list(checkpoint_dir.glob("run_*"))
+
+
+def test_resume_if_exists_false_numbers_successive_runs(
+    checkpoint_config, checkpoint_dir
+):
+    cold_config = {**checkpoint_config, "resume_if_exists": False}
+
+    _write_checkpoints(CheckpointManager(checkpoint_config), [1])
+    with pytest.warns(UserWarning):
+        _write_checkpoints(CheckpointManager(cold_config), [1])
+    with pytest.warns(UserWarning):
+        manager = CheckpointManager(cold_config)
+
+    assert sorted(p.name for p in checkpoint_dir.glob("run_*")) == ["run_0", "run_1"]
+    assert manager.get_latest_checkpoint_path() is None
+
+
+def test_archived_runs_are_invisible_to_checkpoint_discovery(
+    checkpoint_config, checkpoint_dir
+):
+    """run_<n> must not be picked up as a checkpoint by later resuming runs."""
+    _write_checkpoints(CheckpointManager(checkpoint_config), [1, 2])
+    with pytest.warns(UserWarning):
+        CheckpointManager({**checkpoint_config, "resume_if_exists": False})
+
+    manager = CheckpointManager(checkpoint_config)
+    _write_checkpoints(manager, [1])
+
+    assert Path(manager.get_latest_checkpoint_path()).name == "step_1"
+    assert manager.get_best_checkpoint_path() == str(checkpoint_dir / "step_1")
