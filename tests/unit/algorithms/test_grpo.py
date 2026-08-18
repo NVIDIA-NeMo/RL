@@ -7877,7 +7877,9 @@ class TestValidateFunction:
         )
         master_config.env = {}
 
-        with pytest.raises(AssertionError, match="only supported for vLLM NeMo-Gym"):
+        with pytest.raises(
+            AssertionError, match="only supported for vLLM and TRT-LLM NeMo-Gym"
+        ):
             setup(master_config, MagicMock(), MagicMock(), None)
 
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
