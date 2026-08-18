@@ -1407,6 +1407,15 @@ class VllmAsyncGenerationWorkerImpl(
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    async def _reset_encoder_cache_after_weight_update(self) -> None:
+        """Invalidate weight-dependent multimodal encoder outputs when enabled."""
+        if not self.cfg["vllm_cfg"].get(
+            "reset_encoder_cache_after_weight_update", False
+        ):
+            return
+        assert self.llm is not None
+        await self.llm.reset_encoder_cache()
+
     async def update_weights_via_ipc_zmq_async(
         self,
     ) -> bool:
@@ -1438,6 +1447,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
+            await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1474,6 +1484,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
+            await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1533,6 +1544,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
                 )
                 return False
+            await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
             print(f"Exception during nccl_reshard_refit: {e}", flush=True)
