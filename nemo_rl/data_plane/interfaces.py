@@ -104,9 +104,9 @@ class DataPlaneConfig(TypedDict):
 
     ``storage_capacity`` / ``num_storage_units`` / ``global_segment_size`` /
     ``local_buffer_size`` / ``reuse_registered_buffers`` used to sit at this
-    level. :func:`backend_config` rejects them with a migration message rather
-    than accepting both spellings — see there for why silently accepting them
-    would be worse than erroring.
+    level. A config still using that spelling is not rejected — the flat
+    key is simply never read, and :func:`backend_config` resolves the
+    nested block (or its defaults) as if it were absent. See there.
     """
 
     enabled: bool
