@@ -38,8 +38,9 @@ def check_mx_reshard_refit_support(master_config: Any) -> None:
     if str(vllm.get("kv_cache_dtype", "auto")).startswith("fp8"):
         violations.append("mx_reshard does not support FP8 KV-cache scale sync.")
 
-    # The initial target is the divisible Qwen3 geometry. MX can describe more
-    # general GQA intervals, but those have not passed the production gate here.
+    # Query heads still have to divide across trainer TP. KV heads do not:
+    # Megatron slices the globally interleaved fused QKV rows and MX maps each
+    # rank's raw interval, so KV<TP legitimately leaves most ranks with no K/V.
     tp = int(megatron.get("tensor_model_parallel_size", 1))
     heads = megatron.get("num_attention_heads")
     query_groups = megatron.get("num_query_groups")
@@ -47,9 +48,18 @@ def check_mx_reshard_refit_support(master_config: Any) -> None:
         violations.append(
             "Megatron num_attention_heads must be divisible by tensor parallel size."
         )
-    if query_groups is not None and int(query_groups) % tp:
+    if query_groups is not None and int(query_groups) < 1:
         violations.append(
-            "Megatron num_query_groups must be divisible by tensor parallel size."
+            "Megatron num_query_groups must be positive."
+        )
+    if (
+        heads is not None
+        and query_groups is not None
+        and int(query_groups) > 0
+        and int(heads) % int(query_groups)
+    ):
+        violations.append(
+            "Megatron num_attention_heads must be divisible by num_query_groups."
         )
 
     if violations:

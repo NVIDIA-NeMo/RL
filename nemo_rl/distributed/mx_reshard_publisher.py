@@ -15,8 +15,8 @@ module is the narrow adapter between those contracts.
 
 The two sides use the same role vocabulary (``qkv_column``,
 ``gated_mlp_column``, ``expert_column``, ...) and the same extras keys
-(``head_dim``, ``num_heads_local``, ``num_kv_heads_local``, ``gated_mlp_order``),
-so no renaming happens here.
+(``head_dim``, global ``num_heads`` / ``num_kv_heads``, optional divisible
+local-head counts, and ``gated_mlp_order``), so no renaming happens here.
 """
 
 from __future__ import annotations

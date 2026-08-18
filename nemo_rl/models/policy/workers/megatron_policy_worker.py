@@ -2151,6 +2151,7 @@ class MegatronPolicyWorkerImpl(
         # Keep ModelExpress optional for every non-MX NeMo-RL environment.
         from nemo_rl.distributed.mx_megatron_helpers import (
             collect_megatron_publish_set,
+            resolve_qkv_geometry_from_param,
         )
         from nemo_rl.distributed.mx_reshard_config import (
             resolve_mx_reshard_publisher_listen_port_base,
@@ -2223,6 +2224,7 @@ class MegatronPolicyWorkerImpl(
                 num_attention_heads=num_heads,
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
+                qkv_geometry_resolver=resolve_qkv_geometry_from_param,
             )
         )
         items = list(

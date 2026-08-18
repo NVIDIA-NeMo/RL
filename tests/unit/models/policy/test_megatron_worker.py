@@ -46,6 +46,38 @@ from tests.unit.test_utils import SimpleLossFn
 pytestmark = pytest.mark.mcore
 
 
+def test_mx_publisher_wires_the_live_layer_qkv_geometry_resolver():
+    source_path = (
+        Path(__file__).parents[4]
+        / "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    method = next(
+        node
+        for class_node in tree.body
+        if isinstance(class_node, ast.ClassDef)
+        and class_node.name == "MegatronPolicyWorkerImpl"
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "init_mx_reshard_publisher"
+    )
+    collect_call = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "collect_megatron_publish_set"
+    )
+    resolver = next(
+        keyword.value
+        for keyword in collect_call.keywords
+        if keyword.arg == "qkv_geometry_resolver"
+    )
+
+    assert isinstance(resolver, ast.Name)
+    assert resolver.id == "resolve_qkv_geometry_from_param"
+
+
 def test_model_owned_packing_capability_is_detected():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         _model_self_packs_for_cp,

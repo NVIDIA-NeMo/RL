@@ -91,6 +91,37 @@ def test_support_validation_rejects_colocation_and_dtensor() -> None:
         check_mx_reshard_refit_support(master)
 
 
+def _supported_gqa_master(*, heads: int = 64, query_groups: int = 2):
+    return SimpleNamespace(
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "colocated": {"enabled": False},
+                "vllm_cfg": {"kv_cache_dtype": "auto"},
+            },
+            "megatron_cfg": {
+                "enabled": True,
+                "tensor_model_parallel_size": 8,
+                "expert_tensor_parallel_size": 1,
+                "num_attention_heads": heads,
+                "num_query_groups": query_groups,
+            },
+            "dtensor_cfg": {"enabled": False},
+        }
+    )
+
+
+def test_support_validation_accepts_kv_heads_below_tp() -> None:
+    check_mx_reshard_refit_support(_supported_gqa_master())
+
+
+def test_support_validation_rejects_query_heads_that_do_not_form_groups() -> None:
+    with pytest.raises(ValueError, match="divisible by num_query_groups"):
+        check_mx_reshard_refit_support(
+            _supported_gqa_master(heads=63, query_groups=2)
+        )
+
+
 def test_result_validation_accepts_flattened_and_nested_ray_shapes() -> None:
     MxReshardWeightSynchronizer._require_all(True, "scalar")
     MxReshardWeightSynchronizer._require_all([True, (True, [True])], "nested")

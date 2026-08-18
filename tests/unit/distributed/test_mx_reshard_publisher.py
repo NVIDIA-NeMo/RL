@@ -456,13 +456,17 @@ def test_non_strict_resolver_reports_no_names_and_the_tensor_is_dropped():
 
 
 def test_qkv_head_extras_survive_translation():
-    """build_hf_aliases reads head_dim / num_heads_local / num_kv_heads_local off
-    extras, and raises a KeyError if the publisher dropped them."""
+    """Global QKV geometry must reach MX unchanged when KV heads are below TP."""
     entry = _entry(
         "decoder.layers.0.self_attention.linear_qkv.weight",
-        torch.zeros(1280, 2048),
+        torch.zeros(1088, 2048),
         ROLE_QKV_COLUMN,
-        extras={"head_dim": "128", "num_heads_local": "8", "num_kv_heads_local": "2"},
+        extras={
+            "qkv_interleave": "by_head",
+            "head_dim": "128",
+            "num_heads": "64",
+            "num_kv_heads": "2",
+        },
     )
     resolver = make_bridge_resolver(
         {
@@ -474,11 +478,16 @@ def test_qkv_head_extras_survive_translation():
         }
     )
 
-    (item,) = build_megatron_alias_inputs([entry], resolve_hf_names=resolver, tp_size=1, tp_rank=0)
+    (item,) = build_megatron_alias_inputs(
+        [entry], resolve_hf_names=resolver, tp_size=8, tp_rank=3
+    )
 
     assert item.extras["head_dim"] == "128"
-    assert item.extras["num_heads_local"] == "8"
-    assert item.extras["num_kv_heads_local"] == "2"
+    assert item.extras["num_heads"] == "64"
+    assert item.extras["num_kv_heads"] == "2"
+    assert "num_kv_heads_local" not in item.extras
+    assert item.global_shape == (8704, 2048)
+    assert item.local_shard_range == (3264, 4352)
     assert len(item.hf_names) == 3
 
 
