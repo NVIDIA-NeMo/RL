@@ -143,11 +143,12 @@ experiments/h100-hybridep-performance-20260817/submit.sh \
 The launcher requests all eight GPUs on every H100 node. It never embeds a
 cluster hostname, account, shared-storage path, or credential. The baseline
 recipe is materialized from commit
-`4a1454bf430624786251d14ba0197169c8e68a5c` inside the allocated job and is
-deleted on exit. An optional absolute `UV_CACHE_DIR_OVERRIDE` is forwarded to
-`ray.sub` so a one-node dependency warmup can populate a shared wheel cache
-before large jobs allocate GPUs. DeepSeek-V3 rows require an absolute converted
-BF16 checkpoint path and pass it to both `policy.model_name` and
+`4a1454bf430624786251d14ba0197169c8e68a5c` inside the run's result directory
+and retained with the logs. An optional absolute `UV_CACHE_DIR_OVERRIDE`
+selects the warmed cache only after Ray has started; this avoids shadowing the
+nightly image's bootstrap cache while still reusing the pinned HybridEP wheel
+in driver and actor environments. DeepSeek-V3 rows require an absolute
+converted BF16 checkpoint path and pass it to both `policy.model_name` and
 `policy.tokenizer.name`; without that prerequisite the launcher exits before
 submission rather than misclassifying a placeholder-config failure as an OOM.
 
