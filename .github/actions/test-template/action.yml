@@ -149,7 +149,7 @@ runs:
         # ibv_reg_mr additionally needs IPC_LOCK and an unlimited memlock rlimit
         # to pin its registrations.
         #
-        # Requires an mlx5 device on the host, either fabric — rdma_device()
+        # Requires an mlx5 device on the host, either fabric — rdma_devices()
         # prefers InfiniBand and falls back to RoCE. When the host has one,
         # NEMO_RL_REQUIRE_MOONCAKE promotes the tests' skip into a failure, so
         # losing this passthrough surfaces as a red job rather than silently
@@ -157,9 +157,15 @@ runs:
         #
         # --device against a missing path makes docker run itself fail, which
         # would break every test rather than only the RDMA ones — hence the
-        # host-side check.
+        # host-side check. Gate on uverbs* specifically, not just the
+        # /dev/infiniband directory: a host can have the directory without a
+        # verbs node, which is what libibverbs actually opens and what
+        # rdma_devices() requires — that mismatch would pass this gate, set
+        # NEMO_RL_REQUIRE_MOONCAKE, and then hard-fail every mooncake unit
+        # test once rdma_devices() finds nothing.
         RDMA_FLAGS=()
-        if [[ "${{ inputs.is_doc_test }}" != "true" && -d /dev/infiniband ]] &&
+        if [[ "${{ inputs.is_doc_test }}" != "true" ]] &&
+           compgen -G "/dev/infiniband/uverbs*" >/dev/null &&
            compgen -G "/sys/class/infiniband/mlx5_*/ports/1/link_layer" >/dev/null; then
           RDMA_FLAGS=(--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1
                       --env NEMO_RL_REQUIRE_MOONCAKE=1)
