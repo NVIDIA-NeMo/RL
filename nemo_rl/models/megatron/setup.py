@@ -1560,8 +1560,8 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     attention_backend=flash (FA4 via TE), and the Transformer Engine generation
     layer spec so generation and scoring share the patched MoE unpermute path.
     Also applies TE cuBLAS workspace shrink and TP=1 log-softmax via patches.py,
-    MoE gather unpermute (gather+droppad on CUDA-graphed decode) via
-    moe_zero_kl_patches.py, router replay, Mamba train/prefill/decode alignment
+    MoE gather unpermute plus index_put routing maps (gather+droppad on CUDA-graphed
+    decode) via moe_zero_kl_patches.py, router replay, Mamba train/prefill/decode alignment
     via mamba_zero_kl_patches.py, generation ``logprobs_mode=raw_logprobs`` so
     gen uses ``F.log_softmax`` (not FlashInfer processed log-probs). When
     generation CUDA graphs are enabled, also applies
