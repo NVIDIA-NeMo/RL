@@ -263,6 +263,8 @@ class SyncRolloutActor:
                 else None,
                 reward_penalty_config=cfg.reward_penalties,
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
+                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
+                debug_payload_metrics=cfg.grpo.debug_payload_metrics,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:
@@ -275,6 +277,7 @@ class SyncRolloutActor:
                 **common,
                 max_seq_len=cfg.policy["max_total_sequence_length"],
                 max_rollout_turns=cfg.grpo.max_rollout_turns,
+                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
             )
         fb = final_batch.to("cpu")
         del final_batch

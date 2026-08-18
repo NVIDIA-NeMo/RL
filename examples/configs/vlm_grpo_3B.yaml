@@ -3,6 +3,11 @@
 defaults: "grpo_math_1B.yaml"
 
 grpo:
+  # Share immutable multimodal payloads across logical GRPO rows. Currently
+  # qualified with the vLLM generation backend and data_plane.enabled=false.
+  deduplicate_multimodal_data: false
+  # Debug-only exact Ray payload telemetry; serialization adds runtime overhead.
+  debug_payload_metrics: false
   num_prompts_per_step: 8
   reward_shaping:
     overlong_buffer_length: 512
