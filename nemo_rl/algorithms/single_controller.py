@@ -483,9 +483,8 @@ class SingleControllerActor:
           1. Acquire _buffer_capacity slot (backpressure)
           2. Acquire sem (cap concurrent in-flight rollouts)
           3. Wait for _rollout_permitted (paused during weight sync)
-          4. Call rollout_manager.generate_and_push(prompt) — local async
-             RolloutManager reserves a slot, runs the rollout, then commits the
-             group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
+          4. Run the rollout, then either commit it directly or submit its
+             metadata-only request to the finalizer actor pool.
           5. Decrement _inflight_rollouts
         """
         sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)

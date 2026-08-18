@@ -754,16 +754,10 @@ class RolloutManager:
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
         tq_buffer: Optional[TQReplayBuffer] = None,
-        finalizer: Optional[Any] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
-        if finalizer is not None:
-            assert use_nemo_gym, (
-                "token capture (finalizer) is only supported on the NeMo-Gym path"
-            )
-
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
             assert policy_generation is not None, (
@@ -789,7 +783,6 @@ class RolloutManager:
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
-        self._finalizer = finalizer
         # The NeMo-Gym env handle doubles as the gate control-plane proxy
         # (gate_metrics / fail_rollouts) on the capture path.
         self._env_handles = task_to_env
@@ -842,13 +835,6 @@ class RolloutManager:
         assert self._tq_buffer is not None, (
             "generate_and_push requires tq_buffer to be set at __init__"
         )
-        if self._finalizer is not None:
-            await self._generate_and_finalize(
-                input_sample,
-                target_step=target_step,
-                inflight_registry=inflight_registry,
-            )
-            return
         start_version = self._weight_version
         group_id = self._tq_buffer.reserve(
             weight_version=start_version, target_step=target_step
@@ -883,84 +869,6 @@ class RolloutManager:
                 )
             raise
 
-    async def _generate_and_finalize(
-        self,
-        input_sample: DatumSpec,
-        *,
-        target_step: Optional[int] = None,
-        inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
-    ) -> None:
-        """Token-capture dispatch: receipts in, canonical rows via the finalizer.
-
-        Mints the group's rollout ids up front — sample ids and gate-registered
-        rollout ids are the same strings (``{group_id}_g{i}``) — reserves the
-        slot with them so cleanup can name what it owns before a receipt
-        exists, and commits via ``commit_finalized`` with the group's
-        min/max call weight versions.
-        """
-        start_version = self._weight_version
-        group_id = str(uuid.uuid4())
-        rollout_ids = [
-            f"{group_id}_g{i}" for i in range(self._num_generations_per_prompt)
-        ]
-        self._tq_buffer.reserve(
-            weight_version=start_version,
-            target_step=target_step,
-            group_id=group_id,
-            rollout_ids=rollout_ids,
-        )
-        try:
-            if inflight_registry is not None:
-                current_task = asyncio.current_task()
-                assert current_task is not None
-                inflight_registry[group_id] = (current_task, start_version)
-            try:
-                record = await self.run_rollout(input_sample, rollout_ids=rollout_ids)
-            finally:
-                if inflight_registry is not None:
-                    inflight_registry.pop(group_id, None)
-            receipts = [c.env_extras.get("ng_receipt") for c in record.completions]
-            rewards = [float(c.reward) for c in record.completions]
-            finalized = await asyncio.to_thread(
-                self._finalizer.finalize_group,
-                group_id,
-                rollout_ids,
-                receipts,
-                rewards,
-                fallback_weight_version=start_version,
-            )
-            record.rollout_metrics.update(finalized.metrics)
-            if finalized.dropped:
-                # min_valid_fraction_per_group rejected the group: nothing
-                # was published, so drop the slot like a failed dispatch.
-                self._tq_buffer.abort(group_id)
-                raise RuntimeError(
-                    f"token capture: group {group_id} dropped "
-                    "(min_valid_fraction_per_group)"
-                )
-            await self._tq_buffer.commit_finalized(
-                group_id,
-                finalized.meta,
-                finalized.group_min_wv,
-                finalized.group_max_wv,
-                staging_keys=finalized.staging_keys,
-            )
-        except BaseException:
-            self._tq_buffer.abort(group_id)
-            # Best-effort gate cleanup: no receipt will ever seal these ids.
-            nemo_gym_env = self._env_handles.get("nemo_gym")
-            if nemo_gym_env is not None:
-                try:
-                    await nemo_gym_env.fail_rollouts.remote(
-                        rollout_ids, reason="dispatch_failed"
-                    )
-                except Exception as error:
-                    raise RuntimeError(
-                        "failed to close Gym rollout ownership after dispatch "
-                        f"failure for group {group_id!r}"
-                    ) from error
-            raise
-
     async def generate_for_finalization(
         self,
         input_sample: DatumSpec,
@@ -979,10 +887,6 @@ class RolloutManager:
         assert self._tq_buffer is not None, (
             "generate_for_finalization requires tq_buffer to be set at __init__"
         )
-        if self._finalizer is not None:
-            raise RuntimeError(
-                "generate_for_finalization cannot be combined with a local finalizer"
-            )
         start_version = self._weight_version
         group_id = str(uuid.uuid4())
         rollout_ids = tuple(

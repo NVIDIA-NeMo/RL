@@ -128,6 +128,7 @@ The pieces, by repo:
 | Worker-side capture + prefix splice | `nemo_rl/models/generation/vllm/vllm_worker_async.py` |
 | Staging sink/source over TransferQueue | `nemo_rl/data_plane/tq_token_sink.py` |
 | Receipt → training row | `nemo_rl/experience/blackbox_finalizer.py` |
+| Metadata-only finalizer actor pool | `nemo_rl/experience/finalizer_actor.py` |
 
 ## Quick start
 

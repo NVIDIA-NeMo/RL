@@ -142,7 +142,6 @@ def _make_manager(buffer: _FakeBuffer, impl: _FakeImpl) -> RolloutManager:
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = 1
     mgr._tq_buffer = buffer
-    mgr._finalizer = None
     mgr._env_handles = {}
     mgr._weight_version = 0
     return mgr
@@ -306,7 +305,6 @@ class TestGenerateAndPushFlow:
         second_mgr._tokenizer = None
         second_mgr._num_generations_per_prompt = 1
         second_mgr._tq_buffer = buf
-        second_mgr._finalizer = None
         second_mgr._env_handles = {}
         second_mgr._weight_version = 0
 
@@ -991,35 +989,10 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         )
 
 
-class _FakeFinalizedGroup:
-    def __init__(self, *, dropped=False):
-        self.meta = None if dropped else "meta-sentinel"
-        self.group_min_wv = 3
-        self.group_max_wv = 4
-        self.staging_keys = []
-        self.metrics = {"finalize/invalid_row_rate": 0.0}
-        self.dropped = dropped
-
-
-class _FakeFinalizer:
-    def __init__(self, *, dropped=False):
-        self.calls: list[tuple] = []
-        self._dropped = dropped
-
-    def finalize_group(
-        self, group_id, rollout_ids, receipts, rewards, *, fallback_weight_version
-    ):
-        self.calls.append(
-            (group_id, rollout_ids, receipts, rewards, fallback_weight_version)
-        )
-        return _FakeFinalizedGroup(dropped=self._dropped)
-
-
 class _FakeCaptureBuffer(_FakeBuffer):
     def __init__(self):
         super().__init__()
         self.reserve_rollout_ids: list[list[str] | None] = []
-        self.commit_finalized_calls: list[tuple] = []
 
     def reserve(
         self, *, weight_version, target_step=None, group_id=None, rollout_ids=None
@@ -1031,14 +1004,6 @@ class _FakeCaptureBuffer(_FakeBuffer):
             group_id=group_id,
             rollout_ids=rollout_ids,
         )
-
-    async def commit_finalized(
-        self, group_id, meta, group_min_wv, group_max_wv, *, staging_keys=None
-    ):
-        self.commit_finalized_calls.append(
-            (group_id, meta, group_min_wv, group_max_wv, staging_keys)
-        )
-        return meta
 
 
 class _FakeGymEnvHandle:
@@ -1080,12 +1045,11 @@ def _receipt_record(rollout_ids, receipts):
     )
 
 
-def _make_capture_manager(buf, finalizer, *, on_run=None, num_generations=2):
+def _make_capture_manager(buf, *, on_run=None, num_generations=2):
     mgr = object.__new__(RolloutManager)
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
     mgr._tq_buffer = buf
-    mgr._finalizer = finalizer
     mgr._env_handles = {"nemo_gym": _FakeGymEnvHandle()}
     mgr._weight_version = 7
 
@@ -1105,39 +1069,28 @@ def _make_capture_manager(buf, finalizer, *, on_run=None, num_generations=2):
     return mgr
 
 
-class TestGenerateAndFinalizeFlow:
-    def test_mints_ids_finalizes_and_commits(self):
+class TestGenerateForFinalizationFlow:
+    def test_mints_ids_and_returns_metadata_request(self):
         buf = _FakeCaptureBuffer()
-        finalizer = _FakeFinalizer()
-        mgr = _make_capture_manager(buf, finalizer)
+        mgr = _make_capture_manager(buf)
 
-        _run(mgr.generate_and_push({"prompt": "p"}, target_step=5))
+        request = _run(mgr.generate_for_finalization({"prompt": "p"}, target_step=5))
 
         # Rollout ids were minted from the reserved group id and threaded
-        # end to end: reserve -> impl -> finalizer.
+        # end to end: reserve -> impl -> metadata-only actor request.
         (group_id,) = buf._slots
         expected_ids = [f"{group_id}_g0", f"{group_id}_g1"]
         assert buf.reserve_rollout_ids == [expected_ids]
         assert mgr._impl.seen_rollout_ids == expected_ids
-        (fin_group_id, fin_ids, receipts, rewards, fallback_wv) = finalizer.calls[0]
-        assert fin_group_id == group_id
-        assert fin_ids == expected_ids
-        assert [r["rollout_id"] for r in receipts] == expected_ids
-        assert rewards == [0.5, 0.5]
-        assert fallback_wv == 7
-        # commit_finalized carried the group's min/max call versions.
-        assert buf.commit_finalized_calls == [(group_id, "meta-sentinel", 3, 4, [])]
-        # The legacy commit path was not used and nothing failed at the gate.
+        assert request.group_id == group_id
+        assert request.rollout_ids == tuple(expected_ids)
+        assert [r["rollout_id"] for r in request.receipts] == expected_ids
+        assert request.rewards == (0.5, 0.5)
+        assert request.fallback_weight_version == 7
+        # Finalization and commit are exclusively owned by the controller's
+        # actor-pool path; the manager leaves the reservation unready.
         assert buf.commit_calls == []
         assert mgr._env_handles["nemo_gym"].failed == []
-
-    def test_dropped_group_aborts_slot(self):
-        buf = _FakeCaptureBuffer()
-        mgr = _make_capture_manager(buf, _FakeFinalizer(dropped=True))
-        with pytest.raises(RuntimeError, match="min_valid_fraction"):
-            _run(mgr.generate_and_push({"prompt": "p"}))
-        assert buf.commit_finalized_calls == []
-        assert len(buf.abort_calls) >= 1
 
     def test_failed_dispatch_aborts_and_fails_gate_rollouts(self):
         buf = _FakeCaptureBuffer()
@@ -1145,10 +1098,9 @@ class TestGenerateAndFinalizeFlow:
         async def _boom(_sample):
             raise RuntimeError("rollout exploded")
 
-        mgr = _make_capture_manager(buf, _FakeFinalizer(), on_run=_boom)
+        mgr = _make_capture_manager(buf, on_run=_boom)
         with pytest.raises(RuntimeError, match="rollout exploded"):
-            _run(mgr.generate_and_push({"prompt": "p"}))
-        assert buf.commit_finalized_calls == []
+            _run(mgr.generate_for_finalization({"prompt": "p"}))
         assert len(buf.abort_calls) == 1
         (failed_ids, reason) = mgr._env_handles["nemo_gym"].failed[0]
         (group_id,) = [buf.abort_calls[0]]

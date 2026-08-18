@@ -725,33 +725,16 @@ def setup_single_controller(
             token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
         ),
     )
-    finalizer = None
     finalizer_actors: list[Any] = []
     if token_capture_cfg.enabled:
-        from nemo_rl.experience.blackbox_finalizer import BlackboxFinalizer
+        from nemo_rl.experience.finalizer_actor import (
+            FinalizerActorConfig,
+            create_finalizer_actors,
+        )
 
-        if token_capture_cfg.finalizer_actor_pool_enabled:
-            from nemo_rl.experience.finalizer_actor import (
-                FinalizerActorConfig,
-                create_finalizer_actors,
-            )
-
-            finalizer_actors = create_finalizer_actors(
-                dp_config,
-                FinalizerActorConfig(
-                    partition_id=partition_id,
-                    staging_partition=token_capture_cfg.staging_partition,
-                    pad_token_id=pad_id,
-                    mixed_weight_version_policy=token_capture_cfg.mixed_weight_version_policy,
-                    min_valid_fraction_per_group=token_capture_cfg.min_valid_fraction_per_group,
-                    router_replay_enabled=router_replay_enabled(policy_config),
-                    defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
-                ),
-                num_workers=token_capture_cfg.num_finalizer_workers,
-            )
-        else:
-            finalizer = BlackboxFinalizer(
-                dp_client,
+        finalizer_actors = create_finalizer_actors(
+            dp_config,
+            FinalizerActorConfig(
                 partition_id=partition_id,
                 staging_partition=token_capture_cfg.staging_partition,
                 pad_token_id=pad_id,
@@ -759,7 +742,9 @@ def setup_single_controller(
                 min_valid_fraction_per_group=token_capture_cfg.min_valid_fraction_per_group,
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
-            )
+            ),
+            num_workers=token_capture_cfg.num_finalizer_workers,
+        )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -771,7 +756,6 @@ def setup_single_controller(
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
         tq_buffer=tq_buffer,
-        finalizer=finalizer,
     )
 
     # Print setup timing metrics
