@@ -36,6 +36,25 @@ run_test() {
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
+# Full mode only (~10 min): SIGKILLs a generation worker and asserts the job fails fast
+# and attributably instead of wedging. This is the ONLY end-to-end check of the
+# containment behaviour -- without it, a regression that restores the silent wedge is
+# caught by nothing, because a wedged job produces no exception and no failing assertion
+# anywhere else.
+run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
+
+# grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
+# rather than between calls. Registered because pinning the victim state -- which is what
+# makes that test reproducible at all -- would otherwise silently drop a scenario the old,
+# non-deterministic selection used to hit by chance. The two fail by different routes:
+# killing an idle worker leaves the loss to be *detected*, killing a serving one destroys
+# an in-flight RPC that surfaces at once (222s vs 12s when measured). A regression in
+# either is invisible to the other.
+#
+# Cheap to add: the serving path fails in seconds, so this is dominated by startup.
+run_test env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
+
+# Checkpoint save/restore (upstream #3429).
 run_test uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
 
 cd ${PROJECT_ROOT}/tests
