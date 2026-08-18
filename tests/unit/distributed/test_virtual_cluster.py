@@ -211,6 +211,60 @@ def test_ray_uses_same_cluster_for_permuted_cuda_devices():
         assert mock_ray_shutdown.call_count == 0
 
 
+def test_init_ray_threads_data_plane_env_into_runtime_env():
+    """The point of init_ray(data_plane_cfg=...): a backend engine knob must
+    reach the env_vars snapshot ray.init() hands to every worker -- that is
+    the only place it becomes cluster-wide (see init_ray's own docstring and
+    nemo_rl/data_plane/factory.py's maybe_configure_data_plane_env). Setting
+    it from anywhere later (e.g. inside a worker's own __init__) is too late
+    for this snapshot and leaves workers disagreeing with the driver.
+    """
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        # Matching tag -> init_ray takes the "reuse existing cluster" path
+        # and returns after exactly one ray.init call, the one whose
+        # runtime_env we need to inspect.
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        env = {"CUDA_VISIBLE_DEVICES": "0"}
+        with patch.dict(os.environ, env, clear=True):
+            from nemo_rl.distributed.virtual_cluster import init_ray
+
+            init_ray(
+                data_plane_cfg={
+                    "enabled": True,
+                    "impl": "transfer_queue",
+                    "backend": "mooncake_cpu",
+                    "claim_meta_poll_interval_s": 0.5,
+                }
+            )
+
+        assert mock_ray_init.call_count == 1
+        env_vars = mock_ray_init.call_args_list[0][1]["runtime_env"]["env_vars"]
+        assert env_vars["MC_STORE_MEMCPY"] == "0"
+        assert env_vars["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
+
+
+def test_init_ray_data_plane_cfg_none_is_a_noop():
+    """No data_plane_cfg (the default, and every non-data-plane launcher's
+    call) must not touch mooncake env vars at all."""
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        env = {"CUDA_VISIBLE_DEVICES": "0"}
+        with patch.dict(os.environ, env, clear=True):
+            from nemo_rl.distributed.virtual_cluster import init_ray
+
+            init_ray()
+
+        env_vars = mock_ray_init.call_args_list[0][1]["runtime_env"]["env_vars"]
+        assert "MC_STORE_MEMCPY" not in env_vars
+        assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in env_vars
+
+
 def test_mcore_py_executable():
     # The temporary directory is created within the project.
     # For some reason, creating a virtual environment outside of the project
