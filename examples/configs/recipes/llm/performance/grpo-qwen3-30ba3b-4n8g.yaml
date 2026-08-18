@@ -12,6 +12,7 @@ policy:
   train_global_batch_size: 2048
   train_micro_batch_size: 1
   logprob_batch_size: 2
+  logprob_chunk_size: 1024
   max_total_sequence_length: 4096
   sequence_packing:
     fuse_loss: true
@@ -26,6 +27,7 @@ policy:
     moe_flex_dispatcher_backend: hybridep
     moe_hybridep_num_sms: 32
     moe_hybridep_prepad_packed_inputs: true
+    defer_fp32_logits: true
     enabled: true
     empty_unused_memory_level: 1
     tensor_model_parallel_size: 1
