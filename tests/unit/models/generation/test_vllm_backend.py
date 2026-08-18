@@ -246,10 +246,11 @@ def test_refresh_hpc_modules_after_layerwise_reload(monkeypatch):
 def test_batched_bf16_trtllm_layout_matches_vllm_expertwise_converter(
     monkeypatch, is_gated_act_gemm
 ):
-    from nemo_rl.models.generation.vllm import vllm_backend
     from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
         convert_moe_weights_to_flashinfer_trtllm_block_layout,
     )
+
+    from nemo_rl.models.generation.vllm import vllm_backend
 
     num_experts = 3
     w13_rows = 4
@@ -296,8 +297,9 @@ def test_batched_bf16_trtllm_layout_matches_vllm_expertwise_converter(
 def test_batched_bf16_trtllm_layout_is_scoped_to_reload_finalize(monkeypatch):
     import threading
 
-    from nemo_rl.models.generation.vllm import vllm_backend
     from vllm.model_executor.layers.fused_moe.oracle import unquantized
+
+    from nemo_rl.models.generation.vllm import vllm_backend
 
     original_result = (object(), object())
     batched_result = (object(), object())
