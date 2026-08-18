@@ -285,9 +285,7 @@ def _staging_pool(client: Any, n_slots: int, max_bytes: int) -> _StagingPool:
     with _staging_pool_lock:
         pool = getattr(client, "_nrl_staging", None)
         if pool is None:
-            pool = client._nrl_staging = _StagingPool(
-                client._store, n_slots, max_bytes
-            )
+            pool = client._nrl_staging = _StagingPool(client._store, n_slots, max_bytes)
         return pool
 
 
