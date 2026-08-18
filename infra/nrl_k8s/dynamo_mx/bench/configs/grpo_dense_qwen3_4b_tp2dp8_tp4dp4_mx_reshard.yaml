@@ -1,23 +1,18 @@
-# Topology A geometry with a dense model, on the main-native mx_reshard arm.
+# Dense counterpart of grpo_moe_qwen3_30b_tp2ep4dp2_tp4dp4_mx_reshard.yaml.
 #
 #   Qwen3-4B-Thinking-2507 (dense)
 #   trainer TP2 x PP1 x DP8 (16 GPUs)
 #     -> 4 independent vLLM replicas, each TP4 (16 GPUs)
 #
-# Why dense: the MoE Topology A run fails closed because MX's reshard path
-# cannot install vLLM's fused grouped-expert tensors (`w13_weight`/`w2_weight`);
-# the full-pull fallback is unimplemented. See
-# 13_MX_RESHARD_MOE_FUSED_EXPERT_GAP_2026_08_16.md. A dense model has no expert
-# tensors, so it exercises the same TP2 -> TP4 reshard across 16 publishers and
-# 16 receivers without touching the unimplemented path.
+# Why dense: a dense model has no grouped-expert tensors, so it exercises the
+# same TP2 -> TP4 reshard across 16 publishers and 16 receivers without also
+# exercising vLLM's fused expert layout. That separates transport and lifecycle
+# regressions from expert-capture regressions.
 #
-# Why this model: the shared PVC is 100% full, so nothing new can be fetched.
-# This is the largest dense model already in the HF cache.
-#
-# The parallel geometry is deliberately identical to Topology A so the transport
-# shape — rank counts, resharding factor, agent fan-out — carries over. Only the
-# model differs, and the model is smaller, so these numbers bound scale and
-# lifecycle, not Topology A's byte volume.
+# The parallel geometry is deliberately identical to the MoE recipe so the
+# transport shape -- rank counts, resharding factor, agent fan-out -- carries
+# over. Only the model differs, and it is smaller, so these numbers bound scale
+# and lifecycle rather than the MoE recipe's byte volume.
 
 defaults: ../../../../../examples/configs/grpo_math_1B_megatron.yaml
 
@@ -82,8 +77,8 @@ data:
   max_input_seq_length: 1024
 
 logger:
-  # Not the shared PVC: it is 100% full, so every write there fails with
-  # ENOSPC. Evidence is copied off the pod after the run instead.
+  # Node-local so the run does not depend on a shared volume having free space.
+  # Copy the evidence off the pod after the run.
   log_dir: /tmp/mx-reshard-dense
   num_val_samples_to_print: 0
   wandb_enabled: false
