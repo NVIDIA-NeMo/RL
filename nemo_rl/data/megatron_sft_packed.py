@@ -301,6 +301,9 @@ def megatron_sft_packed_preprocessor(
             f"positions={len(pack_positions)} expected={pack_length + 1}"
         )
 
+    for boundary in cu_seqlens[1:-1]:
+        pack_targets[boundary] = IGNORE_INDEX
+
     input_ids = torch.tensor(pack_tokens[:-1], dtype=torch.int64)
     target_ids = torch.tensor(pack_targets[1:], dtype=torch.int64)
     position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)

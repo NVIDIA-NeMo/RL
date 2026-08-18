@@ -625,7 +625,12 @@ def test_packed_preprocessor_cp_pads_each_system_delimited_boundary() -> None:
         processed["input_ids"], torch.tensor([10, 20, 2, 99, 40, 50, 2, 99])
     )
     assert torch.equal(
-        processed["target_ids"], torch.tensor([20, 2, 99, 40, 50, 2, 99, 99])
+        processed["target_ids"],
+        torch.tensor([20, 2, 99, IGNORE_INDEX, 50, 2, 99, 99]),
+    )
+    assert torch.equal(
+        processed["token_mask"],
+        torch.tensor([1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]),
     )
     assert torch.equal(
         processed["position_ids"], torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
@@ -633,6 +638,63 @@ def test_packed_preprocessor_cp_pads_each_system_delimited_boundary() -> None:
     assert torch.equal(processed["packed_cu_seqlens"], torch.tensor([0, 4, 8]))
     assert processed["packed_max_seqlen"] == 4
     assert processed["packed_context_parallel_size"] == 2
+
+
+@pytest.mark.parametrize(
+    ("context_parallel_size", "expected_cu_seqlens"),
+    [
+        pytest.param(1, [0, 3, 6, 12], id="cp1"),
+        pytest.param(2, [0, 4, 8, 12], id="cp2"),
+    ],
+)
+def test_identity_masks_each_internal_packed_conversation_boundary(
+    context_parallel_size: int,
+    expected_cu_seqlens: list[int],
+) -> None:
+    messages = [
+        {"role": "system", "content": "s1"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "system", "content": "s2"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "system", "content": "s3"},
+        {"role": "user", "content": "u3"},
+        {"role": "assistant", "content": "a3"},
+    ]
+    tokenizer = _DummyTokenizer(
+        {
+            ("system", "s1"): [10],
+            ("user", "u1"): [20],
+            ("assistant", "a1"): [30],
+            ("system", "s2"): [40],
+            ("user", "u2"): [50],
+            ("assistant", "a2"): [60],
+            ("system", "s3"): [70],
+            ("user", "u3"): [80],
+            ("assistant", "a3"): [90],
+        }
+    )
+
+    processed = _preprocess(
+        messages,
+        tokenizer,
+        max_seq_length=12,
+        prompt_format="identity",
+        context_parallel_size=context_parallel_size,
+    )
+
+    assert torch.equal(
+        processed["packed_cu_seqlens"], torch.tensor(expected_cu_seqlens)
+    )
+    internal_boundary_indices = processed["packed_cu_seqlens"][1:-1].long() - 1
+    assert torch.equal(
+        processed["target_ids"][internal_boundary_indices],
+        torch.full((2,), IGNORE_INDEX, dtype=torch.int64),
+    )
+    assert torch.equal(
+        processed["token_mask"][internal_boundary_indices], torch.zeros(2)
+    )
 
 
 def test_packed_preprocessor_right_truncates_to_pack_length_plus_one() -> None:
