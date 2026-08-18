@@ -160,6 +160,9 @@ class NemoGymConfig(TypedDict):
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
+    # Central agent loop config (env.nemo_gym.central_agent). When enabled, this
+    # actor runs the agentic loop itself and no agent server is started.
+    central_agent: NotRequired[Optional[Dict[str, Any]]]
     # Multimodal fields (populated by `setup_nemo_gym_config` when VLM is enabled).
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
@@ -417,6 +420,10 @@ class NemoGym(EnvironmentInterface):
         self.node_ip: Optional[str] = None
         self.head_server_port: Optional[int] = None
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
+        # Set in _spinup: whether this actor runs the agent loop itself, and the
+        # agent blocks it took over from the Gym config.
+        self._central_agent_enabled: bool = False
+        self._agent_registry: Dict[str, Any] = {}
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
@@ -470,9 +477,15 @@ class NemoGym(EnvironmentInterface):
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
+        from nemo_gym.global_config import get_global_config_dict
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
         from omegaconf import DictConfig
+
+        from nemo_rl.environments.central_agent_helpers import (
+            pop_agent_registry,
+            resolve_central_agent_config,
+        )
 
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
         assert __file__.endswith(RELATIVE_PATH)
@@ -536,15 +549,35 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
-        self.rh = RunHelper()
-        self.rh.start(
-            global_config_dict_parser_config=GlobalConfigDictParserConfig(
-                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
-                / "nemo_gym_env.yaml",
-                initial_global_config_dict=DictConfig(initial_global_config_dict),
-                skip_load_from_cli=True,
-            )
+        parser_config = GlobalConfigDictParserConfig(
+            dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
+            / "nemo_gym_env.yaml",
+            initial_global_config_dict=DictConfig(initial_global_config_dict),
+            skip_load_from_cli=True,
         )
+
+        # With the central agent, NeMo-RL owns the agentic loop, so the agent
+        # servers are never called. Resolve the merged config here (which caches
+        # it for RunHelper.start below), then move every agent block into a
+        # registry and delete it, so no agent process or venv is created.
+        central_agent_config = resolve_central_agent_config(
+            self.cfg.get("central_agent")
+        )
+        self._central_agent_enabled = bool(central_agent_config["enabled"])
+        if self._central_agent_enabled:
+            merged_config = get_global_config_dict(
+                global_config_dict_parser_config=parser_config
+            )
+            self._agent_registry = pop_agent_registry(
+                merged_config, central_agent_config
+            )
+            print(
+                "Central agent enabled: taking over NeMo-Gym agents "
+                f"{sorted(self._agent_registry)} (their servers are not started)."
+            )
+
+        self.rh = RunHelper()
+        self.rh.start(global_config_dict_parser_config=parser_config)
 
         # Setup for rollout collection
         self.head_server_config = BaseServerConfig(
@@ -560,7 +593,84 @@ Depending on your data shape, you may want to change these values."""
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
     ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
-        """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
+        """Stream postprocessed rollouts driven by the NeMo-Gym agent servers."""
+        if self._central_agent_enabled:
+            raise RuntimeError(
+                "env.nemo_gym.central_agent is enabled, so no agent server is running. "
+                "Use run_agent_rollouts (AsyncNemoGymRolloutImplWithAgent) or disable "
+                "central_agent."
+            )
+        async for item in self._stream_rollouts(
+            nemo_gym_examples,
+            tokenizer,
+            timer_prefix,
+            self._agent_server_tasks,
+            deduplicate_multimodal_data,
+        ):
+            yield item
+
+    async def run_agent_rollouts(
+        self,
+        nemo_gym_examples: list[dict],
+        tokenizer: PreTrainedTokenizerBase,
+        timer_prefix: str,
+        deduplicate_multimodal_data: bool = False,
+    ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
+        """Stream postprocessed rollouts driven by the central agent loop."""
+        if not self._central_agent_enabled:
+            raise RuntimeError(
+                "run_agent_rollouts requires env.nemo_gym.central_agent.enabled=true"
+            )
+        async for item in self._stream_rollouts(
+            nemo_gym_examples,
+            tokenizer,
+            timer_prefix,
+            self._central_agent_tasks,
+            deduplicate_multimodal_data,
+        ):
+            yield item
+
+    def _agent_server_tasks(self, nemo_gym_examples: list[dict]) -> Any:
+        """One /run POST per row against its NeMo-Gym agent server."""
+        return self.rch.run_examples(
+            examples=nemo_gym_examples, head_server_config=self.head_server_config
+        )
+
+    def _central_agent_tasks(self, nemo_gym_examples: list[dict]) -> Any:
+        """One central agent loop per row, run here instead of in an agent server."""
+        from tqdm.asyncio import tqdm
+
+        from nemo_rl.environments.central_agent_helpers import CentralAgent
+
+        server_client = self.rch.setup_server_client(self.head_server_config)
+
+        async def _run_one(row: dict) -> tuple[dict, dict]:
+            agent_name = row["agent_ref"]["name"]
+            if agent_name not in self._agent_registry:
+                raise ValueError(
+                    f"Row references agent '{agent_name}', which is not in the central "
+                    f"agent registry {sorted(self._agent_registry)}"
+                )
+            agent = CentralAgent(server_client, self._agent_registry[agent_name])
+            return row, await agent.run(row)
+
+        return tqdm.as_completed(
+            map(_run_one, nemo_gym_examples),
+            desc="Collecting rollouts (central agent)",
+            miniters=10,
+            total=len(nemo_gym_examples),
+            maxinterval=60,
+        )
+
+    async def _stream_rollouts(
+        self,
+        nemo_gym_examples: list[dict],
+        tokenizer: PreTrainedTokenizerBase,
+        timer_prefix: str,
+        make_tasks: Any,
+        deduplicate_multimodal_data: bool = False,
+    ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
+        """Stream postprocessed rollouts as tasks complete."""
         self._require_spinup()
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
@@ -578,9 +688,7 @@ Depending on your data shape, you may want to change these values."""
         encode_images_in_examples(nemo_gym_examples)
 
         timer.start("_run_rollouts_total")
-        nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
-        )
+        nemo_gym_result_iterator = make_tasks(nemo_gym_examples)
 
         num_results = 0
         for task in nemo_gym_result_iterator:
@@ -1064,6 +1172,7 @@ def spinup_nemo_gym_actor(
         _value = nemo_gym_dict.pop(_flag, None)
         if _value is not None:
             multimodal_flags[_flag] = bool(_value)
+    central_agent = nemo_gym_dict.pop("central_agent", None)
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
     # image-baked venvs instead of rebuilding them.
@@ -1083,6 +1192,7 @@ def spinup_nemo_gym_actor(
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        central_agent=central_agent,
         initial_global_config_dict=nemo_gym_dict,
         **multimodal_flags,
     )

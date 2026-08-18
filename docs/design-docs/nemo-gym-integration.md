@@ -49,6 +49,42 @@ Gym result payloads are needed for a short debugging run.
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
+### Central Agent Loop (SingleController)
+
+By default each rollout is driven by a NeMo Gym agent server. Setting
+`env.nemo_gym.central_agent.enabled: true` moves that loop into the `NemoGym`
+actor: `RolloutManager` selects `AsyncNemoGymRolloutImplWithAgent`, the actor
+runs the turn loop itself, and no agent-server process is started (their config
+blocks become an internal registry). The verify result is unchanged, so
+postprocessing, metrics, and reward penalties behave identically.
+
+```yaml
+env:
+  nemo_gym:
+    central_agent:                  # omit or set to null for the agent-server path
+      enabled: true
+      rollout_tree:
+        type: linear                # single branch, append-only
+      tool_calls:
+        mode: serial                # serial | parallel
+        min_returns: 1              # parallel only: results to return before the next turn
+      steering_message:
+        enabled: false              # true POSTs url_path on the agent's resources server
+        url_path: /steering
+      termination:
+        max_turns: 20
+        max_malformed_tool_calls: null
+        stop_on_no_tool_calls: true
+        stop_on_incomplete_details: true
+```
+
+Any `responses_api_agents` block may carry its own `central_agent:` key, which is
+merged over the config above for rollouts of that agent. Only the `simple_agent`
+and `non_executing_simple_agent` implementations are reproduced; any other agent
+raises at actor spinup. Implementation lives in
+`nemo_rl/environments/central_agent_helpers/`, and the knob is wired for the
+SingleController path (`nemo_rl/algorithms/single_controller_utils/setup.py`).
+
 ### Version Requirements
 
 NeMo Gym runs as a Ray actor within NeMo RL's Ray cluster, so the same Ray and Python versions must be used in both environments.

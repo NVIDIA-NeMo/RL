@@ -400,6 +400,21 @@ def setup_single_controller(
     generation_config = policy_config["generation"]
     data_config = master_config.data
 
+    # Mirrors grpo.py: the reference model is only loaded when the KL penalty is
+    # non-zero, so asking for its logprobs without it would fail in
+    # use_reference_model() with a missing reference_state_dict. Mutating
+    # master_config here reaches SingleControllerActor, which reads this flag.
+    if (
+        master_config.loss_fn.reference_policy_kl_penalty <= 0
+        and not grpo_config.skip_reference_policy_logprobs_calculation
+    ):
+        grpo_config.skip_reference_policy_logprobs_calculation = True
+        print(
+            "Auto-enabling `grpo.skip_reference_policy_logprobs_calculation=True` "
+            "because `loss_fn.reference_policy_kl_penalty == 0` "
+            "(reference model is not loaded)."
+        )
+
     if grpo_config.val_period > 0 or grpo_config.val_at_start or grpo_config.val_at_end:
         raise NotImplementedError(
             "SingleController doesn't support validation now, will support "
@@ -652,6 +667,7 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
+        central_agent=(master_config.env.get("nemo_gym") or {}).get("central_agent"),
     )
 
     # Print setup timing metrics

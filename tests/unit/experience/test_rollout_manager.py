@@ -378,6 +378,38 @@ def test_rollout_manager_forwards_mask_env_flagged_samples():
     assert manager._impl._mask_env_flagged_samples is False
 
 
+def test_rollout_manager_routes_on_central_agent():
+    """env.nemo_gym.central_agent selects the central agent loop impl."""
+    from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImplWithAgent
+
+    common = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 1,
+        "max_seq_len": 1,
+        "generation_config": {
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        "use_nemo_gym": True,
+    }
+
+    for central_agent in (None, {"enabled": False}):
+        manager = RolloutManager(**common, central_agent=central_agent)
+        assert type(manager._impl) is AsyncNemoGymRolloutImpl
+        assert manager._impl._ROLLOUT_METHOD == "run_rollouts"
+
+    manager = RolloutManager(**common, central_agent={"enabled": True})
+    assert isinstance(manager._impl, AsyncNemoGymRolloutImplWithAgent)
+    assert manager._impl._ROLLOUT_METHOD == "run_agent_rollouts"
+
+    with pytest.raises(AssertionError, match="requires the NeMo-Gym path"):
+        RolloutManager(
+            **{**common, "use_nemo_gym": False}, central_agent={"enabled": True}
+        )
+
+
 def _nemo_gym_impl(mask_env_flagged_samples):
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,

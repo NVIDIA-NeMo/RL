@@ -701,6 +701,10 @@ class AsyncNemoGymRolloutImpl:
     batched through a single NeMo-Gym run_rollouts call.
     """
 
+    # Actor method that drives the rollouts. Subclasses swap the loop, not the
+    # row building, completion conversion, or metrics.
+    _ROLLOUT_METHOD = "run_rollouts"
+
     def __init__(
         self,
         tokenizer: TokenizerType,
@@ -832,9 +836,11 @@ class AsyncNemoGymRolloutImpl:
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
 
-        async for result_ref in nemo_gym_env.run_rollouts.options(
-            num_returns="streaming"
-        ).remote(pending, self._tokenizer, timer_prefix):
+        async for result_ref in (
+            getattr(nemo_gym_env, self._ROLLOUT_METHOD)
+            .options(num_returns="streaming")
+            .remote(pending, self._tokenizer, timer_prefix)
+        ):
             rowidx, result, timing_metrics = await result_ref
             # Validated against the original group, not the pending subset: on a
             # re-dispatch the row keeps its original index so results stay ordered.
@@ -1070,6 +1076,17 @@ class AsyncNemoGymRolloutImpl:
         return rollout_metrics
 
 
+class AsyncNemoGymRolloutImplWithAgent(AsyncNemoGymRolloutImpl):
+    """NeMo-Gym rollouts driven by the central agent loop in the NemoGym actor.
+
+    Everything except the loop is inherited: row building, completion conversion,
+    and metrics are identical, and the actor streams the same results back. See
+    nemo_rl/environments/central_agent_helpers/.
+    """
+
+    _ROLLOUT_METHOD = "run_agent_rollouts"
+
+
 class RolloutManager:
     """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
 
@@ -1087,6 +1104,7 @@ class RolloutManager:
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
+        central_agent: Optional[dict[str, Any]] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1102,17 +1120,29 @@ class RolloutManager:
         self._stats = RolloutStats()
 
         if not use_nemo_gym:
+            assert not (central_agent and central_agent.get("enabled")), (
+                "env.nemo_gym.central_agent requires the NeMo-Gym path "
+                "(env.should_use_nemo_gym=true)"
+            )
             rollout_cls = AsyncRolloutImpl
             assert policy_generation is not None, (
                 "policy_generation is required for the native async path"
             )
         else:
-            rollout_cls = AsyncNemoGymRolloutImpl
+            rollout_cls = (
+                AsyncNemoGymRolloutImplWithAgent
+                if central_agent and central_agent.get("enabled")
+                else AsyncNemoGymRolloutImpl
+            )
             assert generation_config is not None, (
                 "generation_config is required for the NeMo-Gym path"
             )
 
-        self._impl: AsyncRolloutImpl | AsyncNemoGymRolloutImpl = rollout_cls(
+        self._impl: (
+            AsyncRolloutImpl
+            | AsyncNemoGymRolloutImpl
+            | AsyncNemoGymRolloutImplWithAgent
+        ) = rollout_cls(
             tokenizer=tokenizer,
             task_to_env=task_to_env,
             num_generations_per_prompt=num_generations_per_prompt,
