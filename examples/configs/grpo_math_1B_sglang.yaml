@@ -8,8 +8,6 @@ policy:
     backend: "sglang"
     use_async_rollouts: false
     sglang_cfg:
-      quantization:
-        scheme: bf16
       model_path: ${policy.model_name}
       dtype: ${policy.precision}
       context_length: 512
