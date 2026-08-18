@@ -94,6 +94,11 @@ policy: &POLICY_BASE
         force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
         activation_checkpointing: false
+        cuda_graph_impl: "none"
+        cuda_graph_modules: []
+        cuda_graph_warmup_steps: 3
+        fine_grained_activation_offloading: false
+        offload_modules: null
         recompute_granularity: "full"
         recompute_modules: null
         tensor_model_parallel_size: 2
@@ -146,6 +151,7 @@ policy: &POLICY_BASE
             # optimizer cpu offload
             optimizer_cpu_offload: false
             optimizer_offload_fraction: 0.0
+            overlap_cpu_optimizer_d2h_h2d: false
 
             clip_grad: ${policy.max_grad_norm}
 
