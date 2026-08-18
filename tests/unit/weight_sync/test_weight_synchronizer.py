@@ -413,7 +413,7 @@ class TestSGLangColocatedWeightSynchronizer:
         gen = _mock_sglang_generation()
         sync = SGLangColocatedWeightSynchronizer(policy, gen)
 
-        with pytest.raises(AssertionError, match="do not support kv_scales"):
+        with pytest.raises(ValueError, match="do not support kv_scales"):
             sync.sync_weights(kv_scales={"layer.0": 0.5})
 
         policy.offload_before_refit.assert_not_called()
