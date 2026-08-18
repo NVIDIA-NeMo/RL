@@ -19,7 +19,10 @@ import torch
 import torch.distributed
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    BlockDraftLossFn,
+    DraftCrossEntropyLossFn,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -229,7 +232,15 @@ class SequencePackingFusionLossWrapper:
 
 
 class DraftLossWrapper:
-    """Combine policy loss with draft soft cross-entropy loss."""
+    """Combine policy loss with the draft soft cross-entropy loss.
+
+    ``draft_method`` selects the draft loss: ``"eagle3"`` uses the (multi-pass
+    TTT) :class:`DraftCrossEntropyLossFn`; ``"dflash"``/``"dspark"`` use
+    :class:`BlockDraftLossFn` over the block logits the train loop stashed in
+    ``data_dict["draft_block_logits"]`` (``ttt_pass_weights`` then carries the
+    per-slot weights, e.g. DFlash's exponential position decay, and
+    ``global_draft_pass_counts`` the per-slot valid counts).
+    """
 
     def __init__(
         self,
@@ -237,20 +248,34 @@ class DraftLossWrapper:
         prepare_fn: Callable[Any, Any],
         data_dict: BatchedDataDict[Any],
         loss_weight: float = 1.0,
+        ttt_pass_weights: Optional[list[float]] = None,
+        global_draft_pass_counts: Optional[torch.Tensor] = None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        draft_method: str = "eagle3",
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
         self.data_dict = data_dict
         self.loss_weight = loss_weight
+        self.global_draft_pass_counts = global_draft_pass_counts
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
-        self.draft_loss_fn = DraftCrossEntropyLossFn(
-            vocab_parallel_group=vocab_parallel_group,
-        )
+        self.draft_method = draft_method
+        if draft_method in ("dflash", "dspark"):
+            self.draft_loss_fn: Any = BlockDraftLossFn(
+                vocab_parallel_group=vocab_parallel_group,
+                slot_weights=ttt_pass_weights,
+            )
+        elif draft_method == "eagle3":
+            self.draft_loss_fn = DraftCrossEntropyLossFn(
+                vocab_parallel_group=vocab_parallel_group,
+                pass_weights=ttt_pass_weights,
+            )
+        else:
+            raise ValueError(f"Unknown draft_method '{draft_method}'.")
 
     def __call__(
         self,
@@ -270,22 +295,33 @@ class DraftLossWrapper:
             **kwargs,
         )
 
-        loss_input, data = self.prepare_fn(
-            logits=next_token_logits,
-            data=data,
-            loss_fn=self.draft_loss_fn,
-            vocab_parallel_rank=self.vocab_parallel_rank,
-            vocab_parallel_group=self.vocab_parallel_group,
-            context_parallel_group=self.context_parallel_group,
-        )
-        draft_loss = self.draft_loss_fn(
+        if self.draft_method in ("dflash", "dspark"):
+            # The block loss needs no prepare step: the teacher is the raw
+            # (vocab-parallel) policy logits and the student block logits were
+            # stashed by the train loop.
+            loss_input = {
+                "teacher_logits": next_token_logits.detach(),
+                "student_block_logits": data["draft_block_logits"],
+            }
+        else:
+            loss_input, data = self.prepare_fn(
+                logits=next_token_logits,
+                data=data,
+                loss_fn=self.draft_loss_fn,
+                vocab_parallel_rank=self.vocab_parallel_rank,
+                vocab_parallel_group=self.vocab_parallel_group,
+                context_parallel_group=self.context_parallel_group,
+            )
+        draft_loss, draft_metrics = self.draft_loss_fn(
             data=data,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            global_draft_pass_counts=self.global_draft_pass_counts,
             **loss_input,
         )
         combined_loss = policy_loss + self.loss_weight * draft_loss
         metrics["draft_loss"] = float(draft_loss.detach().item())
+        metrics.update(draft_metrics)
         return combined_loss, metrics
 
 

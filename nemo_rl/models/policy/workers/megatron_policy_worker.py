@@ -50,6 +50,10 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.utils import (
+    compute_block_draft_slot_valid_counts,
+    compute_draft_pass_valid_counts,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -803,6 +807,77 @@ class MegatronPolicyWorkerImpl(
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
+                # Draft (TTT) loss normalization: the draft's valid-token
+                # counts differ from the policy's (per-pass masks shift by
+                # d+1), so it gets its own global per-pass counts, all-reduced
+                # over DP only. The loss derives its gradient denominator
+                # (sum_d alpha_d * count_d) and the per-pass metric
+                # denominators from this vector.
+                draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+                draft_ttt_steps = (
+                    int(self.cfg["draft"].get("ttt_steps", 1) or 1)
+                    if draft_enabled
+                    else 1
+                )
+                draft_method = (
+                    self.cfg["draft"].get("method", "eagle3")
+                    if draft_enabled
+                    else "eagle3"
+                )
+                global_draft_pass_counts = None
+                if draft_enabled and "token_mask" in batch and "sample_mask" in batch:
+                    if draft_method in ("dflash", "dspark"):
+                        # Deferred import: the dflash module pulls mcore
+                        # transformer pieces only needed on this path.
+                        from nemo_rl.models.megatron.draft.dflash import (
+                            anchors_to_count_map,
+                            sample_block_anchors,
+                        )
+
+                        # Sample block anchors ONCE for the whole local batch
+                        # (deterministic from the batch content, identical on
+                        # every TP rank). They travel through the batch as a
+                        # [B, S] per-position count map: dim 1 must be the
+                        # sequence dim for every batch tensor (dynamic
+                        # batching validates, truncates, and length-bucket
+                        # reorders along it), which a [B, N] position tensor
+                        # cannot survive. The train loop rebuilds per-mb
+                        # block lists from the map. The per-slot counts are
+                        # the block analogue of the per-pass TTT counts.
+                        anchors, anchor_valid = sample_block_anchors(
+                            token_mask=batch["token_mask"],
+                            sample_mask=batch["sample_mask"],
+                            input_ids=batch["input_ids"],
+                            num_anchors=int(self.cfg["draft"]["anchors_per_seq"]),
+                            generation_only=bool(
+                                self.cfg["draft"].get(
+                                    "anchor_from_generation_only", True
+                                )
+                            ),
+                        )
+                        batch["draft_anchor_count_map"] = anchors_to_count_map(
+                            anchors, anchor_valid, batch["token_mask"].shape[1]
+                        )
+                        global_draft_pass_counts = (
+                            compute_block_draft_slot_valid_counts(
+                                batch["token_mask"],
+                                batch["sample_mask"],
+                                anchors,
+                                anchor_valid,
+                                gamma=int(self.cfg["draft"]["gamma"]),
+                            ).to(device=global_valid_toks.device)
+                        )
+                    else:
+                        global_draft_pass_counts = compute_draft_pass_valid_counts(
+                            batch["token_mask"],
+                            batch["sample_mask"],
+                            ttt_steps=draft_ttt_steps,
+                        ).to(device=global_valid_toks.device)
+                    torch.distributed.all_reduce(
+                        global_draft_pass_counts,
+                        group=parallel_state.get_data_parallel_group(),
+                    )
+
                 # Pre-compute the MTP loss mask, only when MTP is enabled, so
                 # process_microbatch can pack it.
                 model_config = self._get_model_config()
@@ -868,7 +943,6 @@ class MegatronPolicyWorkerImpl(
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
-                    draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
                     use_router_replay = _should_use_router_replay(
                         enabled=self._router_replay_enabled,
                         data=batch,
@@ -887,10 +961,12 @@ class MegatronPolicyWorkerImpl(
                             defer_fp32_logits=self.defer_fp32_logits,
                             global_valid_seqs=global_valid_seqs,
                             global_valid_toks=global_valid_toks,
+                            global_draft_pass_counts=global_draft_pass_counts,
                             sampling_params=self.sampling_params,
                             straggler_timer=self.mcore_state.straggler_timer,
                             draft_model=self.draft_model,
                             enable_hidden_capture=draft_enabled,
+                            draft_ttt_steps=draft_ttt_steps,
                             use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
                                 "use_fused_linear_logprobs", False
                             ),
@@ -1354,6 +1430,12 @@ class MegatronPolicyWorkerImpl(
         placeholder_n = torch.tensor(1.0, device="cuda")
 
         draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+        # With TTT enabled the draft's core attention is the multi-pass module,
+        # so the forward MUST run through forward_ttt even here (the plain
+        # single-pass forward would trip its begin_pass guard).
+        draft_ttt_steps = (
+            int(self.cfg["draft"].get("ttt_steps", 1) or 1) if draft_enabled else 1
+        )
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
             data=data,
@@ -1384,6 +1466,7 @@ class MegatronPolicyWorkerImpl(
                     straggler_timer=self.mcore_state.straggler_timer,
                     draft_model=self.draft_model,
                     enable_hidden_capture=draft_enabled,
+                    draft_ttt_steps=draft_ttt_steps,
                     use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
                         "use_fused_linear_logprobs", False
                     ),
@@ -1473,9 +1556,29 @@ class MegatronPolicyWorkerImpl(
             self.model.start_grad_sync()
         self.model.finish_grad_sync()
 
-        # Wait for the comm-stream reduce dispatched above before opt.step
-        # reads main_grad. Without this, grad_norm collapses to ~1/2.
+        # Wait for the comm-stream reduce dispatched above before reading/
+        # all-reducing main_grad below. Without this, grad_norm collapses to
+        # ~1/2 (and the TP all-reduce just below would race the same grads).
         torch.cuda.synchronize()
+
+        # Replicated-param grad all-reduce across TP. The regular train()
+        # path gets this from mcore's finalize_model_grads (the schedules
+        # call config.finalize_model_grads_func after the last backward);
+        # this split-step path bypasses the schedules' finalize, so without
+        # this call the params whose raw grads are per-rank partial sums —
+        # qk-layernorm weights (each rank only sees its local heads) and
+        # SP-flagged layernorms — silently diverge across TP ranks, one
+        # optimizer step at a time. Same call, same ordering (after the DP
+        # grad sync) as mcore finalize_model_grads.
+        from megatron.core.distributed.finalize_model_grads import (
+            _allreduce_non_tensor_model_parallel_grads,
+        )
+
+        _allreduce_non_tensor_model_parallel_grads(
+            [self.model],
+            get_model_config(self.model),
+            get_pg_collection(self.model).tp,
+        )
 
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
@@ -2159,9 +2262,9 @@ class MegatronPolicyWorkerImpl(
             yield name, tensor
 
         if self.draft_model is not None:
-            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
+            from nemo_rl.models.megatron.draft import export_draft_weights_to_hf
 
-            draft_weights = export_eagle_weights_to_hf(
+            draft_weights = export_draft_weights_to_hf(
                 self.draft_model,
             )
             for name, tensor in draft_weights:

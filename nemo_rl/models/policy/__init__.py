@@ -494,6 +494,47 @@ class DraftConfig(TypedDict):
     loss_weight: NotRequired[float]
     num_layers: NotRequired[int | None]
     aux_layer_indices: NotRequired[list[int] | None]
+    # Multi-pass TTT draft training. ttt_steps=1 (default) keeps the stock
+    # single-pass path; >1 runs that many sequential draft passes with the
+    # trunk+branch two-part attention (requires CP=1, no sequence parallel,
+    # no sequence packing, no fused linear logprobs). Pass-d RoPE positions
+    # are offset by d-1 (inference-aligned, matching modelopt's reference
+    # TTT) — not configurable.
+    ttt_steps: NotRequired[int]
+    # Per-pass loss weights alpha_d (len == ttt_steps); null = uniform 1.0.
+    ttt_pass_weights: NotRequired[list[float] | None]
+    # Draft algorithm: "eagle3" (default), or the vLLM >= 0.26 block drafters
+    # "dflash"/"dspark" (anchor + mask-token blocks, bidirectional in-block
+    # attention, trunk truncated at the anchor; additionally require PP == 1).
+    method: NotRequired[str]
+    # ---- dflash/dspark only ----
+    # Speculated tokens per block (vLLM num_speculative_tokens).
+    gamma: NotRequired[int]
+    # Anchors sampled per sequence (static shape).
+    anchors_per_seq: NotRequired[int]
+    # Restrict anchors to generation segments (token_loss_mask == 1 labels).
+    anchor_from_generation_only: NotRequired[bool]
+    # Reserved, unused-in-data token id (required for dflash/dspark). Mask
+    # slots embed via the target's FROZEN embedding row at this id (official
+    # DFlash contract; never trained).
+    mask_token_id: NotRequired[int | None]
+    # Named slot-weighting scheme for the block-draft loss: null/"uniform",
+    # or "exp" = the DFlash paper's exponentially decaying weight
+    # w_j = exp(-j / gamma_d), gamma_d tabulated by block size (b8 -> 4,
+    # b10 -> 5, b16 -> 7; interpolated otherwise).
+    loss_weighting: NotRequired[str | None]
+    # DSpark Markov-head rank.
+    markov_rank: NotRequired[int]
+    # Trunk-attention bucketing granularity in tokens (correctness-neutral).
+    trunk_chunk: NotRequired[int]
+    # Per-head q/k RMSNorm in the draft attention (Qwen3 style).
+    qk_layernorm: NotRequired[bool]
+    # Draft-only optimizer param group (separate from the policy's
+    # megatron_cfg.optimizer settings). All null = share the policy optimizer
+    # settings and keep the stock param-group partition.
+    lr: NotRequired[float | None]
+    min_lr: NotRequired[float | None]
+    weight_decay: NotRequired[float | None]
 
 
 class TokenizerConfig(TypedDict):
