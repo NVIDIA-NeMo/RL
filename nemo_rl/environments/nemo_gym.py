@@ -697,24 +697,6 @@ Depending on your data shape, you may want to change these values."""
         )
 
         token_source = self._token_capture_source
-        if self._token_capture_dirs and not getattr(
-            self, "_checked_capture_dirs", False
-        ):
-            self._checked_capture_dirs = True
-            # The default writer and reader are colocated.
-            # A node-local directory avoids network latency and shard collisions.
-            for capture_dir in self._token_capture_dirs:
-                if any(
-                    str(capture_dir).startswith(prefix)
-                    for prefix in ("/lustre", "/gpfs", "/mnt/shared")
-                ):
-                    print(
-                        f"WARNING: token_id_capture_dir={capture_dir} looks like a shared "
-                        "filesystem. Capture is written and read on this node, so a node-local "
-                        "path (/tmp, RAY_TMPDIR, local NVMe) is faster and safer under sharding.",
-                        flush=True,
-                    )
-
         # A monotonic counter gives each rollout an id unique across steps; the per-step ``_rowidx``
         # resets every step and would collide token files. The counter is per ACTOR, so under
         # sharding K actors would each start at 0 and collide across shards -- harmless while the

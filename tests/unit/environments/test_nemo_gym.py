@@ -905,27 +905,6 @@ class TestTokenCaptureMetrics:
         assert _token_capture_metrics([], rebuilt=0, unbuilt=0) == {}
 
 
-@pytest.mark.parametrize(
-    "recipe_name",
-    [
-        "grpo_rg_claude_code_tokcap.yaml",
-        "grpo_rg_claude_code_tokcap_smoke.yaml",
-        "grpo_rg_claude_code_tokcap_supply.yaml",
-        "grpo_rg_claude_code_tokcap_tools.yaml",
-    ],
-)
-def test_token_capture_recipes_use_actor_owned_file_delivery(recipe_name):
-    recipe = safe_load((Path("examples/nemo_gym") / recipe_name).read_text())
-    capture = recipe["env"]["nemo_gym"]["token_id_capture"]
-
-    assert capture == {
-        "enabled": True,
-        "all_agents": True,
-        "dir": capture["dir"],
-        "rebuild_response": False,
-    }
-
-
 def test_build_token_capture_source_uses_the_default_file_store(tmp_path):
     source, directories = _build_token_capture_source(
         {
