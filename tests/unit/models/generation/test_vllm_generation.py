@@ -689,7 +689,7 @@ def test_main_worker_configures_nvfp4_pertoken_engine_kwargs(monkeypatch):
         DEFAULT_NVFP4_IGNORE,
     )
 
-    module_name = "nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_vllm"
+    module_name = "nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken"
     fake_vllm_module = types.ModuleType(module_name)
     captured = {}
 
@@ -733,7 +733,7 @@ def test_main_worker_accepts_nvfp4_pertoken_over_framework_defaults():
         DEFAULT_NVFP4_IGNORE,
         build_nvfp4_pertoken_hf_quant_config,
     )
-    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_vllm import (
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
         NVFP4_PER_TOKEN_METHOD,
         NvFp4PerTokenConfig,
     )
@@ -786,7 +786,7 @@ def test_nvfp4_pertoken_rejects_conflicting_engine_kwargs(llm_kwargs):
     from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
         DEFAULT_NVFP4_IGNORE,
     )
-    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_vllm import (
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
         configure_nvfp4_pertoken_engine_kwargs,
     )
 
