@@ -321,6 +321,14 @@ def setup_distributed() -> None:
     torch.distributed.init_process_group("nccl")
 
 
+def configure_refit_environment(config) -> None:
+    """Set the refit allocator mode before NCCL caches the value."""
+    generation_cfg = config.get("generation")
+    if generation_cfg is not None and not generation_cfg["colocated"]["enabled"]:
+        backend = generation_cfg.get("backend")
+        os.environ["NCCL_CUMEM_ENABLE"] = "0" if backend == "sglang" else "1"
+
+
 def validate_and_set_config(
     config,
     rank,
@@ -342,11 +350,6 @@ def validate_and_set_config(
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
         )
-
-    # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
-    # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
-    if not is_generation_colocated:
-        os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
     # Setup data types
     dtype_map = {

@@ -36,6 +36,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.fault_tolerance import RolloutHealthMonitor
 from nemo_rl.models.generation.sglang.sglang_router import _start_router
 from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 from nemo_rl.models.generation.sglang.utils.async_utils import AsyncLoopThread
@@ -45,9 +46,11 @@ from nemo_rl.models.generation.sglang.utils.ip_port_utils import (
 )
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
     NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
+    Lock,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.venvs import make_actor_runtime_env
+from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -74,6 +77,11 @@ class SGLangGeneration(GenerationInterface):
     ):
         self.cluster = cluster
         self.sglang_cfg = sglang_cfg
+        # GenerationInterface consumers (create_weight_synchronizer, the refit
+        # transports) read ``cfg``; keep the sglang-specific name as the alias.
+        self.cfg = sglang_cfg
+        # Set by ``grpo.setup``; ``refit_policy_generation`` dispatches on it.
+        self.weight_synchronizer: WeightSynchronizer | None = None
         self._async_loop: AsyncLoopThread | None = AsyncLoopThread()
         self._http_client: HttpClient | None = None
 
@@ -103,6 +111,13 @@ class SGLangGeneration(GenerationInterface):
         self.needs_offload: bool = sglang_server_cfg["needs_offload"]
         self.model_path: str | None = sglang_cfg["sglang_cfg"]["model_path"]
 
+        # --- Weight-refit / fault-tolerance state ------------------------
+        # Number of engines created by the most recent ``_start_engines``
+        # call that the refit dispatch has not connected yet.
+        self.num_new_engines: int = 0
+        self.pause_generation_mode: str = sglang_server_cfg["pause_generation_mode"]
+        self._health_monitor: RolloutHealthMonitor | None = None
+
         # --- Router bootstrap --------------------------------------------
         # Resolved router endpoint is held only on the instance; we don't
         # mutate the caller's config dict. Workers receive these as explicit
@@ -121,6 +136,14 @@ class SGLangGeneration(GenerationInterface):
         init_handles, _ = self._start_engines({})
         if init_handles:
             ray.get(init_handles)
+
+        # Serializes weight refits against engine recovery across processes.
+        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+
+        if sglang_cfg["sglang_cfg"].get("use_fault_tolerance"):
+            monitor = RolloutHealthMonitor(self, sglang_cfg)
+            monitor.start()
+            self._health_monitor = monitor
 
     # ------------------------------------------------------------------
     # Engine topology properties (formerly ``ServerGroup``)
@@ -209,6 +232,10 @@ class SGLangGeneration(GenerationInterface):
                 }.items()
             }
 
+            # Trainer and engine must agree on the NCCL transport; sglang's
+            # scheduler subprocess defaults to NCCL_CUMEM_ENABLE=0.
+            env_vars["NCCL_CUMEM_ENABLE"] = "0"
+
             # Explicitly pass CUDA_VISIBLE_DEVICES through to the engine actor so
             # all engines see the same global value (Ray would otherwise remap it
             # because we set the NOSET_* flags above).
@@ -247,7 +274,9 @@ class SGLangGeneration(GenerationInterface):
             local_all_engines.append((global_rank, engine))
             self.all_engines[i] = engine
 
-        if len(local_all_engines) == 0:
+        self.num_new_engines = len(local_all_engines)
+
+        if self.num_new_engines == 0:
             return [], port_cursors
 
         # SGLang engine server/NCCL/dist_init ports come from the reserved
@@ -292,7 +321,127 @@ class SGLangGeneration(GenerationInterface):
             ]
         )
 
+    def _recover(self) -> None:
+        """Recover dead engines, overlapping init."""
+        dead_indices = [
+            i for i, engine in enumerate(self.all_engines) if engine is None
+        ]
+        if not dead_indices:
+            # ``_start_engines`` rewrites ``num_new_engines`` unconditionally, so
+            # calling it with nothing to restart would clear a count the refit
+            # dispatch has not consumed yet. That count is what gates ``_connect``
+            # in the weight synchronizer, and ``_connect`` is the only place the
+            # transport is ever built -- clearing it on the first refit leaves
+            # every rank silently no-oping the weight send for the rest of the run.
+            return
+
+        port_cursors: dict[int, int] = {}
+        handles, _ = self._start_engines(port_cursors)
+        if handles:
+            ray.get(handles)
+
+        assert self.num_new_engines == len(dead_indices), (
+            "num_new_engines does not match dead_indices length"
+        )
+
+        # Replacement engines are freshly booted and still loading weights, so
+        # give them the configured grace period before the monitor probes them.
+        if self._health_monitor is not None:
+            self._health_monitor.arm_first_wait()
+
+        if self.needs_offload and dead_indices:
+            new_engines = [self.all_engines[i] for i in dead_indices]
+            ray.get(
+                [
+                    engine.release_memory_occupation.remote(tags=["weights"])
+                    for engine in new_engines
+                ]
+            )
+            ray.get(
+                [
+                    engine.release_memory_occupation.remote(tags=["kv_cache"])
+                    for engine in new_engines
+                ]
+            )
+            ray.get(
+                [
+                    engine.resume_memory_occupation.remote(tags=["weights"])
+                    for engine in new_engines
+                ]
+            )
+
+    def get_updatable_engines_and_lock(self):
+        """Return engines eligible for weight updates."""
+        return (
+            self.engines,
+            self.rollout_engine_lock,
+            self.num_new_engines,
+            self.engine_gpu_counts,
+            self.engine_gpu_offsets,
+        )
+
+    def recover_updatable_engines(self):
+        """Restart any dead rollout engines and update ``num_new_engines``."""
+        # Resumed by prepare_for_generation; probing earlier races the weight stream.
+        self._health_monitor.pause()
+
+        self._recover()
+
+        return (
+            self.engines,
+            self.rollout_engine_lock,
+            self.num_new_engines,
+            self.engine_gpu_counts,
+            self.engine_gpu_offsets,
+        )
+
+    def clear_updatable_num_new_engines(self):
+        # Called by the refit dispatch once it has connected the new engines, so
+        # the next refit does not treat them as new again.
+        self.num_new_engines = 0
+
+    def pause_generation(self, mode: str) -> None:
+        """Pause generation on every node-0 engine.
+
+        Args:
+            mode: Pause mode forwarded to every engine.
+        """
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        ray.get([e.pause_generation.remote(mode=mode) for e in engines])
+
+    def continue_generation(self) -> None:
+        """Resume generation on every node-0 engine."""
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        ray.get([e.continue_generation.remote() for e in engines])
+
+    def begin_weight_update(self) -> None:
+        """Open a weight-update session on every node-0 engine."""
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        ray.get([e.begin_weight_update.remote() for e in engines])
+
+    def end_weight_update(self) -> None:
+        """Close a weight-update session and rebuild quantized kernel layouts."""
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        ray.get([e.end_weight_update.remote() for e in engines])
+
     def shutdown(self) -> bool:
+        if self._health_monitor:
+            self._health_monitor.stop()
+
+        if self.weight_synchronizer is not None:
+            # ``shutdown`` is reachable twice (explicit call + ``__del__``);
+            # drop the handle so teardown stays one-shot.
+            self.weight_synchronizer.shutdown()
+            self.weight_synchronizer = None
+
         ok = True
         engines = [e for e in self.all_engines if e is not None]
         if engines:
@@ -742,16 +891,19 @@ class SGLangGeneration(GenerationInterface):
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""
-        if not self.needs_offload:
-            return
         tags = kwargs.get("tags", None)
-        engines = [e for e in self.engines if e is not None]
-        if not engines:
-            return
-        ray.get([e.resume_memory_occupation.remote(tags=tags) for e in engines])
+        if self.needs_offload:
+            engines = [e for e in self.engines if e is not None]
+            if engines:
+                ray.get([e.resume_memory_occupation.remote(tags=tags) for e in engines])
+        # The weights-only stage is mid-refit; only kv_cache can serve a probe.
+        if self._health_monitor and (tags is None or "kv_cache" in tags):
+            self._health_monitor.resume()
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""
+        if self._health_monitor:
+            self._health_monitor.pause()
         if not self.needs_offload:
             return
         tags = kwargs.get("tags", None)
