@@ -1,0 +1,82 @@
+# VLM GRPO recipe for Mistral-Small-3.2-24B-Instruct-2506.
+#
+# Mistral-Small-3.2 is an image-text-to-text model
+# (Mistral3ForConditionalGeneration). This recipe exercises the multimodal
+# path on the CLEVR-CoGenT dataset, mirroring vlm_grpo_3B.yaml (Qwen2.5-VL-3B)
+# with sharding scaled up for the 24B parameter count.
+#
+# The "mistral3" entry in nemo_rl/models/policy/utils.py:AUTOMODEL_FACTORY
+# already routes to AutoModelForImageTextToText, and parallelize.py has the
+# Mistral3 vision-tower + language-model split codepath.
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 8
+  reward_shaping:
+    overlong_buffer_length: 512
+  max_num_steps: 20
+
+checkpointing:
+  checkpoint_dir: results/vlm_grpo-mistral-small-3.2-24b-instruct-clevr-2n8g-dtensor2tp4
+  model_save_format: null
+
+policy:
+  model_name: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+  tokenizer:
+    name: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  dtensor_cfg:
+    activation_checkpointing: true
+    tensor_parallel_size: 4
+    _v2: false
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 4
+  optimizer:
+    kwargs:
+      lr: 5.0e-07
+  generation:
+    max_new_tokens: 1024
+    vllm_cfg:
+      tensor_parallel_size: 4
+      max_model_len: 4096
+      skip_tokenizer_init: false
+    vllm_kwargs:
+      # See vlm_grpo_3B.yaml — mm_processor_cache_gb caching has known issues
+      mm_processor_cache_gb: 0
+
+data:
+  max_input_seq_length: 4096
+  train:
+    dataset_name: clevr-cogent
+    split: train
+  validation:
+    dataset_name: clevr-cogent
+    split: valA
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot.txt
+    processor: vlm_hf_data_processor
+    env_name: clevr-cogent
+
+env:
+  clevr-cogent:
+    num_workers: 8
+    reward_functions:
+    - name: format
+      weight: 0.2
+    - name: exact_alnum
+      weight: 0.8
+
+logger:
+  log_dir: logs/vlm_grpo-mistral-small-3.2-24b-instruct-clevr-2n8g-dtensor2tp4
+  tensorboard_enabled: true
+  monitor_gpus: false
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
