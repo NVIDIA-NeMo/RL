@@ -370,7 +370,14 @@ def _get_params_in_layers(param_names, layers):
     return params
 
 
-def _get_module_from_param_name(model, name: str):
+def get_module_from_param_name(model, name: str):
+    """Resolve the vLLM submodule owning an HF-named parameter.
+
+    Walks ``name``'s dotted path through ``model``, remapping fused/renamed
+    prefixes via ``packed_modules_mapping`` and ``hf_to_vllm_mapper``, and
+    stopping early at a ``RoutedExperts`` (or its owning ``MoERunner``) since
+    per-expert path components below that point do not exist as submodules.
+    """
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
     # The module path is all but the last part (the parameter's own name)
     path_parts = name.split(".")
@@ -439,7 +446,7 @@ def _is_fp8_weight(name, model):
         fp8_state.seen_params.add(name)
         # Filter out bias params
         if name.endswith("weight"):
-            module = _get_module_from_param_name(model, name)
+            module = get_module_from_param_name(model, name)
             # We currently only quantize linear layers
             if (
                 isinstance(module, LinearBase)

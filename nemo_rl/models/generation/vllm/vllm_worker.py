@@ -117,7 +117,7 @@ def _configure_nvfp4_pertoken_engine_kwargs(
 
     # This module subclasses vLLM types and is intentionally imported only in
     # the vLLM worker environment, not by Megatron training workers.
-    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_vllm import (
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
         configure_nvfp4_pertoken_engine_kwargs,
     )
 
