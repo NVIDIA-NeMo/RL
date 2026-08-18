@@ -1,11 +1,11 @@
 defaults: ../../grpo_math_1B.yaml
 # Async colocated GRPO with Megatron (Nemotron-3-Nano-30B-A3B): training and
-# generation share GPUs/workers; the engine stays alive across steps and reads
-# weights from the shared model (no refit). Off-policy data via the replay buffer.
+# generation share GPUs/workers; the engine sleeps across training steps and
+# serves the shared weights (resharding into a dedicated inference layout when
+# one is configured). Off-policy data via the replay buffer.
 grpo:
   num_prompts_per_step: 2
   num_generations_per_prompt: 8
-  max_num_steps: 500
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 4  # weight versions a rollout may span
@@ -15,7 +15,7 @@ loss_fn:
   use_importance_sampling_correction: true  # required for off-policy replay data
 checkpointing:
   enabled: false
-  checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-megatron_async_colocated
+  checkpoint_dir: results/grpo-nanov3-30BA3B-4n4g-megatron_async_colocated
   save_period: 100
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
@@ -40,12 +40,13 @@ policy:
     mcore_generation_config:
       async_engine: true
 logger:
-  log_dir: logs/grpo-nanov3-30BA3B-2n8g-megatron_async_colocated
+  log_dir: logs/grpo-nanov3-30BA3B-4n4g-megatron_async_colocated
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-nanov3-30BA3B-2n8g-megatron_async_colocated
+    name: grpo-nanov3-30BA3B-4n4g-megatron_async_colocated
 cluster:
-  gpus_per_node: 8
-  num_nodes: 2
+  gpus_per_node: 4
+  num_nodes: 4
+  segment_size: 2
