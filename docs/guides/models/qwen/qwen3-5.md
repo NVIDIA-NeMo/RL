@@ -242,9 +242,8 @@ FP8 noise.
 
 ### Limitations
 
-- MXFP8 is not yet supported for Qwen3.5: the grouped-MoE expert refit only
-  implements blockwise FP8 (`fp8_recipe: blockwise`), and an MXFP8 refit raises
-  `NotImplementedError`.
+- MXFP8 is not yet supported; tracked in
+  [#3694](https://github.com/NVIDIA-NeMo/RL/issues/3694).
 
 ## `flash-linear-attention` Performance
 
