@@ -48,8 +48,9 @@ class WeightSynchronizer(ABC):
 
     Implementations handle the weight transfer for a specific transport
     mechanism (ZMQ IPC, HTTP, NCCL collectives). The orchestrator calls
-    sync_weights() and mark_stale() without knowing which transport is
-    being used or whether components are colocated.
+    sync_weights() without knowing which transport is being used or
+    whether components are colocated; per-step staleness bookkeeping is
+    owned by the training loop.
 
     Colocated transports (IPC, HTTP) own phase transitions internally
     (offload_before_refit, prepare_for_generation, offload_after_refit).
@@ -101,19 +102,11 @@ class WeightSynchronizer(ABC):
     def is_stale(self) -> bool:
         """Whether the generation backend's weights are out of date.
 
-        Returns True after mark_stale() is called and before the next
-        successful sync_weights() completes.
-        """
-        pass
-
-    @abstractmethod
-    def mark_stale(self) -> None:
-        """Mark weights as stale after a training step.
-
-        Should be called after every training step so the orchestrator
-        knows a sync is needed before the next generation phase. This
-        applies globally — all generation workers are considered stale
-        and will be updated atomically on the next ``sync_weights()`` call.
+        Returns True until the first successful sync_weights()
+        completes, so a fresh run always performs its initial sync (a
+        synchronizer that seeds current weights at construction may start
+        False to skip it). Per-step staleness is tracked by the training
+        loop, not here.
         """
         pass
 

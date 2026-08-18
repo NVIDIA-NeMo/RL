@@ -74,9 +74,6 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
     def is_stale(self) -> bool:
         return self._stale
 
-    def mark_stale(self) -> None:
-        self._stale = True
-
     def _release_after_refit(self) -> bool:
         cfg = self._checkpoint_engine_config
         return bool(cfg["engine_kwargs"][cfg["backend"]]["release_after_refit"])

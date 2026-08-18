@@ -56,6 +56,9 @@ class VllmSpecificArgs(TypedDict):
     expose_http_server: NotRequired[bool]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
+    # Invalidate weight-dependent multimodal encoder outputs after a successful
+    # async refit. Enable only when generation is quiesced during weight updates.
+    reset_encoder_cache_after_weight_update: NotRequired[bool]
     # Fixed internal refit endpoint port for stable Kubernetes targetPorts.
     http_refit_server_port: NotRequired[int | None]
     # Fixed ZeroMQ relay port for stable Kubernetes targetPorts.
@@ -181,6 +184,20 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
             f"Unknown vLLM refit transport {transport!r}: expected null, "
             "'nccl_reshard', 'vllm_s3_sparse', 'vllm_zmq_sparse', 'nixl', or a "
             "'module:ClassName' checkpoint-engine path."
+        )
+    # The encoder-cache reset is implemented only on the collective/IPC and
+    # nccl_reshard async refit paths (both returned above). Fail loudly rather
+    # than let other transports silently keep stale multimodal encoder outputs
+    # across weight updates. Some callers re-validate partial generation
+    # configs (e.g. worker-side NIXL setup), so vllm_cfg may be absent here.
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg and vllm_cfg.get("reset_encoder_cache_after_weight_update"):
+        raise ValueError(
+            "vllm_cfg.reset_encoder_cache_after_weight_update is not supported "
+            f"with refit_transport={transport!r}: this transport's refit path "
+            "does not reset the multimodal encoder cache, so stale vision "
+            "embeddings would silently survive weight updates. Supported "
+            "transports: null (collective/IPC) and 'nccl_reshard'."
         )
     refit_config = VllmRefitConfig.model_validate(config.get("refit_cfg") or {})
     if ":" in transport:
