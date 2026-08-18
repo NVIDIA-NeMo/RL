@@ -28,6 +28,7 @@ from nemo_rl.data.datasets.response_datasets.intent import (
     IntentDataset,
     _format_options,
 )
+from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
 from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
@@ -93,6 +94,26 @@ def test_aime_defaults_to_one_copy_and_supports_explicit_repeat(monkeypatch):
     assert len(default_dataset.dataset) == 2
     assert len(repeated_dataset.dataset) == 6
     assert default_dataset.processor is PROCESSOR_REGISTRY["math_hf_data_processor"]
+
+
+def test_nemo_gym_dataset_records_source_without_parsing_rows(tmp_path):
+    data_path = tmp_path / "gym.jsonl"
+    rows = [
+        {"agent_ref": {"name": "math"}},
+        {"agent_ref": {"name": "code"}},
+        {"agent_ref": {"name": "math"}},
+    ]
+    data_path.write_text(
+        "".join(f"{json.dumps(row)}\n" for row in rows) + "not parsed at load time\n"
+    )
+
+    dataset = NemoGymDataset(str(data_path), repeat=100)
+    source_stat = data_path.stat()
+
+    assert dataset.agent_name_sources == frozenset(
+        {(str(data_path.resolve()), source_stat.st_mtime_ns, source_stat.st_size)}
+    )
+    assert len(dataset.dataset) == 400
 
 
 @pytest.mark.parametrize(

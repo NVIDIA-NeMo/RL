@@ -11,14 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import math
 import os
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from time import monotonic
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict
@@ -48,6 +50,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_shards import (
+    DEFAULT_PLACEMENT_STRATEGY,
     SHARDING_CONFIG_KEYS,
     ShardConfigError,
     ShardPlan,
@@ -1304,22 +1307,6 @@ class NemoGymShardSet:
                 return shard_name
         raise ShardSetupError("Handle does not belong to this NeMo-Gym shard set")
 
-    def sole_handle(self) -> Any:
-        """The only actor, for callers that predate routing.
-
-        Raises:
-            ShardSetupError: There is more than one actor, so picking one would
-                silently drop the rest.
-        """
-        handles = self.all_handles
-        if len(handles) != 1:
-            raise ShardSetupError(
-                f"Expected a single NeMo-Gym actor but this set has "
-                f"{len(handles)} across shards {sorted(self.handles)}. The "
-                f"caller needs the shard-aware rollout router."
-            )
-        return handles[0]
-
     def shutdown(self) -> None:
         """Stop every actor, then release the bundles they were pinned to."""
         shutdown_environments(
@@ -1461,8 +1448,14 @@ def _build_sharded_gym_actors(
     if nemo_gym_dict.get("num_gpu_nodes", 0):
         print(
             "env.nemo_gym.shards is set, so the num_gpu_nodes affinity hint is "
-            "superseded by STRICT_SPREAD placement across "
-            f"{len(instances)} nodes."
+            f"superseded by {plan.placement_strategy} placement across "
+            f"{len(instances)} bundles."
+        )
+    if plan.placement_strategy != DEFAULT_PLACEMENT_STRATEGY:
+        print(
+            f"env.nemo_gym.placement_strategy is {plan.placement_strategy}, not "
+            f"{DEFAULT_PLACEMENT_STRATEGY}, so shards may share a node and the "
+            f"per-node capacity isolation sharding exists for does not hold."
         )
 
     base_gym_dict = {
@@ -1488,16 +1481,17 @@ def _build_sharded_gym_actors(
             }
             for shard, _ in instances
         ],
-        strategy="STRICT_SPREAD",
+        strategy=plan.placement_strategy,
     )
     try:
         ray.get(pg.ready(), timeout=pg_ready_timeout)
     except BaseException as error:
         remove_placement_group(pg)
         raise ShardSetupError(
-            f"Could not place {len(instances)} NeMo-Gym shard instances on "
-            f"distinct nodes within {pg_ready_timeout}s. STRICT_SPREAD needs "
-            f"one node per instance with the requested CPUs free; the "
+            f"Could not place {len(instances)} NeMo-Gym shard instances with "
+            f"strategy {plan.placement_strategy} within {pg_ready_timeout}s. "
+            f"Every instance needs the requested CPUs free, and "
+            f"{DEFAULT_PLACEMENT_STRATEGY} needs them on distinct nodes; the "
             f"allocation may be too small or its nodes too busy."
         ) from error
 
@@ -1580,40 +1574,114 @@ def _discover_agent_shard_map(
     return build_agent_shard_map(entries_by_shard, plan.allowed_duplicate_entries)
 
 
-def spinup_nemo_gym_actor(
-    env_configs: dict[str, Any],
-    *,
-    base_urls: list[Optional[str]],
-    model_name: str,
-    enable_router_replay: bool = False,
-    use_fastokens: bool = False,
-) -> Any:
-    """Spin up a single NeMo-Gym actor against the given generation server URLs.
+def validate_dataset_agent_coverage(
+    shard_set: NemoGymShardSet,
+    datasets: Mapping[str, Any],
+) -> None:
+    """Fail at setup if any row names an agent no shard hosts.
 
-    When ``env_configs["nemo_gym"]["num_gpu_nodes"] > 0``, the actor is
-    scheduled with soft NodeAffinity to the caller's Ray node so its colocated
-    GPU resources land where the caller expects.
+    Without this the mistake still surfaces, but only when a row naming the
+    missing agent is first dispatched. A rare agent can sit unseen for hours of
+    training, so the useful time to catch it is before the first step.
 
-    Returns:
-        The spun-up ``NemoGym`` Ray actor handle (``_spinup`` already awaited).
+    Unsharded jobs are skipped: there is one actor, every agent resolves to it,
+    and there is nothing a scan could discover.
+
+    Args:
+        shard_set: The running actors, carrying the agent map built at setup.
+        datasets: Split name to dataset, for the error message. ``None`` values
+            and datasets without gym rows are skipped.
 
     Raises:
-        ShardConfigError: The config is sharded. Callers that dispatch to a
-            single handle cannot serve several shards; they need the router.
+        ShardSetupError: A split references agents no shard hosts.
     """
-    plan = parse_shard_plan(dict(env_configs["nemo_gym"]))
-    if plan is not None:
-        raise ShardConfigError(
-            f"env.nemo_gym.shards defines {len(plan.shards)} shards "
-            f"({', '.join(shard.name for shard in plan.shards)}), but this "
-            f"entrypoint dispatches rollouts to one actor handle. Shard-aware "
-            f"rollout routing is not wired up yet."
-        )
+    if not shard_set.is_sharded:
+        return
 
-    return build_nemo_gym_actors(
-        env_configs,
-        base_urls=base_urls,
-        model_name=model_name,
-        enable_router_replay=enable_router_replay,
-        use_fastokens=use_fastokens,
-    ).sole_handle()
+    hosted = shard_set.hosted_agents
+    for split, dataset in datasets.items():
+        unhosted = sorted(_iter_dataset_agent_names(dataset) - hosted)
+        if unhosted:
+            raise ShardSetupError(
+                f"The {split} dataset references agents that no shard hosts: "
+                f"{unhosted}. Hosted agents: {sorted(hosted)}."
+            )
+
+
+def _iter_dataset_agent_names(dataset: Any) -> set[str]:
+    """Collect the agent names a dataset's rows reference.
+
+    Sharded jobs lazily scan each stable source file once.
+    Unsharded jobs never call this function.
+    Custom or changed sources retain the row-scan fallback.
+    """
+    if dataset is None:
+        return set()
+    if isinstance(dataset, Mapping):
+        return set().union(
+            *(_iter_dataset_agent_names(nested) for nested in dataset.values())
+        )
+    agent_name_sources = getattr(dataset, "agent_name_sources", None)
+    if agent_name_sources is not None:
+        source_agent_names: set[str] = set()
+        for source in agent_name_sources:
+            names = _load_agent_names_from_source(source)
+            if names is None:
+                break
+            source_agent_names.update(names)
+        else:
+            return source_agent_names
+
+    # AllTaskProcessedDataset wraps the raw rows; a plain sequence is also fine.
+    rows = getattr(dataset, "dataset", dataset)
+
+    names: set[str] = set()
+    for row in rows:
+        extra_env_info = row.get("extra_env_info") if hasattr(row, "get") else None
+        if isinstance(extra_env_info, str):
+            extra_env_info = json.loads(extra_env_info)
+        agent_name = _get_agent_name(extra_env_info)
+        if agent_name is not None:
+            names.add(agent_name)
+    return names
+
+
+@lru_cache(maxsize=128)
+def _load_agent_names_from_source(
+    source: tuple[str, int, int],
+) -> frozenset[str] | None:
+    """Read a stable Gym source once per controller process."""
+    path, expected_mtime_ns, expected_size = source
+    try:
+        source_stat = os.stat(path)
+        if (
+            source_stat.st_mtime_ns != expected_mtime_ns
+            or source_stat.st_size != expected_size
+        ):
+            return None
+
+        names: set[str] = set()
+        with open(path) as source_file:
+            for raw_row in source_file:
+                agent_name = _get_agent_name(json.loads(raw_row))
+                if agent_name is not None:
+                    names.add(agent_name)
+
+        source_stat_after_read = os.stat(path)
+        if (
+            source_stat_after_read.st_mtime_ns != expected_mtime_ns
+            or source_stat_after_read.st_size != expected_size
+        ):
+            return None
+    except (OSError, json.JSONDecodeError):
+        return None
+    return frozenset(names)
+
+
+def _get_agent_name(row: object) -> str | None:
+    if not isinstance(row, dict):
+        return None
+    agent_ref = row.get("agent_ref")
+    if not isinstance(agent_ref, dict) or "name" not in agent_ref:
+        return None
+    return str(agent_ref["name"])

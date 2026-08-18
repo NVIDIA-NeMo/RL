@@ -85,7 +85,10 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import (
+    build_nemo_gym_actors,
+    validate_dataset_agent_coverage,
+)
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -692,16 +695,32 @@ def setup(
     nemo_gym_actor = None
 
     def _spinup_nemo_gym(base_urls, model_name):
-        """Spin up the NeMo Gym actor against the given generation server URLs."""
+        """Spin up the NeMo Gym stack against the given generation server URLs.
+
+        Returns a shard set, which is the one actor of an unsharded job as much
+        as it is the K of a sharded one.
+        """
         t0 = time.perf_counter()
-        actor = spinup_nemo_gym_actor(
+        shard_set = build_nemo_gym_actors(
             env_configs,
             base_urls=base_urls,
             model_name=model_name,
             enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         )
-        return actor, time.perf_counter() - t0
+        train_splits = (
+            {f"train[{name}]": split for name, split in dataset.items()}
+            if isinstance(dataset, dict)
+            else {"train": dataset}
+        )
+        try:
+            validate_dataset_agent_coverage(
+                shard_set, {**train_splits, "validation": val_dataset}
+            )
+        except BaseException:
+            shard_set.shutdown()
+            raise
+        return shard_set, time.perf_counter() - t0
 
     total_nodes = cluster_config["num_nodes"]
     segment_size = cluster_config.get("segment_size")
@@ -2934,6 +2953,9 @@ def _grpo_train_impl(
                             effort_config=_get_effort_config(master_config),
                             reward_penalty_config=master_config.reward_penalties,
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+                            num_generations_per_prompt=(
+                                master_config.grpo.num_generations_per_prompt
+                            ),
                             mask_env_flagged_samples=should_mask_flagged_samples(
                                 master_config.env
                             ),
@@ -3898,6 +3920,7 @@ def validate(
                     effort_config=_get_effort_config(master_config),
                     reward_penalty_config=master_config.reward_penalties,
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+                    num_generations_per_prompt=val_num_generations_per_prompt,
                     mask_env_flagged_samples=should_mask_flagged_samples(
                         master_config.env
                     ),

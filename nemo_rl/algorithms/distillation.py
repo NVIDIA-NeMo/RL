@@ -53,7 +53,10 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import (
+    build_nemo_gym_actors,
+    validate_dataset_agent_coverage,
+)
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
@@ -517,12 +520,21 @@ def setup(
             def init_nemo_gym():
                 # Distillation does not configure vLLM for router replay, so the
                 # actor must not require routed experts on its output items.
-                return spinup_nemo_gym_actor(
+                shard_set = build_nemo_gym_actors(
                     env_configs,
                     base_urls=deferred_vllm.dp_openai_server_base_urls,
                     model_name=generation_config["model_name"],
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
                 )
+                try:
+                    validate_dataset_agent_coverage(
+                        shard_set,
+                        {"training": train_dataset, "validation": val_dataset},
+                    )
+                except BaseException:
+                    shard_set.shutdown()
+                    raise
+                return shard_set
 
             init_tasks = {
                 "vllm": init_vllm_deferred,
@@ -778,6 +790,9 @@ def _distillation_train_impl(
                             ),
                             max_rollout_turns=None,
                             greedy=False,
+                            num_generations_per_prompt=(
+                                master_config.distillation.num_generations_per_prompt
+                            ),
                         )
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -1226,6 +1241,7 @@ def validate(
                     ),
                     max_rollout_turns=None,
                     greedy=False,
+                    num_generations_per_prompt=1,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics

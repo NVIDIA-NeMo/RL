@@ -42,6 +42,7 @@ class AllTaskProcessedDataset:
         task_data_processors: Either a single TaskDataProcessFnCallable for single-task,
             or a dict mapping task names to (TaskDataSpec, TaskDataProcessFnCallable) for multi-task
         max_seq_length: Maximum sequence length for tokenized outputs
+        agent_name_sources: Stable NeMo Gym source identities used by sharded validation.
     """
 
     def __init__(
@@ -57,8 +58,10 @@ class AllTaskProcessedDataset:
             Union[dict[str, TaskDataPreProcessFnCallable], TaskDataPreProcessFnCallable]
         ] = None,
         max_seq_length: Optional[int] = None,
+        agent_name_sources: frozenset[tuple[str, int, int]] | None = None,
     ):
         self.dataset = dataset
+        self.agent_name_sources = agent_name_sources
         self.tokenizer = tokenizer
         # TODO @yukih: will be removed once eval datasets are adapted
         self.default_task_data_spec = default_task_data_spec

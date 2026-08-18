@@ -1073,7 +1073,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         patch.object(
             distil_mod, "create_weight_synchronizer"
         ) as mock_create_synchronizer,
-        patch.object(distil_mod, "spinup_nemo_gym_actor") as mock_spinup_nemo_gym,
+        patch.object(distil_mod, "build_nemo_gym_actors") as mock_spinup_nemo_gym,
         patch.object(distil_mod, "ray") as mock_ray,
     ):
         mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
@@ -1217,7 +1217,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
         patch.object(distil_mod, "Policy", DummyPolicy),
         patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
         patch.object(
-            distil_mod, "spinup_nemo_gym_actor", return_value=nemo_gym_actor
+            distil_mod, "build_nemo_gym_actors", return_value=nemo_gym_actor
         ) as mock_spinup_nemo_gym,
         patch.object(distil_mod, "ray") as mock_ray,
     ):

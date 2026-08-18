@@ -56,7 +56,11 @@ from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import DataPlaneClient, build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import (
+    NemoGymShardSet,
+    build_nemo_gym_actors,
+    validate_dataset_agent_coverage,
+)
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
     RolloutRetryPolicy,
@@ -288,22 +292,22 @@ def _build_trainer(
 
 def _spinup_gym(
     master_config: MasterConfig, base_urls: list[Optional[str]]
-) -> tuple[Any, float]:
-    """Spin up the NeMo-Gym actor against the reserved vLLM URLs.
+) -> tuple[NemoGymShardSet, float]:
+    """Spin up the NeMo-Gym shard set against the reserved vLLM URLs.
 
     Args:
         master_config: SC MasterConfig.
         base_urls: Reserved vLLM OpenAI server URLs.
 
     Returns:
-        A tuple of (NeMo-Gym actor, wall time spent in this call).
+        A tuple of (NeMo-Gym shard set, wall time spent in this call).
     """
     t0 = time.perf_counter()
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
-    actor = spinup_nemo_gym_actor(
-        env_configs=master_config.env,
+    actor = build_nemo_gym_actors(
+        master_config.env,
         base_urls=base_urls,
         model_name=generation_config["model_name"],
         enable_router_replay=enable_router_replay,
@@ -585,7 +589,16 @@ def setup_single_controller(
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
 
     if use_nemo_gym:
-        env_handles["nemo_gym"], gym_time = results["nemo_gym"]
+        nemo_gym_shards, gym_time = results["nemo_gym"]
+        try:
+            validate_dataset_agent_coverage(
+                nemo_gym_shards,
+                {"training": dataset, "validation": _val_dataset},
+            )
+        except BaseException:
+            nemo_gym_shards.shutdown()
+            raise
+        env_handles["nemo_gym"] = cast(EnvironmentInterface, nemo_gym_shards)
         setup_timing_metrics.nemo_gym_init_time_s = gym_time
         # the two fields are only meaningful when use_nemo_gym enabled
         setup_timing_metrics.generation_init_reserve_time_s = gen_reserve_time

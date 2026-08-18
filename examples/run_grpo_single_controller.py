@@ -35,6 +35,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -141,11 +142,7 @@ def main() -> None:
         print(f"SC run complete: {result}")
     finally:
         # Drain env actors before generation to avoid in-flight requests during shutdown.
-        for env_name, handle in actor_args.env_handles.items():
-            try:
-                ray.get(handle.shutdown.remote())
-            except Exception as e:
-                print(f"Env {env_name!r} shutdown failed: {e}")
+        shutdown_environments(actor_args.env_handles)
 
         for resource_name, resource in (
             ("Generation", actor_args.gen_handle),

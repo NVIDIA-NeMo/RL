@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 from datasets import Dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
@@ -30,16 +32,28 @@ class NemoGymDataset(RawDataset):
         if self.task_name[0] == "-":
             self.task_name = self.task_name[1:]
 
-        # load raw line from jsonl
-        # will use `json.loads` to load to dict format at `nemo_gym_data_processor` later since `Dataset` cannot handle nested structure well
-        with open(data_path) as f:
-            self.dataset = [raw_line for raw_line in f]
+        # Keep raw lines because Dataset cannot reliably represent the nested Gym rows.
+        # Record a stable source identity without parsing rows on the unsharded path.
+        source_path = os.path.realpath(data_path)
+        source_stat = os.stat(source_path)
+        with open(source_path) as f:
+            raw_rows = [raw_line for raw_line in f]
+        source_stat_after_read = os.stat(source_path)
+        if (
+            source_stat.st_mtime_ns == source_stat_after_read.st_mtime_ns
+            and source_stat.st_size == source_stat_after_read.st_size
+        ):
+            self.agent_name_sources = frozenset(
+                {(source_path, source_stat.st_mtime_ns, source_stat.st_size)}
+            )
+        else:
+            self.agent_name_sources = None
 
         # format the dataset
         self.dataset = Dataset.from_dict(
             {
-                "extra_env_info": self.dataset,
-                "task_name": [self.task_name] * len(self.dataset),
+                "extra_env_info": raw_rows,
+                "task_name": [self.task_name] * len(raw_rows),
             }
         )
 
