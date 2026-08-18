@@ -239,6 +239,7 @@ def test_hybridep_warmup_uses_locked_mcore_resolution() -> None:
 def test_h100_submission_builds_multinode_hybridep_for_hopper() -> None:
     script = SUBMIT_SCRIPT.read_text()
 
+    assert 'export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"' in script
     assert "export HYBRID_EP_MULTINODE=1" in script
     assert "export NVTE_CUDA_ARCHS=90" in script
     assert "export TORCH_CUDA_ARCH_LIST=9.0" in script
