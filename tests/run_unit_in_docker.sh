@@ -38,8 +38,12 @@ fi
 # Expose RDMA devices when the host has them, matching CI (see
 # .github/actions/test-template/action.yml). Without these the mooncake_cpu
 # fixtures skip locally while running in CI, so "passes locally" means less.
+# Gate on uverbs* specifically, not just the /dev/infiniband directory: a
+# host can have the directory without a verbs node, which is what
+# libibverbs actually opens and what rdma_devices() requires.
 RDMA_FLAGS=()
-if [[ -d /dev/infiniband ]]; then
+if compgen -G "/dev/infiniband/uverbs*" >/dev/null &&
+   compgen -G "/sys/class/infiniband/mlx5_*/ports/1/link_layer" >/dev/null; then
   RDMA_FLAGS=(--device=/dev/infiniband --cap-add=IPC_LOCK)
 fi
 
