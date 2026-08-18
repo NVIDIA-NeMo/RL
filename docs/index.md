@@ -313,6 +313,7 @@ guides/models/nemotron/nemotron-3-nano.md
 guides/models/nemotron/nemotron-3-nano-omni.md
 guides/models/nemotron/nemotron-3.5-lightning.md
 guides/models/nemotron/nemotron-3-super.md
+guides/models/nemotron/nemotron-3-super-omni-mopd.md
 guides/models/nemotron/nemotron-3-ultra.md
 guides/models/qwen/index.md
 guides/models/qwen/qwen3-5.md

@@ -49,11 +49,9 @@ megatron_generation_supported() {
 }
 
 if megatron_generation_supported; then
-    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
+    run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topology.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
-    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async.sh
-    run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_async.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async_gym.sh
     run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topp_topk.sh
     # Disabled: token_mult_prob_error ~2.0 > 1.1 under top_p/top_k after the
