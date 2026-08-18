@@ -145,9 +145,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
     def is_stale(self) -> bool:
         return self._stale
 
-    def mark_stale(self) -> None:
-        self._stale = True
-
     def init_communicator(self) -> None:
         """Build both communicator families and the refit plan, over the whole fleet."""
         self._build(

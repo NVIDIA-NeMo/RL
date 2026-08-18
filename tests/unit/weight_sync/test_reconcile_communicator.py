@@ -292,9 +292,6 @@ class TestOtherTransportsAreUnaffected:
             def is_stale(self):
                 return False
 
-            def mark_stale(self):
-                pass
-
             def init_communicator(self):
                 pass
 
