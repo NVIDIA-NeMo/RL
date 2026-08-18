@@ -1149,22 +1149,15 @@ def setup(
     def init_megatron_generation(policy=None):
         """Initialize Megatron generation."""
         t0 = time.perf_counter()
-        if colocated_inference:
-            mg = MegatronGeneration(
-                policy=policy,
-                config=policy_config,
-                tokenizer=tokenizer,
-                processor=processor,
-            )
-        else:
-            mg = MegatronGeneration(
-                cluster=inference_cluster,
-                config=policy_config,
-                tokenizer=tokenizer,
-                processor=processor,
-                weights_path=weights_path,
-                skip_weight_load=True,
-            )
+        mg = MegatronGeneration(
+            config=policy_config,
+            tokenizer=tokenizer,
+            cluster=None if colocated_inference else inference_cluster,
+            policy=policy if colocated_inference else None,
+            processor=processor,
+            weights_path=weights_path,
+            skip_weight_load=not colocated_inference,
+        )
         return mg, time.perf_counter() - t0
 
     def initialize_generation_with_policy(
@@ -1452,8 +1445,25 @@ def setup(
             "https://github.com/NVIDIA-NeMo/RL/issues/3288."
         )
 
+    if backend == "megatron":
+        t0 = time.perf_counter()
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster,
+            inference_cluster=None if colocated_inference else inference_cluster,
+        )
+        policy_generation.weight_synchronizer.init_communicator()
+        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
+        if not colocated_inference:
+            # Load the model weights now.
+            t0 = time.perf_counter()
+            policy_generation.weight_synchronizer.sync_weights()
+            setup_timing_metrics.generation_init_load_time_s = time.perf_counter() - t0
     # if it is not colocated inference, initialize collective communication for update weights
-    if (
+    elif (
         not colocated_inference
         and remote_transport is None
         and checkpoint_engine_config is None
@@ -1467,26 +1477,7 @@ def setup(
         world_size = train_world_size + inference_world_size
 
         # init collective
-        if backend == "megatron":
-            refit_backend = policy_config["generation"]["mcore_generation_config"][
-                "refit_backend"
-            ]
-            futures_train = policy.init_collective_mcore_generation(
-                ip,
-                port,
-                world_size,
-                rank_offset=0,
-                refit_backend=refit_backend,
-            )
-            futures_inference = policy_generation.init_collective(
-                ip,
-                port,
-                world_size,
-                train_world_size=train_world_size,
-                refit_backend=refit_backend,
-            )
-            ray.get(futures_train + futures_inference)
-        elif nccl_reshard_refit_enabled:
+        if nccl_reshard_refit_enabled:
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,
@@ -2036,9 +2027,10 @@ def _apply_configured_message_level_advantage_penalties(
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
-    SGLang only uses async rollouts when explicitly configured with
-    ``policy.generation.use_async_rollouts``. vLLM and Megatron use async
-    rollouts when their respective ``async_engine`` config is enabled.
+    SGLang only uses async rollouts when configured with ``policy.generation.use_async_rollouts``.
+    vLLM uses async rollouts when ``vllm_cfg.async_engine`` is enabled.
+    TRT-LLM always requires ``trtllm_cfg.async_engine=true``.
+    Megatron Inference always use async rollouts and does not need a parameter.
     """
     generation_config = master_config.policy["generation"]
     if generation_config is None:
@@ -2060,7 +2052,11 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
 
     if backend == "megatron":
         mcore_cfg = generation_config.get("mcore_generation_config", {})
-        return mcore_cfg.get("async_engine", False)
+        assert mcore_cfg.get("async_engine") is None, (
+            "Megatron Inference always uses the async engine. The parameter "
+            "policy.generation.mcore_generation_config.async_engine was removed."
+        )
+        return True
 
     return False
 
@@ -2131,12 +2127,10 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
         return should_use_nemo_gym
 
     # Validate the setup for training with NeMo-Gym.
-    # Megatron Inference is exempt: there is no difference between its sync and async engines.
     generation_config = master_config.policy["generation"]
-    if generation_config["backend"] != "megatron":
-        assert _should_use_async_rollouts(master_config), (
-            "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
-        )
+    assert _should_use_async_rollouts(master_config), (
+        "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
+    )
 
     # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
     if generation_config["backend"] == "vllm":
@@ -2328,26 +2322,9 @@ def refit_policy_generation(
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
 
-    # Megatron generation backend needs explicit suspend/resume around refits.
-    if isinstance(policy_generation, MegatronGeneration):
-        policy_generation.suspend_for_refit()
-
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
+    if colocated_inference:
         policy.offload_before_refit()
-    # Colocated inference needs to prepare for generation.
-    # Megatron non-colocated inference needs to enter inference mode after refit.
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["weights"])
-
-    if (
-        not colocated_inference
-        and isinstance(policy_generation, MegatronGeneration)
-        and policy_generation.cfg["mcore_generation_config"]["refit_backend"]
-        == "nvshmem"
-    ):
-        futures_train = policy.preinit_nvshmem()
-        futures_inference = policy_generation.preinit_nvshmem_collective()
-        ray.get(futures_train + futures_inference)
 
     # Create a context manager that does nothing when timer is None
     timer_context = (
@@ -2400,12 +2377,7 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
-            if isinstance(policy_generation, MegatronGeneration):
-                futures_train = policy.swap_weights_via_reshard(is_source=True)
-            else:
-                futures_train = policy.broadcast_weights_for_collective(
-                    kv_scales=kv_scales
-                )
+            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
             ray.get(futures_train)
@@ -2424,13 +2396,7 @@ def refit_policy_generation(
 
     if colocated_inference:
         policy.offload_after_refit()
-    # Colocated inference needs to prepare for generation.
-    # Megatron non-colocated inference needs to enter inference mode after refit.
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["kv_cache"])
-
-    if isinstance(policy_generation, MegatronGeneration):
-        policy_generation.resume_after_refit()
 
     return {}
 
@@ -4120,12 +4086,13 @@ def async_grpo_train(
     # SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron", "trtllm") and _should_use_async_rollouts(
-        master_config
-    ), (
-        "Async GRPO requires an async vLLM, Megatron, or TRT-LLM generation engine. "
-        "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
-        "policy.generation.mcore_generation_config.async_engine=true (Megatron), or "
+    assert backend in ("vllm", "megatron", "trtllm"), (
+        "Async GRPO supports the vLLM, Megatron, and TRT-LLM generation backends; "
+        f"got policy.generation.backend={backend!r}."
+    )
+    assert _should_use_async_rollouts(master_config), (
+        "Async GRPO requires an async generation engine. Set "
+        "policy.generation.vllm_cfg.async_engine=true (vLLM) or "
         "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM)."
     )
     assert master_config.loss_fn.use_importance_sampling_correction, (

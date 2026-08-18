@@ -34,6 +34,9 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.ipc_weight_synchronizer import (
     IPCWeightSynchronizer,
 )
+from nemo_rl.weight_sync.megatron_weight_synchronizer import (
+    MegatronWeightSynchronizer,
+)
 from nemo_rl.weight_sync.nccl_reshard_utils import build_nccl_reshard_refit_info
 from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
     NcclReshardWeightSynchronizer,
@@ -174,16 +177,6 @@ class TestIPCWeightSynchronizer:
         expected = int(10 * (1024**3) * 0.3)
         assert call_kwargs.kwargs["buffer_size_bytes"] == expected
 
-    def test_mark_stale(self):
-        policy = _mock_policy()
-        gen = _mock_generation()
-        sync = IPCWeightSynchronizer(policy, gen)
-
-        sync._stale = False
-        assert not sync.is_stale
-        sync.mark_stale()
-        assert sync.is_stale
-
     def test_init_communicator(self):
         policy = _mock_policy()
         gen = _mock_generation()
@@ -283,16 +276,6 @@ class TestHTTPWeightSynchronizer:
         call_kwargs = policy.stream_weights_via_http.call_args
         assert call_kwargs.kwargs["rollout_engine_urls"] == ["http://localhost:30000"]
         assert call_kwargs.kwargs["buffer_size_bytes"] == 2 * (1024**3)
-
-    def test_mark_stale(self):
-        policy = _mock_policy()
-        gen = _mock_generation()
-        sync = HTTPWeightSynchronizer(policy, gen)
-
-        sync._stale = False
-        assert not sync.is_stale
-        sync.mark_stale()
-        assert sync.is_stale
 
     def test_init_communicator(self):
         policy = _mock_policy()
@@ -496,6 +479,112 @@ class TestNcclReshardWeightSynchronizer:
 # ---------------------------------------------------------------------------
 
 
+def _mock_megatron_generation(refit_backend="nccl", **overrides):
+    gen = _mock_generation(**overrides)
+    gen.cfg = {"mcore_generation_config": {"refit_backend": refit_backend}}
+    gen.suspend_for_refit.return_value = None
+    gen.resume_after_refit.return_value = None
+    gen.preinit_nvshmem_collective.return_value = [MagicMock()]
+    return gen
+
+
+def _mock_megatron_policy(**overrides):
+    policy = _mock_policy(**overrides)
+    policy.swap_weights_via_reshard.return_value = [MagicMock()]
+    policy.init_collective_mcore_generation.return_value = [MagicMock()]
+    policy.preinit_nvshmem.return_value = [MagicMock()]
+    return policy
+
+
+class TestMegatronWeightSynchronizer:
+    def test_non_colocated_requires_clusters(self):
+        with pytest.raises(ValueError):
+            MegatronWeightSynchronizer(
+                _mock_megatron_policy(), _mock_megatron_generation(), colocated=False
+            )
+
+    def test_colocated_sync_is_offload_and_wake(self):
+        policy = _mock_megatron_policy()
+        gen = _mock_megatron_generation()
+        sync = MegatronWeightSynchronizer(policy, gen, colocated=True)
+
+        sync.init_communicator()  # no collective to wire
+        policy.init_collective_mcore_generation.assert_not_called()
+
+        assert sync.is_stale
+        assert sync.sync_weights() == {}
+        policy.offload_before_refit.assert_called_once()
+        gen.prepare_for_generation.assert_called_once_with()
+        gen.suspend_for_refit.assert_not_called()
+        policy.swap_weights_via_reshard.assert_not_called()
+        assert not sync.is_stale
+
+    @patch("nemo_rl.weight_sync.megatron_weight_synchronizer.ray")
+    def test_non_colocated_sync_sequence(self, mock_ray):
+        mock_ray.get.side_effect = lambda futures: [True for _ in futures]
+        policy = _mock_megatron_policy()
+        gen = _mock_megatron_generation()
+        sync = MegatronWeightSynchronizer(
+            policy,
+            gen,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        sync.init_communicator()
+        policy.init_collective_mcore_generation.assert_called_once()
+        gen.init_collective.assert_called_once()
+
+        assert sync.sync_weights() == {}
+        gen.suspend_for_refit.assert_called_once()
+        policy.offload_before_refit.assert_called_once()
+        policy.swap_weights_via_reshard.assert_called_once_with(is_source=True)
+        gen.update_weights_from_collective.assert_called_once()
+        gen.resume_after_refit.assert_called_once()
+        # prepare called for the weights phase and then the kv_cache phase
+        tags = [c.kwargs.get("tags") for c in gen.prepare_for_generation.call_args_list]
+        assert tags == [["weights"], ["kv_cache"]]
+        # no nvshmem preinit on the nccl backend
+        policy.preinit_nvshmem.assert_not_called()
+        assert not sync.is_stale
+
+    @patch("nemo_rl.weight_sync.megatron_weight_synchronizer.ray")
+    def test_non_colocated_nvshmem_preinits(self, mock_ray):
+        mock_ray.get.side_effect = lambda futures: [True for _ in futures]
+        policy = _mock_megatron_policy()
+        gen = _mock_megatron_generation(refit_backend="nvshmem")
+        sync = MegatronWeightSynchronizer(
+            policy,
+            gen,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+        sync.init_communicator()
+        sync.sync_weights()
+        policy.preinit_nvshmem.assert_called_once()
+        gen.preinit_nvshmem_collective.assert_called_once()
+
+    @patch("nemo_rl.weight_sync.megatron_weight_synchronizer.ray")
+    def test_non_colocated_failed_update_raises(self, mock_ray):
+        # swap futures resolve fine; the inference-side results report failure
+        mock_ray.get.side_effect = lambda futures: [False for _ in futures]
+        policy = _mock_megatron_policy()
+        gen = _mock_megatron_generation()
+        sync = MegatronWeightSynchronizer(
+            policy,
+            gen,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+        sync.init_communicator()
+        with pytest.raises(RuntimeError):
+            sync.sync_weights()
+        assert sync.is_stale
+
+
 class TestFactory:
     def test_colocated_vllm_returns_ipc(self):
         policy = _mock_policy()
@@ -519,7 +608,7 @@ class TestFactory:
         )
         assert isinstance(sync, HTTPWeightSynchronizer)
 
-    def test_colocated_megatron_returns_ipc(self):
+    def test_colocated_megatron_returns_megatron_synchronizer(self):
         policy = _mock_policy()
         gen = _mock_generation()
         sync = create_weight_synchronizer(
@@ -528,7 +617,20 @@ class TestFactory:
             generation_backend=MEGATRON_BACKEND,
             colocated=True,
         )
-        assert isinstance(sync, IPCWeightSynchronizer)
+        assert isinstance(sync, MegatronWeightSynchronizer)
+
+    def test_non_colocated_megatron_returns_megatron_synchronizer(self):
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=gen,
+            generation_backend=MEGATRON_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+        assert isinstance(sync, MegatronWeightSynchronizer)
 
     def test_non_colocated_vllm_returns_collective(self):
         policy = _mock_policy()

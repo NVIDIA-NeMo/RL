@@ -50,6 +50,11 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.multimodal_utils import (
+    attach_media_token_validity_mask,
+    chunks_accept_media_token_validity_mask,
+    media_placeholder_token_id_from_chunks,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -71,6 +76,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
+    build_inference_model,
     finalize_megatron_setup,
     handle_model_import,
     setup_distributed,
@@ -178,6 +184,24 @@ def _model_slices_context_parallel_inputs(model: Any) -> bool:
         bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
         for chunk in chunks
     )
+
+
+def _unwrapped_chunks(model: Any) -> list[Any]:
+    """Model chunks as a flat list, whatever wrapping the caller handed us."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    return list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+
+
+def _model_media_placeholder_token_id(model: Any) -> Optional[int]:
+    """The vocabulary id this model treats as a media placeholder, if any."""
+    return media_placeholder_token_id_from_chunks(_unwrapped_chunks(model))
+
+
+def _model_accepts_media_token_validity_mask(model: Any) -> bool:
+    """Whether the model's forward takes an explicit media-token validity mask."""
+    return chunks_accept_media_token_validity_mask(_unwrapped_chunks(model))
 
 
 def _estimate_refit_tensor_size_in_bytes(
@@ -495,6 +519,7 @@ class MegatronPolicyWorkerImpl(
         self.offload_optimizer_for_logprob = (
             runtime_config.offload_optimizer_for_logprob
         )
+        self.offload_optimizer_for_refit = runtime_config.offload_optimizer_for_refit
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
@@ -537,6 +562,7 @@ class MegatronPolicyWorkerImpl(
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
+        self._colocated_reshard_plan = model_and_optimizer_state.colocated_reshard_plan
         log_gpu_memory_diagnostics(
             label="after_model_setup", worker_type="MegatronPolicyWorker"
         )
@@ -593,6 +619,14 @@ class MegatronPolicyWorkerImpl(
         self.model_slices_context_parallel_inputs = (
             _model_slices_context_parallel_inputs(self.model)
         )
+        # A media placeholder is an ordinary vocabulary entry, so text that
+        # legitimately contains it must not be read as an anchor demanding a
+        # projected feature. Only models that accept the mask are sent one.
+        self.media_placeholder_token_id = (
+            _model_media_placeholder_token_id(self.model)
+            if _model_accepts_media_token_validity_mask(self.model)
+            else None
+        )
         if self.model_slices_context_parallel_inputs:
             if self.delegate_pack_to_model:
                 raise RuntimeError(
@@ -616,6 +650,11 @@ class MegatronPolicyWorkerImpl(
                     "Nemotron Omni caller-packed THD inputs do not yet support "
                     "virtual pipeline parallelism."
                 )
+
+        # Colocated reshard: build a dedicated inference-layout model container.
+        self.inference_model = None
+        self._swap_weights_plan_prepared = False
+        self._inference_model_offloaded = False
 
         # vars used for refit
         ## will be initialized in prepare_refit_info
@@ -805,6 +844,8 @@ class MegatronPolicyWorkerImpl(
                         "sample_mask"
                     ].unsqueeze(-1)
                     batch["mtp_loss_mask"] = mtp_loss_mask
+
+                attach_media_token_validity_mask(batch, self.media_placeholder_token_id)
 
                 (
                     data_iterator,
@@ -1640,6 +1681,11 @@ class MegatronPolicyWorkerImpl(
 
         self.model.eval()
 
+        # Logprobs run the same forward as training, so a batch that needs the
+        # mask needs it here too -- otherwise these logprobs would be taken
+        # against a different media alignment than the one trained on.
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
+
         (
             mb_iterator,
             num_microbatches,
@@ -1858,6 +1904,8 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.model.eval()
+
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
 
         (
             mb_iterator,
@@ -2737,6 +2785,29 @@ class MegatronPolicyWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
+    def _build_colocated_inference_model(self, config: PolicyConfig) -> None:
+        """Build the dedicated inference-layout model planned at setup."""
+        plan = self._colocated_reshard_plan
+        inference_mcfg = plan.inference_megatron_cfg
+        inference_config = {**config, "megatron_cfg": inference_mcfg}
+
+        print(
+            "[colocated-reshard] building dedicated inference model "
+            f"(inference TP={inference_mcfg['tensor_model_parallel_size']} "
+            f"PP={inference_mcfg['pipeline_model_parallel_size']} "
+            f"EP={inference_mcfg['expert_model_parallel_size']} "
+            f"CP={inference_mcfg['context_parallel_size']} "
+            f"impl={inference_mcfg.get('transformer_impl')})",
+            flush=True,
+        )
+        # Built inside the first prepare_for_generation, immediately before the
+        # reshard needs it resident; finish_generation offloads it afterwards.
+        self.inference_model = build_inference_model(
+            inference_config, self.megatron_cfg, plan.initial_model_provider
+        )
+        # The plan is consumed (provider mutated to the inference layout); release it.
+        self._colocated_reshard_plan = None
+
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
         self.model = self.move_model(
@@ -2873,6 +2944,7 @@ class MegatronPolicyWorkerImpl(
             hasattr(self, "optimizer")
             and self.optimizer is not None
             and not self.optimizer_cpu_offload
+            and self.offload_optimizer_for_refit
         ):
             self.move_optimizer("cpu")
 

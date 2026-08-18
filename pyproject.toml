@@ -196,6 +196,7 @@ mcore = [
   "flashinfer-jit-cache==0.6.8.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "nvidia-cutlass-dsl[cu13]==4.5.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
 ]
