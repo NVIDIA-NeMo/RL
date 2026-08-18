@@ -11,6 +11,42 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Unit tests for nemo_rl/environments/nemo_gym.py helpers."""
+
+import subprocess
+
+import pytest
+
+from nemo_rl.environments.nemo_gym import get_nemo_gym_uv_cache_dir
+
+
+def test_get_nemo_gym_uv_cache_dir_outside_container_returns_none(monkeypatch):
+    monkeypatch.delenv("NRL_CONTAINER", raising=False)
+    assert get_nemo_gym_uv_cache_dir() is None
+
+
+def test_get_nemo_gym_uv_cache_dir_missing_uv_raises(monkeypatch):
+    monkeypatch.setenv("NRL_CONTAINER", "1")
+
+    def raise_file_not_found(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory: 'uv'")
+
+    monkeypatch.setattr(subprocess, "check_output", raise_file_not_found)
+    with pytest.raises(FileNotFoundError, match="uv is not available in the container"):
+        get_nemo_gym_uv_cache_dir()# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 import time
 from copy import deepcopy
