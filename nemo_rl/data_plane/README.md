@@ -437,10 +437,11 @@ data_plane:
   #   enabled: false
 ```
 
-These keys used to sit directly under `data_plane:`. That spelling is
-rejected with a migration message rather than silently accepted — an
-inherited config supplies the nested block, so a surviving flat key
-would always lose the merge without warning.
+These keys used to sit directly under `data_plane:`. That spelling is not
+rejected — it is simply never read. A config still using it silently gets
+this backend's defaults instead of its own values: an inherited config
+supplies the nested block, so a surviving flat key always loses the merge,
+with no warning either way.
 
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
