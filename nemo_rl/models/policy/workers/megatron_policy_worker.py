@@ -463,7 +463,7 @@ class MegatronPolicyWorkerImpl(
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
         # Step 1: Setup distributed
-        setup_distributed(config)
+        setup_distributed()
         log_gpu_memory_diagnostics(
             label="after_nccl_init", worker_type="MegatronPolicyWorker"
         )
@@ -2502,7 +2502,9 @@ class MegatronPolicyWorkerImpl(
             MegatronSGLangHfWeightIterator,
         )
 
-        configured_precision = (sglang_quantization_cfg or {}).get("scheme", "bf16")
+        if sglang_quantization_cfg is None:
+            raise ValueError("SGLang refit requires an explicit quantization config.")
+        configured_precision = sglang_quantization_cfg["scheme"]
         if target_precision != configured_precision:
             raise ValueError(
                 "SGLang refit target precision does not match its quantization "

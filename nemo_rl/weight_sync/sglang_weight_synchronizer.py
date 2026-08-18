@@ -77,13 +77,15 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         self._generation = generation
         self._refit_buffer_size_gb = refit_buffer_size_gb
         self._stale = True
+        if self._generation.pause_generation_mode == "in_place":
+            raise ValueError(
+                "pause_generation_mode='in_place' is unsafe for weight refit because "
+                "it preserves KV cache entries created by the previous weights."
+            )
 
     @property
     def is_stale(self) -> bool:
         return self._stale
-
-    def mark_stale(self) -> None:
-        self._stale = True
 
     def init_communicator(self) -> None:
         state_dict_info = self._policy.prepare_refit_info()
@@ -97,7 +99,7 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         return bool(self._policy.cfg.get("megatron_cfg", {}).get("enabled", False))
 
     def _quantization_cfg(self) -> dict:
-        return dict(self._generation.sglang_cfg["sglang_cfg"].get("quantization") or {})
+        return dict(self._generation.sglang_cfg["sglang_cfg"]["quantization"])
 
     @abstractmethod
     def _connect(self, *, rollout_engines: list, engine_gpu_counts, engine_gpu_offsets):
@@ -148,10 +150,6 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
             )
             self._generation.clear_updatable_num_new_engines()
 
-        # Pause with the configured mode, but only invalidate the KV cache when
-        # the mode actually drops generation state. "in_place" leaves the engine
-        # paused without dropping its KV cache, so flushing would clobber the
-        # still-valid in-place state.
         pause_mode = self._generation.pause_generation_mode
         self._generation.pause_generation(mode=pause_mode)
         # Each acquired state gets its own guard: anything that raises between
@@ -159,8 +157,8 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         # -- must still resume generation, or every engine stays paused for the
         # rest of the run with no error pointing at why.
         try:
-            if pause_mode != "in_place":
-                self._generation.invalidate_kv_cache()
+            if not self._generation.invalidate_kv_cache():
+                raise RuntimeError("SGLang KV cache invalidation failed before refit.")
 
             self._generation.begin_weight_update()
             try:
