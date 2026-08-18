@@ -35,6 +35,7 @@ import numpy as np
 import torch
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
+from nemo_rl.data.multimodal_utils import PER_TOKEN_MULTIMODAL_FIELDS
 from nemo_rl.data_plane.codec import materialize, pack_jagged_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN, Layout
@@ -44,7 +45,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 # through ``.detach().contiguous()``. Add per-token fields here — no
 # separate structural check is needed because the codec's binary
 # dispatch (Tensor | ndarray[object]) errors loudly on unknown types.
-TOKEN_ALIGNED_FIELDS = frozenset(
+_TEXT_TOKEN_ALIGNED_FIELDS = frozenset(
     {
         "input_ids",
         "generation_logprobs",
@@ -54,10 +55,13 @@ TOKEN_ALIGNED_FIELDS = frozenset(
         "token_mask",
         "sample_mask",
         "routed_experts",
-        "mm_token_type_ids",
-        "token_type_ids",
     }
 )
+
+# Per-token multimodal type maps are sequence-aligned too, so they pack the
+# same way. Unioned from the registry rather than re-listed, so a new
+# per-token modality cannot be added there and silently forgotten here.
+TOKEN_ALIGNED_FIELDS = _TEXT_TOKEN_ALIGNED_FIELDS | PER_TOKEN_MULTIMODAL_FIELDS
 
 
 def round_up(value: int, multiple: int) -> int:

@@ -18,7 +18,7 @@ import logging
 import re
 import uuid
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from copy import deepcopy
 from io import BytesIO
 from typing import Any, Optional, Union
@@ -96,9 +96,16 @@ def uses_image_placeholder(processor: Any) -> bool:
     return type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSOR_NAMES
 
 
-# Multimodal field registries — single source of truth. Add a new
-# modality by extending the right set; every consumer (write path,
-# get_multimodal_dict, logprob include-list) dispatches through these.
+# Wire-transport registries for multimodal fields. These are NOT the origin
+# of the packed-vs-per-token classification — ``data/processors.py`` is, where
+# every key from ``get_multimodal_keys_from_processor`` is wrapped in a
+# ``PackedTensor`` and the type maps are kept as plain tensors. These sets
+# mirror that decision by name, because once a value crosses the wire it is a
+# plain tensor and the type distinction is gone; the read-side consumers
+# (materialize's pad skip, get_multimodal_dict, truncate_tensors, both
+# seq-dim validators, the TQ fetch list) can only dispatch on the name.
+# Adding a modality therefore means updating processors.py AND the matching
+# set here; ``encode_multimodal_for_wire`` raises on anything unregistered.
 
 # Per-token: rectangular ``[B, S]`` type maps for text/image/video tokens.
 PER_TOKEN_MULTIMODAL_FIELDS = frozenset(
@@ -705,6 +712,7 @@ class PackedTensor:
 
     @staticmethod
     def lengths_key(field: str) -> str:
+        """Return the companion field name carrying per-row lengths for ``field``."""
         return field + PackedTensor.LENGTHS_SUFFIX
 
     def to_nested_wire(self) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -739,54 +747,63 @@ class PackedTensor:
         # would emit the physical segment count instead of the batch
         # size. ``_row_segment_indices`` degrades to ``[row]`` for the
         # legacy one-tensor-per-row layout.
-        rows: list[Optional[torch.Tensor]] = []
-        for row in range(len(self)):
-            segments = [
+        row_segments: list[list[torch.Tensor]] = [
+            [
                 self.tensors[i]
                 for i in self._row_segment_indices(row)
                 if self.tensors[i] is not None
             ]
-            if not segments:
-                rows.append(None)
-            else:
-                rows.append(
-                    segments[0] if len(segments) == 1 else torch.cat(segments, dim=0)
-                )
-
-        ref = next((t for t in rows if t is not None), None)
-        if ref is None:
-            return None, None
+            for row in range(len(self))
+        ]
 
         # ``torch.nested`` jagged requires every row to agree on all dims
         # except dim 0. Dynamic-resolution values (``pad_to_max_shape``)
         # violate that, so materialize the padding here rather than let
         # ``as_nested_tensor`` reject the list — and rather than let the
         # flag be silently dropped by ``from_nested_wire``, which cannot
-        # recover it. Padding to the *global* batch max (not a per-shard
-        # max) is deliberate: every DP rank then sees identical trailing
-        # dims for the forward.
+        # recover it.
+        #
+        # Pad each *segment* before the per-row concat, exactly as
+        # :meth:`as_tensor` does. Concatenating first would raise on a
+        # multi-segment row whose segments differ in trailing dims, before
+        # the padding could fix them. Padding to the *global* batch max
+        # (not a per-shard max) is deliberate: every DP rank then sees
+        # identical trailing dims for the forward.
         if self.pad_to_max_shape:
-            present = [t for t in rows if t is not None]
-            ranks = {t.ndim for t in present}
-            if len(ranks) != 1:
-                raise ValueError(
-                    "pad_to_max_shape requires tensors with the same rank, "
-                    f"but received ranks {sorted(ranks)}"
-                )
-            rank = ranks.pop()
-            max_shape = [max(t.shape[d] for t in present) for d in range(rank)]
-
-            def _pad_trailing_dims(tensor: torch.Tensor) -> torch.Tensor:
-                padding: list[int] = []
-                for dim in reversed(range(rank)):
-                    # dim 0 is the packing/ragged dim — left jagged.
-                    padding.extend(
-                        (0, 0 if dim == 0 else max_shape[dim] - tensor.shape[dim])
+            present = [t for segs in row_segments for t in segs]
+            if present:
+                ranks = {t.ndim for t in present}
+                if len(ranks) != 1:
+                    raise ValueError(
+                        "pad_to_max_shape requires tensors with the same rank, "
+                        f"but received ranks {sorted(ranks)}"
                     )
-                return F.pad(tensor, padding)
+                rank = ranks.pop()
+                max_shape = [max(t.shape[d] for t in present) for d in range(rank)]
 
-            rows = [None if t is None else _pad_trailing_dims(t) for t in rows]
-            ref = next(t for t in rows if t is not None)
+                def _pad_trailing_dims(tensor: torch.Tensor) -> torch.Tensor:
+                    padding: list[int] = []
+                    for dim in reversed(range(rank)):
+                        # dim 0 is the packing/ragged dim — left jagged.
+                        padding.extend(
+                            (0, 0 if dim == 0 else max_shape[dim] - tensor.shape[dim])
+                        )
+                    return F.pad(tensor, padding)
+
+                row_segments = [
+                    [_pad_trailing_dims(t) for t in segs] for segs in row_segments
+                ]
+
+        rows: list[Optional[torch.Tensor]] = [
+            None
+            if not segs
+            else (segs[0] if len(segs) == 1 else torch.cat(segs, dim=0))
+            for segs in row_segments
+        ]
+
+        ref = next((t for t in rows if t is not None), None)
+        if ref is None:
+            return None, None
 
         length_ints = [0 if t is None else t.shape[0] for t in rows]
         if any(t is None for t in rows):
@@ -823,14 +840,26 @@ class PackedTensor:
         """
         if padded.shape[0] == 0:
             return None
+        if lengths.shape[0] != padded.shape[0]:
+            raise ValueError(
+                f"wire companion length mismatch: {lengths.shape[0]} lengths for "
+                f"{padded.shape[0]} rows. A short companion would silently drop "
+                f"trailing rows and misalign images against their samples."
+            )
         # ``.tolist()`` once instead of ``.item()`` per row: one host
         # sync if ``lengths`` is on GPU.
         lengths_cpu = lengths.tolist()
-        rows = [padded[i, :n] for i, n in enumerate(lengths_cpu)]
+        # ``None`` (not a zero-length slice) for empty rows, so an
+        # image-free shard reconstructs as legacy does: ``as_tensor``
+        # returns ``None`` rather than a ``(0, ...)`` tensor, and
+        # ``logical_segment_counts_by_row`` reports 0 rather than 1.
+        rows = [None if n == 0 else padded[i, :n] for i, n in enumerate(lengths_cpu)]
         return cls(rows, dim_to_pack=0)  # type: ignore[arg-type]
 
 
-def encode_multimodal_for_wire(k, v):
+def encode_multimodal_for_wire(
+    k: str, v: Union["PackedTensor", torch.Tensor]
+) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield ``(wire_key, wire_value)`` pairs. Dispatched by registry membership."""
     if k in PACKED_MULTIMODAL_FIELDS:
         assert isinstance(v, PackedTensor), (

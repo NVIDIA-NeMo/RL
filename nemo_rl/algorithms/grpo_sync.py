@@ -976,9 +976,20 @@ def grpo_train_sync(
                         # (logprobs/advantages/masks) and wire-only message
                         # log bulk fields are skipped by virtue of not being
                         # in DP_CALIB_INPUT_FIELDS.
+                        # ``DP_CALIB_INPUT_FIELDS`` names a ``multi_modal_inputs``
+                        # column that is never actually written — the rollout
+                        # writes pixel_values / image_grid_thw / … individually
+                        # — so on a VLM run this filter would otherwise yield
+                        # only the text fields and calibrate image-blind.
+                        # Local import: ``tq_policy`` is TYPE_CHECKING-only at
+                        # module scope here (see the import block at the top).
+                        from nemo_rl.models.policy.tq_policy import (
+                            _present_multimodal_fields,
+                        )
+
                         _calib_fields = [
                             f for f in (meta.fields or []) if f in DP_CALIB_INPUT_FIELDS
-                        ]
+                        ] + _present_multimodal_fields(meta)
                         calibration_data = policy.read_from_dataplane(
                             meta,
                             select_fields=_calib_fields,
