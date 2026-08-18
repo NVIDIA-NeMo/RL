@@ -413,6 +413,77 @@ def test_mxfp8_native_linear_refit_finalizes_each_root_once_after_failure(
 
 
 @pytest.mark.vllm
+def test_checkpoint_engine_lifecycle_processes_weights_once(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _state_info = _make_collective_update_extension(vllm_backend)
+    process_weights = MagicMock()
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process_weights,
+    )
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    with ext._weight_update_lifecycle("checkpoint_engine") as finalize:
+        finalize()
+
+    process_weights.assert_called_once_with(
+        ext.model_runner.model, ext.model_config, ext.device
+    )
+    ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_checkpoint_engine_native_linear_refit_finalizes_once_without_kv_cache(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
+    _patch_native_mxfp8_kernel(monkeypatch, kernel_type)
+    linear = torch.nn.Linear(1, 1)
+    linear.quant_method = SimpleNamespace(kernel=kernel_type())
+    model = torch.nn.Module()
+    model.add_module("linear", linear)
+
+    extension = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    extension.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    extension.model_config = object()
+    extension.device = torch.device("cpu")
+    extension._maybe_process_mtp_drafter_after_loading = MagicMock()
+    extension._maybe_process_fp8_kv_cache = MagicMock()
+    initialize = MagicMock()
+    finalize = MagicMock()
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        initialize,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload", finalize
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _config: contextlib.nullcontext()
+    )
+
+    with extension._weight_update_lifecycle("checkpoint_engine") as finish:
+        finish()
+
+    initialize.assert_called_once_with(linear)
+    finalize.assert_called_once_with(linear, extension.model_config)
+    extension._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
+    extension._maybe_process_fp8_kv_cache.assert_not_called()
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     "method_name",
     ["update_weights_via_ipc_zmq", "update_weights_from_collective"],

@@ -56,7 +56,9 @@ except ImportError:
     )
 
 
-WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
+WeightUpdateTransport = Literal[
+    "ipc", "collective", "checkpoint_engine", "nccl_reshard"
+]
 WeightUpdateFinalizer = Callable[[], None]
 
 
@@ -631,7 +633,6 @@ class VllmInternalWorkerExtension:
         self, transport: WeightUpdateTransport
     ) -> Iterator[WeightUpdateFinalizer]:
         """Provide setup/finalization around a transport-owned weight update."""
-        del transport
         from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.reload import (
             finalize_layerwise_reload,
@@ -652,7 +653,8 @@ class VllmInternalWorkerExtension:
                 self._maybe_process_mtp_drafter_after_loading()
 
             yield finalize
-            self._maybe_process_fp8_kv_cache()
+            if transport != "checkpoint_engine":
+                self._maybe_process_fp8_kv_cache()
             return
 
         pending_roots: list[torch.nn.Module] = []
@@ -729,7 +731,8 @@ class VllmInternalWorkerExtension:
                     finalize_pending_roots()
         # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
         # this optional second pass, just as it was before lifecycle hooks.
-        self._maybe_process_fp8_kv_cache()
+        if transport != "checkpoint_engine":
+            self._maybe_process_fp8_kv_cache()
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
