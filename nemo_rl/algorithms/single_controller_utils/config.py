@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
@@ -303,6 +304,15 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # dir stays essentially empty on the gate path). None = derived at setup
     # under the run's log dir.
     capture_dir: Optional[str] = None
+    # Keep routed_experts out of canonical rows and assemble them on policy
+    # workers from strict staged-fragment plans.
+    defer_routed_experts_to_policy: bool = False
+    # Move finalization into a bounded CPU Ray actor pool. Disabled is the
+    # serial rollback path; enabled releases generation capacity before the
+    # actor RPC and overlaps finalization with the next rollout group.
+    finalizer_actor_pool_enabled: bool = False
+    # Fixed pool size for validation; actors are never automatically replaced.
+    num_finalizer_workers: PositiveInt = 2
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -386,6 +396,33 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "SingleController path: it has no validation loop yet, so only "
             "'train:<name>' metrics are collected. Use 'train:<name>' (e.g. "
             "'train:loss') or set checkpointing.metric_name=null."
+        )
+
+    token_capture_config = master_config.token_capture
+    if token_capture_config.defer_routed_experts_to_policy and not (
+        token_capture_config.enabled
+    ):
+        raise ValueError(
+            "token_capture.defer_routed_experts_to_policy requires "
+            "token_capture.enabled=true"
+        )
+    if (
+        token_capture_config.finalizer_actor_pool_enabled
+        and not token_capture_config.enabled
+    ):
+        raise ValueError(
+            "token_capture.finalizer_actor_pool_enabled requires "
+            "token_capture.enabled=true"
+        )
+    if (
+        token_capture_config.finalizer_actor_pool_enabled
+        and token_capture_config.num_finalizer_workers
+        > async_config.max_buffered_rollouts
+    ):
+        warnings.warn(
+            "token_capture.num_finalizer_workers exceeds "
+            "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
+            stacklevel=2,
         )
 
     # A non-zero reference-policy KL penalty makes the loss read

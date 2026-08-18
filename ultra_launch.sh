@@ -698,7 +698,6 @@ VLLM_FLASHINFER_MOE_BACKEND=latency \
 NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 \
 NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
-HF_TOKEN=${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
 uv run ${NRL_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py} \
 --config ${CONFIG_PATH} \
@@ -777,6 +776,10 @@ echo ""
 # =============================================================================
 # Record code provenance in the run directory
 # =============================================================================
+TRAIN_CMD_REDACTED="$(
+  printf '%s\n' "${TRAIN_CMD}" \
+    | sed -E 's/(HF_TOKEN|WANDB_API_KEY|NGC_API_KEY)=[^[:space:]]+/\1=<redacted>/g'
+)"
 {
   echo "timestamp: $(date -Iseconds)"
   echo "branch: $(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
@@ -789,7 +792,7 @@ echo ""
   echo "container: ${CONTAINER}"
   echo "config: ${CONFIG_PATH}"
   echo "genrm_base_url_file: ${GENRM_BASE_URL_FILE}"
-  echo "command: ${TRAIN_CMD}"
+  echo "command: ${TRAIN_CMD_REDACTED}"
 } > "${RUN_DIR}/provenance.txt"
 
 # =============================================================================
@@ -800,7 +803,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   echo "DRY_RUN=1 — printing TRAIN_CMD and exiting without submission."
   echo ""
   echo "--- TRAIN_CMD ---"
-  echo "${TRAIN_CMD}"
+  echo "${TRAIN_CMD_REDACTED}"
   echo "--- end ---"
   exit 0
 fi

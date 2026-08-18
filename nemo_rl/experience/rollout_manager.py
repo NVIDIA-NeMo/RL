@@ -18,7 +18,7 @@ import enum
 import json
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import ray.exceptions
 import torch
@@ -56,6 +56,9 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+if TYPE_CHECKING:
+    from nemo_rl.experience.finalizer_actor import FinalizationRequest
 
 
 class RolloutOutcome(str, enum.Enum):
@@ -1155,7 +1158,6 @@ class RolloutManager:
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
-        finalizer: Optional[Any] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1169,11 +1171,6 @@ class RolloutManager:
             else RolloutRetryPolicy.single_attempt()
         )
         self._stats = RolloutStats()
-        if finalizer is not None:
-            assert use_nemo_gym, (
-                "token capture (finalizer) is only supported on the NeMo-Gym path"
-            )
-
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
             assert policy_generation is not None, (
@@ -1205,7 +1202,6 @@ class RolloutManager:
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
-        self._finalizer = finalizer
         # The NeMo-Gym env handle doubles as the gate control-plane proxy
         # (gate_metrics / fail_rollouts) on the capture path.
         self._env_handles = task_to_env
@@ -1299,22 +1295,9 @@ class RolloutManager:
             start_version = self._weight_version
             # Reserved inside the loop so each attempt owns a fresh group_id: rows a
             # failed attempt may have written cannot then collide with the retry's.
-            rollout_ids: Optional[list[str]] = None
-            if self._finalizer is None:
-                group_id = self._tq_buffer.reserve(
-                    weight_version=start_version, target_step=target_step
-                )
-            else:
-                group_id = str(uuid.uuid4())
-                rollout_ids = [
-                    f"{group_id}_g{i}" for i in range(self._num_generations_per_prompt)
-                ]
-                self._tq_buffer.reserve(
-                    weight_version=start_version,
-                    target_step=target_step,
-                    group_id=group_id,
-                    rollout_ids=rollout_ids,
-                )
+            group_id = self._tq_buffer.reserve(
+                weight_version=start_version, target_step=target_step
+            )
             try:
                 # Registered per ATTEMPT, not per prompt: each retry reserves a fresh
                 # group_id, so the controller's registry must follow the attempt that
@@ -1325,22 +1308,14 @@ class RolloutManager:
                     inflight_registry[group_id] = (current_task, start_version)
                 # Unregister before commit so cancellation cannot interrupt it.
                 try:
-                    if rollout_ids is None:
-                        record = await self.run_rollout(input_sample)
-                        end_version = self._weight_version
-                        await self._tq_buffer.commit(
-                            group_id,
-                            record,
-                            start_weight_version=start_version,
-                            end_weight_version=end_version,
-                        )
-                    else:
-                        await self._generate_and_finalize_attempt(
-                            input_sample,
-                            group_id=group_id,
-                            rollout_ids=rollout_ids,
-                            start_version=start_version,
-                        )
+                    record = await self.run_rollout(input_sample)
+                    end_version = self._weight_version
+                    await self._tq_buffer.commit(
+                        group_id,
+                        record,
+                        start_weight_version=start_version,
+                        end_weight_version=end_version,
+                    )
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(group_id, None)
@@ -1348,8 +1323,6 @@ class RolloutManager:
                 # A failed rollout must not leave an unready slot that can block an
                 # in-order sampler. commit() rolls back any DataPlane rows it wrote.
                 # Cleanup failure must not mask the error that caused it.
-                if rollout_ids is not None:
-                    await self._fail_capture_rollouts(group_id, rollout_ids)
                 try:
                     await self._tq_buffer.remove_group(group_id)
                 except Exception as cleanup_exc:
@@ -1402,8 +1375,6 @@ class RolloutManager:
                 continue
             except BaseException:
                 # Cancellation and other non-Exception exits: clean up, never retry.
-                if rollout_ids is not None:
-                    await self._fail_capture_rollouts(group_id, rollout_ids)
                 try:
                     await self._tq_buffer.remove_group(group_id)
                 except Exception as cleanup_exc:
@@ -1431,59 +1402,66 @@ class RolloutManager:
             f"{type(last_infra_error).__name__}: {last_infra_error}"
         ) from last_infra_error
 
-    async def _generate_and_finalize_attempt(
+    async def generate_for_finalization(
         self,
         input_sample: DatumSpec,
         *,
-        group_id: str,
-        rollout_ids: list[str],
-        start_version: int,
-    ) -> None:
-        """Finalize one already-reserved token-capture rollout attempt."""
-        assert self._finalizer is not None
-        assert self._tq_buffer is not None
+        target_step: Optional[int] = None,
+        inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
+    ) -> "FinalizationRequest":
+        """Run capture generation and return a metadata-only actor request.
 
-        record = await self.run_rollout(input_sample, rollout_ids=rollout_ids)
-        receipts = [c.env_extras.get("ng_receipt") for c in record.completions]
-        rewards = [float(c.reward) for c in record.completions]
-        finalized = await asyncio.to_thread(
-            self._finalizer.finalize_group,
-            group_id,
-            rollout_ids,
-            receipts,
-            rewards,
-            fallback_weight_version=start_version,
-        )
-        record.rollout_metrics.update(finalized.metrics)
-        if finalized.dropped:
-            await self._tq_buffer.abort_finalized(
-                group_id, staging_keys=finalized.staging_keys
-            )
-            raise RuntimeError(
-                f"token capture: group {group_id} dropped "
-                "(min_valid_fraction_per_group)"
-            )
-        assert finalized.meta is not None
-        assert finalized.fields is not None
-        await self._tq_buffer.commit_finalized(
-            group_id,
-            finalized.meta,
-            finalized.fields,
-            finalized.group_min_wv,
-            finalized.group_max_wv,
-            staging_keys=finalized.staging_keys,
-        )
+        The replay-buffer slot remains reserved and unready. The caller owns
+        finalizer submission and must either commit the returned group or stop
+        the validation run on an unknown publication outcome.
+        """
+        from nemo_rl.experience.finalizer_actor import FinalizationRequest
 
-    async def _fail_capture_rollouts(
-        self, group_id: str, rollout_ids: list[str]
-    ) -> None:
-        """Best-effort gate cleanup for a failed token-capture attempt."""
-        nemo_gym_env = self._env_handles.get("nemo_gym")
-        if nemo_gym_env is None:
-            return
+        assert self._tq_buffer is not None, (
+            "generate_for_finalization requires tq_buffer to be set at __init__"
+        )
+        start_version = self._weight_version
+        group_id = str(uuid.uuid4())
+        rollout_ids = tuple(
+            f"{group_id}_g{i}" for i in range(self._num_generations_per_prompt)
+        )
+        self._tq_buffer.reserve(
+            weight_version=start_version,
+            target_step=target_step,
+            group_id=group_id,
+            rollout_ids=list(rollout_ids),
+        )
         try:
-            await nemo_gym_env.fail_rollouts.remote(
-                rollout_ids, reason="dispatch_failed"
+            if inflight_registry is not None:
+                current_task = asyncio.current_task()
+                assert current_task is not None
+                inflight_registry[group_id] = (current_task, start_version)
+            try:
+                record = await self.run_rollout(
+                    input_sample,
+                    rollout_ids=list(rollout_ids),
+                )
+            finally:
+                if inflight_registry is not None:
+                    inflight_registry.pop(group_id, None)
+            receipts = tuple(c.env_extras.get("ng_receipt") for c in record.completions)
+            rewards = tuple(float(c.reward) for c in record.completions)
+            request = FinalizationRequest(
+                group_id=group_id,
+                rollout_ids=rollout_ids,
+                receipts=receipts,
+                rewards=rewards,
+                fallback_weight_version=start_version,
             )
-        except Exception as error:  # noqa: BLE001 — TTL is the backstop
-            print(f"fail_rollouts({group_id}) failed: {error}", flush=True)
+            from nemo_rl.experience.finalizer_actor import assert_metadata_only
+
+            assert_metadata_only(request)
+            return request
+        except BaseException:
+            self._tq_buffer.abort(group_id)
+            nemo_gym_env = self._env_handles.get("nemo_gym")
+            if nemo_gym_env is not None:
+                await nemo_gym_env.fail_rollouts.remote(
+                    list(rollout_ids), reason="dispatch_failed"
+                )
+            raise

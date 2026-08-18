@@ -36,9 +36,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import statistics
 import time
 from functools import partial
-from typing import Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import ray
 import torch
@@ -72,15 +73,20 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
+from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
+from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
 from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+
+if TYPE_CHECKING:
+    from nemo_rl.experience.finalizer_actor import FinalizationRequest
 
 Generation = Union[VllmGeneration, SGLangGeneration]
 
@@ -147,6 +153,14 @@ class SingleControllerActor:
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
+        self._finalizer_actors = list(actor_args.finalizer_actors)
+        self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
+        for actor in self._finalizer_actors:
+            self._available_finalizers.put_nowait(actor)
+        self._active_finalizers = 0
+        self._finalizer_waiters = 0
+        self._finalizer_unknown_outcomes = 0
+        self._finalizer_metrics_by_group: dict[str, dict[str, float]] = {}
 
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
@@ -295,6 +309,11 @@ class SingleControllerActor:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            for actor in self._finalizer_actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception as error:
+                    print(f"finalizer actor termination failed: {error}", flush=True)
             try:
                 self._weight_synchronizer.shutdown()
             except Exception as e:  # teardown must not mask the original failure
@@ -317,6 +336,10 @@ class SingleControllerActor:
             "inflight_rollouts": self._inflight_rollouts,
             "rollout_permitted": self._rollout_permitted.is_set(),
             "epoch": self._current_epoch,
+            "active_finalizers": self._active_finalizers,
+            "finalizer_waiters": self._finalizer_waiters,
+            "finalizer_queue_depth": self._available_finalizers.qsize(),
+            "finalizer_unknown_outcomes": self._finalizer_unknown_outcomes,
         }
 
     # ── internal helpers ───────────────────────────────────────────────────
@@ -518,6 +541,203 @@ class SingleControllerActor:
             flush=True,
         )
 
+    @staticmethod
+    def _request_staging_keys(request: "FinalizationRequest") -> list[str]:
+        """Return the full receipt-manifest staging ownership for a request."""
+        keys: list[str] = []
+        for receipt in request.receipts:
+            if receipt is None:
+                continue
+            manifest = receipt.get("manifest")
+            if not isinstance(manifest, list):
+                continue
+            for record in manifest:
+                if isinstance(record, dict) and isinstance(
+                    record.get("staging_key"), str
+                ):
+                    keys.append(record["staging_key"])
+        return list(dict.fromkeys(keys))
+
+    async def _cleanup_known_finalization_request(
+        self, request: "FinalizationRequest"
+    ) -> None:
+        """Clear known request ownership after a pre-publication/known outcome."""
+        errors: list[BaseException] = []
+        try:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=list(request.rollout_ids),
+                partition_id=self._partition_id,
+            )
+        except Exception as error:
+            errors.append(
+                RuntimeError(
+                    "pre-publication canonical cleanup failed for "
+                    f"group={request.group_id!r}, ids={request.rollout_ids!r}"
+                )
+            )
+            errors[-1].__cause__ = error
+        staging_keys = self._request_staging_keys(request)
+        if staging_keys:
+            try:
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=staging_keys,
+                    partition_id=self._master_config.token_capture.staging_partition,
+                )
+            except Exception as error:
+                errors.append(
+                    RuntimeError(
+                        "pre-publication staging cleanup failed for "
+                        f"group={request.group_id!r}, keys={staging_keys!r}"
+                    )
+                )
+                errors[-1].__cause__ = error
+        if errors:
+            raise BaseExceptionGroup(
+                f"known-outcome cleanup failed for group {request.group_id}",
+                errors,
+            )
+        self._buffer.abort(request.group_id)
+
+    async def _finalize_with_actor(self, request: "FinalizationRequest") -> None:
+        """Submit one metadata request to the bounded fixed actor pool."""
+        self._finalizer_waiters += 1
+        queue_depth = max(
+            0,
+            self._finalizer_waiters - self._available_finalizers.qsize(),
+        )
+        queue_start = time.perf_counter()
+        try:
+            actor = await self._available_finalizers.get()
+        except asyncio.CancelledError:
+            await self._cleanup_known_finalization_request(request)
+            raise
+        finally:
+            self._finalizer_waiters -= 1
+        queue_wait_ms = (time.perf_counter() - queue_start) * 1000.0
+        self._active_finalizers += 1
+        active_actor_count = self._active_finalizers
+        finalize_start = time.perf_counter()
+        try:
+            finalized = await actor.finalize.remote(request)
+        except BaseException:
+            self._finalizer_unknown_outcomes += 1
+            print(
+                "FATAL: finalizer actor RPC failed after submission; canonical "
+                f"publication outcome is unknown for group {request.group_id}. "
+                "Stopping validation without actor replacement or retry.",
+                flush=True,
+            )
+            raise
+        else:
+            self._available_finalizers.put_nowait(actor)
+        finally:
+            self._active_finalizers -= 1
+        finalize_total_ms = (time.perf_counter() - finalize_start) * 1000.0
+
+        if finalized.dropped:
+            try:
+                await self._cleanup_known_finalization_request(request)
+            except BaseException as cleanup_error:
+                raise RuntimeError(
+                    "finalizer dropped the group and known-key cleanup failed "
+                    f"for group {request.group_id}"
+                ) from cleanup_error
+            raise RuntimeError(
+                f"token capture: group {request.group_id} dropped "
+                "(min_valid_fraction_per_group)"
+            )
+        if finalized.meta is None:
+            try:
+                await self._cleanup_known_finalization_request(request)
+            except BaseException as cleanup_error:
+                raise RuntimeError(
+                    "finalizer returned no metadata and known-key cleanup failed "
+                    f"for group {request.group_id}"
+                ) from cleanup_error
+            raise RuntimeError(
+                f"finalizer returned no metadata for non-dropped group {request.group_id}"
+            )
+        try:
+            await self._buffer.commit_finalized(
+                request.group_id,
+                finalized.meta,
+                finalized.group_min_wv,
+                finalized.group_max_wv,
+                staging_keys=finalized.staging_keys,
+            )
+        except BaseException as commit_error:
+            try:
+                await self._cleanup_known_finalization_request(request)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    f"finalizer commit and known-key cleanup failed for "
+                    f"group {request.group_id}",
+                    [commit_error, cleanup_error],
+                )
+            raise
+        finalized.metrics.update(
+            {
+                "finalize/queue_wait_ms": queue_wait_ms,
+                "finalize/total_ms": finalize_total_ms,
+                "finalize/queue_depth": float(queue_depth),
+                "finalize/active_actor_count": float(active_actor_count),
+            }
+        )
+        self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
+
+    async def _cleanup_consumed_metas(self, metas: list[KVBatchMeta]) -> None:
+        """Clear canonical rows and full-manifest staging keys after train success."""
+        canonical_by_partition: dict[str, list[str]] = {}
+        staging_by_partition: dict[str, list[str]] = {}
+        for meta in metas:
+            canonical_by_partition.setdefault(meta.partition_id, []).extend(
+                meta.sample_ids
+            )
+            for tag in meta.tags or []:
+                encoded_plan = tag.get(ROUTE_PLAN_TAG)
+                if encoded_plan is None:
+                    continue
+                plan = decode_route_plan(encoded_plan)
+                staging_by_partition.setdefault(plan.staging_partition, []).extend(
+                    plan.cleanup_staging_keys
+                )
+
+        errors: list[BaseException] = []
+        for partition_id, sample_ids in canonical_by_partition.items():
+            unique_ids = list(dict.fromkeys(sample_ids))
+            try:
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=unique_ids,
+                    partition_id=partition_id,
+                )
+            except Exception as error:
+                cleanup_error = RuntimeError(
+                    "post-train canonical cleanup failed: "
+                    f"partition={partition_id!r}, sample_ids={unique_ids!r}"
+                )
+                cleanup_error.__cause__ = error
+                errors.append(cleanup_error)
+        for partition_id, staging_keys in staging_by_partition.items():
+            unique_keys = list(dict.fromkeys(staging_keys))
+            try:
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=unique_keys,
+                    partition_id=partition_id,
+                )
+            except Exception as error:
+                cleanup_error = RuntimeError(
+                    "post-train staging cleanup failed: "
+                    f"partition={partition_id!r}, staging_keys={unique_keys!r}"
+                )
+                cleanup_error.__cause__ = error
+                errors.append(cleanup_error)
+        if errors:
+            raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
+
     # ── the three pumps + the inline advantage stage ───────────────────────
 
     async def _rollout_pump(self) -> None:
@@ -547,20 +767,40 @@ class SingleControllerActor:
         ) -> None:
             task_started_event.set()
             self._inflight_rollouts += 1
+            generation_permit_released = False
+            inflight_count_released = False
+            ownership_transferred = False
             try:
-                outcome = await self._rollout_manager.generate_and_push(
-                    prompt,
-                    target_step=target_step,
-                    inflight_registry=self._inflight_by_group_id,
-                )
+                if self._finalizer_actors:
+                    request = await self._rollout_manager.generate_for_finalization(
+                        prompt,
+                        target_step=target_step,
+                        inflight_registry=self._inflight_by_group_id,
+                    )
+                    self._inflight_rollouts -= 1
+                    inflight_count_released = True
+                    sem.release()
+                    generation_permit_released = True
+                    await self._finalize_with_actor(request)
+                else:
+                    await self._rollout_manager.generate_and_push(
+                        prompt,
+                        target_step=target_step,
+                        inflight_registry=self._inflight_by_group_id,
+                    )
+                    outcome = RolloutOutcome.COMMITTED
+                ownership_transferred = True
             except BaseException:
                 # On success ownership transfers to the train pump, which
                 # releases this permit after consuming the committed group.
-                self._buffer_capacity.release()
+                if not ownership_transferred:
+                    self._buffer_capacity.release()
                 raise
             finally:
-                self._inflight_rollouts -= 1
-                sem.release()
+                if not inflight_count_released:
+                    self._inflight_rollouts -= 1
+                if not generation_permit_released:
+                    sem.release()
 
             if outcome is RolloutOutcome.SKIPPED:
                 # Nothing was committed, so the train pump will never see this group
@@ -665,6 +905,9 @@ class SingleControllerActor:
             min_sample_version = None
             step_open = False
             calibration_batches: list[BatchedDataDict[Any]] = []
+            consumed_metas: list[KVBatchMeta] = []
+            consumed_group_count = 0
+            step_finalizer_metrics: dict[str, list[float]] = {}
 
             with self._timer.time("total_step_time"):
                 while groups_dispatched < grpo_cfg.num_prompts_per_step:
@@ -721,9 +964,19 @@ class SingleControllerActor:
                             await asyncio.sleep(0.005)
                             continue
 
-                        # Release buffer capacity
-                        for _ in range(num_groups):
-                            self._buffer_capacity.release()
+                        consumed_metas.append(train_meta)
+                        consumed_group_count += num_groups
+                        selected_group_ids = {
+                            sample_id.rsplit("_g", 1)[0]
+                            for sample_id in train_meta.sample_ids
+                        }
+                        for group_id in selected_group_ids:
+                            for name, value in self._finalizer_metrics_by_group.pop(
+                                group_id, {}
+                            ).items():
+                                step_finalizer_metrics.setdefault(name, []).append(
+                                    float(value)
+                                )
 
                     # Compute prev_logprobs / ref_logprobs
                     if (
@@ -795,15 +1048,23 @@ class SingleControllerActor:
                     else:
                         min_sample_version = curr_min_sample_version
 
-                    # Remove consumed sample_ids from the buffer
-                    await self._clear_data_plane_samples(list(train_meta.sample_ids))
-
                     groups_dispatched += num_groups
 
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
 
+                await self._cleanup_consumed_metas(consumed_metas)
+                for _ in range(consumed_group_count):
+                    self._buffer_capacity.release()
+
                 step_metrics = aggregate_step_metrics(result)
+                step_metrics.update(
+                    {
+                        name: statistics.fmean(values)
+                        for name, values in step_finalizer_metrics.items()
+                        if values
+                    }
+                )
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )

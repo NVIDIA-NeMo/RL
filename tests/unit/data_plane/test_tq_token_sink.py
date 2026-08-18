@@ -85,6 +85,42 @@ def test_fetch_missing_key_raises_keyerror(tq_client, staging_partition):
         source.fetch(["ghost_rollout/ghost_call"])
 
 
+def test_fetch_for_finalization_is_small_typed_and_identity_preserving(
+    tq_client, staging_partition
+):
+    class RecordingClient:
+        def __init__(self, client):
+            self.client = client
+            self.select_fields = None
+
+        def get_samples(self, **kwargs):
+            self.select_fields = list(kwargs["select_fields"])
+            return self.client.get_samples(**kwargs)
+
+    sink = TQTokenSink(tq_client, staging_partition=staging_partition)
+    records, _, _, _ = build_fixture_artifacts(load_fixture("single_call"))
+    assert sink.stage(records[0]).ok
+    recording_client = RecordingClient(tq_client)
+    source = TQTokenSource(recording_client, staging_partition=staging_partition)
+
+    fetched = source.fetch_for_finalization([records[0].staging_key])
+
+    assert recording_client.select_fields == STAGING_FIELDS
+    assert "routed_experts" not in recording_client.select_fields
+    assert len(fetched) == 1
+    assert fetched[0].staging_key == records[0].staging_key
+    assert fetched[0].snapshot.call_id == records[0].call_id
+    assert fetched[0].routed_len == 0
+
+
+def test_fetch_for_finalization_rejects_duplicate_request_keys(
+    tq_client, staging_partition
+):
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    with pytest.raises(KeyError, match="duplicate keys"):
+        source.fetch_for_finalization(["r/c", "r/c"])
+
+
 def test_stage_failure_reports_not_raises(staging_partition):
     class ExplodingClient:
         def put_samples(self, **kwargs):

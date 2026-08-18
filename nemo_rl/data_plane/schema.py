@@ -62,6 +62,13 @@ LP_SEED_FIELDS = (
 DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS, "multi_modal_inputs")
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
+ROUTED_LEN_FIELD = "routed_len"
+
+# Deferred route storage. Canonical rows carry one strict encoded route plan
+# per tag; policy workers omit the absent canonical route column and assemble
+# it from staging immediately before previous-policy logprob or training.
+ROUTE_PLAN_TAG = "route_assembly_plan"
+ROUTE_PASSTHROUGH_FLAG = "route_passthrough"
 
 # Per-sample 1D scalar fields. The TQ adapter promotes these to ``(N, 1)``
 # on write to work around TQ v0.1.9's KVStorageManager schema/data mismatch on
@@ -79,6 +86,7 @@ PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
         INPUT_LENGTHS,
         "total_reward",
         SAMPLE_MASK,
+        ROUTED_LEN_FIELD,
     }
 )
 

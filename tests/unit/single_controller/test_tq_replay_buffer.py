@@ -32,8 +32,15 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     replay_manifest_digest,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.route_plan import (
+    ROUTE_PLAN_SCHEMA_VERSION,
+    RouteAssemblyPlan,
+    RouteSpan,
+    encode_route_plan,
+)
 
 # Each record yields _N_GENS training rows.
 _N_GENS = 2
@@ -1012,6 +1019,41 @@ class TestTQReplayBufferTokenCaptureMode:
                 buf.commit_finalized("ghost", meta, {}, group_min_wv=0, group_max_wv=0)
             )
 
+    def test_commit_finalized_verifies_full_plan_manifest_ownership(self):
+        dp = MultiPartitionFakeDataPlaneClient()
+        buf = self._make_capture_buffer(dp)
+        group_id = buf.reserve(weight_version=1, rollout_ids=["r0"])
+        plan = encode_route_plan(
+            RouteAssemblyPlan(
+                schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+                staging_partition="rollout_staging",
+                spans=(RouteSpan("r0/on_chain", 0, 2, 2),),
+                cleanup_staging_keys=("r0/on_chain", "r0/off_chain"),
+                expected_token_length=2,
+            )
+        )
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["r0"],
+            fields=["input_ids"],
+            tags=[{ROUTE_PLAN_TAG: plan}],
+        )
+
+        with pytest.raises(ValueError, match="ownership does not match"):
+            _run(
+                buf.commit_finalized(
+                    group_id,
+                    meta,
+                    group_min_wv=1,
+                    group_max_wv=1,
+                    staging_keys=["r0/on_chain"],
+                )
+            )
+
+        assert buf.size() == 1
+        assert buf.ready_list == [False]
+
     def test_abort_drops_unready_slot_only(self):
         dp = MultiPartitionFakeDataPlaneClient()
         buf = self._make_capture_buffer(dp)
@@ -1088,6 +1130,38 @@ class TestTQReplayBufferTokenCaptureMode:
         _run(buf.remove([0], remove_in_dp=True))
         partitions_cleared = {p for p, _ in dp.clear_calls_by_partition}
         assert partitions_cleared == {"rollout_data"}
+
+    def test_cleanup_failure_retains_buffer_ownership(self):
+        class FailingStagingCleanupClient(MultiPartitionFakeDataPlaneClient):
+            def clear_samples(self, sample_ids, partition_id):
+                if partition_id == "rollout_staging":
+                    raise RuntimeError("injected staging cleanup failure")
+                return super().clear_samples(sample_ids, partition_id)
+
+        dp = FailingStagingCleanupClient()
+        buf = self._make_capture_buffer(dp)
+        group_id = buf.reserve(weight_version=1, rollout_ids=["r0"])
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["r0"],
+            fields=None,
+        )
+        _run(
+            buf.commit_finalized(
+                group_id,
+                meta,
+                group_min_wv=1,
+                group_max_wv=1,
+                staging_keys=["r0/c1"],
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="retained replay-buffer ownership"):
+            _run(buf.remove([0], remove_in_dp=True))
+
+        assert buf.size() == 1
+        assert buf._staging_keys_list == [["r0/c1"]]
 
 
 class TestTQReplayBufferEvictedCommit:

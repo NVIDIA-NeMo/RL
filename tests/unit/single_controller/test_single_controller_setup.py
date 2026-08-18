@@ -342,6 +342,14 @@ class TestSetup:
             ("min_groups", "must be >="),
             ("global_batch_size", "must equal policy.train_global_batch_size"),
             ("buffer_capacity", "required capacity"),
+            (
+                "deferred_routes_without_capture",
+                "defer_routed_experts_to_policy requires",
+            ),
+            (
+                "actor_pool_without_capture",
+                "finalizer_actor_pool_enabled requires",
+            ),
         ],
     )
     def test_invalid_config_fails_before_setup_factories(
@@ -357,6 +365,10 @@ class TestSetup:
             mc.policy["train_global_batch_size"] = 7
         elif invalid_case == "buffer_capacity":
             mc.async_rl.max_buffered_rollouts = 7
+        elif invalid_case == "deferred_routes_without_capture":
+            mc.token_capture.defer_routed_experts_to_policy = True
+        elif invalid_case == "actor_pool_without_capture":
+            mc.token_capture.finalizer_actor_pool_enabled = True
         else:  # pragma: no cover
             raise AssertionError(f"unknown test case {invalid_case}")
 

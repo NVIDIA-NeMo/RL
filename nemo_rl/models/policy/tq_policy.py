@@ -46,6 +46,8 @@ from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
+    ROUTE_PASSTHROUGH_FLAG,
+    ROUTE_PLAN_TAG,
     fields_with_optional_routed_experts,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -272,6 +274,38 @@ class TQPolicy(Policy):
             return args, None
         return None, None
 
+    def _with_route_fields(
+        self,
+        meta: KVBatchMeta,
+        base_fields: tuple[str, ...],
+        *,
+        task_name: str,
+        want_routes: bool,
+    ) -> KVBatchMeta:
+        """Resolve direct versus deferred route storage for one worker request."""
+        want = self._router_replay_enabled and want_routes
+        plan_presence = [ROUTE_PLAN_TAG in tag for tag in (meta.tags or [])]
+        if want and any(plan_presence) and not all(plan_presence):
+            raise RuntimeError(
+                "router replay does not support mixed direct/deferred route "
+                "storage in one worker fetch"
+            )
+        passthrough = bool(want and plan_presence and all(plan_presence))
+        extra_info = dict(meta.extra_info or {})
+        if passthrough:
+            extra_info[ROUTE_PASSTHROUGH_FLAG] = True
+        else:
+            extra_info.pop(ROUTE_PASSTHROUGH_FLAG, None)
+        return replace(
+            meta,
+            fields=fields_with_optional_routed_experts(
+                base_fields,
+                enabled=want and not passthrough,
+            ),
+            task_name=task_name,
+            extra_info=extra_info,
+        )
+
     def _logprob_dispatch(
         self,
         meta: KVBatchMeta,
@@ -294,13 +328,11 @@ class TQPolicy(Policy):
         """
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("logprob_mb_tokens")
-        lp_meta = replace(
+        lp_meta = self._with_route_fields(
             meta,
-            fields=fields_with_optional_routed_experts(
-                LP_SEED_FIELDS,
-                enabled=self._router_replay_enabled and include_router_replay,
-            ),
+            LP_SEED_FIELDS,
             task_name=task_name,
+            want_routes=include_router_replay,
         )
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
@@ -402,12 +434,11 @@ class TQPolicy(Policy):
         # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
         # by workers + driver delta-writes. Caller may narrow to drop columns
         # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
-        train_meta = replace(
+        train_meta = self._with_route_fields(
             meta,
-            fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
-            ),
+            train_fields,
             task_name="train",
+            want_routes=True,
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
@@ -526,12 +557,11 @@ class TQPolicy(Policy):
         """
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
-        train_meta = replace(
+        train_meta = self._with_route_fields(
             meta,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
-            ),
+            DP_TRAIN_FIELDS,
             task_name="train",
+            want_routes=True,
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(

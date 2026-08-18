@@ -133,6 +133,17 @@ def test_shard_meta_for_dp_preserves_partition_id():
     assert all(m.partition_id == "train" for m in metas)
 
 
+def test_shard_meta_for_dp_preserves_tag_row_identity():
+    meta = _meta(8)
+    meta.tags = [{"row": sample_id} for sample_id in meta.sample_ids]
+
+    metas, _ = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
+
+    for shard in metas:
+        assert shard.tags is not None
+        assert [tag["row"] for tag in shard.tags] == shard.sample_ids
+
+
 def test_shard_meta_for_dp_unsorted_round_trip():
     """unsorted_indices must reconstruct the input order from DP-rank concat."""
     n, dp = 8, 4

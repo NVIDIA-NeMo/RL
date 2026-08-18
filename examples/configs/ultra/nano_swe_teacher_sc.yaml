@@ -35,11 +35,29 @@ async_rl:
 
 grpo:
   val_period: 0                      # SC does not support validation yet
+  # Main-era SC refuses legacy async config (async_rl above is the SC
+  # equivalent); the block is inherited from swe_teacher.yaml.
+  async_grpo: null
 
 checkpointing:
   enabled: false                     # SC does not support checkpointing yet
 
 policy:
+  generation:
+    # SingleController has no validation loop yet, so keep the required
+    # validation sampling profile identical to rollout sampling.
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
+    vllm_kwargs:
+      # vLLM 0.25's auto MoE backend picks FLASHINFER_TRTLLM on GB200, which
+      # re-lays w13/w2 into a 4D block format at init; the RL refit
+      # (model.load_weights of HF per-expert 2D weights) then dies with
+      # "shard_dim=0 is not a valid data dimension for a 3D tensor"
+      # (smoke 6107601, all 8 workers; same class as sglang#27787). Triton
+      # keeps the canonical [E, I, H] layout that refit can load — matches
+      # the other MoE recipes (e.g. grpo-nemotron3-super-120BA12B).
+      moe_backend: triton
   # run_grpo_single_controller.py:111 reads policy.draft.enabled (speculative
   # draft weights). The Ultra/SWE chain has no draft block; add it, disabled.
   draft:
@@ -66,7 +84,8 @@ loss_fn:
 # (nemo_rl/algorithms/single_controller_utils/config.py).
 token_capture:
   enabled: false
-  # TQ partition holding per-call staged token deltas (finalizer-cleared).
+  # TQ partition holding per-call staged token deltas. Deferred-route mode
+  # retains these through policy consumption; direct mode clears in finalizer.
   staging_partition: "rollout_staging"
   # continue: a failed worker-side stage poisons the rollout (placeholder row);
   # abort: fails the whole rollout at the gate.
@@ -77,7 +96,8 @@ token_capture:
   # Drop the whole group when fewer than this fraction of its rollouts
   # produced valid rows (null keeps every group).
   min_valid_fraction_per_group: null
-  # Gate-side cleanup backstops (seconds).
+  # Gate registration expiry. staging_ttl_s is reserved configuration only;
+  # TQ does not currently provide an operational staging TTL/reaper.
   registration_ttl_s: 3600.0
   staging_ttl_s: 3600.0
   # Gym LineageIndex capacity (each in-flight rollout's cumulative tokens
@@ -94,3 +114,10 @@ token_capture:
   # Directory for the Gym base capture layer the gate rides on (stays
   # essentially empty on the gate path). null = <logger.log_dir>/gym_token_capture.
   capture_dir: null
+  # Keep route bytes out of canonical rows and assemble them on policy workers.
+  defer_routed_experts_to_policy: false
+  # Independent rollback control for the bounded CPU finalizer actor pool and
+  # generation/finalization overlap.
+  finalizer_actor_pool_enabled: false
+  # Fixed validation pool; actors have no automatic restart/task retry.
+  num_finalizer_workers: 2
