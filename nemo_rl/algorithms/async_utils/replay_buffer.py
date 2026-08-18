@@ -24,7 +24,17 @@ from typing import Any, Iterable, Optional
 import ray
 import torch
 
-from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+from nemo_rl.algorithms.async_utils.interfaces import (
+    ReplayBufferProtocol,
+    ReplayBufferState,
+    SampledBatch,
+)
+from nemo_rl.data.weights import (
+    UNWEIGHTED_TASK_NAME,
+    TaskDeficits,
+    TaskName,
+    TaskQuota,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import (
@@ -52,9 +62,32 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
         self.target_weight_versions = []  # it is the weight-version of the trainer where this trajectory will be used.
+        # Source task per trajectory, used to gate batch release on every task's
+        # quota being filled. Parallel to the lists above; see _assert_parallel_lengths.
+        self.task_names: list[TaskName] = []
 
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
+
+    def _assert_parallel_lengths(self) -> None:
+        """Guard the parallel-list invariant.
+
+        Several methods rebuild these lists independently. Missing one silently
+        misaligns task attribution and degrades the per-task gate, so check the
+        invariant after each mutation rather than discovering it much later.
+        """
+        assert (
+            len(self.trajectories)
+            == len(self.trajectory_versions)
+            == len(self.target_weight_versions)
+            == len(self.task_names)
+        ), (
+            f"ReplayBuffer parallel lists out of sync: "
+            f"{len(self.trajectories)} trajectories, "
+            f"{len(self.trajectory_versions)} versions, "
+            f"{len(self.target_weight_versions)} targets, "
+            f"{len(self.task_names)} task names"
+        )
 
     @staticmethod
     def _rollout_metrics_turn_count_for_diagnostics(
@@ -80,6 +113,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         trajectory: dict[str, Any],
         weight_version: int,
         target_weight_version: int,
+        task_name: TaskName = UNWEIGHTED_TASK_NAME,
     ) -> str:
         """Add a per-prompt trajectory group with metadata.
 
@@ -87,6 +121,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             trajectory: data dict
             weight_version: version of the model weights used for generation
             target_weight_version: version of the model weights this trajectory is intended for training
+            task_name: source dataset task; only consulted when a quota is in use
         """
         with self._lock:
             if len(self.trajectories) >= self.max_size:
@@ -96,6 +131,8 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.trajectories.append(trajectory)
             self.trajectory_versions.append(weight_version)
             self.target_weight_versions.append(target_weight_version)
+            self.task_names.append(task_name)
+            self._assert_parallel_lengths()
             # Do not advance last_target_weight_already_generated here. A target
             # is only safe to skip once training consumes a complete batch for it.
             print(
@@ -107,6 +144,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         """Get debug information about buffer state."""
         info: dict[str, Any] = {
             "total_trajectories": len(self.trajectories),
+            "task_name_counts": dict(Counter(self.task_names)),
             "trajectory_versions": self.trajectory_versions,
             "target_weight_versions": self.target_weight_versions,
             "max_size": self.max_size,
@@ -184,14 +222,17 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         for idx in sorted(indices, reverse=True):
             self.trajectory_versions.pop(idx)
             self.target_weight_versions.pop(idx)
+            self.task_names.pop(idx)
             self.trajectories.pop(idx)
+        self._assert_parallel_lengths()
 
     def sample(
         self,
         num_prompt_groups: int,
         current_weight_version: int,
         max_age_steps: int,
-    ) -> Optional[dict[str, Any]]:
+        quota: TaskQuota | None = None,
+    ) -> Optional[SampledBatch]:
         """Sample per-prompt trajectory groups intended for the current training step.
 
         Only returns trajectories with target_weight_version == current_weight_version.
@@ -199,8 +240,17 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         until the remaining trajectories are generated. This ensures no trajectory
         loses its last chance to be used for its intended training step.
 
+        Args:
+            num_prompt_groups: Groups needed for one training step.
+            current_weight_version: Training step being assembled.
+            max_age_steps: Age window for usable trajectories.
+            quota: Per-task group counts. When given, the batch is released only
+                once every task has filled its slots, and exactly ``quota[task]``
+                groups are taken from each -- so the trained mixture matches the
+                configured weights instead of whichever task generated fastest.
+
         Returns:
-            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
+            The sampled batch, or None if insufficient data.
         """
         with self._lock:
             if not self.trajectories:
@@ -277,11 +327,40 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 )
                 return None
 
-            # Select exactly the trajectories intended for this step (FIFO within same target)
-            selected: list[int] = intended_indices[:num_prompt_groups]
-            print(
-                f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
-            )
+            if quota:
+                self._check_quota_applicable(quota)
+                counts = self._counts_by_task(current_weight_version, max_age_steps)
+                deficits = {
+                    task: n - counts[task]
+                    for task, n in quota.items()
+                    if counts[task] < n
+                }
+                if deficits:
+                    # The overall count is satisfied but the mixture is not.
+                    # Releasing now would over-represent whichever task ran fast.
+                    print(
+                        f"   ⏸️ STALLING: step {current_weight_version} is short on "
+                        f"{deficits} (have {dict(counts)}, need {quota})"
+                    )
+                    return None
+
+                # Take exactly quota[task] groups per task, FIFO within a task.
+                taken: Counter = Counter()
+                selected: list[int] = []
+                for i in intended_indices:
+                    task = self.task_names[i]
+                    if taken[task] < quota.get(task, 0):
+                        selected.append(i)
+                        taken[task] += 1
+                print(
+                    f"   ✅ Selected {len(selected)} trajectories matching quota {quota}"
+                )
+            else:
+                # Select exactly the trajectories intended for this step (FIFO within same target)
+                selected: list[int] = intended_indices[:num_prompt_groups]
+                print(
+                    f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
+                )
 
             sampled_weights = [self.trajectory_versions[i] for i in selected]
             avg_trajectory_age = current_weight_version - sum(sampled_weights) / len(
@@ -332,14 +411,16 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.trajectories.clear()
             self.trajectory_versions.clear()
             self.target_weight_versions.clear()
+            self.task_names.clear()
 
-    def state_dict(self) -> dict[str, Any]:
+    def state_dict(self) -> ReplayBufferState:
         """Return serializable state for checkpointing."""
         with self._lock:
             return {
                 "trajectories": list(self.trajectories),
                 "trajectory_versions": list(self.trajectory_versions),
                 "target_weight_versions": list(self.target_weight_versions),
+                "task_names": list(self.task_names),
                 "last_target_weight_already_generated": (
                     self.last_target_weight_already_generated
                 ),
@@ -422,16 +503,31 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             trajectories = list(state["trajectories"])
             trajectory_versions = list(state["trajectory_versions"])
             target_weight_versions = list(state["target_weight_versions"])
+            # Checkpoints written before per-task gating carry no task names.
+            # Backfill so the parallel-list invariant holds; the gate rejects
+            # these explicitly rather than stalling on task names it never sees.
+            if "task_names" in state:
+                task_names = list(state["task_names"])
+            else:
+                task_names = [UNWEIGHTED_TASK_NAME] * len(trajectories)
+                if trajectories:
+                    print(
+                        "⚠️ Checkpoint predates per-task gating and has no task_names; "
+                        "restored trajectories are labeled "
+                        f"{UNWEIGHTED_TASK_NAME!r}. Weighted runs will reject them."
+                    )
             if not (
                 len(trajectories)
                 == len(trajectory_versions)
                 == len(target_weight_versions)
+                == len(task_names)
             ):
                 raise ValueError(
                     "Checkpoint has inconsistent replay buffer lengths: "
                     f"trajectories={len(trajectories)}, "
                     f"trajectory_versions={len(trajectory_versions)}, "
-                    f"target_weight_versions={len(target_weight_versions)}"
+                    f"target_weight_versions={len(target_weight_versions)}, "
+                    f"task_names={len(task_names)}"
                 )
 
             if "max_size" in state and state["max_size"] != self.max_size:
@@ -444,6 +540,8 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.trajectories = trajectories
             self.trajectory_versions = trajectory_versions
             self.target_weight_versions = target_weight_versions
+            self.task_names = task_names
+            self._assert_parallel_lengths()
             self.last_target_weight_already_generated = state[
                 "last_target_weight_already_generated"
             ]
@@ -491,6 +589,8 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.target_weight_versions = [
                 self.target_weight_versions[i] for i in indices_to_keep
             ]
+            self.task_names = [self.task_names[i] for i in indices_to_keep]
+            self._assert_parallel_lengths()
             print(
                 f"   Removed {removed_past} trajectories for past steps "
                 f"(target < {current_step})"
@@ -609,6 +709,47 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         self.target_weight_versions = [
             self.target_weight_versions[i] for i in indices_to_keep
         ]
+        self.task_names = [self.task_names[i] for i in indices_to_keep]
+        self._assert_parallel_lengths()
+
+    def _counts_by_task(
+        self, target_step: int, max_age_steps: int | None = None
+    ) -> Counter:
+        """Count usable trajectories for ``target_step``, broken down by task.
+
+        Must be called while holding ``self._lock``.
+        """
+        return Counter(
+            self.task_names[i]
+            for i in range(len(self.trajectories))
+            if self.target_weight_versions[i] == target_step
+            and self._is_valid_for_target(
+                self.trajectory_versions[i], target_step, max_age_steps
+            )
+        )
+
+    def _check_quota_applicable(self, quota: TaskQuota) -> None:
+        """Fail loudly when buffered trajectories carry no usable task labels.
+
+        Restoring a pre-gating checkpoint into a weighted run leaves every
+        trajectory labeled ``UNWEIGHTED_TASK_NAME``, which no quota key matches.
+        Without this check the gate would simply never open and the run would
+        look like a hang rather than a misconfiguration.
+
+        Must be called while holding ``self._lock``.
+        """
+        if not self.trajectories:
+            return
+        if UNWEIGHTED_TASK_NAME in self.task_names and not (
+            set(self.task_names) & set(quota)
+        ):
+            raise ValueError(
+                "Replay buffer holds trajectories with no task labels while a "
+                f"per-task quota is active (quota tasks: {sorted(quota)}). This "
+                "usually means an async checkpoint written before per-task "
+                "gating was restored into a weighted run. Start from a fresh "
+                "checkpoint, or clear the replay buffer state."
+            )
 
     def get_trajectories_needed(
         self,
@@ -621,19 +762,52 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             current_count = self._count_for_target(target_step, max_age_steps)
             return max(0, num_prompts_per_step - current_count)
 
+    def get_task_deficits(
+        self,
+        target_step: int,
+        quota: TaskQuota,
+        max_age_steps: int | None = None,
+    ) -> TaskDeficits:
+        """Return the per-task shortfall for ``target_step``.
+
+        Drives the collector's pause decision: generation must keep running
+        while any task is still short, even once the overall count is met.
+        """
+        with self._lock:
+            self._check_quota_applicable(quota)
+            counts = self._counts_by_task(target_step, max_age_steps)
+            return {task: max(0, n - counts[task]) for task, n in quota.items()}
+
     def has_complete_batch(
         self,
         target_step: int,
         num_prompts_per_step: int,
         max_age_steps: int | None = None,
+        quota: TaskQuota | None = None,
     ) -> bool:
-        """Return whether ``target_step`` has enough trajectories to train."""
+        """Return whether ``target_step`` has enough trajectories to train.
+
+        With a quota, every task must have filled its slots. A fast task cannot
+        substitute for a slow one, so the released batch always matches the
+        configured mixture.
+        """
         with self._lock:
-            current_count = self._count_for_target(target_step, max_age_steps)
-            return current_count >= num_prompts_per_step
+            if not quota:
+                current_count = self._count_for_target(target_step, max_age_steps)
+                return current_count >= num_prompts_per_step
+
+            self._check_quota_applicable(quota)
+            counts = self._counts_by_task(target_step, max_age_steps)
+            return all(counts[task] >= n for task, n in quota.items())
 
     def _remove_incomplete_target_steps(self, num_prompts_per_step: int) -> None:
         """Remove target steps without a complete batch.
+
+        Completeness is judged on the total count, not the per-task quota, since
+        the quota is not known at restore time. A restored step that has enough
+        trajectories overall but the wrong mixture is therefore kept; the
+        collector's per-task deficits then top up the short tasks, so the gate
+        opens once the mixture is right rather than deadlocking.
 
         Must be called while holding ``self._lock``.
         """
@@ -661,6 +835,8 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         self.target_weight_versions = [
             self.target_weight_versions[i] for i in indices_to_keep
         ]
+        self.task_names = [self.task_names[i] for i in indices_to_keep]
+        self._assert_parallel_lengths()
         print(
             f"   Removed {original_count - len(self.trajectories)} trajectories "
             "from incomplete target steps"

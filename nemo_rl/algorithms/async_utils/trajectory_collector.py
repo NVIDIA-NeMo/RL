@@ -29,8 +29,10 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_multiple
+from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.weights import UNWEIGHTED_TASK_NAME, TaskQuota
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import (
@@ -112,7 +114,7 @@ class AsyncTrajectoryCollector:
 
         self.current_weight_version: int = start_step
         self.initial_weight_version: int = start_step
-        self.dataloader: StatefulDataLoader | None = None
+        self.dataloader: StatefulDataLoader | MultipleDataloaderWrapper | None = None
         self.collection_thread: _threading.Thread | None = None
 
         # Track when generation limits cause collection to pause
@@ -131,7 +133,6 @@ class AsyncTrajectoryCollector:
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
         self._next_nemo_gym_task_index = next_nemo_gym_task_index
-
         # Timer for efficiency metrics
         self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
 
@@ -143,6 +144,16 @@ class AsyncTrajectoryCollector:
         self._max_generation_failures = (
             self.master_config.grpo.async_grpo.max_generation_failures
         )
+
+    @property
+    def task_quota(self) -> TaskQuota:
+        """Per-task prompt counts for one step, or empty when unweighted.
+
+        Sourced from the wrapped dataloader, which owns the mixture definition.
+        """
+        if isinstance(self.dataloader, MultipleDataloaderWrapper):
+            return self.dataloader.task_quota
+        return {}
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -233,6 +244,8 @@ class AsyncTrajectoryCollector:
                 self.replay_buffer.get_last_target_weight_already_generated.remote()
             )
 
+            quota = self.task_quota
+
             # Check if any target weight in our range needs generation
             with self._generation_check_lock:
                 for target_weight in target_weights:
@@ -240,13 +253,24 @@ class AsyncTrajectoryCollector:
                         continue
                     if target_weight in self._generating_targets:
                         continue
-                    trajectories_needed = ray.get(
-                        self.replay_buffer.get_trajectories_needed.remote(
-                            target_weight, num_prompts, max_age_steps
+                    if quota:
+                        # Pausing on the overall count would permanently starve
+                        # whichever task is still short, so check each task.
+                        deficits = ray.get(
+                            self.replay_buffer.get_task_deficits.remote(
+                                target_weight, quota, max_age_steps
+                            )
                         )
-                    )
-                    if trajectories_needed > 0:
-                        return False  # Found a target that needs generation
+                        if any(deficits.values()):
+                            return False  # Some task still owes trajectories
+                    else:
+                        trajectories_needed = ray.get(
+                            self.replay_buffer.get_trajectories_needed.remote(
+                                target_weight, num_prompts, max_age_steps
+                            )
+                        )
+                        if trajectories_needed > 0:
+                            return False  # Found a target that needs generation
 
             print(
                 f"⏸️ All target weights {target_weights} already generated or in progress, pausing"
@@ -869,6 +893,9 @@ class AsyncTrajectoryCollector:
                     final_batch=rollout_result.final_batch,
                     rollout_metrics=rollout_result.rollout_metrics,
                     task_index=task_index,
+                    nemo_gym_metric_samples_by_task=(
+                        rollout_result.nemo_gym_metric_samples_by_task
+                    ),
                 )
             return
 
@@ -1039,10 +1066,23 @@ class AsyncTrajectoryCollector:
         trajectory_group = {
             "batch": final_batch_cpu,
             "rollout_metrics": rollout_metrics,
+            "nemo_gym_metric_samples_by_task": (
+                rollout_result.nemo_gym_metric_samples_by_task
+            ),
             "timestamp": time.time(),
         }
         if rollout_result.task_index is not None:
             trajectory_group[NEMO_GYM_TASK_INDEX_KEY] = rollout_result.task_index
+
+        # A prompt group is one prompt repeated, so every sample in it shares a
+        # task. The buffer needs this to gate release on the configured mixture.
+        group_task_names = final_batch_cpu.get("task_name", None)
+        group_task_name = (
+            group_task_names[0]
+            if group_task_names and group_task_names[0] is not None
+            else UNWEIGHTED_TASK_NAME
+        )
+
         backoff_delay = 0.01
         backoff_started_at: float | None = None
         try:
@@ -1063,6 +1103,7 @@ class AsyncTrajectoryCollector:
                     trajectory_group,
                     generation_weight_version,
                     target_weight_version,
+                    group_task_name,
                 )
                 if status == "success":
                     buffered_group_indices.add(rollout_result.group_index)

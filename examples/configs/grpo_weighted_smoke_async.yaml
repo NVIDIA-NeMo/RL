@@ -1,0 +1,40 @@
+# Async variant of grpo_weighted_smoke.yaml.
+#
+# Exercises the path the branch newly unblocks: the
+# "use_multiple_dataloader is not supported with async GRPO" guard is gone from
+# examples/run_grpo.py, so the weighted mixture now flows through the replay
+# buffer's per-task release gate.
+#
+# 4 GPUs on one node, split 2 training / 2 generation. Same shape as the in-repo
+# recipe grpo-qwen2.5-0.5b-1n4g-megatron-trtllm-noncolocated-async.yaml, but
+# stays on dtensor + vLLM (the backends verified on hsg2) rather than switching
+# to Megatron + TRT-LLM.
+defaults: grpo_weighted_smoke.yaml
+
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+
+# async_grpo_train asserts importance sampling correction at grpo.py:3994 --
+# trajectories are off-policy by construction. Values match the in-repo async
+# recipes (e.g. grpo-qwen2.5-0.5b-1n4g-...-noncolocated-async.yaml).
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+
+policy:
+  generation:
+    # async_grpo_train asserts an async generation engine at grpo.py:3986.
+    # grpo_math_1B.yaml ships async_engine: false, so it must be flipped here.
+    vllm_cfg:
+      async_engine: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: 1
+
+cluster:
+  gpus_per_node: 4

@@ -45,7 +45,14 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.environments.interfaces import EnvironmentReturn
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.metric_utils import (
+    calculate_single_metric,
+    collect_nemo_gym_metric_samples,
+    extract_nemo_gym_metric_values,
+    merge_metric_samples,
+    pct,
+    summarize_nemo_gym_metric_samples,
+)
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutTimeouts,
@@ -66,13 +73,11 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 
 # These are all fixtures
-from tests.unit.environments.test_nemo_gym import (
-    cluster,  # noqa: F401
-    nemo_gym,  # noqa: F401
-    nemo_gym_sanity_test_data,  # noqa: F401
-    nemo_gym_tokenizer,  # noqa: F401
-    nemo_gym_vllm_generation,  # noqa: F401
-)
+from tests.unit.environments.test_nemo_gym import cluster  # noqa: F401
+from tests.unit.environments.test_nemo_gym import nemo_gym  # noqa: F401
+from tests.unit.environments.test_nemo_gym import nemo_gym_sanity_test_data  # noqa: F401
+from tests.unit.environments.test_nemo_gym import nemo_gym_tokenizer  # noqa: F401
+from tests.unit.environments.test_nemo_gym import nemo_gym_vllm_generation  # noqa: F401
 
 # Import the test environment definitions
 from tests.unit.test_envs import (
@@ -513,6 +518,76 @@ class TestPct:
     def test_median_like_p50(self):
         """Test that p50 lands on the upper-mid element (int truncation, no interpolation)."""
         assert pct([10, 20, 30, 40], 50) == 30.0
+
+
+def test_extract_nemo_gym_health_metrics():
+    result = {
+        "resolved": True,
+        "instance_config": {"mask_sample": True},
+        "response": {
+            "output": [
+                {"generation_token_ids": [1, 2, 3]},
+                {"type": "reasoning"},
+            ]
+        },
+        "nested": {
+            "agent_timed_out": True,
+            "ray_queue_time": 2.5,
+            "agent_error_kind": "context_window",
+        },
+        "eval_timed_out": float("nan"),
+    }
+
+    metrics = extract_nemo_gym_metric_values(result)
+
+    assert metrics["resolved"] == 1.0
+    assert metrics["mask_sample"] == 1.0
+    assert metrics["trainable"] == 1.0
+    assert metrics["trainable_items"] == 1.0
+    assert metrics["generated_tokens"] == 3.0
+    assert metrics["output_items"] == 2.0
+    assert metrics["agent_timed_out"] == 1.0
+    assert metrics["ray_queue_time"] == 2.5
+    assert "eval_timed_out" not in metrics
+    assert metrics["agent_error_kind/context_window"] == 1.0
+    assert metrics["agent_error_kind/other"] == 0.0
+
+    unknown_error = extract_nemo_gym_metric_values(
+        {"agent_error_kind": "new_failure_mode"}
+    )
+    assert unknown_error["agent_error_kind/other"] == 1.0
+
+
+def test_merge_and_summarize_nemo_gym_health_metrics():
+    samples = merge_metric_samples(
+        {"resolved": [1.0], "generated_tokens": [2.0]},
+        {"resolved": [0.0], "generated_tokens": [6.0]},
+    )
+
+    metrics = summarize_nemo_gym_metric_samples(
+        samples, prefix="env_a_rollout_metrics/nemo_gym"
+    )
+
+    assert metrics["env_a_rollout_metrics/nemo_gym/resolved/mean"] == 0.5
+    assert metrics["env_a_rollout_metrics/nemo_gym/generated_tokens/min"] == 2.0
+    assert metrics["env_a_rollout_metrics/nemo_gym/generated_tokens/max"] == 6.0
+    assert "env_a_rollout_metrics/nemo_gym/generated_tokens/histogram" in metrics
+
+
+def test_nemo_gym_health_uses_message_logs_after_result_tokens_are_removed():
+    samples = collect_nemo_gym_metric_samples(
+        [{"response": {"output": [{"generation_str": "answer"}]}}],
+        message_logs=[
+            [
+                {"role": "user", "token_ids": torch.tensor([1, 2])},
+                {"role": "assistant", "token_ids": torch.tensor([3, 4, 5])},
+            ]
+        ],
+    )
+
+    assert samples["trainable"] == [1.0]
+    assert samples["trainable_items"] == [1.0]
+    assert samples["generated_tokens"] == [3.0]
 
 
 class _DummyTokenizer:
@@ -2031,7 +2106,13 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
                         "generation_logprobs": torch.tensor([-0.1]),
                     },
                 ],
-                "full_result": {"reward": reward},
+                "full_result": {
+                    "reward": reward,
+                    "resolved": reward == 2.0,
+                    "response": {
+                        "output": [{"generation_token_ids": [2]}],
+                    },
+                },
             }
         )
 
@@ -2045,13 +2126,29 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
             (),
             {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
         )(),
-        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+        input_batch=BatchedDataDict(
+            {
+                "loss_multiplier": torch.ones(2),
+                "task_name": ["env_a", "env_b"],
+            }
+        ),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=log_full_result_tables,
     )
 
     assert rollout_result.task_index == 42
     assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
+    assert rollout_result.final_batch["task_name"] == ["env_a", "env_b"]
+    assert rollout_result.rollout_metrics["env_a_total_reward/mean"] == 1.0
+    assert rollout_result.rollout_metrics["env_b_total_reward/mean"] == 2.0
+    assert (
+        rollout_result.rollout_metrics["env_a_rollout_metrics/nemo_gym/resolved/mean"]
+        == 0.0
+    )
+    assert (
+        rollout_result.rollout_metrics["env_b_rollout_metrics/nemo_gym/resolved/mean"]
+        == 1.0
+    )
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables

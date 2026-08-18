@@ -39,7 +39,12 @@ from nemo_rl.experience.failures import (
     classify_rollout_failure,
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.metric_utils import (
+    calculate_single_metric,
+    collect_nemo_gym_metric_samples,
+    pct,
+    summarize_nemo_gym_metric_samples,
+)
 from nemo_rl.experience.rollouts import (
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
@@ -756,12 +761,32 @@ class AsyncNemoGymRolloutImpl:
 
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
+        rollout_metrics.update(
+            {
+                f"{input_sample['task_name']}_{name}": value
+                for name, value in list(rollout_metrics.items())
+            }
+        )
+        health_samples = collect_nemo_gym_metric_samples(
+            [completion.env_extras or {} for completion in completions],
+            message_logs=[completion.message_log for completion in completions],
+        )
+        rollout_metrics.update(summarize_nemo_gym_metric_samples(health_samples))
+        rollout_metrics.update(
+            summarize_nemo_gym_metric_samples(
+                health_samples,
+                prefix=f"{input_sample['task_name']}_rollout_metrics/nemo_gym",
+            )
+        )
 
         return PromptGroupRecord(
             prompt_idx=input_sample["idx"],
             prompt=prompt_message_log,
             extra_env_info=input_sample["extra_env_info"],
-            metadata={"task_name": "nemo_gym"},
+            # Carry the dataset's own task_name rather than the env name: every
+            # NeMo-Gym dataset shares the "nemo_gym" env but is its own task, and
+            # weighted mixing needs to tell them apart.
+            metadata={"task_name": input_sample["task_name"]},
             completions=completions,
             rollout_metrics=rollout_metrics,
         )

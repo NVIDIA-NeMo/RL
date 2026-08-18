@@ -288,12 +288,6 @@ The validation set you pass in will directly be used for validation with no addi
         if config.grpo.reward_shaping.enabled:
             raise NotImplementedError("reward_shaping is not supported with async GRPO")
 
-        # Async GRPO does not support multiple dataloaders
-        if config.data["use_multiple_dataloader"]:
-            raise NotImplementedError(
-                "use_multiple_dataloader is not supported with async GRPO"
-            )
-
         from nemo_rl.algorithms.grpo import async_grpo_train
 
         print("🚀 Running async GRPO training")

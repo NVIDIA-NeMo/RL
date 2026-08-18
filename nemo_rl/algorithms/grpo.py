@@ -16,6 +16,7 @@ import json
 import os
 import time
 import warnings
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
@@ -73,7 +74,12 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data.utils import (
+    WeightedTaskDatasets,
+    extract_necessary_env_names,
+    load_dataloader_state,
+)
+from nemo_rl.data.weights import TaskQuota, compute_quota
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
@@ -88,6 +94,11 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
+)
+from nemo_rl.experience.metric_utils import (
+    TaskMetricSamples,
+    merge_metric_samples,
+    summarize_nemo_gym_metric_samples,
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
@@ -138,9 +149,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
-from nemo_rl.weight_sync.checkpoint_engine_config import (
-    checkpoint_engine_refit_config,
-)
+from nemo_rl.weight_sync.checkpoint_engine_config import checkpoint_engine_refit_config
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
 # ===============================================================================
@@ -403,7 +412,7 @@ def _needs_hf_refit_handshake(
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
-    dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
+    dataset: AllTaskProcessedDataset | WeightedTaskDatasets,
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
     policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
@@ -534,8 +543,47 @@ def setup(
             "grpo.stop_at_validation_metric is set"
         )
 
+    # Per-task prompt counts for one training step, derived from the configured
+    # dataset weights. Empty when weights are not in use. This is the single
+    # source of truth for both the per-task dataloader batch sizes below and the
+    # replay-buffer release gate on the async path.
+    task_quota: TaskQuota = {}
+    if (
+        data_config["use_multiple_dataloader"]
+        and isinstance(dataset, WeightedTaskDatasets)
+        and dataset.weights
+    ):
+        task_quota = compute_quota(num_prompts_per_step, dataset.weights)
+
+        starved = [task for task, count in task_quota.items() if count < 1]
+        if starved:
+            raise ValueError(
+                f"Tasks {starved} receive 0 prompts per step with "
+                f"grpo.num_prompts_per_step={num_prompts_per_step} and normalized "
+                f"weights { ({t: dataset.weights[t] for t in starved}) }. Raise "
+                "num_prompts_per_step or those weights, or mark the datasets "
+                "evaluation_only."
+            )
+        assert sum(task_quota.values()) == num_prompts_per_step, (
+            f"Task quota {task_quota} sums to {sum(task_quota.values())}, "
+            f"expected {num_prompts_per_step}"
+        )
+
+        # Dynamic sampling drops zero-std prompt groups without regard to task,
+        # so the post-filter mixture would drift away from the configured
+        # weights. Refuse the combination rather than silently approximating it.
+        if grpo_config.use_dynamic_sampling:
+            raise ValueError(
+                "Per-dataset weights and grpo.use_dynamic_sampling cannot be "
+                "combined: dynamic sampling filters zero-std prompt groups "
+                "without regard to task, so the trained mixture would drift "
+                "from the configured weights."
+            )
+
+        print(f"  ✓ Weighted task distribution per step: {task_quota}", flush=True)
+
     # Validate number of prompts per step
-    if data_config["use_multiple_dataloader"]:
+    if data_config["use_multiple_dataloader"] and not task_quota:
         assert num_prompts_per_step % dataloader_batch_size == 0, (
             "Expected num_prompts_per_step to be a multiple of num_prompts_per_dataloader, "
             f"but got {num_prompts_per_step} and {dataloader_batch_size}. "
@@ -544,25 +592,54 @@ def setup(
         )
 
     # Load train dataset
-    def init_train_dataloader(dataset, suffix: str = ""):
+    def init_train_dataloader(
+        dataset,
+        suffix: str = "",
+        batch_size: int | None = None,
+        restore: bool = True,
+    ):
         dataloader = StatefulDataLoader(
             dataset,
-            batch_size=dataloader_batch_size,
+            batch_size=batch_size if batch_size is not None else dataloader_batch_size,
             shuffle=data_config["shuffle"],
             collate_fn=rl_collate_fn,
             drop_last=True,
             num_workers=data_config["num_workers"],
         )
-        if last_checkpoint_path is not None:
+        if last_checkpoint_path is not None and restore:
             load_dataloader_state(dataloader, last_checkpoint_path, data_config, suffix)
         return dataloader
 
     if data_config["use_multiple_dataloader"]:
+        # Two on-disk layouts exist for multi-dataloader state: sync training
+        # writes train_dataloader_{task}.pt per task, async training writes a
+        # single combined train_dataloader.pt keyed by task. Detect which layout
+        # this checkpoint used so a run can resume across either path.
+        per_task_state_exists = last_checkpoint_path is not None and any(
+            os.path.exists(
+                os.path.join(last_checkpoint_path, f"train_dataloader_{task_name}.pt")
+            )
+            for task_name, _ in dataset.items()
+        )
+        combined_state_path = (
+            os.path.join(last_checkpoint_path, "train_dataloader.pt")
+            if last_checkpoint_path is not None
+            else None
+        )
+        use_combined_state = (
+            not per_task_state_exists
+            and combined_state_path is not None
+            and os.path.exists(combined_state_path)
+        )
+
         # Initialize dataloaders
         dataloaders = {}
         for task_name, task_dataset in dataset.items():
             dataloaders[task_name] = init_train_dataloader(
-                task_dataset, f"_{task_name}"
+                task_dataset,
+                f"_{task_name}",
+                batch_size=task_quota.get(task_name),
+                restore=not use_combined_state,
             )
             print(
                 f"  ✓ Training dataloader {task_name} loaded with {len(task_dataset)} samples",
@@ -578,7 +655,14 @@ def setup(
             expected_num_prompts=num_prompts_per_step,
             data_config=data_config,
             dataloaders=dataloaders,
+            task_quota=task_quota,
         )
+        if use_combined_state:
+            dataloader.load_state_dict(torch.load(combined_state_path))
+            print(
+                f"  ✓ Restored combined multi-dataloader state from {combined_state_path}",
+                flush=True,
+            )
     else:
         dataloader = init_train_dataloader(dataset)
         train_sample_count = len(dataloader)
@@ -2684,6 +2768,11 @@ def grpo_train(
     )
     timeout.start_iterations()
     memory_tracker = MemoryTracker()
+    task_quota: TaskQuota = (
+        wrapped_dataloader.task_quota
+        if isinstance(wrapped_dataloader, MultipleDataloaderWrapper)
+        else {}
+    )
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
@@ -2954,6 +3043,12 @@ def grpo_train(
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
+                        rollout_metrics.update(
+                            task_sampling_metrics(
+                                [str(name) for name in batch.get("task_name", [])],
+                                quota=task_quota,
+                            )
+                        )
                         del nemo_gym_rollout_result
 
                     # Use async rollouts when enabled by config/backend defaults.
@@ -3823,8 +3918,11 @@ def validate(
         )
 
         total_rewards = []
-        total_lengths = []
+        total_length_sum = 0.0
         all_message_logs = []  # Collect all message logs
+        all_task_names: list[str] = []
+        per_batch_rollout_metrics: dict[str, list[Any]] = {}
+        validation_health_by_task: TaskMetricSamples = {}
 
         max_batches = (
             master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
@@ -3837,10 +3935,12 @@ def validate(
                 val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
 
             additional_metrics_to_report = dict()
+            is_nemo_gym_batch = False
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
+                is_nemo_gym_batch = True
                 if master_config.grpo.deduplicate_multimodal_data:
                     attach_initial_nemo_gym_image_payloads(val_batch, processor)
                 generation_config = master_config.policy["generation"]
@@ -3879,7 +3979,13 @@ def validate(
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
-                additional_metrics_to_report = gen_metrics
+                for (
+                    task_name,
+                    samples,
+                ) in nemo_gym_rollout_result.nemo_gym_metric_samples_by_task.items():
+                    validation_health_by_task[task_name] = merge_metric_samples(
+                        validation_health_by_task.get(task_name, {}), samples
+                    )
             elif _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
@@ -3908,7 +4014,15 @@ def validate(
                 )
 
             total_rewards.extend(val_batch["total_reward"].tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+            total_length_sum += (
+                gen_metrics["mean_gen_tokens_per_sample"] * val_batch.size
+            )
+            if is_nemo_gym_batch:
+                all_task_names.extend(
+                    str(name) for name in val_batch.get("task_name", [])
+                )
+                for name, value in gen_metrics.items():
+                    per_batch_rollout_metrics.setdefault(name, []).append(value)
 
             # Collect message logs for later display
             to_env = [
@@ -3943,9 +4057,25 @@ def validate(
         else:
             accuracy = 0.0
 
-        avg_length = (
-            sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
+        avg_length = total_length_sum / num_samples if num_samples else 0.0
+
+        additional_metrics_to_report = aggregate_rollout_metrics(
+            per_batch_rollout_metrics
         )
+        if validation_health_by_task:
+            additional_metrics_to_report.update(
+                summarize_nemo_gym_metric_samples(
+                    merge_metric_samples(*validation_health_by_task.values())
+                )
+            )
+            for task_name, samples in validation_health_by_task.items():
+                additional_metrics_to_report.update(
+                    summarize_nemo_gym_metric_samples(
+                        samples,
+                        prefix=f"{task_name}_rollout_metrics/nemo_gym",
+                    )
+                )
+        additional_metrics_to_report.update(task_sampling_metrics(all_task_names))
 
         val_metrics = {
             "accuracy": accuracy,
@@ -4023,7 +4153,12 @@ def aggregate_rollout_metrics(
     """
     aggregated = {}
     for k, v in per_group_metrics.items():
-        if not isinstance(v[0], (int, float)):
+        if k.endswith("/histogram") or k.endswith("/full_result"):
+            # These are already backend-native logging objects. Raw NeMo-Gym
+            # values are aggregated separately, so retain the latest object
+            # here instead of producing an invalid list of Histograms/Tables.
+            aggregated[k] = v[-1]
+        elif not isinstance(v[0], (int, float)):
             aggregated[k] = v
         elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
             aggregated[k] = min(v)
@@ -4042,6 +4177,32 @@ def aggregate_rollout_metrics(
         else:
             aggregated[k] = sum(v) / len(v)
     return aggregated
+
+
+def task_sampling_metrics(
+    task_names: list[str],
+    quota: TaskQuota | None = None,
+    max_deficits: TaskQuota | None = None,
+) -> dict[str, float | int]:
+    """Return Megatron-style per-task mixture accounting for one batch."""
+    counts = Counter(task_names)
+    total = sum(counts.values())
+    metrics: dict[str, float | int] = {}
+    tasks = set(counts) | set(quota or {})
+    for task_name in tasks:
+        count = counts[task_name]
+        prefix = f"{task_name}_sampling"
+        metrics[f"{prefix}/sampled_prompt_groups"] = count
+        metrics[f"{prefix}/sampled_share"] = count / total if total else 0.0
+        if quota:
+            configured = quota.get(task_name, 0)
+            metrics[f"{prefix}/configured_quota"] = configured
+            metrics[f"{prefix}/configured_share"] = configured / sum(quota.values())
+            metrics[f"{prefix}/quota_deficit"] = max(configured - count, 0)
+            metrics[f"{prefix}/max_quota_deficit_while_waiting"] = (
+                max_deficits or {}
+            ).get(task_name, 0)
+    return metrics
 
 
 def async_grpo_train(
@@ -4121,6 +4282,18 @@ def async_grpo_train(
 
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+
+    # Per-task prompt counts for one step, when the datasets are weight-mixed.
+    # Empty otherwise, which leaves the buffer's original first-come gating in
+    # place. Gates batch release on every task filling its slots, so a fast task
+    # cannot crowd out a slow one and skew the trained mixture.
+    task_quota: TaskQuota = (
+        dataloader.task_quota
+        if isinstance(dataloader, MultipleDataloaderWrapper)
+        else {}
+    )
+    if task_quota:
+        print(f"🎯 Async per-task release gate active: {task_quota}")
 
     timer = Timer(context={"worker": "driver"})
     training_wall_start = time.perf_counter()
@@ -4393,6 +4566,7 @@ def async_grpo_train(
             return
 
     print("✅ All setup complete, starting buffer wait...")
+    max_task_deficits: Counter[str] = Counter()
     # Clear logger metrics at start of training
     if policy_generation is not None:
         policy_generation.clear_logger_metrics()
@@ -4408,7 +4582,7 @@ def async_grpo_train(
         ray.get(trajectory_collector.check_health.remote())
         current_step_ready = ray.get(
             replay_buffer.has_complete_batch.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
+                step, num_prompts_per_step, max_trajectory_age_steps, task_quota
             )
         )
 
@@ -4430,7 +4604,10 @@ def async_grpo_train(
             if need_lookahead:
                 next_step_ready = ray.get(
                     replay_buffer.has_complete_batch.remote(
-                        step + 1, num_prompts_per_step, max_trajectory_age_steps
+                        step + 1,
+                        num_prompts_per_step,
+                        max_trajectory_age_steps,
+                        task_quota,
                     )
                 )
                 if not next_step_ready:  # pragma: no cover
@@ -4444,16 +4621,39 @@ def async_grpo_train(
                     continue
             break
 
-        trajectories_needed = ray.get(
-            replay_buffer.get_trajectories_needed.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
+        if task_quota:
+            # Name the task being waited on; otherwise a per-task stall is
+            # indistinguishable from a hang.
+            task_deficits = ray.get(
+                replay_buffer.get_task_deficits.remote(
+                    step, task_quota, max_trajectory_age_steps
+                )
             )
-        )
-        if buffer_size_current >= min_trajectories_needed and trajectories_needed > 0:
-            print(
-                f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
-                f"trajectories for step {step}"
+            outstanding = {t: n for t, n in task_deficits.items() if n > 0}
+            for task_name, deficit in task_deficits.items():
+                max_task_deficits[task_name] = max(
+                    max_task_deficits[task_name], deficit
+                )
+            trajectories_needed = sum(outstanding.values())
+            if buffer_size_current >= min_trajectories_needed and outstanding:
+                print(
+                    f"  ⏳ Gap-filling in progress: step {step} still waiting on "
+                    f"{outstanding}"
+                )
+        else:
+            trajectories_needed = ray.get(
+                replay_buffer.get_trajectories_needed.remote(
+                    step, num_prompts_per_step, max_trajectory_age_steps
+                )
             )
+            if (
+                buffer_size_current >= min_trajectories_needed
+                and trajectories_needed > 0
+            ):
+                print(
+                    f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
+                    f"trajectories for step {step}"
+                )
 
         collector_status = ray.get(trajectory_collector.get_status.remote())
         if (
@@ -4510,6 +4710,7 @@ def async_grpo_train(
                             num_prompt_groups=num_prompt_groups_needed,
                             current_weight_version=weight_version,
                             max_age_steps=max_trajectory_age_steps,
+                            quota=task_quota,
                         )
                     )
                     if sample_result is not None:
@@ -4529,6 +4730,19 @@ def async_grpo_train(
                         print(
                             "⏳ Buffer empty or not enough groups to form a full step, waiting..."
                         )
+
+                        if task_quota:
+                            task_deficits = ray.get(
+                                replay_buffer.get_task_deficits.remote(
+                                    weight_version,
+                                    task_quota,
+                                    max_trajectory_age_steps,
+                                )
+                            )
+                            for task_name, deficit in task_deficits.items():
+                                max_task_deficits[task_name] = max(
+                                    max_task_deficits[task_name], deficit
+                                )
 
                         # Get buffer debug info to help diagnose the issue
                         buffer_debug = ray.get(replay_buffer.get_debug_info.remote())
@@ -4607,6 +4821,11 @@ def async_grpo_train(
                             master_config.grpo.deduplicate_multimodal_data
                         ),
                     )
+                    sampled_task_names = [
+                        str(trajectory["batch"]["task_name"][0])
+                        for trajectory in trajectories
+                        if trajectory["batch"].get("task_name")
+                    ]
 
                     # Teacher logprobs are stored in batch dict by collection-time
                     # computation and padded by from_batches. Extract here.
@@ -4623,6 +4842,36 @@ def async_grpo_train(
                         for k, v in t["rollout_metrics"].items():
                             per_group_metrics.setdefault(k, []).append(v)
                     rollout_metrics = aggregate_rollout_metrics(per_group_metrics)
+
+                    health_samples_by_task: TaskMetricSamples = {}
+                    for trajectory in trajectories:
+                        for task_name, samples in trajectory.get(
+                            "nemo_gym_metric_samples_by_task", {}
+                        ).items():
+                            health_samples_by_task[task_name] = merge_metric_samples(
+                                health_samples_by_task.get(task_name, {}), samples
+                            )
+                    if health_samples_by_task:
+                        rollout_metrics.update(
+                            summarize_nemo_gym_metric_samples(
+                                merge_metric_samples(*health_samples_by_task.values())
+                            )
+                        )
+                        for task_name, samples in health_samples_by_task.items():
+                            rollout_metrics.update(
+                                summarize_nemo_gym_metric_samples(
+                                    samples,
+                                    prefix=(f"{task_name}_rollout_metrics/nemo_gym"),
+                                )
+                            )
+                    rollout_metrics.update(
+                        task_sampling_metrics(
+                            sampled_task_names,
+                            quota=task_quota,
+                            max_deficits=dict(max_task_deficits),
+                        )
+                    )
+                    max_task_deficits.clear()
 
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
                 expected_batch_size = (
