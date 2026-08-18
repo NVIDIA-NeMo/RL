@@ -1133,12 +1133,17 @@ class MegatronPolicyWorkerImpl(
     #    ``forward_backward_func`` calls between ``optimizer.step()`` would
     #    over-count: each call's terminal reduce sums an already-reduced
     #    bucket again. We wrap every call in ``self.model.no_sync()`` so
-    #    hooks accumulate locally only; one explicit ``start_grad_sync`` +
-    #    ``finish_grad_sync`` at finish does the single true reduce.
-    # 2. PP>1: the pipeline scheduler invokes ``config.grad_sync_func``
-    #    directly on last-microbatch boundaries — this bypasses the
-    #    ``no_sync`` gate. We null it for the duration of the step and
-    #    restore at finish/abort.
+    #    hooks accumulate locally only; the single true reduce happens once at
+    #    finish, inside the relocated ``finalize_model_grads_func`` call
+    #    (preceded by ``start_grad_sync`` when ``overlap_grad_reduce`` is set).
+    # 2. Three ``model.config`` hooks would otherwise fire a reduce mid-step,
+    #    none of them gated by the ``no_sync`` above: ``grad_sync_func`` (the
+    #    PP>1 scheduler calls it directly on last-microbatch boundaries),
+    #    ``no_sync_func`` (the PP=1 schedule runs its last microbatch outside
+    #    it) and ``finalize_model_grads_func`` (end of every
+    #    ``forward_backward_func``, i.e. once per chunk). All three are nulled
+    #    for the duration of the step and restored at finish/abort; see
+    #    ``begin_train_step`` for what each one does.
     # 3. Grad clip is bundled inside ``MegatronOptimizer.step()``; the 1/N
     #    rescale via ``self.model.scale_gradients(1/N)`` must run before
     #    ``optimizer.step()`` so the clip operates on the rescaled grad.
@@ -1286,21 +1291,17 @@ class MegatronPolicyWorkerImpl(
         #                    pair (typically step 2).
         #   finalize_model_grads_func
         #                  — every mcore schedule calls this at the END of each
-        #                    ``forward_backward_func`` invocation (schedules.py,
-        #                    ``if config.finalize_model_grads_func is not None
-        #                    and not forward_only``), so under streaming it fires
-        #                    once per chunk rather than once per step. Nothing we
+        #                    ``forward_backward_func`` invocation, so under
+        #                    streaming it fires once per chunk. Nothing we
         #                    already override gates it: it reaches
-        #                    ``finish_grad_sync()`` directly, and
-        #                    ``model.no_sync()`` only clears
-        #                    ``is_last_microbatch``, which is consulted by
-        #                    ``register_grad_ready`` on the overlap path and
-        #                    ignored by ``finish_grad_sync``. With a distributed
-        #                    optimizer the reduce-scatter also writes into the
-        #                    buffer it reads, leaving this rank's shard DP-summed
-        #                    and the remainder local for the next chunk to
-        #                    accumulate on top of. The real callable runs once,
-        #                    in ``_finish_train_step_body``.
+        #                    ``finish_grad_sync()`` directly, which ignores the
+        #                    ``is_last_microbatch`` flag that ``model.no_sync()``
+        #                    clears. With a distributed optimizer the
+        #                    reduce-scatter also writes into the buffer it reads,
+        #                    leaving this rank's shard DP-summed and the
+        #                    remainder local for the next chunk to accumulate on
+        #                    top of. The real callable runs once, in
+        #                    ``_finish_train_step_body``.
         # Save all three so finish/abort restores them.
         # Read "config" via getattr-by-string so the token stays out of
         # begin_train_step.__code__.co_names; otherwise cloudpickle matches
@@ -1550,55 +1551,44 @@ class MegatronPolicyWorkerImpl(
         # owns more than the cross-DP reduce: the non-tensor-parallel / layernorm
         # all-reduce across TP (sequence parallelism), the tied word-embedding
         # and position-embedding all-reduces across PP, the MoE router
-        # expert-bias update, and reset_model_temporary_tensors. Before this
-        # change those were reached ONLY via the per-chunk call, so dropping the
-        # hook outright would have silently lost all of them.
+        # expert-bias update, and reset_model_temporary_tensors.
         #
-        # ``num_tokens=None`` is deliberate: the 1/N normalization is applied
-        # just above from this path's own accumulated valid-token count, and
-        # mcore rescales only when num_tokens is not None, so passing None is
-        # what avoids double-normalizing.
+        # Both arguments are load-bearing by omission:
+        #   num_tokens=None — mcore rescales only when it is not None, and the
+        #     1/N normalization is already applied just above from this path's
+        #     own accumulated valid-token count.
+        #   no pg_collection — the saved callable is not bare
+        #     ``finalize_model_grads`` but Megatron-Bridge's
+        #     ``partial(finalize_model_grads, pg_collection=...)``
+        #     (bridge/training/setup.py, ``_update_model_config_funcs``), so
+        #     omitting the keyword lets that binding through where supplying one
+        #     would override it. It is group-equivalent to the
+        #     ``_build_default_pg_collection()`` the schedule passed on the
+        #     per-chunk path, down to the ``tp_dp_cp`` field that is the one
+        #     thing finalize_model_grads asserts on, for the expert-bias update.
         #
-        # No ``pg_collection`` keyword, which is not the same as leaving the
-        # parameter at its default: the saved callable is not bare
-        # ``finalize_model_grads`` but Megatron-Bridge's
-        # ``partial(finalize_model_grads, pg_collection=...)``
-        # (bridge/training/setup.py, ``_update_model_config_funcs``), built in
-        # nemo_rl/models/megatron/setup.py from
-        # ``ProcessGroupCollection.use_mpu_process_groups()``. Omitting the
-        # keyword lets that binding through; supplying one would override it,
-        # since an explicit keyword beats a partial's.
-        #
-        # The per-chunk path ran with a different collection object but the same
-        # groups, which is what makes relocating the call safe:
-        # megatron_forward_backward calls forward_backward_func without one, so
-        # the schedule built ``_build_default_pg_collection()`` from
-        # ``parallel_state`` and passed it explicitly, overriding the binding.
-        # Both collections carry the same tp / pp / embd / pos_embd / dp_cp
-        # groups, and both populate ``tp_dp_cp`` — the single field
-        # finalize_model_grads asserts on, for the MoE router expert-bias
-        # update — so recipes that set ``moe_router_enable_expert_bias`` satisfy
-        # it either way.
-        #
-        # ``force_all_reduce`` is genuinely left at its default. The schedule
-        # passes it explicitly, but its default is False on both sides and
-        # nothing in NeMo-RL sets it, so the reduce is dispatched the same way.
-        #
-        # Megatron-core's BucketGroup.finish_grad_sync, when
-        # overlap_grad_reduce=False, internally dispatches the synchronous
-        # collective via start_grad_sync(force_all_reduce=...). On the overlap
-        # path ``model.no_sync()`` stopped register_grad_ready from dispatching,
-        # so there is no outstanding handle for the finalize's finish_grad_sync
-        # to wait on — fire start_grad_sync ourselves in that case only.
+        # Checked before anything is dispatched, and asserted rather than
+        # falling back to a bare ``finish_grad_sync()``: that reduces across DP
+        # and silently skips every other collective listed above, which is wrong
+        # gradients with no error. Bridge binds the hook whenever an optimizer
+        # exists, and an open train step implies one because this method steps it
+        # below, so None here means the model config never went through setup.
+        finalize_model_grads_func = state["saved_finalize_model_grads_func"]
+        assert finalize_model_grads_func is not None, (
+            "finalize_model_grads_func was None at finish_train_step; expected "
+            "Megatron-Bridge's _update_model_config_funcs to have bound it on "
+            "the model config during setup"
+        )
+
+        # With overlap_grad_reduce, ``model.no_sync()`` stopped
+        # register_grad_ready from dispatching, so the finalize's internal
+        # finish_grad_sync has no outstanding handle to wait on — start the
+        # reduce ourselves in that case only.
         if self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
             "overlap_grad_reduce"
         ]:
             self.model.start_grad_sync()
-        finalize_model_grads_func = state.get("saved_finalize_model_grads_func")
-        if finalize_model_grads_func is not None:
-            finalize_model_grads_func([self.model], None)
-        else:
-            self.model.finish_grad_sync()
+        finalize_model_grads_func([self.model], None)
 
         # Wait for the comm-stream reduce dispatched above before opt.step
         # reads main_grad. Without this, grad_norm collapses to ~1/2.
@@ -2891,6 +2881,17 @@ class MegatronPolicyWorkerImpl(
                 only the last chunk's contribution against a 1/N normalizer
                 computed over all of them. Keeping the buffers resident also
                 avoids round-tripping tens of GiB per chunk.
+
+                Suppressing the offload here is sufficient only because of an
+                mcore invariant on the other side of the detour:
+                ``prepare_for_training`` runs before every chunk and reloads with
+                ``move_grads=True``, and ``reload_from_cpu`` resizes and
+                ``zero_()``s the grad buffer only ``if grad_data_size > 0``, a
+                counter set only by a matching ``offload_to_cpu``. With the
+                offload suppressed it stays 0, so the reload is a no-op and
+                the accumulated gradients survive. An mcore change that dropped
+                that guard, or that zeroed unconditionally, would silently
+                reinstate this bug.
         """
         # First worker call after the controller's select() wait returns, so this
         # is also the "idle wait end" marker. Whether the offload was suppressed

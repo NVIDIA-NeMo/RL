@@ -81,9 +81,8 @@ def _make_mock_model():
     model.config = MagicMock()
     model.config.grad_sync_func = "ORIGINAL_GRAD_SYNC_FUNC"  # sentinel
     # Set explicitly rather than letting MagicMock auto-create it: the finish
-    # path branches on whether this was saved as None, so an auto-attribute
-    # would silently pick the finalize branch in tests meaning to cover the
-    # fallback.
+    # path asserts this was saved non-None, so the tests that cover the missing
+    # hook need to be able to clear it to a real None.
     model.config.finalize_model_grads_func = MagicMock(name="ORIGINAL_FINALIZE")
     model.config.num_moe_experts = None  # disable MoE branch
     # no_sync() is a context manager — return a MagicMock that supports
@@ -485,15 +484,16 @@ class TestFinish:
             assert order == ["scale", "finalize", "opt_step"]
 
     @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
-    def test_grad_sync_falls_back_to_finish_grad_sync_without_finalize_hook(
+    def test_grad_sync_refuses_to_reduce_without_the_finalize_hook(
         self, mock_module_symbols, overlap_grad_reduce
     ):
-        """When mcore never had a finalize hook there is nothing to relocate,
-        so the reduce must still happen via finish_grad_sync directly.
+        """A missing finalize hook fails the step instead of reducing without it.
 
-        With overlap=False, Megatron's finish_grad_sync internally calls
-        start_grad_sync(force_all_reduce=True), so calling start_grad_sync
-        ourselves would double-reduce.
+        A bare finish_grad_sync would cover the cross-DP reduce and silently
+        skip everything else the finalize owns -- the TP layernorm all-reduce,
+        the tied-embedding all-reduces across PP, the MoE expert-bias update --
+        so falling back would train on wrong gradients with no error. Nothing is
+        dispatched before the check, and the optimizer does not step.
         """
         from nemo_rl.algorithms.loss.interfaces import LossType
 
@@ -502,18 +502,11 @@ class TestFinish:
             "overlap_grad_reduce"
         ] = overlap_grad_reduce
         w._train_step_state["saved_finalize_model_grads_func"] = None
-        order: list[str] = []
-        w.model.scale_gradients.side_effect = lambda s: order.append("scale")
-        w.model.start_grad_sync.side_effect = lambda: order.append("start_sync")
-        w.model.finish_grad_sync.side_effect = lambda: order.append("finish_sync")
-        w.optimizer.step.side_effect = lambda: (
-            order.append("opt_step") or (True, 0.5, 0)
-        )
-        w.finish_train_step()
-        if overlap_grad_reduce:
-            assert order == ["scale", "start_sync", "finish_sync", "opt_step"]
-        else:
-            assert order == ["scale", "finish_sync", "opt_step"]
+        with pytest.raises(AssertionError, match="finalize_model_grads_func was None"):
+            w.finish_train_step()
+        w.model.start_grad_sync.assert_not_called()
+        w.model.finish_grad_sync.assert_not_called()
+        w.optimizer.step.assert_not_called()
 
     def test_picks_global_valid_toks_for_token_level_loss(self, mock_module_symbols):
         """N selection: TOKEN_LEVEL → N = global_valid_toks (not seqs)."""
@@ -928,18 +921,22 @@ class TestFinalizeModelGradsOncePerStep:
         w.abort_train_step()
         sentinel.assert_not_called()
 
-    def test_handles_originally_none_hook(self, mock_module_symbols):
-        """PP=1 without a custom finalize: begin → finish must leave it None and
-        fall back to finish_grad_sync for the reduce."""
+    def test_originally_none_hook_fails_the_step(self, mock_module_symbols):
+        """Megatron-Bridge binds the hook whenever an optimizer exists, and an
+        open step implies one, so a None here means the model config never went
+        through setup. The step fails rather than reducing with finish_grad_sync
+        alone, and the restore path still runs on the way out."""
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.finalize_model_grads_func = None
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(_fake_batch())
-        w.finish_train_step()
+        with pytest.raises(AssertionError, match="finalize_model_grads_func was None"):
+            w.finish_train_step()
+        w.model.finish_grad_sync.assert_not_called()
         assert w.model.config.finalize_model_grads_func is None
-        w.model.finish_grad_sync.assert_called_once()
+        assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
 
     def test_two_consecutive_steps_each_finalize_once(self, mock_module_symbols):
         """Restore-then-null across step boundaries must not lose the hook or
