@@ -101,6 +101,29 @@ def _context_leg_response(
     return JSONResponse(content=response)
 
 
+def _request_matches_profile(body: dict[str, Any], profile: dict[str, Any]) -> bool:
+    """Whether every sampling param the request pins equals *profile*'s value.
+
+    Params the request leaves unset are not evidence against a profile. This
+    server samples from the profile it selects and never from the request, so an
+    omitted field simply takes that profile's value -- unlike vLLM, where an
+    unset ``top_p`` is resolved from the model's ``generation_config.json`` and
+    therefore has to be rejected outright (see ``vllm_worker_async.py``).
+
+    Args:
+        body: Decoded chat-completions request body.
+        profile: Sampling profile to test, keyed ``temperature``/``top_p``/``top_k``.
+
+    Returns:
+        True when the request is compatible with *profile*.
+    """
+    for key in ("temperature", "top_p", "top_k"):
+        requested = body.get(key)
+        if requested is not None and requested != profile.get(key):
+            return False
+    return True
+
+
 def _build_reasoning_parser(name: str, chat_template_kwargs: dict[str, Any]) -> Any:
     from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 
@@ -158,14 +181,35 @@ def create_app(
     llm: Any,
     tokenizer: Any,
     model_name: str,
+    *,
     max_seq_len: int,
     sampling_config: dict[str, Any],
+    val_sampling_config: dict[str, Any] | None = None,
     stop_token_ids: list[int] | None = None,
     default_chat_template_kwargs: dict[str, Any] | None = None,
     tool_parser: str | None = None,
     reasoning_parser: str | None = None,
 ) -> "FastAPI":
-    """Build a FastAPI application backed by *llm* (``tensorrt_llm.LLM``)."""
+    """Build a FastAPI application backed by *llm* (``tensorrt_llm.LLM``).
+
+    Args:
+        llm: The ``tensorrt_llm.LLM`` engine to serve.
+        tokenizer: Tokenizer matching *llm*, used for prompt construction.
+        model_name: Model identifier echoed back on responses.
+        max_seq_len: Context window of the engine being fronted.
+        sampling_config: Train sampling profile, keyed
+            ``temperature``/``top_p``/``top_k``.
+        val_sampling_config: Validation sampling profile, same keys. ``None``
+            (the default) accepts train sampling only, which is what a backend
+            without separate validation sampling wants.
+        stop_token_ids: Extra stop tokens to trim from generations.
+        default_chat_template_kwargs: Server-side chat template defaults.
+        tool_parser: Registered TRT-LLM tool parser name, or None to infer.
+        reasoning_parser: Registered TRT-LLM reasoning parser name, or None.
+
+    Returns:
+        The configured FastAPI application.
+    """
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
 
@@ -245,13 +289,26 @@ def create_app(
         )
 
         # The NeMo-RL generation config, not the request, is the source of truth
-        # for sampling params.
-        for key in ("temperature", "top_p", "top_k"):
-            if body.get(key) is not None:
-                assert body[key] == sampling_config.get(key), (
-                    f"request {key} {body[key]!r} must match the "
-                    f"NeMo-RL generation config ({sampling_config.get(key)})"
-                )
+        # for sampling params: anything else would sample off-policy and destroy
+        # training stability. Validation rollouts are the one exception -- they
+        # are stamped with generation.val_temperature / val_top_p, which is
+        # metric-only and safe to serve. Accept either profile and serve the one
+        # the request pins, mirroring the vLLM server's is_train_sampling /
+        # is_val_sampling check. Multi-turn agents issue their own requests, so
+        # this handler is the single chokepoint they all pass.
+        if _request_matches_profile(body, sampling_config):
+            active_sampling_config = sampling_config
+        elif val_sampling_config is not None and _request_matches_profile(
+            body, val_sampling_config
+        ):
+            active_sampling_config = val_sampling_config
+        else:
+            raise AssertionError(
+                f"request sampling (temperature={body.get('temperature')!r}, "
+                f"top_p={body.get('top_p')!r}, top_k={body.get('top_k')!r}) "
+                f"matches neither the train sampling params ({sampling_config}) "
+                f"nor the validation sampling params ({val_sampling_config})"
+            )
 
         # Request kwargs override server defaults.
         per_request_kwargs: dict[str, Any] = body.get("chat_template_kwargs") or {}
@@ -341,9 +398,12 @@ def create_app(
         from tensorrt_llm import SamplingParams as TrtSamplingParams
         from tensorrt_llm.executor.utils import RequestError
 
+        # Serve whichever profile the request pinned (train or validation),
+        # built through the shared helper so this path and the direct
+        # generate() path keep sampling from the same distribution.
         sampling = _build_sampling_params(
             TrtSamplingParams,
-            sampling_config=sampling_config,
+            sampling_config=active_sampling_config,
             stop_token_ids=stop_token_ids,
             max_tokens=max_tokens,
         )
@@ -655,8 +715,10 @@ def start_server(
     llm: Any,
     tokenizer: Any,
     model_name: str,
+    *,
     max_seq_len: int,
     sampling_config: dict[str, Any],
+    val_sampling_config: dict[str, Any] | None = None,
     stop_token_ids: list[int] | None = None,
     host: str = "0.0.0.0",
     port: int = 0,
@@ -664,7 +726,26 @@ def start_server(
     tool_parser: str | None = None,
     reasoning_parser: str | None = None,
 ) -> "tuple[threading.Thread, str, Any]":
-    """Start the HTTP server in a daemon thread and return (thread, base_url, server)."""
+    """Start the HTTP server in a daemon thread and return (thread, base_url, server).
+
+    Args:
+        llm: The ``tensorrt_llm.LLM`` engine to serve.
+        tokenizer: Tokenizer matching *llm*.
+        model_name: Model identifier echoed back on responses.
+        max_seq_len: Context window of the engine being fronted.
+        sampling_config: Train sampling profile.
+        val_sampling_config: Validation sampling profile, or None to accept
+            train sampling only.
+        stop_token_ids: Extra stop tokens to trim from generations.
+        host: Bind address.
+        port: Bind port; 0 picks a free one.
+        default_chat_template_kwargs: Server-side chat template defaults.
+        tool_parser: Registered TRT-LLM tool parser name, or None to infer.
+        reasoning_parser: Registered TRT-LLM reasoning parser name, or None.
+
+    Returns:
+        Tuple of (server thread, base URL, uvicorn server).
+    """
     import uvicorn
 
     from nemo_rl.distributed.virtual_cluster import (
@@ -684,6 +765,7 @@ def start_server(
         model_name,
         max_seq_len=max_seq_len,
         sampling_config=sampling_config,
+        val_sampling_config=val_sampling_config,
         stop_token_ids=stop_token_ids,
         default_chat_template_kwargs=default_chat_template_kwargs,
         tool_parser=tool_parser,
