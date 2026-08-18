@@ -28,6 +28,7 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.weight_sync.megatron_weight_synchronizer import (
     MegatronWeightSynchronizer,
 )
+from tests.unit.test_utils import SimpleLossFn
 
 model_name = "Qwen/Qwen3-0.6B"
 
@@ -381,11 +382,29 @@ async def test_megatron_policy_generation_async(cluster, test_input_data, tokeni
 
 @pytest.mark.mcore
 @pytest.mark.timeout(900)
-def test_megatron_generation_colocated(cluster, test_input_data, tokenizer):
+@pytest.mark.parametrize(
+    "transformer_impl", ["transformer_engine", "inference_optimized"]
+)
+def test_megatron_generation_colocated(
+    cluster, test_input_data, tokenizer, transformer_impl
+):
     """Colocated Megatron generation: wrap an existing training policy without owning it."""
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["colocated"]["enabled"] = True
-    config["generation"]["mcore_generation_config"]["expose_http_server"] = True
+    # Eager engine startup (expose_http_server) flips MLM's process-wide
+    # InferenceMode on at construction; the inference_optimized leg trains
+    # before any generate/suspend cycle, so it must construct engine-less.
+    config["generation"]["mcore_generation_config"]["expose_http_server"] = (
+        transformer_impl == "transformer_engine"
+    )
+    # The parametrized impl is the GENERATION-side one; training always runs
+    # transformer_engine (the worker rejects inference_optimized on training
+    # workers). transformer_engine => dual-mode (matched impl, shared model);
+    # inference_optimized => the worker builds a dedicated resharded
+    # inference model on the shared GPUs.
+    config["generation"]["mcore_generation_config"]["transformer_impl"] = (
+        transformer_impl
+    )
 
     # construction guard: exactly one of `cluster` / `policy` is required
     with pytest.raises(AssertionError):
@@ -407,10 +426,32 @@ def test_megatron_generation_colocated(cluster, test_input_data, tokenizer):
         assert "max_tokens" not in config["megatron_cfg"]
         assert config["megatron_cfg"] == megatron_cfg_before
 
-        # setup() hands dp_openai_server_base_urls to NeMo Gym right after
-        # construction, so the colocated constructor must have collected them.
-        assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
-        assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
+        if transformer_impl == "transformer_engine":
+            # setup() hands dp_openai_server_base_urls to NeMo Gym right after
+            # construction, so the colocated constructor must have collected them.
+            assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
+            assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
+
+        if transformer_impl == "inference_optimized":
+            # Reshard mode: the TE training model takes a train step (finite
+            # loss) before the engine ever starts; generation then runs on
+            # the dedicated inference_optimized model built at first wake.
+            torch.manual_seed(42)
+            train_data = BatchedDataDict(
+                {
+                    "input_ids": torch.randint(0, 32000, (4, 64)),
+                    "input_lengths": torch.full((4,), 64, dtype=torch.int32),
+                    "attention_mask": torch.ones(4, 64),
+                    "labels": torch.randint(0, 32000, (4, 64)),
+                    "sample_mask": torch.ones(4),
+                }
+            )
+            policy.prepare_for_training()
+            loss = policy.train(train_data, SimpleLossFn())["loss"]
+            assert not torch.isnan(loss).any() and not torch.isinf(loss).any(), (
+                f"dual-mode train step produced bad loss: {loss}"
+            )
+            policy.finish_training()
 
         # re-entering generation mode must be a no-op on the running engine
         mg.prepare_for_generation()

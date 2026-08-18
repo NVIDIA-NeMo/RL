@@ -368,8 +368,20 @@ class MegatronGenerationMixin:
             print(f"[Rank {torch.distributed.get_rank()}] HTTP Server not started")
             self.base_url = None
 
-    def finish_generation(self) -> None:
-        """Wind down a generation cycle."""
+    def finish_generation(self, *, for_training: bool = True) -> None:
+        """Wind down a generation cycle.
+
+        Args:
+            for_training: the caller is about to need the GPUs for itself (a
+                training step or a checkpoint save), so even a colocated
+                engine must fully stand down. Pass False between generation
+                phases (e.g. after validation) to let a colocated engine keep
+                serving; tearing it down there would discard KV/prefix caches
+                and CUDA graphs for no reason. Non-colocated engines wind
+                down either way.
+        """
+        if self.is_generation_colocated and not for_training:
+            return
         print(f"[Rank {self.rank}] finishing generation", flush=True)
         log_gpu_memory("finish_generation START")
 
@@ -939,7 +951,6 @@ class MegatronGenerationRefitMixin:
         if not self._inference_engine_initialized:
             return
         self._sleep()
-        torch.cuda.synchronize()
 
     def resume_after_refit(self) -> None:
         """Resume+unpause the inference engine after a weight refit."""
