@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -231,13 +232,10 @@ class MegatronGeneration(GenerationInterface):
             "policy; when colocated, pass it to the training policy instead."
         )
 
-        # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
-        # `self._policy_config` keeps a reference to the full PolicyConfig.
-        self._policy_config = config
+        # Dedicated inference may modify its policy config.
+        self._policy_config = config if policy is not None else deepcopy(config)
         self.cfg: MCoreGenerationConfig = config["generation"]
-        # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
-        # Installed by setup via create_weight_synchronizer.
         self.weight_synchronizer: Optional["WeightSynchronizer"] = None
 
         if policy is not None:

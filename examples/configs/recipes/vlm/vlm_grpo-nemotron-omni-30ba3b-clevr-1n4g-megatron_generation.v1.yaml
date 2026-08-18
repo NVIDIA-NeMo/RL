@@ -1,0 +1,104 @@
+defaults: ../../vlm_grpo_3B_megatron.yaml
+
+# 1-node × 4-GPU GB200 recipe: Nemotron Omni CLEVR with Megatron generation.
+# Default layout is non-colocated 2 train / 2 gen with async GRPO, age>1, and
+# in-flight weight updates.
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
+  max_num_steps: 4
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  use_dynamic_sampling: false
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 2
+    in_flight_weight_updates: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/nemo-rl-omni/nemotron-omni-clevr-megatron-1n4g
+
+policy:
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  is_vlm: true
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  offload_optimizer_for_logprob: false
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    env_vars:
+      TORCH_CUDA_ARCH_LIST: "10.0"
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    bias_activation_fusion: false
+    activation_checkpointing: true
+  generation:
+    backend: megatron
+    max_new_tokens: 512
+    stop_strings:
+      - <image>
+      - <img>
+      - </img>
+      - <so_embedding>
+      - <so_start>
+      - <so_end>
+    mcore_generation_config:
+      expose_http_server: false
+      parsers: []
+      max_model_len: ${policy.max_total_sequence_length}
+      cuda_graph_impl: local
+      inference_cuda_graph_scope: block
+      buffer_size_gb: 8
+      num_cuda_graphs: -1
+      block_size_tokens: 256
+      use_cuda_graphs_for_non_decode_steps: true
+      enable_chunked_prefill: true
+      enable_prefix_caching: false
+      max_tokens: ${policy.max_total_sequence_length}
+      kv_cache_management_mode: persist
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      refit_backend: gloo
+      transformer_impl: transformer_engine
+      activation_checkpointing: false
+      tensor_model_parallel_size: 2
+      expert_model_parallel_size: 2
+      expert_tensor_parallel_size: 1
+      sequence_parallel: true
+      moe_pad_experts_for_cuda_graph_inference: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: 1
+
+data:
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot_nemotron_omni.txt
+
+logger:
+  wandb_enabled: false
+  tensorboard_enabled: false
+  wandb:
+    project: "nemo-rl-omni"
+    name: "nemotron-omni-clevr-megatron-1n4g"
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
