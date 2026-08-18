@@ -21,6 +21,7 @@ size or with the staging pool off, neither of which fails loudly.
 
 from __future__ import annotations
 
+import pydantic
 import pytest
 from pydantic import TypeAdapter
 
@@ -74,25 +75,29 @@ def test_partial_nested_block_keeps_other_defaults() -> None:
     assert resolved.global_segment_size == MooncakeCpuConfig().global_segment_size
 
 
-@pytest.mark.parametrize(
-    "cfg, expected",
-    [
-        (_cfg("simple", simple={"storage_capacity": 7}), 7),
-        (_cfg("simple"), SimpleStorageConfig().storage_capacity),
-    ],
-    ids=["nested", "absent"],
-)
-def test_simple_backend_resolves_the_same_way(cfg, expected) -> None:
+def test_simple_backend_nested_block_is_used() -> None:
+    cfg = _cfg("simple", simple={"storage_capacity": 7, "num_storage_units": 3})
     resolved = backend_config(cfg)
     assert isinstance(resolved, SimpleStorageConfig)
-    assert resolved.storage_capacity == expected
+    assert resolved.storage_capacity == 7
+    assert resolved.num_storage_units == 3
+
+
+def test_simple_backend_num_storage_units_has_no_default() -> None:
+    """No static default is correct across cluster sizes (see the field's
+    docstring), so an absent/incomplete simple: block must raise rather than
+    silently run at a node count the config never chose."""
+    with pytest.raises(pydantic.ValidationError, match="num_storage_units"):
+        backend_config(_cfg("simple"))
+    with pytest.raises(pydantic.ValidationError, match="num_storage_units"):
+        backend_config(_cfg("simple", simple={"storage_capacity": 7}))
 
 
 def test_only_the_selected_backend_is_read() -> None:
     """A mooncake block must not leak into a simple run, or vice versa."""
     cfg = _cfg(
         "simple",
-        simple={"storage_capacity": 5},
+        simple={"storage_capacity": 5, "num_storage_units": 1},
         mooncake_cpu={"global_segment_size": 999},
     )
     resolved = backend_config(cfg)

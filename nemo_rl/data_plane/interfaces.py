@@ -47,13 +47,15 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
     """Sizing for ``backend="simple"``. Ignored by every other backend.
 
     ``num_storage_units`` scales with the cluster: TQ round-robins storage
-    units over Ray nodes and recommends ``>= 2 x`` the node count, so a fixed
-    literal under-provisions a multi-node run. The exemplar YAML sets
-    ``${mul:2, ${cluster.num_nodes}}``; set a plain int to pin it.
+    units over Ray nodes and recommends ``>= 2 x`` the node count. No static
+    default is correct across cluster sizes, so this is required rather than
+    defaulted — a class field cannot see ``cluster.num_nodes``, only the
+    exemplar YAML can, via ``${mul:2, ${cluster.num_nodes}}``. Every recipe
+    inherits that from the exemplar; set a plain int to pin it.
     """
 
     storage_capacity: int = 1000000  # max samples retained per partition
-    num_storage_units: int = 2
+    num_storage_units: int
 
 
 class MooncakeCpuConfig(BaseModel, extra="allow"):
