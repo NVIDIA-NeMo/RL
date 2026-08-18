@@ -69,6 +69,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
@@ -1295,12 +1296,36 @@ def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components)
             },
             False,
         ),
+        ({"backend": "megatron", "mcore_generation_config": {}}, True),
     ],
 )
 def test_should_use_async_rollouts_selects_backend_specific_config(
     generation_config, expected
 ):
     assert should_use_async_rollouts(generation_config) is expected
+
+
+def test_should_use_async_rollouts_rejects_removed_megatron_async_engine():
+    with pytest.raises(AssertionError, match="async_engine was removed"):
+        should_use_async_rollouts(
+            {
+                "backend": "megatron",
+                "mcore_generation_config": {"async_engine": False},
+            }
+        )
+
+
+def test_should_use_nemo_gym_accepts_megatron_always_async():
+    master_config = MagicMock()
+    master_config.env = {"should_use_nemo_gym": True}
+    master_config.policy = {
+        "generation": {
+            "backend": "megatron",
+            "mcore_generation_config": {"expose_http_server": True},
+        }
+    }
+
+    assert should_use_nemo_gym(master_config)
 
 
 @contextmanager

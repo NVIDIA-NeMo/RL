@@ -2106,6 +2106,12 @@ def async_ppo_train(
             "⚠️ WARNING: max_trajectory_age_steps > 1 increases off-policy "
             "bias in GAE. The validated/recommended value is 1."
         )
+        if not async_config.in_flight_weight_updates:
+            print(
+                "⚠️ WARNING: In-flight weight updates must be enabled for async "
+                "PPO with max_trajectory_age_steps > 1. Without in-flight weight "
+                "updates, a larger trajectory age provides no performance benefit."
+            )
 
     # Import async utilities only when needed (heavy Ray actors).
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer

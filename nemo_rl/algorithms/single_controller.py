@@ -980,6 +980,8 @@ class SingleControllerActor:
         """
         self._rollout_permitted.clear()
 
+        # TODO(#2625): Abort unconditionally once Gym-path abort is validated;
+        # for now only the native path aborts stale in-flight requests.
         aborted_stale_inflight_groups = (
             0
             if should_use_nemo_gym(self._master_config)
