@@ -57,6 +57,18 @@ _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
 
 
+def _caused_by_ray_actor_death(error: BaseException) -> bool:
+    """Return whether an exception chain contains a terminal actor failure."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ray.exceptions.RayActorError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 @ray.remote  # pragma: no cover
 class AsyncTrajectoryCollector:
     """Collects trajectories asynchronously and adds them to replay buffer."""
@@ -1122,12 +1134,22 @@ class AsyncTrajectoryCollector:
         last_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
         for attempt in range(1, max_attempts + 1):
+            pending_before_attempt = expected_group_indices - buffered_group_indices
+            if use_nemo_gym and pending_before_attempt != expected_group_indices:
+                row_indices = [
+                    group_index * num_generations + offset
+                    for group_index in sorted(pending_before_attempt)
+                    for offset in range(num_generations)
+                ]
+                attempt_batch = repeated_batch.select_indices(row_indices)
+            else:
+                attempt_batch = repeated_batch
             push_tasks: list[asyncio.Task[None]] = []
             scheduled_group_indices: set[int] = set()
             stream_error: Exception | None = None
             try:
                 async for rollout_result in self._iter_rollout_groups(
-                    repeated_batch=repeated_batch,
+                    repeated_batch=attempt_batch,
                     num_generations=num_generations,
                     use_nemo_gym=use_nemo_gym,
                     task_index_to_group_index=task_index_to_group_index,
@@ -1178,6 +1200,8 @@ class AsyncTrajectoryCollector:
                     f"{sorted(pending_group_indices)}"
                 )
             if attempt == max_attempts or not self.running:
+                break
+            if _caused_by_ray_actor_death(last_error):
                 break
 
             retry_delay = _NEMO_GYM_RETRY_DELAY_BASE_SECONDS * (2 ** (attempt - 1))

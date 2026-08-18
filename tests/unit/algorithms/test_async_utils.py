@@ -1895,7 +1895,14 @@ class TestAsyncTrajectoryCollector:
             assert kwargs["generation_config"]["stop_strings"] is None
             assert kwargs["log_full_result_tables"] is False
             rollout_calls += 1
-            yield _rollout_result(7)
+            task_indices = [
+                row["_ng_task_index"] for row in kwargs["input_batch"]["extra_env_info"]
+            ]
+            if rollout_calls == 1:
+                assert task_indices == [7, 7, 8, 8]
+                yield _rollout_result(7)
+            else:
+                assert task_indices == [8, 8]
             if rollout_calls == 1:
                 raise RuntimeError("transient stream failure")
             yield _rollout_result(8)
@@ -1921,6 +1928,51 @@ class TestAsyncTrajectoryCollector:
         assert rollout_calls == 2
         assert replay_buffer.add.task_indices == [7, 8]
         assert target_weight not in collector._generating_targets
+
+    def test_nemo_gym_actor_death_is_not_retried(self, monkeypatch):
+        from ray.exceptions import RayActorError
+
+        collector = self.create_local_collector(replay_buffer=SimpleNamespace())
+        collector.running = True
+        repeated_batch = BatchedDataDict(
+            {
+                "extra_env_info": [
+                    {"_ng_task_index": 7},
+                    {"_ng_task_index": 7},
+                ],
+                "loss_multiplier": torch.ones(2),
+            }
+        )
+        rollout_calls = 0
+
+        async def failed_rollouts(**kwargs):
+            nonlocal rollout_calls
+            del kwargs
+            rollout_calls += 1
+            try:
+                raise RayActorError(error_msg="actor died")
+            except RayActorError as error:
+                raise RuntimeError("instance 'tools/0' failed") from error
+            yield
+
+        async def no_sleep(delay):
+            pytest.fail(f"actor death should not retry after {delay}s")
+
+        monkeypatch.setattr(collector, "_iter_rollout_groups", failed_rollouts)
+        monkeypatch.setattr(trajectory_collector_mod.asyncio, "sleep", no_sleep)
+
+        with pytest.raises(RuntimeError, match="failed to buffer prompt groups"):
+            asyncio.run(
+                collector._collect_rollout_batch(
+                    repeated_batch=repeated_batch,
+                    generation_weight_version=3,
+                    target_weight_version=15,
+                    num_generations=2,
+                    use_nemo_gym=True,
+                )
+            )
+
+        assert rollout_calls == 1
 
     def test_invalid_gym_batch_releases_target(self):
         """Validation errors cannot leave a target reservation stuck."""
