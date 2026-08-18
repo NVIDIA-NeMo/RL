@@ -1209,3 +1209,73 @@ def build_media_token_validity_mask(
     for row in empty_rows:
         mask[row] &= ~is_media_token[row]
     return mask
+
+
+def media_placeholder_token_id_from_chunks(chunks: Sequence[Any]) -> Optional[int]:
+    """The vocabulary id these model chunks treat as a media placeholder, if any."""
+    for chunk in chunks:
+        token_id = getattr(chunk, "image_token_index", None)
+        if token_id is not None:
+            return int(token_id)
+    return None
+
+
+def chunks_accept_media_token_validity_mask(chunks: Sequence[Any]) -> bool:
+    """Whether a model chunk's forward takes an explicit media-token validity mask.
+
+    Checked against the signature rather than a class flag so a model that does
+    not know about the mask never receives it: such a forward would absorb it
+    into ``**kwargs`` and silently ignore it, which looks identical to the mask
+    having been applied. Failing to send it is visible; sending it into a void
+    is not.
+    """
+    for chunk in chunks:
+        try:
+            parameters = inspect.signature(chunk.forward).parameters
+        except (TypeError, ValueError):
+            continue
+        if "media_token_validity_mask" in parameters:
+            return True
+    return False
+
+
+def image_counts_by_row(batch: Any, num_rows: int) -> Optional[list[int]]:
+    """How many images each row of the batch actually carries.
+
+    Returns None when the batch describes its images in a way this cannot read,
+    so the caller leaves the model's own derivation alone rather than guessing a
+    count and masking against it.
+    """
+    pixel_values = batch.get("pixel_values", None)
+    if pixel_values is None:
+        # A text-only batch genuinely has no images anywhere, which is exactly
+        # the case the mask exists for -- not a missing-data case.
+        return [0] * num_rows
+    if not isinstance(pixel_values, PackedTensor):
+        return None
+    counts = pixel_values.logical_segment_counts_by_row()
+    return counts if len(counts) == num_rows else None
+
+
+def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) -> None:
+    """Mark media tokens that anchor nothing, so the model keeps their embedding.
+
+    Builds the mask while rows still are samples. Sequence packing later
+    concatenates those rows into one THD sequence, after which no per-row
+    question can be asked, so the packing step carries this through the same
+    transform as ``input_ids`` rather than deriving it downstream.
+
+    The batch is duck-typed rather than annotated as ``BatchedDataDict``:
+    that module imports this one, so naming it here would be circular.
+    """
+    if media_token_id is None:
+        return
+    input_ids = batch.get("input_ids", None)
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        return
+    counts = image_counts_by_row(batch, input_ids.shape[0])
+    if counts is None:
+        return
+    mask = build_media_token_validity_mask(input_ids, media_token_id, counts)
+    if mask is not None:
+        batch["media_token_validity_mask"] = mask

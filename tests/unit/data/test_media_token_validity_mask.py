@@ -15,7 +15,14 @@
 import pytest
 import torch
 
-from nemo_rl.data.multimodal_utils import build_media_token_validity_mask
+from nemo_rl.data.multimodal_utils import (
+    PackedTensor,
+    attach_media_token_validity_mask,
+    build_media_token_validity_mask,
+    chunks_accept_media_token_validity_mask,
+    image_counts_by_row,
+    media_placeholder_token_id_from_chunks,
+)
 
 IMG = 7  # stand-in media token id
 TXT = 1
@@ -69,3 +76,101 @@ def test_rejects_non_2d_input_ids():
 def test_rejects_count_length_mismatch():
     with pytest.raises(ValueError, match="one entry per row"):
         build_media_token_validity_mask(torch.tensor([[TXT, IMG]]), IMG, [0, 1])
+
+
+# --------------------------------------------------------------------------
+# capability probes and batch-level attach
+# --------------------------------------------------------------------------
+
+
+class _ChunkWithMask:
+    image_token_index = IMG
+
+    def forward(self, input_ids, *, media_token_validity_mask=None):
+        raise AssertionError("not called")
+
+
+class _ChunkWithoutMask:
+    image_token_index = IMG
+
+    def forward(self, input_ids):
+        raise AssertionError("not called")
+
+
+def test_placeholder_token_id_is_read_from_the_first_chunk_that_has_one():
+    assert media_placeholder_token_id_from_chunks([_ChunkWithMask()]) == IMG
+    # A chunk without the attribute must not stop the search.
+    assert media_placeholder_token_id_from_chunks([object(), _ChunkWithMask()]) == IMG
+
+
+def test_placeholder_token_id_is_none_when_no_chunk_declares_one():
+    assert media_placeholder_token_id_from_chunks([object(), object()]) is None
+    assert media_placeholder_token_id_from_chunks([]) is None
+
+
+def test_capability_is_read_from_the_forward_signature():
+    """A flag could lie; the signature is what decides whether the kwarg lands."""
+    assert chunks_accept_media_token_validity_mask([_ChunkWithMask()]) is True
+    assert chunks_accept_media_token_validity_mask([_ChunkWithoutMask()]) is False
+    assert chunks_accept_media_token_validity_mask([]) is False
+
+
+def test_capability_skips_chunks_whose_signature_cannot_be_read():
+    """An unintrospectable forward must not abort the search."""
+
+    class _Opaque:
+        forward = print  # builtins raise ValueError from inspect.signature
+
+    assert (
+        chunks_accept_media_token_validity_mask([_Opaque(), _ChunkWithMask()]) is True
+    )
+
+
+def test_image_counts_treats_a_batch_without_pixel_values_as_text_only():
+    """No images anywhere is the case the mask exists for, not missing data."""
+    assert image_counts_by_row({}, 3) == [0, 0, 0]
+
+
+def test_image_counts_returns_none_for_unreadable_media():
+    """Rather than guess a count and mask against it."""
+    assert image_counts_by_row({"pixel_values": torch.ones(2, 3)}, 2) is None
+
+
+def test_image_counts_reads_logical_segments_per_row():
+    packed = PackedTensor([torch.ones(1, 3, 2, 2)], dim_to_pack=0)
+    assert image_counts_by_row({"pixel_values": packed}, 1) == [1]
+
+
+def test_image_counts_returns_none_on_row_count_mismatch():
+    packed = PackedTensor([torch.ones(1, 3, 2, 2)], dim_to_pack=0)
+    assert image_counts_by_row({"pixel_values": packed}, 2) is None
+
+
+def test_attach_sets_the_mask_for_a_text_row_that_spells_the_token():
+    batch = {"input_ids": torch.tensor([[TXT, IMG, TXT]])}
+    attach_media_token_validity_mask(batch, IMG)
+    torch.testing.assert_close(
+        batch["media_token_validity_mask"],
+        torch.tensor([[True, False, True]]),
+    )
+
+
+def test_attach_is_a_noop_without_a_media_token_id():
+    """Models that never declare the kwarg must not get a mask."""
+    batch = {"input_ids": torch.tensor([[TXT, IMG]])}
+    attach_media_token_validity_mask(batch, None)
+    assert "media_token_validity_mask" not in batch
+
+
+def test_attach_is_a_noop_when_nothing_needs_masking():
+    """No key at all, so the model keeps deriving its own."""
+    packed = PackedTensor([torch.ones(1, 3, 2, 2)], dim_to_pack=0)
+    batch = {"input_ids": torch.tensor([[TXT, IMG]]), "pixel_values": packed}
+    attach_media_token_validity_mask(batch, IMG)
+    assert "media_token_validity_mask" not in batch
+
+
+def test_attach_ignores_a_batch_whose_input_ids_are_not_2d():
+    batch = {"input_ids": torch.tensor([TXT, IMG])}
+    attach_media_token_validity_mask(batch, IMG)
+    assert "media_token_validity_mask" not in batch
