@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -223,6 +224,24 @@ def test_build_clusters_rejects_non_colocated_megatron_generation():
         sc_setup_mod._build_clusters(master_config)
 
 
+def test_print_setup_milestone_has_utc_timestamp_and_flushes():
+    """Milestone output is timestamped in UTC and flushed immediately."""
+    fixed_time = datetime(2026, 8, 18, 12, 34, 56, tzinfo=timezone.utc)
+
+    with (
+        patch.object(sc_setup_mod, "datetime") as mock_datetime,
+        patch("builtins.print") as mock_print,
+    ):
+        mock_datetime.now.return_value = fixed_time
+        sc_setup_mod._print_setup_milestone("started")
+
+    mock_datetime.now.assert_called_once_with(timezone.utc)
+    mock_print.assert_called_once_with(
+        "[2026-08-18T12:34:56Z] SingleController setup: started",
+        flush=True,
+    )
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
@@ -339,6 +358,24 @@ class TestSetup:
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
         assert actor_args.tq_buffer._require_routed_experts is False
+
+    def test_prints_setup_milestones_in_order(self, patched_factories):
+        """Setup reports each requested milestone in execution order."""
+        mc = _make_master_config(colocated=True)
+
+        with patch.object(sc_setup_mod, "_print_setup_milestone") as mock_print:
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert [call.args[0] for call in mock_print.call_args_list] == [
+            "started",
+            "Dataset & Environments setup complete",
+            "Clusters & Workers setup complete",
+            "data plane client built",
+            "weight synchronizer communicator initialized",
+            "advantage estimator created",
+            "TQReplayBuffer created",
+            "RolloutManager created",
+        ]
 
     def test_router_replay_requires_routes_in_tq_buffer(self, patched_factories):
         mc = _make_master_config(colocated=True)
