@@ -29,6 +29,7 @@ Guards the silent-drop regression class that motivated the PR.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
@@ -37,10 +38,12 @@ from nemo_rl.data.multimodal_utils import (
     PACKED_MULTIMODAL_FIELDS,
     PER_TOKEN_MULTIMODAL_FIELDS,
     PackedTensor,
+    encode_multimodal_for_wire,
 )
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import keys_from_uids, register_train_partition
@@ -103,10 +106,11 @@ def _make_vlm_rollout_output(
 def _sync_rollout_write_loop(fb: BatchedDataDict, bulk_batch: BatchedDataDict) -> None:
     """Replay the write loop in ``sync_rollout_actor.rollout_to_tq``.
 
-    Copies non-multimodal fields verbatim, encodes ``PackedTensor``
-    multimodal via ``to_nested_wire``, and passes per-token multimodal
-    through as plain tensors. Any drift here (new key added, one branch
-    forgotten) is exactly what the silent-drop regression looked like.
+    Copies non-multimodal fields verbatim, then hands every multimodal
+    field to the *production* encoder ``encode_multimodal_for_wire`` —
+    the same call the actor makes. Reimplementing the encode branches
+    here would make this test blind to exactly the drift (new key added,
+    one branch forgotten) that the silent-drop regression was.
     """
     for k, v in fb.items():
         if k in PACKED_MULTIMODAL_FIELDS or k in PER_TOKEN_MULTIMODAL_FIELDS:
@@ -116,17 +120,8 @@ def _sync_rollout_write_loop(fb: BatchedDataDict, bulk_batch: BatchedDataDict) -
         bulk_batch[k] = v
 
     for k, v in fb.get_multimodal_dict(as_tensors=False).items():
-        if isinstance(v, PackedTensor):
-            assert k in PACKED_MULTIMODAL_FIELDS, (
-                f"unregistered packed multimodal field {k!r}"
-            )
-            nested, lengths = v.to_nested_wire()
-            if nested is None:
-                continue
-            bulk_batch[k] = nested
-            bulk_batch[PackedTensor.lengths_key(k)] = lengths
-        else:
-            bulk_batch[k] = v
+        for wk, wv in encode_multimodal_for_wire(k, v):
+            bulk_batch[wk] = wv
 
 
 def test_vlm_wire_roundtrip_through_noop_data_plane():
@@ -205,6 +200,54 @@ def test_vlm_wire_roundtrip_through_noop_data_plane():
     assert "token_mask" not in mm_wrapped
 
 
+def test_materialize_forward_pad_skips_packed_multimodal_fields():
+    """``codec.materialize`` right-pads dim 1 up to the cross-DP forward pad
+    target, which is a *token* seqlen. For a packed multimodal field dim 1 is
+    patch/image count, so padding it there inflates ``pixel_values`` by the
+    ratio seqlen/patches — the ~40x blow-up the exclusion averts.
+
+    The pad only fires when ``GLOBAL_FORWARD_PAD_SEQLEN`` is stamped on the
+    meta (``TQPolicy._stamp_pad_seqlen`` does this in production). The plain
+    roundtrip above never stamps it, so without this test the exclusion
+    branch in ``codec.materialize`` is never entered by any unit test.
+    """
+    n, seqlen = 4, 32
+    pad_to = 64  # cross-DP forward pad target, > seqlen
+    fb, _, _ = _make_vlm_rollout_output(n=n, seqlen=seqlen)
+
+    client = NoOpDataPlaneClient()
+    fields = list(fb.keys()) + [
+        PackedTensor.lengths_key(k) for k in ("pixel_values", "image_grid_thw")
+    ]
+    register_train_partition(client, num_samples=n, fields=fields)
+
+    bulk_batch: BatchedDataDict = BatchedDataDict()
+    _sync_rollout_write_loop(fb, bulk_batch)
+    meta = kv_first_write(
+        bulk_batch,
+        sample_ids=keys_from_uids(["a", "b", "c", "d"]),
+        dp_client=client,
+        partition_id="train",
+    )
+    meta = replace(
+        meta, extra_info={**(meta.extra_info or {}), GLOBAL_FORWARD_PAD_SEQLEN: pad_to}
+    )
+
+    fetched = read_columns(client, meta, select_fields=meta.fields, layout="padded")
+
+    # Token-aligned fields DO get padded up to the forward target.
+    assert fetched["input_ids"].shape == (n, pad_to)
+    assert fetched["mm_token_type_ids"].shape == (n, pad_to)
+    # Packed multimodal fields keep their patch/image dim 1 untouched.
+    assert fetched["pixel_values"].shape == (n, 5, 4, 4)
+    assert fetched["image_grid_thw"].shape == (n, 2, 3)
+
+    # Reassembly still reproduces the pre-wire values under forward padding.
+    mm = fetched.get_multimodal_dict(as_tensors=True)
+    assert torch.equal(mm["pixel_values"], fb["pixel_values"].as_tensor())
+    assert torch.equal(mm["image_grid_thw"], fb["image_grid_thw"].as_tensor())
+
+
 # ── Dispatch field selection (logprob vs train parity) ──────────────────
 
 
@@ -225,13 +268,20 @@ def _stub_tq_policy(monkeypatch, captured: dict[str, KVBatchMeta]):
 
     # ``Policy.shutdown`` short-circuits on a policy with no ``worker_group``,
     # but the dispatch bodies need one, so that escape hatch is unavailable
-    # here. Drop the destructor instead: this object never owned Ray workers
-    # or a TQ client, so running live teardown on it at GC is simply wrong.
-    # Faking ``shutdown``/``dp_client`` would work too, but it would report a
-    # successful shutdown that never happened and would silently absorb any
-    # future change to the real teardown contract.
+    # here. Override the destructor instead: this object never owned Ray
+    # workers or a TQ client, so running live teardown on it at GC is simply
+    # wrong. Faking ``shutdown``/``dp_client`` would work too, but it would
+    # report a successful shutdown that never happened and would silently
+    # absorb any future change to the real teardown contract.
+    #
+    # It must be a real no-op method, not ``__del__ = None``: CPython
+    # installs ``tp_finalize`` whenever ``__del__`` is present in the class
+    # dict, then calls it — ``None()`` raises ``TypeError`` at GC and pytest
+    # reports it as a ``PytestUnraisableExceptionWarning`` charged to
+    # whichever test happens to be running.
     class _StubTQPolicy(tq_policy_mod.TQPolicy):
-        __del__ = None  # type: ignore[assignment]
+        def __del__(self) -> None:
+            pass
 
     pol = object.__new__(_StubTQPolicy)
     pol.cfg = {}
@@ -278,9 +328,17 @@ def test_train_dispatch_ships_the_same_multimodal_fields_as_logprob(monkeypatch)
 
     lp_fields = set(captured["prev_lp"].fields)
     train_fields = set(captured["train"].fields)
+    # Parity across the FULL registry, not just the hand-listed mm_fields:
+    # the two supersets below would be satisfied by a dispatch that shipped
+    # extra multimodal columns to one side only.
+    registry = (
+        PACKED_MULTIMODAL_FIELDS
+        | PER_TOKEN_MULTIMODAL_FIELDS
+        | {PackedTensor.lengths_key(k) for k in PACKED_MULTIMODAL_FIELDS}
+    )
     assert set(mm_fields) <= lp_fields
     assert set(mm_fields) <= train_fields
-    assert lp_fields & set(mm_fields) == train_fields & set(mm_fields)
+    assert lp_fields & registry == train_fields & registry
 
 
 def test_text_only_dispatch_requests_no_multimodal_fields(monkeypatch):
@@ -303,3 +361,70 @@ def test_text_only_dispatch_requests_no_multimodal_fields(monkeypatch):
     all_mm = PACKED_MULTIMODAL_FIELDS | PER_TOKEN_MULTIMODAL_FIELDS
     assert not (set(captured["prev_lp"].fields) & all_mm)
     assert not (set(captured["train"].fields) & all_mm)
+
+
+def test_ref_logprob_dispatch_ships_multimodal_fields(monkeypatch):
+    """``get_reference_policy_logprobs_from_meta`` shares ``_logprob_dispatch``
+    with the prev-logprob path, but it is the ref forward whose output ends up
+    in the KL term — an image-blind ref logprob is a silent objective skew, so
+    pin the ref task explicitly rather than trusting the shared body."""
+    mm_fields = [
+        "pixel_values",
+        PackedTensor.lengths_key("pixel_values"),
+        "mm_token_type_ids",
+    ]
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="rollout",
+        sample_ids=["a", "b"],
+        fields=["input_ids", "input_lengths", "token_mask", *mm_fields],
+        sequence_lengths=[8, 8],
+    )
+
+    captured: dict[str, KVBatchMeta] = {}
+    pol = _stub_tq_policy(monkeypatch, captured)
+
+    pol.get_reference_policy_logprobs_from_meta(meta)
+
+    assert set(mm_fields) <= set(captured["ref_lp"].fields)
+
+
+def test_sc_microbatch_dispatch_ships_multimodal_fields(monkeypatch):
+    """The single-controller split-API path (``train_microbatches_from_meta``)
+    carries its own copy of the multimodal add-on, separate from
+    ``train_from_meta``. Without a test here the SC path could regress to an
+    image-blind forward while the sync path stays green."""
+    mm_fields = [
+        "pixel_values",
+        PackedTensor.lengths_key("pixel_values"),
+        "image_grid_thw",
+        PackedTensor.lengths_key("image_grid_thw"),
+        "mm_token_type_ids",
+    ]
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="rollout",
+        sample_ids=["a", "b"],
+        fields=["input_ids", "input_lengths", "token_mask", *mm_fields],
+        sequence_lengths=[8, 8],
+    )
+
+    # One policy, one patch: ``_stub_tq_policy`` patches the module-level
+    # ``shard_meta_for_dp``, so two stubs would share the last patch and the
+    # first capture dict would stay empty.
+    captured: dict[str, KVBatchMeta] = {}
+    pol = _stub_tq_policy(monkeypatch, captured)
+
+    pol.train_from_meta(meta, loss_fn=None, gbs=2, mbs=1)
+    sync_fields = set(captured["train"].fields)
+    pol.train_microbatches_from_meta(meta)
+    sc_fields = set(captured["train"].fields)
+
+    assert set(mm_fields) <= sc_fields
+    # Both train entrypoints must request the identical multimodal set.
+    all_mm = (
+        PACKED_MULTIMODAL_FIELDS
+        | PER_TOKEN_MULTIMODAL_FIELDS
+        | {PackedTensor.lengths_key(k) for k in PACKED_MULTIMODAL_FIELDS}
+    )
+    assert sc_fields & all_mm == sync_fields & all_mm

@@ -19,7 +19,10 @@ import torch
 
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    PER_TOKEN_MULTIMODAL_FIELDS,
     PackedTensor,
+    encode_multimodal_for_wire,
 )
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
@@ -695,6 +698,54 @@ def test_to_nested_wire_emits_one_row_per_logical_row_under_dedup():
     )
 
 
+def test_to_nested_wire_pads_segments_before_concat_under_dedup():
+    """A dedup row spanning segments of differing trailing dims.
+
+    ``as_tensor`` pads each physical segment then concatenates. The wire
+    encoder must use the same order: concatenating first raises
+    ``RuntimeError: Sizes of tensors must match except in dimension 0``
+    before the padding can fix the mismatch, so ``to_nested_wire`` would
+    fail on a value ``as_tensor`` handles fine.
+    """
+    # One logical row referencing two segments: 2x4 and 4x2 spatial dims.
+    packed = PackedTensor(
+        [torch.ones(1, 3, 2, 4), 2 * torch.ones(1, 3, 4, 2)],
+        dim_to_pack=0,
+        pad_to_max_shape=True,
+        _row_offsets=[0, 2],
+        _segment_indices=[0, 1],
+    )
+    assert len(packed) == 1
+    expected = packed.as_tensor()
+    assert expected.shape == (2, 3, 4, 4)  # padded to the batch max
+
+    nested, lengths = packed.to_nested_wire()
+    assert lengths.tolist() == [2]
+
+    padded = torch.nested.to_padded_tensor(nested, padding=0.0)
+    restored = PackedTensor.from_nested_wire(padded, lengths).as_tensor()
+    assert torch.equal(restored, expected)
+
+
+def test_from_nested_wire_rejects_mismatched_companion_length():
+    """A short/long companion would misalign images against samples."""
+    padded = torch.zeros(3, 2, 4)
+    with pytest.raises(ValueError, match="wire companion length mismatch"):
+        PackedTensor.from_nested_wire(padded, torch.tensor([2, 2], dtype=torch.int32))
+
+
+def test_from_nested_wire_empty_rows_match_legacy_none_semantics():
+    """An image-free shard must reconstruct as legacy does: ``as_tensor``
+    returns ``None`` and the per-row counts are 0, not a ``(0, ...)``
+    tensor with counts of 1."""
+    padded = torch.zeros(2, 3, 4)
+    lengths = torch.tensor([0, 0], dtype=torch.int32)
+
+    restored = PackedTensor.from_nested_wire(padded, lengths)
+    assert restored.as_tensor() is None
+    assert restored.logical_segment_counts_by_row() == [0, 0]
+
+
 def test_to_nested_wire_materializes_pad_to_max_shape():
     """Dynamic-resolution values carry ``pad_to_max_shape``, which the wire
     cannot round-trip (``from_nested_wire`` has no way to recover it) and
@@ -746,3 +797,148 @@ def test_get_multimodal_dict_empty_batch_skips_wire_field():
     )
     mm = data.get_multimodal_dict(as_tensors=False)
     assert "pixel_values" not in mm
+
+
+# ── encode_multimodal_for_wire (the rollout actor's write-side dispatcher) ──
+
+
+def test_encode_multimodal_for_wire_packed_emits_parent_and_lengths():
+    """A ``PackedTensor`` must arrive on the wire as two entries — the
+    ``torch.nested`` parent and its ``__lengths`` companion. Emitting only
+    the parent is unrecoverable on the read side."""
+    packed = PackedTensor(
+        [torch.ones(3, 4), torch.ones(1, 4)],
+        dim_to_pack=0,
+    )
+
+    pairs = dict(encode_multimodal_for_wire("pixel_values", packed))
+
+    assert set(pairs) == {"pixel_values", "pixel_values__lengths"}
+    assert pairs["pixel_values"].is_nested
+    assert pairs["pixel_values__lengths"].tolist() == [3, 1]
+    assert pairs["pixel_values__lengths"].dtype == torch.int32
+
+
+def test_encode_multimodal_for_wire_per_token_passes_through():
+    """Per-token fields are rectangular ``[B, S]`` — they ride as plain
+    tensors with no ``__lengths`` companion."""
+    ids = torch.ones((2, 6), dtype=torch.long)
+
+    pairs = list(encode_multimodal_for_wire("mm_token_type_ids", ids))
+
+    assert len(pairs) == 1
+    assert pairs[0][0] == "mm_token_type_ids"
+    assert pairs[0][1] is ids
+
+
+def test_encode_multimodal_for_wire_skips_all_empty_packed():
+    """An all-``None`` packed field has nothing to ship; yielding a bare
+    ``__lengths`` with no parent would break reassembly."""
+    packed = PackedTensor([None, None], dim_to_pack=0)
+
+    assert list(encode_multimodal_for_wire("pixel_values", packed)) == []
+
+
+def test_encode_multimodal_for_wire_rejects_unregistered_field():
+    """A new modality added to ``get_multimodal_dict`` without a registry
+    entry must fail loud here — the silent-drop class this PR fixes."""
+    with pytest.raises(KeyError, match="unregistered multimodal field"):
+        list(encode_multimodal_for_wire("audio_values", torch.zeros(2, 4)))
+
+
+def test_encode_multimodal_for_wire_rejects_unregistered_packed_field():
+    """The realistic drift case, and the one the registries exist to catch.
+
+    ``get_multimodal_dict`` emits *any* ``PackedTensor`` value regardless of
+    key, so a processor field that is in neither registry reaches
+    ``encode_multimodal_for_wire`` as a ``PackedTensor``. It must raise
+    rather than be dropped: a dropped image column is a silently
+    image-blind forward, not a crash.
+
+    The key below is a stand-in — the behavior is name-independent. No
+    specific model's ``model_input_names`` is asserted here, because that
+    could not be verified against the pinned transformers version.
+    """
+    packed = PackedTensor([torch.ones(2, 4), torch.ones(3, 4)], dim_to_pack=0)
+
+    with pytest.raises(KeyError, match="unregistered multimodal field"):
+        list(encode_multimodal_for_wire("pixel_attention_mask", packed))
+
+
+def test_unregistered_packed_field_survives_get_multimodal_dict_then_raises():
+    """Pin the whole leak path, not just the encoder in isolation.
+
+    ``get_multimodal_dict``'s first branch is ``isinstance(v, PackedTensor)``
+    — no registry check — so an unregistered packed field passes straight
+    through it. The registry gate is therefore load-bearing only at the wire
+    boundary; this test proves the two halves compose into a loud failure.
+    """
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.arange(8).reshape(2, 4),
+            "pixel_attention_mask": PackedTensor(
+                [torch.ones(2, 4), torch.ones(3, 4)], dim_to_pack=0
+            ),
+        }
+    )
+
+    mm = data.get_multimodal_dict(as_tensors=False)
+    assert "pixel_attention_mask" in mm  # slipped past the read-side dispatch
+
+    with pytest.raises(KeyError, match="unregistered multimodal field"):
+        for k, v in mm.items():
+            list(encode_multimodal_for_wire(k, v))
+
+
+def test_encode_multimodal_for_wire_rejects_wrong_type_per_registry():
+    """Registry membership decides the branch, so a mismatched value type
+    is a contract break, not something to coerce."""
+    with pytest.raises(AssertionError, match="expected PackedTensor"):
+        list(encode_multimodal_for_wire("pixel_values", torch.zeros(2, 4)))
+
+    with pytest.raises(AssertionError, match="expected Tensor"):
+        list(
+            encode_multimodal_for_wire(
+                "mm_token_type_ids", PackedTensor([torch.ones(2, 3)], dim_to_pack=0)
+            )
+        )
+
+
+def test_multimodal_registries_are_disjoint():
+    """A field in both registries would make ``encode_multimodal_for_wire``
+    dispatch order-dependent and silently pick the packed branch."""
+    assert not (PACKED_MULTIMODAL_FIELDS & PER_TOKEN_MULTIMODAL_FIELDS)
+
+
+# ── to_nested_wire guard rails ──────────────────────────────────────────
+
+
+def test_to_nested_wire_rejects_nonzero_dim_to_pack():
+    """Only ``dim_to_pack=0`` round-trips; anything else needs
+    ``ragged_idx`` threading, so it must raise instead of silently
+    encoding along the wrong axis."""
+    packed = PackedTensor([torch.ones(2, 3), torch.ones(2, 5)], dim_to_pack=1)
+
+    with pytest.raises(NotImplementedError, match="only supports dim_to_pack=0"):
+        packed.to_nested_wire()
+
+
+def test_to_nested_wire_all_none_returns_none_pair():
+    """All-empty batch signals 'skip this field' with ``(None, None)``
+    rather than an empty nested tensor the read side cannot interpret."""
+    packed = PackedTensor([None, None, None], dim_to_pack=0)
+
+    assert packed.to_nested_wire() == (None, None)
+
+
+def test_to_nested_wire_pad_to_max_shape_rejects_rank_mismatch():
+    """``pad_to_max_shape`` pads trailing dims to the batch max, which is
+    only defined when every row has the same rank."""
+    packed = PackedTensor(
+        [torch.ones(1, 3, 2), torch.ones(2, 3)],
+        dim_to_pack=0,
+        pad_to_max_shape=True,
+    )
+
+    with pytest.raises(ValueError, match="same rank"):
+        packed.to_nested_wire()
