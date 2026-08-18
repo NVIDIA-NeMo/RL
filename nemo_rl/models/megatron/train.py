@@ -450,6 +450,7 @@ class LossPostProcessor:
         sampling_params: Optional[TrainingSamplingParams] = None,
         draft_model: Optional[MegatronModule] = None,
         prepare_fn: Optional[Callable[..., Any]] = None,
+        defer_draft_normalization: bool = False,
     ):
         """Build a per-microbatch loss post-processor for the Megatron train loop.
 
@@ -466,6 +467,8 @@ class LossPostProcessor:
                 vocab_parallel_group, context_parallel_group)`` and return
                 ``(loss_input, data)``; value models pass one that right-shifts
                 and CP-all-gathers the scalar value-head output.
+            defer_draft_normalization: Return raw draft loss statistics for split
+                optimizer-step finalization instead of normalizing per microbatch.
         """
         self.loss_fn = loss_fn
         self.cfg = cfg
@@ -473,6 +476,7 @@ class LossPostProcessor:
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
         self.prepare_fn = prepare_fn
+        self.defer_draft_normalization = defer_draft_normalization
         if draft_model is not None and draft_model.eagle_module is not None:
             self.d2t = getattr(draft_model.eagle_module, "d2t", None)
         else:
@@ -562,6 +566,7 @@ class LossPostProcessor:
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=get_context_parallel_group(),
+                    defer_normalization=self.defer_draft_normalization,
                 )
 
         loss_fn_wrapped = partial(

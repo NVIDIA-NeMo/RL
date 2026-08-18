@@ -12,12 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+DRAFT_STEP_PAYLOAD_KEY = "_draft_step_payload"
+
+
+def _mock_step_state_without_megatron() -> tuple[types.ModuleType, types.ModuleType]:
+    module = types.ModuleType("nemo_rl.models.megatron.draft.step_state")
+    module.DRAFT_STEP_PAYLOAD_KEY = DRAFT_STEP_PAYLOAD_KEY
+    module.DraftStepState = MagicMock()
+    package = types.ModuleType("nemo_rl.models.megatron.draft")
+    package.step_state = module
+    return package, module
 
 
 @patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
@@ -128,3 +142,54 @@ def test_draft_cross_entropy_loss_uses_streaming_path(
     )
     stats.normalized.assert_called_once()
     assert loss.item() == 2.0
+
+
+@patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
+def test_draft_loss_wrapper_defers_raw_stats_for_split_step(
+    mock_draft_loss_cls,
+) -> None:
+    """Split loss keeps differentiable raw sums and emits detached counts."""
+    from nemo_rl.algorithms.loss.draft import DraftLossStats
+    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+
+    policy_loss = torch.tensor(5.0)
+    numerator = torch.tensor([12.0], requires_grad=True)
+    stats = DraftLossStats(
+        numerators=numerator,
+        counts=torch.tensor([3.0]),
+        weights=torch.ones(1),
+    )
+    draft_loss_fn = MagicMock()
+    draft_loss_fn.loss_stats.return_value = stats
+    mock_draft_loss_cls.return_value = draft_loss_fn
+    data = BatchedDataDict({})
+    wrapper = DraftLossWrapper(
+        loss_fn=MagicMock(return_value=(policy_loss, {})),
+        prepare_fn=MagicMock(return_value=({}, data)),
+        data_dict=data,
+        loss_weight=0.5,
+        defer_normalization=True,
+    )
+
+    payload = object()
+    draft_package, step_state_module = _mock_step_state_without_megatron()
+    step_state_module.DraftStepState.metric_payload.return_value = payload
+    with patch.dict(
+        sys.modules,
+        {
+            "nemo_rl.models.megatron.draft": draft_package,
+            "nemo_rl.models.megatron.draft.step_state": step_state_module,
+        },
+    ):
+        combined_loss, metrics = wrapper(
+            next_token_logits=torch.randn(1, 2, 3),
+            data=data,
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(1.0),
+        )
+
+    assert combined_loss.item() == pytest.approx(11.0)
+    assert metrics["draft_loss"] == pytest.approx(12.0)
+    assert metrics[DRAFT_STEP_PAYLOAD_KEY] is payload
+    step_state_module.DraftStepState.metric_payload.assert_called_once_with(stats)
+    draft_loss_fn.assert_not_called()

@@ -240,6 +240,7 @@ class DraftLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        defer_normalization: bool = False,
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
@@ -248,6 +249,7 @@ class DraftLossWrapper:
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
+        self.defer_normalization = defer_normalization
         self.draft_loss_fn = DraftCrossEntropyLossFn(
             vocab_parallel_group=vocab_parallel_group,
         )
@@ -278,12 +280,25 @@ class DraftLossWrapper:
             vocab_parallel_group=self.vocab_parallel_group,
             context_parallel_group=self.context_parallel_group,
         )
-        draft_loss = self.draft_loss_fn(
-            data=data,
-            global_valid_seqs=global_valid_seqs,
-            global_valid_toks=global_valid_toks,
-            **loss_input,
-        )
+        if self.defer_normalization:
+            stats = self.draft_loss_fn.loss_stats(data=data, **loss_input)
+            draft_loss = stats.normalized(
+                normalization_counts=torch.ones_like(stats.counts),
+            )
+            # Deferred payloads are only consumed by the Megatron split API.
+            from nemo_rl.models.megatron.draft.step_state import (
+                DRAFT_STEP_PAYLOAD_KEY,
+                DraftStepState,
+            )
+
+            metrics[DRAFT_STEP_PAYLOAD_KEY] = DraftStepState.metric_payload(stats)
+        else:
+            draft_loss = self.draft_loss_fn(
+                data=data,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                **loss_input,
+            )
         combined_loss = policy_loss + self.loss_weight * draft_loss
         metrics["draft_loss"] = float(draft_loss.detach().item())
         return combined_loss, metrics
