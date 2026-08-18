@@ -37,7 +37,7 @@ authoritative settings.
 
 | Model | Modality | Algorithm | Backend | Scale | Recipe |
 |---|---|---|---|---|---|
-| Qwen3.8-27B | LLM | GRPO | Megatron | 2n8g | [`grpo-qwen3.8-27b-2n8g-megatron-tp2pp2cp2.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.8-27b-2n8g-megatron-tp2pp2cp2.yaml) |
+| Qwen3.8-27B | LLM | GRPO | Megatron | 2n8g | [`grpo-qwen3.8-27b-2n8g-megatron-tp4pp2cp2.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.8-27b-2n8g-megatron-tp4pp2cp2.yaml) |
 
 ## Choose a Recipe
 
@@ -48,7 +48,7 @@ checkpointing.
 
 ```sh
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3.8-27b-2n8g-megatron-tp2pp2cp2.yaml
+  --config examples/configs/recipes/llm/grpo-qwen3.8-27b-2n8g-megatron-tp4pp2cp2.yaml
 ```
 
 This is a functional validation recipe rather than a long-run convergence
