@@ -173,6 +173,25 @@ export VAL_PATH="${VAL_PATH:-${_BLEND}}"
 export NL2BASH_JUDGE_MODEL="${NL2BASH_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/models/Qwen3-235B-A22B-Instruct-2507-FP8}"
 export SAFETY_JUDGE_MODEL="${SAFETY_JUDGE_MODEL:-/lustre/fsw/portfolios/llmservice/users/ansubramania/super_v3/model_checkpoints/Nemotron-Content-Safety-Reasoning-4B}"
 
+# EXTERNAL_JUDGES=1 otherwise sends both judges to the hetgroup, and a pool
+# replica must own whole nodes (see run_in_allocation.sh: fixed Ray and vLLM
+# ports are only safe because no two replicas share a host), so a judge below
+# TP=GPUS_PER_NODE can only run in Gym. NL2BASH_IN_GYM=1 keeps GenRM in the
+# hetgroup while leaving that judge behind; rlvr_dolphin_ultra_genrm.yaml uses it
+# to run the NL2Bash judge at TP=2.
+#
+# Unsetting the model is the signal: ultra_launch.sh registers a pool only for a
+# judge whose model is set, and falls back to the config's own value when it is
+# not. The checkpoint path therefore has to be pinned in the YAML, which
+# rlvr_dolphin.yaml already does. Assigning "" would not work — the :- default
+# above would substitute the path straight back in.
+if [[ "${NL2BASH_IN_GYM:-0}" == "1" ]]; then
+  unset NL2BASH_JUDGE_MODEL
+  # Undo the drop to 8 above: that default holds only because NL2Bash vacates the
+  # eight Gym nodes it was filling. Keeping it here means Gym needs them back.
+  _DEFAULT_GYM_NODES=16
+fi
+
 # -----------------------------------------------------------------------------
 # Containers
 # Built 2026-08-14 with prefetched venvs, on vllm 0.25.1.
@@ -392,7 +411,11 @@ echo "  HF_HOME    : ${HF_HOME}"
 if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
 echo "  GenRM      : in-job hetgroup — ${GENRM_REPLICAS} x TP=${GENRM_TENSOR_PARALLEL_SIZE}"
 echo "               ${GENRM_MODEL}"
+if [[ "${NL2BASH_IN_GYM:-0}" == "1" ]]; then
+echo "  NL2Bash    : served in the Gym pool (TP below GPUS_PER_NODE)"
+else
 echo "  NL2Bash    : in-job hetgroup — ${NL2BASH_REPLICAS} x TP=${NL2BASH_TENSOR_PARALLEL_SIZE}"
+fi
 else
 echo "  GenRM      : ${GENRM_BASE_URL} (external pool; served model name: model)"
 echo "  NL2Bash    : served in the Gym pool"
