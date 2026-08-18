@@ -1082,6 +1082,34 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    def initialize_model_express(self, *, server_url: str | None = None) -> None:
+        """Initialize an MX generator client in every vLLM rank."""
+        method_name = (
+            "initialize_model_express_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "initialize_model_express"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name, server_url=server_url
+        )
+        ray.get(futures)
+
+    def update_weights_from_model_express(self, version: Any) -> None:
+        """Install an exact MX version in every vLLM rank."""
+        method_name = (
+            "update_weights_from_model_express_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "update_weights_from_model_express"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name, version=version
+        )
+        results = ray.get(futures)
+        if not results or any(result is not True for result in results):
+            raise RuntimeError(
+                f"one or more vLLM engines failed ModelExpress refit: {results}"
+            )
+
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
         if not self.worker_group or not self.worker_group.workers:

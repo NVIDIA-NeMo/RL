@@ -40,6 +40,9 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     RefitCtx,
     _extract_layer_prefix,
 )
+from nemo_rl.weight_sync.model_express.generator import (
+    ModelExpressGeneratorIntegration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +187,7 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+    _model_express: ModelExpressGeneratorIntegration | None = None
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -191,6 +195,23 @@ class VllmInternalWorkerExtension:
             params = dict(self.model_runner.model.named_parameters())
             self._nrl_named_parameters = params
         return params
+
+    def initialize_model_express(self, server_url: str | None = None) -> None:
+        """Initialize ModelExpress inside the vLLM rank that owns live weights."""
+        if self._model_express is not None:
+            return
+        self._model_express = ModelExpressGeneratorIntegration.initialize(
+            model=self.model_runner.model,
+            vllm_config=self.model_runner.vllm_config,
+            model_config=self.model_runner.model_config,
+            server_url=server_url,
+        )
+
+    def update_weights_from_model_express(self, version: Any) -> bool:
+        """Stage, verify, and install an exact MX version at a safe point."""
+        if self._model_express is None:
+            raise RuntimeError("ModelExpress generator client is not initialized")
+        return self._model_express.update(version)
 
     def _load_full_hf_weights(
         self, policy_weights: list[tuple[str, torch.Tensor]]
@@ -1108,6 +1129,9 @@ class VllmInternalWorkerExtension:
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""
+        if self._model_express is not None:
+            self._model_express.close()
+            self._model_express = None
         # Close ZMQ socket and context if they exist
         if hasattr(self, "zmq_socket"):
             self.zmq_socket.close()

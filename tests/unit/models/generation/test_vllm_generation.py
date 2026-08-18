@@ -49,6 +49,30 @@ from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+@pytest.mark.parametrize("results", [[], [None], [True, None], [False]])
+def test_model_express_update_requires_every_engine_to_succeed(monkeypatch, results):
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": False}}
+    generation.worker_group = MagicMock()
+    generation.worker_group.run_all_workers_single_data.return_value = ["update-future"]
+    monkeypatch.setattr(ray, "get", lambda _futures: results)
+
+    with pytest.raises(RuntimeError, match="failed ModelExpress refit"):
+        generation.update_weights_from_model_express(MagicMock(version_id="version-1"))
+
+
+def test_model_express_update_accepts_success_from_every_engine(monkeypatch):
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": False}}
+    generation.worker_group = MagicMock()
+    generation.worker_group.run_all_workers_single_data.return_value = ["update-future"]
+    monkeypatch.setattr(ray, "get", lambda _futures: [True, True])
+
+    generation.update_weights_from_model_express(MagicMock(version_id="version-1"))
+
+
 # Define basic vLLM test config
 basic_vllm_test_config: VllmConfig = {
     "backend": "vllm",

@@ -117,6 +117,9 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     LocalParamSpec,
     RefitCtx,
 )
+from nemo_rl.weight_sync.model_express.trainer import (
+    ModelExpressTrainerIntegration,
+)
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -309,6 +312,7 @@ class MegatronPolicyWorkerImpl(
     _train_step_state: Optional[dict[str, Any]] = None
     _remote_sparse_refit: Any = None
     _async_checkpoint_cuda_cache_active: bool = False
+    _model_express: ModelExpressTrainerIntegration | None = None
 
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
@@ -451,6 +455,9 @@ class MegatronPolicyWorkerImpl(
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
+        self._model_express = ModelExpressTrainerIntegration.from_config(
+            config=config, local_rank=local_rank
+        )
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -2270,6 +2277,40 @@ class MegatronPolicyWorkerImpl(
             for task in self.megatron_bridge.get_conversion_tasks([self.model])
             if task is not None
         ]
+
+    def initialize_model_express(self, *, server_url: str | None = None) -> str | None:
+        """Initialize MX publication on one DP/CP replica of each model shard."""
+        if parallel_state.get_data_parallel_rank() != 0:
+            return None
+        if parallel_state.get_context_parallel_rank() != 0:
+            return None
+        if self._model_express is None:
+            raise RuntimeError("ModelExpress trainer integration was not configured")
+        return self._model_express.initialize(
+            model_name=self.cfg["model_name"],
+            conversion_tasks=self._build_refit_conversion_tasks(),
+            transformer_config=self.megatron_bridge.transformer_config,
+            tensor_parallel_size=parallel_state.get_tensor_model_parallel_world_size(),
+            tensor_parallel_rank=parallel_state.get_tensor_model_parallel_rank(),
+            server_url=server_url,
+        )
+
+    def publish_model_express_version(self, *, version: Any) -> None:
+        """Publish this rank's immutable shard for one MX version."""
+        if self._model_express is not None:
+            self._model_express.publish(version)
+
+    def release_model_express_version(self, *, version: Any) -> None:
+        """Withdraw this rank's shard so training may mutate it again."""
+        if self._model_express is not None:
+            self._model_express.release(version)
+
+    def shutdown(self) -> bool:
+        """Release ModelExpress resources before normal policy cleanup."""
+        if self._model_express is not None:
+            self._model_express.close()
+            self._model_express = None
+        return AbstractPolicyWorker.shutdown(self)
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.

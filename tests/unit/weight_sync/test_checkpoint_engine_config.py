@@ -23,7 +23,12 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 
 @pytest.mark.parametrize(
     "generation_config",
-    [{}, {"refit_transport": None}, {"refit_transport": "vllm_zmq_sparse"}],
+    [
+        {},
+        {"refit_transport": None},
+        {"refit_transport": "vllm_zmq_sparse"},
+        {"refit_transport": "model_express"},
+    ],
 )
 def test_checkpoint_engine_refit_config_returns_none_for_other_transports(
     generation_config,

@@ -1146,6 +1146,24 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         """Prepare the info for refit."""
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    def initialize_model_express(self, *, server_url: str | None = None) -> None:
+        """Initialize the rank-local MX clients owned by this vLLM engine."""
+        assert self.llm is not None, "vLLM must be initialized before ModelExpress"
+        self.llm.collective_rpc("initialize_model_express", args=(server_url,))
+
+    def update_weights_from_model_express(self, *, version: Any) -> bool:
+        """Apply one exact MX version on every internal vLLM rank."""
+        assert self.llm is not None, "vLLM must be initialized before ModelExpress"
+        results = cast(
+            list[bool],
+            self.llm.collective_rpc(
+                "update_weights_from_model_express", args=(version,)
+            ),
+        )
+        if not results or not all(results):
+            raise RuntimeError(f"ModelExpress update failed: {results}")
+        return True
+
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Update weights from IPC handles via ZMQ socket."""
