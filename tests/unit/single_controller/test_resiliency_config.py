@@ -28,6 +28,8 @@ from pydantic import ValidationError
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
+    FleetHealthConfig,
+    GenerationRouterConfig,
     MasterConfig,
     RolloutFailureConfig,
     WatchdogConfig,
@@ -52,7 +54,7 @@ class TestDefaultsAreInert:
         assert cfg.nemo_gym.max_row_attempts == 3
 
     def test_watchdog_has_documented_defaults(self):
-        cfg = AsyncRLConfig().watchdog
+        cfg = AsyncRLConfig().stall_watchdog
         assert cfg.interval_s == 30.0
         assert cfg.stall_timeout_s == 600.0
         assert cfg.stall_action == "warn"
@@ -140,6 +142,50 @@ class TestWatchdogValidation:
             WatchdogConfig(stall_action="explode")
 
 
+class TestGenerationRouterValidation:
+    def test_the_default_status_is_outside_gyms_retry_set(self):
+        assert GenerationRouterConfig().no_healthy_backend_status == 409
+
+    @pytest.mark.parametrize("status", [429, 500, 502, 503, 504, 520])
+    def test_a_status_gym_retries_is_rejected(self, status):
+        """Returning one of these would make Gym retry forever.
+
+        Gym retries 429/500/502/503/504/520, and for the rate-limit subset it raises its
+        own retry ceiling on each attempt. Answering "no healthy backend" with one of
+        them recreates the unbounded hang the router exists to prevent, so it is refused
+        at config load rather than discovered in production.
+        """
+        with pytest.raises(ValidationError, match="NeMo-Gym retries internally"):
+            GenerationRouterConfig(no_healthy_backend_status=status)
+
+    @pytest.mark.parametrize("status", [400, 404, 409, 418, 422])
+    def test_other_client_errors_are_allowed(self, status):
+        assert (
+            GenerationRouterConfig(
+                no_healthy_backend_status=status
+            ).no_healthy_backend_status
+            == status
+        )
+
+    def test_it_is_off_by_default(self):
+        assert AsyncRLConfig().generation_router.enabled is False
+
+
+class TestFleetHealthValidation:
+    def test_it_is_off_by_default(self):
+        assert AsyncRLConfig().generation_fleet_health.enabled is False
+
+    def test_a_probe_timeout_that_outlasts_the_interval_is_rejected(self):
+        """Otherwise probes overlap and a slow fleet reads as a dead one."""
+        with pytest.raises(ValidationError, match="probe_timeout_s"):
+            FleetHealthConfig(probe_interval_s=2.0, probe_timeout_s=2.0)
+
+    def test_unimplemented_recovery_modes_are_rejected(self):
+        """They need the communicator rebuild; accepting them would do nothing."""
+        with pytest.raises(ValidationError):
+            FleetHealthConfig(on_dead_shard="degrade_and_restore")
+
+
 class TestWatchdogVersusRolloutTimeout:
     """The watchdog must outlast EVERY deadline, not just the NeMo-Gym one.
 
@@ -160,7 +206,7 @@ class TestWatchdogVersusRolloutTimeout:
     def _cfg(block, key, deadline, stall_timeout_s):
         return AsyncRLConfig(
             rollout_failure={block: {key: deadline}},
-            watchdog={"interval_s": 30.0, "stall_timeout_s": stall_timeout_s},
+            stall_watchdog={"interval_s": 30.0, "stall_timeout_s": stall_timeout_s},
         )
 
     @pytest.mark.parametrize(("block", "key"), DEADLINES)
@@ -175,11 +221,14 @@ class TestWatchdogVersusRolloutTimeout:
 
     @pytest.mark.parametrize(("block", "key"), DEADLINES)
     def test_a_longer_watchdog_is_accepted(self, block, key):
-        assert self._cfg(block, key, 900.0, 1200.0).watchdog.stall_timeout_s == 1200.0
+        assert (
+            self._cfg(block, key, 900.0, 1200.0).stall_watchdog.stall_timeout_s
+            == 1200.0
+        )
 
     @pytest.mark.parametrize(("block", "key"), DEADLINES)
     def test_a_disabled_deadline_imposes_no_constraint(self, block, key):
-        assert self._cfg(block, key, None, 60.0).watchdog.stall_timeout_s == 60.0
+        assert self._cfg(block, key, None, 60.0).stall_watchdog.stall_timeout_s == 60.0
 
     @pytest.mark.parametrize(("block", "key"), DEADLINES)
     @pytest.mark.parametrize("value", [0.0, -1.0])
@@ -274,3 +323,99 @@ class TestWrongPathFaultToleranceIsRejected:
         del cfg.env
         assert not hasattr(cfg, "env")
         validate_single_controller_config(cfg)
+
+
+class TestGenerationRouterPortAndTimeoutValidation:
+    def test_a_transposed_port_range_is_rejected(self):
+        """Otherwise it surfaces as 'empty range for randrange()' far from the typo."""
+        with pytest.raises(ValidationError, match="port_range_low"):
+            GenerationRouterConfig(port_range_low=6099, port_range_high=6000)
+
+    def test_an_equal_port_range_is_rejected(self):
+        with pytest.raises(ValidationError, match="port_range_low"):
+            GenerationRouterConfig(port_range_low=6000, port_range_high=6000)
+
+    def test_the_connect_timeout_defaults_well_below_the_backend_timeout(self):
+        """A handshake to a local vLLM is ms-or-never; the generation is minutes."""
+        cfg = GenerationRouterConfig()
+        assert cfg.connect_timeout_s == 5.0
+        assert cfg.connect_timeout_s < cfg.backend_timeout_s
+
+    def test_a_connect_timeout_beyond_the_total_is_rejected(self):
+        with pytest.raises(ValidationError, match="connect_timeout_s"):
+            GenerationRouterConfig(connect_timeout_s=100.0, backend_timeout_s=10.0)
+
+
+class TestFleetHealthSelectionIsNotAdvertisedBeyondWhatItDoes:
+    def test_an_unimplemented_selection_mode_is_rejected(self):
+        """Nothing dispatches on this value, so accepting round_robin would silently
+        hand the caller least_outstanding anyway -- the failure mode on_dead_shard's
+        Literal already exists to prevent."""
+        with pytest.raises(ValidationError):
+            FleetHealthConfig(selection="round_robin")
+
+    def test_the_implemented_mode_is_accepted(self):
+        assert FleetHealthConfig(selection="least_outstanding").selection == (
+            "least_outstanding"
+        )
+
+
+class TestRenamedBlocksAreRejected:
+    """The old block names parsed fine under extra="allow" and then did nothing.
+
+    async_rl.watchdog in particular shipped in the containment PR, so a config in the
+    wild can carry it -- and silently losing stall detection is exactly the failure mode
+    this series exists to remove.
+    """
+
+    @pytest.mark.parametrize(
+        ("old", "new"),
+        [
+            ("watchdog", "stall_watchdog"),
+            ("fleet_health", "generation_fleet_health"),
+            ("policy_router", "generation_router"),
+        ],
+    )
+    def test_the_previous_block_names_are_rejected_not_ignored(self, old, new):
+        with pytest.raises(ValidationError, match=new):
+            AsyncRLConfig(**{old: {"enabled": True}})
+
+    def test_the_new_names_are_accepted(self):
+        cfg = AsyncRLConfig(
+            stall_watchdog={"interval_s": 30.0, "stall_timeout_s": 600.0},
+            generation_fleet_health={"enabled": True},
+            generation_router={"enabled": True},
+        )
+        assert cfg.generation_fleet_health.enabled
+        assert cfg.generation_router.enabled
+        assert cfg.stall_watchdog.stall_timeout_s == 600.0
+
+
+class TestRouterDeadlineFitsInsideTheRollout:
+    """backend_timeout_s bounds one HTTP call; rollout_timeout_s bounds the whole stream."""
+
+    def test_a_router_deadline_past_the_rollout_deadline_is_rejected(self):
+        with pytest.raises(ValidationError, match="backend_timeout_s"):
+            AsyncRLConfig(
+                generation_router={"enabled": True, "backend_timeout_s": 600.0},
+                rollout_failure={"nemo_gym": {"rollout_timeout_s": 300.0}},
+            )
+
+    def test_a_router_deadline_inside_it_is_accepted(self):
+        cfg = AsyncRLConfig(
+            generation_router={"enabled": True, "backend_timeout_s": 120.0},
+            rollout_failure={"nemo_gym": {"rollout_timeout_s": 300.0}},
+        )
+        assert cfg.generation_router.backend_timeout_s == 120.0
+
+    def test_an_unset_rollout_deadline_imposes_no_constraint(self):
+        """rollout_timeout_s defaults to None -- disabled -- so there is nothing to fit in."""
+        cfg = AsyncRLConfig(generation_router={"enabled": True})
+        assert cfg.rollout_failure.nemo_gym.rollout_timeout_s is None
+
+    def test_a_disabled_router_imposes_no_constraint(self):
+        cfg = AsyncRLConfig(
+            generation_router={"enabled": False, "backend_timeout_s": 600.0},
+            rollout_failure={"nemo_gym": {"rollout_timeout_s": 60.0}},
+        )
+        assert cfg.generation_router.enabled is False

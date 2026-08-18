@@ -21,6 +21,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    ReadyFirstSamplerConfig,
+    SamplerConfig,
+)
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils import (
@@ -42,6 +46,8 @@ def _make_master_config(
     max_num_steps: int = 100,
     max_num_epochs: int | None = 1,
     num_prompts_per_step: int = 4,
+    sampler_cfg: SamplerConfig | None = None,
+    loss_cfg: ClippedPGLossConfig | None = None,
 ) -> MasterConfig:
     """Build a partially-populated MasterConfig for unit tests.
 
@@ -90,11 +96,12 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
-        loss_fn=ClippedPGLossConfig(),
+        loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=num_prompts_per_step,
             max_buffered_rollouts=num_prompts_per_step * 2,
+            **({} if sampler_cfg is None else {"sampler": sampler_cfg}),
         ),
     )
 
@@ -260,6 +267,43 @@ class TestSetup:
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["_build_generation"].assert_not_called()
         patched_factories["_build_trainer"].assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("loss_overrides", "match"),
+        [
+            (
+                {"use_importance_sampling_correction": False},
+                "use_importance_sampling_correction=true",
+            ),
+            (
+                {
+                    "use_importance_sampling_correction": True,
+                    "force_on_policy_ratio": True,
+                },
+                "force_on_policy_ratio=false",
+            ),
+        ],
+        ids=["no_is_correction", "forced_on_policy_ratio"],
+    )
+    def test_ready_first_sampler_rejects_incompatible_loss_config(
+        self,
+        loss_overrides: dict,
+        match: str,
+        patched_factories,
+    ):
+        # ready_first is only valid with use_importance_sampling_correction=true
+        # and force_on_policy_ratio=false; anything else is rejected at setup,
+        # before any factory allocates resources.
+        mc = _make_master_config(
+            sampler_cfg=ReadyFirstSamplerConfig(max_staleness_versions=1),
+            loss_cfg=ClippedPGLossConfig(**loss_overrides),
+        )
+
+        with pytest.raises(ValueError, match=match):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
 
     def test_returns_actor_args(self, patched_factories):
         mc = _make_master_config(colocated=True)
