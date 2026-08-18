@@ -76,21 +76,12 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     transient registration. Slots ratchet — they grow to the largest payload
     admitted and never shrink — so raise it only when a per-key payload (one
     sample of one field) genuinely exceeds it, not for headroom.
-
-    ``transfer_max_retries`` overrides TransferQueue's mooncake client retry
-    count for a failed ``batch_get_into``/``batch_upsert_from`` (upstream
-    default: 3, fixed 1s delay between attempts, no backoff). A transient
-    RDMA rail failure — e.g. an unlucky cross-rail peer draw on a host with
-    more than one same-NUMA rail — is not guaranteed to clear on any single
-    retry, so hosts that see it more often need more attempts, not a longer
-    delay between them.
     """
 
     global_segment_size: int = 68719476736  # 64 GiB per client process
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
     staging_buffer_size: int = 268435456  # 256 MiB per pool slot
-    transfer_max_retries: int = 3  # upstream TransferQueue default
 
 
 class DataPlaneConfig(TypedDict):
