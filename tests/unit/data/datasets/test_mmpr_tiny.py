@@ -250,7 +250,7 @@ class TestVLMProcessorMMPRTiny:
         result, _ = _run_processor(tiny_image_path, processor=processor)
 
         processor.conversation_preprocessor.assert_called_once()
-        assert result["vllm_content"] == "preprocessed"
+        assert result["vllm_content"] is None
         assert processor.captured_call_text == "preprocessed"
 
     def test_historical_tiled_processor_gets_media_metadata(self, tiny_image_path):
@@ -286,13 +286,13 @@ class TestVLMProcessorMMPRTiny:
         self, tiny_image_path
     ):
         result, _ = _run_processor(tiny_image_path)
-        vllm_content = result["vllm_content"]
+        processed_text = processor.captured_call_text
 
         # Positive: literal \boxed{} must survive prompt formatting
-        assert "\\boxed{}" in vllm_content
+        assert "\\boxed{}" in processed_text
 
         # Negative: the raw dataset string (with <image> prefix) must NOT leak through
-        assert _RAW_QUESTION not in vllm_content
+        assert _RAW_QUESTION not in processed_text
 
     def test_placeholder_conversion_exact_string(self, tiny_image_path):
         """Verify the exact tokenizer input for the placeholder-style processor path.
@@ -310,15 +310,14 @@ class TestVLMProcessorMMPRTiny:
 
         # The stub's apply_chat_template joins message parts with spaces,
         # so the captured text passed to __call__ is the chat-templated string.
-        # Verify the vllm_content (which is apply_chat_template output) matches.
-        vllm_content = result["vllm_content"]
-        assert vllm_content == expected_tokenizer_input
+        # Placeholder-style processors send their expanded token IDs to vLLM.
+        assert result["vllm_content"] is None
 
         # Verify exactly one <image> token in the final output
-        assert vllm_content.count("<image>") == 1
+        assert processor.captured_call_text.count("<image>") == 1
 
         # Verify the question text is present
-        assert _CLEAN_QUESTION in vllm_content
+        assert _CLEAN_QUESTION in processor.captured_call_text
 
         # Verify the captured __call__ text also matches
         # (processor.__call__ receives the apply_chat_template output)

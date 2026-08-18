@@ -675,9 +675,11 @@ def vlm_hf_data_processor(
                     chat_message[key] = PackedTensor.empty_like(value)
         loss_multiplier = 0.0
     else:
-        # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images/audios) for the entire conversation
+        # Placeholder-style processors have already expanded media positions in
+        # input_ids. Let vLLM consume those IDs while retaining main's native
+        # media side channels; other processors keep the formatted-string path.
         vllm_kwargs = {
-            "vllm_content": string_formatted_dialog,
+            "vllm_content": None if uses_placeholder else string_formatted_dialog,
             "vllm_images": images,
             "vllm_audios": audios,
             "vllm_videos": videos,

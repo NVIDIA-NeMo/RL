@@ -12,8 +12,68 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 import torch
+from megatron.core.inference.config import ImageProcessingConfig
 from megatron.core.inference.utils import device_memory_summary
+
+
+def build_image_preprocessing_config(
+    image_processor: Any, *, dynamic_resolution: bool
+) -> ImageProcessingConfig:
+    """Translate an HF image processor to an MCore config."""
+
+    def read(*names: str) -> Any:
+        for name in names:
+            value = getattr(image_processor, name, None)
+            if value is not None:
+                return value
+        return None
+
+    patch_dim = read("patch_size", "patch_dim")
+    if isinstance(patch_dim, dict):
+        patch_dim = patch_dim.get("height", patch_dim.get("width"))
+    min_patches = read("min_num_patches")
+    max_patches = read("max_num_patches")
+    pixel_mean = read("norm_mean", "image_mean")
+    pixel_std = read("norm_std", "image_std")
+
+    missing = [
+        name
+        for name, value in (
+            ("patch_size", patch_dim),
+            ("min_num_patches", min_patches),
+            ("max_num_patches", max_patches),
+            ("norm_mean", pixel_mean),
+            ("norm_std", pixel_std),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ValueError(
+            f"{type(image_processor).__name__} does not expose {', '.join(missing)}, "
+            "so MCore cannot preprocess raw images the way this model's data "
+            "pipeline does."
+        )
+
+    downsample_ratio = read("downsample_ratio")
+    if downsample_ratio is not None:
+        merge_size = int(round(1.0 / float(downsample_ratio)))
+    else:
+        merge_size = int(read("merge_size", "spatial_merge_size") or 1)
+
+    return ImageProcessingConfig(
+        patch_dim=int(patch_dim),
+        dynamic_resolution=dynamic_resolution,
+        use_tiling=False,
+        pixel_shuffle=merge_size > 1,
+        spatial_merge_size=merge_size,
+        dynamic_resolution_min_patches=int(min_patches),
+        dynamic_resolution_max_patches=int(max_patches),
+        pixel_mean=[float(value) for value in pixel_mean],
+        pixel_std=[float(value) for value in pixel_std],
+    )
 
 
 def resolve_torch_dtype(val):
