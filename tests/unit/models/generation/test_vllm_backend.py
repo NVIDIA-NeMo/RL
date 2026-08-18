@@ -265,11 +265,12 @@ def test_mxfp8_native_linear_refit_uses_vllm_layerwise_reload(monkeypatch):
 def test_mxfp8_native_linear_refit_restores_roots_after_initialize_failure(
     monkeypatch,
 ):
-    from nemo_rl.models.generation.vllm import vllm_backend
     from vllm.model_executor.model_loader.reload import (
         initialize_layerwise_reload,
         record_metadata_for_reloading,
     )
+
+    from nemo_rl.models.generation.vllm import vllm_backend
 
     kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
     _patch_native_mxfp8_kernel(monkeypatch, kernel_type)
@@ -322,8 +323,9 @@ def test_mxfp8_native_linear_refit_restores_roots_after_initialize_failure(
 
 @pytest.mark.vllm
 def test_mxfp8_native_linear_refit_aborts_partial_weight_load(monkeypatch):
-    from nemo_rl.models.generation.vllm import vllm_backend
     from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+
+    from nemo_rl.models.generation.vllm import vllm_backend
 
     kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
     _patch_native_mxfp8_kernel(monkeypatch, kernel_type)
