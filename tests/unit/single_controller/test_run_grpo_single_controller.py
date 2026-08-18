@@ -35,7 +35,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             "megatron_cfg": {"mtp_num_layers": 2},
         },
         env={},
-        data_plane={"enabled": True},
+        data_plane={"enabled": True, "impl": "transfer_queue", "backend": "simple"},
         logger={"log_dir": "/tmp/logs"},
         checkpointing={"enabled": False},
         async_rl=SimpleNamespace(
