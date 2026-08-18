@@ -24,6 +24,12 @@ grpo:
   stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
+  # Reuse the generation engine's returned processed logprobs as prev_logprobs instead
+  # of recomputing them with a trainer forward (saves one forward per step).
+  # On-policy only: mutually exclusive with loss_fn.use_importance_sampling_correction,
+  # loss_fn.truncated_importance_sampling_type, and loss_fn.force_on_policy_ratio
+  # (setup() asserts this). It also makes the mismatch diagnostics degenerate.
+  use_generation_logprobs_as_prev: false
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1

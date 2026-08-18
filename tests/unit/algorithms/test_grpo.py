@@ -45,6 +45,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
     _should_use_async_rollouts,
+    _validate_generation_logprobs_as_prev,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
@@ -77,6 +78,57 @@ from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
     create_mock_batch,
 )
+
+
+def test_generation_logprobs_as_prev_rejects_seq_error_masking() -> None:
+    grpo_config = GRPOConfig(
+        use_generation_logprobs_as_prev=True,
+        seq_logprob_error_threshold=1.5,
+    )
+
+    with pytest.raises(AssertionError, match="seq_logprob_error_threshold"):
+        _validate_generation_logprobs_as_prev(
+            grpo_config,
+            ClippedPGLossConfig(use_importance_sampling_correction=False),
+        )
+
+
+def test_generation_logprobs_as_prev_rejects_async_grpo() -> None:
+    grpo_config = GRPOConfig(use_generation_logprobs_as_prev=True)
+    assert grpo_config.async_grpo is not None
+    grpo_config.async_grpo.enabled = True
+
+    with pytest.raises(AssertionError, match="async GRPO"):
+        _validate_generation_logprobs_as_prev(
+            grpo_config,
+            ClippedPGLossConfig(use_importance_sampling_correction=False),
+        )
+
+
+@pytest.mark.parametrize(
+    ("loss_config", "error"),
+    [
+        (
+            ClippedPGLossConfig(use_importance_sampling_correction=True),
+            "use_importance_sampling_correction",
+        ),
+        (
+            ClippedPGLossConfig(
+                use_importance_sampling_correction=False,
+                force_on_policy_ratio=True,
+            ),
+            "force_on_policy_ratio",
+        ),
+    ],
+)
+def test_generation_logprobs_as_prev_rejects_incompatible_loss_config(
+    loss_config: ClippedPGLossConfig, error: str
+) -> None:
+    with pytest.raises(AssertionError, match=error):
+        _validate_generation_logprobs_as_prev(
+            GRPOConfig(use_generation_logprobs_as_prev=True),
+            loss_config,
+        )
 
 
 def _mock_policy_generation() -> MagicMock:
@@ -2707,6 +2759,33 @@ def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
                 _initial_grpo_save_state(),
                 master_config,
             )
+
+
+def test_generation_logprob_reuse_skips_all_logprob_inference(
+    mock_grpo_components, monkeypatch
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_generation_logprobs_as_prev = True
+    master_config.grpo.skip_reference_policy_logprobs_calculation = True
+    master_config.grpo.seq_logprob_error_threshold = None
+    master_config.loss_fn.use_importance_sampling_correction = False
+    master_config.loss_fn.reference_policy_kl_penalty = 0
+
+    policy = mock_grpo_components["policy"]
+    with patch(
+        "nemo_rl.algorithms.grpo._preserve_router_replay_routed_experts"
+    ) as preserve_routed_experts:
+        _run_single_grpo_train_step(mock_grpo_components, grpo_train, monkeypatch)
+
+    policy.prepare_for_lp_inference.assert_not_called()
+    policy.get_logprobs.assert_not_called()
+    policy.get_reference_policy_logprobs.assert_not_called()
+    trained_data = policy.train.call_args.args[0]
+    preserve_routed_experts.assert_called_once()
+    assert preserve_routed_experts.call_args.args[0] is trained_data
+    assert torch.equal(
+        trained_data["prev_logprobs"], trained_data["generation_logprobs"]
+    )
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])

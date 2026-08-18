@@ -279,6 +279,8 @@ class GRPOConfig(BaseModel, extra="allow"):
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool = False
+    # Reuse generation-engine logprobs as the previous-policy logprobs.
+    use_generation_logprobs_as_prev: bool = False
     # When using dynamic sampling, the maximum number of batches to generate
     # before throwing an error
     dynamic_sampling_max_gen_batches: int = 10
@@ -369,6 +371,31 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
+
+
+def _validate_generation_logprobs_as_prev(
+    grpo_config: GRPOConfig, loss_config: ClippedPGLossConfig
+) -> None:
+    """Reject configurations where generation-logprob reuse changes semantics."""
+    if not grpo_config.use_generation_logprobs_as_prev:
+        return
+
+    assert grpo_config.async_grpo is None or not grpo_config.async_grpo.enabled, (
+        "grpo.use_generation_logprobs_as_prev=True is not supported with async GRPO"
+    )
+    assert not loss_config.use_importance_sampling_correction, (
+        "grpo.use_generation_logprobs_as_prev=True is incompatible with "
+        "loss_fn.use_importance_sampling_correction=True"
+    )
+    assert not loss_config.force_on_policy_ratio, (
+        "grpo.use_generation_logprobs_as_prev=True is incompatible with "
+        "loss_fn.force_on_policy_ratio=True"
+    )
+    assert grpo_config.seq_logprob_error_threshold is None, (
+        "grpo.use_generation_logprobs_as_prev=True is incompatible with "
+        "grpo.seq_logprob_error_threshold because prev_logprobs and "
+        "generation_logprobs would be identical"
+    )
 
 
 def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
@@ -661,6 +688,8 @@ def setup(
         )
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")
+
+    _validate_generation_logprobs_as_prev(grpo_config, loss_config)
 
     # Validate skip_reference_policy_logprobs_calculation
     if grpo_config.skip_reference_policy_logprobs_calculation:
@@ -3188,36 +3217,46 @@ def grpo_train(
                 seq_logprob_error_threshold = (
                     master_config.grpo.seq_logprob_error_threshold
                 )
+                reuse_generation_logprobs = (
+                    master_config.grpo.use_generation_logprobs_as_prev
+                )
+                needs_prev_logprob_forward = (
+                    not skip_prev_logprobs and not reuse_generation_logprobs
+                )
+                needs_logprob_forward = (
+                    needs_prev_logprob_forward or not skip_reference_logprobs
+                )
 
-                if not (skip_prev_logprobs and skip_reference_logprobs):
+                if needs_logprob_forward:
                     print("▶ Preparing for logprob inference...", flush=True)
                     with timer.time("logprob_inference_prep"):
                         policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
-                    # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
-                    logprob_data = BatchedDataDict[ClippedPGLossDataDict](
-                        {
-                            "input_ids": train_data["input_ids"],
-                            "input_lengths": train_data["input_lengths"],
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
-                            **extra_multimodal_data,
-                        }
-                    )
-                    # Router replay (R3): the prev-logprobs forward replays the
-                    # recorded routed_experts, so logprob_data must carry the
-                    # field too (it is a separate whitelist from train_data). The
-                    # reference-policy logprobs call reuses logprob_data but
-                    # intentionally ignores routed_experts (require_router_replay
-                    # =False short-circuits before the field is read), so a
-                    # present-but-unused field here is safe.
-                    _preserve_router_replay_routed_experts(
-                        logprob_data, flat_messages, master_config.policy
-                    )
+                    logprob_data = None
+                    if needs_logprob_forward:
+                        # Avoid Ray communication for fields unused by logprob workers.
+                        logprob_data = BatchedDataDict[ClippedPGLossDataDict](
+                            {
+                                "input_ids": train_data["input_ids"],
+                                "input_lengths": train_data["input_lengths"],
+                                "token_mask": flat_messages["token_loss_mask"],
+                                "sample_mask": repeated_batch["loss_multiplier"],
+                                **extra_multimodal_data,
+                            }
+                        )
+                        # The prev-logprobs forward needs routed experts for R3.
+                        _preserve_router_replay_routed_experts(
+                            logprob_data, flat_messages, master_config.policy
+                        )
 
-                    if not skip_prev_logprobs:
+                    if reuse_generation_logprobs:
+                        train_data["prev_logprobs"] = train_data[
+                            "generation_logprobs"
+                        ].clone()
+                    elif needs_prev_logprob_forward:
+                        assert logprob_data is not None
                         train_data["prev_logprobs"] = policy.get_logprobs(
                             logprob_data, timer=timer
                         )["logprobs"]
@@ -3231,6 +3270,7 @@ def grpo_train(
                         )
 
                     if not skip_reference_logprobs:
+                        assert logprob_data is not None
                         train_data["reference_policy_logprobs"] = (
                             policy.get_reference_policy_logprobs(
                                 logprob_data,
@@ -3246,7 +3286,6 @@ def grpo_train(
                             train_data["prev_logprobs"]
                         )
 
-                    del logprob_data
                     del extra_multimodal_data
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs

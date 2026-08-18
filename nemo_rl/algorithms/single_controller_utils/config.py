@@ -464,6 +464,11 @@ def validate_sampler_buffer_capacity(
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    if master_config.grpo.use_generation_logprobs_as_prev:
+        raise ValueError(
+            "grpo.use_generation_logprobs_as_prev is not supported by SingleController"
+        )
+
     async_config = master_config.async_rl
     num_prompts_per_step = master_config.grpo.num_prompts_per_step
     if num_prompts_per_step < async_config.min_groups_for_streaming_train:

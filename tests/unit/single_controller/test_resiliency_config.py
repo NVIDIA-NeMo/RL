@@ -311,6 +311,13 @@ class TestWrongPathFaultToleranceIsRejected:
             self._master_config(use_nemo_gym=use_nemo_gym, rollout_failure={})
         )
 
+    def test_generation_logprob_reuse_is_rejected(self):
+        cfg = self._master_config(use_nemo_gym=False, rollout_failure={})
+        cfg.grpo.use_generation_logprobs_as_prev = True
+
+        with pytest.raises(ValueError, match="use_generation_logprobs_as_prev"):
+            validate_single_controller_config(cfg)
+
     def test_a_config_without_env_is_skipped_not_crashed(self):
         """`env` is required, so model_construct leaves it absent entirely.
 
