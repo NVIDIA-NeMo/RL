@@ -2360,11 +2360,7 @@ def refit_policy_generation(
             "set. Attach one with create_weight_synchronizer(...) during setup."
         )
 
-    # Megatron generation backend needs explicit suspend/resume around refits.
-    if isinstance(policy_generation, MegatronGeneration):
-        policy_generation.suspend_for_refit()
-
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
+    if colocated_inference:
         policy.offload_before_refit()
         policy_generation.prepare_for_generation(tags=["weights"])
 
@@ -2403,13 +2399,8 @@ def refit_policy_generation(
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl (vLLM) or megatron reshard
-            if isinstance(policy_generation, MegatronGeneration):
-                futures_train = policy.swap_weights_via_reshard(is_source=True)
-            else:
-                futures_train = policy.broadcast_weights_for_collective(
-                    kv_scales=kv_scales
-                )
+            # update weights through nccl (vLLM)
+            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
             ray.get(futures_train)

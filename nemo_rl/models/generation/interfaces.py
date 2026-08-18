@@ -369,7 +369,7 @@ class GenerationInterface(ABC):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         pass
 
-    def pause_generation(self) -> None:
+    def pause_generation(self, mode: str) -> None:
         """Pause in-flight generation on the backend."""
         raise NotImplementedError
 

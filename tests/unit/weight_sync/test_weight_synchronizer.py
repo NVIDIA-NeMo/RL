@@ -236,8 +236,11 @@ _SGLANG_RAY = "nemo_rl.weight_sync.sglang_weight_synchronizer.ray"
 
 def _mock_sglang_generation(num_new_engines=0, pause_mode="retract", quantization=None):
     gen = _mock_generation()
+    if quantization is None:
+        quantization = {"scheme": "bf16"}
     gen.sglang_cfg = {"sglang_cfg": {"quantization": quantization}}
     gen.pause_generation_mode = pause_mode
+    gen.invalidate_kv_cache.return_value = True
     gen.get_updatable_engines_and_lock.return_value = (
         [MagicMock(), MagicMock()],
         MagicMock(),
@@ -272,7 +275,7 @@ class TestSGLangColocatedWeightSynchronizer:
         call_kwargs = policy.update_weights_to_sglang_colocated.call_args.kwargs
         assert call_kwargs["buffer_size_bytes"] == int((1024**3) * 0.3)
         assert call_kwargs["target_precision"] == "bf16"
-        assert call_kwargs["sglang_quantization_cfg"] == {}
+        assert call_kwargs["sglang_quantization_cfg"] == {"scheme": "bf16"}
         mock_ray.get.assert_called_once()
 
         gen.end_weight_update.assert_called_once()
@@ -288,6 +291,29 @@ class TestSGLangColocatedWeightSynchronizer:
         sync.sync_weights()
         call_kwargs = policy.update_weights_to_sglang_colocated.call_args.kwargs
         assert call_kwargs["buffer_size_bytes"] == 2 * (1024**3)
+
+    @pytest.mark.parametrize("quantization", [None, {}])
+    def test_quantization_config_is_required(self, quantization, mock_ray):
+        policy = _mock_policy()
+        gen = _mock_sglang_generation()
+        if quantization is None:
+            del gen.sglang_cfg["sglang_cfg"]["quantization"]
+        else:
+            gen.sglang_cfg["sglang_cfg"]["quantization"] = quantization
+
+        with pytest.raises(KeyError, match="quantization|scheme"):
+            SGLangColocatedWeightSynchronizer(policy, gen).sync_weights()
+
+        gen.pause_generation.assert_not_called()
+
+    def test_unknown_quantization_scheme_is_rejected(self, mock_ray):
+        policy = _mock_policy()
+        gen = _mock_sglang_generation(quantization={"scheme": "unknown"})
+
+        with pytest.raises(ValueError, match="must be one of"):
+            SGLangColocatedWeightSynchronizer(policy, gen).sync_weights()
+
+        gen.pause_generation.assert_not_called()
 
     def test_new_engines_trigger_connect(self, mock_ray):
         policy = _mock_policy()
@@ -306,13 +332,29 @@ class TestSGLangColocatedWeightSynchronizer:
 
         policy.connect_sglang_rollout_engines.assert_not_called()
 
-    def test_in_place_pause_keeps_kv_cache(self, mock_ray):
+    def test_in_place_pause_is_rejected(self, mock_ray):
         policy = _mock_policy()
         gen = _mock_sglang_generation(pause_mode="in_place")
-        SGLangColocatedWeightSynchronizer(policy, gen).sync_weights()
+        with pytest.raises(ValueError, match="unsafe for weight refit"):
+            SGLangColocatedWeightSynchronizer(policy, gen)
 
-        gen.pause_generation.assert_called_once_with(mode="in_place")
+        gen.pause_generation.assert_not_called()
         gen.invalidate_kv_cache.assert_not_called()
+
+    def test_kv_cache_invalidation_failure_aborts_refit(self, mock_ray):
+        policy = _mock_policy()
+        gen = _mock_sglang_generation()
+        gen.invalidate_kv_cache.return_value = False
+        sync = SGLangColocatedWeightSynchronizer(policy, gen)
+
+        with pytest.raises(RuntimeError, match="KV cache invalidation failed"):
+            sync.sync_weights()
+
+        gen.begin_weight_update.assert_not_called()
+        gen.end_weight_update.assert_not_called()
+        gen.continue_generation.assert_called_once()
+        policy.update_weights_to_sglang_colocated.assert_not_called()
+        assert sync.is_stale
 
     def test_init_communicator(self, mock_ray):
         policy = _mock_policy()

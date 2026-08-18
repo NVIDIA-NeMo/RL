@@ -275,14 +275,9 @@ def validate_and_prepare_config(
             temperature=generation_cfg["temperature"],
         )
 
-    # SGLang's scheduler subprocess defaults to NCCL_CUMEM_ENABLE=0, and the
-    # trainer / engine must agree on the transport selection.
-    if rollout_backend == "sglang":
-        os.environ["NCCL_CUMEM_ENABLE"] = "0"
-    # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
-    # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
-    elif not is_generation_colocated:
-        os.environ["NCCL_CUMEM_ENABLE"] = "1"
+    if not is_generation_colocated:
+        # SGLang uses CUMEM=0; other non-colocated refit communicators require 1.
+        os.environ["NCCL_CUMEM_ENABLE"] = "0" if rollout_backend == "sglang" else "1"
 
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles

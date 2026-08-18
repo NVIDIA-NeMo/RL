@@ -15,7 +15,7 @@
 import asyncio
 import logging
 import os
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator
 
 import ray
 import torch
@@ -329,21 +329,15 @@ class SGLangGeneration(GenerationInterface):
         # the next refit does not treat them as new again.
         self.num_new_engines = 0
 
-    def pause_generation(self, mode: Optional[str] = None) -> None:
+    def pause_generation(self, mode: str) -> None:
         """Pause generation on every node-0 engine.
 
         Args:
-            mode: Pause mode override. When ``None`` (default), the mode
-                configured in ``sglang_server_config.pause_generation_mode``
-                is used. Callers (e.g. the SGLang weight synchronizers) pass
-                an explicit mode when they also need to gate follow-up steps
-                such as ``invalidate_kv_cache`` on the same value.
+            mode: Pause mode forwarded to every engine.
         """
         engines = [e for e in self.engines if e is not None]
         if not engines:
             return
-        if mode is None:
-            mode = self.pause_generation_mode
         ray.get([e.pause_generation.remote(mode=mode) for e in engines])
 
     def continue_generation(self) -> None:

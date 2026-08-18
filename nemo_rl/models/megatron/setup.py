@@ -310,18 +310,8 @@ def destroy_parallel_state():
         pass
 
 
-def setup_distributed(config: Optional[PolicyConfig] = None) -> None:
+def setup_distributed() -> None:
     """Handle NCCL settings, dtype mapping, and basic config setup."""
-    generation_cfg = (config or {}).get("generation") or {}
-    rollout_backend = generation_cfg.get("backend")
-    is_generation_colocated = (generation_cfg.get("colocated") or {}).get("enabled")
-
-    # SGLang's scheduler subprocess defaults to NCCL_CUMEM_ENABLE=0 and the
-    # trainer has to agree with it, so this one has to land before the process
-    # group below picks a transport.
-    if rollout_backend == "sglang":
-        os.environ["NCCL_CUMEM_ENABLE"] = "0"
-
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
     configure_dynamo_cache()
@@ -329,13 +319,6 @@ def setup_distributed(config: Optional[PolicyConfig] = None) -> None:
     destroy_parallel_state()
     # Initialize process group
     torch.distributed.init_process_group("nccl")
-
-    # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
-    # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
-    # Deliberately after init_process_group: it targets the refit communicator,
-    # not the training process group.
-    if not is_generation_colocated and rollout_backend != "sglang":
-        os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
 
 def validate_and_set_config(
@@ -361,6 +344,10 @@ def validate_and_set_config(
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
         )
+
+    # Select the transport for the later non-colocated refit communicator.
+    if not is_generation_colocated:
+        os.environ["NCCL_CUMEM_ENABLE"] = "0" if rollout_backend == "sglang" else "1"
 
     # Setup data types
     dtype_map = {
