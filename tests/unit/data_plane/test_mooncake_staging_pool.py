@@ -79,7 +79,7 @@ def test_register_checked_accepts_success_statuses(status) -> None:
 
 # Comfortably above every payload these tests stage, so the ceiling only
 # matters in the test that sets it explicitly.
-_MAX = 1 << 20
+_MAX = 1 << 24
 
 
 def test_register_checked_raises_on_failed_registration() -> None:
@@ -123,11 +123,11 @@ def test_growing_a_slot_unregisters_before_dropping_the_old_buffer() -> None:
         small_ptr = small.data_ptr()
     assert store.registered == {small_ptr: 1024}
 
-    with pool.buffer(8 * 1024) as big:
+    with pool.buffer(8 * 1024 * 1024) as big:
         big_ptr = big.data_ptr()
 
     assert small_ptr in store.unregistered
-    assert store.registered == {big_ptr: 8 * 1024}
+    assert store.registered == {big_ptr: 8 * 1024 * 1024}
 
 
 def test_failed_growth_leaves_the_slot_empty_not_poisoned() -> None:
