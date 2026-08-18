@@ -1239,6 +1239,71 @@ def mock_sync_grpo_infrastructure(policy):
     return stack
 
 
+def test_async_grpo_refits_before_starting_trajectory_collection(
+    mock_grpo_components,
+):
+    """Generation must hold trained weights before any rollout can start."""
+
+    class StartupOrderObserved(Exception):
+        pass
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    mock_grpo_components["checkpointer"].get_latest_checkpoint_path.return_value = None
+
+    events = []
+    policy_generation = _mock_policy_generation()
+    policy_generation.weight_synchronizer = None
+
+    collector = MagicMock()
+
+    def record_collection_start(*_args, **_kwargs):
+        assert events == ["refit"], (
+            "trajectory collection started before generation received trained weights"
+        )
+        events.append("start_collection")
+        raise StartupOrderObserved
+
+    collector.start_collection.remote.side_effect = record_collection_start
+    collector_cls = MagicMock()
+    collector_cls.options.return_value.remote.return_value = collector
+
+    def record_refit(*_args, **_kwargs):
+        events.append("refit")
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    with (
+        mock_async_grpo_infrastructure(mock_batch, {}),
+        patch(
+            "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
+            collector_cls,
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.refit_policy_generation",
+            side_effect=record_refit,
+        ),
+        pytest.raises(StartupOrderObserved),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            policy_generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert events == ["refit", "start_collection"]
+
+
 def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components):
     """A fatal collector health result aborts the trainer and still cleans up."""
     master_config = mock_grpo_components["master_config"]
