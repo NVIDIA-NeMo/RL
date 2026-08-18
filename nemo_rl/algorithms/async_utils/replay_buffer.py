@@ -1085,6 +1085,51 @@ class TQReplayBuffer:
         """Return how many slots are stamped with ``target_step``."""
         return sum(1 for target in self.target_step_list if target == target_step)
 
+    def promote_ready_group(self, *, to_target_step: int) -> Optional[int]:
+        """Re-stamp a finished group from a later step so it lands in this one.
+
+        Fills a hole left by a dropped prompt with generation that is already done,
+        which is the point: the step closes immediately instead of waiting out a fresh
+        rollout. The step it was borrowed from is returned so the caller can repay it,
+        and the caller must -- an unrepaid loan is the same hole one step later, carried
+        forward until it reaches the last step, which has nobody to borrow from.
+
+        The furthest future step is preferred because it is due last and so has the most
+        slack to absorb the repayment. Only ready slots qualify: an unready one is a
+        reservation whose rollout is still running, so moving its stamp would hand this
+        step the same wait it is trying to avoid.
+
+        Promotion can only make a step fresher, never staler. Slots are appended in
+        dispatch order and the trainer version never decreases, so a group stamped for a
+        later step was generated at a weight version at least as new as the ones already
+        in this step.
+
+        Synchronous on purpose. ``remove`` deletes its indices before its own first
+        await, so as long as nothing here yields, the index picked below cannot be
+        shifted out from under the write by a selection running concurrently.
+
+        Args:
+            to_target_step: Training step to re-stamp the borrowed group onto -- the
+                step that lost a prompt. Must be at or ahead of the trainer version:
+                a group re-stamped onto a step already trained is never selectable
+                again and would only be evicted.
+
+        Returns:
+            The target step the group was taken from, or None when no later step has a
+            ready group to lend.
+        """
+        lender_idx: Optional[int] = None
+        lender_target: Optional[int] = None
+        for i, target in enumerate(self.target_step_list):
+            if target is None or target <= to_target_step or not self.ready_list[i]:
+                continue
+            if lender_target is None or target > lender_target:
+                lender_idx, lender_target = i, target
+        if lender_idx is None:
+            return None
+        self.target_step_list[lender_idx] = to_target_step
+        return lender_target
+
     def size(self) -> int:
         """Return the number of prompt-group entries currently held."""
         return len(self.meta_list)

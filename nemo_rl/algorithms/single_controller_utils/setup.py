@@ -498,6 +498,7 @@ def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
         backoff_base_s=failure_config.backoff_base_s,
         max_backoff_s=failure_config.max_backoff_s,
         max_skipped_prompts=failure_config.max_skipped_prompts,
+        max_consecutive_dropped_prompts=failure_config.max_consecutive_dropped_prompts,
         max_gym_row_attempts=failure_config.nemo_gym.max_row_attempts,
     )
 

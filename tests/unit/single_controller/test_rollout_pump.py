@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from types import SimpleNamespace
 from typing import Any
 
@@ -62,17 +63,65 @@ from tests.unit.single_controller._dp_fakes import (
 )
 
 
-class _RecordingBuffer:
-    """TQReplayBuffer stand-in recording the target_step of each reserve."""
+def _failure_cfg(
+    *,
+    on_dropped_prompt: str = "shrink",
+    max_replacement_attempts: int = 1,
+    replacement_reserve_prompts: int = 1,
+    min_step_batch_fraction: float = 0.9,
+) -> SimpleNamespace:
+    """The rollout_failure block the pump reads, defaulted to today's behaviour."""
+    return SimpleNamespace(
+        on_dropped_prompt=on_dropped_prompt,
+        max_replacement_attempts=max_replacement_attempts,
+        replacement_reserve_prompts=replacement_reserve_prompts,
+        min_step_batch_fraction=min_step_batch_fraction,
+    )
 
-    def __init__(self, target_step_list: list[int | None] | None = None) -> None:
+
+def _init_pump_ledgers(ctrl: Any) -> None:
+    """Set the per-step bookkeeping the pump reads unconditionally.
+
+    Empty is the neutral state, so tests that do not care about these can call this
+    and forget them. They are collected here because every hand-built controller in
+    this file needs all of them, and a field added to only some of the builders is a
+    missing attribute rather than a wrong answer.
+    """
+    ctrl._batch_shortfall = {}
+    ctrl._batch_replacements = {}
+    ctrl._batch_promotions = {}
+    ctrl._replacement_reserve = deque()
+
+
+class _RecordingBuffer:
+    """TQReplayBuffer stand-in recording the target_step of each reserve.
+
+    Seeded entries stand for groups whose rollout has already finished; anything the
+    pump reserves during the test is in flight and so unready, as in the real buffer.
+    """
+
+    def __init__(
+        self,
+        target_step_list: list[int | None] | None = None,
+        ready_list: list[bool] | None = None,
+    ) -> None:
         self.target_step_list: list[int | None] = list(target_step_list or [])
+        self.ready_list: list[bool] = (
+            list(ready_list)
+            if ready_list is not None
+            else [True] * len(self.target_step_list)
+        )
 
     def reserve(self, *, target_step: int | None) -> None:
         self.target_step_list.append(target_step)
+        self.ready_list.append(False)
 
     def count_for_target_step(self, target_step: int) -> int:
         return sum(1 for target in self.target_step_list if target == target_step)
+
+    # The real thing, so the pump tests exercise the promotion the controller ships
+    # rather than a second implementation of it that could drift.
+    promote_ready_group = TQReplayBuffer.promote_ready_group
 
 
 class _RecordingRolloutManager:
@@ -110,6 +159,7 @@ def test_rollout_pump_stamps_target_steps(
     ctrl._async_cfg = SimpleNamespace(
         max_inflight_prompts=2,
         diagnostics=False,
+        rollout_failure=_failure_cfg(),
     )
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
@@ -131,6 +181,7 @@ def test_rollout_pump_stamps_target_steps(
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
     ctrl._current_epoch = 0
+    _init_pump_ledgers(ctrl)
 
     asyncio.run(ctrl._rollout_pump())
 
@@ -166,7 +217,9 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
+    ctrl._async_cfg = SimpleNamespace(
+        max_inflight_prompts=2, diagnostics=False, rollout_failure=_failure_cfg()
+    )
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
     )
@@ -184,6 +237,7 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     ctrl._trainer_version = 0
     ctrl._current_epoch = 0
     ctrl._inflight_by_group_id = {}
+    _init_pump_ledgers(ctrl)
 
     asyncio.run(ctrl._rollout_pump())
 
@@ -217,7 +271,9 @@ def test_rollout_pump_tops_up_restored_target_step(
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._buffer = buffer
-    ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
+    ctrl._async_cfg = SimpleNamespace(
+        max_inflight_prompts=2, diagnostics=False, rollout_failure=_failure_cfg()
+    )
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
     )
@@ -243,6 +299,7 @@ def test_rollout_pump_tops_up_restored_target_step(
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
     ctrl._current_epoch = 0
+    _init_pump_ledgers(ctrl)
 
     asyncio.run(ctrl._rollout_pump())
 
@@ -254,6 +311,452 @@ def test_rollout_pump_tops_up_restored_target_step(
     assert ctrl._buffer_capacity._value == 4 - expected_new_dispatches
     assert ctrl._inflight_rollouts == 0
     assert ctrl._rollout_exhausted.is_set()
+
+
+class _SkippingRolloutManager:
+    """Every prompt is given up on within budget, so nothing is ever committed."""
+
+    async def generate_and_push(
+        self,
+        prompt: Any,
+        *,
+        target_step: int | None = None,
+        inflight_registry: dict[str, Any] | None = None,
+    ) -> RolloutOutcome:
+        del prompt, target_step, inflight_registry
+        return RolloutOutcome.SKIPPED
+
+
+@pytest.mark.parametrize(
+    ("make_sampler", "expected_shortfall"),
+    [
+        # in_order matches a batch to one step exactly, so a group that is never
+        # generated leaves that step permanently short. Without the credit the train
+        # pump waits on it forever, turning a tolerated drop into a hung run.
+        (lambda buf: InOrderSampler(buf, max_lookahead_versions=1), {0: 1, 1: 1}),
+        # weight_fifo does not stamp a step: the batch fills from whatever is ready, so
+        # a drop costs throughput and strands nothing. Crediting here would shrink an
+        # unrelated step.
+        (lambda buf: WeightFifoSampler(buf, max_staleness_versions=1), {}),
+    ],
+)
+def test_rollout_pump_credits_shortfall_only_for_stamped_prompts(
+    make_sampler,
+    expected_shortfall: dict[int, int],
+) -> None:
+    buffer = _RecordingBuffer()
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._buffer = buffer
+    ctrl._async_cfg = SimpleNamespace(
+        max_inflight_prompts=2, diagnostics=False, rollout_failure=_failure_cfg()
+    )
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
+    ctrl._rollout_manager = _SkippingRolloutManager()
+    ctrl._sampler = make_sampler(buffer)
+    prompt_batch = BatchedDataDict(
+        {"message_log": [[{"role": "user", "content": "prompt"}]]}
+    )
+    ctrl._dataloader = [prompt_batch, prompt_batch]
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(2)
+    ctrl._inflight_rollouts = 0
+    ctrl._inflight_by_group_id = {}
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+    _init_pump_ledgers(ctrl)
+
+    asyncio.run(ctrl._rollout_pump())
+
+    assert ctrl._batch_shortfall == expected_shortfall
+    # A dropped prompt commits nothing, so every permit comes back either way.
+    assert ctrl._buffer_capacity._value == 2
+
+
+class _ScriptedRolloutManager:
+    """Returns a scripted outcome per call, recording which prompt each one saw."""
+
+    def __init__(self, outcomes: list[RolloutOutcome]) -> None:
+        self._outcomes = list(outcomes)
+        self.prompts_seen: list[str] = []
+
+    async def generate_and_push(
+        self,
+        prompt: Any,
+        *,
+        target_step: int | None = None,
+        inflight_registry: dict[str, Any] | None = None,
+    ) -> RolloutOutcome:
+        del target_step, inflight_registry
+        self.prompts_seen.append(prompt["message_log"][0]["content"])
+        if self._outcomes:
+            return self._outcomes.pop(0)
+        return RolloutOutcome.COMMITTED
+
+
+def _batch(*contents: str) -> BatchedDataDict:
+    """A dataloader batch holding one prompt per content string."""
+    return BatchedDataDict(
+        {"message_log": [[{"role": "user", "content": c}] for c in contents]}
+    )
+
+
+def _pump_controller(
+    manager: Any,
+    dataloader: list[BatchedDataDict],
+    *,
+    on_dropped_prompt: str = "replace",
+    max_replacement_attempts: int = 1,
+    num_prompts_per_step: int = 1,
+    buffer: _RecordingBuffer | None = None,
+    trainer_version: int = 0,
+):
+    buffer = _RecordingBuffer() if buffer is None else buffer
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._buffer = buffer
+    ctrl._async_cfg = SimpleNamespace(
+        max_inflight_prompts=2,
+        diagnostics=False,
+        rollout_failure=_failure_cfg(
+            on_dropped_prompt=on_dropped_prompt,
+            max_replacement_attempts=max_replacement_attempts,
+        ),
+    )
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(
+            max_num_epochs=1, num_prompts_per_step=num_prompts_per_step
+        )
+    )
+    ctrl._rollout_manager = manager
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=1)
+    ctrl._dataloader = dataloader
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(4)
+    ctrl._inflight_rollouts = 0
+    ctrl._inflight_by_group_id = {}
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = trainer_version
+    ctrl._current_epoch = 0
+    _init_pump_ledgers(ctrl)
+    ctrl._sampler_stamps_target_steps = False
+    return ctrl
+
+
+class TestReplaceDroppedPrompt:
+    """on_dropped_prompt="replace": hold the batch size by substituting a spare."""
+
+    def test_a_spare_stands_in_so_the_step_keeps_its_batch_size(self):
+        # The first batch is admitted as step 0; the second is diverted into the pool
+        # while step 0's rollout is still in flight, which is what makes it available.
+        manager = _ScriptedRolloutManager([RolloutOutcome.SKIPPED])
+        ctrl = _pump_controller(manager, [_batch("step0"), _batch("spare")])
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["step0", "spare"]
+        assert ctrl._batch_shortfall == {}, (
+            "a group that was replaced must not also shrink its step -- crediting both "
+            "would drop a group the step is actually going to receive"
+        )
+        assert ctrl._batch_replacements == {0: 1}
+
+    def test_a_replacement_that_also_fails_falls_back_to_shrinking(self):
+        """Bounded rounds are what guarantee the step still closes."""
+        manager = _ScriptedRolloutManager(
+            [RolloutOutcome.SKIPPED, RolloutOutcome.SKIPPED]
+        )
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0"), _batch("spare")],
+            max_replacement_attempts=1,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["step0", "spare"], (
+            "budget of 1 was not exceeded"
+        )
+        assert ctrl._batch_shortfall == {0: 1}
+        assert ctrl._batch_replacements == {}
+        # Nothing committed, so the slot's permit must come back exactly once.
+        assert ctrl._buffer_capacity._value == 4
+
+    def test_an_unstamped_sampler_never_diverts_a_batch_into_the_pool(self):
+        """No step can be stranded, so a pool would only cost prompts nothing draws on."""
+        buffer = _RecordingBuffer()
+        manager = _ScriptedRolloutManager([RolloutOutcome.SKIPPED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("p0"), _batch("p1")],
+            buffer=buffer,
+        )
+        ctrl._sampler = WeightFifoSampler(buffer, max_staleness_versions=1)
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["p0", "p1"], "no substitution attempted"
+        assert len(ctrl._replacement_reserve) == 0, "no batch was spent on the pool"
+        assert ctrl._batch_shortfall == {}
+
+    @pytest.mark.parametrize("on_dropped_prompt", ["shrink", "replace"])
+    def test_a_clean_run_loses_neither_a_prompt_nor_a_step_to_the_pool(
+        self, on_dropped_prompt: str
+    ):
+        """Enabling replace must be free when nothing fails.
+
+        The pool is filled by diverting a batch, so without draining it at the end that
+        batch is never trained on -- and since max_num_steps is derived from
+        len(dataloader), the run would also finish a step short of its budget.
+
+        Stamps contiguous from 0 are what pin the diverting order. Diverting *after*
+        admit would leave step 0 with no group at all, and these stamps would start at
+        1: a step the train pump waits on forever.
+        """
+        buffer = _RecordingBuffer()
+        ctrl = _pump_controller(
+            _RecordingRolloutManager(buffer),
+            [_batch("a"), _batch("b")],
+            on_dropped_prompt=on_dropped_prompt,
+            buffer=buffer,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert buffer.target_step_list == [0, 1], "both batches became training steps"
+        assert len(ctrl._replacement_reserve) == 0, "the pool was handed back"
+
+    def test_a_partial_pool_is_not_dispatched_as_a_short_step(self):
+        """A step short by construction would trip the floor and fail a finished run."""
+        buffer = _RecordingBuffer()
+        manager = _ScriptedRolloutManager([RolloutOutcome.SKIPPED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("p0", "p1"), _batch("s0", "s1")],
+            num_prompts_per_step=2,
+            buffer=buffer,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        # s0 stood in for the dropped p0, which leaves the pool one short of a step.
+        assert manager.prompts_seen == ["p0", "s0", "p1"]
+        assert len(ctrl._replacement_reserve) == 1, "s1 is left over, not a short step"
+
+
+class TestBorrowFromALaterStep:
+    """Where a replacement is sent when a later step has finished work to lend.
+
+    Same guarantee as any replacement -- the batch size holds -- but the dropped step
+    closes on a group that already exists instead of one the trainer has to wait for.
+    Each case seeds a finished group stamped for a later step, which is what a run with
+    lookahead has in the buffer by the time a drop is declared.
+    """
+
+    @staticmethod
+    def _with_lender(
+        *,
+        lender_step: int | None = 1,
+        lender_ready: bool = True,
+        trainer_version: int = 0,
+        outcomes: list[RolloutOutcome] | None = None,
+    ):
+        buffer = _RecordingBuffer(
+            target_step_list=[] if lender_step is None else [lender_step],
+            ready_list=[] if lender_step is None else [lender_ready],
+        )
+        manager = _ScriptedRolloutManager(
+            [RolloutOutcome.SKIPPED] if outcomes is None else outcomes
+        )
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0"), _batch("spare")],
+            on_dropped_prompt="replace",
+            buffer=buffer,
+            trainer_version=trainer_version,
+        )
+        return ctrl, manager, buffer
+
+    def test_the_lost_step_is_filled_now_and_the_lender_is_repaid_later(self):
+        ctrl, manager, buffer = self._with_lender()
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert buffer.target_step_list == [0], (
+            "the finished group was re-stamped, so step 0 is whole immediately"
+        )
+        assert manager.prompts_seen == ["step0", "spare"]
+        assert ctrl._batch_promotions == {0: 1}, "step 0 borrowed one group"
+        assert ctrl._batch_replacements == {1: 1}, (
+            "the spare repays the lender, not the step that was dropped from"
+        )
+        assert ctrl._batch_shortfall == {}, "neither step ends up short"
+
+    def test_nothing_to_borrow_degrades_to_replacing_in_place(self):
+        # The shape at max_lookahead_versions=0, where the next batch is not dispatched
+        # until this step trains, so no later step can ever have finished work.
+        ctrl, manager, _ = self._with_lender(lender_step=None)
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["step0", "spare"]
+        assert ctrl._batch_promotions == {}
+        assert ctrl._batch_replacements == {0: 1}, "the spare filled step 0 itself"
+        assert ctrl._batch_shortfall == {}
+
+    def test_an_in_flight_group_is_not_borrowed(self):
+        """Borrowing one would inherit its wait, which is the thing being avoided."""
+        ctrl, manager, buffer = self._with_lender(lender_ready=False)
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert buffer.target_step_list == [1], "the reservation kept its own step"
+        assert ctrl._batch_promotions == {}
+        assert ctrl._batch_replacements == {0: 1}
+
+    def test_a_step_the_trainer_has_passed_is_not_filled(self):
+        """A second drop can land after the first already closed the step short.
+
+        A group re-stamped for a finished step is selectable by nobody and evicted as
+        stale, so the borrow would destroy the lender's work for nothing.
+        """
+        ctrl, manager, buffer = self._with_lender(lender_step=9, trainer_version=5)
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert buffer.target_step_list == [9], "the lender kept its group"
+        assert ctrl._batch_promotions == {}
+        assert ctrl._batch_replacements == {0: 1}
+
+    def test_a_borrow_is_never_taken_without_a_spare_to_repay_it(self):
+        """An unrepaid loan is the same hole one step later, carried to the last step."""
+        buffer = _RecordingBuffer(target_step_list=[1], ready_list=[True])
+        manager = _ScriptedRolloutManager([RolloutOutcome.SKIPPED])
+        # One batch, so nothing is ever diverted and the pool stays empty.
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0")],
+            on_dropped_prompt="replace",
+            buffer=buffer,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert buffer.target_step_list == [1], "no group was moved off the lender"
+        assert ctrl._batch_promotions == {}
+        assert ctrl._batch_shortfall == {0: 1}, "step 0 shrinks instead"
+
+
+class TestTakeReplacement:
+    """Every way a substitution can be unavailable falls back to shrinking."""
+
+    @staticmethod
+    def _controller(
+        *,
+        on_dropped_prompt: str = "replace",
+        max_replacement_attempts: int = 1,
+        spares: int = 0,
+    ):
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._async_cfg = SimpleNamespace(
+            rollout_failure=_failure_cfg(
+                on_dropped_prompt=on_dropped_prompt,
+                max_replacement_attempts=max_replacement_attempts,
+            )
+        )
+        ctrl._replacement_reserve = deque(_batch(f"spare{i}") for i in range(spares))
+        return ctrl
+
+    def test_a_spare_is_handed_out_and_leaves_the_pool(self):
+        ctrl = self._controller(spares=2)
+        assert ctrl._take_replacement(0, 0) is not None
+        assert len(ctrl._replacement_reserve) == 1
+
+    def test_shrink_mode_never_substitutes(self):
+        ctrl = self._controller(on_dropped_prompt="shrink", spares=2)
+        assert ctrl._take_replacement(0, 0) is None
+        assert len(ctrl._replacement_reserve) == 2, "pool left untouched"
+
+    def test_an_unstamped_prompt_has_no_short_step_to_repair(self):
+        ctrl = self._controller(spares=2)
+        assert ctrl._take_replacement(None, 0) is None
+
+    def test_the_per_slot_budget_stops_substituting(self):
+        ctrl = self._controller(max_replacement_attempts=2, spares=5)
+        assert ctrl._take_replacement(0, 1) is not None
+        assert ctrl._take_replacement(0, 2) is None
+
+    def test_an_empty_pool_shrinks_instead_of_waiting(self):
+        """At epoch end there is no more data; the step closes short, not never."""
+        ctrl = self._controller(spares=0)
+        assert ctrl._take_replacement(0, 0) is None
+
+
+class TestTargetGroupsForStep:
+    """How many groups a step waits for, once some are known not to be coming."""
+
+    @staticmethod
+    def _controller(
+        num_prompts_per_step: int,
+        shortfall: dict[int, int],
+        fraction: float = 0.9,
+    ):
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(
+                num_prompts_per_step=num_prompts_per_step,
+            )
+        )
+        ctrl._async_cfg = SimpleNamespace(
+            rollout_failure=SimpleNamespace(min_step_batch_fraction=fraction)
+        )
+        ctrl._batch_shortfall = dict(shortfall)
+        return ctrl
+
+    def test_an_untouched_step_waits_for_the_configured_batch(self):
+        ctrl = self._controller(128, {})
+        assert ctrl._target_groups_for_step(3) == 128
+
+    def test_a_dropped_group_shrinks_only_the_step_it_was_stamped_for(self):
+        ctrl = self._controller(128, {3: 2})
+        assert ctrl._target_groups_for_step(3) == 126
+        assert ctrl._target_groups_for_step(4) == 128, "neighbouring steps unaffected"
+
+    def test_a_step_below_the_floor_fails_rather_than_training_a_part_batch(self):
+        """The drop budgets are run-scoped and cannot bound one step's shrinkage."""
+        # floor = ceil(0.9 * 128) = 116, so 12 drops are allowed and 13 are not.
+        ctrl = self._controller(128, {0: 12})
+        assert ctrl._target_groups_for_step(0) == 116
+
+        ctrl = self._controller(128, {0: 13})
+        with pytest.raises(RuntimeError, match="below the floor of 116"):
+            ctrl._target_groups_for_step(0)
+
+    def test_a_small_batch_is_protected_more_strictly(self):
+        """Losing 1 of 4 is a 25% batch reduction; the fraction says no."""
+        ctrl = self._controller(4, {0: 1})
+        with pytest.raises(RuntimeError, match="below the floor of 4"):
+            ctrl._target_groups_for_step(0)
+
+    def test_a_step_stripped_of_every_group_never_reaches_an_empty_batch(self):
+        """ceil() with a positive fraction keeps the floor >= 1, so this is caught."""
+        ctrl = self._controller(4, {0: 4}, fraction=0.01)
+        with pytest.raises(RuntimeError, match="leaving 0"):
+            ctrl._target_groups_for_step(0)
+
+    def test_a_fraction_of_one_forbids_shrinking_at_all(self):
+        ctrl = self._controller(128, {0: 1}, fraction=1.0)
+        with pytest.raises(RuntimeError, match="below the floor of 128"):
+            ctrl._target_groups_for_step(0)
 
 
 def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
@@ -342,6 +845,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=2,
             diagnostics=False,
+            rollout_failure=_failure_cfg(),
         )
         ctrl._master_config = SimpleNamespace(
             grpo=GRPOConfig.model_construct(max_num_epochs=1)
@@ -368,6 +872,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
+        _init_pump_ledgers(ctrl)
 
         with pytest.raises(ExceptionGroup) as exc_info:
             await asyncio.wait_for(ctrl._rollout_pump(), timeout=1.0)
@@ -428,6 +933,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=1,
             diagnostics=False,
+            rollout_failure=_failure_cfg(),
         )
         ctrl._master_config = SimpleNamespace(
             grpo=GRPOConfig.model_construct(max_num_epochs=1)
@@ -447,6 +953,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
+        _init_pump_ledgers(ctrl)
 
         await ctrl._rollout_pump()
         await asyncio.sleep(0)

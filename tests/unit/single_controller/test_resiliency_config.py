@@ -20,6 +20,7 @@ combinations that would silently do nothing are rejected at load time rather tha
 hour three of a run.
 """
 
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -35,6 +36,26 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     WatchdogConfig,
     validate_single_controller_config,
 )
+from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
+
+
+def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterConfig:
+    """A config the SC validator accepts, with the fields under test overridable."""
+    return MasterConfig.model_construct(
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=num_prompts_per_step,
+            **async_kwargs,
+        ),
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=num_prompts_per_step,
+            num_generations_per_prompt=4,
+            skip_reference_policy_logprobs_calculation=False,
+        ),
+        policy={"train_global_batch_size": num_prompts_per_step * 4},
+        loss_fn=SimpleNamespace(reference_policy_kl_penalty=0),
+        env={"should_use_nemo_gym": True},
+        checkpointing={"enabled": False, "metric_name": None},
+    )
 
 
 class TestDefaultsAreInert:
@@ -51,6 +72,11 @@ class TestDefaultsAreInert:
         assert cfg.backoff_base_s == 1.0
         assert cfg.max_backoff_s == 30.0
         assert cfg.max_skipped_prompts == 0
+        assert cfg.max_consecutive_dropped_prompts == 0
+        assert cfg.min_step_batch_fraction == 0.9
+        assert cfg.on_dropped_prompt == "shrink"
+        assert cfg.max_replacement_attempts == 1
+        assert cfg.replacement_reserve_prompts == 1
         assert cfg.nemo_gym.max_row_attempts == 3
 
     def test_watchdog_has_documented_defaults(self):
@@ -94,6 +120,72 @@ class TestRolloutFailureValidation:
         validator existed purely to reject that one combination.
         """
         assert RolloutFailureConfig().max_skipped_prompts == 0
+
+    def test_a_consecutive_drop_budget_is_accepted(self):
+        cfg = RolloutFailureConfig(max_consecutive_dropped_prompts=4)
+        assert cfg.max_consecutive_dropped_prompts == 4
+
+    def test_the_two_drop_budgets_are_independent_knobs(self):
+        """Tolerating a bad dataset must not imply tolerating a dying fleet."""
+        cfg = RolloutFailureConfig(max_skipped_prompts=100)
+        assert cfg.max_consecutive_dropped_prompts == 0
+
+    @pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1])
+    def test_an_out_of_range_step_floor_is_rejected(self, fraction):
+        """0 would permit an empty step; above 1 could never be satisfied."""
+        with pytest.raises(ValidationError):
+            RolloutFailureConfig(min_step_batch_fraction=fraction)
+
+    def test_a_full_step_floor_is_allowed_and_forbids_shrinking(self):
+        assert RolloutFailureConfig(min_step_batch_fraction=1.0).min_step_batch_fraction
+
+    def test_replace_mode_is_opt_in(self):
+        """Shrinking is what the branch shipped with; replacing must be asked for."""
+        assert RolloutFailureConfig().on_dropped_prompt == "shrink"
+
+    @pytest.mark.parametrize("policy", ["regenerate", "promote"])
+    def test_an_unknown_drop_policy_is_rejected(self, policy):
+        """Borrowing is an optimization inside "replace", not a mode to select.
+
+        Both paths hold the batch size, so "please hold it the slower way" is not a
+        choice worth offering; promoted_prompt_groups reports which one ran.
+        """
+        with pytest.raises(ValidationError):
+            RolloutFailureConfig(on_dropped_prompt=policy)
+
+    @pytest.mark.parametrize(
+        ("field", "message"),
+        [
+            ("max_replacement_attempts", "max_replacement_attempts"),
+            ("replacement_reserve_prompts", "replacement_reserve_prompts"),
+        ],
+    )
+    def test_replace_mode_that_could_never_replace_is_rejected(self, field, message):
+        """Either zero leaves "replace" configured but behaving as "shrink".
+
+        Silently degrading is the failure worth catching: the only reason to ask for
+        replacement is the batch-size guarantee, so losing it without a word defeats
+        the point of setting the knob. The spare pool gates borrowing too, since a
+        group is only taken from a later step when a spare can repay it.
+        """
+        with pytest.raises(ValidationError, match=message):
+            RolloutFailureConfig(on_dropped_prompt="replace", **{field: 0})
+
+    def test_the_same_zeros_are_fine_while_shrinking(self):
+        """They are only read in replace mode, so shrink runs must not trip on them."""
+        cfg = RolloutFailureConfig(
+            max_replacement_attempts=0, replacement_reserve_prompts=0
+        )
+        assert cfg.on_dropped_prompt == "shrink"
+
+    def test_replace_mode_accepts_a_deeper_budget(self):
+        cfg = RolloutFailureConfig(
+            on_dropped_prompt="replace",
+            max_replacement_attempts=3,
+            replacement_reserve_prompts=16,
+        )
+        assert cfg.max_replacement_attempts == 3
+        assert cfg.replacement_reserve_prompts == 16
 
     @pytest.mark.parametrize("attempts", [0, -1])
     def test_non_positive_attempt_budgets_are_rejected(self, attempts):
@@ -419,3 +511,99 @@ class TestRouterDeadlineFitsInsideTheRollout:
             rollout_failure={"nemo_gym": {"rollout_timeout_s": 60.0}},
         )
         assert cfg.generation_router.enabled is False
+
+
+class TestTheDropBudgetsReachTheRolloutLayer:
+    """A validated knob that no one reads is still a knob that does nothing.
+
+    ``max_consecutive_dropped_prompts`` is enforced inside RolloutManager, which only
+    ever sees ``RolloutRetryPolicy``. Nothing else in the suite crosses that seam, so a
+    dropped assignment in `_build_retry_policy` would leave every config test green
+    while the budget silently reverted to the default.
+    """
+
+    def test_the_configured_budgets_are_carried_across(self):
+        policy = _build_retry_policy(
+            _master_config(
+                rollout_failure={
+                    "max_consecutive_dropped_prompts": 8,
+                    "max_skipped_prompts": 3,
+                }
+            )
+        )
+        assert policy.max_consecutive_dropped_prompts == 8
+        assert policy.max_skipped_prompts == 3
+
+    def test_the_default_still_fails_the_run_on_the_first_drop(self):
+        policy = _build_retry_policy(_master_config())
+        assert policy.max_consecutive_dropped_prompts == 0
+        assert policy.max_skipped_prompts == 0
+
+
+class TestCombinationsThatCannotDoWhatTheyWereSetFor:
+    """Coherent configs whose knobs cancel out warn instead of failing.
+
+    Each of these parses, and each is a defensible thing to ask for while debugging, so
+    rejecting them would be wrong. What is not defensible is discovering hours in that
+    the tolerance you configured could never have been exercised.
+    """
+
+    @staticmethod
+    def _messages(cfg) -> list[str]:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            validate_single_controller_config(cfg)
+        return [str(w.message) for w in caught]
+
+    def test_a_floor_that_rounds_up_to_the_full_batch_cancels_the_drop_budget(self):
+        """8 prompts at the 0.9 default floor to 8: no step may ever run short."""
+        cfg = _master_config(rollout_failure={"max_consecutive_dropped_prompts": 4})
+        with pytest.warns(UserWarning, match="min_step_batch_fraction"):
+            validate_single_controller_config(cfg)
+
+    def test_replacing_keeps_the_full_batch_legitimately(self):
+        """A full floor is the point of replace mode, not a contradiction with it."""
+        cfg = _master_config(
+            rollout_failure={
+                "max_consecutive_dropped_prompts": 4,
+                "min_step_batch_fraction": 1.0,
+                "on_dropped_prompt": "replace",
+            }
+        )
+        assert not any("min_step_batch_fraction" in m for m in self._messages(cfg))
+
+    def test_a_floor_that_leaves_room_to_shrink_is_not_warned_about(self):
+        cfg = _master_config(
+            rollout_failure={
+                "max_consecutive_dropped_prompts": 4,
+                "min_step_batch_fraction": 0.5,
+            }
+        )
+        assert not any("min_step_batch_fraction" in m for m in self._messages(cfg))
+
+    def test_replacing_under_a_sampler_that_never_stamps_falls_back_to_shrinking(self):
+        """Replacement needs a step stamp to know which step it owes a group to."""
+        cfg = _master_config(
+            sampler={"name": "windowed"},
+            rollout_failure={"on_dropped_prompt": "replace"},
+        )
+        with pytest.warns(UserWarning, match="on_dropped_prompt"):
+            validate_single_controller_config(cfg)
+
+    def test_a_stamping_sampler_is_not_warned_about(self):
+        cfg = _master_config(rollout_failure={"on_dropped_prompt": "replace"})
+        assert not any("on_dropped_prompt" in m for m in self._messages(cfg))
+
+    def test_a_reserve_larger_than_a_step_can_never_fill(self):
+        """The reserve is skimmed from completed steps, so a step bounds it."""
+        cfg = _master_config(
+            rollout_failure={
+                "on_dropped_prompt": "replace",
+                "replacement_reserve_prompts": 100,
+            }
+        )
+        with pytest.warns(UserWarning, match="replacement_reserve_prompts"):
+            validate_single_controller_config(cfg)
+
+    def test_an_untouched_config_warns_about_nothing(self):
+        assert self._messages(_master_config()) == []

@@ -36,10 +36,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
+from collections import deque
 from functools import partial
-from typing import Any, Optional, Union, cast
+from typing import Any, Awaitable, Callable, Optional, Union, cast
 
 import ray
 import torch
@@ -211,6 +213,34 @@ class SingleControllerActor:
 
         self._inflight_by_group_id: dict[str, tuple[asyncio.Task[None], int]] = {}
 
+        # Groups that will never arrive, keyed by the training step they were stamped
+        # for. A sampler that matches batches to steps exactly (InOrderSampler) can only
+        # ever select num_prompts_per_step groups carrying that stamp, so a dropped
+        # prompt leaves that step permanently one short and the train pump waits on a
+        # group no one is generating. The pump subtracts these to close the step short.
+        # Only stamped prompts appear here: with an unstamped sampler the batch fills
+        # from whatever is ready, so a drop costs throughput but strands nothing.
+        self._batch_shortfall: dict[int, int] = {}
+
+        # Spare prompts that on_dropped_prompt="replace" substitutes for dropped ones,
+        # and the per-step counts of how each step got made whole (logged so a step's
+        # batch size stays explainable after the fact). The reserve is filled only by the
+        # rollout pump, which owns the dataloader iterator; see the config docstring for
+        # why a dispatch task cannot pull from it directly.
+        #
+        # The two counters read from opposite ends of a borrow: a step that filled a
+        # hole with a later step's finished group counts a promotion, and the step it
+        # borrowed from counts the replacement that repaid it.
+        self._replacement_reserve: deque[DatumSpec] = deque()
+        self._batch_replacements: dict[int, int] = {}
+        self._batch_promotions: dict[int, int] = {}
+        # Whether the sampler has ever handed back a target step. Only stamped prompts
+        # can strand a step, so this gates the pool: filling it for a sampler that never
+        # stamps would divert a batch of prompts that nothing is ever able to draw on.
+        # Learned from admit rather than the sampler's type, because a custom sampler's
+        # stamping is not knowable until it answers.
+        self._sampler_stamps_target_steps: bool = False
+
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
         # Acquired before each rollout dispatch; released when the buffer
         # drops a group (sampler.evict or post-train buffer.remove).
@@ -244,6 +274,7 @@ class SingleControllerActor:
         await self._sync_weights()
 
         await self._maybe_restore_replay_buffer()
+        await self._maybe_restore_replacement_reserve()
 
         # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
@@ -352,6 +383,42 @@ class SingleControllerActor:
         for _ in range(restored):
             await self._buffer_capacity.acquire()
 
+    async def _maybe_restore_replacement_reserve(self) -> None:
+        """Restore spare prompts diverted before the previous run's checkpoint.
+
+        These were pulled from the dataloader and never dispatched, so the restored
+        dataloader resumes past them. Nothing else in the checkpoint holds them, and
+        without this they are simply gone: one batch of the dataset per divert, plus
+        the training step ``_clamp_max_num_steps`` had budgeted for it.
+
+        No sampler-name guard, unlike the buffer restore. Spares carry no stamp -- they
+        are prompts that never reached ``admit`` -- so nothing about them depends on
+        which sampler wrote the checkpoint. They are restored even into a run that has
+        since switched to ``on_dropped_prompt="shrink"``, where the pool is never drawn
+        on but is still drained back into training at the end of the dataloader.
+        """
+        if self._last_checkpoint_path is None:
+            return
+        reserve_path = os.path.join(
+            self._last_checkpoint_path, "replacement_reserve.pt"
+        )
+        # Absent for every run that never diverted a batch, which is every run that
+        # does not use "replace" -- so silence here rather than the buffer restore's
+        # warning, since this is the ordinary case rather than a lost artifact.
+        if not os.path.exists(reserve_path):
+            return
+        # weights_only=False: spares are pickled DatumSpecs, and the checkpoint is a
+        # trusted same-job artifact (the replay buffer restore loads on the same terms).
+        reserve_state = await asyncio.to_thread(
+            torch.load, reserve_path, weights_only=False
+        )
+        self._replacement_reserve.extend(reserve_state)
+        print(
+            f"📦 Restored {len(reserve_state)} pooled spare prompt(s) from checkpoint: "
+            f"{reserve_path}",
+            flush=True,
+        )
+
     async def _ray_get(self, obj_ref: Any) -> Any:
         """Await a Ray ObjectRef without blocking the asyncio event loop."""
         return await obj_ref
@@ -373,8 +440,10 @@ class SingleControllerActor:
         """Continuously dispatch rollout tasks until cancellation.
 
         Per batch:
-          0. await sampler.admit(...) to wait until the batch may dispatch and
-             obtain its target_step stamp.
+          0. Under on_dropped_prompt="replace", divert the batch into the spare pool
+             if the pool is below its low-water mark, and skip admission entirely.
+             Otherwise await sampler.admit(...) to wait until the batch may dispatch
+             and obtain its target_step stamp.
 
         Per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
@@ -383,7 +452,14 @@ class SingleControllerActor:
           4. Call rollout_manager.generate_and_push(prompt) — local async
              RolloutManager reserves a slot, runs the rollout, then commits the
              group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
-          5. Decrement _inflight_rollouts
+          5. If the prompt was dropped, substitute a spare and repeat step 4 -- for this
+             step, or for whichever step lends this one a finished group in its place
+             (see _take_replacement, _promote_into_step) -- or credit the step short so
+             the train pump can close it
+          6. Decrement _inflight_rollouts
+
+        Once every epoch is done, whatever is left in the spare pool is dispatched as
+        ordinary steps rather than discarded (see _drain_reserve_into_steps).
         """
         sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
         self._rollout_exhausted.clear()
@@ -396,26 +472,69 @@ class SingleControllerActor:
         ) -> None:
             task_started_event.set()
             self._inflight_rollouts += 1
+            # This task owns one slot of a step, which can outlive both the prompt it
+            # started with and the step it started on: a dropped prompt is substituted in
+            # place and the loop runs again, and the slot is re-aimed at whichever step
+            # lends this one a finished group. Both permits are held across
+            # substitutions because the slot stays occupied either way -- they are
+            # released once something commits, or once a step is credited short.
+            replacements = 0
             try:
-                outcome = await self._rollout_manager.generate_and_push(
-                    prompt,
-                    target_step=target_step,
-                    inflight_registry=self._inflight_by_group_id,
-                )
-            except BaseException:
-                # On success ownership transfers to the train pump, which
-                # releases this permit after consuming the committed group.
-                self._buffer_capacity.release()
-                raise
+                while True:
+                    try:
+                        outcome = await self._rollout_manager.generate_and_push(
+                            prompt,
+                            target_step=target_step,
+                            inflight_registry=self._inflight_by_group_id,
+                        )
+                    except BaseException:
+                        # On success ownership transfers to the train pump, which
+                        # releases this permit after consuming the committed group.
+                        self._buffer_capacity.release()
+                        raise
+
+                    if outcome is not RolloutOutcome.SKIPPED:
+                        break
+
+                    replacement = self._take_replacement(target_step, replacements)
+                    if replacement is None:
+                        # Nothing was committed, so the train pump will never see this
+                        # group and never release its permit on our behalf.
+                        self._buffer_capacity.release()
+                        self._credit_shortfall(target_step)
+                        return
+
+                    replacements += 1
+                    prompt = replacement
+                    print(
+                        f"  target_step={target_step}: substituting a spare prompt for "
+                        f"the dropped group (replacement {replacements}/"
+                        f"{self._async_cfg.rollout_failure.max_replacement_attempts}, "
+                        f"{len(self._replacement_reserve)} spare(s) left)",
+                        flush=True,
+                    )
+                    # Attempted only now that a spare is in hand, because the borrow is a
+                    # debt and the spare is what repays it. Borrowing without one would
+                    # leave the lender short instead: the same hole, one step later.
+                    lender_step = self._promote_into_step(target_step)
+                    if lender_step is not None:
+                        target_step = lender_step
+                    # A substitution is a fresh rollout, not a continuation of the one
+                    # that failed, so it observes the same pause a first dispatch does
+                    # instead of pushing new generation into a weight-sync window.
+                    await self._rollout_permitted.wait()
             finally:
                 self._inflight_rollouts -= 1
                 sem.release()
 
-            if outcome is RolloutOutcome.SKIPPED:
-                # Nothing was committed, so the train pump will never see this group
-                # and never release its permit on our behalf.
-                self._buffer_capacity.release()
-                return
+            if replacements and target_step is not None:
+                # Counted per slot, not per attempt: a step got its group back, which is
+                # the fact that explains why its batch is full despite a drop. Recorded
+                # against the step the spare actually committed to, which after a borrow
+                # is the lender rather than the step that was dropped from.
+                self._batch_replacements[target_step] = (
+                    self._batch_replacements.get(target_step, 0) + 1
+                )
 
             if self._async_cfg.diagnostics:
                 content = ""
@@ -434,13 +553,40 @@ class SingleControllerActor:
                 self._buffer_capacity.release()
                 sem.release()
 
+        async def _launch(prompt: DatumSpec, target_step: Optional[int]) -> None:
+            # check if buffer is full
+            await self._buffer_capacity.acquire()
+            # check if inflight rollouts is full
+            await sem.acquire()
+            # wait for rollout to be permitted
+            await self._rollout_permitted.wait()
+
+            task_started_event = asyncio.Event()
+            # dispatch rollout
+            task = rollout_tasks.create_task(
+                _dispatch_one_prompt(prompt, target_step, task_started_event)
+            )
+            self._dispatched_rollouts.add(task)
+            task.add_done_callback(self._dispatched_rollouts.discard)
+            task.add_done_callback(
+                partial(
+                    _release_permits_if_task_not_started,
+                    task_started_event=task_started_event,
+                )
+            )
+
         max_epochs = self._master_config.grpo.max_num_epochs
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
                 for prompt_batch in self._dataloader:
+                    if self._divert_batch_to_reserve(prompt_batch):
+                        continue
+
                     target_step = await self._sampler.admit(
                         trainer_version_fn=lambda: self._trainer_version
                     )
+                    if target_step is not None:
+                        self._sampler_stamps_target_steps = True
 
                     num_prompts = prompt_batch.size
                     if target_step is not None:
@@ -458,31 +604,17 @@ class SingleControllerActor:
                         prompt: DatumSpec = {  # type: ignore
                             k: v[prompt_idx] for k, v in prompt_batch.items()
                         }
-
-                        # check if buffer is full
-                        await self._buffer_capacity.acquire()
-                        # check if inflight rollouts is full
-                        await sem.acquire()
-                        # wait for rollout to be permitted
-                        await self._rollout_permitted.wait()
-
-                        task_started_event = asyncio.Event()
-                        # dispatch rollout
-                        task = rollout_tasks.create_task(
-                            _dispatch_one_prompt(
-                                prompt, target_step, task_started_event
-                            )
-                        )
-                        self._dispatched_rollouts.add(task)
-                        task.add_done_callback(self._dispatched_rollouts.discard)
-                        task.add_done_callback(
-                            partial(
-                                _release_permits_if_task_not_started,
-                                task_started_event=task_started_event,
-                            )
-                        )
+                        await _launch(prompt, target_step)
 
                 self._current_epoch += 1
+
+        # Only now that every dispatched rollout has settled is the pool genuinely
+        # spare. Draining it inside the group above would race them for it, and a
+        # rollout that was about to be dropped has the better claim: it needs a spare to
+        # keep its step whole, whereas an extra step is only worth having if one is
+        # left over. A second group because the first is closed to new tasks.
+        async with asyncio.TaskGroup() as rollout_tasks:
+            await self._drain_reserve_into_steps(_launch)
 
         # Drain in-flight so return implies "all rollouts in TQ".
         inflight = list(self._dispatched_rollouts)
@@ -491,6 +623,216 @@ class SingleControllerActor:
 
         self._rollout_exhausted.set()
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
+
+    def _divert_batch_to_reserve(
+        self, prompt_batch: BatchedDataDict[DatumSpec]
+    ) -> bool:
+        """Consume a whole batch as spare prompts instead of admitting it as a step.
+
+        Returns whether the batch was taken, in which case the caller must not admit it.
+        Diverting before ``admit`` is what keeps the stamp sequence honest: admitting a
+        batch and then dispatching nothing for it would leave a target step that no
+        group is ever generated for, which is exactly the hang the shortfall accounting
+        exists to prevent.
+
+        A whole batch at a time because the dataloader only yields batches. The spares
+        that go unused are not wasted work -- nothing has been generated for them -- and
+        they stay in the pool for later steps.
+
+        Nothing is diverted until the sampler has actually stamped a batch, so a run
+        whose sampler never stamps does not lose a batch of prompts to a pool it can
+        never draw on. The cost is that the first batch is always admitted rather than
+        diverted; in practice the pool is filled while that first batch's rollouts are
+        still running, so it is available by the time any of them can be given up on.
+        """
+        failure_cfg = self._async_cfg.rollout_failure
+        if failure_cfg.on_dropped_prompt != "replace":
+            return False
+        if not self._sampler_stamps_target_steps:
+            return False
+        if len(self._replacement_reserve) >= failure_cfg.replacement_reserve_prompts:
+            return False
+
+        for prompt_idx in range(prompt_batch.size):
+            spare: DatumSpec = {  # type: ignore
+                k: v[prompt_idx] for k, v in prompt_batch.items()
+            }
+            self._replacement_reserve.append(spare)
+        print(
+            f"  spare pool refilled with {prompt_batch.size} prompt(s) "
+            f"(low-water mark {failure_cfg.replacement_reserve_prompts}); this batch is "
+            "not admitted as a training step",
+            flush=True,
+        )
+        return True
+
+    async def _drain_reserve_into_steps(
+        self, launch: Callable[[DatumSpec, Optional[int]], Awaitable[None]]
+    ) -> None:
+        """Train on the leftover spares once the dataloader has nothing more to give.
+
+        Spares were consumed from the dataset like any other prompt, so leaving them in
+        the pool at the end of the last epoch throws away data the run already paid for.
+
+        It also restores the step count. ``_clamp_max_num_steps`` derives
+        ``max_num_steps`` from ``len(dataloader)``, and every diverted batch is one
+        fewer batch the loop can admit -- so without this a replace-mode run quietly
+        finishes one step short of the budget it was configured with, per divert.
+
+        Whole steps only. A partial pool dispatched as a step is short by construction,
+        and ``min_step_batch_fraction`` would then reject it and fail a run that had
+        otherwise completed cleanly. In the ordinary case the pool holds exactly one
+        batch (the dataloader uses ``batch_size=num_prompts_per_step``), so the common
+        outcome is that the whole thing is recovered.
+
+        Not gated on ``on_dropped_prompt``: an empty pool makes this a no-op anyway, and
+        only "replace" ever fills one, so the gate would buy nothing while stranding a
+        pool restored from a checkpoint into a run that has since switched to "shrink".
+        """
+        num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
+        while len(self._replacement_reserve) >= num_prompts_per_step:
+            # Take the step's prompts out before the first await. A drop resolving
+            # concurrently draws from this same pool, and could otherwise claim one of
+            # them and leave the step it is filling one group short.
+            step_prompts = [
+                self._replacement_reserve.popleft() for _ in range(num_prompts_per_step)
+            ]
+            target_step = await self._sampler.admit(
+                trainer_version_fn=lambda: self._trainer_version
+            )
+            print(
+                f"  dataloader exhausted; training on {len(step_prompts)} pooled "
+                f"spare(s) as target_step={target_step}",
+                flush=True,
+            )
+            for prompt in step_prompts:
+                await launch(prompt, target_step)
+
+        if self._replacement_reserve:
+            print(
+                f"  {len(self._replacement_reserve)} pooled spare(s) left over, fewer "
+                f"than the {num_prompts_per_step} a step needs; they are not trained on",
+                flush=True,
+            )
+
+    def _take_replacement(
+        self, target_step: Optional[int], replacements_used: int
+    ) -> Optional[DatumSpec]:
+        """A spare prompt to stand in for a dropped group, or None to shrink instead.
+
+        None covers the four ways a replacement can be unavailable: it was not asked
+        for, the sampler did not stamp this prompt so no step is waiting on it, the
+        per-slot budget is spent, or the pool is empty because the dataloader is
+        exhausted. Every one of them falls back to ``on_dropped_prompt="shrink"`` rather
+        than waiting, because a step whose replacements keep failing still has to close.
+        """
+        failure_cfg = self._async_cfg.rollout_failure
+        if failure_cfg.on_dropped_prompt != "replace":
+            return None
+        if target_step is None:
+            return None
+        if replacements_used >= failure_cfg.max_replacement_attempts:
+            return None
+        if not self._replacement_reserve:
+            return None
+        return self._replacement_reserve.popleft()
+
+    def _promote_into_step(self, target_step: Optional[int]) -> Optional[int]:
+        """Fill a dropped step from a later step's finished work, and name the lender.
+
+        Where a replacement goes, rather than whether one happens. The lost step closes
+        on generation that already exists instead of waiting out a rollout with the
+        trainer idle, and the caller redirects its spare prompt to the lender, which is
+        due a training step later and has the slack to absorb the wait. The same prompt
+        is generated either way.
+
+        Only ever reached with a spare already in hand, which is what makes the borrow
+        safe to take: an unrepaid loan is the same hole one step later.
+
+        Returns None -- leaving the caller filling the dropped step directly -- when
+        nothing is stamped so no step is stranded, when the trainer has already moved
+        past this step (a second drop can land after the first one closed it short, and
+        a group stamped for a finished step would only be evicted), or when no later
+        step has a finished group to lend. The last is always the case at
+        ``in_order.max_lookahead_versions=0``, where the next batch is not dispatched
+        until this step trains.
+
+        Returns:
+            The step that lent the group, which the caller now owes a rollout, or None.
+        """
+        if target_step is None:
+            return None
+        if target_step < self._trainer_version:
+            return None
+        lender_step = self._buffer.promote_ready_group(to_target_step=target_step)
+        if lender_step is None:
+            return None
+        self._batch_promotions[target_step] = (
+            self._batch_promotions.get(target_step, 0) + 1
+        )
+        print(
+            f"  target_step={target_step}: filled the dropped group by promoting a "
+            f"finished group from target_step={lender_step}; the spare prompt is "
+            "dispatched to repay that step instead",
+            flush=True,
+        )
+        return lender_step
+
+    def _credit_shortfall(self, target_step: Optional[int]) -> None:
+        """Record that a stamped step will never receive a group it is waiting for."""
+        if target_step is None:
+            return
+        self._batch_shortfall[target_step] = (
+            self._batch_shortfall.get(target_step, 0) + 1
+        )
+        print(
+            f"  target_step={target_step} is one group short "
+            f"({self._batch_shortfall[target_step]} total); the train pump "
+            "will close that step early",
+            flush=True,
+        )
+
+    def _target_groups_for_step(self, step: int) -> int:
+        """How many prompt groups this step should train on, after dropped prompts.
+
+        ``num_prompts_per_step`` is the target; groups stamped for this step that were
+        given up on are subtracted, because they are never arriving and a sampler that
+        matches batches to steps exactly cannot substitute another step's groups for
+        them. Without this the pump waits on a group no one is generating.
+
+        The step trains on fewer samples than configured, which is the point: a smaller
+        step beats a stalled run. The count is logged as ``dropped_prompt_groups`` so
+        the batch size a step actually used is recoverable afterwards.
+
+        How much smaller is bounded by ``min_step_batch_fraction``, and that bound has
+        to live here because neither drop budget provides it. Both budgets are
+        run-scoped -- the consecutive counter is cleared by any commit, including
+        commits for other steps -- so drops landing on one step while other steps
+        succeed can shrink it without ever tripping them.
+
+        Raises:
+            RuntimeError: The step fell below ``min_step_batch_fraction`` of
+                ``num_prompts_per_step``. Training a fraction of a batch is a silent
+                change to the gradient estimate, so it is refused rather than absorbed.
+        """
+        num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
+        dropped = self._batch_shortfall.get(step, 0)
+        target = num_prompts_per_step - dropped
+        fraction = self._async_cfg.rollout_failure.min_step_batch_fraction
+        # ceil, so the floor is never rounded down into allowing one more drop than the
+        # fraction states. With fraction > 0 this is always >= 1, which also rules out
+        # the empty step.
+        floor = math.ceil(num_prompts_per_step * fraction)
+        if target < floor:
+            raise RuntimeError(
+                f"training step {step} lost {dropped} of {num_prompts_per_step} prompt "
+                f"group(s), leaving {target}, below the floor of {floor} set by "
+                f"async_rl.rollout_failure.min_step_batch_fraction={fraction}. "
+                "Either the generation fleet is failing a whole step's worth of "
+                "prompts, or the drop budgets are set too high to catch it: they are "
+                "run-scoped and cannot bound how short a single step gets."
+            )
+        return target
 
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
@@ -517,7 +859,12 @@ class SingleControllerActor:
             calibration_batches: list[BatchedDataDict[Any]] = []
 
             with self._timer.time("total_step_time"):
-                while groups_dispatched < grpo_cfg.num_prompts_per_step:
+                # Re-read on every iteration rather than once: a prompt stamped for this
+                # step can be dropped while the pump is already waiting for it, which is
+                # precisely the case that would otherwise wait forever.
+                while groups_dispatched < self._target_groups_for_step(
+                    version_during_step
+                ):
                     # Wait for a selectable batch
                     with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
@@ -535,10 +882,19 @@ class SingleControllerActor:
                             for _ in range(evicted):
                                 self._buffer_capacity.release()
 
-                        # Select a batch
-                        max_prompt_groups = (
-                            grpo_cfg.num_prompts_per_step - groups_dispatched
+                        # Select a batch. Read the target again rather than reusing
+                        # the loop condition's value: the awaits above are a window in
+                        # which a prompt stamped for this step can be dropped, and the
+                        # target would then be stale by the time it is subtracted. It
+                        # can also have fallen to what is already dispatched, which is
+                        # not a batch the sampler can be asked for -- select() rejects
+                        # a min below 1 -- so close the step instead.
+                        target_groups = self._target_groups_for_step(
+                            version_during_step
                         )
+                        max_prompt_groups = target_groups - groups_dispatched
+                        if max_prompt_groups <= 0:
+                            break
                         min_prompt_groups = min(
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
@@ -560,11 +916,14 @@ class SingleControllerActor:
                                         flush=True,
                                     )
                                     return
+                                # Against the step's own target, not the configured
+                                # batch size: a step that legitimately shrank would
+                                # otherwise be reported as missing groups it was
+                                # already excused from.
                                 raise RuntimeError(
                                     "rollout exhausted before a complete training "
                                     f"step was assembled: dispatched "
-                                    f"{groups_dispatched}/"
-                                    f"{grpo_cfg.num_prompts_per_step} prompt "
+                                    f"{groups_dispatched}/{target_groups} prompt "
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
@@ -698,6 +1057,33 @@ class SingleControllerActor:
 
                 self._trainer_version += 1
                 self._train_steps += 1
+                dropped_prompt_groups = self._batch_shortfall.get(
+                    version_during_step, 0
+                )
+                replaced_prompt_groups = self._batch_replacements.get(
+                    version_during_step, 0
+                )
+                promoted_prompt_groups = self._batch_promotions.get(
+                    version_during_step, 0
+                )
+                # Prune every stamp this step or older. Popping only this step's entry
+                # would leak the ones belonging to a step that was already closed when
+                # a straggler stamped for it was finally given up on.
+                self._batch_shortfall = {
+                    step: dropped
+                    for step, dropped in self._batch_shortfall.items()
+                    if step > version_during_step
+                }
+                self._batch_replacements = {
+                    step: replaced
+                    for step, replaced in self._batch_replacements.items()
+                    if step > version_during_step
+                }
+                self._batch_promotions = {
+                    step: promoted
+                    for step, promoted in self._batch_promotions.items()
+                    if step > version_during_step
+                }
                 with self._timer.time("weight_sync"):
                     calibration_data = (
                         BatchedDataDict.from_batches(calibration_batches)
@@ -711,11 +1097,31 @@ class SingleControllerActor:
                         {
                             "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
                             "aborted_stale_inflight_groups": aborted_stale_inflight_groups,
+                            # Non-zero means this step trained on a smaller batch than
+                            # num_prompts_per_step, which any comparison of step metrics
+                            # across steps has to account for.
+                            "dropped_prompt_groups": dropped_prompt_groups,
+                            # Groups filled by a spare prompt this step waited on --
+                            # either one it lost itself, or one it lent to an earlier
+                            # step and was repaid for. Non-zero here with zero above is
+                            # the healthy shape of on_dropped_prompt="replace": the
+                            # batch stayed whole, and the cost was the wall-clock spent
+                            # waiting on the spare.
+                            "replaced_prompt_groups": replaced_prompt_groups,
+                            # Groups this step lost and filled by borrowing finished work
+                            # from a later step. The better shape of the same thing: the
+                            # batch stayed whole and nothing waited for it, with the
+                            # repayment showing up as a replacement on the lender.
+                            "promoted_prompt_groups": promoted_prompt_groups,
                         }
                     )
 
                 # Checkpointing (mirrors async_grpo_train's save block).
-                self._consumed_samples += grpo_cfg.num_prompts_per_step
+                # What the step actually trained on, which is num_prompts_per_step only
+                # when nothing was dropped. Counted from the dispatch tally rather than
+                # derived from the shortfall so the figure does not depend on the
+                # bookkeeping staying exact; this lands in the checkpoint.
+                self._consumed_samples += groups_dispatched
                 self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
                 self._timeout.mark_iteration()
 
@@ -1102,6 +1508,15 @@ class SingleControllerActor:
         # Snapshot before any await so it can't interleave with
         # _rollout_pump iterating this same dataloader.
         dataloader_state = self._dataloader.state_dict()
+        # The spare pool has to be saved with that snapshot, not left out of the
+        # checkpoint: diverting a batch already advanced the iterator, so the state
+        # above records those prompts as consumed while they are still only in memory.
+        # Without this a resumed replace-mode run comes back with an empty pool and a
+        # dataloader positioned past the diverted batch, silently losing it -- and
+        # losing it for good, since _drain_reserve_into_steps only ever recovers spares
+        # held by the process that diverted them. Snapshotted here, in the same
+        # await-free window, so the pair cannot disagree.
+        reserve_state = list(self._replacement_reserve)
         # SC has no validation loop yet; drop the default sentinel instead of
         # persisting a bogus val_reward.
         if hasattr(save_state, "val_reward"):
@@ -1143,6 +1558,12 @@ class SingleControllerActor:
             dataloader_state,
             os.path.join(checkpoint_path, "train_dataloader.pt"),
         )
+        if reserve_state:
+            await asyncio.to_thread(
+                torch.save,
+                reserve_state,
+                os.path.join(checkpoint_path, "replacement_reserve.pt"),
+            )
         buffer_state = await self._buffer.state_dict(
             saved_capacity=self._async_cfg.max_buffered_rollouts
         )
