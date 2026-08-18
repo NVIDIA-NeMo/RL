@@ -1,0 +1,155 @@
+defaults: ../../../nemo_gym/grpo_nanov3.yaml
+grpo:
+  num_prompts_per_step: 256
+  max_num_steps: 1000
+  val_period: 0
+  advantage_clip_low: -50
+  advantage_clip_high: 50
+  zero_variance_prompt_filtering: false
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+loss_fn:
+  token_level_loss: false
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_ratio_min: 0.5
+checkpointing:
+  checkpoint_dir: results/nemotron-super-omni-async-gym
+  checkpoint_must_save_by: 00:03:45:00
+  # This recipe disables validation (grpo.val_period: 0 above), so no val
+  # metric is ever collected. The parent sets metric_name to
+  # val:total_reward/mean, which is coherent there because it validates every
+  # 5 steps; inherited here it makes every checkpoint tie at -inf, warns on
+  # each save, and degrades best-checkpoint selection to "latest anyway".
+  # null selects the same behaviour deliberately: keep_top_k then ranks
+  # periodic checkpoints by step. Set a val metric here only alongside a
+  # non-zero val_period (or val_at_end).
+  metric_name: null
+  # A Super Omni checkpoint is ~1.4 TB with optimizer state, so the parent's
+  # keep_top_k: 1000000 (never prune) costs ~14 TB across a 50-step run at
+  # save_period: 5. Keep the 5 most recent instead. Safe to prune by step
+  # only because metric_name is null above: with a val metric named but
+  # never collected, every checkpoint ties at -inf and pruning is arbitrary.
+  keep_top_k: 5
+policy:
+  is_vlm: true
+  model_name: /path/to/nemotron-super-omni-hf-checkpoint
+  tokenizer:
+    chat_template: ${policy.model_name}/chat_template.jinja
+  train_global_batch_size: 4096
+  max_total_sequence_length: 16384
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.context_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.tensor_model_parallel_size}}}
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 2
+    moe_per_layer_logging: false
+    # Keep MTP disabled for both training and refit.
+    mtp_num_layers: 0
+    radio_force_cpe_eval_mode: true
+    freeze_vision_model: false
+    freeze_vision_projection: false
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    optimizer:
+      min_lr: 2.0e-09
+      adam_beta2: 0.99
+    scheduler:
+      lr_warmup_init: 3.0e-08
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    env_vars:
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NRL_REFIT_BUFFER_MEMORY_RATIO: '0.006'
+      NRL_REFIT_NUM_BUFFERS: '1'
+  generation:
+    bad_words:
+    - <image>
+    - <img>
+    - </img>
+    - <so_embedding>
+    - <so_start>
+    - <so_end>
+    vllm_cfg:
+      gpu_memory_utilization: 0.8
+      load_format: auto
+      enable_prefix_caching: false
+      skip_tokenizer_init: false
+      logprobs_mode: raw_logprobs
+      env_vars:
+        NCCL_ALGO: Ring
+        NCCL_PROTO: Simple
+        NRL_REFIT_BUFFER_MEMORY_RATIO: '0.006'
+        NRL_REFIT_NUM_BUFFERS: '1'
+      http_server_serving_chat_kwargs:
+        chat_template: ${policy.tokenizer.chat_template}
+        chat_template_content_format: openai
+        reasoning_parser: deepseek_r1
+    vllm_kwargs:
+      # Match the higher-throughput backend used by the earlier successful
+      # policy-serving runs. This must remain compatible with repeated refits.
+      moe_backend: flashinfer_cutlass
+      limit_mm_per_prompt:
+        image: 3
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: ${policy.max_total_sequence_length}
+      max_num_seqs: 32
+      skip_mm_profiling: true
+      disable_custom_all_reduce: true
+      attention_backend: FLASH_ATTN
+      attention_config:
+        use_trtllm_attention: false
+      compilation_config:
+        cudagraph_mode: PIECEWISE
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 8
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  train:
+    data_path: /path/to/super-omni-gym-train.jsonl
+  validation:
+    data_path: /path/to/super-omni-gym-validation.jsonl
+env:
+  nemo_gym:
+    policy_max_input_tokens: ${policy.max_total_sequence_length}
+    skip_venv_if_present: true
+    pad_dynamic_image_shapes: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/gui_coordinate/configs/gui_coordinate.yaml
+    - resources_servers/string_match/configs/string_match.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            bad_words:
+            - <image>
+            - <img>
+            - </img>
+            - <so_embedding>
+            - <so_start>
+            - <so_end>
+            chat_template_kwargs:
+              enable_thinking: true
+logger:
+  log_dir: logs/nemotron-super-omni-async-gym
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: grpo-superv3omni
+    name: nemotron-super-omni-async-gym
+cluster:
+  num_nodes: 16
