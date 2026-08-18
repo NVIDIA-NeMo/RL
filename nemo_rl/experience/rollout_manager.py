@@ -873,6 +873,8 @@ class AsyncNemoGymRolloutImpl:
         # They share an agent and must stay on one instance.
         shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
         nemo_gym_env = shard_set.pick_handle(inputs[0]["agent_ref"]["name"])
+        instance_label = shard_set.instance_label(nemo_gym_env)
+        instance_timer_prefix = f"{timer_prefix}/shard/{instance_label}"
         total_rows = len(inputs)
         # Re-dispatch maps NeMo-Gym's echoed _rowidx back onto the original group, so
         # the rows must carry the index _build_inputs stamped on them. Checked here
@@ -921,17 +923,26 @@ class AsyncNemoGymRolloutImpl:
                             self._stats.record_gym_row_redispatch(len(pending))
                     try:
                         timing_metrics = await self._stream_rows(
-                            nemo_gym_env, pending, results, total_rows, timer_prefix
+                            nemo_gym_env,
+                            pending,
+                            results,
+                            total_rows,
+                            instance_timer_prefix,
                         )
                     except Exception as error:
                         last_error = error
+                        if isinstance(error, ValueError):
+                            raise
                         # Only transport-shaped failures are worth another dispatch; a
                         # prompt NeMo-Gym cannot serve fails the same way every time.
                         if (
                             classify_rollout_failure(error) is not FailureClass.INFRA
                             or attempt == self._max_gym_row_attempts
                         ):
-                            raise
+                            raise RuntimeError(
+                                f"NeMo-Gym instance '{instance_label}' failed during "
+                                f"rollout collection: {error}"
+                            ) from error
                     else:
                         if timing_metrics is not None:
                             env_timing_metrics = timing_metrics
@@ -939,7 +950,8 @@ class AsyncNemoGymRolloutImpl:
             missing = [i for i, result in enumerate(results) if result is None]
             if missing:
                 failure = GymTransportError(
-                    "NeMo-Gym rollout stream ended before all rows arrived; missing "
+                    f"NeMo-Gym instance '{instance_label}' rollout stream ended "
+                    "before all rows arrived; missing "
                     f"rows {missing} of {total_rows} after "
                     f"{self._max_gym_row_attempts} attempt(s)"
                 )
@@ -965,6 +977,7 @@ class AsyncNemoGymRolloutImpl:
             )
 
         rollout_metrics.update(env_timing_metrics)
+        rollout_metrics[f"{timer_prefix}/routing/groups/{instance_label}"] = 1
 
         return completions, prompt_message_log, rollout_metrics
 
