@@ -12,9 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, Required, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+
+
+class SglangQuantizationConfig(TypedDict, total=False):
+    """SGLang weight-precision config.
+
+    ``scheme="bf16"`` means BF16 rollout/refit. Set ``scheme="mxfp8"`` to boot
+    SGLang from a matching quantized HF checkpoint and quantize HF tensors
+    during online refit. High-precision exclusions are shared by conversion
+    and online refit.
+    """
+
+    scheme: Required[Literal["bf16", "mxfp8"]]
+    # HF module-name substrings that the checkpoint loader and refit both skip.
+    modules_to_not_convert: list[str]
+    # Additional HF weight-name substrings to keep in high precision.
+    extra_high_precision_layers_hf: list[str]
+    # Number of decoder layers at each edge to keep in high precision.
+    num_layers_at_start_in_bf16: int
+    num_layers_at_end_in_bf16: int
+    converted_model_path: str
+    cache_root: str
 
 
 class SGLangServerConfig(TypedDict):
@@ -27,10 +48,17 @@ class SGLangServerConfig(TypedDict):
     # Per-engine concurrency cap; multiplied by num_gpus / num_gpus_per_engine to set
     # the global router concurrency limit.
     sglang_server_concurrency: int
-    # How to handle in-flight requests on pause: "retract" (preempt) or "kill". Required in YAML.
-    pause_generation_mode: str
+    # How to handle in-flight requests on pause, as accepted by SGLang's
+    # /pause_generation: "abort" (drop them), "retract" (requeue, KV cache may
+    # be flushed) or "in_place" (keep them and their KV cache). Weight refit
+    # rejects in_place because cached entries would outlive their source weights.
+    pause_generation_mode: Literal["abort", "retract", "in_place"]
     # Total number of GPUs allocated to inference across all engines.
     num_gpus: NotRequired[int]
+    # "ipc" -> CUDA-IPC to the colocated SGLang HTTP server (default for
+    # colocated inference). "broadcast" -> NCCL broadcast over a shared
+    # weight-update group (used when SGLang engines run on disaggregate GPUs).
+    weight_transfer_mode: NotRequired[Literal["ipc", "broadcast"]]
     # GPUs per SGLang engine
     # num_gpus_per_engine = tp_size * pp_size; set ep, dp-attn are not orthgonal to those
     # nodes_per_engine: max(1, num_gpus_per_engine // num_gpus_per_node)
@@ -69,6 +97,17 @@ class SglangSpecificArgs(TypedDict):
     sglang_server_config: SGLangServerConfig
     sglang_router_config: SGLangRouterConfig
 
+    # Fault tolerance (RolloutHealthMonitor). When True, a daemon thread health-checks
+    # each engine and restarts hung/dead actors. Absent is equivalent to False, which
+    # is what the recipes that predate this feature rely on; the three fields below
+    # are required iff it is True, and ``RolloutHealthMonitor`` asserts on them.
+    use_fault_tolerance: NotRequired[bool]
+    rollout_health_check_interval: NotRequired[int]
+    rollout_health_check_timeout: NotRequired[int]
+    rollout_health_check_first_wait: NotRequired[int]
+    # Weight precision and quantized-checkpoint conversion/refit knobs.
+    quantization: SglangQuantizationConfig
+
     # Path to model weights (local folder or HF repo id).
     model_path: NotRequired[str]
     # Random seed for the engine; if None, SGLang picks one.
@@ -81,11 +120,12 @@ class SglangSpecificArgs(TypedDict):
     disable_radix_cache: NotRequired[bool]
     # Skip CUDA graphs only for batches that need padding; use them otherwise.
     disable_cuda_graph_padding: NotRequired[bool]
-    # Disable piecewise CUDA graph for extend/prefill.
-    # Enabling piecewise CUDA graph (i.e. setting this to False) currently crashes with
-    # "illegal memory access", likely due to torch 2.10 + sglang incompatibility.
-    # Defaulted to True (disabled) in sglang_worker.py until the upstream sglang fork is updated.
-    disable_piecewise_cuda_graph: NotRequired[bool]
+    # Per-phase CUDA graph backend. "tc_piecewise" is the piecewise mode, which
+    # crashed with "illegal memory access" on torch 2.10; recipes pass
+    # "breakable" for prefill to stay off it. Replaces the pre-v0.5.16
+    # `disable_piecewise_cuda_graph` boolean.
+    cuda_graph_backend_decode: NotRequired[str]
+    cuda_graph_backend_prefill: NotRequired[str]
     # Enable NCCL NVLS for prefill-heavy requests when available.
     enable_nccl_nvls: NotRequired[bool]
     # Disable on-disk cache for the outlines grammar backend (avoids FS-related crashes).
@@ -106,9 +146,13 @@ class SglangSpecificArgs(TypedDict):
     # Maximum batch size when using torch.compile.
     torch_compile_max_bs: NotRequired[int]
     # Upper bound on CUDA-graph capture batch sizes; None = let SGLang pick.
-    cuda_graph_max_bs: NotRequired[int | None]
+    # Split per phase in v0.5.16 (was `cuda_graph_max_bs`).
+    cuda_graph_max_bs_decode: NotRequired[int | None]
+    cuda_graph_max_bs_prefill: NotRequired[int | None]
     # Explicit list of batch sizes to capture CUDA graphs for; None = auto.
-    cuda_graph_bs: NotRequired[list[int] | None]
+    # Split per phase in v0.5.16 (was `cuda_graph_bs`).
+    cuda_graph_bs_decode: NotRequired[list[int] | None]
+    cuda_graph_bs_prefill: NotRequired[list[int] | None]
     # torchao quantization config string, e.g. "int8wo", "fp8wo" (experimental).
     torchao_config: NotRequired[str]
     # [Deprecated] Use SGLANG_SPEC_NAN_DETECTION=1 / SGLANG_SPEC_OOB_DETECTION=1 instead.

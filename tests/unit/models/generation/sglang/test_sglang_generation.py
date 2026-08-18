@@ -90,7 +90,7 @@ def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID, tp_size=1):
             "dp_size": 1,
             "pp_size": 1,
             "ep_size": 1,
-            "disable_piecewise_cuda_graph": True,
+            "cuda_graph_backend_prefill": "breakable",
             "disable_cuda_graph": False,
             "mem_fraction_static": 0.3,
             "sglang_server_config": {
@@ -216,6 +216,7 @@ def _make_minimal_sglang_gen_for_clamp_test(
 ):
     sglang_gen = SGLangGeneration.__new__(SGLangGeneration)
     sglang_gen.all_engines = []
+    sglang_gen._health_monitor = None
     sglang_gen._router_actor = None
     sglang_gen._http_client = None
     sglang_gen.sglang_cfg = _make_sglang_generation_cfg()
