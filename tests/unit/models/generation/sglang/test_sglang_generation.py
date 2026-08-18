@@ -46,6 +46,12 @@ MODEL_PATH = "Qwen/Qwen3-4B"
 pytestmark = pytest.mark.sglang
 
 
+def test_prepare_refit_info_accepts_missing_metadata():
+    generation = SGLangGeneration.__new__(SGLangGeneration)
+
+    assert generation.prepare_refit_info(None) is None
+
+
 @pytest.fixture(scope="module")
 def ray_cluster():
     """Initialise Ray once for this module's tests."""

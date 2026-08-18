@@ -196,8 +196,11 @@ class MegatronGeneration(GenerationInterface):
             refit_backend=refit_backend,
         )
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, buffer_size_bytes: Optional[int] = None
+    ) -> list[ray.ObjectRef]:
         """Receive updated weights from the training cluster via collective communication."""
+        del buffer_size_bytes
         return self._policy.swap_weights_via_reshard(is_source=False)
 
     def generate(

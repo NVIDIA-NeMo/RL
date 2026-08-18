@@ -146,6 +146,161 @@ def test_refit_load_weights_uses_full_weight_path_by_default():
 
 
 @pytest.mark.vllm
+def test_refit_loader_cache_records_replays_and_falls_back(monkeypatch):
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        load_weights_maybe_cached,
+    )
+
+    events = []
+
+    def remote_loader(param, loaded_weight, *args, **kwargs):
+        events.append(("remote", loaded_weight, args, kwargs))
+        return False
+
+    def local_loader(param, loaded_weight, *args, **kwargs):
+        events.append(("local", loaded_weight, args, kwargs))
+        with torch.no_grad():
+            param.copy_(loaded_weight)
+        return None
+
+    class Model:
+        def __init__(self):
+            self.remote = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+            self.local = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+            self.default = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+            self.remote.weight_loader = remote_loader
+            self.local.weight_loader = local_loader
+            self.default.weight_loader = default_weight_loader
+            self.load_calls = []
+
+        def named_parameters(self):
+            return [
+                ("remote", self.remote),
+                ("local", self.local),
+                ("default", self.default),
+            ]
+
+        def load_weights(self, *, weights):
+            self.load_calls.append([name for name, _weight in weights])
+            loaded = set()
+            for name, weight in weights:
+                if name == "expert":
+                    results = [
+                        self.remote.weight_loader(
+                            self.remote, weight, "w1", expert_id=0
+                        ),
+                        self.local.weight_loader(self.local, weight, "w1", expert_id=1),
+                    ]
+                    if any(result is not False for result in results):
+                        loaded.add(name)
+                else:
+                    self.default.weight_loader(self.default, weight)
+                    loaded.add(name)
+            return loaded
+
+    model = Model()
+    first_expert = torch.tensor([1.0])
+    first_default = torch.tensor([2.0])
+    second_expert = torch.tensor([3.0])
+    second_default = torch.tensor([4.0])
+
+    assert load_weights_maybe_cached(
+        model,
+        [("expert", first_expert), ("default", first_default)],
+        cache_loader_routes=True,
+    ) == {"expert", "default"}
+    assert load_weights_maybe_cached(
+        model,
+        [("expert", second_expert), ("default", second_default)],
+        cache_loader_routes=True,
+    ) == {"expert", "default"}
+
+    cache = model._nrl_refit_loader_cache
+    assert model.load_calls == [["expert", "default"], ["default"]]
+    assert cache.uncached == {"default"}
+    assert set(cache.calls) == {"expert"}
+    assert len(cache.calls["expert"]) == 2
+    first_loader, first_param, first_args, first_kwargs = cache.calls["expert"][0]
+    second_loader, second_param, second_args, second_kwargs = cache.calls["expert"][1]
+    assert first_loader is remote_loader
+    assert first_param is model.remote
+    assert first_args == ("w1",)
+    assert first_kwargs == {"expert_id": 0}
+    assert second_loader is local_loader
+    assert second_param is model.local
+    assert second_args == ("w1",)
+    assert second_kwargs == {"expert_id": 1}
+    assert [event[0] for event in events] == ["remote", "local", "remote", "local"]
+    assert events[2][1] is second_expert
+    assert events[3][1] is second_expert
+    assert model.remote.weight_loader is remote_loader
+    assert model.local.weight_loader is local_loader
+    torch.testing.assert_close(model.local, second_expert)
+    torch.testing.assert_close(model.default, second_default)
+
+
+@pytest.mark.vllm
+def test_refit_loader_cache_invalidates_replaced_parameter(monkeypatch):
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        load_weights_maybe_cached,
+    )
+
+    events = []
+
+    def make_loader(label):
+        def loader(param, loaded_weight):
+            events.append(label)
+            with torch.no_grad():
+                param.copy_(loaded_weight)
+
+        return loader
+
+    class Model:
+        def __init__(self):
+            self.remote = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+            self.local = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+            self.remote.weight_loader = make_loader("remote")
+            self.local.weight_loader = make_loader("local")
+            self.load_calls = []
+
+        def named_parameters(self):
+            return [("remote", self.remote), ("local", self.local)]
+
+        def load_weights(self, *, weights):
+            self.load_calls.append([name for name, _weight in weights])
+            for _name, weight in weights:
+                self.remote.weight_loader(self.remote, weight)
+                self.local.weight_loader(self.local, weight)
+            return {name for name, _weight in weights}
+
+    model = Model()
+    first = torch.tensor([1.0])
+    second = torch.tensor([2.0])
+
+    assert load_weights_maybe_cached(
+        model, [("expert", first)], cache_loader_routes=True
+    ) == {"expert"}
+    cache = model._nrl_refit_loader_cache
+    old_local = model.local
+    model.local = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+    model.local.weight_loader = make_loader("replacement")
+
+    assert load_weights_maybe_cached(
+        model, [("expert", second)], cache_loader_routes=True
+    ) == {"expert"}
+
+    assert model.load_calls == [["expert"], ["expert"]]
+    assert events == ["remote", "local", "remote", "replacement"]
+    torch.testing.assert_close(old_local, first)
+    torch.testing.assert_close(model.local, second)
+    assert cache.calls == {}
+    assert cache.uncached == set()
+    assert cache.snapshot == {}
+
+
+@pytest.mark.vllm
 def test_refit_load_weights_dispatches_to_sharded_path_when_enabled():
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtensionWithCheckpointEngine,

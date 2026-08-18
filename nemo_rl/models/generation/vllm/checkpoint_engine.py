@@ -143,18 +143,18 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
         load_time = 0.0
         start_time = time.time()
 
-        async for weight_batch in self.checkpoint_engine.receive_weight_batches():
-            loaded_batches += 1
-            loaded_tensors += len(weight_batch)
-            loaded_bytes += sum(weight.nbytes for _name, weight in weight_batch)
+        with self._weight_update_lifecycle("checkpoint_engine") as finalize:
+            async for weight_batch in self.checkpoint_engine.receive_weight_batches():
+                loaded_batches += 1
+                loaded_tensors += len(weight_batch)
+                loaded_bytes += sum(weight.nbytes for _name, weight in weight_batch)
 
-            load_start = time.time()
-            self._load_weights(weight_batch)
-            torch.cuda.current_stream().synchronize()
-            load_time += time.time() - load_start
-            del weight_batch
-
-        self._maybe_process_fp8_kv_cache()
+                load_start = time.time()
+                self._load_weights(weight_batch)
+                torch.cuda.current_stream().synchronize()
+                load_time += time.time() - load_start
+                del weight_batch
+            finalize()
 
         total_time = time.time() - start_time
         loaded_gib = loaded_bytes / (1024 * 1024 * 1024)

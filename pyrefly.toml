@@ -8,6 +8,7 @@ replace-imports-with-any = [
   "transformers.*",
   "tensorrt_llm.*",
   "vllm.*",
+  "flashinfer.*",
   "math_verify.*",
   "sympy.*",
   "torchdata.*",

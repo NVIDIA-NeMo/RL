@@ -21,11 +21,8 @@ policy:
       gpu_memory_utilization: 0.8
       precision: "fp8"
       is_mx: true
-      quantization_ignored_layer_kws:
-        - q_proj
-        - k_proj
-        - v_proj
-        - o_proj
+      refit_prequantize: true
+      refit_cache_loader_routes: true
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout
   wandb:

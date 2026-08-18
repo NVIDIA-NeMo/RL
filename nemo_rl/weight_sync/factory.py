@@ -140,6 +140,7 @@ def create_weight_synchronizer(
             generation=generation,
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
+            refit_buffer_size_gb=refit_buffer_size_gb,
         )
 
     if generation_backend == SGLANG_BACKEND:

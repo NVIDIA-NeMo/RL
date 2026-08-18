@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 import ray
 import torch
@@ -21,6 +21,9 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.utils.timer import Timer
+
+if TYPE_CHECKING:
+    from nemo_rl.models.policy import PolicyConfig
 
 
 class LogprobOutputSpec(TypedDict):
@@ -164,6 +167,8 @@ class PolicyInterface(ABC):
 
 
 class ColocatablePolicyInterface(PolicyInterface):
+    cfg: "PolicyConfig"
+
     @abstractmethod
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
@@ -184,6 +189,18 @@ class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass
+
+    def enable_refit_prequantize(
+        self, param_names: list[str]
+    ) -> Optional[dict[str, Any]]:
+        """Quantize the listed params on the trainer during refit streaming.
+
+        Returns:
+            Refit info updated with the quantized dtypes and scale entries.
+        """
+        raise NotImplementedError(
+            "enable_refit_prequantize is not implemented for this policy worker"
+        )
 
     @abstractmethod
     def stream_weights_via_ipc_zmq(
@@ -220,7 +237,9 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        buffer_size_bytes: Optional[int] = None,
     ) -> list[ray.ObjectRef]:
         pass
 

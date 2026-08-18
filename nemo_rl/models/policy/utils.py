@@ -359,7 +359,12 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
 
 
 def stream_weights_via_ipc_zmq_impl(
-    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+    params_generator,
+    buffer_size_bytes: int,
+    zmq_socket,
+    rank: int,
+    worker_name: str,
+    buffer_cache: dict[str, Any] | None = None,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
@@ -372,6 +377,11 @@ def stream_weights_via_ipc_zmq_impl(
         zmq_socket: ZMQ socket for communication
         rank: Worker rank for logging
         worker_name: Name of the worker for logging
+        buffer_cache: Optional caller-owned dict that keeps the ping-pong staging
+            buffers alive across calls. When provided, buffers are reused between
+            refits (skipping two large allocations plus a gc.collect/empty_cache
+            pair per refit) as long as the buffer size and device are unchanged.
+            The buffers then stay resident on the GPU between refits.
     """
     # Divide total buffer size by 2 because we use two individual buffers (ping-pong) for overlapping communication.
     buffer_size_bytes = buffer_size_bytes // 2
@@ -419,6 +429,11 @@ def stream_weights_via_ipc_zmq_impl(
         """Release acyclic IPC buffers without scanning the worker object graph."""
         nonlocal buffer_a, buffer_b, current_buffer
 
+        if buffer_cache is not None:
+            # Persistent-buffer mode: the buffers intentionally outlive this
+            # call (and the refit), so both the mid-stream reclaim and the
+            # final cleanup are skipped.
+            return
         had_buffers = buffer_a is not None or buffer_b is not None
         current_buffer = None
         buffer_a = None
@@ -438,8 +453,30 @@ def stream_weights_via_ipc_zmq_impl(
                 buffer_device = tensor.device
                 if buffer_device.type == "cpu" and torch.cuda.is_available():
                     buffer_device = torch.device("cuda", torch.cuda.current_device())
-                buffer_a = allocate_buffer(buffer_device)
-                buffer_b = allocate_buffer(buffer_device)
+                if (
+                    buffer_cache is not None
+                    and "a" in buffer_cache
+                    and buffer_cache.get("device") == buffer_device
+                ):
+                    # Reuse the first-refit size even when dynamic sizing asks
+                    # for more: parameters are identical every refit, and with
+                    # vLLM sleep level 2 the free-memory-based request inflates
+                    # while rollout weights are discarded - allocating (and
+                    # keeping) larger buffers then OOMs vLLM's wake_up remap.
+                    buffer_a = buffer_cache["a"]
+                    buffer_b = buffer_cache["b"]
+                    buffer_size_bytes = buffer_cache["size"]
+                else:
+                    buffer_a = allocate_buffer(buffer_device)
+                    buffer_b = allocate_buffer(buffer_device)
+                    if buffer_cache is not None:
+                        buffer_cache.clear()
+                        buffer_cache.update(
+                            a=buffer_a,
+                            b=buffer_b,
+                            size=buffer_size_bytes,
+                            device=buffer_device,
+                        )
                 current_buffer = buffer_a
 
             aligned_size = calculate_aligned_size(tensor.nbytes)

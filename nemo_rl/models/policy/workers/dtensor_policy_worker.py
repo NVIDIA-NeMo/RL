@@ -258,6 +258,9 @@ class DTensorPolicyWorkerImpl(
         configure_dynamo_cache()
 
         self.cfg = config
+        # Staging-buffer cache for refit weight streaming; only populated when
+        # cfg["refit_persistent_ipc_buffers"] is enabled.
+        self._refit_ipc_buffer_cache: dict[str, Any] = {}
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
         self.rank = torch.distributed.get_rank()
@@ -1891,6 +1894,11 @@ class DTensorPolicyWorkerImpl(
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
+            buffer_cache=(
+                self._refit_ipc_buffer_cache
+                if self.cfg.get("refit_persistent_ipc_buffers")
+                else None
+            ),
         )
 
     def _checkpoint_engine_params(
@@ -1900,7 +1908,9 @@ class DTensorPolicyWorkerImpl(
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        buffer_size_bytes: Optional[int] = None,
     ) -> None:
         """Broadcast the weights for collective communication."""
         if kv_scales is not None:
@@ -1930,6 +1940,7 @@ class DTensorPolicyWorkerImpl(
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,
+            buffer_size_bytes=buffer_size_bytes,
         )
 
         # Manually move model to cpu for cpu offload case

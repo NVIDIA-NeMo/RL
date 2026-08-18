@@ -34,7 +34,10 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    WeightSynchronizer,
+    initialize_refit_metadata,
+)
 
 
 class CollectiveWeightSynchronizer(WeightSynchronizer):
@@ -49,6 +52,8 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         train_cluster: RayVirtualCluster for the training workers, used to
             obtain the master address/port and world size for collective init.
         inference_cluster: RayVirtualCluster for the inference workers.
+        refit_buffer_size_gb: Optional fixed packing threshold shared by the
+            collective producer and consumer.
     """
 
     def __init__(
@@ -57,11 +62,19 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         generation: Any,
         train_cluster: Any,
         inference_cluster: Any,
+        refit_buffer_size_gb: float | int | None = None,
     ):
         self._policy = policy
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
+        if refit_buffer_size_gb is not None and refit_buffer_size_gb <= 0:
+            raise ValueError("refit_buffer_size_gb must be > 0")
+        self._buffer_size_bytes = (
+            None
+            if refit_buffer_size_gb is None
+            else int(refit_buffer_size_gb * 1024**3)
+        )
         self._stale = True
 
     def sync_weights(
@@ -76,10 +89,19 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             else nullcontext()
         )
         with timer_context:
-            futures_train = self._policy.broadcast_weights_for_collective(
-                kv_scales=kv_scales
-            )
-            futures_inference = self._generation.update_weights_from_collective()
+            if self._buffer_size_bytes is None:
+                futures_train = self._policy.broadcast_weights_for_collective(
+                    kv_scales=kv_scales
+                )
+                futures_inference = self._generation.update_weights_from_collective()
+            else:
+                futures_train = self._policy.broadcast_weights_for_collective(
+                    kv_scales=kv_scales,
+                    buffer_size_bytes=self._buffer_size_bytes,
+                )
+                futures_inference = self._generation.update_weights_from_collective(
+                    buffer_size_bytes=self._buffer_size_bytes
+                )
 
             ray.get(futures_train)
             results = ray.get(futures_inference)
@@ -102,8 +124,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # prepare_refit_info is called before init_collective. This matches
         # distillation.py ordering. Neither call depends on the other today,
         # but we document this as the canonical ordering for future reference.
-        state_dict_info = self._policy.prepare_refit_info()
-        self._generation.prepare_refit_info(state_dict_info)
+        initialize_refit_metadata(self._policy, self._generation)
 
         ip, port = self._train_cluster.get_master_address_and_port()
         train_world_size = self._train_cluster.world_size()

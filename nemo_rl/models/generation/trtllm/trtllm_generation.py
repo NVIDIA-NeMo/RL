@@ -435,13 +435,18 @@ class TrtllmGeneration(GenerationInterface):
             print(f"Error in finish_generation: {e}")
             return False
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
+        if state_dict_info is None:
+            return None
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_refit_info_async",
             state_dict_info=state_dict_info,
             run_rank_0_only_axes=["tensor_parallel"],
         )
         ray.get(futures)
+        return None
 
     def start_gpu_profiling(self) -> None:
         """Grpo profiling protocol: start nsys capture on the GPU workers."""
@@ -463,17 +468,24 @@ class TrtllmGeneration(GenerationInterface):
         )
         ray.get(futures)
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, buffer_size_bytes: int | None = None
+    ) -> list[ray.ObjectRef]:
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group not initialised")
         trtllm_cfg = self.cfg["trtllm_cfg"]
         in_flight = bool(trtllm_cfg.get("in_flight_weight_updates"))
         recompute_kv = bool(trtllm_cfg.get("recompute_kv_cache_after_weight_updates"))
+        update_kwargs: dict[str, bool | int] = {
+            "drain": not in_flight,
+            "recompute_kv": recompute_kv,
+        }
+        if buffer_size_bytes is not None:
+            update_kwargs["buffer_size_bytes"] = buffer_size_bytes
         return self.worker_group.run_all_workers_single_data(
             "update_weights_from_collective_async",
             run_rank_0_only_axes=["tensor_parallel"],
-            drain=not in_flight,
-            recompute_kv=recompute_kv,
+            **update_kwargs,
         )
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:

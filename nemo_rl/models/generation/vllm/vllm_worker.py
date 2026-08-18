@@ -50,6 +50,7 @@ from nemo_rl.models.generation.vllm.utils import (
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
+    configure_refit_runtime,
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
@@ -368,6 +369,7 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
+        configure_refit_runtime(self.cfg["vllm_cfg"], vllm_kwargs)
         checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
         if checkpoint_engine_config is not None:
             from nemo_rl.models.generation.vllm.checkpoint_engine import (
@@ -1142,9 +1144,24 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
         return cast(list[str], list_of_worker_results)
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
-        self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+    def prepare_refit_info(
+        self, state_dict_info: dict[str, Any]
+    ) -> Optional[list[str]]:
+        """Prepare the info for refit.
+
+        Returns the parameter names the engine wants pre-quantized on the
+        trainer (vllm_cfg.refit_prequantize), or None.
+        """
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        results = self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(state_dict_info, fp8.serialize_fp8_config()),
+        )
+        # Union across the engine's TP/PP workers: with pipeline parallelism
+        # each shard only classifies its local parameters as fp8-eligible.
+        names = sorted({name for result in results if result for name in result})
+        return names or None
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
@@ -1179,7 +1196,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             return False
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(
+        self, buffer_size_bytes: Optional[int] = None
+    ) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -1191,9 +1210,15 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                     "update_weights_from_collective can only be used with async_engine=False. Use update_weights_from_collective_async instead."
                 )
 
-            result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
-            )
+            if buffer_size_bytes is None:
+                result_or_coro = self.llm.collective_rpc(
+                    "update_weights_from_collective", args=tuple()
+                )
+            else:
+                result_or_coro = self.llm.collective_rpc(
+                    "update_weights_from_collective",
+                    kwargs={"buffer_size_bytes": buffer_size_bytes},
+                )
             worker_results = cast(list[bool], result_or_coro)
 
             if not worker_results or not all(worker_results):

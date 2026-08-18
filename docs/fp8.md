@@ -57,6 +57,25 @@ FP8 generations are recommended to be configured with the following settings:
                 pow2_activation_scaling_factors: False
 ```
 
+For MXFP8 rollout with Megatron training, trainer-side prequantization can
+reduce the refit payload:
+
+```yaml
+policy:
+    generation:
+        vllm_cfg:
+            precision: fp8
+            is_mx: true
+            refit_prequantize: true
+```
+
+`refit_prequantize` is an MXFP8 refit optimization. It requires
+`precision: fp8`, `is_mx: true`, and the Megatron policy backend. It moves
+eligible weight quantization to the trainer and transfers E4M3 values plus E8M0
+scales instead of BF16 weights. It is rejected for blockwise FP8, BF16, NVFP4,
+sparse-delta refit, and NCCL-Reshard refit. NVFP4 real-quant rollout uses its own
+packed-weight refit protocol.
+
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
 ```

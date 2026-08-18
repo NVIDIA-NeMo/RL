@@ -731,13 +731,18 @@ class SGLangGeneration(GenerationInterface):
     ) -> list[ray.ObjectRef]:
         return []
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        pass
+    def prepare_refit_info(
+        self, state_dict_info: dict[str, Any] | None
+    ) -> list[str] | None:
+        return None
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         return []
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, buffer_size_bytes: int | None = None
+    ) -> list[ray.ObjectRef]:
+        del buffer_size_bytes
         return []
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:

@@ -1,10 +1,9 @@
-defaults: ./grpo-qwen3-235b-32n4g-async-1off.yaml
+defaults: ./grpo-qwen3-30ba3b-4n8g-async-1off.yaml
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n8g-async-1off-mxfp8-rollout
 policy:
   generation:
     vllm_cfg:
-      tensor_parallel_size: 4
       precision: "fp8"
       is_mx: true
       refit_prequantize: true
@@ -18,8 +17,6 @@ policy:
     vllm_kwargs:
       moe_backend: flashinfer_trtllm
 logger:
-  log_dir: logs/grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout
+  log_dir: logs/grpo-qwen3-30ba3b-4n8g-async-1off-mxfp8-rollout
   wandb:
-    name: grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout
-cluster:
-  segment_size: 16
+    name: grpo-qwen3-30ba3b-4n8g-async-1off-mxfp8-rollout

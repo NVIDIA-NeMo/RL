@@ -14,12 +14,39 @@
 
 """Tests for vLLM worker helper functions."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from nemo_rl.models.generation.vllm.worker_utils import (
+    configure_refit_runtime,
+    refit_cache_loader_routes_enabled,
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_refit_loader_cache_round_trips_through_additional_config(enabled):
+    vllm_kwargs = {"additional_config": {"existing": "value"}}
+
+    configure_refit_runtime(
+        {"refit_cache_loader_routes": enabled},
+        vllm_kwargs,
+    )
+
+    assert vllm_kwargs["additional_config"]["existing"] == "value"
+    vllm_config = SimpleNamespace(additional_config=vllm_kwargs["additional_config"])
+    assert refit_cache_loader_routes_enabled(vllm_config) is enabled
+
+
+def test_refit_loader_cache_defaults_to_disabled():
+    vllm_kwargs = {}
+
+    configure_refit_runtime({}, vllm_kwargs)
+
+    vllm_config = SimpleNamespace(additional_config=vllm_kwargs["additional_config"])
+    assert refit_cache_loader_routes_enabled(vllm_config) is False
 
 
 @pytest.mark.parametrize(
