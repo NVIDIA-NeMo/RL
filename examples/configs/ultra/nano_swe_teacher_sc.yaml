@@ -116,8 +116,5 @@ token_capture:
   capture_dir: null
   # Keep route bytes out of canonical rows and assemble them on policy workers.
   defer_routed_experts_to_policy: false
-  # Independent rollback control for the bounded CPU finalizer actor pool and
-  # generation/finalization overlap.
-  finalizer_actor_pool_enabled: false
-  # Fixed validation pool; actors have no automatic restart/task retry.
+  # Fixed CPU finalizer pool; actors have no automatic restart/task retry.
   num_finalizer_workers: 2
