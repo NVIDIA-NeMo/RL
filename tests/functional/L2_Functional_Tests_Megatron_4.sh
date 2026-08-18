@@ -24,8 +24,9 @@ cd ${PROJECT_ROOT}
 # non-colocated generation with the Megatron inference backend, exercising extra
 # features on top of the base non-colocated path. These are CLUSTER tests: they
 # must run from /opt/nemo-rl on the HEAD of a 2-node `cog submit --launcher ray`
-# allocation on GB200 / oci-hsg (1 gen node + 1 train node, 4 GPUs each -> EP=4),
-# with the nano-3.5 checkpoint mounted. See
+# allocation on GB200 / oci-hsg (1 gen node + 1 train node, 4 GPUs each -> EP=4).
+# The model is pulled from the public HF release, so the nodes need hub access and
+# a shared HF/Megatron checkpoint cache. See
 # .claude/skills/run-nano35-megatron-inference-cog/SKILL.md.
 
 # run_test [fast] <command...>

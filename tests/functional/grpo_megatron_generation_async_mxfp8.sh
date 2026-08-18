@@ -7,9 +7,8 @@
 #
 # This is a CLUSTER test (GB200 / oci-hsg). It expects to run from /opt/nemo-rl on
 # the HEAD node of a 2-node `cog submit --launcher ray` allocation (1 gen + 1 train
-# node, 4 GPUs each -> EP=4). The nano-3.5 dist-checkpoint + HF config/tokenizer are
-# read from the paths below (already present on the cluster); override MODEL_DIR /
-# HF_DIR to point elsewhere. See
+# node, 4 GPUs each -> EP=4). Weights come from the public nano-3.5 release on the
+# HF hub; override MODEL_NAME to point at a local HF snapshot instead. See
 # .claude/skills/run-nano35-megatron-inference-cog/SKILL.md for the wiring.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
@@ -28,11 +27,10 @@ export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
-# nano-3.5 checkpoint (torch_dist) + HF config/tokenizer, present on the oci-hsg
-# lustre. Both live under portfolios/llmservice and must be mounted into the
-# container (COG_EXTRA_MOUNTS is handled by the submit wrapper).
-: "${MODEL_DIR:=/lustre/fsw/portfolios/llmservice/users/ksanthanam/nemotron-3.5-nano-swe-step25/without_mtp}"
-: "${HF_DIR:=/lustre/fsw/portfolios/llmservice/users/dmosallanezh/nemo-evaluator-rundirs/nano_v35/conversions/geshen_ultra_rl_v5_kd600_step30_fixedpath_20260520_1130/hf}"
+# Public nano-3.5 release. The first run downloads it and converts HF -> Megatron;
+# the converted checkpoint is cached under $NRL_MEGATRON_CHECKPOINT_DIR (or
+# $HF_HOME/nemo_rl), which must be visible to both nodes.
+: "${MODEL_NAME:=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16}"
 
 # expandable_segments defrags the tight nano-3.5 training footprint (megatron gen path).
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -40,10 +38,8 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 cd $PROJECT_ROOT
 uv run --no-sync python $PROJECT_ROOT/examples/run_grpo.py \
     --config $PROJECT_ROOT/examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation.yaml \
-    policy.model_name=$HF_DIR \
-    policy.tokenizer.name=$HF_DIR \
-    ++policy.pretrained_checkpoint.path=$MODEL_DIR \
-    ++policy.pretrained_checkpoint.format=megatron_lm \
+    policy.model_name=$MODEL_NAME \
+    policy.tokenizer.name=$MODEL_NAME \
     policy.generation.backend=megatron \
     policy.max_total_sequence_length=2048 \
     policy.train_global_batch_size=8 \
@@ -63,7 +59,6 @@ uv run --no-sync python $PROJECT_ROOT/examples/run_grpo.py \
     ++policy.generation.colocated.resources.num_nodes=1 \
     ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
     ++policy.generation.mcore_generation_config.refit_backend=nccl \
-    ++policy.generation.mcore_generation_config.async_engine=true \
     ++policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
     ++policy.generation.mcore_generation_config.expert_model_parallel_size=4 \
     ++policy.generation.mcore_generation_config.expert_tensor_parallel_size=1 \
