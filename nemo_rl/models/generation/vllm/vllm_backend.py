@@ -56,7 +56,7 @@ except ImportError:
     )
 
 
-WeightUpdateTransport = Literal["ipc", "collective"]
+WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
 WeightUpdateFinalizer = Callable[[], None]
 
 
@@ -729,8 +729,7 @@ class VllmInternalWorkerExtension:
         Native reload initialization invalidates the old runtime layout. Any
         subsequent exception therefore marks this worker permanently unusable.
         """
-        del transport
-        if self._uses_unquantized_flashinfer_trtllm():
+        if transport != "nccl_reshard" and self._uses_unquantized_flashinfer_trtllm():
             self._validate_weight_update_compatibility()
             previous_failure = self._nrl_layerwise_reload_failure
             if previous_failure is not None:
@@ -1219,38 +1218,26 @@ class VllmInternalWorkerExtension:
 
         import time
 
-        misc_t0 = time.perf_counter()
-        self._receive_and_load_misc_params()
-        torch.cuda.synchronize()
-        if torch.distributed.get_rank() == 0:
-            print(
-                f"[nccl_reshard_refit] misc recv+load (gen side): "
-                f"{time.perf_counter() - misc_t0:.2f}s",
-                flush=True,
-            )
-        torch.cuda.empty_cache()
-        from vllm.config import set_current_vllm_config
-        from vllm.model_executor.model_loader.utils import (
-            process_weights_after_loading,
-        )
+        with self._weight_update_lifecycle("nccl_reshard") as finalize:
+            misc_t0 = time.perf_counter()
+            self._receive_and_load_misc_params()
+            torch.cuda.synchronize()
+            if torch.distributed.get_rank() == 0:
+                print(
+                    f"[nccl_reshard_refit] misc recv+load (gen side): "
+                    f"{time.perf_counter() - misc_t0:.2f}s",
+                    flush=True,
+                )
+            torch.cuda.empty_cache()
 
-        # This direct-buffer transport intentionally does not use the native
-        # layerwise lifecycle. Its mapping is cached against live parameter
-        # storage at setup, and every refit rewrites canonical fused-weight
-        # regions before this backend-specific repack. Rebuilding parameters
-        # would invalidate that mapping.
-        #
-        # Finalize dense Linear + attention/MLA state and the per-MoE-backend
-        # w13 layout (FlashInfer CUTLASS/TRTLLM).
-        with set_current_vllm_config(self.model_runner.vllm_config):
-            process_weights_after_loading(
-                self.model_runner.model, self.model_config, self.device
-            )
+            # Finalize post-load weight processing: dense Linear + attention/MLA,
+            # the per-MoE-backend w13 layout (FlashInfer CUTLASS/TRTLLM) that the
+            # canonical [gate; up] bulk write above defers to here, and the MTP
+            # drafter's mirror of the same. The FP8 KV-cache per-layer k/v scales
+            # are finalized by the lifecycle on exit.
+            finalize()
 
-        torch.cuda.empty_cache()
-
-        # Finalize FP8 KV-cache per-layer k/v scales after the misc broadcast.
-        self._maybe_process_fp8_kv_cache()
+            torch.cuda.empty_cache()
         return True
 
     def _receive_and_load_misc_params(self) -> None:

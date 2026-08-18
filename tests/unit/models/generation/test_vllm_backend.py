@@ -224,6 +224,48 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_unquantized_nccl_reshard_keeps_existing_refit_lifecycle(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = _make_unquantized_moe_model("FlashInfer TRTLLM")
+    model_config = object()
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+        quant_config=None,
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    process = MagicMock()
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda _: pytest.fail(
+            "NCCL reshard must preserve the direct-buffer parameter mapping"
+        ),
+    )
+
+    with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+        finalize()
+
+    process.assert_called_once_with(model, model_config, ext.device)
+    ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
+    ext._maybe_process_fp8_kv_cache.assert_called_once_with()
+
+
+@pytest.mark.vllm
 def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypatch):
     from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
 
@@ -637,10 +679,88 @@ async def test_async_weight_updates_check_every_internal_worker(
     )
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": True}}
-    worker.llm = SimpleNamespace(collective_rpc=AsyncMock(return_value=worker_results))
+    worker.cfg = {
+        "vllm_cfg": {
+            "async_engine": True,
+            "reset_encoder_cache_after_weight_update": True,
+        }
+    }
+    worker.llm = SimpleNamespace(
+        collective_rpc=AsyncMock(return_value=worker_results),
+        reset_encoder_cache=AsyncMock(),
+    )
 
     assert await getattr(worker, method_name)() is expected
+    if expected:
+        worker.llm.reset_encoder_cache.assert_awaited_once_with()
+    else:
+        worker.llm.reset_encoder_cache.assert_not_awaited()
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_async_weight_update_skips_encoder_cache_reset_when_disabled():
+    """Text-only and in-flight refit users retain the existing cache behavior."""
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = SimpleNamespace(
+        collective_rpc=AsyncMock(return_value=[True]),
+        reset_encoder_cache=AsyncMock(),
+    )
+
+    assert await worker.update_weights_from_collective_async() is True
+    worker.llm.reset_encoder_cache.assert_not_awaited()
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_async_weight_update_fails_when_encoder_cache_reset_fails():
+    """A successful refit must not resume with stale multimodal encoder outputs."""
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "vllm_cfg": {
+            "async_engine": True,
+            "reset_encoder_cache_after_weight_update": True,
+        }
+    }
+    worker.llm = SimpleNamespace(
+        collective_rpc=AsyncMock(return_value=[True]),
+        reset_encoder_cache=AsyncMock(side_effect=RuntimeError("reset failed")),
+    )
+
+    assert await worker.update_weights_from_collective_async() is False
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_nccl_reshard_refit_resets_encoder_cache():
+    """NCCL-reshard refits invalidate encoder outputs just like other transports."""
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "vllm_cfg": {
+            "async_engine": True,
+            "reset_encoder_cache_after_weight_update": True,
+        }
+    }
+    worker.llm = SimpleNamespace(
+        collective_rpc=AsyncMock(return_value=[True]),
+        reset_encoder_cache=AsyncMock(),
+    )
+
+    assert await worker.nccl_reshard_refit_async() is True
+    worker.llm.reset_encoder_cache.assert_awaited_once_with()
 
 
 @pytest.mark.vllm
