@@ -17,8 +17,9 @@
 Selects the appropriate weight synchronizer based on the deployment
 topology (colocated vs. non-colocated) and the generation backend:
 
-- vLLM / Megatron colocated -> IPC (ZMQ + CUDA IPC handles)
-- vLLM / Megatron non-colocated -> NCCL collective
+- Megatron -> Megatron reshard synchronizer
+- vLLM colocated -> IPC (ZMQ + CUDA IPC handles)
+- vLLM non-colocated -> NCCL collective
 - SGLang colocated -> Ray CUDA-IPC bucket transfer
 - SGLang non-colocated -> NCCL broadcast over SGLang's own weight-update group
 """

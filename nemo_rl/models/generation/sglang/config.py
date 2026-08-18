@@ -17,7 +17,7 @@ from typing import Any, Literal, NotRequired, TypedDict
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
-class SglangQuantizationConfig(TypedDict, total=False):
+class SglangQuantizationConfig(TypedDict):
     """SGLang weight precision. Only BF16 on this layer."""
 
     scheme: Literal["bf16"]
@@ -26,16 +26,12 @@ class SglangQuantizationConfig(TypedDict, total=False):
 SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16"})
 
 
-def get_sglang_quantization_scheme(quantization_config: dict[str, Any] | None) -> str:
+def get_sglang_quantization_scheme(quantization_config: dict[str, Any]) -> str:
     """Return the configured SGLang weight precision.
 
-    Absent or empty means BF16; a non-empty block must declare a supported
-    ``scheme`` so a typo raises instead of silently falling back.
+    The block must declare a supported ``scheme`` so omissions and typos fail.
     """
-    if not quantization_config:
-        return "bf16"
-
-    scheme = quantization_config.get("scheme")
+    scheme = quantization_config["scheme"]
     if scheme not in SUPPORTED_SGLANG_QUANTIZATION_SCHEMES:
         supported = ", ".join(sorted(SUPPORTED_SGLANG_QUANTIZATION_SCHEMES))
         raise ValueError(
@@ -56,7 +52,8 @@ class SGLangServerConfig(TypedDict):
     sglang_server_concurrency: int
     # How to handle in-flight requests on pause, as accepted by SGLang's
     # /pause_generation: "abort" (drop them), "retract" (requeue, KV cache may
-    # be flushed) or "in_place" (keep them and their KV cache). Required in YAML.
+    # be flushed) or "in_place" (keep them and their KV cache). Weight refit
+    # rejects in_place because cached entries would outlive their source weights.
     pause_generation_mode: Literal["abort", "retract", "in_place"]
     # Total number of GPUs allocated to inference across all engines.
     num_gpus: NotRequired[int]
@@ -102,8 +99,8 @@ class SglangSpecificArgs(TypedDict):
     sglang_server_config: SGLangServerConfig
     sglang_router_config: SGLangRouterConfig
 
-    # Weight precision for rollout/refit; absent means BF16.
-    quantization: NotRequired[SglangQuantizationConfig]
+    # Weight precision for rollout/refit.
+    quantization: SglangQuantizationConfig
 
     # Path to model weights (local folder or HF repo id).
     model_path: NotRequired[str]

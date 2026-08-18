@@ -1028,7 +1028,8 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy preparation: {e}")
             return False
 
-    def pause_generation(self) -> None:
+    def pause_generation(self, mode: str) -> None:
+        del mode
         pass
 
     def continue_generation(self) -> None:

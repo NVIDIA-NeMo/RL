@@ -432,7 +432,7 @@ class GenerationInterface(ABC):
         """Shut down generation resources; repeated calls must be safe."""
         pass
 
-    def pause_generation(self) -> None:
+    def pause_generation(self, mode: str) -> None:
         """Pause in-flight generation on the backend."""
         raise NotImplementedError
 

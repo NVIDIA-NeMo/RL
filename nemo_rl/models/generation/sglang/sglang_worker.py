@@ -354,7 +354,7 @@ class SGLangGenerationWorker:
             payload,
         )
 
-    def pause_generation(self, mode: str = "retract"):
+    def pause_generation(self, mode: str):
         response = requests.post(
             f"{self.server_base_url}/pause_generation",
             json={"mode": mode},
