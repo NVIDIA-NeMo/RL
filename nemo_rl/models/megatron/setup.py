@@ -321,6 +321,14 @@ def setup_distributed() -> None:
     torch.distributed.init_process_group("nccl")
 
 
+def configure_refit_environment(config) -> None:
+    """Set the refit allocator mode before NCCL caches the value."""
+    generation_cfg = config.get("generation")
+    if generation_cfg is not None and not generation_cfg["colocated"]["enabled"]:
+        backend = generation_cfg.get("backend")
+        os.environ["NCCL_CUMEM_ENABLE"] = "0" if backend == "sglang" else "1"
+
+
 def validate_and_set_config(
     config,
     rank,
@@ -331,23 +339,17 @@ def validate_and_set_config(
 ):
     # Handle generation configuration
     is_generation_colocated = None
-    rollout_backend = None
     sampling_params = None
     if "generation" in config and config["generation"] is not None:
         generation_cfg = config["generation"]
         # set generation colocated
         is_generation_colocated = generation_cfg["colocated"]["enabled"]
-        rollout_backend = generation_cfg.get("backend")
         # set sampling params
         sampling_params = TrainingSamplingParams(
             top_k=generation_cfg["top_k"],
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
         )
-
-    # Select the transport for the later non-colocated refit communicator.
-    if not is_generation_colocated:
-        os.environ["NCCL_CUMEM_ENABLE"] = "0" if rollout_backend == "sglang" else "1"
 
     # Setup data types
     dtype_map = {
