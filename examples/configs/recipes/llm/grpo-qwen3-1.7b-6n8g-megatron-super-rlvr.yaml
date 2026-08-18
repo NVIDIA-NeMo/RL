@@ -8,7 +8,7 @@
 #              genrm dp=2×tp=8 (2 nodes) + nl2bash dp=2×tp=8 (2 nodes) + safety dp=8×tp=1 (1 node)
 #
 # Data: nvidia/Nemotron-RL-Super-Training-Blends (rlvr1 split).
-# See docs/guides/nemotron-3-super.md for download instructions.
+# See docs/guides/models/nemotron/nemotron-3-super.md for download instructions.
 defaults: ../../../nemo_gym/nemotron-3-super/stage1_rlvr.yaml
 
 checkpointing:

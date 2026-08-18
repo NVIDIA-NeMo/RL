@@ -47,6 +47,9 @@ ppo:
     source_max: 1.0
     target_min: -1.0  # DAPO: scale rewards to [-1, 1]
     target_max: 1.0
+  # Log train/generation probability mismatch. Set a threshold to mask
+  # high-error sequences; null keeps metrics-only behavior.
+  seq_logprob_error_threshold: null
 
 loss_fn:
   disable_ppo_ratio: false
@@ -125,6 +128,15 @@ policy:
     enabled: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
+    # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when enabled; null disables module selection. Common
+    # examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"]. Supported
+    # names depend on the pinned Megatron-LM version and are validated by MCore.
+    # "attn_proj" requires "core_attn". See the latest upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
     converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
@@ -234,6 +246,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
@@ -313,6 +328,15 @@ value:
     enabled: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
+    # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when enabled; null disables module selection. Common
+    # examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"]. Supported
+    # names depend on the pinned Megatron-LM version and are validated by MCore.
+    # "attn_proj" requires "core_attn". See the latest upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -461,3 +485,9 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  # Port range for the distributed master address (TCPStore / NCCL rendezvous)
+  # and per-worker available ports.  Kept below the OS ephemeral range
+  # (32768-60999 on stock Linux).  See ray.sub for the full port layout.
+  master_port_range_low: 1400
+  master_port_range_high: 1999
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

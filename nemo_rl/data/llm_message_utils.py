@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,15 +26,34 @@ from nemo_rl.data.interfaces import (
 )
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
-    get_dim_to_pack_along,
+    extract_multimodal_model_inputs,
     get_multimodal_default_settings_from_processor,
-    get_multimodal_keys_from_processor,
     load_media_from_message,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = torch.Tensor
 TokenizerType = PreTrainedTokenizerBase
+
+
+def _validated_packed_values(key: str, values: list[Any]) -> list[PackedTensor]:
+    """Return packed values while rejecting mixed non-empty representations."""
+    if not any(isinstance(value, PackedTensor) for value in values):
+        return []
+
+    packed_values: list[PackedTensor] = []
+    invalid_types: list[str] = []
+    for value in values:
+        if isinstance(value, PackedTensor):
+            packed_values.append(value)
+        elif value is not None:
+            invalid_types.append(type(value).__name__)
+    if invalid_types:
+        raise TypeError(
+            f"Packed multimodal key {key!r} also contains non-packed "
+            f"values: {invalid_types}"
+        )
+    return packed_values
 
 
 def message_log_to_flat_messages(
@@ -115,9 +134,10 @@ def message_log_to_flat_messages(
                         f"tensors for {key=} must have same number of dimensions: {[t.shape for t in result[key]]}"
                     ) from e
                 raise
-        elif result[key] and isinstance(result[key][0], PackedTensor):
+        packed_values = _validated_packed_values(key, result[key])
+        if packed_values:
             try:
-                concat[key] = PackedTensor.concat(result[key])
+                concat[key] = PackedTensor.merge_segments(packed_values)
             except Exception as e:
                 raise RuntimeError(
                     f"Error concatenating packed multimodal data for {key=}"
@@ -363,9 +383,21 @@ def batched_message_log_to_flat_message(
     result = BatchedDataDict()
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
-        # if the values are PackedTensors, create a new PackedTensor from the list of values
-        if values and isinstance(values[0], PackedTensor):
-            result[key] = PackedTensor.flattened_concat(values)
+        packed_values = _validated_packed_values(key, values)
+        # Preserve one logical row for conversations missing this media key.
+        # Async replay may concatenate text-only and multimodal prompt groups in
+        # either order, so the first row cannot determine the value type.
+        if packed_values:
+            template = packed_values[0]
+            aligned_values = [
+                (
+                    value
+                    if isinstance(value, PackedTensor)
+                    else PackedTensor.empty_rows_like(template, 1)
+                )
+                for value in values
+            ]
+            result[key] = PackedTensor.flattened_concat(aligned_values)
             continue
         if not values or not isinstance(values[0], Tensor):
             result[key] = values
@@ -460,7 +492,6 @@ def get_formatted_message_log(
         list[dict[str, str]], message_log
     )  # we just use the str:str parts here
 
-    multimodal_keys = get_multimodal_keys_from_processor(tokenizer)
     multimodal_load_kwargs = get_multimodal_default_settings_from_processor(tokenizer)
 
     def _format_content_helper(
@@ -625,20 +656,9 @@ def get_formatted_message_log(
             )
             new_message["token_ids"] = processed_chunk["input_ids"][0]
 
-            # add all vlm keys to the message
-            for key in multimodal_keys:
-                if key in processed_chunk:
-                    # token_type_ids and mm_token_type_ids are sequence-length tensors
-                    # (one label per token), not visual patch tensors. They must be
-                    # stored as plain tensors and padded like input_ids rather than
-                    # packed as multimodal data. This mirrors processors.py behavior.
-                    if key in ("token_type_ids", "mm_token_type_ids"):
-                        new_message[key] = processed_chunk[key][0]
-                    else:
-                        new_message[key] = PackedTensor(
-                            processed_chunk[key],
-                            dim_to_pack=get_dim_to_pack_along(tokenizer, key),
-                        )
+            new_message.update(
+                extract_multimodal_model_inputs(tokenizer, dict(processed_chunk))
+            )
 
         if len(new_message["token_ids"]) == 0:
             # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,
