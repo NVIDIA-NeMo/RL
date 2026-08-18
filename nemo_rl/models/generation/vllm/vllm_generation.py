@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,6 +42,11 @@ from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
+)
+from nemo_rl.utils.multimodal_payload_metrics import (
+    collect_multimodal_payload_metrics,
+    collect_sharded_multimodal_payload_metrics,
+    print_multimodal_payload_metrics,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -638,6 +643,13 @@ class VllmGeneration(GenerationInterface):
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
         )
+        print_multimodal_payload_metrics(
+            collect_sharded_multimodal_payload_metrics(
+                sharded_data,
+                "vllm_generation",
+                enabled=bool(self.cfg.get("_debug_payload_metrics")),
+            )
+        )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate",
             data=sharded_data,
@@ -688,6 +700,13 @@ class VllmGeneration(GenerationInterface):
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
+        )
+        print_multimodal_payload_metrics(
+            collect_sharded_multimodal_payload_metrics(
+                sharded_data,
+                "vllm_text_generation",
+                enabled=bool(self.cfg.get("_debug_payload_metrics")),
+            )
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_text",
@@ -758,6 +777,13 @@ class VllmGeneration(GenerationInterface):
         leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
             self.current_generate_dp_shard_idx
         )
+        print_multimodal_payload_metrics(
+            collect_multimodal_payload_metrics(
+                data,
+                "vllm_generation_async",
+                enabled=bool(self.cfg.get("_debug_payload_metrics")),
+            )
+        )
 
         # Run the async method on the selected leader worker
         worker_gen_proxy = self.worker_group.run_single_worker_single_data(
@@ -776,34 +802,40 @@ class VllmGeneration(GenerationInterface):
             os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "900")
         )  # Default 15 minutes
 
+        # Propagate cancellation to the Ray worker and its vLLM request.
         try:
-            sample_result_ref = await anext(worker_gen_proxy)
-        except StopAsyncIteration:
-            raise RuntimeError(
-                f"Worker produced no output for the given sample {data}."
-            )
+            try:
+                sample_result_ref = await anext(worker_gen_proxy)
+            except StopAsyncIteration:
+                raise RuntimeError(
+                    f"Worker produced no output for the given sample {data}."
+                )
 
-        # Materialize the result from Ray's object store. ``anext`` above
-        # resolves when the worker yields, but the object bytes have not yet
-        # crossed the network to the driver — this is where that happens, and
-        # where a Ray deadlock / unreachable worker would manifest, hence the
-        # timeout.
-        try:
-            sample_result = await asyncio.wait_for(
-                sample_result_ref, timeout=timeout_seconds
-            )
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"Timeout waiting for worker results after {timeout_seconds}s. "
-                f"For longer sequences, increase timeout by setting: "
-                f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
-                f"{int(timeout_seconds * 2)}"
-            )
+            # Materialize the result from Ray's object store. ``anext`` above
+            # resolves when the worker yields, but the object bytes have not yet
+            # crossed the network to the driver — this is where that happens, and
+            # where a Ray deadlock / unreachable worker would manifest, hence the
+            # timeout.
+            try:
+                sample_result = await asyncio.wait_for(
+                    sample_result_ref, timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                ray.cancel(worker_gen_proxy)
+                raise RuntimeError(
+                    f"Timeout waiting for worker results after {timeout_seconds}s. "
+                    f"For longer sequences, increase timeout by setting: "
+                    f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
+                    f"{int(timeout_seconds * 2)}"
+                )
 
-        # sample_result is a tuple: (original_idx, BatchedDataDict).
-        original_idx, result_batch = sample_result
-        result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
-        yield (original_idx, result_batch)
+            # sample_result is a tuple: (original_idx, BatchedDataDict).
+            original_idx, result_batch = sample_result
+            result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
+            yield (original_idx, result_batch)
+        except (asyncio.CancelledError, GeneratorExit):
+            ray.cancel(worker_gen_proxy)
+            raise
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -909,6 +941,9 @@ class VllmGeneration(GenerationInterface):
                 self.weight_synchronizer.shutdown()
             # Use the worker group's shutdown method with the worker's cleanup method
             return self.worker_group.shutdown(cleanup_method="shutdown")
+        except ray.exceptions.RayActorError:
+            # Workers already dead (e.g., shut down via another handle to the same actors).
+            return True
         except Exception as e:
             print(f"Error during policy shutdown: {e}")
             return False
@@ -972,6 +1007,76 @@ class VllmGeneration(GenerationInterface):
         )
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
+        return futures
+
+    def init_nccl_reshard_comm_group(
+        self,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Initialize the nccl_reshard bulk-path comm group(s) on all gen workers.
+
+        One group per PP stage (non-PP = ``pp_size`` 1).
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        method_name = (
+            "init_nccl_reshard_comm_group_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "init_nccl_reshard_comm_group"
+        )
+
+        total_workers = len(self.worker_group.workers)
+        workers_per_group = total_workers // self.dp_size
+        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+
+        futures = self.worker_group.run_all_workers_multiple_data(
+            method_name,
+            rank_prefix=rank_prefix_list,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            common_kwargs={
+                "pp_ips": pp_ips,
+                "pp_ports": pp_ports,
+                "pp_size": pp_size,
+                "train_ranks_per_stage": train_ranks_per_stage,
+                "sub_world_size": sub_world_size,
+            },
+        )
+        # co-works with lm_policy; wait for all futures to complete outside
+        return futures
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Forward per-layer param metadata to vLLM workers for nccl_reshard refit."""
+        method_name = (
+            "prepare_nccl_reshard_refit_info_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "prepare_nccl_reshard_refit_info"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            refit_info=refit_info,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
+        """Receive weights from training workers via nccl_reshard (xferdtensor)."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        method_name = (
+            "nccl_reshard_refit_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "nccl_reshard_refit"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
         return futures
 
     def start_gpu_profiling(self) -> None:

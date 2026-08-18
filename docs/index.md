@@ -100,6 +100,13 @@ Reproduce DeepscaleR results with NeMo RL using GRPO on mathematical reasoning t
 Step-by-step guide for supervised fine-tuning on the OpenMathInstruct2 dataset.
 :::
 
+:::{grid-item-card} {octicon}`rocket` Nemotron 3 Ultra
+:link: guides/models/nemotron/nemotron-3-ultra
+:link-type: doc
+
+Post-train Nemotron 3 Ultra with RLVR, teacher training, and MOPD stages on GB200 NVL72 hardware.
+:::
+
 :::{grid-item-card} {octicon}`stack` Environments
 :link: guides/environments
 :link-type: doc
@@ -175,6 +182,13 @@ Choose among colocated IPC, NCCL, sparse delta, and NIXL refit transports.
 :link-type: doc
 
 Use NIXL checkpoint-engine refit to update non-colocated vLLM generation workers from policy workers.
+:::
+
+:::{grid-item-card} {octicon}`workflow` Single-Controller (Async GRPO)
+:link: guides/single-controller
+:link-type: doc
+
+Run async GRPO via the SingleController path: TransferQueue data plane, pluggable staleness samplers, and streaming trainer.
 :::
 
 ::::
@@ -275,9 +289,6 @@ guides/sft-openmathinstruct2.md
 ```{toctree}
 :caption: Guides
 
-guides/nemotron-3-nano.md
-guides/nemotron-3-nano-omni.md
-guides/nemotron-3-super.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
@@ -296,8 +307,19 @@ guides/rm.md
 guides/environments.md
 guides/eval.md
 guides/deepseek.md
+guides/models/index.md
+guides/models/nemotron/index.md
+guides/models/nemotron/nemotron-3-nano.md
+guides/models/nemotron/nemotron-3-nano-omni.md
+guides/models/nemotron/nemotron-3.5-lightning.md
+guides/models/nemotron/nemotron-3-super.md
+guides/models/nemotron/nemotron-3-super-omni-mopd.md
+guides/models/nemotron/nemotron-3-ultra.md
+guides/models/qwen/index.md
+guides/models/qwen/qwen3-5.md
 model-quirks.md
 guides/async-grpo.md
+guides/single-controller.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
@@ -348,6 +370,7 @@ design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
+design-docs/nccl-reshard-refit.md
 ```
 
 ```{toctree}

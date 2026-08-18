@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,17 +20,23 @@ import pytest
 import ray
 import requests
 import torch
+from PIL import Image
 from yaml import safe_load
 
 from nemo_rl.algorithms.grpo import MasterConfig
+from nemo_rl.data.multimodal_utils import PackedTensor, image_to_data_url
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    build_reward_component_columns,
+    extract_reward_components,
     setup_nemo_gym_config,
+    validate_reward_components_match_scalar,
 )
+from nemo_rl.experience.rollouts import _reattach_original_multimodal_payloads
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -41,6 +47,91 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+def test_extract_reward_components():
+    """The GDPO multi-reward bridge helper: None for single-reward, normalized dict otherwise."""
+    # Single-reward result (no reward_components) -> None, so callers use scalar reward.
+    assert extract_reward_components({"reward": 1.0}) is None
+    assert extract_reward_components({"reward": 1.0, "reward_components": {}}) is None
+
+    # Multi-reward result -> name->float dict (values coerced to float, keys to str).
+    components = extract_reward_components(
+        {
+            "reward": 2.0,
+            "reward_components": {"correctness": 1, "format": 0.5},
+        }
+    )
+    assert components == {"correctness": 1.0, "format": 0.5}
+    assert all(isinstance(v, float) for v in components.values())
+
+
+def test_build_reward_component_columns():
+    """The bridge emission helper: reward/<name> keys, 0.0-fill, deterministic order.
+
+    Guards the producer->consumer contract end to end — the keys built here must be
+    exactly what get_gdpo_reward_component_keys() selects (this is what would have caught
+    the earlier reward1/reward2 vs reward/<name> mismatch).
+    """
+    from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
+
+    # Keys are reward/<name>; one entry per sample; values preserved.
+    cols = build_reward_component_columns(
+        [
+            {"correctness": 1.0, "format": 0.0},
+            {"correctness": 0.0, "format": 1.0},
+        ]
+    )
+    assert set(cols) == {"reward/correctness", "reward/format"}
+    assert torch.equal(cols["reward/correctness"], torch.tensor([1.0, 0.0]))
+    assert torch.equal(cols["reward/format"], torch.tensor([0.0, 1.0]))
+
+    # Union across the batch, deterministic (sorted) order, 0.0-fill for missing
+    # components (and None samples).
+    cols = build_reward_component_columns([{"b": 2.0}, {"a": 1.0, "b": 3.0}, None])
+    assert list(cols.keys()) == ["reward/a", "reward/b"]
+    assert torch.equal(cols["reward/a"], torch.tensor([0.0, 1.0, 0.0]))
+    assert torch.equal(cols["reward/b"], torch.tensor([2.0, 3.0, 0.0]))
+
+    # The emitted keys are exactly what GDPO's consumer selects.
+    assert get_gdpo_reward_component_keys(cols) == ["reward/a", "reward/b"]
+
+    # No components anywhere -> no columns (single-reward path is untouched).
+    assert build_reward_component_columns([None, None]) == {}
+
+
+def test_validate_reward_components_match_scalar():
+    """Multi-reward verifiers must set reward == sum(reward_components); mismatch raises."""
+    # Contract satisfied: reward equals the component sum -> no error.
+    validate_reward_components_match_scalar(
+        [{"reward": 1.5, "reward_components": {"correctness": 1.0, "format": 0.5}}]
+    )
+    # Float tolerance: tiny rounding differences are accepted.
+    validate_reward_components_match_scalar(
+        [
+            {
+                "reward": 1.5000001,
+                "reward_components": {"correctness": 1.0, "format": 0.5},
+            }
+        ]
+    )
+    # Single-reward results (no reward_components) are skipped entirely.
+    validate_reward_components_match_scalar([{"reward": 2.0}])
+
+    # Mismatch (scalar reward != component sum) -> ValueError naming the offending index.
+    with pytest.raises(ValueError, match="result 1"):
+        validate_reward_components_match_scalar(
+            [
+                {
+                    "reward": 1.5,
+                    "reward_components": {"correctness": 1.0, "format": 0.5},
+                },
+                {
+                    "reward": 2.0,
+                    "reward_components": {"correctness": 1.0, "format": 0.5},
+                },
+            ]
+        )
 
 
 @pytest.mark.nemo_gym
@@ -102,7 +193,6 @@ openai_model:
       model: ${policy_model_name}
       return_token_id_information: true
       uses_reasoning_parser: true
-rollout_max_attempts_to_avoid_lp_nan: 1
 """
 
     config = NemoGymConfig(
@@ -206,7 +296,7 @@ def test_nemo_gym_postprocess_uses_batch_decode():
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), nemo_gym_result, tokenizer
+            _MockSelf(), {}, nemo_gym_result, tokenizer
         )
     )
 
@@ -222,6 +312,293 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
+
+
+@pytest.mark.parametrize("include_initial_multimodal_data", [False, True])
+def test_nemo_gym_dedup_redacts_initial_images_from_actor_return(
+    include_initial_multimodal_data,
+):
+    data_url = image_to_data_url(Image.new("RGB", (2, 2), color="red"))
+    initial_input = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "count"},
+                {"type": "input_image", "image_url": data_url},
+            ],
+        }
+    ]
+    nemo_gym_result = {
+        "response": {
+            "agent_input": deepcopy(initial_input),
+            "seed_obs": deepcopy(initial_input),
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                }
+            ],
+        },
+        "responses_create_params": {"input": deepcopy(initial_input)},
+        "reward": 1.0,
+    }
+
+    class _Tokenizer:
+        def batch_decode(self, batch):
+            return ["decoded"] * len(batch)
+
+    class _MockSelf:
+        cfg = {}
+        _processor = None
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(),
+            {},
+            nemo_gym_result,
+            _Tokenizer(),
+            include_initial_multimodal_data=include_initial_multimodal_data,
+        )
+    )
+
+    if include_initial_multimodal_data:
+        assert "_initial_multimodal_data_omitted" not in result
+        assert data_url in json.dumps(result["full_result"])
+    else:
+        assert result["_initial_multimodal_data_omitted"] is True
+        assert data_url not in json.dumps(result["full_result"])
+        assert result["full_result"]["responses_create_params"]["input"][0][
+            "content"
+        ] == [{"type": "input_text", "text": "count"}]
+
+
+def test_nemo_gym_dedup_omits_actor_initial_tensor_and_preserves_later_media():
+    initial_url = image_to_data_url(Image.new("RGB", (1, 1), color=(1, 0, 0)))
+    tool_url = image_to_data_url(Image.new("RGB", (1, 1), color=(2, 0, 0)))
+    initial_input = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "inspect"},
+                {"type": "input_image", "image_url": initial_url},
+            ],
+        }
+    ]
+    template = {
+        "response": {
+            "agent_input": deepcopy(initial_input),
+            "seed_obs": deepcopy(initial_input),
+            "output": [
+                {
+                    "prompt_token_ids": [1],
+                    "generation_token_ids": [2],
+                    "generation_log_probs": [-0.1],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": tool_url},
+                    ],
+                },
+                {
+                    "prompt_token_ids": [1, 2, 3],
+                    "generation_token_ids": [4],
+                    "generation_log_probs": [-0.2],
+                },
+            ],
+        },
+        "responses_create_params": {"input": deepcopy(initial_input)},
+        "reward": 1.0,
+    }
+
+    class _Tokenizer:
+        def batch_decode(self, batch):
+            return ["decoded"] * len(batch)
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class _TextTokenizer:
+        model_input_names = ["input_ids"]
+
+    class _Processor:
+        image_token = "<image>"
+        image_processor = _ImageProcessor()
+        tokenizer = _TextTokenizer()
+        model_input_names = ["input_ids", "pixel_values"]
+
+        def __call__(self, *, text, images, return_tensors):
+            assert text == "<image>" * len(images)
+            assert return_tensors == "pt"
+            red_values = [image.getpixel((0, 0))[0] for image in images]
+            return {
+                "input_ids": torch.tensor([[1]]),
+                "pixel_values": torch.tensor(red_values, dtype=torch.float32).view(
+                    -1, 1
+                ),
+            }
+
+    class _MockSelf:
+        cfg = {}
+        _processor = _Processor()
+
+    postprocess = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
+    )
+    flag_off = postprocess(
+        _MockSelf(),
+        {},
+        deepcopy(template),
+        _Tokenizer(),
+        include_initial_multimodal_data=True,
+    )
+    flag_on = postprocess(
+        _MockSelf(),
+        {},
+        deepcopy(template),
+        _Tokenizer(),
+        include_initial_multimodal_data=False,
+    )
+
+    off_users = [
+        message for message in flag_off["message_log"] if message["role"] == "user"
+    ]
+    on_users = [
+        message for message in flag_on["message_log"] if message["role"] == "user"
+    ]
+    assert off_users[0]["pixel_values"].as_tensor().item() == 1
+    assert off_users[1]["pixel_values"].as_tensor().item() == 2
+    assert "pixel_values" not in on_users[0]
+    assert on_users[1]["pixel_values"].as_tensor().item() == 2
+    assert initial_url not in json.dumps(flag_on["full_result"])
+    assert tool_url in json.dumps(flag_on["full_result"])
+
+    original_media = PackedTensor(torch.tensor([[99.0]]), dim_to_pack=0)
+    _reattach_original_multimodal_payloads(
+        [flag_on],
+        [[{"role": "user", "content": "", "pixel_values": original_media}]],
+    )
+    on_users = [
+        message for message in flag_on["message_log"] if message["role"] == "user"
+    ]
+    assert on_users[0]["pixel_values"] is original_media
+    assert on_users[1]["pixel_values"].as_tensor().item() == 2
+
+
+@pytest.mark.parametrize(
+    ("seed_mode", "expected_pixel_values"),
+    [
+        ("text_only", None),
+        ("initial_plus_additional", [1.0, 2.0]),
+    ],
+)
+def test_nemo_gym_dedup_keeps_authoritative_changed_seed_media(
+    seed_mode, expected_pixel_values
+):
+    initial_url = image_to_data_url(Image.new("RGB", (1, 1), color=(1, 0, 0)))
+    additional_url = image_to_data_url(Image.new("RGB", (1, 1), color=(2, 0, 0)))
+    initial_input = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "inspect"},
+                {"type": "input_image", "image_url": initial_url},
+            ],
+        }
+    ]
+    if seed_mode == "text_only":
+        seed_obs = [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "text only"}],
+            }
+        ]
+    else:
+        seed_obs = deepcopy(initial_input)
+        seed_obs[0]["content"].append(
+            {"type": "input_image", "image_url": additional_url}
+        )
+
+    nemo_gym_result = {
+        "response": {
+            "agent_input": deepcopy(initial_input),
+            "seed_obs": seed_obs,
+            "output": [
+                {
+                    "prompt_token_ids": [1],
+                    "generation_token_ids": [2],
+                    "generation_log_probs": [-0.1],
+                }
+            ],
+        },
+        "responses_create_params": {"input": deepcopy(initial_input)},
+        "reward": 1.0,
+    }
+
+    class _Tokenizer:
+        def batch_decode(self, batch):
+            return ["decoded"] * len(batch)
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class _TextTokenizer:
+        model_input_names = ["input_ids"]
+
+    class _Processor:
+        image_token = "<image>"
+        image_processor = _ImageProcessor()
+        tokenizer = _TextTokenizer()
+        model_input_names = ["input_ids", "pixel_values"]
+
+        def __call__(self, *, text, images, return_tensors):
+            assert text == "<image>" * len(images)
+            assert return_tensors == "pt"
+            red_values = [image.getpixel((0, 0))[0] for image in images]
+            return {
+                "input_ids": torch.tensor([[1]]),
+                "pixel_values": torch.tensor(red_values, dtype=torch.float32).view(
+                    -1, 1
+                ),
+            }
+
+    class _MockSelf:
+        cfg = {}
+        _processor = _Processor()
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(),
+            {},
+            nemo_gym_result,
+            _Tokenizer(),
+            include_initial_multimodal_data=False,
+        )
+    )
+
+    assert result["_initial_multimodal_data_omitted"] is False
+    user_message = next(
+        message for message in result["message_log"] if message["role"] == "user"
+    )
+    if expected_pixel_values is None:
+        assert "pixel_values" not in user_message
+    else:
+        assert user_message["pixel_values"].as_tensor().flatten().tolist() == (
+            expected_pixel_values
+        )
+
+    original_media = PackedTensor(torch.tensor([[99.0]]), dim_to_pack=0)
+    _reattach_original_multimodal_payloads(
+        [result],
+        [[{"role": "user", "content": "", "pixel_values": original_media}]],
+    )
+    if expected_pixel_values is None:
+        assert "pixel_values" not in user_message
+    else:
+        assert user_message["pixel_values"].as_tensor().flatten().tolist() == (
+            expected_pixel_values
+        )
 
 
 def test_nemo_gym_postprocess_no_generation_data_raises():
@@ -248,7 +625,7 @@ def test_nemo_gym_postprocess_no_generation_data_raises():
 
     with pytest.raises(ValueError) as excinfo:
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), nemo_gym_result, _Tokenizer()
+            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
         )
 
     msg = str(excinfo.value)
@@ -277,7 +654,7 @@ def test_nemo_gym_postprocess_no_generation_data_chat_template_failure():
 
     with pytest.raises(ValueError) as excinfo:
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), nemo_gym_result, _Tokenizer()
+            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
         )
 
     msg = str(excinfo.value)
@@ -309,11 +686,12 @@ def test_nemo_gym_sanity(
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
         example["_rowidx"] = idx
 
-    actual_result, _ = ray.get(
-        nemo_gym.run_rollouts.remote(
-            nemo_gym_sanity_test_data["input"], nemo_gym_tokenizer, ""
-        )
-    )
+    actual_result = [None] * len(nemo_gym_sanity_test_data["input"])
+    for result_ref in nemo_gym.run_rollouts.options(num_returns="streaming").remote(
+        nemo_gym_sanity_test_data["input"], nemo_gym_tokenizer, ""
+    ):
+        rowidx, result, _ = ray.get(result_ref)
+        actual_result[rowidx] = result
     expected_result = nemo_gym_sanity_test_data["expected_output"]
 
     # These are tensors originally and we swap them back to a list for comparison below

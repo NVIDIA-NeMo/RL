@@ -64,6 +64,19 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 logger = logging.getLogger(__name__)
 
 
+def _context_capped_max_new_tokens(
+    *, configured_max_new_tokens: int, input_length: int, max_model_len: int
+) -> int:
+    """Cap generation so the training prompt and response fit the context."""
+    remaining_context = max_model_len - input_length
+    if remaining_context <= 0:
+        raise ValueError(
+            "Cannot generate from an input whose training length exhausts the "
+            f"model context: input_length={input_length}, max_model_len={max_model_len}."
+        )
+    return min(configured_max_new_tokens, remaining_context)
+
+
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     enable_prefix_caching = vllm_cfg.get("enable_prefix_caching", None)
     if enable_prefix_caching is None:
@@ -184,6 +197,14 @@ class BaseVllmGenerationWorker:
                 # The engine spans several nodes. Each engine's rank-0 process is
                 # on a different node, so every such engine can use node-local
                 # slot 0 without colliding.
+                #
+                # These engines are also the ones exposed to the vLLM 0.25
+                # TCPStore/MessageQueue collision within a single engine's window
+                # (see _patch_vllm_ray_executor_v2_tcpstore_port in patches.py).
+                # That is fixed by offsetting the TCPStore search, deliberately
+                # *not* by dropping VLLM_PORT: an unset VLLM_PORT sends vLLM to
+                # kernel-ephemeral ports, which is the TOCTOU contention this port
+                # layout exists to avoid (#2380, #3103).
                 engine_index_on_node = 0
             elif mp_size == 1:
                 engine_index_on_node = local_bundle_indices[0] % num_gpus_per_node
@@ -355,6 +376,21 @@ class BaseVllmGenerationWorker:
 
             configure_nixl_worker(self.cfg, vllm_kwargs)
 
+        # A speculative_config with num_speculative_tokens == 0 is the supported
+        # way to disable speculative decoding (e.g. MTP) from a launch script
+        # without restructuring the config. Drop it so vLLM runs without a drafter.
+        speculative_config = vllm_kwargs.get("speculative_config")
+        if (
+            isinstance(speculative_config, dict)
+            and speculative_config.get("num_speculative_tokens") == 0
+        ):
+            vllm_kwargs["speculative_config"] = None
+            if not _resolve_enable_prefix_caching(self.cfg["vllm_cfg"]):
+                logger.warning(
+                    "Speculative decoding is disabled (num_speculative_tokens=0); "
+                    "consider enabling prefix caching for better generation performance."
+                )
+
         # Calculate total parallel size (TP * PP)
         model_parallel_size = self.tensor_parallel_size * self.pipeline_parallel_size
 
@@ -411,7 +447,7 @@ class BaseVllmGenerationWorker:
         # weights via refit, but the MTP draft layer is not covered by refit, so
         # those layers are loaded directly from the checkpoint after engine init
         # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
-        spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config")
+        spec_cfg = vllm_kwargs.get("speculative_config")
         mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
         self._mtp_load_from_disk: bool = (
             load_format == "dummy"
@@ -581,9 +617,12 @@ class BaseVllmGenerationWorker:
             enable_sleep_mode=True,
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
-            logprobs_mode="processed_logprobs",
             **vllm_kwargs,
         )
+
+        logprobs_mode = self.cfg["vllm_cfg"].get("logprobs_mode")
+        if logprobs_mode is not None:
+            llm_kwargs["logprobs_mode"] = logprobs_mode
 
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
@@ -642,6 +681,7 @@ class BaseVllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
+            bad_words=self.cfg.get("bad_words"),
             ignore_eos=self.cfg.get("ignore_eos", False),
         )
 
@@ -656,6 +696,49 @@ class BaseVllmGenerationWorker:
         torch.cuda.profiler.stop()
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
+
+    @staticmethod
+    def _spec_decode_max_tokens(
+        base_max_tokens: int,
+        input_len: int,
+        max_model_len: int,
+        spec_lookahead: int,
+    ) -> int:
+        """Clamp max_tokens so speculative decoding never reads past max_model_len.
+
+        The drafter looks `spec_lookahead` tokens ahead, so generation must stop
+        at least `spec_lookahead + 1` tokens before the boundary.
+        """
+        return max(
+            1, min(base_max_tokens, max_model_len - input_len - (spec_lookahead + 1))
+        )
+
+    @classmethod
+    def _request_max_new_tokens(
+        cls,
+        *,
+        configured_max_new_tokens: int,
+        input_length: int,
+        max_model_len: int,
+        cap_to_context: bool,
+        spec_lookahead: int,
+    ) -> int:
+        """Apply context and speculative-decoding limits to one request."""
+        max_new_tokens = configured_max_new_tokens
+        if cap_to_context:
+            max_new_tokens = _context_capped_max_new_tokens(
+                configured_max_new_tokens=max_new_tokens,
+                input_length=input_length,
+                max_model_len=max_model_len,
+            )
+        if spec_lookahead > 0:
+            max_new_tokens = cls._spec_decode_max_tokens(
+                max_new_tokens,
+                input_length,
+                max_model_len,
+                spec_lookahead,
+            )
+        return max_new_tokens
 
     @staticmethod
     def _patch_vllm_nsight_config() -> None:
@@ -815,24 +898,54 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         input_lengths = data["input_lengths"]
         batch_stop_strings: list[list[str]] = data.get("stop_strings", [])
         stop_strings = self._merge_stop_strings(batch_stop_strings)
-        sampling_params = self._build_sampling_params(
-            greedy=greedy,
-            stop_strings=stop_strings,
-        )
 
+        # vLLM Eagle3 spec decode hits a CUDA illegal memory access when a
+        # request's total length reaches max_model_len (the drafter looks ahead
+        # past the boundary). Clamp per-request max_tokens so speculative
+        # requests stop short of the boundary by the drafter lookahead.
+        spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
+        spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
         # Original input length with padding
         padded_input_length = input_ids.size(1)
 
-        # Convert inputs to vLLM format
-        prompts = format_prompt_for_vllm_generation(data)
-
-        # Generate outputs
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
+        cap_to_context = bool(self.cfg["vllm_cfg"].get("cap_max_tokens_to_context"))
+        if cap_to_context or spec_lookahead > 0:
+            max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+            configured_max_new_tokens = int(self.cfg["max_new_tokens"])
+            per_request_max_new_tokens = []
+            for input_length in input_lengths.tolist():
+                per_request_max_new_tokens.append(
+                    self._request_max_new_tokens(
+                        configured_max_new_tokens=configured_max_new_tokens,
+                        input_length=int(input_length),
+                        max_model_len=max_model_len,
+                        cap_to_context=cap_to_context,
+                        spec_lookahead=spec_lookahead,
+                    )
+                )
+
+            sampling_params = [
+                self._build_sampling_params(
+                    greedy=greedy,
+                    stop_strings=stop_strings,
+                    max_new_tokens=max_new_tokens,
+                )
+                for max_new_tokens in per_request_max_new_tokens
+            ]
+        else:
+            sampling_params = self._build_sampling_params(
+                greedy=greedy,
+                stop_strings=stop_strings,
+            )
+
+        # Convert inputs to vLLM format and generate outputs.
+        prompts = format_prompt_for_vllm_generation(data)
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
         outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
@@ -1078,11 +1191,11 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 "update_weights_via_ipc_zmq",
                 args=tuple(),
             )
-            worker_result = result_or_coro[0]
+            worker_results = cast(list[bool], result_or_coro)
 
-            if not worker_result:
+            if not worker_results or not all(worker_results):
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
             return True
@@ -1109,16 +1222,65 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_from_collective", args=tuple()
             )
-            worker_result = result_or_coro[0]
+            worker_results = cast(list[bool], result_or_coro)
 
-            if not worker_result:
+            if not worker_results or not all(worker_results):
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    def init_nccl_reshard_comm_group(
+        self,
+        rank_prefix: int,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        """Forward nccl_reshard bulk-path comm group init to vLLM backend workers."""
+        self.llm.collective_rpc(
+            "init_nccl_reshard_comm_group",
+            args=(
+                rank_prefix,
+                pp_ips,
+                pp_ports,
+                pp_size,
+                train_ranks_per_stage,
+                sub_world_size,
+            ),
+        )
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Forward refit info to vLLM backend workers."""
+        self.llm.collective_rpc("prepare_nccl_reshard_refit_info", args=(refit_info,))
+
+    def nccl_reshard_refit(self) -> bool:
+        """Receive weights from training workers via nccl_reshard (xferdtensor)."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            result_or_coro = self.llm.collective_rpc("nccl_reshard_refit", args=tuple())
+            worker_result = result_or_coro[0]
+
+            if not worker_result:
+                print(
+                    f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during nccl_reshard_refit: {e}")
             import traceback
 
             traceback.print_exc()

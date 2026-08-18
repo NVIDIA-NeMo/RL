@@ -15,6 +15,7 @@
 import pytest
 import torch
 
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 # ---------------------------------------------------------------------------
@@ -110,6 +111,131 @@ def test_compute_teacher_logprobs_dp_padding(batch_size, dp_size):
 
     assert result.shape == (batch_size, S)
     assert torch.allclose(result, torch.tensor(2.0))
+
+
+class _RecordingTeacherWorkerGroup(_MockTeacherWorkerGroup):
+    """Capture the batch passed to a teacher for row-alignment assertions."""
+
+    def __init__(self, fill_value=1.0, dp_size=4):
+        super().__init__(fill_value=fill_value, dp_size=dp_size)
+        self.received: BatchedDataDict | None = None
+
+    def get_logprobs(self, data):
+        self.received = data
+        return super().get_logprobs(data)
+
+
+def _row_marked_packed_tensor(markers):
+    return PackedTensor(
+        [
+            None
+            if marker is None
+            else torch.full((1, 2), float(marker), dtype=torch.float32)
+            for marker in markers
+        ],
+        dim_to_pack=0,
+    ).enable_deduplication()
+
+
+def _received_row_markers(packed):
+    return [
+        None if tensor is None else float(tensor[0, 0])
+        for tensor in packed.iter_logical_segments()
+    ]
+
+
+def test_compute_teacher_logprobs_selects_multimodal_rows_per_teacher():
+    """Each teacher receives media rows aligned with its selected token rows."""
+    vision_twg = _RecordingTeacherWorkerGroup(fill_value=1.0, dp_size=1)
+    text_twg = _RecordingTeacherWorkerGroup(fill_value=2.0, dp_size=1)
+    collector = _make_collector(
+        teacher_worker_groups={"vision": vision_twg, "text": text_twg},
+        alias_to_group_alias={"vision_agent": "vision", "text_agent": "text"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {
+                "vision_agent": "/ckpt/vision",
+                "text_agent": "/ckpt/text",
+            },
+        },
+        _has_distillation_teachers=True,
+    )
+
+    collector._compute_teacher_logprobs(
+        torch.randint(0, 100, (4, 8)),
+        [
+            {"name": "vision_agent"},
+            {"name": "text_agent"},
+            {"name": "vision_agent"},
+            {"name": "text_agent"},
+        ],
+        multimodal_data={
+            "pixel_values": _row_marked_packed_tensor([0, None, 2, None]),
+            "imgs_sizes": _row_marked_packed_tensor([10, None, 12, None]),
+        },
+    )
+
+    assert vision_twg.received is not None
+    assert text_twg.received is not None
+    assert _received_row_markers(vision_twg.received["pixel_values"]) == [0.0, 2.0]
+    assert _received_row_markers(vision_twg.received["imgs_sizes"]) == [10.0, 12.0]
+    assert "pixel_values" not in text_twg.received
+    assert "imgs_sizes" not in text_twg.received
+
+
+def test_compute_teacher_logprobs_dp_padding_repeats_multimodal_row():
+    """DP padding repeats the media row paired with the repeated token row."""
+    twg = _RecordingTeacherWorkerGroup(fill_value=3.0, dp_size=4)
+    collector = _make_collector(
+        teacher_worker_groups={"vision": twg},
+        alias_to_group_alias={"vision_agent": "vision"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"vision_agent": "/ckpt/vision"},
+        },
+        _has_distillation_teachers=True,
+    )
+
+    result, _ = collector._compute_teacher_logprobs(
+        torch.randint(0, 100, (1, 8)),
+        [{"name": "vision_agent"}],
+        multimodal_data={
+            "pixel_values": _row_marked_packed_tensor([7]),
+            "num_frames": _row_marked_packed_tensor([1]),
+        },
+    )
+
+    assert twg.received is not None
+    assert twg.received["input_ids"].shape[0] == 4
+    assert _received_row_markers(twg.received["pixel_values"]) == [7.0] * 4
+    assert _received_row_markers(twg.received["num_frames"]) == [1.0] * 4
+    assert result.shape == (1, 8)
+
+
+def test_compute_teacher_logprobs_mixed_media_and_text_rows_per_teacher():
+    """Mixed image and text-only rows in one group keep the empty rows aligned."""
+    twg = _RecordingTeacherWorkerGroup(fill_value=4.0, dp_size=1)
+    collector = _make_collector(
+        teacher_worker_groups={"mixed": twg},
+        alias_to_group_alias={"mixed_agent": "mixed"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"mixed_agent": "/ckpt/mixed"},
+        },
+        _has_distillation_teachers=True,
+    )
+
+    result, _ = collector._compute_teacher_logprobs(
+        torch.randint(0, 100, (3, 8)),
+        [{"name": "mixed_agent"}] * 3,
+        multimodal_data={
+            "pixel_values": _row_marked_packed_tensor([5, None, 6]),
+            "imgs_sizes": _row_marked_packed_tensor([15, None, 16]),
+        },
+    )
+
+    assert twg.received is not None
+    # The text-only row keeps its slot so media rows stay paired with token rows.
+    assert _received_row_markers(twg.received["pixel_values"]) == [5.0, None, 6.0]
+    assert _received_row_markers(twg.received["imgs_sizes"]) == [15.0, None, 16.0]
+    assert result.shape == (3, 8)
 
 
 def test_compute_teacher_logprobs_routes_to_correct_teacher():
@@ -393,6 +519,171 @@ def test_teacher_seq_pad_multiple_non_packed_incompatible_divisor_raises():
 
 
 # ---------------------------------------------------------------------------
+# Teacher placement-group reservation
+# ---------------------------------------------------------------------------
+
+
+def _teacher_setup_config():
+    """Return a minimal config with two distinct non-colocated teachers."""
+    return {
+        "on_policy_distillation": {
+            "enabled": True,
+            "teacher_model_by_agent_name": {
+                "math": "/checkpoints/math",
+                "code": "/checkpoints/code",
+            },
+            "non_colocated_teachers": {
+                "enabled": True,
+                "default_teacher_cfg": {
+                    "num_nodes": 2,
+                    "gpus_per_node": 4,
+                },
+            },
+        }
+    }
+
+
+def test_reserve_teacher_clusters_claims_each_topology_segment(monkeypatch):
+    """Every teacher placement group is claimed before planning the next one."""
+    from nemo_rl.algorithms import opd
+
+    events = []
+
+    class FakeRayVirtualCluster:
+        def __init__(self, **kwargs):
+            self.name = kwargs["name"]
+            self.kwargs = kwargs
+            events.append(("create", self.name))
+
+        def get_placement_groups(self):
+            events.append(("reserve", self.name))
+            return [object()]
+
+        def shutdown(self):
+            events.append(("shutdown", self.name))
+
+    def fake_prepare_segment_topology(segment_size, num_nodes, *, topology, role):
+        assert segment_size == num_nodes == 2
+        events.append(("prepare", role, tuple(topology)))
+        selected_ids = list(topology)[:num_nodes]
+        remaining_ids = [node_id for node_id in topology if node_id not in selected_ids]
+        constraints = [{"nvlink_domain_0": 0.001}] * num_nodes
+        return constraints, remaining_ids, topology
+
+    monkeypatch.setattr(opd, "RayVirtualCluster", FakeRayVirtualCluster)
+    monkeypatch.setattr(opd, "prepare_segment_topology", fake_prepare_segment_topology)
+
+    topology = {f"node_{index}": ("nvlink_domain_0", index) for index in range(4)}
+    clusters = opd.reserve_teacher_clusters(
+        _teacher_setup_config(),
+        segment_size=16,
+        teacher_segment_topology=topology,
+    )
+
+    assert list(clusters) == ["math", "code"]
+    assert events == [
+        (
+            "prepare",
+            "teacher:math",
+            ("node_0", "node_1", "node_2", "node_3"),
+        ),
+        ("create", "teacher_math"),
+        ("reserve", "teacher_math"),
+        ("prepare", "teacher:code", ("node_2", "node_3")),
+        ("create", "teacher_code"),
+        ("reserve", "teacher_code"),
+    ]
+    assert clusters["math"].kwargs["segment_size"] == 2
+    assert clusters["code"].kwargs["node_resource_constraints"] == [
+        {"nvlink_domain_0": 0.001},
+        {"nvlink_domain_0": 0.001},
+    ]
+
+
+def test_reserve_teacher_clusters_claims_without_topology_constraints(monkeypatch):
+    """Teachers are claimed before Gym even when segment topology is disabled."""
+    from nemo_rl.algorithms import opd
+
+    events = []
+
+    class FakeRayVirtualCluster:
+        def __init__(self, **kwargs):
+            self.name = kwargs["name"]
+            self.kwargs = kwargs
+            events.append(("create", self.name))
+
+        def get_placement_groups(self):
+            events.append(("reserve", self.name))
+            return [object()]
+
+        def shutdown(self):
+            events.append(("shutdown", self.name))
+
+    def fail_if_topology_is_prepared(*args, **kwargs):
+        raise AssertionError("topology must not be prepared when segment_size is unset")
+
+    monkeypatch.setattr(opd, "RayVirtualCluster", FakeRayVirtualCluster)
+    monkeypatch.setattr(opd, "prepare_segment_topology", fail_if_topology_is_prepared)
+
+    clusters = opd.reserve_teacher_clusters(_teacher_setup_config())
+
+    assert events == [
+        ("create", "teacher_math"),
+        ("reserve", "teacher_math"),
+        ("create", "teacher_code"),
+        ("reserve", "teacher_code"),
+    ]
+    assert all(cluster.kwargs["segment_size"] is None for cluster in clusters.values())
+    assert all(
+        cluster.kwargs["node_resource_constraints"] is None
+        for cluster in clusters.values()
+    )
+
+
+def test_create_teacher_worker_groups_reuses_reserved_clusters(monkeypatch):
+    """Deferred worker initialization uses the already claimed clusters."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms import opd
+    from nemo_rl.models.policy import teacher_worker_group
+
+    math_cluster = object()
+    code_cluster = object()
+    reserved_clusters = {"math": math_cluster, "code": code_cluster}
+    initialized_clusters = []
+
+    class FakeTeacherWorkerGroup:
+        def __init__(self, *, teacher_cfg, cluster, policy_config, tokenizer):
+            initialized_clusters.append((teacher_cfg.alias, cluster))
+            self.worker_group = SimpleNamespace(workers=[])
+            self.use_sequence_packing = True
+            self.sequence_length_pad_multiple = 1
+
+    def fail_if_reservation_repeats(*args, **kwargs):
+        raise AssertionError("teacher placement groups must not be reserved twice")
+
+    monkeypatch.setattr(
+        teacher_worker_group, "TeacherWorkerGroup", FakeTeacherWorkerGroup
+    )
+    monkeypatch.setattr(opd, "reserve_teacher_clusters", fail_if_reservation_repeats)
+    monkeypatch.setattr(opd.ray, "get", lambda refs, timeout: [])
+
+    worker_groups, alias_to_group_alias = opd.create_teacher_worker_groups(
+        _teacher_setup_config(),
+        {"make_sequence_length_divisible_by": 8},
+        tokenizer=object(),
+        teacher_clusters=reserved_clusters,
+    )
+
+    assert initialized_clusters == [
+        ("math", math_cluster),
+        ("code", code_cluster),
+    ]
+    assert list(worker_groups) == ["math", "code"]
+    assert alias_to_group_alias == {"math": "math", "code": "code"}
+
+
+# ---------------------------------------------------------------------------
 # Teacher-logprob seq-length padding + the "opd" advantage-estimator branch
 # ---------------------------------------------------------------------------
 
@@ -415,8 +706,11 @@ def test_create_advantage_estimator_opd_branch():
     import warnings
     from types import SimpleNamespace
 
-    from nemo_rl.algorithms.advantage_estimator import OPDAdvantageEstimator
-    from nemo_rl.algorithms.grpo import _create_advantage_estimator
+    from nemo_rl.algorithms.advantage_estimator import (
+        AdvEstimatorConfig,
+        OPDAdvantageEstimator,
+    )
+    from nemo_rl.algorithms.grpo import GRPOConfig, _create_advantage_estimator
 
     # loss_fn not MOPD-configured -> the 3 recommendation warnings fire.
     loss_fn = SimpleNamespace(
@@ -425,7 +719,8 @@ def test_create_advantage_estimator_opd_branch():
         truncated_importance_sampling_type="none",
     )
     master_config = SimpleNamespace(
-        grpo={"adv_estimator": {"name": "opd"}}, loss_fn=loss_fn
+        grpo=GRPOConfig(adv_estimator=AdvEstimatorConfig(name="opd")),
+        loss_fn=loss_fn,
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

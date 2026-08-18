@@ -23,9 +23,13 @@ logging.basicConfig(
 
 """
 This is a work around to ensure whenever NeMo RL is imported, that we
-add Megatron-LM to the python path. This is because the only sub-package
-that's officially installed is megatron.core. So we add the whole repo into
-the path so we can access megatron.{training,legacy,inference,...}
+add Megatron-LM to the python path. The editable install of megatron-core
+only exposes the packages declared in Megatron-LM's pyproject.toml
+(megatron.core and megatron.training), but megatron.training lazily imports
+megatron.{legacy,post_training} in some code paths (e.g., loading old fp16
+checkpoints, detecting modelopt state for quantization-aware flows). Adding
+the whole repo to the path makes megatron.{legacy,inference,post_training,...}
+importable too.
 
 Since users may pip install NeMo RL, this is a convenience so they do not
 have to manually run with PYTHONPATH=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM.
@@ -276,12 +280,19 @@ _patch_nsight_file()
 
 # Need to set PYTHONPATH to include transformers downloaded modules.
 # Assuming the cache directory is the same cross venvs.
-def patch_transformers_module_dir(env_vars: dict[str, str]):
-    hf_home = os.environ.get("HF_HOME", None)
-    if hf_home is None:
-        return env_vars
+def patch_transformers_module_dir(
+    env_vars: dict[str, str], *, apply_to_current_interpreter: bool = False
+):
+    # Prefer the explicit cache. A per-run HF_MODULES_CACHE keeps concurrent
+    # runs from racing on generated module names, and deriving the directory
+    # from HF_HOME instead would silently point at a different tree.
+    module_dir = os.environ.get("HF_MODULES_CACHE")
+    if module_dir is None:
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home is None:
+            return env_vars
+        module_dir = os.path.join(hf_home, "modules")
 
-    module_dir = os.path.join(hf_home, "modules")
     if not os.path.isdir(module_dir):
         return env_vars
 
@@ -290,7 +301,15 @@ def patch_transformers_module_dir(env_vars: dict[str, str]):
     else:
         env_vars["PYTHONPATH"] = f"{module_dir}:{env_vars['PYTHONPATH']}"
 
+    # Updating PYTHONPATH only affects interpreters started after this process.
+    # Ray actors may import NeMo RL before unpickling trust_remote_code objects,
+    # so make the dynamic module package importable in the current interpreter.
+    if apply_to_current_interpreter:
+        while module_dir in sys.path:
+            sys.path.remove(module_dir)
+        sys.path.insert(0, module_dir)
+
     return env_vars
 
 
-patch_transformers_module_dir(os.environ)
+patch_transformers_module_dir(os.environ, apply_to_current_interpreter=True)
