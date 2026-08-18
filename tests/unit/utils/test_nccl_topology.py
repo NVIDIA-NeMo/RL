@@ -197,6 +197,25 @@ def test_auto_rejects_plane_id_with_nccl_reserved_bit() -> None:
     assert result.errors == ("NCCL cannot use plane ID 16384",)
 
 
+def test_auto_rejects_invalid_current_plane_when_trusted_ucx_devices_match() -> None:
+    inventory = {
+        "data0": RdmaDevice(name="data0", ports=(1,), active_ports=(1,)),
+    }
+
+    result = diagnose_topology(
+        action="auto",
+        nccl_ib_hca="=data0:1:0:16384",
+        ucx_net_devices="data0:1",
+        expected_hcas=None,
+        repair_source="ucx",
+        inventory=inventory,
+    )
+
+    assert result.status == "error"
+    assert result.replacement is None
+    assert result.errors == ("NCCL cannot use plane ID 16384",)
+
+
 def test_auto_rejects_more_than_twelve_user_defined_planes() -> None:
     inventory = {
         f"data{index}": RdmaDevice(name=f"data{index}", ports=(1,), active_ports=(1,))
@@ -423,6 +442,28 @@ def test_auto_rejects_invalid_or_missing_ucx_repair_source_configuration(
             inventory=inventory,
         )
     assert str(error.value) == expected_error
+
+
+@pytest.mark.parametrize("action", ["auto", "warn", "repair", "strict"])
+def test_enabled_actions_require_declared_ucx_source_to_be_present(
+    action: str,
+) -> None:
+    inventory = {
+        "data0": RdmaDevice(name="data0", ports=(1,), active_ports=(1,)),
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="NRL_NCCL_HCA_REPAIR_SOURCE=ucx requires UCX_NET_DEVICES",
+    ):
+        diagnose_topology(
+            action=action,
+            nccl_ib_hca="=data0:1",
+            ucx_net_devices=None,
+            expected_hcas="=data0:1",
+            repair_source="ucx",
+            inventory=inventory,
+        )
 
 
 def test_strict_rejects_mismatch_with_trusted_expected_hcas() -> None:
@@ -656,6 +697,100 @@ def test_cli_writes_error_report_for_invalid_expected_hca_selector(
     report = json.loads(report_path.read_text())
     assert report["status"] == "error"
     assert report["errors"] == ["Invalid HCA device list: '=invalid device:1'"]
+    assert env_path.read_text() == ""
+
+
+@pytest.mark.parametrize("action", ["off", "auto"])
+def test_cli_noop_actions_skip_unreadable_inventory(
+    action: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_path = tmp_path / "report.json"
+    env_path = tmp_path / "repair.env"
+    for variable in (
+        "NCCL_IB_HCA",
+        "NRL_NCCL_EXPECTED_HCAS",
+        "NRL_NCCL_HCA_REPAIR_SOURCE",
+        "UCX_NET_DEVICES",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("NRL_NCCL_TOPOLOGY_ACTION", action)
+
+    def fail_inventory_read(*, sysfs_root: Path) -> dict[str, RdmaDevice]:
+        raise PermissionError("RDMA sysfs is unavailable")
+
+    monkeypatch.setattr(
+        "nemo_rl.utils.nccl_topology.read_rdma_inventory", fail_inventory_read
+    )
+
+    exit_code = main(
+        [
+            "--sysfs-root",
+            str(tmp_path / "sys"),
+            "--node-rank",
+            "5",
+            "--report",
+            str(report_path),
+            "--env-file",
+            str(env_path),
+        ]
+    )
+
+    assert exit_code == 0
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "skipped"
+    assert report["rdma_devices"] == []
+    assert env_path.read_text() == ""
+
+
+def test_cli_writes_error_report_when_inventory_read_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    report_path = tmp_path / "report.json"
+    env_path = tmp_path / "repair.env"
+    monkeypatch.setenv("NRL_NCCL_TOPOLOGY_ACTION", "strict")
+    monkeypatch.setenv("NCCL_IB_HCA", "=data0:1")
+    for variable in (
+        "NRL_NCCL_EXPECTED_HCAS",
+        "NRL_NCCL_HCA_REPAIR_SOURCE",
+        "UCX_NET_DEVICES",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    def fail_inventory_read(*, sysfs_root: Path) -> dict[str, RdmaDevice]:
+        raise PermissionError("RDMA sysfs is unavailable")
+
+    monkeypatch.setattr(
+        "nemo_rl.utils.nccl_topology.read_rdma_inventory", fail_inventory_read
+    )
+
+    exit_code = main(
+        [
+            "--sysfs-root",
+            str(tmp_path / "sys"),
+            "--node-rank",
+            "6",
+            "--report",
+            str(report_path),
+            "--env-file",
+            str(env_path),
+        ]
+    )
+
+    assert exit_code == 2
+    assert (
+        "[NRL NCCL topology][ERROR] Unable to read RDMA inventory"
+        in capsys.readouterr().out
+    )
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "error"
+    assert report["errors"] == [
+        "Unable to read RDMA inventory: RDMA sysfs is unavailable"
+    ]
+    assert report["rdma_devices"] == []
     assert env_path.read_text() == ""
 
 

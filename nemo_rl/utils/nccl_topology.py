@@ -212,12 +212,7 @@ def diagnose_topology(
         )
     if repair_source not in {None, "ucx"}:
         raise ValueError(f"Unsupported HCA repair source: {repair_source!r}")
-    if (
-        action in {"auto", "repair"}
-        and repair_source == "ucx"
-        and not ucx_net_devices
-        and not expected_hcas
-    ):
+    if repair_source == "ucx" and not ucx_net_devices:
         raise ValueError("NRL_NCCL_HCA_REPAIR_SOURCE=ucx requires UCX_NET_DEVICES")
     if (
         action == "auto"
@@ -397,6 +392,16 @@ def diagnose_topology(
             errors=errors,
         )
     if current_is_exact and not nccl_only and not candidate_only:
+        current_errors = _device_validation_errors(current, inventory)
+        if current_errors:
+            return TopologyDiagnostic(
+                status="error",
+                replacement=None,
+                nccl_only=(),
+                candidate_only=(),
+                candidate_source=candidate_source,
+                errors=current_errors,
+            )
         return TopologyDiagnostic(
             status="ok",
             replacement=None,
@@ -465,30 +470,55 @@ def main(argv: list[str] | None = None) -> int:
     nccl_ib_hca = os.environ.get("NCCL_IB_HCA")
     expected_hcas = os.environ.get("NRL_NCCL_EXPECTED_HCAS")
     ucx_net_devices = os.environ.get("UCX_NET_DEVICES")
-    inventory = read_rdma_inventory(sysfs_root=args.sysfs_root)
-    try:
-        diagnostic = diagnose_topology(
-            action=action,
-            nccl_ib_hca=nccl_ib_hca,
-            ucx_net_devices=ucx_net_devices,
-            expected_hcas=expected_hcas,
-            repair_source=os.environ.get("NRL_NCCL_HCA_REPAIR_SOURCE"),
-            inventory=inventory,
+    repair_source = os.environ.get("NRL_NCCL_HCA_REPAIR_SOURCE")
+    candidate_source: Literal["expected", "ucx"] | None = None
+    if expected_hcas:
+        candidate_source = "expected"
+    elif ucx_net_devices:
+        candidate_source = "ucx"
+
+    inventory: dict[str, RdmaDevice] = {}
+    inventory_required = not (
+        action == "off"
+        or (
+            action == "auto"
+            and not nccl_ib_hca
+            and not expected_hcas
+            and repair_source != "ucx"
         )
-    except ValueError as error:
-        candidate_source: Literal["expected", "ucx"] | None = None
-        if expected_hcas:
-            candidate_source = "expected"
-        elif ucx_net_devices:
-            candidate_source = "ucx"
+        or (repair_source == "ucx" and not ucx_net_devices)
+    )
+    try:
+        if inventory_required:
+            inventory = read_rdma_inventory(sysfs_root=args.sysfs_root)
+    except OSError as error:
         diagnostic = TopologyDiagnostic(
             status="error",
             replacement=None,
             nccl_only=(),
             candidate_only=(),
             candidate_source=candidate_source,
-            errors=(str(error),),
+            errors=(f"Unable to read RDMA inventory: {error}",),
         )
+    else:
+        try:
+            diagnostic = diagnose_topology(
+                action=action,
+                nccl_ib_hca=nccl_ib_hca,
+                ucx_net_devices=ucx_net_devices,
+                expected_hcas=expected_hcas,
+                repair_source=repair_source,
+                inventory=inventory,
+            )
+        except ValueError as error:
+            diagnostic = TopologyDiagnostic(
+                status="error",
+                replacement=None,
+                nccl_only=(),
+                candidate_only=(),
+                candidate_source=candidate_source,
+                errors=(str(error),),
+            )
     report = _build_report(
         node_rank=args.node_rank,
         action=action,
