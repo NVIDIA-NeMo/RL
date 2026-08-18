@@ -22,8 +22,62 @@ from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
+def first_parameter_device(
+    model: Any,
+) -> Optional[torch.device]:
+    """Return the device of the model's first parameter, or None if it has none.
+
+    ``model`` is a single ``nn.Module`` on the DTensor workers and a list of
+    virtual pipeline chunks on the Megatron worker, so both are accepted.
+    """
+    modules = model if isinstance(model, (list, tuple)) else [model]
+    for module in modules:
+        for param in module.parameters():
+            return param.device
+    return None
+
+
 class AbstractPolicyWorker:
     """Base class for policy workers with shared functionality."""
+
+    def _assert_model_onloaded(
+        self,
+        api_name: str,
+        required_prepare_call: str,
+        *,
+        params_may_be_offloaded: bool = False,
+    ) -> None:
+        """Fail with an actionable message if the model is still offloaded to CPU.
+
+        Workers offload model parameters to CPU between phases (``finish_inference``,
+        ``offload_after_refit``), and the matching ``prepare_for_*`` call onloads them
+        again. Reaching a compute API without that call leaves parameters on CPU while
+        the rest of the step assumes CUDA, which surfaces as an opaque ``illegal memory
+        access`` rather than anything pointing at the missing step. Check up front so
+        the failure names the call to add.
+
+        Args:
+            api_name: Name of the compute API being entered, used in the message.
+            required_prepare_call: Name of the ``prepare_for_*`` call that onloads the
+                model for ``api_name``.
+            params_may_be_offloaded: Set when the worker is configured so that
+                parameters legitimately live on CPU during compute (FSDP
+                ``cpu_offload``), in which case the check does not apply.
+        """
+        if params_may_be_offloaded:
+            return
+
+        device = first_parameter_device(self.model)
+        if device is None or device.type != "cpu":
+            return
+
+        raise RuntimeError(
+            f"{type(self).__name__}.{api_name}() was called while the model parameters "
+            f"are still on CPU. Call {required_prepare_call}() to onload the model "
+            f"before {api_name}(). Parameters are offloaded to CPU between phases (for "
+            f"example by finish_inference() or offload_after_refit()), and without the "
+            f"onload this typically fails later as a CUDA 'illegal memory access'."
+        )
 
     def init_collective(
         self,
