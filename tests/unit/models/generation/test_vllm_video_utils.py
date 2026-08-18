@@ -12,6 +12,7 @@ import pytest
 import torch
 from PIL import Image
 
+from nemo_rl.environments.nemotron_utils import _nemotron_video_target_resolution
 from nemo_rl.models.generation.vllm import video_utils as utils
 from nemo_rl.models.generation.vllm.config import (
     materialize_vllm_video_config,
@@ -191,6 +192,9 @@ def test_cached_video_data_url_requires_no_driver_decoder(monkeypatch, tmp_path)
     manifest = json.loads(payload[len(utils._CACHED_VIDEO_FRAME_MANIFEST_MAGIC) :])
     assert manifest["frame_paths"] == frame_paths
     assert manifest["metadata"]["frames_indices"] == [0, 1, 2, 3]
+    assert manifest["metadata"]["fps"] == 1.0
+    assert manifest["metadata"]["duration"] == 4.0
+    assert manifest["metadata"]["total_num_frames"] == 4
 
 
 def test_cached_video_manifest_does_not_import_torchcodec(monkeypatch, tmp_path):
@@ -222,6 +226,62 @@ def test_cached_video_manifest_does_not_import_torchcodec(monkeypatch, tmp_path)
     assert loaded[0].shape == (1, 2, 2, 3)
 
 
+def test_cached_video_media_root_is_required(monkeypatch, tmp_path):
+    frame_path = tmp_path / "frame.png"
+    Image.new("RGB", (2, 2)).save(frame_path)
+    monkeypatch.delenv("NEMO_RL_VIDEO_MEDIA_ROOT", raising=False)
+
+    with pytest.raises(ValueError, match="NEMO_RL_VIDEO_MEDIA_ROOT"):
+        utils.build_cached_video_frame_data_url([str(frame_path)])
+
+
+def test_cached_video_frame_cannot_escape_media_root(monkeypatch, tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    outside_frame = tmp_path / "outside.png"
+    Image.new("RGB", (2, 2)).save(outside_frame)
+    monkeypatch.setenv("NEMO_RL_VIDEO_MEDIA_ROOT", str(media_root))
+
+    with pytest.raises(ValueError, match="must be under"):
+        utils.build_cached_video_frame_data_url([str(outside_frame)])
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "patches", "maintain_aspect_ratio"),
+    [
+        (1280, 720, 1024, True),
+        (720, 1280, 1024, True),
+        (640, 640, 1024, False),
+        (320, 180, 256, True),
+    ],
+)
+def test_nemotron_target_resolution_matches_vllm(
+    width, height, patches, maintain_aspect_ratio
+):
+    upstream = pytest.importorskip(
+        "vllm.transformers_utils.processors.nano_nemotron_vl"
+    )
+    expected_width, expected_height, _ = (
+        upstream.get_video_target_size_and_feature_size(
+            width,
+            height,
+            patches,
+            maintain_aspect_ratio,
+            16,
+            0.5,
+        )
+    )
+
+    assert _nemotron_video_target_resolution(
+        original_width=width,
+        original_height=height,
+        target_num_patches=patches,
+        patch_size=16,
+        downsample_ratio=0.5,
+        maintain_aspect_ratio=maintain_aspect_ratio,
+    ) == (expected_width, expected_height)
+
+
 def test_materialize_video_config_is_single_source_of_sampling_values():
     generation = {
         "backend": "vllm",
@@ -250,6 +310,7 @@ def test_materialize_video_config_is_single_source_of_sampling_values():
         "video_temporal_patch_size": 2,
     }
     assert generation["vllm_kwargs"]["limit_mm_per_prompt"]["video"]["num_frames"] == 32
+    assert generation["vllm_kwargs"]["media_io_kwargs"]["video"]["num_frames"] == 32
 
 
 def test_materialize_video_config_requires_video_limit_mapping():
@@ -270,3 +331,19 @@ def test_materialize_video_config_requires_video_limit_mapping():
 
     with pytest.raises(ValueError, match="limit_mm_per_prompt.video"):
         materialize_vllm_video_config(policy, {})
+
+
+def test_video_config_rejects_unknown_sampling_fields():
+    generation = {
+        "vllm_cfg": {
+            "video": {
+                "sampling_style": "nemotron_vl",
+                "num_frames": 32,
+                "temporal_patch_size": 2,
+                "sampling_stlye": "typo",
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="sampling_stlye"):
+        resolve_vllm_video_config(generation)

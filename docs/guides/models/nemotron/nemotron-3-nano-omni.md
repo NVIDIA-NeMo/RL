@@ -189,7 +189,16 @@ must provide real top-level `options` and one uppercase `expected_answer`
 present in those options. Use
 [`prepare_video_dataset.py`](../../../../examples/nemo_gym/prepare_video_dataset.py)
 to convert and validate source JSONL. Raw videos are decoded with TorchCodec;
-cached datasets may instead carry precomputed lossless frame manifests.
+the runtime can also read externally prepared lossless frame manifests, but the
+converter currently emits raw-video rows only.
+
+Set the three recipe inputs before loading either config:
+
+```bash
+export NEMO_RL_VIDEO_MEDIA_ROOT=/absolute/path/to/video-data
+export NEMO_RL_VIDEO_TRAIN_JSONL=/absolute/path/to/train.jsonl
+export NEMO_RL_VIDEO_VAL_JSONL=/absolute/path/to/validation.jsonl
+```
 
 Policy and rollout preprocessing must use the same sampling contract. The
 provided recipes set one `policy.generation.vllm_cfg.video` block for
@@ -197,6 +206,13 @@ TorchCodec-backed Nemotron sampling, 32 frames, and a temporal patch size of 2.
 NeMo RL materializes those values for both policy and rollout preprocessing.
 The runtime therefore needs TorchCodec and its FFmpeg dependencies; no parallel
 sampling environment variables are required.
+
+The remaining policy-side video settings live under `data.default`:
+`video_target_num_patches`, `video_maintain_aspect_ratio`, and, for generic
+processors only, `min_generation_tokens`. Set
+`policy.generation.vllm_cfg.reset_encoder_cache_after_weight_update: true` only
+when the multimodal encoder trains; the provided frozen-vision recipes leave it
+disabled.
 
 The synchronous and asynchronous overlays are:
 
@@ -208,7 +224,10 @@ video request/token propagation in NeMo Gym. Rollout preprocessing is patched
 at runtime against stock vLLM 0.25.1; a custom vLLM fork is not required.
 
 Both overlays set `grpo.max_num_steps: -1`, so training ends through the
-configured dataset epochs rather than an artificial step cap. They also leave
+finite `grpo.max_num_epochs` dataset horizon rather than an artificial step cap.
+For Megatron this horizon also determines `train_iters`; non-constant learning
+rate schedules should therefore choose `max_num_epochs` deliberately. The
+recipes also leave
 `grpo.seq_logprob_error_threshold: null`: logged token multiplicative
 probability error (TMPE) is raw and no high-error sequence is masked. Interpret
 TMPE together with reward, loss, sequence length, and refit metrics; isolated

@@ -99,10 +99,12 @@ def _nemotron_video_target_resolution(
 
 def _flatten_nemotron_video_frame_messages(
     messages: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[Image.Image]]:
+) -> tuple[list[dict[str, Any]], list[Image.Image], list[int], float]:
     """Replace locally decoded frame items with ordered ``<image>`` markers."""
     flattened_messages = []
     frames = []
+    frame_indices = []
+    frame_fps: float | None = None
     for message in messages:
         content = message.get("content")
         if not isinstance(content, list):
@@ -123,6 +125,25 @@ def _flatten_nemotron_video_frame_messages(
                         f"got {type(image).__name__}."
                     )
                 frames.append(image)
+                frame_index = part.get("_video_frame_index")
+                fps = part.get("_video_fps")
+                if type(frame_index) is not int or frame_index < 0:
+                    raise ValueError(
+                        "Nemotron video frames require a non-negative "
+                        "_video_frame_index."
+                    )
+                fps_value = float(fps) if isinstance(fps, (int, float)) else 0.0
+                if not math.isfinite(fps_value) or fps_value <= 0:
+                    raise ValueError(
+                        "Nemotron video frames require a positive _video_fps."
+                    )
+                if frame_fps is None:
+                    frame_fps = fps_value
+                elif not math.isclose(frame_fps, fps_value):
+                    raise ValueError(
+                        "All frames from one Nemotron video must use one fps value."
+                    )
+                frame_indices.append(frame_index)
                 flattened_parts.append("<image>")
             elif part_type == "text":
                 flattened_parts.append(str(part.get("text", "")))
@@ -137,7 +158,7 @@ def _flatten_nemotron_video_frame_messages(
                 "content": "\n".join(part for part in flattened_parts if part),
             }
         )
-    return flattened_messages, frames
+    return flattened_messages, frames, frame_indices, frame_fps or 0.0
 
 
 def _render_nemotron_video_prompt(
@@ -168,21 +189,22 @@ def _expand_nemotron_video_placeholders(
     rendered_text: str,
     *,
     embeddings_per_tubelet: list[int],
+    frame_indices: list[int],
+    fps: float,
     temporal_patch_size: int,
 ) -> str:
-    """Expand primary tubelet frames and retain secondary frames as bare tokens.
-
-    The current Megatron-Bridge model consumes only image tokens inside
-    ``<img>...</img>`` wrappers. vLLM-authored Nemotron prompts retain a bare
-    ``<image>`` for secondary frames in each temporal tubelet, so reproducing
-    that shape here keeps the pre-rollout datum compatible with the native
-    expanded-sequence path. The rollout manager later replaces these provisional
-    token IDs with the exact token IDs returned by vLLM.
-    """
+    """Match vLLM's timestamped one-wrapper-per-tubelet video replacement."""
     if temporal_patch_size < 1:
         raise ValueError("video_temporal_patch_size must be at least 1.")
+    if fps <= 0:
+        raise ValueError("Nemotron video placeholder expansion requires positive fps.")
     parts = rendered_text.split("<image>")
     frame_count = len(parts) - 1
+    if len(frame_indices) != frame_count:
+        raise ValueError(
+            "Rendered Nemotron video prompt/frame-index mismatch: "
+            f"found {frame_count} markers and {len(frame_indices)} indices."
+        )
     expected_tubelets = math.ceil(frame_count / temporal_patch_size)
     if len(embeddings_per_tubelet) != expected_tubelets:
         raise ValueError(
@@ -192,18 +214,31 @@ def _expand_nemotron_video_placeholders(
             f"{expected_tubelets} tubelets with temporal patch size "
             f"{temporal_patch_size}."
         )
+    if any(fragment.strip() for fragment in parts[1:-1]):
+        raise ValueError(
+            "Nemotron video frame placeholders must form one contiguous block."
+        )
 
-    expanded = parts[0]
-    for frame_index, suffix in enumerate(parts[1:]):
-        if frame_index % temporal_patch_size == 0:
-            tubelet_index = frame_index // temporal_patch_size
-            replacement = (
-                "<img>" + "<image>" * embeddings_per_tubelet[tubelet_index] + "</img>"
+    tubelet_replacements = []
+    frame_duration_ms = int(1000.0 / fps)
+    for tubelet_index, first_frame in enumerate(
+        range(0, frame_count, temporal_patch_size)
+    ):
+        descriptions = []
+        for offset in range(temporal_patch_size):
+            frame_position = first_frame + offset
+            if frame_position >= frame_count:
+                break
+            frame_label = "Frame" if offset == 0 else "frame"
+            timestamp = frame_indices[frame_position] * frame_duration_ms / 1000.0
+            descriptions.append(
+                f"{frame_label} {frame_position + 1} sampled at {timestamp:.2f} seconds"
             )
-        else:
-            replacement = "<image>"
-        expanded += replacement + suffix
-    return expanded
+        wrapper = "<img>" + "<image>" * embeddings_per_tubelet[tubelet_index] + "</img>"
+        tubelet_replacements.append(" and ".join(descriptions) + ": " + wrapper)
+
+    replacement = "\n".join(tubelet_replacements)
+    return parts[0] + replacement + parts[-1]
 
 
 def process_nemotron_video_frames(
@@ -231,7 +266,9 @@ def process_nemotron_video_frames(
         _required_config_value(model_config, "norm_std"), dtype=torch.float32
     ).view(3, 1, 1)
 
-    flattened_messages, frames = _flatten_nemotron_video_frame_messages(messages)
+    flattened_messages, frames, frame_indices, frame_fps = (
+        _flatten_nemotron_video_frame_messages(messages)
+    )
     if not frames:
         raise ValueError("Nemotron video preprocessing received no decoded frames.")
 
@@ -285,6 +322,8 @@ def process_nemotron_video_frames(
     expanded_text = _expand_nemotron_video_placeholders(
         rendered_text,
         embeddings_per_tubelet=embeddings_per_tubelet,
+        frame_indices=frame_indices,
+        fps=frame_fps,
         temporal_patch_size=temporal_patch_size,
     )
     text_inputs = processor.tokenizer(

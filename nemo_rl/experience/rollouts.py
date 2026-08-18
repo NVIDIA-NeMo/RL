@@ -183,18 +183,19 @@ def _reattach_original_multimodal_payloads(
     for result, original_log in zip(results, original_message_logs):
         if not result.pop("_initial_multimodal_data_omitted", False):
             continue
-        original_user_messages = [
-            message for message in original_log if message.get("role") == "user"
-        ]
-        for log_key in ("input_message_log", "message_log"):
-            target_log = result.get(log_key)
-            if not target_log:
-                continue
-            target_user_messages = [
-                message for message in target_log if message.get("role") == "user"
-            ]
-            for original, target in zip(original_user_messages, target_user_messages):
-                attach_static_multimodal_payload([target], [original])
+        _reattach_static_multimodal_payloads_to_result(result, original_log)
+
+
+def _reattach_static_multimodal_payloads_to_result(
+    result: dict[str, Any],
+    source_message_log: list[dict[str, Any]],
+) -> None:
+    """Restore static media to each Gym-authored message-log representation."""
+    for log_key in ("input_message_log", "message_log"):
+        target_log = result.get(log_key)
+        if not target_log:
+            continue
+        attach_static_multimodal_payload(target_log, source_message_log)
 
 
 def attach_static_multimodal_payload(
@@ -2434,19 +2435,15 @@ async def run_async_nemo_gym_rollout(
                 _tensorize_nemo_gym_result(result)
                 completed_group = accumulator.add(rowidx, result)
                 if original_message_logs is not None:
-                    attach_static_multimodal_payload(
-                        result["message_log"], original_message_logs[rowidx]
+                    _reattach_static_multimodal_payloads_to_result(
+                        result, original_message_logs[rowidx]
                     )
+                    result.pop("_initial_multimodal_data_omitted", None)
                 if completed_group is not None:
                     group_input_batch = input_batch.slice(
                         completed_group.group_index * num_generations,
                         (completed_group.group_index + 1) * num_generations,
                     )
-                    if deduplicate_multimodal_data:
-                        _reattach_original_multimodal_payloads(
-                            completed_group.results,
-                            group_input_batch["message_log"],
-                        )
                     rollout_result = _postprocess_single_nemo_gym_group(
                         nemo_gym_rows=completed_group.rows,
                         results=completed_group.results,

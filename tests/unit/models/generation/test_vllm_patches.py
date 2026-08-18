@@ -356,3 +356,14 @@ def test_nemotron_video_preprocessing_patch_requires_exact_vllm_version(monkeypa
 
     with pytest.raises(RuntimeError, match="requires vLLM 0.25.1"):
         patches._patch_vllm_nemotron_video_preprocessing(_Logger(), required=True)
+
+
+def test_nemotron_video_preprocessing_patch_warns_when_not_required(monkeypatch):
+    monkeypatch.setattr(patches, "version", lambda _package: "0.25.2")
+    logger = _Logger()
+
+    patches._patch_vllm_nemotron_video_preprocessing(logger, required=False)
+
+    assert logger.warning_messages == [
+        "The Nemotron video preprocessing patch requires vLLM 0.25.1; found 0.25.2."
+    ]

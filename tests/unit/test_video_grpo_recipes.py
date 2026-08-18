@@ -31,6 +31,7 @@ def test_video_grpo_recipes_preserve_unmasked_sync_and_async_contracts():
     for recipe, async_enabled in ((async_recipe, True), (sync_recipe, False)):
         grpo = recipe["grpo"]
         policy = recipe["policy"]
+        materialize_vllm_video_config(policy, recipe["data"])
         vllm_cfg = policy["generation"]["vllm_cfg"]
 
         assert grpo["max_num_steps"] == -1
@@ -43,6 +44,9 @@ def test_video_grpo_recipes_preserve_unmasked_sync_and_async_contracts():
             "temporal_patch_size": 2,
         }
         assert vllm_cfg["reset_encoder_cache_after_weight_update"] is False
+        assert policy["generation"]["vllm_kwargs"]["media_io_kwargs"]["video"] == {
+            "num_frames": 32
+        }
         assert not {
             "NRL_VIDEO_BACKEND",
             "NRL_VIDEO_SAMPLING_STYLE",
@@ -67,3 +71,6 @@ def test_video_recipe_materializes_one_sampling_contract_for_all_consumers():
         ]
         == 32
     )
+    assert recipe["policy"]["generation"]["vllm_kwargs"]["media_io_kwargs"] == {
+        "video": {"num_frames": 32}
+    }

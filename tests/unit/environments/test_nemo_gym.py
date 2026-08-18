@@ -29,6 +29,7 @@ from yaml import safe_load
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.multimodal_utils import (
+    MULTIMODAL_CONTENT_TYPES,
     PackedTensor,
     image_to_data_url,
 )
@@ -55,6 +56,10 @@ from nemo_rl.environments.nemo_gym_video import (
     nemo_gym_example_to_video_datum_spec,
     normalize_video_urls_in_examples,
 )
+from nemo_rl.environments.nemotron_utils import (
+    _expand_nemotron_video_placeholders,
+    _flatten_nemotron_video_frame_messages,
+)
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -65,6 +70,20 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+def test_multimodal_content_types_cover_responses_media_aliases():
+    assert {
+        "input_image",
+        "image",
+        "image_url",
+        "input_video",
+        "video",
+        "video_url",
+        "input_audio",
+        "audio",
+        "audio_url",
+    } <= MULTIMODAL_CONTENT_TYPES
 
 
 def test_extract_static_video_message_resolves_local_file(tmp_path):
@@ -137,6 +156,14 @@ def test_extract_static_video_message_accepts_cached_frames(tmp_path):
         isinstance(part["image"], Image.Image) for part in messages[0]["content"][:2]
     )
     assert all(part["_is_video_frame"] for part in messages[0]["content"][:2])
+    assert [part["_video_frame_index"] for part in messages[0]["content"][:2]] == [0, 1]
+    assert [part["_video_fps"] for part in messages[0]["content"][:2]] == [1.0, 1.0]
+
+    _, frames, frame_indices, fps = _flatten_nemotron_video_frame_messages(messages)
+
+    assert len(frames) == 2
+    assert frame_indices == [0, 1]
+    assert fps == 1.0
 
 
 def test_extract_static_video_message_ignores_still_image_only_row():
@@ -209,6 +236,79 @@ def test_extract_static_video_message_rejects_multiple_videos(tmp_path):
 
     with pytest.raises(ValueError, match="exactly one video"):
         _extract_static_video_messages(example)
+
+
+def test_extract_static_video_message_requires_cached_frame_source(tmp_path):
+    frame_path = tmp_path / "frame.png"
+    Image.new("RGB", (2, 2)).save(frame_path)
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": str(frame_path),
+                            "_is_video_frame": True,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(ValueError, match="exactly one video"):
+        _extract_static_video_messages(example)
+
+
+def test_extract_static_video_message_rejects_mixed_image_and_video(tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    image_path = tmp_path / "still.png"
+    Image.new("RGB", (2, 2)).save(image_path)
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_video", "video_url": str(video_path)},
+                        {"type": "input_image", "image_url": str(image_path)},
+                    ],
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(ValueError, match="mixing still images"):
+        _extract_static_video_messages(example)
+
+
+def test_extract_static_video_message_rejects_audio_and_unknown_parts(tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    base_content = [{"type": "input_video", "video_url": str(video_path)}]
+
+    for part, error in (
+        (
+            {"type": "input_audio", "audio_url": "/audio.wav"},
+            "does not support audio",
+        ),
+        ({"type": "output_text", "text": "answer"}, "Unsupported Gym"),
+    ):
+        example = {
+            "responses_create_params": {
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [*base_content, part],
+                    }
+                ]
+            }
+        }
+        with pytest.raises(ValueError, match=error):
+            _extract_static_video_messages(example)
 
 
 @pytest.mark.parametrize("extra_body", ["{", "[]", 3])
@@ -632,7 +732,14 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
     )
     assert processor.tokenizer.expanded_text.count("<img>") == 2
     assert processor.tokenizer.expanded_text.count("</img>") == 2
-    assert processor.tokenizer.expanded_text.count("<image>") == 32
+    assert processor.tokenizer.expanded_text.count("<image>") == 30
+    assert processor.tokenizer.expanded_text.startswith(
+        "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 1.00 seconds: "
+    )
+    assert (
+        "\nFrame 3 sampled at 2.00 seconds and frame 4 sampled at 3.00 seconds: "
+        in processor.tokenizer.expanded_text
+    )
 
     user_message = datum["message_log"][0]
     assert user_message["pixel_values"].as_tensor().shape == (4, 3, 96, 160)
@@ -642,6 +749,21 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
         datum["extra_env_info"]["responses_create_params"]["metadata"]["extra_body"]
     )
     assert "mm_processor_kwargs" not in extra_body
+
+
+def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
+    expanded = _expand_nemotron_video_placeholders(
+        "<image>\n<image>\nquestion",
+        embeddings_per_tubelet=[2],
+        frame_indices=[0, 30],
+        fps=29.97,
+        temporal_patch_size=2,
+    )
+
+    assert expanded == (
+        "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 0.99 seconds: "
+        "<img><image><image></img>\nquestion"
+    )
 
 
 def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_path):
@@ -1290,12 +1412,33 @@ def test_nemo_gym_dedup_keeps_authoritative_changed_seed_media(
         )
 
 
-def test_nemo_gym_run_rollouts_passes_result_to_postprocess():
+def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
+    video_path = tmp_path / "clip with spaces.mp4"
+    video_path.write_bytes(b"video")
+    image_path = tmp_path / "still.png"
+    Image.new("RGB", (2, 2)).save(image_path)
+
     async def _run():
         nemo_gym_row = {
             "_rowidx": 7,
             "agent_ref": {"name": "test_agent"},
-            "responses_create_params": {"input": []},
+            "responses_create_params": {
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_video",
+                                "video_url": str(video_path),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": str(image_path)},
+                            },
+                        ],
+                    }
+                ]
+            },
         }
         nemo_gym_result = {"response": {"output": []}}
         tokenizer = object()
@@ -1303,7 +1446,10 @@ def test_nemo_gym_run_rollouts_passes_result_to_postprocess():
 
         class _RolloutCollectionHelper:
             def run_examples(self, examples, head_server_config):
-                del examples, head_server_config
+                del head_server_config
+                content = examples[0]["responses_create_params"]["input"][0]["content"]
+                assert content[0]["video_url"] == video_path.resolve().as_uri()
+                assert content[1]["image_url"].startswith("data:image/png;base64,")
 
                 async def _completed_result():
                     return nemo_gym_row, nemo_gym_result

@@ -165,6 +165,25 @@ def _resolve_cached_video_media_path(value: str) -> Path:
     return resolved
 
 
+def build_cached_video_frame_metadata(num_frames: int) -> dict[str, Any]:
+    """Return the shared synthetic timing contract for cached video frames."""
+    if num_frames < 1:
+        raise ValueError("Cached Gym video requires at least one frame.")
+
+    # The cache contains lossless sampled frames but not source timing
+    # metadata, and original videos are not guaranteed to remain mounted.
+    # Match vLLM's built-in image-sequence contract: one synthetic second
+    # per cached frame with stable sequential indices.
+    return {
+        "fps": 1.0,
+        "duration": float(num_frames),
+        "total_num_frames": num_frames,
+        "frames_indices": list(range(num_frames)),
+        "video_backend": "cached_png_sequence",
+        "do_sample_frames": False,
+    }
+
+
 def build_cached_video_frame_data_url(
     frame_paths: list[str],
 ) -> str:
@@ -177,18 +196,7 @@ def build_cached_video_frame_data_url(
     ]
     manifest = {
         "frame_paths": resolved_frames,
-        # The cache contains lossless sampled frames but not source timing
-        # metadata, and original videos are not guaranteed to remain mounted.
-        # Match vLLM's built-in image-sequence contract: one synthetic second
-        # per cached frame with stable sequential indices.
-        "metadata": {
-            "fps": 1.0,
-            "duration": float(len(resolved_frames)),
-            "total_num_frames": len(resolved_frames),
-            "frames_indices": list(range(len(resolved_frames))),
-            "video_backend": "cached_png_sequence",
-            "do_sample_frames": False,
-        },
+        "metadata": build_cached_video_frame_metadata(len(resolved_frames)),
     }
     payload = _CACHED_VIDEO_FRAME_MANIFEST_MAGIC + json.dumps(
         manifest, separators=(",", ":")

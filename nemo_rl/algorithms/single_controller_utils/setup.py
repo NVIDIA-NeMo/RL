@@ -342,13 +342,6 @@ def _clamp_max_num_steps(
     """Resolve the SingleController step limit against its finite data horizon."""
     grpo_config = master_config.grpo
     max_num_epochs = grpo_config.max_num_epochs
-    if max_num_epochs is None:
-        if grpo_config.max_num_steps == -1:
-            raise ValueError(
-                "SingleController grpo.max_num_steps=-1 requires a finite "
-                "max_num_epochs"
-            )
-        return
     epoch_horizon = max_num_epochs * len(dataloader)
     if grpo_config.max_num_steps == -1:
         grpo_config.max_num_steps = epoch_horizon

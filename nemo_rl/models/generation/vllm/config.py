@@ -14,7 +14,14 @@
 
 from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
 
-from pydantic import BaseModel, Field, NonNegativeInt, PositiveFloat, PositiveInt
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+)
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
@@ -23,8 +30,10 @@ VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_r
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
 
 
-class VllmVideoConfig(BaseModel, extra="allow"):
+class VllmVideoConfig(BaseModel):
     """Video sampling contract shared by policy preprocessing and vLLM."""
+
+    model_config = ConfigDict(extra="forbid")
 
     sampling_style: Literal["nemotron_vl"]
     num_frames: PositiveInt
@@ -227,6 +236,20 @@ def materialize_vllm_video_config(
             "policy.generation.vllm_kwargs.limit_mm_per_prompt.video must be a mapping"
         )
     video_limit["num_frames"] = video_config.num_frames
+
+    media_io_kwargs = vllm_kwargs.setdefault("media_io_kwargs", {})
+    if not isinstance(media_io_kwargs, dict):
+        raise ValueError(
+            "policy.generation.vllm_kwargs.media_io_kwargs must be a mapping"
+        )
+    video_media_io_kwargs = media_io_kwargs.setdefault("video", {})
+    if not isinstance(video_media_io_kwargs, dict):
+        raise ValueError(
+            "policy.generation.vllm_kwargs.media_io_kwargs.video must be a mapping"
+        )
+    # VideoMediaIO otherwise defaults to 32 independently of the policy-side
+    # frame count. Materializing the value here makes a mismatch impossible.
+    video_media_io_kwargs["num_frames"] = video_config.num_frames
 
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:

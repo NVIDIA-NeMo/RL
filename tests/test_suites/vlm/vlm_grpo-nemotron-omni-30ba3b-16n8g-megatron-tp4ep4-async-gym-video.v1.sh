@@ -17,7 +17,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source "$SCRIPT_DIR/common.env"
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=2
+NUM_NODES=16
 GPUS_PER_NODE=8
 STEPS_PER_RUN=1
 MAX_STEPS=1
@@ -29,8 +29,8 @@ exit_if_max_steps_reached
 
 cd "$PROJECT_ROOT"
 
-# Build a deterministic local video fixture at runtime so the nightly covers
-# TorchCodec decoding and native Gym video transport without a binary fixture.
+# Build a deterministic local video fixture at runtime. This driver is listed
+# in disabled.txt because its 16-node topology is too large for nightly.
 DATA_DIR="$EXP_DIR/data"
 VIDEO_PATH="$DATA_DIR/red.mp4"
 RAW_TRAIN_PATH="$DATA_DIR/train_raw.jsonl"
@@ -68,8 +68,8 @@ export NEMO_RL_VIDEO_MEDIA_ROOT="$DATA_DIR"
 export NEMO_RL_VIDEO_TRAIN_JSONL="$TRAIN_PATH"
 export NEMO_RL_VIDEO_VAL_JSONL="$VALIDATION_PATH"
 
-# max_num_steps remains -1 from the recipe. The four-row, one-epoch dataset is
-# the only training terminator; no GRPO step cap or TMPE mask is introduced.
+# max_num_steps remains -1 from the recipe. The finite one-epoch fixture is the
+# only training terminator; no GRPO step cap or TMPE mask is introduced.
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config "$CONFIG_PATH" \
     policy.generation.max_new_tokens=256 \
