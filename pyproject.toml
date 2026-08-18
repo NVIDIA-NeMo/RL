@@ -198,6 +198,7 @@ mcore = [
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
+  "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
 ]

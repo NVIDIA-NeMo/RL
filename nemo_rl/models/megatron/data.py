@@ -354,14 +354,6 @@ def process_microbatch(
                     )
                 position_ids = None
             else:
-                if (
-                    model_slices_context_parallel_inputs
-                    and "mtp_loss_mask" in data_dict
-                ):
-                    raise NotImplementedError(
-                        "Nemotron Omni caller-packed THD inputs do not yet support MTP. "
-                        "Disable MTP for the Nano image/text path."
-                    )
                 token_identity = None
                 if routed_experts is not None and r3_trace_verify_forward_enabled():
                     token_identity = _make_r3_trace_token_identity(
@@ -484,8 +476,8 @@ def process_microbatch(
                 # Pack pre-computed mtp_loss_mask the same way as input_ids
                 if "mtp_loss_mask" in data_dict:
                     (
-                        _,
-                        mtp_loss_mask,
+                        packed_mtp_loss_mask,
+                        local_mtp_loss_mask,
                         _,
                         _,
                         _,
@@ -497,6 +489,16 @@ def process_microbatch(
                         pad_full_seq_to,
                         cp_rank=get_context_parallel_rank(),
                         cp_size=get_context_parallel_world_size(),
+                    )
+                    # Mirror the input_ids layout choice above. A model that
+                    # slices CP itself receives the full THD row so it can insert
+                    # media before selecting its CP-owned embeddings, so its MTP
+                    # mask has to stay unsharded to line up with the labels.
+                    # Every other model consumes the CP-local shard.
+                    mtp_loss_mask = (
+                        packed_mtp_loss_mask
+                        if model_slices_context_parallel_inputs
+                        else local_mtp_loss_mask
                     )
 
                 # For packed sequences, position_ids and attention_mask are typically None
