@@ -1,31 +1,47 @@
-# Full GLM-5.2 131K recipe on 72 H100 nodes: 64 nodes for
-# TP2/PP8/CP32/EP64 training and 8 nodes for non-colocated vLLM generation.
+# Colocated GLM-5.2 recipe on 64 H100 nodes with a 6,144-token total sequence
+# length. Training and vLLM share all 512 GPUs. The optimization settings mirror
+# the validated 64-node AutoModel experiment while the model topology and cuDNN
+# DSA settings target Megatron.
 defaults: ../../grpo_math_1B.yaml
 
 grpo:
-  num_prompts_per_step: 1
+  num_prompts_per_step: 16
   num_generations_per_prompt: 8
-  max_num_steps: 100
-  val_period: -1
-  reward_shaping:
-    # Cap rollout responses at 4K while retaining 131K model capacity.
-    max_response_length: 4000
+  max_num_epochs: 10
+  max_num_steps: 10000
+  use_leave_one_out_baseline: false
+  val_period: 10
+  val_at_start: true
+  val_at_end: false
+  max_val_samples: 128
+  val_batch_size: 128
   skip_reference_policy_logprobs_calculation: true
+
 loss_fn:
   reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_type: tis
   ratio_clip_max: 0.28
-  force_on_policy_ratio: true
+  ratio_clip_c: 10
+
 checkpointing:
-  checkpoint_dir: results/grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
+  checkpoint_dir: results/grpo-glm5.2-64n8g-megatron-8K-colocated
+  keep_top_k: 2
+  save_period: 3
+  checkpoint_must_save_by: "00:03:45:00"
+
 policy:
   model_name: zai-org/GLM-5.2
   hf_config_overrides:
     qk_rope_head_dim: 64
-  train_global_batch_size: 8
+  train_global_batch_size: 128
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  max_total_sequence_length: 131072
-  logprob_chunk_size: 2048
+  max_total_sequence_length: 6144
+  make_sequence_length_divisible_by: 128
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: true
   dtensor_cfg:
     enabled: false
   megatron_cfg:
@@ -37,7 +53,7 @@ policy:
     pipeline_model_parallel_size: 8
     num_layers_in_first_pipeline_stage: 14
     num_layers_in_last_pipeline_stage: 16
-    context_parallel_size: 32
+    context_parallel_size: 8
     cp_comm_type: all_gather
     sequence_parallel: true
     moe_router_dtype: fp32
@@ -45,14 +61,13 @@ policy:
     defer_fp32_logits: true
     moe_token_dispatcher_type: allgather
     optimizer:
-      lr: 5.0e-07
-      min_lr: 5.0e-08
-      weight_decay: 0.0
-      optimizer_cpu_offload: true
-      optimizer_offload_fraction: 1.0
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
     scheduler:
-      lr_warmup_iters: 2
-      lr_warmup_init: 5.0e-08
+      lr_decay_iters: 10000
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-14
     distributed_data_parallel_config:
       grad_reduce_in_fp32: true
       overlap_grad_reduce: false
@@ -71,39 +86,35 @@ policy:
       persist_layer_norm: true
       bias_dropout_fusion: true
     clear_memory_caches_before_refit: true
-    moe_grouped_gemm: true
-  dynamic_batching:
-    train_mb_tokens: 131072
-    logprob_mb_tokens: 131072
   sequence_packing:
-    train_mb_tokens: 131072
-    logprob_mb_tokens: 131072
-  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
-    ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
+    train_mb_tokens: ${policy.max_total_sequence_length}
+    logprob_mb_tokens: ${policy.max_total_sequence_length}
   optimizer: null
   scheduler: null
   generation:
     max_new_tokens: 4096
     vllm_cfg:
       precision: bfloat16
-      tensor_parallel_size: 8
-      expert_parallel_size: 64
-      gpu_memory_utilization: 0.7
+      tensor_parallel_size: 32
+      expert_parallel_size: 128
+      gpu_memory_utilization: 0.5
+      max_model_len: 6144
       enforce_eager: true
     vllm_kwargs:
       max_num_batched_tokens: 4096
-      max_num_seqs: 1
+      max_num_seqs: null
       enable_chunked_prefill: true
       attention_config:
         backend: FLASHMLA_SPARSE
       kernel_config:
         moe_backend: flashinfer_cutlass
       async_scheduling: false
+      compilation_config:
+        pass_config:
+          fuse_allreduce_rms: false
     colocated:
-      enabled: false
-      resources:
-        gpus_per_node: 8
-        num_nodes: 8
+      enabled: true
+
 data:
   max_input_seq_length: 2048
   train:
@@ -112,17 +123,20 @@ data:
     dataset_name: DAPOMathAIME2024
   default:
     prompt_file: null
+
 env:
   math:
     num_workers: 16
     math_verify_impl: dapo_math_verify
+
 logger:
-  log_dir: logs/grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
+  log_dir: logs/grpo-glm5.2-64n8g-megatron-8K-colocated
   wandb_enabled: true
-  tensorboard_enabled: true
   wandb:
-    project: nemo-rl-glm-perf
-    name: grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
+    project: nemorl-glm52
+    name: grpo-glm5.2-64n8g-megatron-8K-colocated
+    entity: nvidia
+
 cluster:
   gpus_per_node: 8
-  num_nodes: 72
+  num_nodes: 64

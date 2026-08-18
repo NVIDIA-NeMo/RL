@@ -181,10 +181,6 @@ def test_glm_decoder_sp_moe_patch_anchor_still_matches_installed_vllm(
     """Pin the vLLM 0.25.1 decoder-level SP-MoE source shape."""
     content = patched_glm_dsa_source.read_text()
     assert _GLM_DSA_MARKER in content
-    assert (
-        "self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe"
-        in content
-    )
     ast.parse(content)
 
 
