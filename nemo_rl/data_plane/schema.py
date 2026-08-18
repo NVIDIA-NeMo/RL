@@ -15,6 +15,8 @@
 
 from typing import Literal, Sequence
 
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
+
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
 Layout = Literal["padded", "jagged"]
 
@@ -124,6 +126,11 @@ ROUTED_EXPERTS_FIELD = "routed_experts"
 #
 # Delete this set and the corresponding adapter transforms when upstream TQ
 # fixes 1D field schema extraction.
+#
+# The ``<key>__lengths`` companions minted by ``PackedTensor.to_nested_wire``
+# are dense ``int32[B]`` and must be declared too, or the first multimodal
+# ``kv_first_write`` on this backend raises. Derived from the registry rather
+# than hand-listed so a new packed modality is covered automatically.
 PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
     {
         INPUT_LENGTHS,
@@ -132,7 +139,7 @@ PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
         SAMPLE_MASK,
         TRUNCATED,
     }
-)
+) | frozenset(PackedTensor.lengths_key(k) for k in PACKED_MULTIMODAL_FIELDS)
 
 
 def fields_with_optional_routed_experts(
