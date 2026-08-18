@@ -2469,18 +2469,8 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
-            broadcast_kwargs: dict[str, int] = {}
-            if isinstance(policy_generation, DynamoGeneration):
-                # Dynamo vLLM workers use vLLM's native packed NCCL
-                # transaction, whose sender protocol is fixed at 1 GiB and
-                # two alternating buffers.
-                broadcast_kwargs = {
-                    "buffer_size_bytes": VLLM_PACKED_BUFFER_SIZE_BYTES,
-                    "num_buffers": VLLM_PACKED_NUM_BUFFERS,
-                }
             futures_train = policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales,
-                **broadcast_kwargs,
             )
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
