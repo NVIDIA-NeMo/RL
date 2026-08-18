@@ -17,6 +17,8 @@ policy:
         - model.layers.*.mixer.shared_experts.*
         - model.layers.*.mixer.fc1_latent_proj
         - model.layers.*.mixer.fc2_latent_proj
+        - mtp.*
+        - language_model.mtp.*
     vllm_kwargs:
       moe_backend: flashinfer_trtllm
 logger:

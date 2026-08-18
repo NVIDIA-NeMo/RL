@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from unittest.mock import patch
@@ -298,6 +299,13 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
         fp8_block_quant_kwargs["ignored_layers"] = bf16_params
     quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws")
+    if "quantization_ignored_layer_kws" in vllm_cfg:
+        warnings.warn(
+            "quantization_ignored_layer_kws is deprecated in NeMo RL 0.8; "
+            "use quantization_ignore_patterns instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     if quantization_ignored_layer_kws:
         with init_empty_weights():
             model = AutoModel.from_config(config)

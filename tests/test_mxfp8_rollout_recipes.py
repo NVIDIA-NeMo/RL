@@ -38,6 +38,8 @@ MXFP8_CASES = {
             "model.layers.1.mlp.*",
             "model.layers.2.mlp.*",
             "model.layers.61.*",
+            "mtp.*",
+            "language_model.mtp.*",
         ],
     },
     "grpo-deepseek-v3-64n4g-async-1off-mxfp8-rollout": {
@@ -55,6 +57,8 @@ MXFP8_CASES = {
             "model.layers.1.mlp.*",
             "model.layers.2.mlp.*",
             "model.layers.61.*",
+            "mtp.*",
+            "language_model.mtp.*",
         ],
     },
     "grpo-nemotron3-super-120BA12B-32n4g-mxfp8-rollout": {
@@ -75,6 +79,8 @@ MXFP8_CASES = {
             "model.layers.*.mixer.shared_experts.*",
             "model.layers.*.mixer.fc1_latent_proj",
             "model.layers.*.mixer.fc2_latent_proj",
+            "mtp.*",
+            "language_model.mtp.*",
         ],
     },
     "grpo-nemotron3-super-120BA12B-32n4g-async-1off-mxfp8-rollout": {
@@ -95,6 +101,8 @@ MXFP8_CASES = {
             "model.layers.*.mixer.shared_experts.*",
             "model.layers.*.mixer.fc1_latent_proj",
             "model.layers.*.mixer.fc2_latent_proj",
+            "mtp.*",
+            "language_model.mtp.*",
         ],
     },
     "grpo-qwen3-30ba3b-4n4g-mxfp8-rollout": {

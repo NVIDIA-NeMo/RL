@@ -429,18 +429,22 @@ def test_init_fp8_combines_legacy_and_modelopt_ignore_patterns(fp8_module, monke
     monkeypatch.setattr(fp8.AutoModel, "from_config", lambda *_args: FakeModel())
     monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
 
-    vllm_kwargs = fp8.init_fp8(
-        {
-            "precision": "fp8",
-            "kv_cache_dtype": "auto",
-            "async_engine": False,
-            "is_mx": True,
-            "quantization_ignored_layer_kws": ["q_proj"],
-            "quantization_ignore_patterns": ["lm_head"],
-        },
-        "dummy-model",
-        model_parallel_size=1,
-    )
+    with pytest.warns(
+        DeprecationWarning,
+        match="quantization_ignored_layer_kws.*quantization_ignore_patterns",
+    ):
+        vllm_kwargs = fp8.init_fp8(
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": "auto",
+                "async_engine": False,
+                "is_mx": True,
+                "quantization_ignored_layer_kws": ["q_proj"],
+                "quantization_ignore_patterns": ["lm_head"],
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
 
     quant_config = vllm_kwargs["hf_overrides"]["quantization_config"]
     assert quant_config["ignore"] == [
