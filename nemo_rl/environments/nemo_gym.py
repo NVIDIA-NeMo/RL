@@ -488,12 +488,6 @@ def _build_token_capture_source(
             )
         return None, capture_dirs
 
-    if capture_config.token_id_capture.source is not None:
-        raise ValueError(
-            "NeMo-RL does not construct framework TokenSource implementations from Gym config. "
-            "Pass token_source_factory to spinup_nemo_gym_actor instead."
-        )
-
     source = token_source_factory() if token_source_factory is not None else None
     if source is not None and not isinstance(source, TokenSource):
         raise TypeError(

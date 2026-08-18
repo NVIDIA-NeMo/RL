@@ -977,20 +977,6 @@ def test_framework_source_factory_runs_in_the_consumer_process():
     assert directories == []
 
 
-def test_build_token_capture_source_rejects_framework_imports_in_gym_config():
-    with pytest.raises(ValueError, match="Pass token_source_factory"):
-        _build_token_capture_source(
-            {
-                "token_id_capture": {
-                    "enabled": True,
-                    "source": f"{__name__}:_ConfiguredTokenSource",
-                    "source_kwargs": {"endpoint": "transfer-queue://tokens"},
-                    "rebuild_response": True,
-                }
-            }
-        )
-
-
 @pytest.mark.asyncio
 async def test_run_rollouts_retires_capture_after_yield_is_accepted(monkeypatch):
     """Keep frozen evidence until the rollout consumer requests another item."""
