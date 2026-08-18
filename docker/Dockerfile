@@ -546,7 +546,7 @@ RUN find /opt/nemo-rl -xdev -type d \
         \( -name '*.egg-info' -o -name '__pycache__' \) \
         -prune -exec rm -rf -- {} + && \
     find /opt/nemo-rl -xdev -uid 0 \
-        -exec chown "${RUNTIME_UID}:${RUNTIME_GID}" -- {} + && \
+        -exec chown --no-dereference "${RUNTIME_UID}:${RUNTIME_GID}" -- {} + && \
     install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /nemo_run
 
 ENV UV_CACHE_DIR=/opt/nemo_rl_cache/uv \
