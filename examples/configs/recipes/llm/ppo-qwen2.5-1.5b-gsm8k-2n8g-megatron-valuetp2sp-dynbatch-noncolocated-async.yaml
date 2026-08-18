@@ -9,6 +9,7 @@ ppo:
   overlong_filtering: true
   async_ppo:
     enabled: true
+    in_flight_weight_updates: true
   reward_shaping:
     enabled: false
   adv_estimator:

@@ -251,7 +251,7 @@ ppo:
     enabled: false
     max_trajectory_age_steps: 1
     warmup_max_trajectory_age_steps: null
-    in_flight_weight_updates: true
+    in_flight_weight_updates: false
     recompute_kv_cache_after_weight_updates: false
     drop_incomplete_targets_on_restore: true
 

@@ -5,10 +5,13 @@ ppo:
   # Async PPO cycles the dataloader and stops via max_num_steps.
   max_num_epochs: -1
   ppo_epochs: 1
+  policy_training_start_step: 5
   val_period: 1
   overlong_filtering: true
   async_ppo:
     enabled: true
+    warmup_max_trajectory_age_steps: 2
+    in_flight_weight_updates: true
   reward_shaping:
     enabled: false
   adv_estimator:

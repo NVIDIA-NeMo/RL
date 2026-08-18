@@ -41,7 +41,8 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'median(data["train/token_mult_prob_error"]) < 1.1' \
         'data["train/token_mult_prob_error"]["40"] < 1.1' \
         'median(data["train/max_seq_mult_prob_error"]) < 1.2' \
-        'max(data["train/avg_trajectory_age"]) <= 1.0' \
+        'max(data["train/avg_trajectory_age"]) <= 2.0' \
+        'data["train/avg_trajectory_age"]["40"] <= 1.0' \
         'data["train/reward"]["40"] > 0.75' \
         'data["validation/accuracy"]["40"] > 0.65'
 
