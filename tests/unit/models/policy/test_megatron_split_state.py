@@ -577,7 +577,7 @@ class TestFinish:
         metrics = w.finish_train_step()
 
         reduced = mock_module_symbols["all_reduce"].call_args.args[0]
-        assert torch.equal(reduced, torch.tensor([8.0, 2048.0, 1024.0]))
+        assert torch.equal(reduced, reduced.new_tensor([8.0, 2048.0, 1024.0]))
         # policy scale 1/2048 followed by relative draft correction 2048/1024
         assert draft_param.main_grad.item() == pytest.approx(6.0)
         mb = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"][0]
