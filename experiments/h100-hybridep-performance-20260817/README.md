@@ -145,9 +145,10 @@ experiments/h100-hybridep-performance-20260817/submit.sh \
 
 The launcher requests all eight GPUs on every H100 node. It never embeds a
 cluster hostname, account, shared-storage path, or credential. The baseline
-recipe is materialized from commit
+configuration tree is materialized from commit
 `4a1454bf430624786251d14ba0197169c8e68a5c` inside the run's result directory
-and retained with the logs. An optional absolute `UV_CACHE_DIR_OVERRIDE`
+and retained with the logs so inherited YAML paths remain valid. An optional
+absolute `UV_CACHE_DIR_OVERRIDE`
 selects the warmed cache only after Ray has started; this avoids shadowing the
 nightly image's bootstrap cache while still reusing the pinned HybridEP wheel
 in driver and actor environments. Before launching Ray actors, the launcher

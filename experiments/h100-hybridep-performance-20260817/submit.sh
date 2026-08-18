@@ -118,9 +118,10 @@ run_dir="${RUN_ROOT}/${run_id}"
 mkdir -p "${run_dir}"
 
 if [[ ${arm} == "baseline" ]]; then
-  config_setup="baseline_config=\"${run_dir}/baseline-${BASELINE_COMMIT}-${recipe}\"
-git -C \"${PROJECT_ROOT}\" show \"${BASELINE_COMMIT}:${config_rel}\" > \"\${baseline_config}\"
-config_path=\"\${baseline_config}\""
+  config_setup="baseline_root=\"${run_dir}/baseline-${BASELINE_COMMIT}\"
+mkdir -p \"\${baseline_root}\"
+git -C \"${PROJECT_ROOT}\" archive \"${BASELINE_COMMIT}\" examples/configs | tar -x -C \"\${baseline_root}\"
+config_path=\"\${baseline_root}/${config_rel}\""
 else
   config_setup="config_path=\"${config_path}\""
 fi

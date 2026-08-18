@@ -208,8 +208,7 @@ def test_submission_rejects_ray_bootstrap_and_lock_version_skew() -> None:
 def test_baseline_config_is_materialized_outside_the_source_tree() -> None:
     script = SUBMIT_SCRIPT.read_text()
 
-    assert (
-        'baseline_config=\\"${run_dir}/baseline-${BASELINE_COMMIT}-${recipe}\\"'
-        in script
-    )
+    assert 'baseline_root=\\"${run_dir}/baseline-${BASELINE_COMMIT}\\"' in script
+    assert 'archive \\"${BASELINE_COMMIT}\\" examples/configs' in script
+    assert 'config_path=\\"\\${baseline_root}/${config_rel}\\"' in script
     assert "performance/.${recipe}.baseline" not in script
