@@ -66,6 +66,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.rollout_timing import NemoGymRolloutTiming
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
@@ -212,6 +213,20 @@ class _ExhaustingSampler(_FakeSampler):
         return await super().select(**kwargs)
 
 
+class _FakeGeneration:
+    """GenerationInterface stand-in for the telemetry hooks the train pump calls.
+
+    Mirrors the interface defaults -- no samples, nothing to clear -- which is what
+    every backend except vLLM with its metrics logger enabled actually does.
+    """
+
+    def get_logger_metrics(self) -> dict[str, Any]:
+        return {}
+
+    def clear_logger_metrics(self) -> None:
+        return None
+
+
 class _FakeDPClient:
     def __init__(self) -> None:
         self.clear_calls: list[tuple[list[str], str]] = []
@@ -236,6 +251,7 @@ class _FakeRolloutManager:
     def __init__(self) -> None:
         self.weight_versions: list[int] = []
         self._tq_buffer = None
+        self.rollout_timing = NemoGymRolloutTiming()
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
@@ -378,7 +394,7 @@ def _make_actor_args(
     last_checkpoint_path: Optional[str] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
-        gen_handle=object(),
+        gen_handle=_FakeGeneration(),
         trainer_handle=trainer if trainer is not None else _FakeTrainer(),
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]

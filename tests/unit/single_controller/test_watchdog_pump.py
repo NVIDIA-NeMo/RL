@@ -53,6 +53,7 @@ def _make_controller(
     env_handles=None,
     train_steps: int = 0,
     max_num_steps: int = 100,
+    buffered: int = 0,
 ):
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
@@ -64,7 +65,10 @@ def _make_controller(
             stall_timeout_s=stall_timeout_s,
             stall_action=stall_action,
             gym_subprocess_check=gym_subprocess_check,
-        )
+        ),
+        # Capacities the occupancy report divides by.
+        max_inflight_prompts=16,
+        max_buffered_rollouts=64,
     )
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_steps=max_num_steps)
@@ -72,6 +76,8 @@ def _make_controller(
     ctrl._rollout_manager = SimpleNamespace(stats=stats)
     ctrl._inflight_rollouts = inflight
     ctrl._train_steps = train_steps
+    ctrl._trainer_version = train_steps
+    ctrl._buffer = [None] * buffered
     ctrl._logger = _RecordingLogger()
     ctrl._env_handles = env_handles if env_handles is not None else {}
     return ctrl
@@ -199,6 +205,32 @@ class TestMetrics:
         assert published["rollout/inflight"] == 2.0
         # The leading indicator: idle time rises before a wedge becomes a stall.
         assert "rollout/idle_s" in published
+
+    def test_buffer_occupancy_is_published_as_a_series(self):
+        """Buffer depth against its capacity is what the async knobs are tuned on.
+
+        It used to be readable only from the train pump's stall warning, so a run that
+        never stalled -- every healthy run -- reported it nowhere.
+        """
+        ctrl = _make_controller(
+            stats=RolloutStats(), inflight=2, stall_timeout_s=1000.0, buffered=5
+        )
+
+        asyncio.run(_run_ticks(ctrl, 2))
+
+        assert ctrl._logger.metrics[-1]["rollout/buffered"] == 5.0
+
+    def test_occupancy_is_printed_against_its_capacities(self, capsys):
+        """The numbers are useless without the bounds they are approaching."""
+        ctrl = _make_controller(
+            stats=RolloutStats(), inflight=3, stall_timeout_s=1000.0, buffered=9
+        )
+
+        asyncio.run(_run_ticks(ctrl, 2))
+
+        out = capsys.readouterr().out
+        assert "inflight=3/16" in out
+        assert "buffered=9/64" in out
 
 
 class TestEnvHealthCheck:
