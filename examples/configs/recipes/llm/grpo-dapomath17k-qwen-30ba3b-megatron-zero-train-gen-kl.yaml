@@ -32,6 +32,7 @@ policy:
     moe_router_dtype: fp32
     moe_pad_experts_for_cuda_graph_inference: true
     moe_permute_fusion: false
+    cuda_graph_impl: none
     optimizer:
       lr: 1.0e-06
       min_lr: 1.0e-06
