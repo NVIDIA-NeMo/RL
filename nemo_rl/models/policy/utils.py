@@ -724,10 +724,6 @@ def stream_weights_via_http_impl(
             f"rank must fall within [0, {num_gpus_per_engine * len(rollout_engine_urls)})."
         )
 
-    # Read the cached topology only once the rank is known to be covered:
-    # ``_ensure_ipc_topology`` stashes ``gather_src``/``gather_group`` on matched
-    # ranks only, so an uncovered rank would otherwise die with a bare
-    # ``KeyError('gather_src')`` and never reach the error above.
     worker_state["weight_version"] = worker_state.get("weight_version", 0) + 1
     weight_version = worker_state["weight_version"]
     gather_src = worker_state["gather_src"]
