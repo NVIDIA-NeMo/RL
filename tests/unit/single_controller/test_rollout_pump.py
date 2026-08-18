@@ -31,6 +31,9 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSampler,
     WindowedSamplerConfig,
 )
+from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -38,7 +41,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollout_manager import (
@@ -59,6 +62,34 @@ from tests.unit.single_controller._dp_fakes import (
 )
 
 
+class _RecordingBuffer:
+    """TQReplayBuffer stand-in recording the target_step of each reserve."""
+
+    def __init__(self, target_step_list: list[int | None] | None = None) -> None:
+        self.target_step_list: list[int | None] = list(target_step_list or [])
+
+    def reserve(self, *, target_step: int | None) -> None:
+        self.target_step_list.append(target_step)
+
+    def count_for_target_step(self, target_step: int) -> int:
+        return sum(1 for target in self.target_step_list if target == target_step)
+
+
+class _RecordingRolloutManager:
+    def __init__(self, buffer: _RecordingBuffer) -> None:
+        self._buffer = buffer
+
+    async def generate_and_push(
+        self,
+        prompt: Any,
+        *,
+        target_step: int | None = None,
+        inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+    ) -> None:
+        del prompt, inflight_registry
+        self._buffer.reserve(target_step=target_step)
+
+
 @pytest.mark.parametrize(
     ("make_sampler", "expected_target_steps"),
     [
@@ -72,31 +103,17 @@ def test_rollout_pump_stamps_target_steps(
     make_sampler,
     expected_target_steps: list[int | None],
 ) -> None:
-    class _RecordingBuffer:
-        def __init__(self) -> None:
-            self.target_step_list: list[int | None] = []
-
-        def reserve(self, *, target_step: int | None) -> None:
-            self.target_step_list.append(target_step)
-
-    class _RecordingRolloutManager:
-        def __init__(self, buffer: _RecordingBuffer) -> None:
-            self._buffer = buffer
-
-        async def generate_and_push(
-            self, prompt: Any, *, target_step: int | None = None
-        ) -> None:
-            del prompt
-            self._buffer.reserve(target_step=target_step)
-
     buffer = _RecordingBuffer()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(
         max_inflight_prompts=2,
         diagnostics=False,
     )
-    ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # The sampler owns admission + target_step stamping (the dispatch counter
     # lives on the sampler, not the actor).
@@ -110,6 +127,7 @@ def test_rollout_pump_stamps_target_steps(
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._inflight_rollouts = 0
+    ctrl._inflight_by_group_id = {}
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
     ctrl._current_epoch = 0
@@ -120,6 +138,173 @@ def test_rollout_pump_stamps_target_steps(
     assert ctrl._rollout_exhausted.is_set()
 
 
+@pytest.mark.parametrize(
+    ("outcome", "expect_permit_released"),
+    [
+        # A committed group transfers permit ownership to the train pump, which
+        # releases it after consuming the group.
+        (RolloutOutcome.COMMITTED, False),
+        # A skipped prompt never reaches the buffer, so the train pump will never
+        # see it and the dispatcher must release the permit itself. Getting this
+        # wrong leaks one backpressure slot per skipped prompt until the pump wedges.
+        (RolloutOutcome.SKIPPED, True),
+    ],
+)
+def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
+    outcome: RolloutOutcome, expect_permit_released: bool
+) -> None:
+    class _OutcomeRolloutManager:
+        async def generate_and_push(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, Any] | None = None,
+        ) -> RolloutOutcome:
+            del prompt, target_step, inflight_registry
+            return outcome
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
+    ctrl._rollout_manager = _OutcomeRolloutManager()
+    ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+    ctrl._dataloader = [
+        BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+    ]
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(2)
+    ctrl._inflight_rollouts = 0
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+    ctrl._inflight_by_group_id = {}
+
+    asyncio.run(ctrl._rollout_pump())
+
+    # One prompt was dispatched out of a semaphore sized 2.
+    expected = 2 if expect_permit_released else 1
+    assert ctrl._buffer_capacity._value == expected
+    assert ctrl._inflight_rollouts == 0
+
+
+@pytest.mark.parametrize(
+    ("restored", "expected_new_dispatches"),
+    [
+        # Room left for a partial top-up.
+        (1, 1),
+        # Target step already full: the whole batch is dropped.
+        (2, 0),
+        # More restored than a batch: still zero, never negative.
+        (3, 0),
+    ],
+)
+def test_rollout_pump_tops_up_restored_target_step(
+    restored: int,
+    expected_new_dispatches: int,
+) -> None:
+    # On resume the buffer holds groups still stamped for the next target
+    # step. In-order selection consumes a target step as one fixed-size batch,
+    # so the pump must dispatch only the shortfall — a full batch on top would
+    # leave surplus groups that are never selected and whose capacity permits
+    # are held until evict.
+    buffer = _RecordingBuffer([0] * restored)
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._buffer = buffer
+    ctrl._async_cfg = SimpleNamespace(max_inflight_prompts=2, diagnostics=False)
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
+    ctrl._rollout_manager = _RecordingRolloutManager(buffer)
+    # lookahead=0 keeps the single batch on target_step 0.
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
+    ctrl._dataloader = [
+        BatchedDataDict(
+            {
+                "message_log": [
+                    [{"role": "user", "content": "p0"}],
+                    [{"role": "user", "content": "p1"}],
+                ]
+            }
+        )
+    ]
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(4)
+    ctrl._inflight_rollouts = 0
+    ctrl._inflight_by_group_id = {}
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+
+    asyncio.run(ctrl._rollout_pump())
+
+    # Only the shortfall was dispatched on top of the restored groups.
+    assert buffer.target_step_list == [0] * (restored + expected_new_dispatches)
+    # A dispatched prompt keeps its permit (the train pump releases it after
+    # consuming the group), so exactly one permit per dispatch is held and the
+    # dropped prompts consume none.
+    assert ctrl._buffer_capacity._value == 4 - expected_new_dispatches
+    assert ctrl._inflight_rollouts == 0
+    assert ctrl._rollout_exhausted.is_set()
+
+
+def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
+    async def _main() -> None:
+        fresh = asyncio.create_task(asyncio.Event().wait())
+        stale = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
+        ctrl._trainer_version = 5
+        ctrl._inflight_by_group_id = {"fresh": (fresh, 5), "stale": (stale, 1)}
+
+        aborted = await ctrl._abort_stale_inflight()
+
+        assert aborted == 1
+        assert stale.cancelled()
+        assert not fresh.cancelled()
+
+        fresh.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await fresh
+
+    asyncio.run(_main())
+
+
+def test_abort_stale_inflight_aggregates_cleanup_failures() -> None:
+    async def _main() -> None:
+        async def _boom() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError("cleanup boom")
+
+        task = asyncio.create_task(_boom())
+        await asyncio.sleep(0)
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=0)
+        ctrl._trainer_version = 5
+        ctrl._inflight_by_group_id = {"g": (task, 0)}
+
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await ctrl._abort_stale_inflight()
+        assert exc_info.value.subgroup(RuntimeError) is not None
+
+    asyncio.run(_main())
+
+
 def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
     class _FailingRolloutManager:
         def __init__(self) -> None:
@@ -128,9 +313,13 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             self.sibling_cancelled = False
 
         async def generate_and_push(
-            self, prompt: Any, *, target_step: int | None = None
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
         ) -> None:
-            del target_step
+            del target_step, inflight_registry
             self._started += 1
             if self._started == 2:
                 self._both_started.set()
@@ -154,7 +343,9 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             max_inflight_prompts=2,
             diagnostics=False,
         )
-        ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        )
         ctrl._rollout_manager = manager
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -173,6 +364,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = asyncio.Semaphore(2)
         ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
@@ -193,9 +385,13 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
 def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> None:
     class _NeverCalledRolloutManager:
         async def generate_and_push(
-            self, prompt: Any, *, target_step: int | None = None
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
         ) -> None:
-            del prompt, target_step
+            del prompt, target_step, inflight_registry
             raise AssertionError("cancelled child unexpectedly started")
 
     class _CancelBeforeStartTaskGroup:
@@ -233,7 +429,9 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             max_inflight_prompts=1,
             diagnostics=False,
         )
-        ctrl._master_config = SimpleNamespace(grpo={"max_num_epochs": 1})
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        )
         ctrl._rollout_manager = _NeverCalledRolloutManager()
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
@@ -245,6 +443,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl._rollout_exhausted = asyncio.Event()
         ctrl._buffer_capacity = real_semaphore(1)
         ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
@@ -288,13 +487,13 @@ def test_rollout_pump_writes_expected_tq_data(
 
     master_config = MasterConfig.model_construct(
         policy={"train_global_batch_size": expected_samples},
-        grpo={
-            "num_prompts_per_step": num_prompts,
-            "num_generations_per_prompt": num_generations,
-            "max_num_steps": 1,
-            "max_num_epochs": 1,
-        },
-        loss_fn=SimpleNamespace(force_on_policy_ratio=False),
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=num_prompts,
+            num_generations_per_prompt=num_generations,
+            max_num_steps=1,
+            max_num_epochs=1,
+        ),
+        loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
         async_rl=AsyncRLConfig(
             sampler=WindowedSamplerConfig(max_staleness_versions=1),
             min_groups_for_streaming_train=1,
@@ -308,6 +507,18 @@ def test_rollout_pump_writes_expected_tq_data(
             "tensorboard_enabled": False,
             "mlflow_enabled": False,
             "monitor_gpus": False,
+        },
+        # Actor __init__ builds a CheckpointManager + TimeoutChecker from
+        # this block; enabled=False keeps the run write-free.
+        checkpointing={
+            "enabled": False,
+            "checkpoint_dir": str(tmp_path / "checkpoints"),
+            "metric_name": None,
+            "higher_is_better": False,
+            "keep_top_k": None,
+            "save_period": 10_000,
+            "save_optimizer": False,
+            "checkpoint_must_save_by": None,
         },
     )
     # Wrap each value in a single-element list so size==1 and v[0] returns the original field.
@@ -343,9 +554,13 @@ def test_rollout_pump_writes_expected_tq_data(
         rollout_manager=rollout_manager,
         tq_buffer=tq_buffer,
         partition_id=_PARTITION_ID,
+        save_state=_initial_grpo_save_state(),
+        last_checkpoint_path=None,
     )
     ctrl = SingleControllerActor.remote(
-        master_config=master_config, actor_args=actor_args
+        master_config=master_config,
+        actor_args=actor_args,
+        setup_timing_metrics=SetupTimingMetrics(),
     )
 
     vllm_generation.prepare_for_generation()

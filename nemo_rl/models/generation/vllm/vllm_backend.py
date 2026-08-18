@@ -56,7 +56,7 @@ except ImportError:
     )
 
 
-WeightUpdateTransport = Literal["ipc", "collective"]
+WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
 WeightUpdateFinalizer = Callable[[], None]
 
 
@@ -700,6 +700,16 @@ class VllmInternalWorkerExtension:
                         self._load_weights(weights)
                     except Exception as error:
                         batch_error = error
+                        # The manifest only keeps the exception message; log
+                        # the full traceback and the batch contents so loader
+                        # failures stay diagnosable from worker logs.
+                        batch_desc = ", ".join(
+                            f"{k}: {tuple(w.shape)} {w.dtype}"
+                            for k, w in (weights or [])[:40]
+                        )
+                        logger.exception(
+                            "IPC weight batch load failed (batch: %s)", batch_desc
+                        )
                     finally:
                         # Synchronize before releasing or ACKing an IPC allocation,
                         # including when a loader failed after scheduling CUDA work.
@@ -882,10 +892,24 @@ class VllmInternalWorkerExtension:
 
         vllm_by_relative = {_layer_relative(n): n for n in vllm_params}
 
+        # vLLM 0.25 moved the fused-MoE expert weights onto a nested
+        # ``routed_experts`` submodule, so real names carry a
+        # ``.routed_experts.`` segment that the name built from the HF side
+        # below does not (``...mlp.experts.w13_weight`` vs
+        # ``...mlp.experts.routed_experts.w13_weight``).  Index the real names
+        # with that segment dropped so either layout resolves; on a 0.20-style
+        # model this index is identical to ``vllm_by_relative``.
+        vllm_by_relative_flat = {
+            _layer_relative(n).replace(".routed_experts.", "."): n for n in vllm_params
+        }
+
         def _to_vllm_name(n: str) -> str:
             if n in vllm_params:
                 return n
-            return vllm_by_relative.get(_layer_relative(n), n)
+            relative = _layer_relative(n)
+            if relative in vllm_by_relative:
+                return vllm_by_relative[relative]
+            return vllm_by_relative_flat.get(relative, n)
 
         for hf_name in hf_shapes:
             # 1) Grouped MoE expert params (gate_proj/up_proj/down_proj, each
@@ -1040,33 +1064,26 @@ class VllmInternalWorkerExtension:
 
         import time
 
-        misc_t0 = time.perf_counter()
-        self._receive_and_load_misc_params()
-        torch.cuda.synchronize()
-        if torch.distributed.get_rank() == 0:
-            print(
-                f"[nccl_reshard_refit] misc recv+load (gen side): "
-                f"{time.perf_counter() - misc_t0:.2f}s",
-                flush=True,
-            )
-        torch.cuda.empty_cache()
-        from vllm.config import set_current_vllm_config
-        from vllm.model_executor.model_loader.utils import (
-            process_weights_after_loading,
-        )
+        with self._weight_update_lifecycle("nccl_reshard") as finalize:
+            misc_t0 = time.perf_counter()
+            self._receive_and_load_misc_params()
+            torch.cuda.synchronize()
+            if torch.distributed.get_rank() == 0:
+                print(
+                    f"[nccl_reshard_refit] misc recv+load (gen side): "
+                    f"{time.perf_counter() - misc_t0:.2f}s",
+                    flush=True,
+                )
+            torch.cuda.empty_cache()
 
-        # Finalize post-load weight processing: dense Linear + attention/MLA, and
-        # crucially the per-MoE-backend w13 layout (FlashInfer CUTLASS/TRTLLM) that
-        # the canonical [gate; up] bulk write above defers to here.
-        with set_current_vllm_config(self.model_runner.vllm_config):
-            process_weights_after_loading(
-                self.model_runner.model, self.model_config, self.device
-            )
+            # Finalize post-load weight processing: dense Linear + attention/MLA,
+            # the per-MoE-backend w13 layout (FlashInfer CUTLASS/TRTLLM) that the
+            # canonical [gate; up] bulk write above defers to here, and the MTP
+            # drafter's mirror of the same. The FP8 KV-cache per-layer k/v scales
+            # are finalized by the lifecycle on exit.
+            finalize()
 
-        torch.cuda.empty_cache()
-
-        # Finalize FP8 KV-cache per-layer k/v scales after the misc broadcast.
-        self._maybe_process_fp8_kv_cache()
+            torch.cuda.empty_cache()
         return True
 
     def _receive_and_load_misc_params(self) -> None:

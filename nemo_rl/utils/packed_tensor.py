@@ -77,14 +77,17 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     # Apply backend specific post processing and then convert to linearized uint8 tensor.
                     # contiguous() is required because the upstream iterator may
                     # yield non-contiguous tensors that view(...) cannot handle.
-                    tensor = (
-                        post_iter_func(next(iterator))
-                        .contiguous()
-                        .view(torch.uint8)
-                        .view(-1)
-                    )
+                    tensor = post_iter_func(next(iterator))
+                    if tensor.device.type != "cuda":
+                        # Everything here is concatenated into one buffer and
+                        # broadcast over a CUDA collective, so a single host
+                        # tensor anywhere in the stream fails the cat. The
+                        # producer owns its buffer's device rather than
+                        # trusting every upstream exporter to agree.
+                        tensor = tensor.to(torch.cuda.current_device())
+                    tensor = tensor.contiguous().reshape(-1).view(torch.uint8)
                     packing_tensor_list[buffer_idx].append(tensor)
-                    packing_tensor_sizes[buffer_idx] += tensor.view(torch.uint8).numel()
+                    packing_tensor_sizes[buffer_idx] += tensor.numel()
                     if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
                         break
                 # Pack the tensors and call broadcast collective
@@ -101,6 +104,10 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     group.broadcast(packed_tensors[buffer_idx], src=src)
                 break
 
+    # Join all packing/broadcast side streams before returning. Without this,
+    # the caller may mutate or offload the source weights while the final
+    # broadcasts are still in flight on the side streams (vLLM >= 0.25's
+    # PyNcclCommunicator enqueues on the current stream without blocking).
     for s in streams:
         s.synchronize()
 
@@ -136,11 +143,25 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
         packed_tensor_sizes = list(map(lambda x: x[4], meta_data_list))
         unpacked_tensor = packed_tensor.split_with_sizes(packed_tensor_sizes)
 
-        # unpacked_list = List[(name, torch.Tensor.view(dtype).view(*shape))]
+        def restore_tensor(
+            tensor: torch.Tensor, shape: torch.Size | list[int], dtype: torch.dtype
+        ) -> torch.Tensor:
+            """Restore dtype and shape for a tensor from the packed byte stream.
+
+            Unlike the 512-byte-aligned IPC/ZMQ refit path, packed collective
+            refit adds no padding between tensors. Scalar GEMM or K/V amax can
+            therefore leave the next mixed-dtype slice unaligned. Cloning moves
+            only such slices to offset zero. ``reshape(tuple(shape))`` accepts an
+            empty tuple and therefore also restores scalar tensors.
+            """
+            if tensor.storage_offset() % dtype.itemsize:
+                tensor = tensor.clone()
+            return tensor.view(dtype).reshape(tuple(shape))
+
         unpacked_list = [
             (
                 meta_data_list[i][0],
-                tensor.view(meta_data_list[i][2]).view(*meta_data_list[i][1]),
+                restore_tensor(tensor, meta_data_list[i][1], meta_data_list[i][2]),
             )
             for i, tensor in enumerate(unpacked_tensor)
         ]
@@ -212,5 +233,10 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
                     )
                 break
 
+    # Join all recv/unpack/load side streams before returning. Without this,
+    # generation can start reading model weights while the final unpack/load
+    # copies are still in flight on the side streams, producing garbage
+    # logprobs (vLLM >= 0.25's PyNcclCommunicator enqueues on the current
+    # stream without blocking).
     for s in streams:
         s.synchronize()

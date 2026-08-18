@@ -8,12 +8,20 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
+  val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
   advantage_clip_low: null
   advantage_clip_high: null
   max_val_samples: 256
+  # Validation rollouts per prompt; k > 1 also reports the pass_k metric.
+  # max_val_samples counts PROMPTS: total validation rollouts = max_val_samples * k.
+  val_num_generations_per_prompt: 1
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
   use_dynamic_sampling: false
@@ -49,6 +57,10 @@ grpo:
     enabled: false # Set to true to enable async training mode
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
+    # Number of generation-worker failures tolerated before aborting.
+    # 0 (default) = fail on the first worker exception. Increase only
+    # when transient generation errors are expected and acceptable to drop.
+    max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
     recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates
 
@@ -158,6 +170,9 @@ policy:
   
   megatron_cfg:
     enabled: false
+    # Arbitrary overrides applied recursively to the Megatron Bridge model
+    # provider before model instantiation. Do not duplicate first-class fields.
+    model_overrides: {}
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true
@@ -171,6 +186,22 @@ policy:
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false
+    # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
+    cuda_graph_impl: "none"
+    cuda_graph_modules: []
+    cuda_graph_warmup_steps: 3
+    # Offload specific module activations to CPU. Works for both dense and MoE
+    # models and requires transformer_engine. Different from optimizer_cpu_offload,
+    # which offloads optimizer states. On TE >= 2.10,
+    # also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when fine_grained_activation_offloading is true.
+    # Common examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"].
+    # Supported names depend on the pinned Megatron-LM version and are
+    # validated by MCore. "attn_proj" requires "core_attn". See the latest
+    # upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
     # recompute_granularity controls activation checkpointing depth.
     # "full": recompute all activations (default, max memory savings).
     # "selective": recompute only specific modules (see recompute_modules).
@@ -301,6 +332,7 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
 
   # makes the training sequence length divisible by the tensor parallel size
@@ -338,11 +370,18 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    # Validation-only sampling; defaults follow the train values above.
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     # null = topology default (IPC colocated, NCCL non-colocated).
     # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
     refit_transport: null
+    # Keep real-quant export tensors on CPU by default. Set false only for
+    # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.
+    real_quant_export_cpu_offload: true
     refit_cfg:
       nixl:
         update_weights_bucket_memory_ratio: 0.05
@@ -352,7 +391,6 @@ policy:
         release_after_refit: false
         shard_expert_weights: false
     mcore_generation_config:
-      async_engine: false
       max_model_len: ${policy.max_total_sequence_length}  # Engine-side max sequence length.
       cuda_graph_impl: "local"  # CUDA-graph implementation. Options: "none", "local", "transformer_engine", "full_iteration".
       inference_cuda_graph_scope: "block"  # Inference CUDA-graph scope. Options: "none", "layer", "block".
@@ -366,13 +404,14 @@ policy:
       kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
-      refit_backend: "nvshmem"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nvshmem".
+      refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nccl"
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
+      logprobs_mode: processed_logprobs
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
@@ -389,6 +428,7 @@ policy:
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
       vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
       http_refit_api_key_env_var: null # Optional env var containing the internal refit API key.
+      reset_encoder_cache_after_weight_update: false # Invalidate cached multimodal encoder outputs after a successful async refit. Only safe when generation is quiesced (grpo.async_grpo.in_flight_weight_updates=false).
       http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.
       zmq_refit_server_port: null # Optional fixed ZeroMQ relay port for Kubernetes targetPorts.
     vllm_kwargs: {}

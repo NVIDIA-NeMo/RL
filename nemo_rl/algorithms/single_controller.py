@@ -14,9 +14,9 @@
 
 """SingleController: asyncio orchestrator for the RL training loop.
 
-CPU-only Ray actor that runs two concurrent pumps and coordinates the
-other actors via lightweight RPCs. SC sends control signals and reads
-metadata only — model tensors still move through DataPlane or NCCL.
+CPU-only Ray actor that runs two concurrent pumps plus a watchdog, and
+coordinates the other actors via lightweight RPCs. SC sends control signals
+and reads metadata only — model tensors still move through DataPlane or NCCL.
 
 Data flow:
   _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
@@ -35,14 +35,17 @@ Data flow:
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from functools import partial
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
+from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
+from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
@@ -61,11 +64,14 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
 from nemo_rl.utils.logger import Logger
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
 
@@ -74,11 +80,14 @@ Generation = Union[VllmGeneration, SGLangGeneration]
 class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
 
-    Owns two concurrent asyncio tasks:
-      - _rollout_pump: dispatches prompts to GenerationWorkerActor
-      - _train_pump:   claims DataPlane meta, trains, clears consumed rows,
-                       then runs _sync_weights (drain gate + weight
-                       synchronization) inline after each optimizer step
+    Owns three concurrent asyncio tasks:
+      - _rollout_pump:  dispatches prompts to GenerationWorkerActor
+      - _train_pump:    claims DataPlane meta, trains, clears consumed rows,
+                        then runs _sync_weights (drain gate + weight
+                        synchronization) inline after each optimizer step
+      - _watchdog_pump: publishes rollout counters and reports stalls or
+                        unhealthy environments, which are the failures that
+                        otherwise produce no signal at all
 
     All other actors are passive — they expose methods and wait to be called.
     """
@@ -87,12 +96,14 @@ class SingleControllerActor:
         self,
         master_config: MasterConfig,
         actor_args: SingleControllerActorArgs,
+        setup_timing_metrics: SetupTimingMetrics,
     ) -> None:
         """Initialize the SingleController actor.
 
         Args:
             master_config: SC MasterConfig.
             actor_args: Pre-built actor args from setup_single_controller.
+            setup_timing_metrics: Driver-side setup timings; logged here (Logger isn't cloudpickleable).
         """
         validate_single_controller_config(master_config)
 
@@ -103,10 +114,10 @@ class SingleControllerActor:
         self._async_cfg = master_config.async_rl
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
-            and master_config.grpo.get("seq_logprob_error_threshold") is None
+            and master_config.grpo.seq_logprob_error_threshold is None
         )
         self._reference_logprobs_required = not bool(
-            master_config.grpo.get("skip_reference_policy_logprobs_calculation")
+            master_config.grpo.skip_reference_policy_logprobs_calculation
         )
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
@@ -117,6 +128,13 @@ class SingleControllerActor:
         self._loss_fn = actor_args.loss_fn
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
+        # Direct access, deliberately. A getattr default here reads as defensive but
+        # buys a silent failure mode: rename or drop the field and
+        # watchdog.gym_subprocess_check: true degrades to a health check that iterates
+        # nothing and reports nothing -- the exact class of silent failure this work
+        # exists to remove. A missing field should break loudly at construction, where
+        # it costs five minutes, not quietly at hour three of a run.
+        self._env_handles = actor_args.env_handles
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -124,17 +142,37 @@ class SingleControllerActor:
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
         self._logger = Logger(master_config.logger)  # type: ignore
+        self._logger.log_hyperparams(master_config.model_dump())
+        self._logger.log_metrics(
+            setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
+        )
         self._timer = Timer()
+
+        # Also built here, not on the driver: TimeoutChecker must capture
+        # wall-clock start times inside the actor, not at driver setup time.
+        # actor_args only carries the driver-side restore products
+        # (save_state, last_checkpoint_path).
+        self._checkpointer = CheckpointManager(master_config.checkpointing)
+        self._timeout = TimeoutChecker(
+            timeout=master_config.checkpointing["checkpoint_must_save_by"],
+            fit_last_save_time=True,
+        )
+        self._timeout.start_iterations()
+
+        # Loaded (or initial) GRPOSaveState from setup; _get_grpo_save_state
+        # already defaulted any fields missing from older checkpoints.
+        self._save_state: GRPOSaveState = actor_args.save_state
+        self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
+        self._consumed_samples: int = actor_args.save_state.consumed_samples
+        self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
         self._inference_cluster = actor_args.inference_cluster
 
-        num_prompts_per_step = self._master_config.grpo["num_prompts_per_step"]
-        self._sampler = create_sampler(
-            self._buffer,
-            self._async_cfg.sampler,
-        )
+        num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
+        self._sampler = create_sampler(self._buffer, self._async_cfg.sampler)
+        self._sampler.set_dispatch_index(actor_args.save_state.current_step)
         required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
         validate_sampler_buffer_capacity(
             self._async_cfg,
@@ -158,6 +196,8 @@ class SingleControllerActor:
         # Cancellation handles for in-flight rollout dispatches.
         self._dispatched_rollouts: set[asyncio.Task[None]] = set()
 
+        self._inflight_by_group_id: dict[str, tuple[asyncio.Task[None], int]] = {}
+
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
         # Acquired before each rollout dispatch; released when the buffer
         # drops a group (sampler.evict or post-train buffer.remove).
@@ -165,9 +205,9 @@ class SingleControllerActor:
             self._async_cfg.max_buffered_rollouts
         )
 
-        self._trainer_version: int = 0
-        self._train_steps: int = 0
-        self._current_epoch: int = 0
+        self._trainer_version: int = actor_args.save_state.current_step
+        self._train_steps: int = actor_args.save_state.current_step
+        self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
             "masked_advantages": [],
@@ -190,23 +230,38 @@ class SingleControllerActor:
         # Synchronize weights before starting the pumps
         await self._sync_weights()
 
-        # Start the rollout and train pumps
+        await self._maybe_restore_replay_buffer()
+
+        # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
+        watchdog_task = asyncio.create_task(self._watchdog_pump())
+        tasks = (rollout_task, train_task, watchdog_task)
         try:
             done, _ = await asyncio.wait(
-                {rollout_task, train_task}, return_when=asyncio.FIRST_COMPLETED
+                set(tasks), return_when=asyncio.FIRST_COMPLETED
             )
+            if watchdog_task in done:
+                # The watchdog loops forever, so finishing at all means it raised --
+                # a stall or an unhealthy environment. Surface that ahead of the
+                # pumps, whose own symptom would just be "waiting".
+                await watchdog_task
             if rollout_task in done:
                 # Propagate rollout failures immediately. A normally exhausted
                 # rollout pump leaves the train pump to drain committed groups.
                 await rollout_task
             await train_task
         finally:
-            rollout_task.cancel()
-            train_task.cancel()
-            await asyncio.gather(rollout_task, train_task, return_exceptions=True)
-            self._logger.finish()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                self._weight_synchronizer.shutdown()
+            except Exception as e:  # teardown must not mask the original failure
+                print(f"Error during weight-synchronizer shutdown: {e}", flush=True)
+            finally:
+                self._logger.finish()
+                await asyncio.to_thread(self._checkpointer.shutdown)
 
         return {
             "train_steps": self._train_steps,
@@ -225,6 +280,51 @@ class SingleControllerActor:
         }
 
     # ── internal helpers ───────────────────────────────────────────────────
+
+    async def _maybe_restore_replay_buffer(self) -> None:
+        """Restore replay-buffer groups from the previous run's checkpoint.
+
+        Skipped with a warning when the checkpoint was written under a
+        different sampler: restored groups carry the saving sampler's
+        weight/target-step stamps, which another policy may never select.
+        """
+        if self._last_checkpoint_path is None:
+            return
+        buffer_path = os.path.join(self._last_checkpoint_path, "replay_buffer.pt")
+        if not os.path.exists(buffer_path):
+            print(
+                f"⚠️ No replay buffer checkpoint found at {buffer_path}. "
+                "Starting with an empty replay buffer.",
+                flush=True,
+            )
+            return
+        saved_sampler_name = self._save_state.sampler_name
+        current_sampler_name = self._async_cfg.sampler.name
+        if saved_sampler_name != current_sampler_name:
+            print(
+                f"⚠️ Replay buffer checkpoint was saved with sampler "
+                f"{saved_sampler_name!r} but this run uses "
+                f"{current_sampler_name!r}; skipping the buffer restore.",
+                flush=True,
+            )
+            return
+        print(f"📦 Restoring replay buffer from checkpoint: {buffer_path}")
+        # weights_only=False: groups hold pickled KVBatchMeta/TensorDicts,
+        # not plain tensors. The checkpoint is a trusted same-job artifact.
+        buffer_state = await asyncio.to_thread(
+            torch.load, buffer_path, weights_only=False
+        )
+        restored = await self._buffer.load_state_dict(
+            buffer_state,
+            max_groups=self._async_cfg.max_buffered_rollouts,
+            expected_partition_id=self._partition_id,
+            expected_group_size=self._master_config.grpo.num_generations_per_prompt,
+        )
+        # Each buffered group holds one _buffer_capacity permit; the load
+        # truncation guarantees restored <= capacity, so this never blocks.
+        assert restored <= self._async_cfg.max_buffered_rollouts
+        for _ in range(restored):
+            await self._buffer_capacity.acquire()
 
     async def _ray_get(self, obj_ref: Any) -> Any:
         """Await a Ray ObjectRef without blocking the asyncio event loop."""
@@ -271,8 +371,10 @@ class SingleControllerActor:
             task_started_event.set()
             self._inflight_rollouts += 1
             try:
-                await self._rollout_manager.generate_and_push(
-                    prompt, target_step=target_step
+                outcome = await self._rollout_manager.generate_and_push(
+                    prompt,
+                    target_step=target_step,
+                    inflight_registry=self._inflight_by_group_id,
                 )
             except BaseException:
                 # On success ownership transfers to the train pump, which
@@ -282,6 +384,12 @@ class SingleControllerActor:
             finally:
                 self._inflight_rollouts -= 1
                 sem.release()
+
+            if outcome is RolloutOutcome.SKIPPED:
+                # Nothing was committed, so the train pump will never see this group
+                # and never release its permit on our behalf.
+                self._buffer_capacity.release()
+                return
 
             if self._async_cfg.diagnostics:
                 content = ""
@@ -300,7 +408,7 @@ class SingleControllerActor:
                 self._buffer_capacity.release()
                 sem.release()
 
-        max_epochs = self._master_config.grpo["max_num_epochs"]
+        max_epochs = self._master_config.grpo.max_num_epochs
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
                 for prompt_batch in self._dataloader:
@@ -308,7 +416,19 @@ class SingleControllerActor:
                         trainer_version_fn=lambda: self._trainer_version
                     )
 
-                    for prompt_idx in range(prompt_batch.size):
+                    num_prompts = prompt_batch.size
+                    if target_step is not None:
+                        buffered = self._buffer.count_for_target_step(target_step)
+                        if buffered:
+                            num_prompts = max(0, prompt_batch.size - buffered)
+                            print(
+                                f"  target_step={target_step}: {buffered} group(s) "
+                                f"already buffered; dispatching {num_prompts} of "
+                                f"{prompt_batch.size} prompt(s), dropping the rest",
+                                flush=True,
+                            )
+
+                    for prompt_idx in range(num_prompts):
                         prompt: DatumSpec = {  # type: ignore
                             k: v[prompt_idx] for k, v in prompt_batch.items()
                         }
@@ -361,15 +481,16 @@ class SingleControllerActor:
         """
         grpo_cfg = self._master_config.grpo
 
-        while self._train_steps < grpo_cfg["max_num_steps"]:
+        while self._train_steps < grpo_cfg.max_num_steps:
             version_during_step = self._trainer_version
             groups_dispatched = 0
+            evicted_stale_prompt_groups = 0
             min_sample_version = None
             step_open = False
             calibration_batches: list[BatchedDataDict[Any]] = []
 
             with self._timer.time("total_step_time"):
-                while groups_dispatched < grpo_cfg["num_prompts_per_step"]:
+                while groups_dispatched < grpo_cfg.num_prompts_per_step:
                     # Wait for a selectable batch
                     with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
@@ -378,6 +499,7 @@ class SingleControllerActor:
                         evicted = await self._sampler.evict(
                             current_train_weight=self._trainer_version,
                         )
+                        evicted_stale_prompt_groups += evicted
                         if evicted:
                             print(
                                 f"  evicted {evicted} stale prompt group(s)",
@@ -388,7 +510,7 @@ class SingleControllerActor:
 
                         # Select a batch
                         max_prompt_groups = (
-                            grpo_cfg["num_prompts_per_step"] - groups_dispatched
+                            grpo_cfg.num_prompts_per_step - groups_dispatched
                         )
                         min_prompt_groups = min(
                             self._async_cfg.min_groups_for_streaming_train,
@@ -415,7 +537,7 @@ class SingleControllerActor:
                                     "rollout exhausted before a complete training "
                                     f"step was assembled: dispatched "
                                     f"{groups_dispatched}/"
-                                    f"{grpo_cfg['num_prompts_per_step']} prompt "
+                                    f"{grpo_cfg.num_prompts_per_step} prompt "
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
@@ -522,7 +644,44 @@ class SingleControllerActor:
                         if calibration_batches
                         else None
                     )
-                    await self._sync_weights(calibration_data=calibration_data)
+                    aborted_stale_inflight_groups = await self._sync_weights(
+                        calibration_data=calibration_data
+                    )
+                    step_metrics.update(
+                        {
+                            "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
+                            "aborted_stale_inflight_groups": aborted_stale_inflight_groups,
+                        }
+                    )
+
+                # Checkpointing (mirrors async_grpo_train's save block).
+                self._consumed_samples += grpo_cfg.num_prompts_per_step
+                self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
+                self._timeout.mark_iteration()
+
+                is_last_step = self._train_steps >= grpo_cfg.max_num_steps or (
+                    self._rollout_exhausted.is_set() and len(self._buffer) == 0
+                )
+                ft_save_period = self._master_config.checkpointing.get("ft_save_period")
+                # _train_steps was already incremented above, so it equals
+                # the legacy loop's 1-indexed `step + 1`.
+                should_save_by_step = (
+                    is_last_step
+                    or self._train_steps
+                    % self._master_config.checkpointing["save_period"]
+                    == 0
+                    or (
+                        ft_save_period is not None
+                        and self._train_steps % ft_save_period == 0
+                    )
+                )
+                should_save_by_timeout = self._timeout.check_save()
+
+                if self._master_config.checkpointing["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
+                ):
+                    with self._timer.time("checkpointing"):
+                        await self._save_checkpoint(step_metrics)
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
@@ -549,8 +708,6 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            # TODO: checkpointing (save_period/top-k metric_name,
-            #   policy.save_checkpoint, dataloader state, TQReplayBuffer state).
             # TODO: per-step train_data jsonl dump, vllm metrics logger,
             #   histogram log, rollout_metrics, seq_logprob_error_metrics,
             #   pretty-print "Training Results" block, print_performance_metrics.
@@ -567,17 +724,239 @@ class SingleControllerActor:
             # generated with; lag = training version - oldest sample version.
             lag = version_during_step - min_sample_version  # type: ignore
             print(
-                f"train step {self._train_steps}/{grpo_cfg['max_num_steps']}  "
+                f"train step {self._train_steps}/{grpo_cfg.max_num_steps}  "
                 f"trainer_v={self._trainer_version}  "
                 f"lag={lag}  ",
                 flush=True,
             )
 
+            if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
+                break
+
+    async def _watchdog_pump(self) -> None:
+        """Report rollout health, and detect stalls nothing else catches.
+
+        Progress is the pair (committed groups, completed train steps) rather than a
+        timestamp: both counters already exist, and "neither has moved" is the property
+        that actually matters.
+
+        Deliberately *not* conditioned on rollouts being in flight. An earlier version
+        required that, on the reasoning that an idle controller has legitimately no
+        work -- and a fault-injection run walked straight through the gap. Killing a
+        generation worker wedged the loop with zero rollouts in flight and zero
+        failures recorded: the rollout pump was blocked on backpressure behind a train
+        pump that could no longer finish a step, so nothing was in flight to count.
+        The watchdog observed six minutes of idleness and said nothing.
+
+        What separates a real stall from an idle gap is whether work remains, so that
+        is what is checked instead.
+        """
+        watchdog_cfg = self._async_cfg.watchdog
+        max_num_steps = self._master_config.grpo.max_num_steps
+        last_progress = (-1, -1)
+        last_progress_at = time.monotonic()
+
+        while True:
+            await asyncio.sleep(watchdog_cfg.interval_s)
+            now = time.monotonic()
+
+            stats = self._rollout_manager.stats
+            progress = (stats.committed, self._train_steps)
+            if progress != last_progress:
+                last_progress = progress
+                last_progress_at = now
+            idle_s = now - last_progress_at
+
+            metrics = dict(stats.as_metrics())
+            metrics["rollout/inflight"] = float(self._inflight_rollouts)
+            metrics["rollout/idle_s"] = idle_s
+            metrics["rollout/train_steps"] = float(self._train_steps)
+            self._logger.log_metrics(metrics, step=self._train_steps)
+
+            if watchdog_cfg.gym_subprocess_check:
+                # Bounded by one tick so a wedged environment cannot stop the pump, and
+                # routed through stall_action so "warn" means warn -- see
+                # _check_env_health.
+                problems = await self._check_env_health(watchdog_cfg.interval_s)
+                if problems:
+                    detail = "; ".join(problems)
+                    if watchdog_cfg.stall_action == "abort":
+                        raise RuntimeError(
+                            f"environment health check failed -- {detail}"
+                        )
+                    print(f"WARNING: environment health -- {detail}", flush=True)
+
+            work_remains = self._train_steps < max_num_steps
+            if work_remains and idle_s > watchdog_cfg.stall_timeout_s:
+                message = (
+                    f"no rollout committed and no train step completed in "
+                    f"{idle_s:.0f}s ({self._inflight_rollouts} rollouts in flight, "
+                    f"{stats.committed} groups committed, step "
+                    f"{self._train_steps}/{max_num_steps}, "
+                    f"stall_timeout_s={watchdog_cfg.stall_timeout_s})"
+                )
+                if watchdog_cfg.stall_action == "abort":
+                    raise RolloutStall(message)
+                print(f"WARNING: rollout stall -- {message}", flush=True)
+
+    async def _check_env_health(self, timeout_s: float) -> list[str]:
+        """Ask each environment actor that exposes a health check whether it is whole.
+
+        Returns the problems found, empty when everything is well. It *reports* rather
+        than raises so the caller can route the verdict through ``stall_action``, the
+        same way the stall path does. Raising here bypassed ``stall_action`` entirely:
+        under the documented default (``"warn"``, which promises to "only report"), and
+        with ``gym_subprocess_check`` defaulting to true, an unhealthy environment killed
+        the run -- a run-ending path switched on by default, in a feature whose whole
+        posture is inert-by-default.
+
+        Each probe is bounded. ``NemoGym`` is an asyncio actor, so a *wedged* environment
+        -- precisely the case this check exists to catch -- left the await hanging
+        forever, the pump never ticked again, and stall detection was dead exactly when
+        it was needed. A probe that does not answer within one tick IS the unhealthy
+        signal; it is not a reason to stop watching.
+
+        Environments without the method are skipped rather than treated as unhealthy;
+        only NeMo-Gym has subprocess servers to lose.
+        """
+        problems: list[str] = []
+        for env_name, handle in self._env_handles.items():
+            health_check = getattr(handle, "health_check", None)
+            if health_check is None:
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._ray_get(health_check.remote()), timeout=timeout_s
+                )
+            except asyncio.TimeoutError:
+                problems.append(
+                    f"environment {env_name!r} did not answer its health check within "
+                    f"{timeout_s}s"
+                )
+            except Exception as error:
+                problems.append(f"environment {env_name!r} reported unhealthy: {error}")
+        return problems
+
+    async def _abort_stale_inflight(self) -> int:
+        """Abort in-flight rollouts that the sampler can no longer select."""
+        stale_tasks = [
+            task
+            for task, start_version in self._inflight_by_group_id.values()
+            if self._sampler.should_abort_inflight(
+                start_weight_version=start_version,
+                current_train_weight=self._trainer_version,
+            )
+        ]
+        if not stale_tasks:
+            return 0
+
+        for task in stale_tasks:
+            task.cancel()
+
+        results = await asyncio.gather(*stale_tasks, return_exceptions=True)
+        failures = [
+            result
+            for result in results
+            if isinstance(result, BaseException)
+            and not isinstance(result, asyncio.CancelledError)
+        ]
+        if failures:
+            raise BaseExceptionGroup(
+                "stale in-flight rollout cleanup failed",
+                failures,
+            )
+
+        print(
+            f"  aborted {len(stale_tasks)} stale in-flight rollout(s)",
+            flush=True,
+        )
+        return len(stale_tasks)
+
+    async def _save_checkpoint(self, step_metrics: dict[str, Any]) -> None:
+        """Write a full checkpoint for the just-finished train step.
+
+        Everything except the (possibly async) policy weight write must be
+        on disk before begin_finalization; rollouts keep running throughout.
+        """
+        save_state = self._save_state
+        save_state.current_step = self._train_steps
+        save_state.total_steps = self._train_steps
+        save_state.current_epoch = self._current_epoch
+        save_state.consumed_samples = self._consumed_samples
+        save_state.total_valid_tokens = self._total_valid_tokens
+        # The restore skips the replay buffer when the resuming run uses a
+        # different sampler (its stamps may never be selectable there).
+        save_state.sampler_name = self._async_cfg.sampler.name
+        # Snapshot before any await so it can't interleave with
+        # _rollout_pump iterating this same dataloader.
+        dataloader_state = self._dataloader.state_dict()
+        # SC has no validation loop yet; drop the default sentinel instead of
+        # persisting a bogus val_reward.
+        if hasattr(save_state, "val_reward"):
+            delattr(save_state, "val_reward")
+
+        # validate_single_controller_config already rejected anything but a
+        # "train:" prefix, so step_metrics is the only source to consult.
+        full_metric_name = self._master_config.checkpointing["metric_name"]
+        if full_metric_name is not None:
+            metric_name = full_metric_name.split(":", 1)[1]
+            if metric_name not in step_metrics:
+                raise ValueError(f"Metric {metric_name} not found in train metrics")
+            setattr(save_state, full_metric_name, step_metrics[metric_name])
+
+        # Flush the previous checkpoint's background finalization first;
+        # re-raises a failure from it.
+        await asyncio.to_thread(self._checkpointer.finalize_pending)
+
+        print(f"Saving checkpoint for step {self._train_steps}...")
+        checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
+            self._checkpointer.init_tmp_checkpoint,
+            self._train_steps,
+            vars(save_state),
+            self._master_config,
+        )
+        # With async_save this returns after D2H staging; disk writes finish
+        # in the background.
+        await asyncio.to_thread(
+            self._trainer.save_checkpoint,
+            weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+            optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer")
+            if self._checkpointer.save_optimizer
+            else None,
+            tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
+            checkpointing_cfg=self._master_config.checkpointing,
+        )
+        await asyncio.to_thread(
+            torch.save,
+            dataloader_state,
+            os.path.join(checkpoint_path, "train_dataloader.pt"),
+        )
+        buffer_state = await self._buffer.state_dict(
+            saved_capacity=self._async_cfg.max_buffered_rollouts
+        )
+        await asyncio.to_thread(
+            torch.save,
+            buffer_state,
+            os.path.join(checkpoint_path, "replay_buffer.pt"),
+        )
+        # Rename happens in the background once the async weight writes
+        # finish; flushed at the next save or on exit.
+        self._checkpointer.begin_finalization(
+            checkpoint_path,
+            wait_fn=self._trainer.finalize_async_save,
+        )
+        await asyncio.to_thread(
+            _write_latest_checkpoint_status,
+            self._checkpointer,
+            last_checkpoint_step=self._train_steps,
+        )
+
     async def _sync_weights(
         self,
         *,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
-    ) -> None:
+    ) -> int:
         """Pause new rollout dispatches, synchronize weights, resume.
 
         SC owns the pause gate; in-flight generations continue through the
@@ -589,8 +968,28 @@ class SingleControllerActor:
           2. Optionally calibrate FP8 KV-cache scales.
           3. weight_synchronizer.sync_weights(kv_scales=...)
           4. _rollout_permitted.set()   — resume
+
+        Args:
+            calibration_data: Optional data used to calibrate FP8 KV-cache
+                scales before synchronizing weights.
+
+        Returns:
+            The number of stale in-flight rollout groups aborted before the
+            weight synchronization.
         """
         self._rollout_permitted.clear()
+
+        # TODO(#2625): abort unconditionally once gym-path abort is validated;
+        # for now only the native path aborts. Local import dodges the grpo.py
+        # circular dep (as in async_utils/trajectory_collector.py).
+        from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
+        from nemo_rl.algorithms.grpo import _should_use_nemo_gym
+
+        aborted_stale_inflight_groups = (
+            0
+            if _should_use_nemo_gym(cast(GrpoMasterConfig, self._master_config))
+            else await self._abort_stale_inflight()
+        )
 
         # TODO(#2625): Add drain-gate support during refit.
 
@@ -619,6 +1018,7 @@ class SingleControllerActor:
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
         self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_permitted.set()
+        return aborted_stale_inflight_groups
 
     async def _advantage_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Fetch advantage inputs, compute advantages, and write them back.

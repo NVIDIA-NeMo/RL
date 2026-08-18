@@ -32,8 +32,9 @@ tests/test_suites/llm/grpo-moonlight-16ba3b-4n8g-megatron.sh
 tests/test_suites/llm/grpo-qwen3.5-9b-1n8g-megatron.sh
 
 # Functional Qwen3.5-35B run (text-only task)
-# Disabled due to known flaky vLLM hang with Qwen3.5 (see disabled.txt): https://github.com/vllm-project/vllm/issues/36237
-# tests/test_suites/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.sh
+# Re-enabled with the vLLM 0.25.1 bump: the AutoModel variant no longer hits the
+# hang from https://github.com/vllm-project/vllm/issues/36237.
+tests/test_suites/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.sh
 tests/test_suites/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.sh
 
 # Functional VLM run
@@ -48,10 +49,15 @@ tests/test_suites/vlm/vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron.v1.sh
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.sh
 tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.sh
 
+# Functional Nemotron-Omni 30B-A3B VLM GRPO runs (Megatron)
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.sh
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.sh
+
 # Functional Qwen3.5-35B VLM GRPO run
-# Disable this due to known vLLM crash issue with Qwen3.5: https://github.com/vllm-project/vllm/issues/36237
-# tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.sh
-# tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
+# The AutoModel variant is re-enabled with the vLLM 0.25.1 bump (no longer hits
+# https://github.com/vllm-project/vllm/issues/36237). The Megatron variant still
+# hangs in sample_tokens and stays disabled -- see disabled.txt.
+tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.sh
 
 # Removing this until this issue is resolved: https://github.com/huggingface/transformers/issues/41190
 # tests/test_suites/vlm/vlm_grpo-smolvlm2-2.2b-instruct-clevr-1n2g-dtensor2tp1.v2.sh
@@ -79,6 +85,7 @@ tests/test_suites/llm/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-
 tests/test_suites/llm/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3.sh
 tests/test_suites/llm/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3-tq_simple.sh
 tests/test_suites/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async.sh
+tests/test_suites/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.sh
 tests/test_suites/llm/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym.sh
 
 # FP8
@@ -110,6 +117,9 @@ tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.sh
 tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron-pack-cp.sh
 tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation.sh
 tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-async-gym.sh
+
+# Nano-v3.5
+tests/test_suites/llm/dapo-nanov3.5-30BA3B-4n8g-automodel.sh
 
 # Nemotron 3 Super pipeline sanity checks (RLVR / SWE1 / RLHF environments)
 # Data paths and genrm model path require cluster-specific TODO items in each YAML.
@@ -269,8 +279,14 @@ tests/test_suites/llm/distillation-xtoken-off-policy-multiteacher-qwen3-4b-llama
 # DTensor PPO with value sequence parallelism (TP2+SP) (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.sh
 
+# Non-colocated AutoModel PPO with vLLM on a dedicated GPU split (Qwen2.5-1.5B, GSM8K)
+tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-noncolocated.sh
+
 # Megatron PPO with value sequence parallelism (TP2+SP) and dynamic batching (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch.sh
+
+# Non-colocated Megatron PPO with dedicated training and vLLM nodes (Qwen2.5-1.5B, GSM8K)
+tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated.sh
 
 # Megatron PPO with value SP + pipeline + context parallelism + sequence packing (TP2+SP+PP2+CP2) (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-pp2cp2-pack.sh

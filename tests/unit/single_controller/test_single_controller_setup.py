@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
+from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
@@ -56,17 +57,17 @@ def _make_master_config(
             "num_workers": 0,
             "train": [{"env_name": "math"}],
         },
-        grpo={
-            "seed": 42,
-            "max_num_steps": max_num_steps,
-            "max_num_epochs": max_num_epochs,
-            "num_prompts_per_step": num_prompts_per_step,
-            "num_generations_per_prompt": 2,
-            "max_rollout_turns": 1,
-            "val_period": 0,
-            "val_at_start": False,
-            "val_at_end": False,
-        },
+        grpo=GRPOConfig.model_construct(
+            seed=42,
+            max_num_steps=max_num_steps,
+            max_num_epochs=max_num_epochs,
+            num_prompts_per_step=num_prompts_per_step,
+            num_generations_per_prompt=2,
+            max_rollout_turns=1,
+            val_period=0,
+            val_at_start=False,
+            val_at_end=False,
+        ),
         policy={
             "train_global_batch_size": num_prompts_per_step * 2,
             "max_total_sequence_length": 32,
@@ -77,7 +78,18 @@ def _make_master_config(
                 "colocated": {"enabled": colocated, "resources": {}},
             },
         },
-        checkpointing={"enabled": False},
+        # Full block: setup builds a CheckpointManager unconditionally (resume
+        # lookup), which indexes these keys directly. Nothing is written while
+        # enabled=False and the dir doesn't exist.
+        checkpointing={
+            "enabled": False,
+            "checkpoint_dir": "results/_sc_setup_test_ckpt",
+            "metric_name": None,
+            "higher_is_better": False,
+            "keep_top_k": None,
+            "save_period": 10,
+            "save_optimizer": False,
+        },
         loss_fn=ClippedPGLossConfig(),
         env=env if env is not None else {},
         async_rl=AsyncRLConfig(
@@ -99,6 +111,9 @@ def patched_factories():
     # len(dataloader) used by the Megatron train_iters injection.
     fake_dataloader.__len__ = MagicMock(return_value=4)
     fake_env_handles = {"math": MagicMock(name="math_env")}
+    # Real return objects; _build_generation and _build_trainer return (obj, elapsed_s) tuples.
+    fake_gen = MagicMock(name="gen")
+    fake_policy = MagicMock(name="policy")
 
     with (
         patch.object(
@@ -120,10 +135,10 @@ def patched_factories():
             ),
         ) as mock_clusters,
         patch.object(
-            sc_setup_mod, "_build_generation", return_value=MagicMock(name="gen")
+            sc_setup_mod, "_build_generation", return_value=(fake_gen, 0.0)
         ) as mock_gen,
         patch.object(
-            sc_setup_mod, "_build_trainer", return_value=MagicMock(name="policy")
+            sc_setup_mod, "_build_trainer", return_value=(fake_policy, 0.0)
         ) as mock_trainer,
         patch.object(
             sc_setup_mod,
@@ -161,6 +176,8 @@ def patched_factories():
             "ClippedPGLossFn": mock_loss,
             "dataloader": fake_dataloader,
             "env_handles": fake_env_handles,
+            "fake_gen": fake_gen,
+            "fake_policy": fake_policy,
         }
 
 
@@ -172,7 +189,7 @@ def test_build_generation_passes_sglang_config():
     inference_cluster = MagicMock(name="inference_cluster")
 
     with patch.object(sc_setup_mod, "SGLangGeneration") as mock_sglang:
-        generation = sc_setup_mod._build_generation(
+        generation, _ = sc_setup_mod._build_generation(
             inference_cluster,
             master_config,
         )
@@ -248,16 +265,11 @@ class TestSetup:
         mc = _make_master_config(colocated=True)
         tokenizer = MagicMock(pad_token_id=0)
 
-        actor_args = setup_single_controller(mc, tokenizer)
+        actor_args, _ = setup_single_controller(mc, tokenizer)
 
         assert isinstance(actor_args, SingleControllerActorArgs)
-        assert (
-            actor_args.gen_handle is patched_factories["_build_generation"].return_value
-        )
-        assert (
-            actor_args.trainer_handle
-            is patched_factories["_build_trainer"].return_value
-        )
+        assert actor_args.gen_handle is patched_factories["fake_gen"]
+        assert actor_args.trainer_handle is patched_factories["fake_policy"]
         assert actor_args.env_handles is patched_factories["env_handles"]
         assert (
             actor_args.dp_client
@@ -282,13 +294,22 @@ class TestSetup:
         assert actor_args.tq_buffer._dp_client is actor_args.dp_client
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
+        assert actor_args.tq_buffer._require_routed_experts is False
+
+    def test_router_replay_requires_routes_in_tq_buffer(self, patched_factories):
+        mc = _make_master_config(colocated=True)
+        mc.policy["router_replay"] = {"enabled": True}
+
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.tq_buffer._require_routed_experts is True
 
     def test_env_handles_sourced_from_setup_response_data(self, patched_factories):
         """setup_response_data receives master_config.env and supplies env handles."""
         math_env_cfg = {"some": "value"}
         mc = _make_master_config(env={"math": math_env_cfg})
 
-        actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         _, call_kwargs = patched_factories["setup_response_data"].call_args
         assert call_kwargs["env_configs"] == {"math": math_env_cfg}
@@ -302,13 +323,8 @@ class TestSetup:
         setup_single_controller(mc, tokenizer)
 
         _, factory_kwargs = patched_factories["create_weight_synchronizer"].call_args
-        assert (
-            factory_kwargs["policy"] is patched_factories["_build_trainer"].return_value
-        )
-        assert (
-            factory_kwargs["generation"]
-            is patched_factories["_build_generation"].return_value
-        )
+        assert factory_kwargs["policy"] is patched_factories["fake_policy"]
+        assert factory_kwargs["generation"] is patched_factories["fake_gen"]
         assert factory_kwargs["generation_backend"] == "vllm"
         assert factory_kwargs["colocated"] is False
 
@@ -316,7 +332,7 @@ class TestSetup:
         mc = _make_master_config()
         tokenizer = MagicMock(pad_token_id=7)
 
-        actor_args = setup_single_controller(
+        actor_args, _ = setup_single_controller(
             mc, tokenizer, partition_id="custom_partition"
         )
 
@@ -337,7 +353,7 @@ class TestSetup:
         # patched dataloader has len() == 4, so the min picks max_num_steps.
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert mc.grpo["max_num_steps"] == 2
+        assert mc.grpo.max_num_steps == 2
 
     def test_max_num_steps_capped_by_dataloader_epochs(self, patched_factories):
         """grpo.max_num_steps drops to max_num_epochs * len(dataloader) when smaller."""
@@ -349,7 +365,7 @@ class TestSetup:
         # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert mc.grpo["max_num_steps"] == 8
+        assert mc.grpo.max_num_steps == 8
 
     def test_megatron_train_iters_capped_by_max_num_steps(self, patched_factories):
         """train_iters = min(max_num_steps, max_num_epochs * len(dataloader))."""
@@ -384,7 +400,7 @@ class TestSetup:
         )
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert mc.grpo["max_num_steps"] == 100
+        assert mc.grpo.max_num_steps == 100
         assert mc.policy["megatron_cfg"]["train_iters"] == 100
 
     def test_megatron_train_iters_not_set_when_disabled(self, patched_factories):
@@ -413,19 +429,190 @@ class TestSetup:
             ) as mock_spinup,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
         ):
-            actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         mock_spinup.assert_called_once_with(
             env_configs=mc.env,
-            base_urls=patched_factories[
-                "_build_generation"
-            ].return_value.dp_openai_server_base_urls,
+            base_urls=patched_factories["fake_gen"].dp_openai_server_base_urls,
             model_name="test-model",
             enable_router_replay=False,
             routed_experts_dtype="int16",
             use_fastokens=False,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+
+    def test_setup_timing_populated_for_colocated_vllm(self, patched_factories):
+        """Colocated vLLM records gen+policy+collective+total+worker fields."""
+        mc = _make_master_config(colocated=True, backend="vllm")
+
+        _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        for field in (
+            "generation_init_time_s",
+            "policy_init_time_s",
+            "collective_init_time_s",
+            "worker_setup_time_s",
+            "total_setup_time_s",
+            "other_setup_time_s",
+        ):
+            value = getattr(metrics, field)
+            assert value is not None, f"missing {field} on {metrics}"
+            assert value >= 0
+        # parallel_wall_time_s / parallel_init_enabled are grpo.py-only in the
+        # shared SetupTimingMetrics — SC does not emit them.
+        assert metrics.parallel_wall_time_s is None
+        assert metrics.parallel_init_enabled is None
+        # Reserve/load split is populated on the gym-on path only.
+        assert metrics.generation_init_reserve_time_s is None
+        assert metrics.generation_init_load_time_s is None
+
+    def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
+        """Non-colocated vLLM records the same per-phase fields as colocated."""
+        mc = _make_master_config(colocated=False, backend="vllm")
+
+        _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert metrics.generation_init_time_s is not None
+        assert metrics.policy_init_time_s is not None
+        assert metrics.worker_setup_time_s is not None
+        # parallel_wall_time_s / parallel_init_enabled are grpo.py-only.
+        assert metrics.parallel_wall_time_s is None
+        assert metrics.parallel_init_enabled is None
+        # Reserve/load split is populated on the gym-on path only.
+        assert metrics.generation_init_reserve_time_s is None
+        assert metrics.generation_init_load_time_s is None
+
+    def test_setup_timing_backend_agnostic_for_sglang(self, patched_factories):
+        """SC uses the backend-agnostic generation_init_time_s regardless of backend."""
+        mc = _make_master_config(colocated=True, backend="sglang")
+
+        _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert metrics.generation_init_time_s is not None
+        # Backend-specific fields are grpo.py-only; SC does not populate them.
+        assert metrics.vllm_init_time_s is None
+        assert metrics.sglang_init_time_s is None
+
+    def test_nemo_gym_uses_deferred_vllm_load(self, patched_factories):
+        """NeMo-Gym path reserves vLLM ports up-front and finishes the load afterwards."""
+        mc = _make_master_config(colocated=True, backend="vllm")
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.policy["generation"]["stop_strings"] = None
+        mc.policy["generation"]["stop_token_ids"] = None
+        mc.policy["generation"]["top_k"] = None
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # _build_generation must be called with defer_model_load=True so the workers
+        # only reserve URLs; load_and_start()+finish_generation() run afterwards.
+        _, gen_kwargs = patched_factories["_build_generation"].call_args
+        assert gen_kwargs.get("defer_model_load") is True
+        deferred_vllm = patched_factories["fake_gen"]
+        deferred_vllm.load_and_start.assert_called_once_with()
+        deferred_vllm.finish_generation.assert_called_once_with()
+
+    def test_nemo_gym_records_timing_metrics(self, patched_factories):
+        """NeMo-Gym path records per-phase timings (vllm/policy/gym/worker)."""
+        mc = _make_master_config(colocated=True, backend="vllm")
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.policy["generation"]["stop_strings"] = None
+        mc.policy["generation"]["stop_token_ids"] = None
+        mc.policy["generation"]["top_k"] = None
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert metrics.nemo_gym_init_time_s is not None
+        assert metrics.generation_init_time_s is not None
+        assert metrics.policy_init_time_s is not None
+        assert metrics.worker_setup_time_s is not None
+        # parallel_wall_time_s / parallel_init_enabled are grpo.py-only.
+        assert metrics.parallel_wall_time_s is None
+        assert metrics.parallel_init_enabled is None
+
+    def test_nemo_gym_noncolocated_finishes_deferred_load(self, patched_factories):
+        """Non-colocated + gym fans out gym / deferred-load / trainer together."""
+        mc = _make_master_config(colocated=False, backend="vllm")
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.policy["generation"]["stop_strings"] = None
+        mc.policy["generation"]["stop_token_ids"] = None
+        mc.policy["generation"]["top_k"] = None
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            actor_args, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # _build_generation runs once (URL reservation only); the load is finished
+        # by _finish_deferred_generation inside the executor.
+        patched_factories["_build_generation"].assert_called_once()
+        _, gen_kwargs = patched_factories["_build_generation"].call_args
+        assert gen_kwargs.get("defer_model_load") is True
+        patched_factories["fake_gen"].load_and_start.assert_called_once_with()
+        assert actor_args.gen_handle is patched_factories["fake_gen"]
+        assert metrics.nemo_gym_init_time_s is not None
+        assert metrics.generation_init_time_s is not None
+        assert metrics.policy_init_time_s is not None
+
+    @pytest.mark.parametrize("colocated", [True, False])
+    def test_nemo_gym_generation_init_time_includes_reserve_time(
+        self, patched_factories, colocated
+    ):
+        """generation_init_time_s folds in the deferred-VllmGeneration reserve time.
+
+        With gym on, _build_generation(defer_model_load=True) does worker-group
+        spawn + port bind (no weight load). That elapsed time has to end up in
+        generation_init_time_s alongside the deferred-load elapsed; otherwise
+        gym-on runs undercount generation setup by the worker-group span. The
+        reserve/load split is also exposed for overlap analysis.
+        """
+        mc = _make_master_config(colocated=colocated, backend="vllm")
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.policy["generation"]["stop_strings"] = None
+        mc.policy["generation"]["stop_token_ids"] = None
+        mc.policy["generation"]["top_k"] = None
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        # Deferred _build_generation returns 3.0s of reserve time; _build_generation
+        # is only called once (for reservation), so this is the reserve span.
+        patched_factories["_build_generation"].return_value = (
+            patched_factories["fake_gen"],
+            3.0,
+        )
+
+        with (
+            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            _, metrics = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # gen_load_time (from _finish_deferred_generation, unpatched) is ~0 in
+        # the test — the reserve time dominates and must be present.
+        assert metrics.generation_init_time_s >= 3.0
+        assert metrics.generation_init_reserve_time_s == 3.0
+        assert metrics.generation_init_load_time_s is not None
 
     @pytest.mark.parametrize("backend", ["sglang", "megatron"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):

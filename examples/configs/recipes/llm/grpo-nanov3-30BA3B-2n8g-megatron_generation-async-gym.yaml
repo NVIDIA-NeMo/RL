@@ -14,9 +14,7 @@ policy:
   max_total_sequence_length: 2048
   megatron_cfg:
     pipeline_model_parallel_size: 1
-    context_parallel_size: 1
-  sequence_packing:
-    enabled: false
+    context_parallel_size: 2
   generation:
     backend: megatron
     colocated:

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,10 +36,18 @@ from nemo_rl.data.interfaces import (
     DatumSpec,
     FlatMessagesType,
     LLMMessageLogType,
+    VLMMessageLogType,
 )
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
+)
+from nemo_rl.data.multimodal_utils import (
+    NATIVE_MULTIMODAL_KEYS,
+    VLLM_MULTIMODAL_DATA_KEYS,
+    PackedTensor,
+    attach_image_model_inputs_to_message,
+    extract_input_images_from_responses_messages,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
@@ -50,14 +58,145 @@ from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationConfig,
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    GenerationSamplingParams,
+)
+from nemo_rl.utils.multimodal_payload_metrics import (
+    collect_multimodal_payload_metrics,
+    print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+def attach_initial_nemo_gym_image_payloads(
+    batch: BatchedDataDict[DatumSpec],
+    processor: Any,
+) -> None:
+    """Attach initial Gym image tensors once, before prompt repeat.
+
+    The NeMo Gym dataset deliberately carries only the Responses request in
+    ``extra_env_info``. Dedup-enabled GRPO calls this helper on the unrepeated
+    prompt batch, allowing ``repeat_interleave(..., share_immutable_media=True)``
+    to retain one physical processor output per prompt. Flag-off runs never call
+    this helper.
+    """
+    for message_log, extra_env_info in zip(
+        batch["message_log"], batch["extra_env_info"]
+    ):
+        if extra_env_info is None or not isinstance(extra_env_info, dict):
+            continue
+        initial_messages = extra_env_info.get("responses_create_params", {}).get(
+            "input", []
+        )
+        images = extract_input_images_from_responses_messages(initial_messages)
+        if not images:
+            continue
+        if processor is None or getattr(processor, "image_processor", None) is None:
+            raise ValueError(
+                "NeMo Gym image deduplication requires the multimodal processor "
+                "to be passed to GRPO."
+            )
+        user_message = next(
+            (message for message in message_log if message.get("role") == "user"),
+            None,
+        )
+        if user_message is None:
+            raise ValueError("NeMo Gym image prompt has no user message to attach to.")
+        if isinstance(user_message.get("pixel_values"), PackedTensor):
+            continue
+        attach_image_model_inputs_to_message(
+            user_message,
+            images=images,
+            processor=processor,
+        )
+
+
+def _add_multimodal_generation_payload(
+    generation_input_data: BatchedDataDict[GenerationDatumSpec],
+    flat_messages: BatchedDataDict[FlatMessagesType],
+    active_batch: BatchedDataDict[DatumSpec],
+    policy_generation: GenerationInterface,
+    *,
+    deduplicate_multimodal_data: bool,
+) -> None:
+    """Attach one policy-ready or native-vLLM media representation.
+
+    The compact policy representation remains in ``message_log`` for later
+    logprob/training construction. When every active row has a native vLLM
+    prompt, sending that representation as well is redundant.
+    """
+    generation_config = getattr(policy_generation, "cfg", {})
+    native_content = active_batch.get("vllm_content")
+
+    def row_has_formatter_consumed_media(row_index: int) -> bool:
+        for key in VLLM_MULTIMODAL_DATA_KEYS:
+            rows = active_batch.get(key)
+            if rows is None or row_index >= len(rows):
+                continue
+            value = rows[row_index]
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple, dict, str, bytes)):
+                if len(value) > 0:
+                    return True
+            else:
+                return True
+        return False
+
+    use_native_vllm_only = (
+        deduplicate_multimodal_data
+        and generation_config.get("backend") == "vllm"
+        and native_content is not None
+        and all(
+            row_has_formatter_consumed_media(row_index)
+            for row_index in range(len(native_content))
+        )
+    )
+    if not use_native_vllm_only:
+        generation_input_data.update(
+            flat_messages.get_multimodal_dict(as_tensors=False)
+        )
+
+    for key in NATIVE_MULTIMODAL_KEYS:
+        if key in active_batch:
+            generation_input_data[key] = active_batch[key]
+
+
+def _reattach_original_multimodal_payloads(
+    results: list[dict[str, Any]],
+    original_message_logs: list[LLMMessageLogType | VLMMessageLogType],
+) -> None:
+    """Restore exact prompt media omitted by a remote Gym rollout.
+
+    User turns are matched by their ordinal position. Only explicit
+    ``PackedTensor`` values and named native-generation media are restored, so
+    arbitrary non-text metadata is never misclassified as media. Newly returned
+    Gym media is left untouched unless it occupies the corresponding original
+    prompt key.
+    """
+    for result, original_log in zip(results, original_message_logs):
+        if not result.pop("_initial_multimodal_data_omitted", False):
+            continue
+        original_user_messages = [
+            message for message in original_log if message.get("role") == "user"
+        ]
+        for log_key in ("input_message_log", "message_log"):
+            target_log = result.get(log_key)
+            if not target_log:
+                continue
+            target_user_messages = [
+                message for message in target_log if message.get("role") == "user"
+            ]
+            for original, target in zip(original_user_messages, target_user_messages):
+                for key, value in original.items():
+                    if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
+                        target[key] = value
 
 
 def _add_r3_fallback_metrics(
@@ -142,6 +281,50 @@ def _dummy_routed_experts_for_tokens(
         .expand(int(token_ids.shape[0]), template.shape[1], topk)
         .clone()
     )
+
+
+def backfill_missing_routed_experts(
+    message_logs: Sequence[list[dict]],
+) -> None:
+    """Give every tokenized message a ``routed_experts`` row, in place.
+
+    Routes are attached only where generation ran, so a trajectory whose first
+    turn raised (or a turn whose routes vLLM could not return) leaves messages
+    without the field while its siblings have it. Flattening then either stacks
+    ragged ranks or silently concatenates a short column, so fill the gaps with
+    the all--1 missing-route sentinel: Megatron routes those tokens with its own
+    router, which is the honest answer for tokens no capture covered.
+
+    No-op when the batch carries no routes at all — that is the router-replay-off
+    case, and on the TQ paths the producer-side guard must still see the field
+    missing so it can report a capture failure.
+    """
+    template = None
+    for message_log in message_logs:
+        template = _find_routed_experts_template(message_log)
+        if template is not None:
+            break
+    if template is None:
+        return
+    if template.dim() != 3:
+        raise ValueError(
+            "routed_experts messages must have shape [tokens, layers, topk], "
+            f"got {tuple(template.shape)}"
+        )
+
+    for message_log in message_logs:
+        for msg in message_log:
+            token_ids = msg.get("token_ids")
+            if not isinstance(token_ids, torch.Tensor):
+                continue
+            if isinstance(msg.get("routed_experts"), torch.Tensor):
+                continue
+            msg["routed_experts"] = torch.full(
+                (int(token_ids.shape[0]), template.shape[1], template.shape[2]),
+                ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+                dtype=template.dtype,
+                device=template.device,
+            )
 
 
 class EffortLevelsConfig(BaseModel, extra="allow"):
@@ -349,8 +532,9 @@ async def generate_responses_async(
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
     # Check if this is a supported inference engine with async generation enabled.
-    # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``; vLLM and
-    # Megatron expose ``cfg`` and gate on their respective ``async_engine`` flag.
+    # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``;
+    # vLLM exposes ``cfg`` and gates on ``vllm_cfg.async_engine``;
+    # TRT-LLM requires its flag; the Megatron backend is always async.
     vllm_cfg = getattr(policy_generation, "cfg", None)
     sglang_cfg = getattr(policy_generation, "sglang_cfg", None)
     generation_config = vllm_cfg or sglang_cfg or {}
@@ -369,19 +553,15 @@ async def generate_responses_async(
         )
         use_async_generation = True
     elif backend == "megatron":
-        use_async_generation = bool(
-            generation_config.get("mcore_generation_config", {}).get(
-                "async_engine", False
-            )
-        )
+        # The Megatron backend always uses the async engine.
+        use_async_generation = True
     else:
         use_async_generation = False
 
     assert use_async_generation and hasattr(policy_generation, "generate_async"), (
         "Async generation is not enabled. For SGLang, set "
         "policy.generation.use_async_rollouts=True. For vLLM, set "
-        "policy.generation.vllm_cfg.async_engine=True. For Megatron, set "
-        "policy.generation.mcore_generation_config.async_engine=True. The "
+        "policy.generation.vllm_cfg.async_engine=True. The "
         "generation backend must also implement generate_async."
     )
 
@@ -625,6 +805,7 @@ def run_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    deduplicate_multimodal_data: bool = False,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Runs a multi-turn rollout loop, interacting with the environment.
 
@@ -636,6 +817,9 @@ def run_multi_turn_rollout(
         max_rollout_turns: Maximum number of agent-environment interaction turns.
         max_seq_len: Maximum sequence length allowed.
         greedy: Whether to use greedy decoding.
+        deduplicate_multimodal_data: Send only native media through the vLLM
+            generation boundary while retaining compact policy media for
+            logprob and training.
 
     Returns:
         Tuple containing:
@@ -674,6 +858,8 @@ def run_multi_turn_rollout(
 
         # Convert LLMMessageLogType to FlatMessagesType for generation
         active_batch = current_batch.select_indices(active_indices)
+        if turn > 0 and "vllm_content" in active_batch:
+            active_batch["vllm_content"] = [None] * len(active_indices)
         active_stop_strings = [current_stop_strings[i] for i in active_indices.tolist()]
 
         active_flat_messages: BatchedDataDict[FlatMessagesType]
@@ -695,19 +881,13 @@ def run_multi_turn_rollout(
                 "stop_strings": active_stop_strings,
             }
         )
-        # add the multimodal data to the generation input data
-        multimodal_data = active_flat_messages.get_multimodal_dict(as_tensors=False)
-        generation_input_data.update(multimodal_data)
-
-        # keep message log for generation
-        if "vllm_content" in active_batch:
-            generation_input_data["vllm_content"] = active_batch["vllm_content"]
-        if "vllm_images" in active_batch:
-            generation_input_data["vllm_images"] = active_batch["vllm_images"]
-        if "vllm_videos" in active_batch:
-            generation_input_data["vllm_videos"] = active_batch["vllm_videos"]
-        if "vllm_audios" in active_batch:
-            generation_input_data["vllm_audios"] = active_batch["vllm_audios"]
+        _add_multimodal_generation_payload(
+            generation_input_data,
+            active_flat_messages,
+            active_batch,
+            policy_generation,
+            deduplicate_multimodal_data=deduplicate_multimodal_data,
+        )
 
         # generate_responses updates active_batch["message_log"] in-place
         active_batch, generated_ids, gen_metrics = generate_responses(
@@ -874,6 +1054,9 @@ async def async_generate_response_for_sample_turn(
     tokenizer: TokenizerType,
     max_seq_len: int,
     greedy: bool = False,
+    *,
+    sample_multimodal_data: dict[str, Any] | None = None,
+    deduplicate_multimodal_data: bool = False,
 ) -> tuple[list[dict], torch.Tensor, torch.Tensor, dict[str, float]]:
     """Generate a response for a single sample's turn using async generation.
 
@@ -884,6 +1067,9 @@ async def async_generate_response_for_sample_turn(
         tokenizer: Tokenizer to use
         max_seq_len: Maximum sequence length
         greedy: Whether to use greedy decoding
+        sample_multimodal_data: Native vLLM media fields for this sample.
+        deduplicate_multimodal_data: Avoid sending both native and policy-ready
+            media through the async generation boundary.
 
     Returns:
         Tuple of (updated_message_log, generated_tokens, input_lengths, generation_metrics)
@@ -915,6 +1101,15 @@ async def async_generate_response_for_sample_turn(
             "stop_strings": [sample_stop_strings],
         }
     )
+    for key, value in (sample_multimodal_data or {}).items():
+        dummy_batch[key] = [value]
+    _add_multimodal_generation_payload(
+        generation_input_data,
+        flat_messages,
+        dummy_batch,
+        policy_generation,
+        deduplicate_multimodal_data=deduplicate_multimodal_data,
+    )
 
     # Generate response using the async version
     updated_batch, generated_ids, gen_metrics = await generate_responses_async(
@@ -943,6 +1138,7 @@ async def run_sample_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    deduplicate_multimodal_data: bool = False,
 ) -> tuple[dict, dict[str, Any]]:
     """Run a multi-turn rollout for a single sample.
 
@@ -958,6 +1154,8 @@ async def run_sample_multi_turn_rollout(
         max_seq_len: Maximum sequence length
         max_rollout_turns: Maximum number of turns
         greedy: Whether to use greedy decoding
+        deduplicate_multimodal_data: Avoid redundant media at generation
+            boundaries while preserving compact policy media in the trajectory.
 
     Returns:
         Tuple of (final_sample_state, sample_metrics)
@@ -967,6 +1165,11 @@ async def run_sample_multi_turn_rollout(
     current_extra_env_info = copy.deepcopy(initial_sample_state["extra_env_info"])
     current_stop_strings = initial_sample_state.get("stop_strings", None)
     task_name = initial_sample_state["task_name"]
+    sample_multimodal_data = {
+        key: initial_sample_state[key]
+        for key in NATIVE_MULTIMODAL_KEYS
+        if key in initial_sample_state
+    }
 
     # Sample-level metrics
     total_reward = 0.0
@@ -995,6 +1198,11 @@ async def run_sample_multi_turn_rollout(
 
         # Generate response for this sample using async generation
         try:
+            turn_multimodal_data = sample_multimodal_data
+            if turn > 0 and "vllm_content" in sample_multimodal_data:
+                turn_multimodal_data = dict(sample_multimodal_data)
+                turn_multimodal_data["vllm_content"] = None
+
             (
                 updated_message_log,
                 generated_tokens,
@@ -1007,6 +1215,8 @@ async def run_sample_multi_turn_rollout(
                 tokenizer,
                 max_seq_len,
                 greedy=greedy,
+                sample_multimodal_data=turn_multimodal_data,
+                deduplicate_multimodal_data=deduplicate_multimodal_data,
             )
             current_message_log = updated_message_log
 
@@ -1243,21 +1453,24 @@ async def _run_multi_turn_rollout_async(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    deduplicate_multimodal_data: bool = False,
 ) -> tuple[BatchedDataDict[DatumSpec], list[dict[str, Any]]]:
     """Run one native rollout batch and retain metrics at sample granularity."""
     batch_size = len(input_batch["message_log"])
 
     sample_initial_states = []
     for i in range(batch_size):
-        sample_initial_states.append(
-            {
-                "message_log": input_batch["message_log"][i],
-                "extra_env_info": input_batch["extra_env_info"][i],
-                "task_name": input_batch["task_name"][i],
-                "stop_strings": input_batch.get("stop_strings", [None] * batch_size)[i],
-                "idx": input_batch.get("idx", list(range(batch_size)))[i],
-            }
-        )
+        sample_state = {
+            "message_log": input_batch["message_log"][i],
+            "extra_env_info": input_batch["extra_env_info"][i],
+            "task_name": input_batch["task_name"][i],
+            "stop_strings": input_batch.get("stop_strings", [None] * batch_size)[i],
+            "idx": input_batch.get("idx", list(range(batch_size)))[i],
+        }
+        for key in NATIVE_MULTIMODAL_KEYS:
+            if key in input_batch:
+                sample_state[key] = input_batch[key][i]
+        sample_initial_states.append(sample_state)
 
     async def run_single_sample_with_error_handling(i, sample_state):
         try:
@@ -1270,6 +1483,7 @@ async def _run_multi_turn_rollout_async(
                 max_seq_len=max_seq_len,
                 max_rollout_turns=max_rollout_turns,
                 greedy=greedy,
+                deduplicate_multimodal_data=deduplicate_multimodal_data,
             )
         except Exception as error:
             raise RuntimeError(f"Error in sample {i} rollout: {error}") from error
@@ -1336,6 +1550,7 @@ def run_async_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    deduplicate_multimodal_data: bool = False,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Run a complete native rollout batch from a synchronous call site.
 
@@ -1368,6 +1583,7 @@ def run_async_multi_turn_rollout(
             max_seq_len=max_seq_len,
             max_rollout_turns=max_rollout_turns,
             greedy=greedy,
+            deduplicate_multimodal_data=deduplicate_multimodal_data,
         )
     )
     return final_batch, _aggregate_multi_turn_rollout_metrics(sample_metrics)
@@ -1382,6 +1598,7 @@ async def run_async_multi_turn_rollout_groups(
     num_generations: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    deduplicate_multimodal_data: bool = False,
 ) -> AsyncGenerator[RolloutGroupResult, None]:
     """Run one native batch, then yield prompt groups with group-local metrics.
 
@@ -1424,6 +1641,7 @@ async def run_async_multi_turn_rollout_groups(
         max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
         greedy=greedy,
+        deduplicate_multimodal_data=deduplicate_multimodal_data,
     )
     for group_index, start in enumerate(range(0, final_batch.size, num_generations)):
         end = start + num_generations
@@ -1556,6 +1774,21 @@ def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
     if isinstance(nemo_gym_config, dict) and nemo_gym_config.get("thinking_tags"):
         return list(nemo_gym_config["thinking_tags"])
     return list(DEFAULT_THINKING_TAGS)
+
+
+def should_mask_flagged_samples(env_config: dict[str, Any]) -> bool:
+    """Read ``env.should_mask_flagged_samples``; absent means True.
+
+    True (the default): env-driven ``mask_sample`` flags are carried in the
+    rollout batch and flagged samples are dropped from the loss.
+
+    Set false when the flags are too coarse to honor: for example, Gym flags
+    rollouts that hit max iterations even when they solve the task, and those
+    are samples worth training on. It also keeps batch composition
+    deterministic for controlled benchmark runs — how many samples get
+    flagged varies run to run.
+    """
+    return env_config.get("should_mask_flagged_samples") is not False
 
 
 def _get_reward_penalty_config_value(
@@ -1947,7 +2180,9 @@ def apply_reward_penalties(
 
 
 def _prepare_nemo_gym_rows(
-    rows: list[dict], generation_config: GenerationConfig
+    rows: list[dict],
+    generation_config: GenerationConfig,
+    sampling_params: GenerationSamplingParams,
 ) -> None:
     """Apply NeMo-RL sampling parameters and stable row indices in place."""
     for row_index, row in enumerate(rows):
@@ -1957,8 +2192,8 @@ def _prepare_nemo_gym_rows(
                 "Each NeMo-Gym row must contain a responses_create_params dict"
             )
 
-        responses_create_params["temperature"] = generation_config["temperature"]
-        responses_create_params["top_p"] = generation_config["top_p"]
+        responses_create_params["temperature"] = sampling_params.temperature
+        responses_create_params["top_p"] = sampling_params.top_p
         configured_max_tokens = generation_config["max_new_tokens"]
         row_max_tokens = responses_create_params.get("max_output_tokens")
         responses_create_params["max_output_tokens"] = (
@@ -1997,7 +2232,11 @@ async def run_async_nemo_gym_rollout(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    mask_env_flagged_samples: bool = True,
     returns_entire_batch: bool = False,
+    sampling_params: Optional[GenerationSamplingParams] = None,
+    deduplicate_multimodal_data: bool = False,
+    debug_payload_metrics: bool = False,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2023,9 +2262,18 @@ async def run_async_nemo_gym_rollout(
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
+        mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
+            flags in the rollout batch for loss masking.
         returns_entire_batch: Whether to treat the input as one potentially
             heterogeneous group. This requires ``num_generations`` to equal the
             batch size and is used by synchronous callers.
+        sampling_params: Sampling profile stamped onto every NeMo-Gym row.
+            ``None`` uses the train profile from ``generation_config``;
+            validation passes its own profile explicitly.
+        deduplicate_multimodal_data: Omit initial policy-ready media from the
+            remote Gym return and restore the exact original payload locally.
+        debug_payload_metrics: Emit logical, physical, and serialized media
+            payload metrics at the Gym Ray boundary.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
@@ -2076,9 +2324,13 @@ async def run_async_nemo_gym_rollout(
     assert not generation_config["stop_token_ids"], (
         "Stop strings is not supported in the generation config in NeMo-Gym path!"
     )
+    if sampling_params is None:
+        sampling_params = GenerationSamplingParams.from_generation_config(
+            generation_config
+        )
     # Top k is not OpenAI compatible, so NeMo-Gym does not guarantee support over it.
-    assert not generation_config["top_k"], (
-        "Top k is not supported in the generation config in NeMo-Gym path!"
+    assert not sampling_params.top_k, (
+        "Top k is not supported in the sampling params in NeMo-Gym path!"
     )
     if num_generations <= 0:
         raise ValueError("num_generations must be greater than zero")
@@ -2099,7 +2351,7 @@ async def run_async_nemo_gym_rollout(
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
     with timer.time(total_timer_label):
-        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config)
+        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config, sampling_params)
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
             num_generations=num_generations,
@@ -2109,9 +2361,22 @@ async def run_async_nemo_gym_rollout(
         actor_timing_metrics: dict[str, Any] = {}
         nemo_gym_environment = task_to_env["nemo_gym"]
         with timer.time(run_rollouts_timer_label):
+            ray_arguments = (
+                nemo_gym_rows,
+                tokenizer,
+                timer_prefix,
+                deduplicate_multimodal_data,
+            )
+            print_multimodal_payload_metrics(
+                collect_multimodal_payload_metrics(
+                    ray_arguments,
+                    "nemo_gym_request",
+                    enabled=debug_payload_metrics,
+                )
+            )
             rollout_gen = nemo_gym_environment.run_rollouts.options(
                 num_returns="streaming"
-            ).remote(nemo_gym_rows, tokenizer, timer_prefix)
+            ).remote(*ray_arguments)
         rollout_iterator = rollout_gen.__aiter__()
 
     while True:
@@ -2125,6 +2390,17 @@ async def run_async_nemo_gym_rollout(
                     stream_finished = True
                 else:
                     rowidx, result, timing_metrics = await future
+                    # Measure the received streaming Ray value in the caller. In
+                    # async training this runs in the collector actor; validation
+                    # runs in the driver, so the two phases cannot share a metric
+                    # accumulator even when they share the NeMo-Gym actor.
+                    print_multimodal_payload_metrics(
+                        collect_multimodal_payload_metrics(
+                            (rowidx, result, timing_metrics),
+                            "nemo_gym_return",
+                            enabled=debug_payload_metrics,
+                        )
+                    )
 
             if not stream_finished:
                 if timing_metrics is not None:
@@ -2133,21 +2409,28 @@ async def run_async_nemo_gym_rollout(
                 _tensorize_nemo_gym_result(result)
                 completed_group = accumulator.add(rowidx, result)
                 if completed_group is not None:
+                    group_input_batch = input_batch.slice(
+                        completed_group.group_index * num_generations,
+                        (completed_group.group_index + 1) * num_generations,
+                    )
+                    if deduplicate_multimodal_data:
+                        _reattach_original_multimodal_payloads(
+                            completed_group.results,
+                            group_input_batch["message_log"],
+                        )
                     rollout_result = _postprocess_single_nemo_gym_group(
                         nemo_gym_rows=completed_group.rows,
                         results=completed_group.results,
                         timer=timer,
                         timer_prefix=timer_prefix,
                         policy_generation=policy_generation,
-                        input_batch=input_batch.slice(
-                            completed_group.group_index * num_generations,
-                            (completed_group.group_index + 1) * num_generations,
-                        ),
+                        input_batch=group_input_batch,
                         tokenizer=tokenizer,
                         log_full_result_tables=log_full_result_tables,
                         effort_config=effort_config,
                         reward_penalty_config=reward_penalty_config,
                         thinking_tags=thinking_tags,
+                        mask_env_flagged_samples=mask_env_flagged_samples,
                     )
                     if accumulator.is_complete:
                         final_rollout_result = rollout_result
@@ -2184,6 +2467,10 @@ def run_nemo_gym_rollout_sync(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    sampling_params: Optional[GenerationSamplingParams] = None,
+    mask_env_flagged_samples: bool = True,
+    deduplicate_multimodal_data: bool = False,
+    debug_payload_metrics: bool = False,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2206,6 +2493,14 @@ def run_nemo_gym_rollout_sync(
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
+        sampling_params: Sampling profile stamped onto every NeMo-Gym row.
+            ``None`` uses the train profile from ``generation_config``;
+            validation passes its own profile explicitly.
+        mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
+            flags in the rollout batch for loss masking.
+        deduplicate_multimodal_data: Omit initial policy-ready media from the
+            remote Gym return and restore it from the input batch.
+        debug_payload_metrics: Emit exact Gym Ray-boundary media payload metrics.
 
     Returns:
         The fully postprocessed NeMo-Gym rollout batch in input-row order.
@@ -2235,7 +2530,11 @@ def run_nemo_gym_rollout_sync(
             effort_config=effort_config,
             reward_penalty_config=reward_penalty_config,
             thinking_tags=thinking_tags,
+            mask_env_flagged_samples=mask_env_flagged_samples,
             returns_entire_batch=True,
+            sampling_params=sampling_params,
+            deduplicate_multimodal_data=deduplicate_multimodal_data,
+            debug_payload_metrics=debug_payload_metrics,
         ):
             pass
         if rollout_result is None:
@@ -2257,6 +2556,7 @@ def _postprocess_single_nemo_gym_group(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
     # Length-based reward shaping for low-effort prompts
@@ -2437,11 +2737,12 @@ def _postprocess_single_nemo_gym_group(
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
             ),
-            # Agent/env-driven mask flag — True means this sample should be masked
-            # from the GRPO gradient (kept for advantage computation).
-            "mask_sample": _extract_mask_sample_flags(results),
         }
     )
+    # Env/agent mask flag: flagged samples are dropped from the loss but still
+    # count for advantages. env.should_mask_flagged_samples=false skips this.
+    if mask_env_flagged_samples:
+        final_batch["mask_sample"] = _extract_mask_sample_flags(results)
 
     if length_rewards_low:
         rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(

@@ -34,6 +34,15 @@ class VllmSpecificArgs(TypedDict):
     async_engine: bool
     load_format: NotRequired[str]
     precision: NotRequired[str]
+    # Whether vLLM returns logprobs before or after generation-time logit
+    # processors. RL policy recomputation uses raw model logits, so recipes
+    # with generation-time processors should request ``raw_logprobs`` when
+    # comparing generation and policy logprobs.
+    logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
+    # Cap each request's generated tokens so the training prompt plus response
+    # fits within max_model_len. This is needed when multimodal processing makes
+    # the training prompt longer than its text-only representation.
+    cap_max_tokens_to_context: NotRequired[bool]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
@@ -47,6 +56,9 @@ class VllmSpecificArgs(TypedDict):
     expose_http_server: NotRequired[bool]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
+    # Invalidate weight-dependent multimodal encoder outputs after a successful
+    # async refit. Enable only when generation is quiesced during weight updates.
+    reset_encoder_cache_after_weight_update: NotRequired[bool]
     # Fixed internal refit endpoint port for stable Kubernetes targetPorts.
     http_refit_server_port: NotRequired[int | None]
     # Fixed ZeroMQ relay port for stable Kubernetes targetPorts.
@@ -147,6 +159,9 @@ class VllmConfig(GenerationConfig):
     # NVFP4 kernels and stream packed quantized weights instead of fake-quant
     # modules. This is intended for ModelOpt NVFP4 rollout experiments.
     real_quant: NotRequired[bool]
+    # CPU offload remains the default. Disabling it is supported only for
+    # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
+    real_quant_export_cpu_offload: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
 
 
@@ -169,6 +184,20 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
             f"Unknown vLLM refit transport {transport!r}: expected null, "
             "'nccl_reshard', 'vllm_s3_sparse', 'vllm_zmq_sparse', 'nixl', or a "
             "'module:ClassName' checkpoint-engine path."
+        )
+    # The encoder-cache reset is implemented only on the collective/IPC and
+    # nccl_reshard async refit paths (both returned above). Fail loudly rather
+    # than let other transports silently keep stale multimodal encoder outputs
+    # across weight updates. Some callers re-validate partial generation
+    # configs (e.g. worker-side NIXL setup), so vllm_cfg may be absent here.
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg and vllm_cfg.get("reset_encoder_cache_after_weight_update"):
+        raise ValueError(
+            "vllm_cfg.reset_encoder_cache_after_weight_update is not supported "
+            f"with refit_transport={transport!r}: this transport's refit path "
+            "does not reset the multimodal encoder cache, so stale vision "
+            "embeddings would silently survive weight updates. Supported "
+            "transports: null (collective/IPC) and 'nccl_reshard'."
         )
     refit_config = VllmRefitConfig.model_validate(config.get("refit_cfg") or {})
     if ":" in transport:

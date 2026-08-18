@@ -45,8 +45,9 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 )
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
+    attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
-    model_dump_chat_response_with_routed_experts,
+    model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
@@ -353,6 +354,7 @@ class VllmAsyncGenerationWorkerImpl(
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
             ChatCompletionResponse,
@@ -368,12 +370,10 @@ class VllmAsyncGenerationWorkerImpl(
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
-        from vllm.entrypoints.serve.render.serving import (
-            OpenAIServingRender,
-        )
         from vllm.entrypoints.serve.tokenize.serving import (
-            OpenAIServingTokenization,
+            ServingTokenization,
         )
+        from vllm.renderers.online_renderer import OnlineRenderer
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
@@ -448,9 +448,10 @@ class VllmAsyncGenerationWorkerImpl(
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)
 
-            # vLLM 0.20 moved chat preprocessing from
-            # OpenAIServing._preprocess_chat to OpenAIServingRender.preprocess_chat,
-            # so this override now applies via the render subclass.
+            # vLLM 0.25 moved chat preprocessing to
+            # OnlineRenderer.preprocess_chat (tool_parser/reasoning_parser were
+            # folded into a single `parser`), so this override now applies via
+            # the renderer subclass.
             async def preprocess_chat(
                 self,
                 request,
@@ -459,8 +460,7 @@ class VllmAsyncGenerationWorkerImpl(
                 default_template_content_format,
                 default_template_kwargs,
                 tool_dicts=None,
-                tool_parser=None,
-                reasoning_parser=None,
+                parser=None,
                 *,
                 skip_mm_cache: bool = False,
             ):
@@ -492,8 +492,7 @@ class VllmAsyncGenerationWorkerImpl(
                         default_template_content_format=default_template_content_format,
                         default_template_kwargs=default_template_kwargs,
                         tool_dicts=tool_dicts,
-                        tool_parser=tool_parser,
-                        reasoning_parser=reasoning_parser,
+                        parser=parser,
                         skip_mm_cache=skip_mm_cache,
                     )
                 except (ValueError, VLLMValidationError) as e:
@@ -546,8 +545,7 @@ class VllmAsyncGenerationWorkerImpl(
                     default_template_content_format=default_template_content_format,
                     default_template_kwargs=default_template_kwargs,
                     tool_dicts=tool_dicts,
-                    tool_parser=tool_parser,
-                    reasoning_parser=reasoning_parser,
+                    parser=parser,
                     skip_mm_cache=skip_mm_cache,
                 )
                 actual_corresponding_token_ids = corresponding_res[1][0][
@@ -585,9 +583,9 @@ class VllmAsyncGenerationWorkerImpl(
         ):
             required_prefix_token_ids: Optional[List[int]] = None
 
-        # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
-        # OpenAIServingRender.preprocess_chat, so the prefix-token override
-        # belongs on the render subclass.
+        # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
+        # OnlineRenderer.preprocess_chat, so the prefix-token override
+        # belongs on the renderer subclass.
         worker_self = self
 
         class NeMoRLOpenAIServingChatMixin:
@@ -598,6 +596,22 @@ class VllmAsyncGenerationWorkerImpl(
                 *args,
                 **kwargs,
             ):
+                return_as_token_id = (
+                    request.return_tokens_as_token_ids
+                    if request.return_tokens_as_token_ids is not None
+                    else self.return_tokens_as_token_ids
+                )
+                if (
+                    request.logprobs
+                    and return_as_token_id
+                    and request.top_logprobs is None
+                ):
+                    raise VLLMValidationError(
+                        "`top_logprobs` must be set when requesting token "
+                        "information from the NeMo-RL chat endpoint.",
+                        parameter="top_logprobs",
+                    )
+
                 final_res = None
 
                 async def capture_result_generator():
@@ -613,24 +627,32 @@ class VllmAsyncGenerationWorkerImpl(
                     **kwargs,
                 )
                 if (
-                    not worker_self._return_routed_experts_enabled()
-                    or not isinstance(response, ChatCompletionResponse)
+                    not isinstance(response, ChatCompletionResponse)
                     or final_res is None
                 ):
                     return response
 
-                return attach_routed_experts_to_chat_response_choices(
-                    response,
-                    final_res,
-                    device=torch.device("cpu"),
-                    logger=LOGGER,
-                    routed_experts_dtype=worker_self.routed_experts_dtype,
-                )
+                if request.logprobs and return_as_token_id:
+                    response = attach_token_information_to_chat_response_choices(
+                        response,
+                        final_res,
+                    )
+
+                if worker_self._return_routed_experts_enabled():
+                    response = attach_routed_experts_to_chat_response_choices(
+                        response,
+                        final_res,
+                        device=torch.device("cpu"),
+                        logger=LOGGER,
+                        routed_experts_dtype=worker_self.routed_experts_dtype,
+                    )
+
+                return response
 
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
             pass
 
-        class NeMoRLOpenAIServingRender(NeMoRLOpenAIServingMixin, OpenAIServingRender):
+        class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
             pass
 
         serving_chat_default_kwargs = dict(
@@ -643,22 +665,61 @@ class VllmAsyncGenerationWorkerImpl(
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
-        openai_serving_render = NeMoRLOpenAIServingRender(
+        # The embedded server is constructed directly instead of through
+        # vLLM's CLI, where chat-template file paths are normally loaded.
+        # OnlineRenderer expects literal Jinja content; passing a path makes
+        # Transformers render the path itself and drops multimodal
+        # placeholders such as <image>.
+        configured_chat_template = serving_chat_kwargs.get("chat_template")
+        if configured_chat_template is not None:
+            serving_chat_kwargs["chat_template"] = load_chat_template(
+                configured_chat_template
+            )
+        # Recipes may name the parameter either way: ``default_chat_template_kwargs``
+        # is vLLM's own spelling, ``chat_template_kwargs`` is accepted for recipes
+        # written against the older name. Normalize onto the native key rather
+        # than popping it: OnlineRenderer, OpenAIServingChat and ServingTokenization
+        # each keep their *own* copy and read it independently -- the chat serving
+        # builds its reasoning parser from it, and the tokenize path passes its own
+        # into preprocess_chat -- so the renderer's copy does not reach either.
+        # vLLM's api_server hands the same value to all three for that reason.
+        #
+        # Popped separately, not `A or B`: short-circuiting on a truthy A would
+        # leave B in the bag and OpenAIServingChat(**kwargs) would reject it.
+        _legacy_chat_template_kwargs = serving_chat_kwargs.pop(
+            "chat_template_kwargs", None
+        )
+        if serving_chat_kwargs.get("default_chat_template_kwargs") is None:
+            serving_chat_kwargs["default_chat_template_kwargs"] = (
+                _legacy_chat_template_kwargs
+            )
+        default_chat_template_kwargs: dict[str, Any] = (
+            serving_chat_kwargs["default_chat_template_kwargs"] or {}
+        )
+        online_renderer = NeMoRLOnlineRenderer(
             model_config=engine_client.model_config,
             renderer=engine_client.renderer,
-            model_registry=openai_serving_models.registry,
             request_logger=serving_chat_kwargs["request_logger"],
             chat_template=serving_chat_kwargs["chat_template"],
             chat_template_content_format=serving_chat_kwargs[
                 "chat_template_content_format"
             ],
             enable_auto_tools=serving_chat_kwargs["enable_auto_tools"],
+            # Keep the renderer's parser consistent with any parser overrides
+            # passed to OpenAIServingChat via http_server_serving_chat_kwargs.
+            tool_parser=serving_chat_kwargs.get("tool_parser"),
+            reasoning_parser=serving_chat_kwargs.get("reasoning_parser"),
+            # vLLM merges these into every render, with request-supplied keys
+            # winning (preprocess_chat's default_template_kwargs). The renderer
+            # is shared by /v1/chat/completions and /tokenize, so setting it
+            # here keeps the two endpoints rendering identical prompts.
+            default_chat_template_kwargs=default_chat_template_kwargs,
         )
         serving_chat_kwargs.update(
             dict(
                 engine_client=engine_client,
                 models=openai_serving_models,
-                openai_serving_render=openai_serving_render,
+                online_renderer=online_renderer,
                 return_tokens_as_token_ids=True,
             )
         )
@@ -679,16 +740,45 @@ class VllmAsyncGenerationWorkerImpl(
             request.top_k = -1
 
             # The request sampling params need to exactly match those as are set in NeMo RL.
-            # If they do not match, the inference will be off policy and destroy training stability.
-            assert request.temperature == generation_config["temperature"]
-            assert request.top_p == generation_config["top_p"]
+            # If they do not match, the inference will be off policy and destroy training
+            # stability. Validation rollouts are the one exception: they are stamped with
+            # the validation sampling profile (generation.val_temperature / val_top_p),
+            # which is metric-only and safe to serve — grpo.validate() is the only
+            # caller that constructs a non-train GenerationSamplingParams. Multi-turn
+            # agents issue their own requests, so this server-side check is the one
+            # chokepoint they all pass.
+            # vLLM resolves an unset top_p from the model's generation_config.json
+            # (ModelConfig.generation_config defaults to "auto"), NOT to 1.0, so a
+            # request omitting it would sample off-policy while passing this check.
+            assert request.top_p is not None, (
+                "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
+                "resolved by vLLM from the model's generation_config.json and would "
+                "bypass the on-policy sampling check."
+            )
+            request_top_p = request.top_p
+            is_train_sampling = (
+                request.temperature == generation_config["temperature"]
+                and request_top_p == generation_config["top_p"]
+            )
+            is_val_sampling = (
+                request.temperature == generation_config["val_temperature"]
+                and request_top_p == generation_config["val_top_p"]
+            )
+            assert is_train_sampling or is_val_sampling, (
+                f"request sampling (temperature={request.temperature}, "
+                f"top_p={request.top_p}) matches neither the train sampling params "
+                f"(temperature={generation_config['temperature']}, "
+                f"top_p={generation_config['top_p']}) nor the validation sampling "
+                f"params (val_temperature={generation_config['val_temperature']}, "
+                f"val_top_p={generation_config['val_top_p']})"
+            )
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
                 )
             except VLLMValidationError as e:
-                # vLLM 0.20 raises VLLMValidationError for prompts exceeding
+                # vLLM raises VLLMValidationError for prompts exceeding
                 # max_model_len during tokenization, instead of returning an
                 # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
                 # detect context-length overflow and handle it gracefully.
@@ -710,7 +800,9 @@ class VllmAsyncGenerationWorkerImpl(
 
             elif isinstance(generator, ChatCompletionResponse):
                 return JSONResponse(
-                    content=model_dump_chat_response_with_routed_experts(generator)
+                    content=model_dump_chat_response_with_dynamic_message_fields(
+                        generator
+                    )
                 )
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
@@ -729,9 +821,9 @@ class VllmAsyncGenerationWorkerImpl(
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
         ]
 
-        # Tokenize path delegates to OpenAIServingRender.preprocess_chat in
-        # vLLM 0.20, where the prefix-token override lives.
-        class NeMoRLOpenAIServingTokenization(OpenAIServingTokenization):
+        # Tokenize path delegates to OnlineRenderer.preprocess_chat,
+        # where the prefix-token override lives.
+        class NeMoRLServingTokenization(ServingTokenization):
             pass
 
         serving_tokenization_kwargs = dict(
@@ -740,11 +832,14 @@ class VllmAsyncGenerationWorkerImpl(
             chat_template_content_format=serving_chat_kwargs[
                 "chat_template_content_format"
             ],
-            engine_client=serving_chat_kwargs["engine_client"],
             models=serving_chat_kwargs["models"],
-            openai_serving_render=openai_serving_render,
+            online_renderer=online_renderer,
+            # ServingTokenization reads its own copy in preprocess_chat rather
+            # than the renderer's, so /tokenize would otherwise render with {}
+            # and diverge from /v1/chat/completions under multi-turn.
+            default_chat_template_kwargs=default_chat_template_kwargs,
         )
-        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
+        openai_serving_tokenization = NeMoRLServingTokenization(
             **serving_tokenization_kwargs
         )
 
@@ -797,7 +892,7 @@ class VllmAsyncGenerationWorkerImpl(
                         return False
                 return True
 
-        _getLogger("vllm.entrypoints.openai.serving_chat").addFilter(
+        _getLogger("vllm.entrypoints.openai.chat_completion.serving").addFilter(
             MaxContextLengthFilter()
         )
 
@@ -956,10 +1051,20 @@ class VllmAsyncGenerationWorkerImpl(
                 [per_sample_stop_strings] if per_sample_stop_strings else None
             )
 
-            remaining_ctx = (
-                self.cfg["vllm_cfg"]["max_model_len"] - current_input_actual_length
-            )
+            max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+            remaining_ctx = max_model_len - current_input_actual_length
             allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
+
+            spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
+            spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
+            if allowed_new_tokens > 0 and spec_lookahead > 0:
+                allowed_new_tokens = self._request_max_new_tokens(
+                    configured_max_new_tokens=allowed_new_tokens,
+                    input_length=current_input_actual_length,
+                    max_model_len=max_model_len,
+                    cap_to_context=False,
+                    spec_lookahead=spec_lookahead,
+                )
 
             # Handle case where no tokens can be generated due to length constraints
             if allowed_new_tokens == 0:
@@ -1169,17 +1274,15 @@ class VllmAsyncGenerationWorkerImpl(
         ]
 
         # Yield results as they become available
-        for completed_task in asyncio.as_completed(sample_tasks):
-            try:
+        try:
+            for completed_task in asyncio.as_completed(sample_tasks):
                 result = await completed_task
                 yield result
-            except Exception as e:
-                # Cancel remaining tasks
-                for task in sample_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*sample_tasks, return_exceptions=True)
-                raise e
+        finally:
+            for task in sample_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*sample_tasks, return_exceptions=True)
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -1270,17 +1373,15 @@ class VllmAsyncGenerationWorkerImpl(
         ]
 
         # Yield results as they become available
-        for completed_task in asyncio.as_completed(prompt_tasks):
-            try:
+        try:
+            for completed_task in asyncio.as_completed(prompt_tasks):
                 result = await completed_task
                 yield result
-            except Exception as e:
-                # Cancel remaining tasks
-                for task in prompt_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*prompt_tasks, return_exceptions=True)
-                raise e
+        finally:
+            for task in prompt_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*prompt_tasks, return_exceptions=True)
 
     async def report_device_id_async(self) -> list[str]:
         """Async version of report_device_id."""
@@ -1305,6 +1406,15 @@ class VllmAsyncGenerationWorkerImpl(
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+
+    async def _reset_encoder_cache_after_weight_update(self) -> None:
+        """Invalidate weight-dependent multimodal encoder outputs when enabled."""
+        if not self.cfg["vllm_cfg"].get(
+            "reset_encoder_cache_after_weight_update", False
+        ):
+            return
+        assert self.llm is not None
+        await self.llm.reset_encoder_cache()
 
     async def update_weights_via_ipc_zmq_async(
         self,
@@ -1337,6 +1447,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
+            await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1373,6 +1484,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
+            await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1432,6 +1544,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
                 )
                 return False
+            await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
             print(f"Exception during nccl_reshard_refit: {e}", flush=True)

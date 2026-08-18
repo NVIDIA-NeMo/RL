@@ -12,6 +12,9 @@ generation:
   temperature: 0.0
   top_p: 1.0
   top_k: -1 # -1 means disable
+  val_temperature: ${.temperature}
+  val_top_p: ${.top_p}
+  val_top_k: ${.top_k}
   num_prompts_per_step: -1 # -1 means pass all prompts at once
   model_name: "Qwen/Qwen2.5-Math-1.5B-Instruct"
   stop_token_ids: null

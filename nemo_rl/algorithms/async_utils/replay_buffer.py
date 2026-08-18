@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import gc
 import statistics
 import threading as _threading
 import uuid
@@ -21,11 +22,18 @@ from collections.abc import Mapping
 from typing import Any, Iterable, Optional
 
 import ray
+import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_TASK_INDEX_KEY,
+    NEXT_NEMO_GYM_TASK_INDEX_KEY,
+    PromptGroupRecord,
+)
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -338,6 +346,44 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 "max_size": self.max_size,
             }
 
+    def save_to_path(self, path: str) -> int:
+        """Serialize inside the actor without materializing the buffer on the driver."""
+        state = self.state_dict()
+        torch.save(state, path)
+        num_trajectories = len(state["trajectories"])
+        del state
+        gc.collect()
+        return num_trajectories
+
+    def load_from_path(
+        self,
+        path: str,
+        num_prompts_per_step: int | None = None,
+        current_training_step: int | None = None,
+        max_age_steps: int | None = None,
+    ) -> dict[str, int]:
+        """Restore inside the actor and return only compact coordination metadata."""
+        state = torch.load(path, weights_only=False)
+        saved_task_indices = [
+            int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
+            for trajectory in state.get("trajectories", [])
+            if trajectory.get(NEMO_GYM_TASK_INDEX_KEY) is not None
+        ]
+        next_task_index = max(saved_task_indices, default=-1) + 1
+        num_trajectories = len(state["trajectories"])
+        self.load_state_dict(
+            state,
+            num_prompts_per_step=num_prompts_per_step,
+            current_training_step=current_training_step,
+            max_age_steps=max_age_steps,
+        )
+        del state
+        gc.collect()
+        return {
+            "num_trajectories": num_trajectories,
+            NEXT_NEMO_GYM_TASK_INDEX_KEY: next_task_index,
+        }
+
     def load_state_dict(
         self,
         state: dict[str, Any],
@@ -648,10 +694,12 @@ class TQReplayBuffer:
         partition_id: str,
         *,
         pad_value_dict: Mapping[str, int],
+        require_routed_experts: bool = False,
     ):
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
+        self._require_routed_experts = require_routed_experts
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
         self.end_weight_list: list[int] = []
@@ -708,6 +756,7 @@ class TQReplayBuffer:
 
         Raises:
             ValueError: group_id has no live slot (removed or never reserved).
+            RuntimeError: router replay is enabled but the payload has no routes.
         """
         # Precondition: reserve() must have registered this group_id. Raise
         # before any side effects so a stray commit doesn't leak orphan DP rows.
@@ -720,6 +769,14 @@ class TQReplayBuffer:
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=start_weight_version, group_id=group_id
         )
+        if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
+            raise RuntimeError(
+                "policy.router_replay.enabled=true requires routed_experts in "
+                "the SingleController rollout payload, but payload packing did "
+                "not produce that field. Check vLLM routed-expert capture and "
+                "the async message-log flattening path."
+            )
+        trace_rollout_payload(keys=sample_ids, data=train_batch)
         try:
             await self._call_dp(
                 "put_samples",
@@ -822,6 +879,211 @@ class TQReplayBuffer:
             )
 
         return len(drop_idxs)
+
+    async def state_dict(self, *, saved_capacity: int) -> dict[str, Any]:
+        """Serialize ready groups (meta + DataPlane payloads) for checkpointing.
+
+        Snapshots the ready slots synchronously on the event loop first, then
+        fetches each group's rows from the DataPlane. Unready reservations are
+        in-flight rollouts and are dropped, matching legacy semantics. The
+        snapshot stays consistent during the async fetch: concurrent commits
+        only append/flip *other* slots, and the train pump — the only
+        remover — is the caller itself; groups committed mid-save land in the
+        next checkpoint.
+
+        Args:
+            saved_capacity: max_buffered_rollouts at save time, recorded so
+                load_state_dict can report capacity changes across restarts.
+
+        Returns:
+            Envelope: ``{"partition_id": ..., "saved_capacity": ...,
+            "groups": [{"meta", "start_weight", "end_weight", "target_step",
+            "group_id", "fields_data"}, ...]}``.
+        """
+        snapshot: list[tuple[KVBatchMeta, int, int, Optional[int], str]] = []
+        for i, ready in enumerate(self.ready_list):
+            if not ready:
+                continue
+            meta = self.meta_list[i]
+            assert meta is not None  # commit sets meta before ready=True
+            snapshot.append(
+                (
+                    meta,
+                    self.start_weight_list[i],
+                    self.end_weight_list[i],
+                    self.target_step_list[i],
+                    self._group_ids[i],
+                )
+            )
+
+        groups: list[dict[str, Any]] = []
+        for meta, start_weight, end_weight, target_step, group_id in snapshot:
+            fields_data = await self._call_dp(
+                "get_samples",
+                sample_ids=meta.sample_ids,
+                partition_id=self._partition_id,
+                select_fields=meta.fields,
+            )
+            groups.append(
+                {
+                    "meta": meta,
+                    "start_weight": start_weight,
+                    "end_weight": end_weight,
+                    "target_step": target_step,
+                    "group_id": group_id,
+                    "fields_data": fields_data,
+                }
+            )
+        return {
+            "partition_id": self._partition_id,
+            "saved_capacity": saved_capacity,
+            "groups": groups,
+        }
+
+    async def load_state_dict(
+        self,
+        state: dict[str, Any],
+        *,
+        max_groups: int,
+        expected_partition_id: str,
+        expected_group_size: int,
+    ) -> int:
+        """Validate and re-put checkpointed groups into the buffer.
+
+        The preflight runs entirely before any DataPlane write (legacy
+        precedent: validate, then truncate):
+          1. Validate the envelope and raise ValueError on malformed state.
+          2. Truncate to ``max_groups``, keeping the freshest groups, so the
+             restored count can never exceed the buffer's capacity. Groups
+             carrying a ``target_step`` are never truncated — an over-capacity
+             in-order checkpoint raises instead (see Raises).
+
+        Staleness is intentionally NOT handled here — load only loads. The
+        train pump's first ``sampler.evict`` drops any restored group that is
+        outside the staleness window and releases its capacity permit, keeping
+        eviction in one place.
+
+        Args:
+            state: Envelope produced by ``state_dict``.
+            max_groups: Current max_buffered_rollouts; the restored count
+                never exceeds it.
+            expected_partition_id: Partition this buffer writes to; must
+                match the envelope.
+            expected_group_size: num_generations_per_prompt; every group must
+                hold exactly this many rows (a changed group size silently
+                breaks the group-relative baseline).
+
+        Returns:
+            Number of groups restored into the buffer.
+
+        Raises:
+            ValueError: If the envelope is malformed (missing keys, partition
+                mismatch, misaligned or wrongly sized groups, duplicate
+                sample_ids), or if target-stamped groups exceed ``max_groups``.
+        """
+        required_keys = {"partition_id", "saved_capacity", "groups"}
+        missing_keys = required_keys - set(state)
+        if missing_keys:
+            raise ValueError(
+                f"Replay buffer checkpoint missing required keys: {missing_keys}"
+            )
+        if state["partition_id"] != expected_partition_id:
+            raise ValueError(
+                "Replay buffer checkpoint partition_id mismatch: "
+                f"checkpoint={state['partition_id']!r}, "
+                f"expected={expected_partition_id!r}"
+            )
+
+        groups = list(state["groups"])
+        group_keys = {
+            "meta",
+            "start_weight",
+            "end_weight",
+            "target_step",
+            "group_id",
+            "fields_data",
+        }
+        seen_sample_ids: set[str] = set()
+        for group in groups:
+            missing_group_keys = group_keys - set(group)
+            if missing_group_keys:
+                raise ValueError(
+                    f"Replay buffer checkpoint group missing keys: {missing_group_keys}"
+                )
+            meta = group["meta"]
+            num_tags = len(meta.tags) if meta.tags is not None else -1
+            num_lengths = (
+                len(meta.sequence_lengths) if meta.sequence_lengths is not None else -1
+            )
+            if not (
+                len(meta.sample_ids) == num_tags == num_lengths == expected_group_size
+            ):
+                raise ValueError(
+                    "Replay buffer checkpoint group misaligned: "
+                    f"sample_ids={len(meta.sample_ids)}, tags={num_tags}, "
+                    f"sequence_lengths={num_lengths}, "
+                    f"expected_group_size={expected_group_size}"
+                )
+            for sid in meta.sample_ids:
+                if sid in seen_sample_ids:
+                    raise ValueError(
+                        f"Replay buffer checkpoint has duplicate sample_id: {sid!r}"
+                    )
+                seen_sample_ids.add(sid)
+
+        if state["saved_capacity"] != max_groups:
+            print(
+                "TQReplayBuffer capacity changed: "
+                f"checkpoint={state['saved_capacity']}, current={max_groups}. "
+                "Using current config value."
+            )
+        num_truncated = 0
+        if len(groups) > max_groups:
+            if any(group["target_step"] is not None for group in groups):
+                raise ValueError(
+                    f"Replay buffer checkpoint holds {len(groups)} group(s) "
+                    f"but async_rl.max_buffered_rollouts is {max_groups}. "
+                    "These groups carry target_step stamps (in-order "
+                    "sampling) and are selected as whole per-step batches, so "
+                    "dropping any of them would deadlock the resumed run. "
+                    "Resume with async_rl.max_buffered_rollouts >= "
+                    f"{len(groups)}, or delete replay_buffer.pt from the "
+                    "checkpoint to resume with an empty buffer."
+                )
+            num_truncated = len(groups) - max_groups
+            # Keep the freshest max_groups groups, preserving original order.
+            prioritized = sorted(
+                range(len(groups)),
+                key=lambda i: (groups[i]["start_weight"], i),
+            )
+            indices_to_keep = sorted(prioritized[num_truncated:])
+            groups = [groups[i] for i in indices_to_keep]
+
+        for group in groups:
+            meta = group["meta"]
+            await self._call_dp(
+                "put_samples",
+                sample_ids=list(meta.sample_ids),
+                partition_id=self._partition_id,
+                fields=group["fields_data"],
+                tags=[dict(t) for t in meta.tags],
+            )
+            self.meta_list.append(meta)
+            self.start_weight_list.append(group["start_weight"])
+            self.end_weight_list.append(group["end_weight"])
+            self.target_step_list.append(group["target_step"])
+            self.ready_list.append(True)
+            self._group_ids.append(group["group_id"])
+
+        summary = f"📦 Restored {len(groups)} replay group(s) from checkpoint"
+        if num_truncated:
+            summary += f"; truncated {num_truncated} group(s) over capacity"
+        print(summary, flush=True)
+        return len(groups)
+
+    def count_for_target_step(self, target_step: int) -> int:
+        """Return how many slots are stamped with ``target_step``."""
+        return sum(1 for target in self.target_step_list if target == target_step)
 
     def size(self) -> int:
         """Return the number of prompt-group entries currently held."""

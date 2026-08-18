@@ -13,7 +13,7 @@ permissions:
 jobs:
   claude-review:
     if: github.event.issue.pull_request != null && contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@v1.7.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@1fc7b2f024bac423b1825a57182f3628c5fcb1f1 # v1.7.0
     with:
       model: ${{ vars.CLAUDE_MODEL }}
       prompt: |
