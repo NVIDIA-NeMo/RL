@@ -203,6 +203,33 @@ def _estimate_refit_tensor_size_in_bytes(
     return param.numel() * tp_size * ep_size * element_size
 
 
+def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
+    """Return HF layer names whose weights originate from Megatron's MTP module.
+
+    This is required because, in some cases, only the Megatron-side name contains
+    the `mtp` string, while the HF-side name does not.
+
+    Args:
+        conversion_tasks: Megatron-Bridge ``WeightConversionTask`` list
+
+    Returns:
+        Set of HF layer names, e.g. ``{"model.layers.61", "mtp.layers.0"}``.
+    """
+    from nemo_rl.weight_sync.nccl_reshard_utils import _extract_layer_name
+
+    mtp_layers: set[str] = set()
+    for task in conversion_tasks or []:
+        if task is None:
+            continue
+        if ".mtp." in task.global_param_name or task.global_param_name.startswith(
+            "mtp."
+        ):
+            hf = task.mapping.hf_param
+            for hf_name in hf.values() if isinstance(hf, dict) else [str(hf)]:
+                mtp_layers.add(_extract_layer_name(hf_name))
+    return mtp_layers
+
+
 @contextmanager
 def _meta_tensor_alloc_context():
     """Skip real GPU work during metadata enumeration.
@@ -574,13 +601,10 @@ class MegatronPolicyWorkerImpl(
                     "A model cannot both own sequence packing and consume caller-packed "
                     "full THD inputs."
                 )
-            model_config = self._get_model_config()
-            mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
-            if mtp_num_layers is not None and mtp_num_layers > 0:
-                raise NotImplementedError(
-                    "Nemotron Omni caller-packed THD inputs do not yet support MTP. "
-                    "Disable MTP for the Nano image/text path."
-                )
+            # MTP is supported here: the caller packs the MTP loss mask onto the
+            # same full THD row as input_ids and leaves it unsharded, so the
+            # model's own post-embedding CP slice applies to both alike. See the
+            # mtp_loss_mask branch in nemo_rl.models.megatron.data.
             if self.cfg["megatron_cfg"].get("use_fused_linear_logprobs", False):
                 raise NotImplementedError(
                     "Nemotron Omni caller-packed THD inputs do not support "
@@ -2421,7 +2445,18 @@ class MegatronPolicyWorkerImpl(
         # state_dict_metadata[hf_name] -> [shape, dtype]
         # At the same time, filter the params to the misc subset (packed_broadcast path).
         # misc_meta[hf_name] -> [shape, dtype]
-        from nemo_rl.weight_sync.nccl_reshard_utils import _extract_layer_prefix
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
+            _extract_layer_name,
+            _extract_layer_prefix,
+        )
+
+        # HF layers whose weights come from Megatron's MTP module. The prefix
+        # gate inside is_nccl_reshard_param only catches families whose HF
+        # names keep the bare ``mtp.`` prefix (NemotronH, Qwen3.5); DeepSeek
+        # exports MTP as trailing ``model.layers.N`` indices, so provenance is
+        # the only reliable signal. vLLM keeps the MTP drafter separate from
+        # the main model and updates it through load_weights -> misc path.
+        mtp_hf_layers_names = _collect_mtp_hf_layer_names(self.refit_conversion_tasks)
 
         layer_prefix = None
         with _meta_tensor_alloc_context():
@@ -2433,7 +2468,10 @@ class MegatronPolicyWorkerImpl(
                 _nbytes = tensor.numel() * tensor.element_size()
                 # Downsized whitelist: only FFN gate/up/down weights take the bulk
                 # nccl-reshard path; everything else -> misc (packed_broadcast).
-                if is_nccl_reshard_param(name):
+                if (
+                    is_nccl_reshard_param(name)
+                    and _extract_layer_name(name) not in mtp_hf_layers_names
+                ):
                     state_dict_metadata[name] = meta
                     _xfer_bytes += _nbytes
                     if layer_prefix is not None:
@@ -3001,6 +3039,19 @@ class MegatronPolicyWorkerImpl(
                 ckpt_cfg=self.mcore_state.cfg.checkpoint,
                 blocking=True,
             )
+
+            # Onload model before saving it.
+            self.model = self.move_model(
+                self.model, "cuda", move_params=True, move_grads=False
+            )
+            if (
+                optimizer_path is not None
+                and self.optimizer is not None
+                and not self.optimizer_cpu_offload
+            ):
+                self.move_optimizer("cuda")
+            torch.cuda.synchronize()
+
             self.mcore_state.cfg.checkpoint.save = weights_path
 
             optimizer_to_save = None
