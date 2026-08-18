@@ -456,19 +456,22 @@ def setup(
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
     _validate_multimodal_dedup_capability(master_config)
 
-    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
-    # path; everywhere else validation must sample exactly like training.
+    # Validation-only sampling is honored on the NeMo-Gym rollout path for the
+    # backends whose HTTP server accepts a second sampling profile; everywhere
+    # else validation must sample exactly like training.
     val_sampling_overridden = (
         generation_config["val_temperature"] != generation_config["temperature"]
         or generation_config["val_top_p"] != generation_config["top_p"]
         or generation_config["val_top_k"] != generation_config["top_k"]
     )
     if val_sampling_overridden:
-        assert generation_config["backend"] == "vllm" and _should_use_nemo_gym(
-            master_config
-        ), (
+        assert generation_config["backend"] in (
+            "vllm",
+            "trtllm",
+        ) and _should_use_nemo_gym(master_config), (
             "generation.val_temperature/val_top_p/val_top_k differing from the "
-            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
+            "train sampling params is only supported for vLLM and TRT-LLM "
+            "NeMo-Gym rollouts."
         )
         # The NeMo-Gym path only stamps temperature/top_p onto requests and
         # rejects any top_k at rollout time, so a val_top_k override can never
