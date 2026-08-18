@@ -754,14 +754,17 @@ class PackedTensor:
         # would emit the physical segment count instead of the batch
         # size. ``_row_segment_indices`` degrades to ``[row]`` for the
         # legacy one-tensor-per-row layout.
-        row_segments: list[list[torch.Tensor]] = [
-            [
-                self.tensors[i]
-                for i in self._row_segment_indices(row)
-                if self.tensors[i] is not None
-            ]
-            for row in range(len(self))
-        ]
+        # Built with an explicit loop rather than a comprehension: the
+        # ``is not None`` filter does not narrow ``Optional[Tensor]`` inside a
+        # comprehension, so the result would type as ``list[list[Tensor | None]]``.
+        row_segments: list[list[torch.Tensor]] = []
+        for row in range(len(self)):
+            segments: list[torch.Tensor] = []
+            for i in self._row_segment_indices(row):
+                segment = self.tensors[i]
+                if segment is not None:
+                    segments.append(segment)
+            row_segments.append(segments)
 
         # ``torch.nested`` jagged requires every row to agree on all dims
         # except dim 0. Dynamic-resolution values (``pad_to_max_shape``)
@@ -873,7 +876,9 @@ def encode_multimodal_for_wire(
             f"{k!r}: expected PackedTensor, got {type(v).__name__}"
         )
         nested, lengths = v.to_nested_wire()
-        if nested is None:
+        # ``to_nested_wire`` returns both or neither; test both so the
+        # yielded values narrow to non-Optional.
+        if nested is None or lengths is None:
             return  # all-None batch
         yield k, nested
         yield PackedTensor.lengths_key(k), lengths
