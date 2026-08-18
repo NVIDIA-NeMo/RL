@@ -95,9 +95,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     ++data_plane.impl=transfer_queue \
     ++data_plane.backend=simple \
     ++data_plane.simple.storage_capacity=1000000 \
+    ++data_plane.simple.num_storage_units=2 \
     ++data_plane.claim_meta_poll_interval_s=0.5 \
-    ++data_plane.mooncake_cpu.global_segment_size=4294967296 \
-    ++data_plane.mooncake_cpu.local_buffer_size=1073741824 \
     ++async_rl.sampler.name=in_order \
     ++async_rl.sampler.max_lookahead_versions=0 \
     ++async_rl.min_groups_for_streaming_train=4 \
