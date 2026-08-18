@@ -3,12 +3,21 @@
 #   ARM 1  BF16, exactly as CI runs it. Validates the widened reward sample
 #          (4 prompts x 8 generations) and the new grad_norm > 0 assertion that
 #          keeps the ratio check from going vacuous (doc 23).
-#   ARM 2  identical, plus a vLLM MXFP8 rollout. This is the first time FP8 has
-#          been exercised on the mx_reshard path at all. The trainer still holds
-#          BF16 weights; ModelExpress re-quantizes at install, so no FP8 scale
+#   ARM 2  identical, plus a vLLM MXFP8 rollout. The trainer still holds BF16
+#          weights; ModelExpress re-quantizes at install, so no FP8 scale
 #          transport is required. FP8 KV cache is deliberately NOT set, because
 #          mx_reshard rejects it outright in
 #          nemo_rl/weight_sync/mx_reshard_weight_synchronizer.py.
+#          use_importance_sampling_correction is required, not optional: grpo.py
+#          asserts it whenever vllm precision is fp8, and without it the run dies
+#          in setup before any refit.
+#          ARM 2 is CURRENTLY EXPECTED TO FAIL. It reaches the first refit with a
+#          clean transport (898 descriptors, 0 full-pull sources) and then raises
+#          `NotImplementedError: Cannot copy out of meta tensor; no data!` inside
+#          ModelExpress's quantized install path, at
+#          engines/vllm/refit/receiver.py _copy_and_restore_kernel_tensors. That
+#          is an MX-side bug, tracked in doc 24. Keep the arm so the fix has a
+#          reproducer.
 # Reusing the gate script means the FP8 arm is judged by the same assertions as
 # BF16 rather than by a bespoke check.
 namespace: kavin
@@ -48,7 +57,8 @@ launch:
     bash tests/functional/grpo_mx_reshard_refit.sh \
       ++policy.generation.vllm_cfg.precision=fp8 \
       ++policy.generation.vllm_cfg.is_mx=true \
-      '++policy.generation.vllm_cfg.quantization_ignored_layer_kws=[q_proj,k_proj,v_proj,o_proj]'
+      '++policy.generation.vllm_cfg.quantization_ignored_layer_kws=[q_proj,k_proj,v_proj,o_proj]' \\
+      ++loss_fn.use_importance_sampling_correction=true
     echo "ARM2_EXIT=$?"
     cp -a tests/functional/grpo_mx_reshard_refit /tmp/arm2_fp8 2>/dev/null || true
     echo "=========== BOTH ARMS DONE ==========="
