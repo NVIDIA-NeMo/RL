@@ -61,10 +61,11 @@ MTP-disabled recipes supported by the NeMo-RL compatibility path. Other
 recipes rely on the Megatron-LM uneven-dispatch padding path.
 
 Both arms build dependencies with the same H100 environment. In particular,
-`HYBRID_EP_MULTINODE=1`, `TORCH_CUDA_ARCH_LIST=9.0`, `RDMA_CORE_HOME=/usr`,
-and `USE_NIXL=0` make the pinned DeepEP revision compile its Hopper
-multi-node DOCA/NCCL path. These are fixed software-stack prerequisites, not
-A/B recipe variables.
+`HYBRID_EP_MULTINODE=1`, `TORCH_CUDA_ARCH_LIST=9.0`, `NVTE_CUDA_ARCHS=90`,
+`RDMA_CORE_HOME=/usr`, and `USE_NIXL=0` make the pinned DeepEP revision
+compile its Hopper multi-node DOCA/NCCL path without rebuilding unrelated GPU
+architectures. These are fixed software-stack prerequisites, not A/B recipe
+variables.
 
 ## Experiment matrix
 

@@ -2,7 +2,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --job-name=warm-hybridep-cache
 #SBATCH --output=warm-hybridep-cache-%j.log
 
@@ -34,6 +34,7 @@ srun \
     set -euo pipefail
     export HYBRID_EP_MULTINODE=1
     export MAX_JOBS="${MAX_JOBS:-8}"
+    export NVTE_CUDA_ARCHS=90
     export RDMA_CORE_HOME=/usr
     export TORCH_CUDA_ARCH_LIST=9.0
     export USE_NIXL=0
