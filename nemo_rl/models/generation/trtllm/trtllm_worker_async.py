@@ -410,6 +410,15 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "top_p": self.cfg["top_p"],
                 "top_k": self.cfg["top_k"],
             },
+            # Validation rollouts are stamped with this second profile by
+            # grpo.validate(); without it the server would reject them as
+            # off-policy, which is why validation previously had to be pinned to
+            # the train sampling params on this backend.
+            val_sampling_config={
+                "temperature": self.cfg["val_temperature"],
+                "top_p": self.cfg["val_top_p"],
+                "top_k": self.cfg["val_top_k"],
+            },
             stop_token_ids=list(self.cfg.get("stop_token_ids") or []),
             default_chat_template_kwargs=self.engine_cfg.get(
                 "default_chat_template_kwargs"
