@@ -2780,8 +2780,9 @@ def test_generation_logprob_reuse_skips_all_logprob_inference(
     policy.prepare_for_lp_inference.assert_not_called()
     policy.get_logprobs.assert_not_called()
     policy.get_reference_policy_logprobs.assert_not_called()
-    preserve_routed_experts.assert_not_called()
     trained_data = policy.train.call_args.args[0]
+    preserve_routed_experts.assert_called_once()
+    assert preserve_routed_experts.call_args.args[0] is trained_data
     assert torch.equal(
         trained_data["prev_logprobs"], trained_data["generation_logprobs"]
     )
