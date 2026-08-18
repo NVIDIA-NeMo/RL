@@ -483,10 +483,10 @@ fi
 export TRTLLM_WHEEL_CACHE_DIR=/opt/nemo_rl_cache/trtllm-wheels
 export TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
-# The final checkouts are already owned by the runtime UID. This build-only root
-# invocation needs Git metadata only while setuptools builds NeMo RL and Gym.
-# uv strips GIT_CONFIG_GLOBAL from its isolated build environment, so add exact
-# protected system entries for this RUN and remove them before committing it.
+# The final checkouts are owned by the runtime UID while root remains the image's
+# default user. uv strips GIT_CONFIG_GLOBAL from its isolated build environment,
+# so retain exact protected system entries for build-time and runtime Git metadata
+# discovery in NeMo RL and Gym.
 git config --system --add safe.directory /opt/nemo-rl
 git config --system --add safe.directory /opt/nemo-rl/3rdparty/Gym-workspace/Gym
 # A normal upstream BASE_IMAGE can already contain prefetched Ray environments
@@ -500,8 +500,6 @@ if [[ -n "$NEGATIVE_FILTERS" ]]; then
 else
     UV_LINK_MODE=symlink uv run --locked --extra nemo_gym nemo_rl/utils/prefetch_venvs.py
 fi
-git config --system --unset-all safe.directory /opt/nemo-rl/3rdparty/Gym-workspace/Gym
-git config --system --unset-all safe.directory /opt/nemo-rl
 # Keep ownership changes in the layer that creates the prefetched venvs.
 chown -R "${RUNTIME_UID}:${RUNTIME_GID}" \
     /opt/nemo_rl_venv /opt/ray_venvs "${UV_CACHE_DIR}"
