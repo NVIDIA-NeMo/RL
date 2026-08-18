@@ -530,7 +530,7 @@ def test_prepare_for_generation_disables_param_gather_hook_before_wake(
     assert model.config.flash_decode is False
 
 
-def test_prepare_for_generation_ensures_cuda_graph_managers_before_toggle(
+def test_prepare_for_generation_ensure_cuda_graph_managers_before_toggle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from nemo_rl.models.generation.megatron import megatron_worker
