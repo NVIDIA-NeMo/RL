@@ -343,9 +343,10 @@ def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
     ):
         return
 
-    n_slots = getattr(_mc, "MAX_BATCH_WORKER_THREADS", None)
-    if n_slots is None:
+    _n_slots_raw = getattr(_mc, "MAX_BATCH_WORKER_THREADS", None)
+    if not isinstance(_n_slots_raw, int):
         return
+    n_slots: int = _n_slots_raw
 
     def _get_tensors_thread_worker(
         self, batch_keys, batch_shapes, batch_dtypes, indexes
