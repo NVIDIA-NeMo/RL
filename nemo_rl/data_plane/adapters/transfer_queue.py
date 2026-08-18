@@ -309,6 +309,29 @@ def _patch_mooncake_register_check() -> None:
     cls._nrl_register_checked = True
 
 
+def _patch_mooncake_retry_count(max_retries: int) -> None:
+    """Override TransferQueue's fixed retry count for a failed batch transfer.
+
+    ``MAX_RETRIES`` is a bare module-level int that ``_batch_get_into_with_retry``
+    / ``_batch_upsert_with_retry`` read directly out of the module's namespace on
+    every call, so reassigning it here — before any transfer runs — changes every
+    subsequent retry loop process-wide. No class to patch, no sentinel needed:
+    setting the same value twice is a no-op.
+
+    Monkey-patched because TransferQueue is pinned by git SHA in
+    ``pyproject.toml``. Returns early, leaving upstream's default (3) intact, if
+    the module or the constant is not shaped as expected.
+    """
+    try:
+        from transfer_queue.storage.clients import mooncake_client as _mc
+    except ImportError:
+        return
+
+    if not hasattr(_mc, "MAX_RETRIES"):
+        return
+    _mc.MAX_RETRIES = max_retries
+
+
 def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
     """Reuse RDMA-registered host buffers for mooncake tensor GETs and PUTs.
 
@@ -676,6 +699,9 @@ class TQDataPlaneClient(DataPlaneClient):
             # an absent mooncake_cpu block means "this backend's defaults",
             # so the pool is on unless a config deliberately turns it off.
             mooncake_cfg = backend_config(cfg)
+            # Unconditional, like the registration check above: a transient
+            # rail failure can hit any transfer regardless of the staging pool.
+            _patch_mooncake_retry_count(mooncake_cfg.transfer_max_retries)
             if mooncake_cfg.reuse_registered_buffers:
                 _patch_mooncake_staging_buffers(mooncake_cfg.staging_buffer_size)
 

@@ -112,6 +112,21 @@ def test_register_all_buffers_patch_checks_upstream_call_site(monkeypatch) -> No
         client._register_all_buffers([0x1000, 0x2000], [4096, 4096])
 
 
+def test_retry_count_patch_overrides_the_module_constant(monkeypatch) -> None:
+    """MAX_RETRIES is read fresh from the module namespace on every call.
+
+    _batch_get_into_with_retry / _batch_upsert_with_retry reference the bare
+    name, not a captured default, so reassigning it before either runs changes
+    every retry loop process-wide — no class/instance to patch.
+    """
+    mc = pytest.importorskip("transfer_queue.storage.clients.mooncake_client")
+    monkeypatch.setattr(mc, "MAX_RETRIES", mc.MAX_RETRIES)  # restore on teardown
+
+    tq_adapter._patch_mooncake_retry_count(10)
+
+    assert mc.MAX_RETRIES == 10
+
+
 # ── pool slot bookkeeping ────────────────────────────────────────────────────
 
 
