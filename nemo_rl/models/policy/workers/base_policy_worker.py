@@ -100,7 +100,11 @@ class AbstractPolicyWorker:
             "prepare_nccl_reshard_refit_info is not implemented for this policy worker"
         )
 
-    def nccl_reshard_refit(self, kv_scales: Optional[dict[str, float]] = None) -> None:
+    def nccl_reshard_refit(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+    ) -> None:
         """Transfer policy weights with NCCL reshard refit."""
         # This is a placeholder implementation.
         # Implementation should be located in each policy worker implementation.
