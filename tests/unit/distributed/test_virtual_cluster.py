@@ -211,14 +211,18 @@ def test_ray_uses_same_cluster_for_permuted_cuda_devices():
         assert mock_ray_shutdown.call_count == 0
 
 
-def test_init_ray_threads_data_plane_env_into_runtime_env():
-    """The point of init_ray(data_plane_cfg=...): a backend engine knob must
-    reach the env_vars snapshot ray.init() hands to every worker -- that is
-    the only place it becomes cluster-wide (see init_ray's own docstring and
-    nemo_rl/data_plane/factory.py's maybe_configure_data_plane_env). Setting
-    it from anywhere later (e.g. inside a worker's own __init__) is too late
-    for this snapshot and leaves workers disagreeing with the driver.
+def test_maybe_configure_data_plane_env_then_init_ray_threads_env_vars():
+    """This is the pattern every data-plane-enabled launcher uses --
+    maybe_configure_data_plane_env(config.data_plane) immediately before
+    init_ray() -- because init_ray's env_vars snapshot is the only point a
+    backend engine knob becomes cluster-wide (see both functions'
+    docstrings). init_ray itself has no data-plane awareness; the ordering
+    at the call site is what makes this work, so exercise the two calls
+    together rather than mocking either one out.
     """
+    from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
     with (
         patch("ray.init") as mock_ray_init,
         patch("ray.cluster_resources") as mock_cluster_resources,
@@ -229,16 +233,15 @@ def test_init_ray_threads_data_plane_env_into_runtime_env():
         mock_cluster_resources.return_value = {"nrl_tag_0": 1}
         env = {"CUDA_VISIBLE_DEVICES": "0"}
         with patch.dict(os.environ, env, clear=True):
-            from nemo_rl.distributed.virtual_cluster import init_ray
-
-            init_ray(
-                data_plane_cfg={
+            maybe_configure_data_plane_env(
+                {
                     "enabled": True,
                     "impl": "transfer_queue",
                     "backend": "mooncake_cpu",
                     "claim_meta_poll_interval_s": 0.5,
                 }
             )
+            init_ray()
 
         assert mock_ray_init.call_count == 1
         env_vars = mock_ray_init.call_args_list[0][1]["runtime_env"]["env_vars"]
@@ -246,9 +249,10 @@ def test_init_ray_threads_data_plane_env_into_runtime_env():
         assert env_vars["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
 
 
-def test_init_ray_data_plane_cfg_none_is_a_noop():
-    """No data_plane_cfg (the default, and every non-data-plane launcher's
-    call) must not touch mooncake env vars at all."""
+def test_init_ray_alone_has_no_data_plane_awareness():
+    """Every non-data-plane launcher's call (bare init_ray(), no preceding
+    maybe_configure_data_plane_env) must not touch mooncake env vars --
+    init_ray does not know the data plane exists."""
     with (
         patch("ray.init") as mock_ray_init,
         patch("ray.cluster_resources") as mock_cluster_resources,
