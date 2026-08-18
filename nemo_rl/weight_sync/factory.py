@@ -93,6 +93,21 @@ def create_weight_synchronizer(
     if refit_buffer_size_gb is not None and refit_buffer_size_gb <= 0:
         raise ValueError("refit_buffer_size_gb must be > 0")
 
+    if generation_backend == MEGATRON_BACKEND:
+        from nemo_rl.weight_sync.megatron_weight_synchronizer import (
+            MegatronWeightSynchronizer,
+        )
+
+        # One synchronizer serves both colocation modes; colocated is the
+        # degenerate path (no cross-group collective to wire).
+        return MegatronWeightSynchronizer(
+            policy=policy,
+            generation=generation,
+            colocated=colocated,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+        )
+
     if not colocated:
         if generation_backend == SGLANG_BACKEND:
             raise NotImplementedError(

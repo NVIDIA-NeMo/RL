@@ -286,9 +286,6 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
     def is_stale(self) -> bool:
         return self._stale
 
-    def mark_stale(self) -> None:
-        self._stale = True
-
     def _run_policy_workers(self, method_name: str, **kwargs: Any) -> list[Any]:
         workers = self._policy.worker_group
         count = len(workers.workers)
