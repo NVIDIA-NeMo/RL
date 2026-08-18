@@ -380,6 +380,9 @@ def _validate_generation_logprobs_as_prev(
     if not grpo_config.use_generation_logprobs_as_prev:
         return
 
+    assert grpo_config.async_grpo is None or not grpo_config.async_grpo.enabled, (
+        "grpo.use_generation_logprobs_as_prev=True is not supported with async GRPO"
+    )
     assert not loss_config.use_importance_sampling_correction, (
         "grpo.use_generation_logprobs_as_prev=True is incompatible with "
         "loss_fn.use_importance_sampling_correction=True"

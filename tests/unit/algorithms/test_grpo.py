@@ -93,6 +93,18 @@ def test_generation_logprobs_as_prev_rejects_seq_error_masking() -> None:
         )
 
 
+def test_generation_logprobs_as_prev_rejects_async_grpo() -> None:
+    grpo_config = GRPOConfig(use_generation_logprobs_as_prev=True)
+    assert grpo_config.async_grpo is not None
+    grpo_config.async_grpo.enabled = True
+
+    with pytest.raises(AssertionError, match="async GRPO"):
+        _validate_generation_logprobs_as_prev(
+            grpo_config,
+            ClippedPGLossConfig(use_importance_sampling_correction=False),
+        )
+
+
 @pytest.mark.parametrize(
     ("loss_config", "error"),
     [
