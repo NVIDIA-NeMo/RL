@@ -951,9 +951,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
-    def prepare_for_lp_inference(self, *args: Any, **kwargs: Any) -> None:
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put every worker in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave grad buffers and optimizer state on CUDA.
+                Set this when a train step is already open, so that gradients
+                accumulated by earlier streaming chunks survive; see
+                ``MegatronPolicyWorker.prepare_for_lp_inference``.
+        """
         futures = self.worker_group.run_all_workers_single_data(
-            "prepare_for_lp_inference"
+            "prepare_for_lp_inference", keep_train_buffers=keep_train_buffers
         )
         ray.get(futures)
 
