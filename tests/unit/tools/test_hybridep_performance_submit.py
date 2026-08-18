@@ -185,6 +185,8 @@ def test_h100_submission_builds_multinode_hybridep_for_hopper() -> None:
     assert "export HYBRID_EP_MULTINODE=1" in script
     assert "export NVTE_CUDA_ARCHS=90" in script
     assert "export TORCH_CUDA_ARCH_LIST=9.0" in script
+    assert "export NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS:-false}" in script
+    assert 'export NEMO_RL_VENV_DIR=\\"${run_dir}/venvs\\"' in script
 
 
 def test_shared_uv_cache_does_not_shadow_the_container_bootstrap_cache() -> None:

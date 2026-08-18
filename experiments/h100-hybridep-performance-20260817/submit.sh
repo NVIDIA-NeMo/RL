@@ -142,6 +142,7 @@ fi"
 command="${source_guard}
 ${config_setup}
 ${uv_cache_setup}
+export NEMO_RL_VENV_DIR=\"${run_dir}/venvs\"
 UV_NO_SYNC=1 uv run examples/run_grpo.py \\
   --config \"\${config_path}\" \\
   grpo.max_num_steps=${max_steps} \\
@@ -160,7 +161,7 @@ export HF_HOME
 export HYBRID_EP_MULTINODE=1
 export MAX_JOBS=${MAX_JOBS:-8}
 export MOUNTS
-export NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS:-true}
+export NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS:-false}
 export NVTE_CUDA_ARCHS=90
 export RDMA_CORE_HOME=/usr
 export TORCH_CUDA_ARCH_LIST=9.0

@@ -65,7 +65,10 @@ Both arms build dependencies with the same H100 environment. In particular,
 `RDMA_CORE_HOME=/usr`, and `USE_NIXL=0` make the pinned DeepEP revision
 compile its Hopper multi-node DOCA/NCCL path without rebuilding unrelated GPU
 architectures. These are fixed software-stack prerequisites, not A/B recipe
-variables.
+variables. Each arm uses a persistent venv directory inside its result
+directory with `NRL_FORCE_REBUILD_VENVS=false`. The first builder materializes
+each actor environment once on shared storage and later nodes or retries reuse
+it, avoiding concurrent multi-node force-rebuild races.
 
 ## Experiment matrix
 
