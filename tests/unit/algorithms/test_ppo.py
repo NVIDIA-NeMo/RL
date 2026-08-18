@@ -2356,7 +2356,10 @@ def test_async_ppo_consumes_frozen_policy_rollout_at_safe_warmup_frontier():
         == frontier
     )
 
-    buffer = ReplayBufferImpl(max_size=4)
+    buffer = ReplayBufferImpl(
+        max_size=4,
+        drop_incomplete_targets_on_restore=False,
+    )
     frozen_rollout = {
         "batch": {"data": "frozen-policy"},
         "rollout_metrics": {},

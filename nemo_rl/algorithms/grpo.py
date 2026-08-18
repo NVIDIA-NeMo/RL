@@ -4139,7 +4139,8 @@ def async_grpo_train(
     )
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
-        max_size=optimal_buffer_size
+        max_size=optimal_buffer_size,
+        drop_incomplete_targets_on_restore=False,
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()

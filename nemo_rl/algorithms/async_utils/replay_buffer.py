@@ -47,7 +47,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     def __init__(
         self,
         max_size: int,
-        drop_incomplete_targets_on_restore: bool = False,
+        drop_incomplete_targets_on_restore: bool,
     ) -> None:
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
