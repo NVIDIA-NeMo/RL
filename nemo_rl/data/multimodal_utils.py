@@ -913,23 +913,102 @@ def extract_input_images_from_responses_messages(
     ]
 
 
+def _materialize_ragged_pixel_values(
+    processed: dict[str, Any], processor: Any
+) -> dict[str, Any]:
+    """Fold a ragged per-image ``pixel_values`` list into one padded tensor.
+
+    Processors with dynamic per-image resolution return a list of CHW tensors
+    rather than a stacked batch. ``imgs_sizes`` is derived from the *unpadded*
+    shapes first, since those exact sizes are what the projector slices with;
+    padding happens afterwards so downstream sees the single tensor its
+    torch.Tensor contract expects.
+    """
+    processed = dict(processed)
+    pixel_values = processed.get("pixel_values")
+
+    # pixel_values is only ragged when the images genuinely differ in size; two
+    # images of equal resolution come back already stacked. Either way the rest
+    # of the batch still needs restoring to tensors, so that runs below rather
+    # than behind this branch.
+    if isinstance(pixel_values, list):
+        tiles = [torch.as_tensor(item) for item in pixel_values]
+        if not tiles or any(item.ndim != 3 for item in tiles):
+            raise ValueError(
+                "Ragged pixel_values must contain one CHW tensor per image."
+            )
+        if len({item.shape[0] for item in tiles}) != 1:
+            raise ValueError("Ragged pixel_values must use the same channel count.")
+        _stack_ragged_pixel_values(processed, tiles, processor)
+
+    _restore_tensors(processed)
+    return processed
+
+
+def _stack_ragged_pixel_values(
+    processed: dict[str, Any], tiles: list[torch.Tensor], processor: Any
+) -> None:
+    """Derive imgs_sizes from unpadded shapes, then pad into one tensor."""
+    if uses_image_placeholder(processor) and "imgs_sizes" not in processed:
+        processed["imgs_sizes"] = torch.tensor(
+            [[int(item.shape[-2]), int(item.shape[-1])] for item in tiles],
+            dtype=torch.long,
+        )
+    stacked = PackedTensor(
+        [item.unsqueeze(0) for item in tiles],
+        dim_to_pack=0,
+        pad_to_max_shape=True,
+    ).as_tensor()
+    assert stacked is not None
+    processed["pixel_values"] = stacked
+
+
+def _restore_tensors(processed: dict[str, Any]) -> None:
+    """Convert a processor's list outputs back to tensors, in place.
+
+    ``return_tensors=None`` makes the processor hand back *every* output as
+    plain Python lists, not only the ragged ``pixel_values`` that mode was
+    requested for. Downstream expects tensors -- ``input_ids`` in particular is
+    rank-checked -- so restore the rest of the batch to what
+    ``return_tensors="pt"`` would have produced. Values that resist conversion
+    (genuinely ragged per-image metadata) are left for their own handling.
+    """
+    for key, value in processed.items():
+        if key == "pixel_values" or isinstance(value, torch.Tensor):
+            continue
+        if isinstance(value, (list, tuple)):
+            try:
+                processed[key] = torch.as_tensor(value)
+            except (TypeError, ValueError, RuntimeError):
+                continue
+
+
 def attach_image_model_inputs_to_message(
     message: dict[str, Any],
     *,
     images: list[Image.Image],
     processor: Any,
+    pad_dynamic_image_shapes: bool = False,
 ) -> None:
     """Attach processor-owned image tensors without replacing rollout tokens."""
     if not images or processor is None:
         return
 
     image_token = getattr(processor, "image_token", "<image>")
+    # Processors that emit dynamic per-image resolutions return a ragged CHW list
+    # for heterogeneous multi-image turns. Asking BatchFeature for PT tensors
+    # would make it stack those and fail before the exact imgs_sizes are read off
+    # them. Off by default, so every other caller keeps the stacked path.
+    allow_ragged_output = pad_dynamic_image_shapes and len(images) > 1
     processed = processor(
         text=image_token * len(images),
         images=images,
-        return_tensors="pt",
+        return_tensors=None if allow_ragged_output else "pt",
     )
-    model_inputs = extract_multimodal_model_inputs(processor, dict(processed))
+    processed = dict(processed)
+    if allow_ragged_output:
+        processed = _materialize_ragged_pixel_values(processed, processor)
+    model_inputs = extract_multimodal_model_inputs(processor, processed)
     message.update(
         {
             key: value

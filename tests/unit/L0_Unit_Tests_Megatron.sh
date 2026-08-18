@@ -14,7 +14,7 @@
 
 #!/bin/bash
 # Shard: All mcore-marked tests except policy worker tests
-# Policy worker mcore tests run in L0_Unit_Tests_Mcore_Policy
+# Policy worker mcore tests run in L0_Unit_Tests_Megatron_Policy
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
