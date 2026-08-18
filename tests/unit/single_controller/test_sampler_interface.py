@@ -357,7 +357,7 @@ class TestDispatchCursorRestore:
         assert _run(s.admit(trainer_version_fn=lambda: 8)) == 8
 
     def test_in_order_restores_after_highest_admitted_target(self):
-        s = InOrderSampler(FakeBuffer(), max_lookahead_versions=2, resume_from_step=5)
+        s = InOrderSampler(FakeBuffer(), max_lookahead_versions=2)
         s.restore_dispatch_state(
             current_train_weight=5,
             restored_target_steps=[5, 5, 6, 6],
@@ -390,7 +390,6 @@ class TestDispatchCursorRestore:
         s = InOrderSampler(
             FakeBuffer(),
             max_lookahead_versions=lookahead,
-            resume_from_step=5,
         )
         with pytest.raises(ValueError, match=error):
             s.restore_dispatch_state(
