@@ -75,6 +75,10 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
 
+# How long the train pump may go without selecting a group before it says so.
+# Generous: a healthy step can wait several minutes on generation alone.
+_SELECT_STALL_WARN_SECONDS = 600.0
+
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
 class SingleControllerActor:
@@ -485,6 +489,8 @@ class SingleControllerActor:
             version_during_step = self._trainer_version
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
+            last_select = time.monotonic()
+            select_stall_warnings = 0
             min_sample_version = None
             step_open = False
             calibration_batches: list[BatchedDataDict[Any]] = []
@@ -540,6 +546,29 @@ class SingleControllerActor:
                                     f"{grpo_cfg.num_prompts_per_step} prompt "
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
+                                )
+                            # The watchdog cannot see this one: it resets its idle
+                            # timer on every commit, so a fleet that keeps rolling
+                            # out into a step that never fills reads as healthy
+                            # there while the pump spins here in silence. Escalate
+                            # the threshold on each firing so a long stall reports
+                            # periodically rather than every 5ms.
+                            stalled_for = time.monotonic() - last_select
+                            if stalled_for > _SELECT_STALL_WARN_SECONDS * (
+                                select_stall_warnings + 1
+                            ):
+                                select_stall_warnings += 1
+                                print(
+                                    f"WARNING: train_pump selected no group for "
+                                    f"{stalled_for / 60:.1f} min on step "
+                                    f"{self._train_steps}: "
+                                    f"{groups_dispatched}/"
+                                    f"{grpo_cfg.num_prompts_per_step} groups, "
+                                    f"{len(self._buffer)} buffered, "
+                                    f"{self._inflight_rollouts} rollouts in flight, "
+                                    f"{self._rollout_manager.stats.skipped} prompts "
+                                    f"skipped",
+                                    flush=True,
                                 )
                             await asyncio.sleep(0.005)
                             continue
@@ -626,6 +655,8 @@ class SingleControllerActor:
                     )
 
                     groups_dispatched += num_groups
+                    last_select = time.monotonic()
+                    select_stall_warnings = 0
 
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
