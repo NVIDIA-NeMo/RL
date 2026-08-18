@@ -100,9 +100,6 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
     def is_stale(self) -> bool:
         return self._stale
 
-    def mark_stale(self) -> None:
-        self._stale = True
-
     def init_communicator(self) -> None:
         state_dict_info = self._policy.prepare_refit_info()
         self._generation.prepare_refit_info(state_dict_info)

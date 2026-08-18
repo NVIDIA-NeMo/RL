@@ -25,8 +25,13 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
-from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
+from nemo_rl.models.generation.megatron.config import (
+    MCoreGenerationConfig,
+    dedicated_inference_megatron_cfg,
+    merged_inference_megatron_cfg,
+)
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy.lm_policy import Policy
@@ -43,23 +48,28 @@ class MegatronGeneration(GenerationInterface):
         values apply; non-colocated builds a dedicated policy with
         mcore_generation_config merged on top. Always returns a fresh dict.
         """
-        megatron_cfg = config["megatron_cfg"]
         if config["generation"]["colocated"]["enabled"]:
-            return dict(megatron_cfg)
-        return {
-            **megatron_cfg,
-            **config["generation"].get("mcore_generation_config", {}),
-        }
+            return dict(config["megatron_cfg"])
+        return merged_inference_megatron_cfg(config)
 
     @classmethod
     def nvlink_domain_span(cls, config: PolicyConfig) -> int:
-        """Largest GPU group requiring full NVLink connectivity."""
-        megatron_cfg = cls.effective_megatron_cfg(config)
+        """Largest GPU group requiring full NVLink connectivity.
+
+        Colocated reshard hosts a second, inference-layout model on the same ranks.
+        """
+        layouts = [cls.effective_megatron_cfg(config)]
+        if config["generation"]["colocated"]["enabled"]:
+            inference_mcfg = dedicated_inference_megatron_cfg(config)
+            if inference_mcfg is not None:
+                layouts.append(inference_mcfg)
         return max(
-            megatron_cfg["tensor_model_parallel_size"]
-            * megatron_cfg["context_parallel_size"],
-            megatron_cfg.get("expert_tensor_parallel_size", 1)
-            * megatron_cfg.get("expert_model_parallel_size", 1),
+            max(
+                mcfg["tensor_model_parallel_size"] * mcfg["context_parallel_size"],
+                mcfg.get("expert_tensor_parallel_size", 1)
+                * mcfg.get("expert_model_parallel_size", 1),
+            )
+            for mcfg in layouts
         )
 
     @classmethod
@@ -121,6 +131,8 @@ class MegatronGeneration(GenerationInterface):
         self.cfg: MCoreGenerationConfig = config["generation"]
         # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
+        # Installed by setup via create_weight_synchronizer.
+        self.weight_synchronizer: Optional["WeightSynchronizer"] = None
 
         if policy is not None:
             # Reuse the existing training policy.
@@ -137,8 +149,6 @@ class MegatronGeneration(GenerationInterface):
             **config,
             "megatron_cfg": self.effective_megatron_cfg(config),
         }
-        # Activation checkpointing is not compatible or useful in inference.
-        self._policy_config["megatron_cfg"]["activation_checkpointing"] = False
         # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.
         self.init_cluster_placement_groups(cluster, self._policy_config)
         self._policy = Policy(
