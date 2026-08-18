@@ -17,10 +17,15 @@
 Wired from ``setup._apply_zero_train_gen_mismatch`` for recipes such as
 Qwen3-30B-A3B DAPO with ``zero_train_gen_mismatch: true``:
 
-1. **MoE combine** — deterministic ``moe_utils.unpermute`` (gather on train;
-   gather+droppad on CUDA-graphed decode when ``moe_pad_experts_for_cuda_graph_inference``).
+1. **MoE routing + combine** — ``topk_routing_with_score_function`` builds sparse
+   routing maps with ``index_put_`` (not ``scatter``); ``unpermute`` uses gather on
+   train and gather+droppad on CUDA-graphed decode. Fused TE router/unpermute paths
+   are rejected (``moe_permute_fusion=false`` required).
 2. **Router replay** — reconstruct finished-request routing before KV blocks release.
-3. **CUDA graphs** — 64-token graph bucket floor and runtime decode padding alignment.
+3. **CUDA graphs** — 64-token graph bucket floor, runtime decode padding alignment,
+   suppress spurious graph-bucket match when inference graphs are off (via lifecycle
+   wrappers on ``prepare_for_generation`` / ``finish_generation``), and colocated pad
+   reset after inference sleep (before scoring).
 
 TP=1 log-softmax lives in ``patches.py`` (generic zero-KL, not MoE-specific).
 
@@ -51,10 +56,17 @@ _NRL_LOGGER = logging.getLogger(__name__)
 # Module state
 # ---------------------------------------------------------------------------
 
-# MoE combine
+_ZERO_KL_EAGER_MOE_MSG = (
+    "zero_train_gen_mismatch requires eager MoE routing/combine; set "
+    "policy.megatron_cfg.moe_permute_fusion=false and disable fused router paths."
+)
+
+# MoE routing + combine (single moe_utils monkeypatch entry)
 _NRL_UNPERMUTE_PATH_SEEN: set[str] = set()
 _UNPERMUTE_ORIG: Optional[Callable[..., torch.Tensor]] = None
 _TOKEN_DISPATCHER_UNPERMUTE_ORIG: Optional[Callable[..., torch.Tensor]] = None
+_TOPK_ROUTING_ORIG: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]] = None
+_ROUTER_TOPK_ROUTING_ORIG: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]] = None
 _MOE_UNPERMUTE_PATCHED = False
 _NRL_DET_COMBINE_BANNER = False
 _COMBINE_IMPL_OVERRIDE: Optional[str] = None
@@ -70,6 +82,19 @@ _CUDA_GRAPH_BUCKET_FLOOR_PATCHED = False
 _CG_DIMS_GEN_ORIG: Optional[Callable[..., Tuple[Sequence, Optional[Sequence]]]] = None
 _MIN_TOKEN_PAD_PATCHED = False
 _DIC_SETATTR_ORIG: Optional[Callable[..., None]] = None
+_FORCE_EAGER_DIMS_PATCHED = False
+_IAS_ORIG: Optional[Callable[..., Any]] = None
+_MATCH_GRAPH_CONFIG_ORIG: Optional[Callable[..., Any]] = None
+_IN_GRAPH_CAPTURE = False
+_INFERENCE_CUDA_GRAPHS_ENABLED = False
+_FORCE_EAGER_DIMS_BANNER = False
+_FORCE_EAGER_LIFECYCLE_PATCHED = False
+_PREPARE_FOR_GEN_ORIG: Optional[Callable[..., None]] = None
+_FINISH_GEN_ORIG: Optional[Callable[..., None]] = None
+
+# Colocated inference sleep — clear graph decode expert padding before scoring
+_SLEEP_ORIG: Optional[Callable[..., None]] = None
+_PAD_RESET_PATCHED = False
 
 # ---------------------------------------------------------------------------
 # MoE combine — configuration
@@ -110,6 +135,44 @@ def _nrl_log_unpermute_path(path: str) -> None:
     if path not in _NRL_UNPERMUTE_PATH_SEEN:
         _NRL_UNPERMUTE_PATH_SEEN.add(path)
         _NRL_LOGGER.warning("[moe-combine] unpermute executed via '%s'", path)
+
+
+def _build_sparse_routing_with_index_put(
+    logits: torch.Tensor,
+    probs: torch.Tensor,
+    top_indices: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build ``[T, E]`` routing tensors with deterministic ``index_put_`` (rl-fp4 path)."""
+    num_tokens = logits.size(0)
+    rows = torch.arange(num_tokens, device=logits.device).unsqueeze(1)
+    routing_probs = torch.zeros_like(logits)
+    routing_probs.index_put_((rows, top_indices), probs, accumulate=False)
+    routing_map = torch.zeros_like(logits, dtype=logits.dtype)
+    routing_map.index_put_(
+        (rows, top_indices),
+        torch.ones_like(probs, dtype=routing_map.dtype),
+        accumulate=False,
+    )
+    return routing_probs, routing_map.bool()
+
+
+def _patched_topk_routing_with_score_function(
+    *args: Any, **kwargs: Any
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``topk_routing_with_score_function`` with ``index_put_`` sparse routing maps."""
+    if kwargs.get("fused", False):
+        raise ValueError(_ZERO_KL_EAGER_MOE_MSG)
+    if kwargs.get("dense_output", False):
+        assert _TOPK_ROUTING_ORIG is not None
+        return _TOPK_ROUTING_ORIG(*args, **kwargs)
+
+    assert _TOPK_ROUTING_ORIG is not None
+    eager_kwargs = dict(kwargs)
+    eager_kwargs["dense_output"] = True
+    eager_kwargs["fused"] = False
+    probs, top_indices = _TOPK_ROUTING_ORIG(*args, **eager_kwargs)
+    logits = args[0] if args else kwargs["logits"]
+    return _build_sparse_routing_with_index_put(logits, probs, top_indices)
 
 
 # ---------------------------------------------------------------------------
@@ -232,23 +295,9 @@ def _patched_unpermute(
     pad_offsets: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``moe_utils.unpermute`` with deterministic combine routing."""
-    import megatron.core.transformer.moe.moe_utils as moe_utils
-
     global _NRL_DET_COMBINE_BANNER
     if fused:
-        if not moe_utils.HAVE_TE or moe_utils.fused_unpermute is None:
-            raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
-        _nrl_log_unpermute_path("fused_unpermute")
-        extra_kwargs = {}
-        if moe_utils.is_te_min_version("2.12.0"):
-            extra_kwargs["pad_offsets"] = pad_offsets
-        return moe_utils.fused_unpermute(
-            permuted_tokens,
-            sorted_indices,
-            merging_probs=probs,
-            restore_shape=restore_shape,
-            **extra_kwargs,
-        )
+        raise ValueError(_ZERO_KL_EAGER_MOE_MSG)
 
     input_dtype = permuted_tokens.dtype
 
@@ -302,8 +351,9 @@ def _patched_unpermute(
 
 
 def apply_moe_unpermute_determinism_patch() -> None:
-    """Patch MoE unpermute and the token dispatcher's cached import."""
+    """Patch MoE routing/combine in ``moe_utils`` (+ cached import sites)."""
     global _UNPERMUTE_ORIG, _TOKEN_DISPATCHER_UNPERMUTE_ORIG, _MOE_UNPERMUTE_PATCHED
+    global _TOPK_ROUTING_ORIG, _ROUTER_TOPK_ROUTING_ORIG
     if _MOE_UNPERMUTE_PATCHED:
         return
     try:
@@ -311,8 +361,8 @@ def apply_moe_unpermute_determinism_patch() -> None:
         import megatron.core.transformer.moe.token_dispatcher as token_dispatcher
     except ImportError:
         print(
-            "moe_determinism_patches: Megatron MoE modules are not importable; "
-            "skipping unpermute patch."
+            "moe_zero_kl_patches: Megatron MoE modules are not importable; "
+            "skipping routing/combine patch."
         )
         return
 
@@ -321,10 +371,26 @@ def apply_moe_unpermute_determinism_patch() -> None:
     moe_utils.unpermute = _patched_unpermute
     # token_dispatcher binds unpermute at import time; patch both call sites.
     token_dispatcher.unpermute = _patched_unpermute
+
+    if hasattr(moe_utils, "topk_routing_with_score_function"):
+        _TOPK_ROUTING_ORIG = moe_utils.topk_routing_with_score_function
+        moe_utils.topk_routing_with_score_function = _patched_topk_routing_with_score_function
+    try:
+        import megatron.core.transformer.moe.router as moe_router
+
+        if hasattr(moe_router, "topk_routing_with_score_function"):
+            _ROUTER_TOPK_ROUTING_ORIG = moe_router.topk_routing_with_score_function
+            moe_router.topk_routing_with_score_function = (
+                _patched_topk_routing_with_score_function
+            )
+    except ImportError:
+        pass
+
     _MOE_UNPERMUTE_PATCHED = True
     print(
-        "[moe_determinism_patches] patched moe_utils.unpermute and "
-        "token_dispatcher.unpermute with deterministic combine routing."
+        "[moe_zero_kl_patches] patched moe_utils topk_routing_with_score_function "
+        "(index_put routing maps), unpermute/token_dispatcher.unpermute "
+        "(gather combine), and rejected fused MoE paths."
     )
 
 
@@ -653,11 +719,221 @@ def restore_min_token_pad_patch() -> None:
     _MIN_TOKEN_PAD_PATCHED = False
 
 
+def set_inference_cuda_graphs_enabled(enabled: bool) -> None:
+    """Track whether colocated inference has CUDA graphs toggled on."""
+    global _INFERENCE_CUDA_GRAPHS_ENABLED
+    _INFERENCE_CUDA_GRAPHS_ENABLED = enabled
+
+
+def _should_suppress_spurious_cuda_graph_match() -> bool:
+    """Return True when eager steps must not match the graph capture ladder."""
+    if _IN_GRAPH_CAPTURE:
+        return False
+    force_eager = os.environ.get("NRL_FORCE_EAGER_DIMS", "auto")
+    if force_eager == "1":
+        return True
+    if force_eager == "0":
+        return False
+    return not _INFERENCE_CUDA_GRAPHS_ENABLED
+
+
+def apply_force_eager_dims_patch() -> None:
+    """Suppress graph-bucket matching when inference CUDA graphs are disabled."""
+    global _FORCE_EAGER_DIMS_PATCHED, _IAS_ORIG, _MATCH_GRAPH_CONFIG_ORIG
+    if _FORCE_EAGER_DIMS_PATCHED:
+        return
+
+    from megatron.core.inference.batch_dimensions_utils import (
+        CUDAGraphBatchDimensionBuilder,
+    )
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+
+    _IAS_ORIG = DynamicInferenceContext.initialize_attention_state
+    _MATCH_GRAPH_CONFIG_ORIG = CUDAGraphBatchDimensionBuilder.match_graph_config
+
+    def _patched_initialize_attention_state(self: Any, **kwargs: Any) -> Any:
+        global _IN_GRAPH_CAPTURE
+        assert _IAS_ORIG is not None
+        in_capture = kwargs.get("construct_graph_dimensions") is not None
+        _IN_GRAPH_CAPTURE = in_capture
+        try:
+            return _IAS_ORIG(self, **kwargs)
+        finally:
+            _IN_GRAPH_CAPTURE = False
+
+    @classmethod  # type: ignore[misc]
+    def _patched_match_graph_config(cls, *args: Any, **kwargs: Any) -> Any:
+        assert _MATCH_GRAPH_CONFIG_ORIG is not None
+        if _should_suppress_spurious_cuda_graph_match():
+            global _FORCE_EAGER_DIMS_BANNER
+            if not _FORCE_EAGER_DIMS_BANNER:
+                _FORCE_EAGER_DIMS_BANNER = True
+                print(
+                    "[cuda_graph_force_eager_dims] suppressing spurious bucket match "
+                    "(inference graphs off)",
+                    flush=True,
+                )
+            return None
+        return _MATCH_GRAPH_CONFIG_ORIG(*args, **kwargs)
+
+    DynamicInferenceContext.initialize_attention_state = (  # type: ignore[method-assign]
+        _patched_initialize_attention_state
+    )
+    CUDAGraphBatchDimensionBuilder.match_graph_config = _patched_match_graph_config
+    _FORCE_EAGER_DIMS_PATCHED = True
+
+
+def restore_force_eager_dims_patch() -> None:
+    """Restore graph-bucket matching hooks (for tests)."""
+    restore_colocated_force_eager_lifecycle_patch()
+    global _FORCE_EAGER_DIMS_PATCHED, _IAS_ORIG, _MATCH_GRAPH_CONFIG_ORIG
+    global _IN_GRAPH_CAPTURE, _INFERENCE_CUDA_GRAPHS_ENABLED, _FORCE_EAGER_DIMS_BANNER
+    if not _FORCE_EAGER_DIMS_PATCHED:
+        return
+    from megatron.core.inference.batch_dimensions_utils import (
+        CUDAGraphBatchDimensionBuilder,
+    )
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+
+    if _IAS_ORIG is not None:
+        DynamicInferenceContext.initialize_attention_state = _IAS_ORIG  # type: ignore[method-assign]
+    if _MATCH_GRAPH_CONFIG_ORIG is not None:
+        CUDAGraphBatchDimensionBuilder.match_graph_config = _MATCH_GRAPH_CONFIG_ORIG
+    _IAS_ORIG = None
+    _MATCH_GRAPH_CONFIG_ORIG = None
+    _IN_GRAPH_CAPTURE = False
+    _INFERENCE_CUDA_GRAPHS_ENABLED = False
+    _FORCE_EAGER_DIMS_BANNER = False
+    _FORCE_EAGER_DIMS_PATCHED = False
+
+
+def _generation_cuda_graph_impl(cfg: dict[str, Any]) -> str:
+    mcore_gen = (cfg.get("generation") or {}).get("mcore_generation_config") or {}
+    return mcore_gen.get("cuda_graph_impl", "none") or "none"
+
+
+def _should_track_inference_cuda_graph_lifecycle(cfg: dict[str, Any]) -> bool:
+    """True for colocated zero-KL runs that toggle inference CUDA graphs on/off."""
+    megatron_cfg = cfg.get("megatron_cfg") or {}
+    if not megatron_cfg.get("zero_train_gen_mismatch"):
+        return False
+    generation = cfg.get("generation") or {}
+    if not (generation.get("colocated") or {}).get("enabled", False):
+        return False
+    return _generation_cuda_graph_impl(cfg) not in ("none",)
+
+
+def _sync_inference_cuda_graphs_enabled_for_prepare(cfg: dict[str, Any]) -> None:
+    if not _should_track_inference_cuda_graph_lifecycle(cfg):
+        return
+    enabled = _generation_cuda_graph_impl(cfg) not in ("none",)
+    set_inference_cuda_graphs_enabled(enabled)
+
+
+def apply_colocated_force_eager_lifecycle_patch() -> None:
+    """Wrap gen entry/exit so force-eager knows when inference graphs are toggled."""
+    global _FORCE_EAGER_LIFECYCLE_PATCHED, _PREPARE_FOR_GEN_ORIG, _FINISH_GEN_ORIG
+    if _FORCE_EAGER_LIFECYCLE_PATCHED:
+        return
+
+    from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
+
+    _PREPARE_FOR_GEN_ORIG = MegatronGenerationMixin.prepare_for_generation
+    _FINISH_GEN_ORIG = MegatronGenerationMixin.finish_generation
+
+    def _patched_prepare_for_generation(self: Any, tags: Any = None, **kwargs: Any) -> None:
+        _sync_inference_cuda_graphs_enabled_for_prepare(self.cfg)
+        assert _PREPARE_FOR_GEN_ORIG is not None
+        _PREPARE_FOR_GEN_ORIG(self, tags=tags, **kwargs)
+
+    def _patched_finish_generation(self: Any) -> None:
+        assert _FINISH_GEN_ORIG is not None
+        _FINISH_GEN_ORIG(self)
+        if _should_track_inference_cuda_graph_lifecycle(self.cfg):
+            set_inference_cuda_graphs_enabled(False)
+
+    MegatronGenerationMixin.prepare_for_generation = (  # type: ignore[method-assign]
+        _patched_prepare_for_generation
+    )
+    MegatronGenerationMixin.finish_generation = _patched_finish_generation  # type: ignore[method-assign]
+    _FORCE_EAGER_LIFECYCLE_PATCHED = True
+
+
+def restore_colocated_force_eager_lifecycle_patch() -> None:
+    global _FORCE_EAGER_LIFECYCLE_PATCHED, _PREPARE_FOR_GEN_ORIG, _FINISH_GEN_ORIG
+    if not _FORCE_EAGER_LIFECYCLE_PATCHED:
+        return
+    from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
+
+    if _PREPARE_FOR_GEN_ORIG is not None:
+        MegatronGenerationMixin.prepare_for_generation = _PREPARE_FOR_GEN_ORIG  # type: ignore[method-assign]
+    if _FINISH_GEN_ORIG is not None:
+        MegatronGenerationMixin.finish_generation = _FINISH_GEN_ORIG  # type: ignore[method-assign]
+    _PREPARE_FOR_GEN_ORIG = None
+    _FINISH_GEN_ORIG = None
+    _FORCE_EAGER_LIFECYCLE_PATCHED = False
+
+
 def apply_cuda_graph_inference_determinism_patches() -> None:
     """CUDA-graph zero-KL path: gather+droppad MoE combine, bucket floor, decode padding."""
     configure_moe_combine_for_cuda_graph_inference()
     apply_cuda_graph_bucket_floor_patch()
     apply_min_token_pad_patch()
+    apply_force_eager_dims_patch()
+    apply_colocated_force_eager_lifecycle_patch()
+    apply_colocated_pad_reset_patch()
+
+
+def _should_reset_pad_before_scoring(cfg: dict[str, Any]) -> bool:
+    megatron_cfg = cfg.get("megatron_cfg") or {}
+    if not megatron_cfg.get("zero_train_gen_mismatch"):
+        return False
+    if not megatron_cfg.get("moe_pad_experts_for_cuda_graph_inference"):
+        return False
+    generation = cfg.get("generation") or {}
+    if not (generation.get("colocated") or {}).get("enabled", False):
+        return False
+    mcore_gen = generation.get("mcore_generation_config") or {}
+    return mcore_gen.get("cuda_graph_impl", "none") not in (None, "none")
+
+
+def _reset_decode_expert_padding(model: Any) -> None:
+    from megatron.core.inference.utils import set_decode_expert_padding
+    from megatron.core.utils import unwrap_model
+
+    set_decode_expert_padding(unwrap_model(model), False)
+    print("[NRL_PAD_RESET] expert padding cleared before scoring", flush=True)
+
+
+def apply_colocated_pad_reset_patch() -> None:
+    """Wrap colocated ``_sleep`` so graph decode padding does not leak into scoring."""
+    global _SLEEP_ORIG, _PAD_RESET_PATCHED
+    if _PAD_RESET_PATCHED:
+        return
+
+    from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
+
+    _SLEEP_ORIG = MegatronGenerationMixin._sleep
+
+    def _patched_sleep(self: Any) -> None:
+        assert _SLEEP_ORIG is not None
+        _SLEEP_ORIG(self)
+        if _should_reset_pad_before_scoring(self.cfg):
+            _reset_decode_expert_padding(self.model)
+
+    MegatronGenerationMixin._sleep = _patched_sleep  # type: ignore[method-assign]
+    _PAD_RESET_PATCHED = True
+
+
+def restore_colocated_pad_reset_patch() -> None:
+    global _SLEEP_ORIG, _PAD_RESET_PATCHED
+    if not _PAD_RESET_PATCHED or _SLEEP_ORIG is None:
+        return
+    from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
+
+    MegatronGenerationMixin._sleep = _SLEEP_ORIG  # type: ignore[method-assign]
+    _SLEEP_ORIG = None
+    _PAD_RESET_PATCHED = False
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +954,7 @@ def restore_moe_determinism_patches() -> None:
     global _ROUTER_REPLAY_INFERENCE_PATCHED
     global _NRL_DET_COMBINE_BANNER
     global _COMBINE_IMPL_OVERRIDE, _COMBINE_GATHER_DROPPAD_OVERRIDE
+    global _TOPK_ROUTING_ORIG, _ROUTER_TOPK_ROUTING_ORIG
 
     if _MOE_UNPERMUTE_PATCHED and _UNPERMUTE_ORIG is not None:
         import megatron.core.transformer.moe.moe_utils as moe_utils
@@ -686,6 +963,17 @@ def restore_moe_determinism_patches() -> None:
         moe_utils.unpermute = _UNPERMUTE_ORIG
         if _TOKEN_DISPATCHER_UNPERMUTE_ORIG is not None:
             token_dispatcher.unpermute = _TOKEN_DISPATCHER_UNPERMUTE_ORIG
+        if _TOPK_ROUTING_ORIG is not None:
+            moe_utils.topk_routing_with_score_function = _TOPK_ROUTING_ORIG
+        try:
+            import megatron.core.transformer.moe.router as moe_router
+
+            if _ROUTER_TOPK_ROUTING_ORIG is not None:
+                moe_router.topk_routing_with_score_function = _ROUTER_TOPK_ROUTING_ORIG
+        except ImportError:
+            pass
+        _TOPK_ROUTING_ORIG = None
+        _ROUTER_TOPK_ROUTING_ORIG = None
         _MOE_UNPERMUTE_PATCHED = False
 
     if _ROUTER_REPLAY_INFERENCE_PATCHED:
@@ -704,6 +992,8 @@ def restore_moe_determinism_patches() -> None:
 
     restore_cuda_graph_bucket_floor_patch()
     restore_min_token_pad_patch()
+    restore_force_eager_dims_patch()
+    restore_colocated_pad_reset_patch()
 
     _NRL_UNPERMUTE_PATH_SEEN.clear()
     if hasattr(_unpermute_gather_combine_droppad, "_nrl_static_topk"):
