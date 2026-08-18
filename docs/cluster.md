@@ -133,7 +133,7 @@ sbatch ray.sub \
   - Explanation
 * - `UV_CACHE_DIR_OVERRIDE`
   - By default, this variable does not need to be set. If unset, `ray.sub` uses the 
-    `UV_CACHE_DIR` defined within the container (defaulting to `/root/.cache/uv`). 
+    `UV_CACHE_DIR` defined within the container (defaulting to `/opt/nemo_rl_cache/uv`).
     `ray.sub` intentionally avoids using the `UV_CACHE_DIR` from the user's host 
     environment to prevent the host's cache from interfering with the container's cache. 
     Set `UV_CACHE_DIR_OVERRIDE` if you have a customized `uv` environment (e.g., 

@@ -560,10 +560,10 @@ USER ${RUNTIME_UID}:${RUNTIME_GID}
 # with the runtime UID. Keep UV on the owned, baked cache so offline reinstall
 # launchers can reuse prepared artifacts; each test pod mutates its own image
 # filesystem and cannot contaminate another run.
-RUN export HOME=/home/nemo-runtime \
-        XDG_CACHE_HOME=/tmp/regent-cache/xdg \
+RUN export XDG_CACHE_HOME=/tmp/regent-cache/xdg \
         UV_CACHE_DIR=/opt/nemo_rl_cache/uv && \
     test "$(id -u)" = "${RUNTIME_UID}" && \
+    test "${HOME}" = /home/nemo-runtime && \
     test -w "${HOME}" && \
     test -x /usr/local/bin/uv && \
     test -x /usr/local/bin/uvx && \
@@ -572,7 +572,7 @@ RUN export HOME=/home/nemo-runtime \
     UV_OFFLINE=1 UV_LINK_MODE=symlink \
         uv run --frozen --extra nemo_gym python -c "import nemo_gym" && \
     UV_OFFLINE=1 UV_LINK_MODE=symlink \
-        uv sync --frozen --all-groups --no-install-project && \
+        uv sync --frozen --all-groups && \
     mkdir -p "${XDG_CACHE_HOME}" "${UV_CACHE_DIR}" && \
     test -w "${XDG_CACHE_HOME}" && \
     test -w "${UV_CACHE_DIR}" && \
@@ -592,7 +592,7 @@ RUN export HOME=/home/nemo-runtime \
 
 # Validate every prefetched environment as the final runtime identity. Check
 # the full trees because uv also symlinks packages, not only Python launchers.
-RUN HOME=/home/nemo-runtime /opt/nemo_rl_venv/bin/python - <<'PY'
+RUN /opt/nemo_rl_venv/bin/python - <<'PY'
 import os
 import subprocess
 from pathlib import Path
@@ -636,10 +636,9 @@ for interpreter in sorted(set(interpreters)):
     )
 PY
 
-# Root remains the default runtime identity and keeps the conventional home.
+# Root remains the default runtime identity. Keep HOME absent from the image
+# config so OCI runtimes derive it from /etc/passwd after a user override.
 USER root
-ENV HOME=/root
-RUN test "$(id -u)" = 0 && test "${HOME}" = /root
 
 # Export the builder-local ccache as a separate scratch image. CI builds this
 # target immediately after the release target with the same Buildx builder, so
