@@ -751,8 +751,8 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
             _assert_dequant_close(weight, scale, source[eid])
 
 
-def test_load_weights_rejects_grouped_experts_for_mxfp8(fp8_module, monkeypatch):
-    """Grouped MoE expansion only implements blockwise FP8, not MXFP8."""
+def test_load_weights_expands_grouped_experts_for_mxfp8(fp8_module, monkeypatch):
+    """MXFP8 grouped slabs emit per-expert values and E8M0 scales."""
     import torch
 
     fp8 = fp8_module
@@ -760,15 +760,80 @@ def test_load_weights_rejects_grouped_experts_for_mxfp8(fp8_module, monkeypatch)
         use_weight_pow2_scale=False, is_mx=True
     )
     model = _grouped_expert_model(fp8, monkeypatch, torch.float8_e4m3fn)
-    model.load_weights = lambda pairs: pytest.fail("must raise before loading")
+    loaded = []
+    model.load_weights = lambda pairs: loaded.extend(pairs)
 
-    with pytest.raises(NotImplementedError, match="MXFP8"):
-        fp8.load_weights(
-            [
-                (
-                    "model.layers.0.mlp.experts.gate_up_proj",
-                    torch.randn(2, 512, 384).to(torch.bfloat16),
-                )
-            ],
-            types.SimpleNamespace(model=model),
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    quantized_inputs = []
+
+    def fake_mxfp8_quantize(weight):
+        quantized_inputs.append(weight.clone())
+        rows, cols = weight.shape
+        value = weight.to(torch.float8_e4m3fn)
+        scale = torch.full(
+            (rows, cols // 32, 1),
+            len(quantized_inputs),
+            dtype=torch.uint8,
         )
+        return value, scale
+
+    monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", fake_mxfp8_quantize)
+
+    intermediate, hidden = 32, 64
+    gate_up = (
+        torch.arange(2 * 2 * intermediate * hidden, dtype=torch.float32)
+        .remainder(128)
+        .reshape(2, 2 * intermediate, hidden)
+    )
+    down = (
+        torch.arange(2 * hidden * intermediate, dtype=torch.float32)
+        .remainder(128)
+        .reshape(2, hidden, intermediate)
+    )
+    fp8.load_weights(
+        [
+            (
+                "model.layers.0.mlp.experts.gate_up_proj",
+                gate_up.to(torch.bfloat16),
+            ),
+            ("model.layers.0.mlp.experts.down_proj", down.to(torch.bfloat16)),
+        ],
+        types.SimpleNamespace(model=model),
+    )
+
+    base = "model.layers.0.mlp.experts"
+    expected_names = [
+        f"{base}.{eid}.{proj}.weight{suffix}"
+        for proj in ("gate_proj", "up_proj")
+        for eid in (0, 1)
+        for suffix in ("", "_scale_from_checkpoint")
+    ] + [
+        f"{base}.{eid}.down_proj.weight{suffix}"
+        for eid in (0, 1)
+        for suffix in ("", "_scale_from_checkpoint")
+    ]
+    assert [name for name, _ in loaded] == expected_names
+
+    entries = dict(loaded)
+    source_shards = {
+        "gate_proj": gate_up[:, :intermediate, :],
+        "up_proj": gate_up[:, intermediate:, :],
+        "down_proj": down,
+    }
+    quantize_call = 0
+    for proj, source in source_shards.items():
+        for expert_id in (0, 1):
+            quantize_call += 1
+            name = f"{base}.{expert_id}.{proj}.weight"
+            value = entries[name]
+            scale = entries[name + "_scale_from_checkpoint"]
+            assert value.dtype == torch.float8_e4m3fn
+            expected = source[expert_id].to(torch.float8_e4m3fn)
+            assert torch.equal(value.float(), expected.float())
+            assert scale.dtype == torch.uint8
+            assert scale.shape == (*value.shape[:-1], value.shape[-1] // 32)
+            assert torch.all(scale == quantize_call)
+            assert torch.equal(quantized_inputs[quantize_call - 1], source[expert_id])
+
+    assert len(quantized_inputs) == 6
