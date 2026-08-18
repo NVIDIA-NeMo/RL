@@ -530,6 +530,130 @@ def test_prepare_for_generation_disables_param_gather_hook_before_wake(
     assert model.config.flash_decode is False
 
 
+def test_prepare_for_generation_ensures_cuda_graph_managers_before_toggle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    events: list[str | tuple[str, str]] = []
+    model = SimpleNamespace(
+        config=SimpleNamespace(flash_decode=True),
+        eval=lambda: events.append("eval"),
+    )
+    worker = object.__new__(megatron_worker.MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {
+            "mcore_generation_config": {
+                "cuda_graph_impl": "local",
+                "inference_cuda_graph_scope": "block",
+            }
+        }
+    }
+    worker.model = model
+    worker.is_generation_colocated = False
+    worker.should_disable_forward_pre_hook = False
+    worker._inference_engine_initialized = True
+    worker._wake = lambda: events.append("wake_engine")
+
+    monkeypatch.setattr(megatron_worker, "log_gpu_memory", lambda *_: None)
+    monkeypatch.setattr(megatron_worker, "unwrap_model", lambda model: model)
+    monkeypatch.setattr(
+        megatron_worker,
+        "_ensure_inference_cuda_graph_managers",
+        lambda lang_module, mcore_generation_config: events.append("ensure_managers"),
+    )
+    monkeypatch.setattr(
+        megatron_worker,
+        "toggle_cuda_graphs",
+        lambda lang_module, set_to: events.append(("toggle_cuda_graphs", set_to)),
+    )
+
+    worker.prepare_for_generation()
+
+    assert events.index("ensure_managers") < events.index(("toggle_cuda_graphs", "local"))
+    assert ("toggle_cuda_graphs", "local") in events
+
+
+def test_prepare_for_generation_skips_cuda_graph_managers_when_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    ensure_called = False
+    toggle_called = False
+    model = SimpleNamespace(
+        config=SimpleNamespace(flash_decode=True),
+        eval=lambda: None,
+    )
+    worker = object.__new__(megatron_worker.MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {"mcore_generation_config": {"cuda_graph_impl": "none"}}
+    }
+    worker.model = model
+    worker.is_generation_colocated = False
+    worker.should_disable_forward_pre_hook = False
+    worker._inference_engine_initialized = True
+    worker._wake = lambda: None
+
+    monkeypatch.setattr(megatron_worker, "log_gpu_memory", lambda *_: None)
+    monkeypatch.setattr(megatron_worker, "unwrap_model", lambda model: model)
+
+    def _ensure_managers(lang_module, mcore_generation_config):
+        nonlocal ensure_called
+        ensure_called = True
+
+    def _toggle_cuda_graphs(lang_module, set_to):
+        nonlocal toggle_called
+        toggle_called = True
+
+    monkeypatch.setattr(
+        megatron_worker, "_ensure_inference_cuda_graph_managers", _ensure_managers
+    )
+    monkeypatch.setattr(megatron_worker, "toggle_cuda_graphs", _toggle_cuda_graphs)
+
+    worker.prepare_for_generation()
+
+    assert not ensure_called
+    assert not toggle_called
+
+
+def test_finish_generation_invalidates_cuda_graph_attr_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    events: list[str | tuple[str, str]] = []
+    model = SimpleNamespace(config=SimpleNamespace())
+    worker = object.__new__(megatron_worker.MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {"mcore_generation_config": {"cuda_graph_impl": "local"}}
+    }
+    worker.model = model
+    worker.rank = 0
+    worker.is_generation_colocated = True
+    worker._inference_engine_initialized = False
+    worker._inference_engine_asleep = True
+
+    monkeypatch.setattr(megatron_worker, "log_gpu_memory", lambda *_: None)
+    monkeypatch.setattr(megatron_worker, "unwrap_model", lambda model: model)
+    monkeypatch.setattr(
+        megatron_worker,
+        "toggle_cuda_graphs",
+        lambda lang_module, set_to: events.append(("toggle_cuda_graphs", set_to)),
+    )
+    monkeypatch.setattr(
+        megatron_worker,
+        "_invalidate_cuda_graph_attr_cache",
+        lambda lang_module: events.append("invalidate_cache"),
+    )
+    monkeypatch.setattr(megatron_worker.gc, "collect", lambda: None)
+    monkeypatch.setattr(megatron_worker.torch.cuda, "empty_cache", lambda: None)
+
+    worker.finish_generation()
+
+    assert events == [("toggle_cuda_graphs", "none"), "invalidate_cache"]
+
+
 def create_megatron_test_config(
     model_name: str,
     tp: int = 1,
