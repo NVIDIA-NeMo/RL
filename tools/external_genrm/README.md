@@ -41,9 +41,8 @@ Hugging Face model ID such as `Qwen/Qwen3-32B`.
 - importable `nemo_rl`, `ray`, and `vllm` packages in that Python environment;
 - the `ray` command on `PATH`.
 
-The launcher checks the Python imports in one GenRM container before starting
-the replica fleet. `serve_vllm_on_ray.py` imports NeMo RL's vLLM compatibility
-patches, so a standalone vLLM-only container is insufficient.
+`serve_vllm_on_ray.py` imports NeMo RL's vLLM compatibility patches, so a
+standalone vLLM-only container is insufficient.
 
 `CONTAINER` must provide `GENRM_LB_PYTHON` with `aiohttp` installed.
 `MOUNTS` remains the mount list for the NeMo RL container and must expose the

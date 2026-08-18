@@ -148,7 +148,6 @@ echo "[INFO]   Hetgroup 0, NeMo RL Ray: ${#ray_nodes[@]} nodes (${SLURM_JOB_NODE
 echo "[INFO]   Hetgroup 1, GenRM: ${#genrm_nodes[@]} nodes, ${GENRM_REPLICAS} TP=${GENRM_TENSOR_PARALLEL_SIZE} replicas"
 
 declare -a genrm_step_pids=()
-declare -a preflight_pids=()
 lb_step_pid=""
 ray_sub_pid=""
 
@@ -168,12 +167,6 @@ cleanup() {
       kill "${pid}" 2>/dev/null || true
     fi
   done
-  for pid in "${preflight_pids[@]}"; do
-    if kill -0 "${pid}" 2>/dev/null; then
-      kill "${pid}" 2>/dev/null || true
-    fi
-  done
-
   wait 2>/dev/null || true
   exit "${status}"
 }
@@ -357,62 +350,6 @@ bash -n <(printf '%s' "${GENRM_BODY}") || {
 ray_head_node="${ray_nodes[0]}"
 lb_state_dir="/tmp/external-genrm-state"
 lb_mounts="${MOUNTS},${GENRM_TOOLS_DIR_HOST}:/opt/external-genrm-tools:ro,${GENRM_STATE_DIR}:${lb_state_dir}"
-
-echo "[INFO] Validating the GenRM container and Python environment"
-srun \
-  --het-group=1 \
-  --no-container-mount-home \
-  --container-image="${GENRM_CONTAINER}" \
-  --container-mounts=/lustre:/lustre \
-  --mpi=pmix \
-  --gres="gpu:${GPUS_PER_NODE}" \
-  -A "${SLURM_JOB_ACCOUNT}" \
-  -p "${SLURM_JOB_PARTITION}" \
-  --overlap \
-  --kill-on-bad-exit=1 \
-  --nodelist="${genrm_nodes[0]}" \
-  --nodes=1 \
-  --ntasks=1 \
-  bash -lc \
-  "command -v ray >/dev/null && '${GENRM_VLLM_PYTHON}' -c 'import ray, vllm; from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches'" \
-  >/dev/null &
-preflight_pids+=("$!")
-
-echo "[INFO] Validating the load-balancer container and Python environment"
-srun \
-  --het-group=0 \
-  --no-container-mount-home \
-  --container-name="genrm-lb-preflight-${SLURM_JOB_ID}" \
-  --container-image="${CONTAINER}" \
-  --container-mounts="${lb_mounts}" \
-  --container-workdir="${SLURM_SUBMIT_DIR}" \
-  --mpi=pmix \
-  -A "${SLURM_JOB_ACCOUNT}" \
-  -p "${SLURM_JOB_PARTITION}" \
-  --overlap \
-  --kill-on-bad-exit=1 \
-  --nodelist="${ray_head_node}" \
-  --nodes=1 \
-  --ntasks=1 \
-  --cpus-per-task=1 \
-  bash -lc \
-  "test -x /opt/external-genrm-tools/lb_watchdog.sh && '${GENRM_LB_PYTHON}' -c 'import aiohttp'" \
-  >/dev/null &
-preflight_pids+=("$!")
-
-preflight_failed=0
-if ! wait "${preflight_pids[0]}"; then
-  echo "[FATAL] GenRM container preflight failed" >&2
-  preflight_failed=1
-fi
-if ! wait "${preflight_pids[1]}"; then
-  echo "[FATAL] Load-balancer container preflight failed" >&2
-  preflight_failed=1
-fi
-preflight_pids=()
-if (( preflight_failed != 0 )); then
-  exit 1
-fi
 
 echo "[INFO] Launching external GenRM replicas"
 for (( replica_index = 0; replica_index < GENRM_REPLICAS; replica_index++ )); do
