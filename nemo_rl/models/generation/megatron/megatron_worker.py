@@ -69,6 +69,7 @@ class MegatronGenerationMixin:
      - tokenizer: HF tokenizer.
      - megatron_tokenizer: tokenizer for inference.
      - is_generation_colocated: Whether colocated or distributed.
+     - _reserved_http_server_socket: driver-reserved server socket, or None.
     """
 
     # Colocated-reshard hosts assign the dedicated inference-layout model here
@@ -314,18 +315,23 @@ class MegatronGenerationMixin:
         )
 
         ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        reserved_socket = self._reserved_http_server_socket
+        if reserved_socket is not None:
+            server_port = reserved_socket.getsockname()[1]
+        else:
+            server_port = _get_free_port_local()
 
         start_text_gen_server(
             coordinator_addr=self.coordinator_addr,
             tokenizer=self.megatron_tokenizer,
             rank=torch.distributed.get_rank(),
-            server_port=free_port,
+            server_port=server_port,
             parsers=self.cfg["generation"]["mcore_generation_config"]["parsers"],
             verbose=False,
+            sock=reserved_socket,
         )
 
-        base_url = f"http://{ip}:{free_port}/v1"
+        base_url = f"http://{ip}:{server_port}/v1"
         max_wait_time = 300
         start_time = time.time()
         with requests.Session() as session:
