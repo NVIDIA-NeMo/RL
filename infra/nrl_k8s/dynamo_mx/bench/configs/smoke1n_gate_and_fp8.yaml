@@ -1,0 +1,228 @@
+# Single-node (4 GPU) smoke cluster for two 2-GPU arms of the shipped
+# mx_reshard functional gate:
+#   ARM 1  BF16, exactly as CI runs it. Validates the widened reward sample
+#          (4 prompts x 8 generations) and the new grad_norm > 0 assertion that
+#          keeps the ratio check from going vacuous (doc 23).
+#   ARM 2  identical, plus a vLLM MXFP8 rollout. This is the first time FP8 has
+#          been exercised on the mx_reshard path at all. The trainer still holds
+#          BF16 weights; ModelExpress re-quantizes at install, so no FP8 scale
+#          transport is required. FP8 KV cache is deliberately NOT set, because
+#          mx_reshard rejects it outright in
+#          nemo_rl/weight_sync/mx_reshard_weight_synchronizer.py.
+# Reusing the gate script means the FP8 arm is judged by the same assertions as
+# BF16 rather than by a bespoke check.
+namespace: kavin
+image: nvcr.io/nvidian/dynamo-dev/nemo-rl:mx-lifecycle-candidate-3ddb9b16-r9-moefix2@sha256:f136da96b638068ebc9dd916dbeaa001248b8f16fcc4bbb65f3e51a97412296d
+imagePullSecrets:
+- nvcr-imagepullsecret
+serviceAccount: default
+launch:
+  mode: attach
+  runMode: interactive
+  codeSource: upload
+  attach:
+    training: kavin-rc-smoke1n
+  entrypoint: |
+    set -u
+    export PYTHONPATH=/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:.
+    export MODEL_EXPRESS_URL=modelexpress-server.kavin.svc.cluster.local:8001
+    export MX_SERVER_URL=modelexpress-server.kavin.svc.cluster.local:8001
+    export MX_REFIT_TIMING_STDOUT=1
+    export MX_REFIT_VERIFY=1
+    export UCX_TLS='^tcp,ud,ud:aux,ud_verbs,ud_mlx5'
+    export NIXL_UCX_TLS='^tcp,ud,ud:aux,ud_verbs,ud_mlx5'
+    export UCX_NET_DEVICES='mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,eth0'
+    export UCX_IB_GID_INDEX=3
+    export UCX_CUDA_COPY_DMABUF=yes
+    export UCX_CUDA_COPY_REG_WHOLE_ALLOC=off
+    export MX_RDMA_NIC_PIN=off
+    export NCCL_P2P_DISABLE=1
+    export NCCL_NVLS_ENABLE=0
+    export NCCL_MNNVL_ENABLE=0
+
+    echo "=========== ARM 1: BF16, the shipped gate as written ==========="
+    bash tests/functional/grpo_mx_reshard_refit.sh; echo "ARM1_EXIT=$?"
+    cp -a tests/functional/grpo_mx_reshard_refit /tmp/arm1_bf16 2>/dev/null || true
+
+    echo "=========== ARM 2: same gate, vLLM MXFP8 rollout ==========="
+    bash tests/functional/grpo_mx_reshard_refit.sh \
+      ++policy.generation.vllm_cfg.precision=fp8 \
+      ++policy.generation.vllm_cfg.is_mx=true \
+      '++policy.generation.vllm_cfg.quantization_ignored_layer_kws=[q_proj,k_proj,v_proj,o_proj]'
+    echo "ARM2_EXIT=$?"
+    cp -a tests/functional/grpo_mx_reshard_refit /tmp/arm2_fp8 2>/dev/null || true
+    echo "=========== BOTH ARMS DONE ==========="
+
+kuberay:
+  training:
+    name: kavin-rc-smoke1n
+    labels:
+      kai.scheduler/queue: dynamo
+    spec:
+      rayVersion: 2.52.0
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: 0.0.0.0
+          no-monitor: 'true'
+          num-gpus: '0'
+          object-store-memory: '100000000'
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector:
+              kubernetes.io/arch: arm64
+              nodeGroup: customer-gpu
+              nvidia.com/gpu.present: 'true'
+              cloud.google.com/gke-nodepool: customer-gpu-o7v
+            tolerations:
+            - operator: Exists
+            containers:
+            - name: ray-head
+              env:
+              - name: HF_HOME
+                value: /mnt/rl-workspace/${user:}/hf-cache
+              - name: NCCL_DEBUG
+                value: WARN
+              - name: RAY_memory_monitor_refresh_ms
+                value: '0'
+              envFrom: &id001
+              - secretRef:
+                  name: ${user:}-secrets
+                  optional: true
+              resources:
+                limits:
+                  cpu: '8'
+                  memory: 32Gi
+                requests:
+                  cpu: '4'
+                  memory: 16Gi
+              ports:
+              - containerPort: 6379
+                name: gcs-server
+              - containerPort: 8265
+                name: dashboard
+              - containerPort: 10001
+                name: client
+              volumeMounts: &id002
+              - mountPath: /dev/shm
+                name: dshm
+              - mountPath: /mnt/rl-workspace
+                name: rl-workspace
+              - mountPath: /dev/infiniband
+                name: infiniband
+              image: nvcr.io/nvidian/dynamo-dev/nemo-rl:mx-lifecycle-candidate-3ddb9b16-r9-moefix2@sha256:f136da96b638068ebc9dd916dbeaa001248b8f16fcc4bbb65f3e51a97412296d
+            volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 8Gi
+            - name: rl-workspace
+              persistentVolumeClaim:
+                claimName: shared-model-cache
+            - name: infiniband
+              hostPath:
+                path: /dev/infiniband
+      workerGroupSpecs:
+      - groupName: gpu-workers
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 1
+        rayStartParams:
+          num-gpus: '4'
+          object-store-memory: '100000000'
+        template:
+          metadata:
+            annotations:
+              networking.gke.io/default-interface: eth0
+              networking.gke.io/interfaces: "[{\"interfaceName\":\"eth0\",\"network\":\"default\"},\n {\"interfaceName\":\"rdma0\",\"network\":\"rdma-0\"},\n {\"interfaceName\":\"rdma1\",\"network\":\"\
+                rdma-1\"},\n {\"interfaceName\":\"rdma2\",\"network\":\"rdma-2\"},\n {\"interfaceName\":\"rdma3\",\"network\":\"rdma-3\"}]"
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector:
+              kubernetes.io/arch: arm64
+              nvidia.com/gpu.present: 'true'
+              nvidia.com/gpu.product: NVIDIA-GB200
+              cloud.google.com/gke-nodepool: customer-gpu-o7v
+            tolerations:
+            - operator: Exists
+            containers:
+            - name: ray-worker
+              env:
+              - name: HF_HOME
+                value: /mnt/rl-workspace/${user:}/hf-cache
+              - name: NCCL_DEBUG
+                value: INFO
+              - name: NCCL_MNNVL_ENABLE
+                value: '0'
+              - name: RAY_memory_monitor_refresh_ms
+                value: '0'
+              - name: UCX_TLS
+                value: ^tcp,ud,ud:aux,ud_verbs,ud_mlx5
+              - name: NIXL_UCX_TLS
+                value: ^tcp,ud,ud:aux,ud_verbs,ud_mlx5
+              - name: UCX_NET_DEVICES
+                value: mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,eth0
+              - name: UCX_IB_GID_INDEX
+                value: '3'
+              - name: UCX_CUDA_COPY_DMABUF
+                value: 'yes'
+              - name: UCX_CUDA_COPY_REG_WHOLE_ALLOC
+                value: 'off'
+              - name: MX_RDMA_NIC_PIN
+                value: 'off'
+              - name: NCCL_NET_PLUGIN
+                value: none
+              - name: NCCL_IB_HCA
+                value: mlx5_0,mlx5_1,mlx5_2,mlx5_3
+              - name: NCCL_P2P_DISABLE
+                value: '1'
+              - name: NCCL_NVLS_ENABLE
+                value: '0'
+              envFrom: *id001
+              resources:
+                limits:
+                  cpu: '32'
+                  memory: 320Gi
+                  nvidia.com/gpu: '4'
+                  networking.gke.io.networks/rdma-0: '1'
+                  networking.gke.io.networks/rdma-0.IP: '1'
+                  networking.gke.io.networks/rdma-1: '1'
+                  networking.gke.io.networks/rdma-1.IP: '1'
+                  networking.gke.io.networks/rdma-2: '1'
+                  networking.gke.io.networks/rdma-2.IP: '1'
+                  networking.gke.io.networks/rdma-3: '1'
+                  networking.gke.io.networks/rdma-3.IP: '1'
+                  ephemeral-storage: 200Gi
+                requests:
+                  cpu: '16'
+                  memory: 192Gi
+                  nvidia.com/gpu: '4'
+                  networking.gke.io.networks/rdma-0: '1'
+                  networking.gke.io.networks/rdma-0.IP: '1'
+                  networking.gke.io.networks/rdma-1: '1'
+                  networking.gke.io.networks/rdma-1.IP: '1'
+                  networking.gke.io.networks/rdma-2: '1'
+                  networking.gke.io.networks/rdma-2.IP: '1'
+                  networking.gke.io.networks/rdma-3: '1'
+                  networking.gke.io.networks/rdma-3.IP: '1'
+                  ephemeral-storage: 100Gi
+              securityContext:
+                capabilities:
+                  add:
+                  - IPC_LOCK
+              volumeMounts: *id002
+              image: nvcr.io/nvidian/dynamo-dev/nemo-rl:mx-lifecycle-candidate-3ddb9b16-r9-moefix2@sha256:f136da96b638068ebc9dd916dbeaa001248b8f16fcc4bbb65f3e51a97412296d
+            volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi
+            - name: rl-workspace
+              persistentVolumeClaim:
+                claimName: shared-model-cache
+            - name: infiniband
+              hostPath:
+                path: /dev/infiniband
+        numOfHosts: 1

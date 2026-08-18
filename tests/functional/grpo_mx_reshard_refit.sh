@@ -31,9 +31,9 @@ uv run coverage run -a \
     "${PROJECT_ROOT}/examples/run_grpo.py" \
     --config "${PROJECT_ROOT}/examples/configs/grpo_math_1B_megatron.yaml" \
     policy.model_name=Qwen/Qwen3-0.6B \
-    grpo.num_prompts_per_step=2 \
-    grpo.num_generations_per_prompt=4 \
-    policy.train_global_batch_size=4 \
+    grpo.num_prompts_per_step=4 \
+    grpo.num_generations_per_prompt=8 \
+    policy.train_global_batch_size=16 \
     policy.train_micro_batch_size=1 \
     policy.logprob_batch_size=1 \
     policy.max_total_sequence_length=512 \
@@ -63,5 +63,14 @@ uv run tests/json_dump_tb_logs.py "${LOG_DIR}" --output_path "${JSON_METRICS}"
 
 # A broken refit corrupts generation weights and makes the train/gen
 # importance-sampling ratio explode.
+#
+# The grad_norm check keeps the ratio check from going vacuous. GRPO's
+# leave-one-out baseline gives zero advantage to any prompt group whose rewards
+# are all equal, so a run where the model never gets a mixed group trains
+# nothing, the second refit re-sends bit-identical weights, and the ratio check
+# passes for a model a no-op would also satisfy. 4 prompts x 8 generations over
+# two steps is sized so that outcome is rare; at the observed ~1/8 solve rate
+# for this model it is on the order of 1e-4.
 uv run tests/check_metrics.py "${JSON_METRICS}" \
-    'max(data["train/token_mult_prob_error"]) < 1.05'
+    'max(data["train/token_mult_prob_error"]) < 1.05' \
+    'max(data["train/grad_norm"]) > 0'
