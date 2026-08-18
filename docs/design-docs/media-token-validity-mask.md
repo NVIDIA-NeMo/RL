@@ -2,16 +2,16 @@
 
 ## Summary
 
-A media placeholder is an ordinary vocabulary entry. Text can legitimately
-contain it, and until now that text could not be trained on: the model read
-every occurrence as an anchor for a projected image feature and failed when no
-feature existed. The workaround was a sanitizer that rewrote the offending
-tokens before they reached the model, which changed the data to fit the model.
+A media placeholder is an ordinary vocabulary entry, so text can legitimately
+contain it — a competitive-programming statement that spells `<image>` in its
+prose, for instance. The model reads every occurrence as an anchor for a
+projected image feature and fails when no feature exists, so those rows cannot
+be trained on.
 
-This design removes the sanitizer and replaces it with a **media-token validity
-mask**: the caller, which knows how many media items each row carries, marks
-which placeholder positions are real anchors. Positions it does not mark keep
-their ordinary token embedding.
+This design adds a **media-token validity mask**: the caller, which knows how
+many media items each row carries, marks which placeholder positions are real
+anchors. Positions it does not mark are skipped by the media merge and keep
+whatever language embedding the forward gave them.
 
 ## The problem
 
