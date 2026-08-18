@@ -1,5 +1,6 @@
 defaults: ../../vlm_grpo_3B_megatron.yaml
 grpo:
+  deduplicate_multimodal_data: true
   num_prompts_per_step: 1
   num_val_generations_per_prompt: 1
   max_num_steps: 100
@@ -87,7 +88,6 @@ policy:
       buffer_size_gb: 20
       num_cuda_graphs: -1
       max_tokens: ${policy.max_total_sequence_length}
-      async_engine: true
       expose_http_server: true
       enable_prefix_caching: true
       parsers:
