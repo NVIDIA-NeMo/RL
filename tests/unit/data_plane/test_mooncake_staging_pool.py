@@ -194,9 +194,9 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
     constructed: list[object] = []
     original_init = tq_adapter._StagingPool.__init__
 
-    def slow_init(self, store, n_slots):  # type: ignore[no-untyped-def]
+    def slow_init(self, store, n_slots, max_bytes):  # type: ignore[no-untyped-def]
         time.sleep(0.05)  # widen the check-then-set window
-        original_init(self, store, n_slots)
+        original_init(self, store, n_slots, max_bytes)
         constructed.append(self)
 
     monkeypatch.setattr(tq_adapter._StagingPool, "__init__", slow_init)

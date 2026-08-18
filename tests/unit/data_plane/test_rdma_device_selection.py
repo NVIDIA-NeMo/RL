@@ -132,7 +132,9 @@ def stub_client(monkeypatch):
         monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
         monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
         monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
-        monkeypatch.setattr(tq_adapter, "_patch_mooncake_staging_buffers", lambda: None)
+        monkeypatch.setattr(
+            tq_adapter, "_patch_mooncake_staging_buffers", lambda max_bytes: None
+        )
         monkeypatch.setattr(os, "environ", dict(os.environ))
         return tq_adapter.TQDataPlaneClient(cfg, bootstrap=False)
 
