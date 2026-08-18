@@ -363,7 +363,7 @@ class TestFleetHealthSelectionIsNotAdvertisedBeyondWhatItDoes:
 class TestRenamedBlocksAreRejected:
     """The old block names parsed fine under extra="allow" and then did nothing.
 
-    async_rl.stall_watchdog in particular shipped in the containment PR, so a config in the
+    async_rl.watchdog in particular shipped in the containment PR, so a config in the
     wild can carry it -- and silently losing stall detection is exactly the failure mode
     this series exists to remove.
     """
