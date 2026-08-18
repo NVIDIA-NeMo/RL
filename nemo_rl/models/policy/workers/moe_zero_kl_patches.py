@@ -734,6 +734,11 @@ def _should_suppress_spurious_cuda_graph_match() -> bool:
         return True
     if force_eager == "0":
         return False
+    # Auto: only suppress on colocated train/score steps where lifecycle tracking
+    # explicitly cleared inference graphs. Non-colocated (or pre-prepare) defaults
+    # to graphs-on so decode replay is never accidentally disabled.
+    if not _FORCE_EAGER_LIFECYCLE_PATCHED:
+        return False
     return not _INFERENCE_CUDA_GRAPHS_ENABLED
 
 
@@ -833,6 +838,7 @@ def _sync_inference_cuda_graphs_enabled_for_prepare(cfg: dict[str, Any]) -> None
 def apply_colocated_force_eager_lifecycle_patch() -> None:
     """Wrap gen entry/exit so force-eager knows when inference graphs are toggled."""
     global _FORCE_EAGER_LIFECYCLE_PATCHED, _PREPARE_FOR_GEN_ORIG, _FINISH_GEN_ORIG
+    global _INFERENCE_CUDA_GRAPHS_ENABLED
     if _FORCE_EAGER_LIFECYCLE_PATCHED:
         return
 
@@ -840,6 +846,9 @@ def apply_colocated_force_eager_lifecycle_patch() -> None:
 
     _PREPARE_FOR_GEN_ORIG = MegatronGenerationMixin.prepare_for_generation
     _FINISH_GEN_ORIG = MegatronGenerationMixin.finish_generation
+    # Default graphs-on until colocated finish_generation clears the flag after
+    # toggle_cuda_graphs(none); avoids suppressing decode before the first prepare.
+    _INFERENCE_CUDA_GRAPHS_ENABLED = True
 
     def _patched_prepare_for_generation(self: Any, tags: Any = None, **kwargs: Any) -> None:
         _sync_inference_cuda_graphs_enabled_for_prepare(self.cfg)
