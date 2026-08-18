@@ -155,8 +155,19 @@ if [[ -z \${locked_ray_version} || \${bootstrap_ray_version} != \${locked_ray_ve
   exit 2
 fi"
 
+source_import_guard="expected_source_root=\$(realpath \"${PROJECT_ROOT}\")
+actual_nemo_rl_file=\$(realpath \"\$(/opt/nemo_rl_venv/bin/python -c 'import nemo_rl; print(nemo_rl.__file__)')\")
+case \${actual_nemo_rl_file} in
+  \${expected_source_root}/*) ;;
+  *)
+    echo \"NeMo-RL import is outside the submitted worktree: \${actual_nemo_rl_file}\" >&2
+    exit 2
+    ;;
+esac"
+
 command="${source_guard}
 ${ray_version_guard}
+${source_import_guard}
 ${config_setup}
 ${uv_cache_setup}
 export NEMO_RL_VENV_DIR=${venv_dir_q}
