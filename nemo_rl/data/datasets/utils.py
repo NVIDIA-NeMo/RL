@@ -114,7 +114,11 @@ def load_dataset_from_path(
         ".parquet": "parquet",
         ".txt": "text",
     }
-    suffix = os.path.splitext(data_path)[-1]
+    suffix = (
+        ".jsonl"
+        if data_path.endswith(".jsonl.packed")
+        else os.path.splitext(data_path)[-1]
+    )
     # load from local file (not save_to_disk format)
     if dataset_type := FILEEXT2TYPE.get(suffix):
         assert data_subset is None, (
