@@ -33,7 +33,7 @@ precision-only A/B; their configurations differ beyond numerical precision.
 | Generation time | 319.2 s | 144.7 s | 2.21x faster |
 | Observed step time | 390.9 s | 224.8 s | 42.5% lower |
 | Token-normalized end-to-end throughput | 376.1 tokens/s/GPU | 506.2 tokens/s/GPU | 1.35x |
-| Weight transfer and update | 1.76 s | 17.93 s | 16.17 s higher |
+| Weight transfer and update* | 1.76 s | 17.93 s | 16.17 s higher |
 
 The NVFP4 run generated shorter responses in this interval, so observed step
 time alone overstates the speedup: its median response length was approximately
@@ -62,6 +62,10 @@ training workspaces, quantization buffers, and allocator caching, and did not
 show a lower end-to-end peak in this comparison. The current result therefore
 demonstrates lower rollout weight memory and greater KV-cache headroom, rather
 than lower peak memory for the full training process.
+
+\* Measured with routed-expert quantization on the Megatron training worker.
+Quantization has since moved to the vLLM worker (see "Weight refit" below);
+this row awaits re-measurement under that path.
 
 The current performance result includes quantization and weight refit after
 each policy update. Refit is still a visible part of the step and remains an
@@ -128,9 +132,9 @@ It must cover the same boundary layers selected by
 ```mermaid
 flowchart LR
     A[TE per-token NVFP4 policy training] --> B[Megatron-Bridge HF weight export]
-    B --> C[Quantize and pack routed experts]
-    C --> D[Colocated weight refit]
-    D --> E[vLLM per-token NVFP4 rollout]
+    B --> D[Colocated weight refit]
+    D --> C[Quantize routed experts]
+    C --> E[vLLM per-token NVFP4 rollout]
     E --> A
 ```
 
@@ -152,22 +156,18 @@ activation granularity used by the rollout kernel.
 ### Weight refit
 
 Megatron-Bridge exports the updated policy weights with Hugging Face parameter
-names and reconstructs tensors across the training TP, PP, and EP topology.
-NeMo RL then processes each routed-expert layer:
+names and reconstructs tensors across the training TP, PP, and EP topology,
+sending plain BF16 — identical to a BF16-only run. Training stays entirely
+unaware of NVFP4.
 
-1. collect the gate, up, and down projection weights;
-2. fuse gate and up projections into W13;
-3. quantize weights in 16-value NVFP4 blocks;
-4. emit packed weights, block scales, and global scales; and
-5. fuse each quantized layer into six transport tensors.
-
-Layer fusion keeps the refit stream compact: large MoE models transfer six
-tensors per quantized expert layer instead of separate tensors for every expert
-and projection. Ignored BF16 expert layers use two fused tensors per layer.
-
-The current path quantizes after Megatron-Bridge reconstructs the expert
-weights. Each vLLM engine receives the stream and its native loaders select the
-TP and PP shards owned by the local rank.
+Each vLLM engine receives the BF16 stream over the refit transport and
+quantizes routed-expert projections at load time, mirroring the fp8/mxfp8
+"real quant" rollout path: gate and up projections are quantized together
+under one shared per-expert global scale (vLLM's fused-MoE loader keeps only
+one gate/up scale per expert), and down projections are quantized
+independently. Ignored BF16 expert layers (`additional_ignore`) pass through
+untouched. vLLM's native loaders then select the TP and PP shards owned by the
+local rank as usual.
 
 ### Per-token vLLM rollout
 
