@@ -96,7 +96,12 @@ it, avoiding concurrent multi-node force-rebuild races.
 - end-to-end step time;
 - end-to-end throughput in tokens/second/GPU;
 - policy-training and log-probability time/throughput when logged; and
-- valid-token counts, reward, loss, and generation-KL sanity checks; and
+- valid-token counts and reward-distribution shares;
+- generation KL, policy KL, JS divergence, KL penalty, and loss;
+- token multiplicative probability error, probability ratio, and the number
+  of sequences masked by the logprob-error guard;
+- approximate entropy and gradient norm, recording mean, median, and maximum
+  for outlier-prone metrics; and
 - W&B run URL for reproducibility.
 
 The primary speedup calculations are:
