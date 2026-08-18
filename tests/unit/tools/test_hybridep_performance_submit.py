@@ -155,6 +155,63 @@ def test_submission_rejects_dirty_source_tree(tmp_path: Path) -> None:
     assert "clean source tree" in result.stderr
 
 
+def _add_fixture_submodule(repo: Path, tmp_path: Path) -> tuple[Path, str]:
+    submodule_source = tmp_path / "runtime-submodule-source"
+    submodule_source.mkdir()
+    _run(["git", "init", "-q"], submodule_source)
+    _run(["git", "config", "user.name", "HybridEP test"], submodule_source)
+    _run(
+        ["git", "config", "user.email", "hybridep-test@example.com"],
+        submodule_source,
+    )
+    (submodule_source / "tracked.txt").write_text("tracked\n")
+    _run(["git", "add", "tracked.txt"], submodule_source)
+    _run(["git", "commit", "-q", "-m", "fixture submodule"], submodule_source)
+
+    _run(
+        [
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            str(submodule_source),
+            "thirdparty/runtime",
+        ],
+        repo,
+    )
+    _run(["git", "add", ".gitmodules", "thirdparty/runtime"], repo)
+    _run(["git", "commit", "-q", "-m", "add fixture submodule"], repo)
+    return repo / "thirdparty" / "runtime", _run(["git", "rev-parse", "HEAD"], repo)
+
+
+def test_submission_allows_untracked_runtime_build_output_in_submodules(
+    tmp_path: Path,
+) -> None:
+    repo, environment = _build_test_repo(tmp_path, "Qwen3-30B-A3B")
+    submodule, baseline_commit = _add_fixture_submodule(repo, tmp_path)
+    generated = submodule / "megatron" / "core" / "datasets" / "helpers_cpp"
+    generated.mkdir(parents=True)
+    (generated / "helpers.so").write_text("generated\n")
+    environment["BASELINE_COMMIT"] = baseline_commit
+
+    result = _launch(repo, environment)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_submission_rejects_tracked_changes_in_submodules(tmp_path: Path) -> None:
+    repo, environment = _build_test_repo(tmp_path, "Qwen3-30B-A3B")
+    submodule, baseline_commit = _add_fixture_submodule(repo, tmp_path)
+    (submodule / "tracked.txt").write_text("changed\n")
+    environment["BASELINE_COMMIT"] = baseline_commit
+
+    result = _launch(repo, environment)
+
+    assert result.returncode != 0
+    assert "clean source tree" in result.stderr
+
+
 def test_queued_job_rejects_source_revision_change(tmp_path: Path) -> None:
     repo, environment = _build_test_repo(tmp_path, "Qwen3-30B-A3B")
     environment["FAKE_SBATCH_MODE"] = "mutate-and-run"

@@ -65,7 +65,9 @@ if ! git -C "${PROJECT_ROOT}" cat-file -e "${BASELINE_COMMIT}^{commit}"; then
   echo "BASELINE_COMMIT is unavailable: ${BASELINE_COMMIT}" >&2
   exit 2
 fi
-if [[ -n $(git -C "${PROJECT_ROOT}" status --porcelain) ]]; then
+# Runtime dependency builds create untracked artifacts inside submodules.
+# Keep rejecting root untracked files and tracked changes everywhere.
+if [[ -n $(git -C "${PROJECT_ROOT}" -c diff.ignoreSubmodules=untracked status --porcelain) ]]; then
   echo "Launcher requires a clean source tree" >&2
   exit 2
 fi
@@ -137,7 +139,7 @@ if [[ \${actual_source_commit} != \"${expected_source_commit}\" ]]; then
   echo \"source revision changed after submission\" >&2
   exit 2
 fi
-if [[ -n \$(git -C \"${PROJECT_ROOT}\" status --porcelain) ]]; then
+if [[ -n \$(git -C \"${PROJECT_ROOT}\" -c diff.ignoreSubmodules=untracked status --porcelain) ]]; then
   echo \"source tree changed after submission\" >&2
   exit 2
 fi
