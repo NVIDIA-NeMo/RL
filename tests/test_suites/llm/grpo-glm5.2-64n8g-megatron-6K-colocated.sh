@@ -13,7 +13,7 @@ NUM_MINUTES=240
 
 exit_if_max_steps_reached
 
-# Run the experiment
+# Run the 6K experiment
 cd $PROJECT_ROOT
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
