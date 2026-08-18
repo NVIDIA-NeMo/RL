@@ -197,6 +197,14 @@ def test_shared_uv_cache_does_not_shadow_the_container_bootstrap_cache() -> None
     assert "export UV_CACHE_DIR_OVERRIDE" not in script
 
 
+def test_submission_rejects_ray_bootstrap_and_lock_version_skew() -> None:
+    script = SUBMIT_SCRIPT.read_text()
+
+    assert "bootstrap_ray_version" in script
+    assert "locked_ray_version" in script
+    assert "Ray bootstrap/lock version mismatch" in script
+
+
 def test_baseline_config_is_materialized_outside_the_source_tree() -> None:
     script = SUBMIT_SCRIPT.read_text()
 

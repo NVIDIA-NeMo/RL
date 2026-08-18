@@ -150,7 +150,10 @@ recipe is materialized from commit
 and retained with the logs. An optional absolute `UV_CACHE_DIR_OVERRIDE`
 selects the warmed cache only after Ray has started; this avoids shadowing the
 nightly image's bootstrap cache while still reusing the pinned HybridEP wheel
-in driver and actor environments. DeepSeek-V3 rows require an absolute
+in driver and actor environments. Before launching Ray actors, the launcher
+also verifies that the Ray version in `uv.lock` matches the nightly image's
+bootstrap Ray version. This prevents a mixed-version Ray cluster from being
+mistaken for a model or HybridEP failure. DeepSeek-V3 rows require an absolute
 converted BF16 checkpoint path and pass it to both `policy.model_name` and
 `policy.tokenizer.name`; without that prerequisite the launcher exits before
 submission rather than misclassifying a placeholder-config failure as an OOM.

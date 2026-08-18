@@ -139,7 +139,15 @@ if git -C \"${PROJECT_ROOT}\" submodule status --recursive | grep -Eq '^[+-U]'; 
   exit 2
 fi"
 
+ray_version_guard="bootstrap_ray_version=\$(/opt/nemo_rl_venv/bin/python -c 'import ray; print(ray.__version__)')
+locked_ray_version=\$(grep -A1 '^name = \"ray\"$' \"${PROJECT_ROOT}/uv.lock\" | sed -n 's/^version = \"\\(.*\\)\"$/\\1/p' | head -n 1)
+if [[ -z \${locked_ray_version} || \${bootstrap_ray_version} != \${locked_ray_version} ]]; then
+  echo \"Ray bootstrap/lock version mismatch: bootstrap=\${bootstrap_ray_version}, lock=\${locked_ray_version:-missing}\" >&2
+  exit 2
+fi"
+
 command="${source_guard}
+${ray_version_guard}
 ${config_setup}
 ${uv_cache_setup}
 export NEMO_RL_VENV_DIR=\"${run_dir}/venvs\"
