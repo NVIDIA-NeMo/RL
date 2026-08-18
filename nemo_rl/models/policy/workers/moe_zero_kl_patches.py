@@ -76,23 +76,28 @@ _DIC_SETATTR_ORIG: Optional[Callable[..., None]] = None
 # ---------------------------------------------------------------------------
 
 
-def configure_moe_combine_for_cuda_graph_inference() -> None:
-    """Select gather+droppad combine for CUDA-graphed MoE decode (Qwen30B path).
+def configure_moe_combine_for_zero_kl(*, gather_droppad: bool = False) -> None:
+    """Select gather-based MoE combine for zero train/gen KL (rl-fp4 ground truth).
 
-    Invoked from ``apply_cuda_graph_inference_determinism_patches``; the patched
-    unpermute reads these overrides at forward time.
+    Train and logprob scoring use ``gather_combine``; CUDA-graphed decode with
+    ``drop_and_pad`` uses ``gather_combine_droppad`` when ``gather_droppad=True``.
     """
     global _COMBINE_IMPL_OVERRIDE, _COMBINE_GATHER_DROPPAD_OVERRIDE
     _COMBINE_IMPL_OVERRIDE = "gather"
-    _COMBINE_GATHER_DROPPAD_OVERRIDE = True
+    _COMBINE_GATHER_DROPPAD_OVERRIDE = gather_droppad
+
+
+def configure_moe_combine_for_cuda_graph_inference() -> None:
+    """Gather on train, gather+droppad on CUDA-graphed MoE decode."""
+    configure_moe_combine_for_zero_kl(gather_droppad=True)
 
 
 def _combine_impl() -> str:
     if _COMBINE_IMPL_OVERRIDE is not None:
         impl = _COMBINE_IMPL_OVERRIDE
     else:
-        impl = os.environ.get("NRL_COMBINE_IMPL", "padded").strip().lower()
-    return impl if impl in ("padded", "segmented", "gather") else "padded"
+        impl = os.environ.get("NRL_COMBINE_IMPL", "gather").strip().lower()
+    return impl if impl in ("segmented", "gather") else "gather"
 
 
 def _combine_gather_droppad() -> bool:
@@ -110,45 +115,6 @@ def _nrl_log_unpermute_path(path: str) -> None:
 # ---------------------------------------------------------------------------
 # MoE combine — deterministic kernels
 # ---------------------------------------------------------------------------
-
-
-def _unpermute_fixed_order_combine(
-    permuted_tokens: torch.Tensor,
-    sorted_indices: torch.Tensor,
-    restore_shape: torch.Size,
-) -> torch.Tensor:
-    """Sum expert outputs per token in stable (permute) order via [T, max_slots, H].sum(1)."""
-    num_tokens, hidden = restore_shape
-    num_permuted = permuted_tokens.size(0)
-    if num_permuted == 0:
-        return torch.zeros(
-            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-        )
-
-    sort_perm = torch.argsort(sorted_indices, stable=True)
-    dest = sorted_indices[sort_perm]
-    vals = permuted_tokens[sort_perm]
-
-    seq = torch.arange(num_permuted, device=permuted_tokens.device, dtype=torch.long)
-    if num_permuted > 1:
-        change = dest.new_ones(num_permuted, dtype=torch.bool)
-        change[1:] = dest[1:] != dest[:-1]
-    else:
-        change = dest.new_ones(1, dtype=torch.bool)
-    group_id = change.long().cumsum(0) - 1
-    num_groups = int(group_id[-1].item()) + 1
-    group_sizes = torch.bincount(group_id, minlength=num_groups)
-    starts = torch.zeros(num_groups, dtype=torch.long, device=permuted_tokens.device)
-    if num_groups > 1:
-        starts[1:] = group_sizes.cumsum(0)[:-1]
-    slot = seq - starts[group_id]
-    max_slots = int(group_sizes.max().item())
-
-    contrib = torch.zeros(
-        num_tokens, max_slots, hidden, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-    )
-    contrib[dest, slot] = vals
-    return contrib.sum(dim=1)
 
 
 def _segment_sum(vals: torch.Tensor, group_sizes: torch.Tensor) -> torch.Tensor:
@@ -327,14 +293,9 @@ def _patched_unpermute(
         output_tokens = _unpermute_gather_combine_droppad(
             permuted_tokens, sorted_indices, restore_shape, routing_map
         )
-    elif impl in ("segmented", "gather"):
+    else:
         _nrl_log_unpermute_path("segmented_combine")
         output_tokens = _unpermute_segmented_combine(
-            permuted_tokens, sorted_indices, restore_shape
-        )
-    else:
-        _nrl_log_unpermute_path("fixed_order_combine")
-        output_tokens = _unpermute_fixed_order_combine(
             permuted_tokens, sorted_indices, restore_shape
         )
     return output_tokens.to(dtype=input_dtype)
@@ -706,6 +667,7 @@ def apply_cuda_graph_inference_determinism_patches() -> None:
 
 def apply_moe_determinism_patches() -> None:
     """Apply MoE combine and router replay patches."""
+    configure_moe_combine_for_zero_kl(gather_droppad=False)
     apply_moe_unpermute_determinism_patch()
     apply_router_replay_inference_patches()
 
