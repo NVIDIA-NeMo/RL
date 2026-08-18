@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for packing mcore inference replies into a GenerationOutputSpec.
+"""CPU tests for the GPU-free slices of the megatron generation worker.
 
 The end-to-end megatron generation tests need GPUs and several minutes, which
 makes them a poor guard for the wire format of the engine's reply. That format
@@ -21,15 +21,27 @@ does change: megatron-core stopped echoing `prompt_tokens` back unless
 test began failing with `AttributeError: 'NoneType' object has no attribute
 'tolist'` -- while two async ones swallowed the error per sample and still
 reported success. These tests pin the packing logic without a GPU.
+
+The same reasoning covers the NeMo-Gym port-reservation wiring
+(test_http_server_port_reservation): its safety properties are pure
+socket/plumbing contracts, pinned here without a GPU.
 """
 
+import socket
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
+from nemo_rl.distributed.virtual_cluster import (
+    _HeldPortReservation,
+    receive_held_socket,
+)
+from nemo_rl.models.generation.megatron.megatron_worker import (
+    MegatronGenerationMixin,
+)
 
 PAD = 0
 
@@ -150,3 +162,71 @@ def test_handles_a_reply_with_no_generated_tokens(two_sample_batch):
     torch.testing.assert_close(out["generation_lengths"], torch.tensor([0, 1]))
     torch.testing.assert_close(out["unpadded_sequence_lengths"], torch.tensor([3, 3]))
     assert out["output_ids"][0].tolist() == [5, 6, 7, PAD, PAD]
+
+
+@pytest.mark.mcore
+def test_http_server_port_reservation(monkeypatch):
+    """The NeMo-Gym overlap contract, exercised back to back.
+
+    The server URL is published to NeMo Gym before any worker exists, so: the
+    reserved port is bound and listening from reservation time (early Gym
+    probes queue instead of being refused), and the worker adopts that same
+    socket through the fd handoff — the port is never released in between.
+    On this tree the high-level LLM API has no socket handoff, so the last
+    step is close-then-rebind: the held socket is closed and its port goes to
+    ServeConfig — falling back to a fresh port only when nothing was reserved.
+    """
+    monkeypatch.setattr(
+        "nemo_rl.distributed.virtual_cluster._get_node_ip_local",
+        lambda: "10.0.0.5",
+    )
+    holder = _HeldPortReservation()
+    node_ip, port = holder.address()
+    assert node_ip == "10.0.0.5"
+
+    # Held and listening from reservation time: early Gym probes queue
+    # instead of being refused.
+    with socket.create_connection(("127.0.0.1", port), timeout=5):
+        pass
+
+    # Worker-side adoption: the same live socket, duplicated across the
+    # process boundary; still the same port, still accepting.
+    reserved = receive_held_socket(port)
+    try:
+        assert reserved.getsockname()[1] == port
+        with socket.create_connection(("127.0.0.1", port), timeout=5):
+            pass
+
+        # Server start with the network and the high-level LLM stubbed out.
+        monkeypatch.setattr(
+            "nemo_rl.distributed.virtual_cluster._get_free_port_local",
+            lambda: 12345,
+        )
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+        requests_mock = MagicMock()
+        health_get = requests_mock.Session.return_value.__enter__.return_value.get
+        health_get.return_value.status_code = 200
+        monkeypatch.setattr(
+            "nemo_rl.models.generation.megatron.megatron_worker.requests",
+            requests_mock,
+        )
+
+        for reserved_socket, expected_port in ((reserved, port), (None, 12345)):
+            worker = SimpleNamespace(
+                llm=MagicMock(),
+                rank=0,
+                cfg={"generation": {"mcore_generation_config": {"parsers": []}}},
+                _reserved_http_server_socket=reserved_socket,
+            )
+            base_url = MegatronGenerationMixin._setup_openai_api_server(worker)
+            (serve_config,) = worker.llm.serve.call_args.args
+            assert worker.llm.serve.call_args.kwargs == {"blocking": False}
+            assert serve_config.port == expected_port
+            worker.llm.run_sync.assert_called_once()
+            assert base_url == f"http://10.0.0.5:{expected_port}/v1"
+
+        # Close-then-rebind contract: the held socket was closed and cleared
+        # just before serve() took the port.
+        assert reserved.fileno() == -1
+    finally:
+        reserved.close()

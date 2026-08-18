@@ -416,6 +416,15 @@ class GenerationInterface(ABC):
     def invalidate_kv_cache(self) -> bool:
         return False
 
+    def blocks_training(self) -> bool:
+        """Whether this engine must stand down before a training step.
+
+        True when generation shares GPUs with training (colocated): the
+        training loop then pauses collection and winds the engine down
+        before training. Engines on dedicated GPUs never block training.
+        """
+        return False
+
     def clear_logger_metrics(self) -> None:
         """Clear logger metrics for performance reporting.
 

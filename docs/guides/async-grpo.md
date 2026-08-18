@@ -24,7 +24,7 @@ loss_fn:
   use_importance_sampling_correction: true
 ```
 
-3. **Disable colocated inference** (required for async mode):
+3. **Disable colocated inference** (required for async mode with the vLLM backend; the Megatron backend supports colocated async — see `examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_async_colocated.yaml`):
 ```yaml
 policy:
   generation:

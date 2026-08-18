@@ -29,6 +29,10 @@ test_suites_dir = os.path.join(project_root, "tests", "test_suites")
 nightly_test_suite_path = os.path.join(test_suites_dir, "nightly.txt")
 release_test_suite_path = os.path.join(test_suites_dir, "release.txt")
 nightly_gb200_test_suite_path = os.path.join(test_suites_dir, "nightly_gb200.txt")
+nightly_mcore_test_suite_path = os.path.join(test_suites_dir, "nightly_mcore.txt")
+nightly_mcore_gb200_test_suite_path = os.path.join(
+    test_suites_dir, "nightly_mcore_gb200.txt"
+)
 release_gb200_test_suite_path = os.path.join(test_suites_dir, "release_gb200.txt")
 h100_performance_test_suite_path = os.path.join(test_suites_dir, "performance.txt")
 gb200_performance_test_suite_path = os.path.join(
@@ -102,6 +106,28 @@ def release_gb200_test_suite():
 
 
 @pytest.fixture
+def nightly_mcore_test_suite():
+    nightly_mcore_suite = []
+    with open(nightly_mcore_test_suite_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                nightly_mcore_suite.append(line)
+    return nightly_mcore_suite
+
+
+@pytest.fixture
+def nightly_mcore_gb200_test_suite():
+    nightly_mcore_gb200_suite = []
+    with open(nightly_mcore_gb200_test_suite_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                nightly_mcore_gb200_suite.append(line)
+    return nightly_mcore_gb200_suite
+
+
+@pytest.fixture
 def performance_test_suite():
     performance_suite = []
     with open(h100_performance_test_suite_path, "r") as f:
@@ -164,6 +190,8 @@ def all_recipe_yaml_rel_paths():
         release_test_suite_path,
         nightly_gb200_test_suite_path,
         release_gb200_test_suite_path,
+        nightly_mcore_test_suite_path,
+        nightly_mcore_gb200_test_suite_path,
         h100_performance_test_suite_path,
         gb200_performance_test_suite_path,
         disabled_test_suite_path,
@@ -173,6 +201,8 @@ def all_recipe_yaml_rel_paths():
         "release_test_suite",
         "nightly_gb200_test_suite",
         "release_gb200_test_suite",
+        "nightly_mcore_test_suite",
+        "nightly_mcore_gb200_test_suite",
         "h100_performance_test_suite",
         "gb200_performance_test_suite",
         "disabled_test_suite",
@@ -192,11 +222,16 @@ def test_no_overlap_across_test_suites(all_test_suites):
 
 
 def test_nightly_suites_match_gpus_per_node(
-    nightly_test_suite, nightly_gb200_test_suite
+    nightly_test_suite,
+    nightly_gb200_test_suite,
+    nightly_mcore_test_suite,
+    nightly_mcore_gb200_test_suite,
 ):
     for test_suite, expected_gpus_per_node in (
         (nightly_test_suite, 8),
         (nightly_gb200_test_suite, 4),
+        (nightly_mcore_test_suite, 8),
+        (nightly_mcore_gb200_test_suite, 4),
     ):
         for test_script in test_suite:
             gpus_per_node = 8
@@ -211,8 +246,15 @@ def test_nightly_suites_match_gpus_per_node(
             )
 
 
-def test_all_test_scripts_accounted_for_in_test_suites(all_test_suites):
-    all_test_scripts_in_test_suites = set(all_test_suites)
+def test_all_test_scripts_accounted_for_in_test_suites(
+    all_test_suites, nightly_mcore_test_suite, nightly_mcore_gb200_test_suite
+):
+    # mcore overlays mostly re-list scripts from other suites, except -smoke scripts.
+    all_test_scripts_in_test_suites = (
+        set(all_test_suites)
+        | set(nightly_mcore_test_suite)
+        | set(nightly_mcore_gb200_test_suite)
+    )
 
     all_tests_in_test_suites_dir = set()
     for recipe_path in glob.glob(
@@ -228,15 +270,24 @@ def test_all_test_scripts_accounted_for_in_test_suites(all_test_suites):
 
 
 def test_all_recipe_yamls_accounted_for_in_test_suites(
-    all_recipe_yaml_rel_paths, all_test_suites
+    all_recipe_yaml_rel_paths,
+    all_test_suites,
+    nightly_mcore_test_suite,
+    nightly_mcore_gb200_test_suite,
 ):
     """This test along with test_all_test_scripts_accounted_for_in_test_suites() ensures that all recipe yaml/test scripts/test_suite(txts) are in sync."""
-    assert len(set(all_recipe_yaml_rel_paths)) == len(set(all_test_suites)), (
+    # The -smoke recipes' driver scripts live only in the mcore overlay lists.
+    all_suite_entries = (
+        set(all_test_suites)
+        | set(nightly_mcore_test_suite)
+        | set(nightly_mcore_gb200_test_suite)
+    )
+    assert len(set(all_recipe_yaml_rel_paths)) == len(all_suite_entries), (
         "Recipe YAMLs should be accounted for in the test suites"
     )
 
     all_test_script_paths_in_test_suites = set()
-    for test_script in all_test_suites:
+    for test_script in all_suite_entries:
         # Each test suite is relative from project root
         test_script_rel_to_test_suites_dir = test_script[
             len(os.path.join("tests", "test_suites")) + 1 :

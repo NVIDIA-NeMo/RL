@@ -15,11 +15,15 @@
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import ray
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    PortHolder,
+    RayVirtualCluster,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -90,6 +94,52 @@ class MegatronGeneration(GenerationInterface):
             use_unified_pg=cls.nvlink_domain_span(config) > cluster.num_gpus_per_node,
         )
 
+    @classmethod
+    def reserve_http_server_address(
+        cls,
+        cluster: RayVirtualCluster,
+        config: PolicyConfig,
+    ) -> tuple[str, int, ray.actor.ActorHandle]:
+        """Reserve the OpenAI server address before any generation worker exists.
+
+        Args:
+            cluster: The cluster the generation workers will run on.
+            config: The full `PolicyConfig`.
+
+        Returns:
+            Tuple of (server base URL, reserved port, port-holder actor handle).
+            The caller must keep the handle referenced until rank 0 has adopted
+            the socket (worker init complete), then `ray.kill` it.
+        """
+        if config["generation"]["colocated"]["enabled"]:
+            # Colocated generation shares the training policy's cluster; trigger
+            # the same (idempotent) default placement-group init Policy would.
+            cluster.get_placement_groups()
+        else:
+            cls.init_cluster_placement_groups(cluster, config)
+
+        # Distributed rank 0 lands on the first bundle handed to the worker
+        # group: sorted-first for a unified placement group, else bundle 0 of
+        # the first group (mirrors Policy's worker-group construction).
+        placement_groups = cluster.get_placement_groups()
+        rank0_bundle_index = (
+            cluster._sorted_bundle_indices[0]
+            if cluster._sorted_bundle_indices is not None
+            else 0
+        )
+        # Zero-gap reservation: a holder actor on the rank-0 node binds and
+        # HOLDS the socket (num_cpus=0, so it schedules even on a full bundle);
+        # rank 0 later adopts the live fd via receive_held_socket, so the port
+        # can never be stolen in between and any free port is safe.
+        holder = PortHolder.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=placement_groups[0],
+                placement_group_bundle_index=rank0_bundle_index,
+            ),
+        ).remote()
+        node_ip, port = ray.get(holder.address.remote())
+        return f"http://{node_ip}:{port}/v1", port, holder
+
     def __init__(
         self,
         config: PolicyConfig,
@@ -100,6 +150,7 @@ class MegatronGeneration(GenerationInterface):
         processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
         skip_weight_load: bool = False,
+        reserved_http_server_port: Optional[int] = None,
     ):
         """Initialize a MegatronGeneration instance.
 
@@ -114,6 +165,7 @@ class MegatronGeneration(GenerationInterface):
             processor: Optional processor for VLMs (non-colocated only).
             weights_path: Optional path to model weights (non-colocated only).
             skip_weight_load: Do not load the weights from the checkpoint; refit will do it.
+            reserved_http_server_port: Driver-reserved OpenAI server port for non-colocated.
         """
         # Import here to avoid circular imports
         from nemo_rl.models.policy.lm_policy import Policy
@@ -123,6 +175,10 @@ class MegatronGeneration(GenerationInterface):
         )
         assert not (skip_weight_load and policy is not None), (
             "skip_weight_load only applies to the dedicated inference policy."
+        )
+        assert not (reserved_http_server_port is not None and policy is not None), (
+            "reserved_http_server_port only applies to the dedicated inference "
+            "policy; when colocated, pass it to the training policy instead."
         )
 
         # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
@@ -161,6 +217,7 @@ class MegatronGeneration(GenerationInterface):
             init_reference_model=False,
             weights_path=weights_path,
             skip_weight_load=skip_weight_load,
+            reserved_http_server_port=reserved_http_server_port,
         )
 
         # Start the persistent inference engine + HTTP server during construction.
@@ -260,12 +317,38 @@ class MegatronGeneration(GenerationInterface):
         return True
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Clean up after generation."""
+        """Clean up after generation.
+
+        Accepts `for_training` (default True): when False, a colocated engine
+        keeps serving instead of standing down (see the worker docstring).
+        """
         futures = self._policy.worker_group.run_all_workers_single_data(
-            "finish_generation"
+            "finish_generation", **kwargs
         )
         ray.get(futures)
         return True
+
+    def blocks_training(self) -> bool:
+        """Whether the engine must stand down before a training step.
+
+        Colocated generation shares the training GPUs, so the training
+        loop must wind the engine down before it can train.
+        """
+        return bool(self.cfg["colocated"]["enabled"])
+
+    def invalidate_kv_cache(self) -> bool:
+        """Report whether weight updates invalidate the KV cache.
+
+        Under "recompute" mode the engine drops and rebuilds its KV cache
+        across the suspend/resume that brackets every weight update, so
+        invalidation is genuinely handled; report it truthfully instead of
+        inheriting the interface's `False` (which makes the trajectory
+        collector warn every step).
+        """
+        return (
+            self.cfg["mcore_generation_config"].get("kv_cache_management_mode")
+            == "recompute"
+        )
 
     def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
         """Pre-initialize NVShmem collectively after CUDA graph capture.
