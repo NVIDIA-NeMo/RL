@@ -11,330 +11,511 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""NVFP4 per-token W4A4 rollout support (no ModelOpt training dependency).
+"""vLLM-side NVFP4 per-token W4A4 rollout quantization.
 
-This module is importable from BOTH sides of the refit boundary:
-
-- Megatron training workers (mcore venv, **no vLLM installed**) use the
-  weight producer and the refit iterator filter. Everything at module scope
-  is therefore vLLM-free; vLLM imports live inside functions.
-- vLLM generation workers use the registered ``nvfp4_pertoken`` quantization
-  config (weights pre-quantized by the producer, activation global scales
-  derived per token inside the FlashInfer TRT-LLM fused-MoE kernel).
-
-The producer matches vLLM's online-quant kernel
-(``vllm._custom_ops.scaled_fp4_quant`` as used by
-``_quantize_moe_weight_to_nvfp4``) bit for bit.
+Routed-expert weights are quantized here, at refit weight-load time, from the
+plain BF16 stream the Megatron training worker exports — a sibling of the
+fp8/mxfp8 "real quant" rollout path (``quantization/fp8.py``). The training
+worker stays entirely unaware of NVFP4; the refit transport always carries
+BF16.
 """
 
-import fnmatch
 import re
-from collections.abc import Iterator
-from typing import Any, Optional
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Iterator, Optional
 
 import torch
+from vllm import _custom_ops as ops
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    NvFp4MoeBackend,
+    convert_to_nvfp4_moe_kernel_format,
+    make_nvfp4_moe_kernel,
+)
+from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptNvFp4Config,
+    ModelOptNvFp4FusedMoE,
+)
+from vllm.model_executor.utils import replace_parameter
 
+from nemo_rl.models.generation.vllm.quantization.fp8 import get_module_from_param_name
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     DEFAULT_NVFP4_IGNORE,
+    NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS,
     NvFp4PerTokenRolloutConfig,
 )
+from nemo_rl.models.generation.vllm.vllm_backend import (
+    VllmInternalWorkerExtension,
+    WeightUpdateFinalizer,
+    WeightUpdateTransport,
+)
+
+logger = init_logger(__name__)
 
 __all__ = ["DEFAULT_NVFP4_IGNORE", "NvFp4PerTokenRolloutConfig"]
 
+NVFP4_PER_TOKEN_METHOD = "nvfp4_pertoken"
+
 _EXPERT_WEIGHT_RE = re.compile(
     r"^(?P<prefix>.*\.experts)\.(?P<eid>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
-)
-
-_FUSED_EXPERT_RE = re.compile(
-    r"^(?P<prefix>.*\.experts)\.(?P<kind>w13|w2)_(?P<part>weight|weight_scale|weight_scale_2)$"
 )
 
 _FP4_MAX = 6.0
 _FP8_E4M3_MAX = 448.0
 _AMAX_DENOMINATOR = _FP4_MAX * _FP8_E4M3_MAX
 
-# E2M1 rounding boundaries. At a boundary, round-to-nearest-even selects the
-# grid point with an even mantissa bit (0.25->0, 0.75->1.0, 1.25->1.0,
-# 1.75->2.0, 2.5->2.0, 3.5->4.0, 5.0->4.0).
-_E2M1_BOUNDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
-# Boundary indices whose tie resolves DOWN (toward the lower grid point).
-_E2M1_TIE_DOWN = (0, 2, 4, 6)
+_registered = False
+_pertoken_marker_printed = False
 
 
-def _round_e2m1_codes(y: torch.Tensor) -> torch.Tensor:
-    """Round |y| to E2M1 codes 0..7 with round-to-nearest-even semantics."""
-    bounds = torch.tensor(_E2M1_BOUNDS, device=y.device, dtype=torch.float32)
-    mag = y.abs()
-    # searchsorted(right=True): ties land on the upper grid point...
-    codes = torch.searchsorted(bounds, mag.reshape(-1).contiguous(), right=True)
-    codes = codes.reshape(mag.shape).to(torch.uint8)
-    # ...then push tie-down boundaries back to the lower point.
-    for b_idx in _E2M1_TIE_DOWN:
-        codes = torch.where(
-            mag == _E2M1_BOUNDS[b_idx],
-            torch.tensor(b_idx, device=y.device, dtype=torch.uint8),
-            codes,
+@dataclass
+class PendingHalf:
+    """One half of a gate/up pair awaiting its partner.
+
+    The tensor is cloned off the refit IPC buffer, which the sender recycles
+    as soon as the batch is acknowledged (see ``policy/utils.py``'s
+    ping-pong double buffering).
+    """
+
+    layer_prefix: str
+    expert_id: int
+    proj: str  # "gate_proj" | "up_proj"
+    tensor: torch.Tensor
+
+
+class NvFp4PerTokenQuantizer:
+    """Quantizes routed-expert weights to NVFP4 during vLLM-side weight refit.
+
+    Stateful only over a single gate/up pair per (layer, expert) — never a
+    whole layer — so memory stays bounded regardless of expert count. Gate
+    and up projections share one global scale (vLLM's
+    ``ModelOptNvFp4FusedMoE.process_weights_after_loading`` collapses
+    ``w13_weight_scale_2`` to column 0, so independently-scaled halves would
+    decode the up projection with the gate's scale), so quantization of a
+    pair is deferred until both halves have arrived. ``additional_ignore``
+    expert layers are detected by probing the owning module's quant method
+    rather than re-deriving the ignore-pattern match, since a config-level
+    check cannot see how ``configure_nvfp4_pertoken_engine_kwargs`` resolved
+    that layer's ``quant_method`` at engine build time.
+    """
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        self._model = model
+        self._pending: dict[tuple[str, int], PendingHalf] = {}
+        self._quantized_layer: dict[str, bool] = {}
+        self._quantized_events = 0
+
+    def reset(self) -> None:
+        """Clear pending gate/up state and this refit's liveness counter."""
+        self._pending = {}
+        self._quantized_events = 0
+
+    def _is_quantized_layer(self, layer_prefix: str) -> bool:
+        cached = self._quantized_layer.get(layer_prefix)
+        if cached is not None:
+            return cached
+        module = get_module_from_param_name(
+            self._model, f"{layer_prefix}.0.gate_proj.weight"
         )
-    sign = (y < 0).to(torch.uint8) << 3
-    # satfinite: values beyond the last boundary already clamp to code 7 (6.0)
-    return sign | codes
+        is_quantized = isinstance(
+            getattr(module, "quant_method", None), ModelOptNvFp4PerTokenFusedMoE
+        )
+        self._quantized_layer[layer_prefix] = is_quantized
+        return is_quantized
 
+    def process(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Quantize matching expert weights in one refit batch.
 
-def _quantize_blocks(scaled: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Block-16 NVFP4 quantization of a pre-globally-scaled tensor.
+        Non-expert names and expert layers outside the quantized scope
+        (``additional_ignore``) pass through untouched.
+        """
+        out: list[tuple[str, torch.Tensor]] = []
+        for name, tensor in weights:
+            match = _EXPERT_WEIGHT_RE.match(name)
+            if match is None or not self._is_quantized_layer(match.group("prefix")):
+                out.append((name, tensor))
+                continue
 
-    Mirrors ``scaled_fp4_quant(scaled, global_scale=1, non-swizzled)``:
-    per-16-block e4m3 scale = RNE(block_amax / 6); elements are multiplied by
-    the reciprocal of the decoded scale (multiply, not divide — matches the
-    kernel) and rounded RNE onto the E2M1 grid, then nibble-packed with the
-    even element in the low nibble.
-    """
-    *lead, k = scaled.shape
-    if k % 16 != 0:
-        raise ValueError(f"last dim must be a multiple of 16, got {k}")
-    x = scaled.float().reshape(*lead, k // 16, 16)
+            prefix = match.group("prefix")
+            expert_id = int(match.group("eid"))
+            proj = match.group("proj")
 
-    block_amax = x.abs().amax(dim=-1)
-    block_scale = (block_amax / _FP4_MAX).to(torch.float8_e4m3fn)
-    sf = block_scale.float()
-    inv_sf = torch.where(sf > 0, sf.reciprocal(), torch.zeros_like(sf))
-    y = x * inv_sf.unsqueeze(-1)
-
-    codes = _round_e2m1_codes(y).reshape(*lead, k)
-    packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
-    return packed.contiguous(), block_scale.contiguous()
-
-
-def quantize_nvfp4_weight(
-    weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize a weight to the NVFP4 (ModelOpt HF checkpoint) layout.
-
-    Accepts ``(N, K)`` (one linear / one expert projection) or ``(E, N, K)``
-    (stacked experts). Returns:
-
-    - packed FP4 weight, uint8, ``(..., K // 2)``
-    - block scales, float8_e4m3fn, ``(..., K // 16)``
-    - global ``weight_scale_2``, float32, scalar for 2D / ``(E,)`` for 3D,
-      stored as ``amax / (6 * 448)``
-
-    Matches vLLM's ``_quantize_moe_weight_to_nvfp4`` numerics: per-tensor
-    (per-expert) amax, global scale folded in with an intermediate cast back
-    to the input dtype, then block-16 quantization under a unit global scale.
-    """
-    if weight.dim() == 2:
-        amax = weight.abs().amax().float().clamp_min(1e-8)
-        global_scale = _AMAX_DENOMINATOR / amax
-        weight_scale_2 = (1.0 / global_scale).reshape(())
-        scaled = (weight.float() * global_scale).to(weight.dtype)
-    elif weight.dim() == 3:
-        amax = weight.abs().amax(dim=(1, 2)).float().clamp_min(1e-8)
-        global_scale = _AMAX_DENOMINATOR / amax
-        weight_scale_2 = 1.0 / global_scale
-        scaled = (weight.float() * global_scale[:, None, None]).to(weight.dtype)
-    else:
-        raise ValueError(f"expected 2D or 3D weight, got shape {tuple(weight.shape)}")
-
-    packed, block_scale = _quantize_blocks(scaled)
-    return packed, block_scale, weight_scale_2.to(torch.float32)
-
-
-def _matches_any(name: str, patterns: list[str]) -> bool:
-    return any(fnmatch.fnmatch(name, p) for p in patterns)
-
-
-def iter_nvfp4_pertoken_weights(
-    base_iter: Iterator[tuple[str, torch.Tensor]],
-    quant_patterns: list[str],
-    ignore_patterns: Optional[list[str]] = None,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Refit filter: quantize matching ``*.weight`` tensors in an export stream.
-
-    Wraps the ``(hf_name, tensor)`` iterator the Megatron policy worker already
-    produces (TP-gathered, HF-named). Per-expert projections matching
-    ``quant_patterns`` are collected per layer. Layers outside
-    ``ignore_patterns`` are quantized per expert (gate+up share one global
-    scale — vLLM's fused-MoE loader keeps only
-    ``w13_weight_scale_2[:, 0]``) and emitted as fused stacked tensors in the
-    ModelOpt fused-MoE convention::
-
-        <...>.experts.w13_weight          uint8   (E, 2N, K/2)
-        <...>.experts.w13_weight_scale    e4m3    (E, 2N, K/16)
-        <...>.experts.w13_weight_scale_2  fp32    (E, 2)
-        <...>.experts.w2_weight / _scale / _scale_2
-
-    Ignored expert layers stay BF16 but are fused into
-    ``experts.gate_up_proj`` and ``experts.down_proj`` tensors for transport.
-    Everything else (non-matching weights, biases, kv scales, draft weights)
-    passes through untouched. Assumes the export streams a layer's experts
-    contiguously (HF checkpoint order), flushing on layer-prefix change.
-    """
-    ignore = ignore_patterns or []
-    quantized = {"layers": 0, "experts": 0}
-    bf16_fused_layers = 0
-    passthrough = 0
-
-    # Per-(layer-prefix) buffers of expert projections. Experts are stacked
-    # and emitted as FUSED tensors (`<prefix>.w13_weight` etc.) purely for
-    # transport: streaming per-expert names (~55k tensors on a 128-expert
-    # 48-layer model) crawls through per-tensor IPC handshakes and reload
-    # buffering and cannot finish a refit in tolerable time. vLLM-side, the
-    # worker extension expands them back to per-expert checkpoint names via
-    # expand_fused_expert_weights before model.load_weights (the fused names
-    # match no entry in RoutedExperts' expert mapping and would be dropped).
-    pending: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
-    pending_ignore: dict[str, bool] = {}
-
-    def _flush(prefix: str) -> Iterator[tuple[str, torch.Tensor]]:
-        nonlocal bf16_fused_layers
-        group = pending.pop(prefix)
-        ignored = pending_ignore.pop(prefix)
-        missing = {p for p in ("gate_proj", "up_proj", "down_proj") if p not in group}
-        if missing:
-            raise RuntimeError(
-                f"[nvfp4_pertoken] incomplete expert group for {prefix}: "
-                f"missing {sorted(missing)}"
-            )
-        counts = {p: sorted(group[p]) for p in group}
-        num_experts = len(counts["gate_proj"])
-        for p, eids in counts.items():
-            if eids != list(range(num_experts)):
-                raise RuntimeError(
-                    f"[nvfp4_pertoken] non-contiguous expert ids for "
-                    f"{prefix}.{p}: {eids[:5]}..."
+            if proj == "down_proj":
+                out.extend(
+                    self._quantize(f"{prefix}.{expert_id}.down_proj", weight=tensor)
                 )
+                continue
 
-        def _stack(proj: str) -> torch.Tensor:
-            return torch.stack([group[proj][e] for e in range(num_experts)], dim=0)
+            key = (prefix, expert_id)
+            partner = self._pending.pop(key, None)
+            if partner is None:
+                self._pending[key] = PendingHalf(
+                    layer_prefix=prefix,
+                    expert_id=expert_id,
+                    proj=proj,
+                    tensor=tensor.clone(),
+                )
+                continue
 
-        if ignored:
-            bf16_fused_layers += 1
-            yield (
-                f"{prefix}.gate_up_proj",
-                torch.cat([_stack("gate_proj"), _stack("up_proj")], dim=1),
+            gate, up = (
+                (tensor, partner.tensor)
+                if proj == "gate_proj"
+                else (partner.tensor, tensor)
             )
-            yield f"{prefix}.down_proj", _stack("down_proj")
-            return
+            out.extend(self._quantize_pair(prefix, expert_id, gate=gate, up=up))
+        return out
 
-        # ONE global scale per expert across the fused gate+up tensor.
-        # vLLM's ModelOptNvFp4FusedMoE.process_weights_after_loading collapses
-        # w13_weight_scale_2 to column 0 (`[:, 0]`) — per-projection scales
-        # would decode the up half with the gate scale, corrupting MoE outputs.
-        # Quantizing the stacked (E, 2N, K) tensor matches upstream's
-        # online-quant behavior;
-        # the (E, 2) checkpoint-convention shape carries the shared scale in
-        # both columns.
-        w13 = torch.cat([_stack("gate_proj"), _stack("up_proj")], dim=1)
-        w13_q, w13_bs, w13_s2 = quantize_nvfp4_weight(w13)
-        d_q, d_bs, d_s2 = quantize_nvfp4_weight(_stack("down_proj"))
+    def _quantize(
+        self, name_prefix: str, *, weight: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Quantize a single expert projection; emit its four checkpoint names."""
+        weight_scale_2 = self._global_scale(weight)
+        packed, scale = self._scaled_fp4_quant(weight, weight_scale_2)
+        self._quantized_events += 1
+        return self._emit(name_prefix, packed, scale, weight_scale_2)
 
-        quantized["layers"] += 1
-        quantized["experts"] += num_experts
-        yield f"{prefix}.w13_weight", w13_q
-        yield f"{prefix}.w13_weight_scale", w13_bs
-        yield (
-            f"{prefix}.w13_weight_scale_2",
-            w13_s2.unsqueeze(1).expand(-1, 2).contiguous(),
+    def _quantize_pair(
+        self, prefix: str, expert_id: int, *, gate: torch.Tensor, up: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Quantize a gate/up pair under one shared global scale."""
+        weight_scale_2 = self._global_scale(gate, up)
+        out: list[tuple[str, torch.Tensor]] = []
+        for proj_name, w in (("gate_proj", gate), ("up_proj", up)):
+            packed, scale = self._scaled_fp4_quant(w, weight_scale_2)
+            out.extend(
+                self._emit(
+                    f"{prefix}.{expert_id}.{proj_name}", packed, scale, weight_scale_2
+                )
+            )
+        self._quantized_events += 1
+        return out
+
+    @staticmethod
+    def _global_scale(*weights: torch.Tensor) -> torch.Tensor:
+        amax = (
+            torch.stack([w.abs().amax() for w in weights])
+            .amax()
+            .float()
+            .clamp_min(1e-8)
         )
-        yield f"{prefix}.w2_weight", d_q
-        yield f"{prefix}.w2_weight_scale", d_bs
-        yield f"{prefix}.w2_weight_scale_2", d_s2
+        return (amax / _AMAX_DENOMINATOR).reshape(())
 
-    current_prefix: Optional[str] = None
-    for name, tensor in base_iter:
-        m = _EXPERT_WEIGHT_RE.match(name)
-        if m is None or not _matches_any(name, quant_patterns):
-            passthrough += 1
-            yield name, tensor
-            continue
-        prefix = m.group("prefix")
-        if current_prefix is not None and prefix != current_prefix:
-            yield from _flush(current_prefix)
-        current_prefix = prefix
-        ignored = _matches_any(name, ignore)
-        previous_ignore = pending_ignore.setdefault(prefix, ignored)
-        if previous_ignore != ignored:
+    @staticmethod
+    def _scaled_fp4_quant(
+        weight: torch.Tensor, weight_scale_2: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        global_scale = weight_scale_2.reciprocal().reshape(1)
+        packed, scale = ops.scaled_fp4_quant(
+            weight, global_scale, is_sf_swizzled_layout=False, backend="none"
+        )
+        expected_scale_shape = (weight.shape[0], weight.shape[1] // 16)
+        assert scale.shape == expected_scale_shape, (
+            f"[nvfp4_pertoken] expected linear (non-swizzled) NVFP4 block-scale "
+            f"shape {expected_scale_shape}, got {tuple(scale.shape)} — "
+            "scaled_fp4_quant's default swizzled layout may have changed."
+        )
+        return packed, scale
+
+    @staticmethod
+    def _emit(
+        name_prefix: str,
+        packed: torch.Tensor,
+        scale: torch.Tensor,
+        weight_scale_2: torch.Tensor,
+    ) -> list[tuple[str, torch.Tensor]]:
+        return [
+            (f"{name_prefix}.weight", packed),
+            (f"{name_prefix}.weight_scale", scale),
+            (f"{name_prefix}.weight_scale_2", weight_scale_2.to(torch.float32)),
+            (
+                f"{name_prefix}.input_scale",
+                torch.ones((), device=packed.device, dtype=torch.float32),
+            ),
+        ]
+
+    def finish(self) -> None:
+        """Raise if any gate/up half never received its partner this refit.
+
+        A non-empty ``pending`` at refit end means stale expert weights would
+        silently survive under the previous refit's values — fail loud rather
+        than let that pass unnoticed (mirrors
+        ``_IPCWeightManifest.require_complete``).
+
+        Also prints a per-refit liveness line and raises if nothing was
+        quantized — a config/name mismatch would otherwise silently degrade to
+        an all-BF16 refit. Use print because Ray workers default to
+        WARNING-level logging.
+        """
+        if self._pending:
             raise RuntimeError(
-                f"[nvfp4_pertoken] partial expert-layer ignore for {prefix}; "
-                "ignore patterns must cover the complete layer"
+                "[nvfp4_pertoken] refit ended with unpaired expert projections: "
+                f"{sorted(self._pending)}"
             )
-        pending.setdefault(prefix, {}).setdefault(m.group("proj"), {})[
-            int(m.group("eid"))
-        ] = tensor
+        print(
+            f"[nvfp4_pertoken] refit: quantized {self._quantized_events} expert "
+            "weight groups",
+            flush=True,
+        )
+        if self._quantized_events == 0:
+            raise RuntimeError(
+                "[nvfp4_pertoken] refit quantized 0 params — export naming and "
+                "the model's quant_method assignment are out of sync."
+            )
 
-    for prefix in list(pending):
-        yield from _flush(prefix)
 
-    # Per-refit liveness proof: a config/name mismatch (e.g. quant_patterns
-    # not matching the export's expert naming) would otherwise silently
-    # degrade to an all-BF16 refit that vLLM then fails to load — or worse.
-    # Use print because Ray workers default to WARNING-level logging.
-    print(
-        f"[nvfp4_pertoken] refit: quantized {quantized['layers']} expert layers "
-        f"({quantized['experts']} experts) -> {6 * quantized['layers']} fused "
-        f"tensors; fused {bf16_fused_layers} BF16 expert layers -> "
-        f"{2 * bf16_fused_layers} tensors; passthrough {passthrough}",
-        flush=True,
-    )
-    if quant_patterns and quantized["layers"] == 0:
-        raise RuntimeError(
-            "[nvfp4_pertoken] refit quantized 0 params although quant_patterns="
-            f"{quant_patterns} is configured — export naming and patterns are "
-            "out of sync."
+class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
+    """W4A4 MoE: pre-quantized weights, per-token dynamic activation scales.
+
+    The class NAME must contain "ModelOpt": vLLM's RoutedExperts.weight_loader
+    duck-types NVFP4 scale loading on ``"ModelOpt" in
+    self.quant_method.__class__.__name__`` (routed_experts.py); a rename
+    silently drops expert scale params out of that branch and initial load
+    fails with "quant method must be one of ['tensor','channel','group',
+    'block']".
+    """
+
+    moe_quant_config: Any
+    moe_kernel: Any
+
+    def __init__(self, quant_config, moe_config) -> None:
+        super().__init__(
+            quant_config,  # pyrefly: ignore[bad-argument-count]
+            moe_config,
+        )
+        if self.use_a16:
+            raise ValueError(
+                f"{NVFP4_PER_TOKEN_METHOD} requires a W4A4 NVFP4 checkpoint, "
+                "got W4A16_NVFP4."
+            )
+        # make_nvfp4_moe_kernel silently drops per_token_activation for every
+        # backend except FLASHINFER_TRTLLM — fail loudly instead of running
+        # with stale static scales.
+        if self.nvfp4_backend != NvFp4MoeBackend.FLASHINFER_TRTLLM:
+            raise ValueError(
+                f"{NVFP4_PER_TOKEN_METHOD} requires the FlashInfer TRT-LLM MoE "
+                f"backend, got {self.nvfp4_backend}."
+            )
+
+    def process_weights_after_loading(self, layer) -> None:
+        # Neutral (1.0) global activation scales: the kernel derives per-token
+        # scales at runtime, so the output scalars reduce to the weight scales.
+        num_experts = layer.w13_input_scale.data.shape[0]
+        device = layer.w13_weight.device
+        ones = torch.ones(num_experts, device=device, dtype=torch.float32)
+        replace_parameter(layer, "w13_input_scale", ones)
+        replace_parameter(layer, "w2_input_scale", ones.clone())
+        # Use print because the engine process does not configure INFO logging
+        # for the nemo_rl logger tree.
+        global _pertoken_marker_printed
+        if not _pertoken_marker_printed:
+            _pertoken_marker_printed = True
+            print(
+                f"[{NVFP4_PER_TOKEN_METHOD}] per-token NVFP4 activation scaling active",
+                flush=True,
+            )
+
+        w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
+
+        (
+            w13,
+            w13_scale,
+            w13_scale_2,
+            a13_scale,
+            w2,
+            w2_scale,
+            w2_scale_2,
+            a2_scale,
+        ) = convert_to_nvfp4_moe_kernel_format(
+            nvfp4_backend=self.nvfp4_backend,
+            layer=layer,
+            w13=layer.w13_weight,
+            w13_scale=layer.w13_weight_scale,
+            w13_scale_2=w13_weight_scale_2,
+            a13_scale=layer.w13_input_scale,
+            w2=layer.w2_weight,
+            w2_scale=layer.w2_weight_scale,
+            w2_scale_2=layer.w2_weight_scale_2,
+            a2_scale=layer.w2_input_scale,
+            is_act_and_mul=self.moe.is_act_and_mul,
+        )
+
+        # Stride-0 expanded scale views break layerwise-reload finalize
+        # (param.data.copy_() into broadcast storage); contiguous is a no-op
+        # for already-dense tensors.
+        def _dense(t):
+            return t.contiguous() if isinstance(t, torch.Tensor) else t
+
+        replace_parameter(layer, "w13_weight", _dense(w13))
+        replace_parameter(layer, "w13_weight_scale", _dense(w13_scale))
+        replace_parameter(layer, "w13_weight_scale_2", _dense(w13_scale_2))
+        replace_parameter(layer, "w13_input_scale", _dense(a13_scale))
+        replace_parameter(layer, "w2_weight", _dense(w2))
+        replace_parameter(layer, "w2_weight_scale", _dense(w2_scale))
+        replace_parameter(layer, "w2_weight_scale_2", _dense(w2_scale_2))
+        replace_parameter(layer, "w2_input_scale", _dense(a2_scale))
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        assert self.experts_cls is not None
+        self.moe_kernel = make_nvfp4_moe_kernel(
+            moe_quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            experts_cls=self.experts_cls,
+            backend=self.nvfp4_backend,
+            routing_tables=layer._expert_routing_tables(),
+            layer=layer,
+            per_token_activation=True,
+        )
+        self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+
+
+class NvFp4PerTokenConfig(ModelOptNvFp4Config):
+    """Stock ModelOpt NVFP4 config with per-token FusedMoE activations."""
+
+    FusedMoEMethodCls = ModelOptNvFp4PerTokenFusedMoE
+
+    def get_name(self):
+        return NVFP4_PER_TOKEN_METHOD
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
+        # Never auto-select from checkpoint metadata; only an explicit
+        # quantization="nvfp4_pertoken" picks this config.
+        if user_quant == NVFP4_PER_TOKEN_METHOD:
+            return NVFP4_PER_TOKEN_METHOD
+        return None
+
+
+def register_nvfp4_pertoken() -> None:
+    """Register the per-token NVFP4 config through vLLM's public API."""
+    global _registered
+    if _registered:
+        return
+    register_quantization_config(NVFP4_PER_TOKEN_METHOD)(NvFp4PerTokenConfig)
+    _registered = True
+    logger.info("Registered vLLM quantization method %r", NVFP4_PER_TOKEN_METHOD)
+
+
+class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
+    """Refit transport for per-token NVFP4 rollouts.
+
+    Quantizes routed-expert BF16 weights to NVFP4 at refit-load time
+    (``NvFp4PerTokenQuantizer``), mirroring the fp8/mxfp8 real-quant rollout
+    path (``quantization/fp8.py``). Weight updates run inside vLLM's
+    layerwise reload lifecycle so quantized params are restored to load
+    format before loading and re-processed (per-token kernel rebuilt)
+    afterwards, preserving CUDA-graph-stable kernel storage.
+    """
+
+    _quantizer: Optional[NvFp4PerTokenQuantizer] = None
+
+    def _get_quantizer(self) -> NvFp4PerTokenQuantizer:
+        if self._quantizer is None:
+            self._quantizer = NvFp4PerTokenQuantizer(self.model_runner.model)
+        return self._quantizer
+
+    def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
+        super()._load_hf_weights(self._get_quantizer().process(policy_weights))
+
+    def maybe_init_zmq(self) -> None:
+        """Use a longer ZMQ timeout.
+
+        The first refit re-processes every layer (per-token kernel rebuild plus
+        FlashInfer autotune) before acknowledging the update.
+        """
+        import zmq
+
+        super().maybe_init_zmq()
+        self.zmq_socket.setsockopt(zmq.SNDTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
+        self.zmq_socket.setsockopt(zmq.RCVTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
+
+    @contextmanager
+    def _weight_update_lifecycle(
+        self, transport: WeightUpdateTransport
+    ) -> Iterator[WeightUpdateFinalizer]:
+        del transport
+        from vllm.model_executor.model_loader.reload import (
+            finalize_layerwise_reload,
+            initialize_layerwise_reload,
+        )
+
+        model = self.model_runner.model
+        # Reset on entry, not just at completion: _weight_update_errors_are_fatal
+        # is True, so a mid-refit exception propagates but the actor survives —
+        # a pending half from a failed refit must not silently pair with a
+        # fresh partner on the next one.
+        self._get_quantizer().reset()
+
+        with torch.device(self.device):
+            initialize_layerwise_reload(model)
+
+        def finalize() -> None:
+            self._get_quantizer().finish()
+            with torch.device(self.device):
+                finalize_layerwise_reload(model, self.model_config)
+            torch.accelerator.synchronize()
+
+        yield finalize
+
+    def _weight_update_errors_are_fatal(self) -> bool:
+        return True
+
+    def _synchronize_before_ipc_data_ack(self) -> None:
+        torch.accelerator.synchronize()
+
+
+def _reject_conflicting_engine_kwargs(llm_kwargs: dict[str, Any]) -> None:
+    """Reject explicit engine settings incompatible with per-token NVFP4."""
+    conflicts = [
+        key for key in ("worker_extension_cls", "quantization") if key in llm_kwargs
+    ]
+    if "load_format" in llm_kwargs and llm_kwargs["load_format"] != "dummy":
+        conflicts.append("load_format")
+    hf_overrides = llm_kwargs.get("hf_overrides")
+    if isinstance(hf_overrides, dict) and "quantization_config" in hf_overrides:
+        conflicts.append("hf_overrides.quantization_config")
+    if conflicts:
+        raise ValueError(
+            "nvfp4_pertoken cannot overwrite explicit vLLM settings: "
+            + ", ".join(sorted(set(conflicts)))
         )
 
 
-def expand_fused_expert_weights(
-    weights: Iterator[tuple[str, torch.Tensor]],
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Expand fused expert tensors back to per-expert ModelOpt checkpoint names.
+def configure_nvfp4_pertoken_engine_kwargs(
+    llm_kwargs: dict[str, Any],
+    ignore: list[str],
+    *,
+    explicit_engine_kwargs: dict[str, Any] | None = None,
+) -> None:
+    """Mutate vLLM engine kwargs for the per-token W4A4 rollout.
 
-    Inverse of :func:`iter_nvfp4_pertoken_weights`'s fused emission, applied
-    vLLM-side just before ``model.load_weights``. The fused tensors exist for
-    TRANSPORT only (per-expert streaming crawls through per-tensor IPC): vLLM's
-    ``RoutedExperts.load_weights`` expert mapping matches per-expert checkpoint
-    names (``experts.{e}.gate_proj.weight`` ...) or BF16 HF fused names
-    (``experts.gate_up_proj``), but NOT the ``w13_weight``/``w2_weight``
-    parameter names — those pass through unmatched and the layerwise-reload
-    finalize silently restores the previous kernel tensors
-    ("RoutedExperts: Failed to load weights"). Expansion is local slicing
-    (views, no copies), so it adds none of the per-tensor transport overhead
-    the fusing removed.
+    ``explicit_engine_kwargs`` carries the untouched user configuration when
+    the framework has already added defaults to ``llm_kwargs``. Direct callers
+    may omit it to treat every supplied engine kwarg as explicit.
+
+    - registers and selects the ``nvfp4_pertoken`` quantization method
+    - overrides the HF quantization config (weights NVFP4, activations dynamic)
+    - dummy initial load: params are NVFP4-shaped and the BF16 checkpoint on
+      disk cannot fill them; the first refit (which always precedes the first
+      generation) provides every weight
+    - installs the refit worker extension
     """
-    for name, tensor in weights:
-        m = _FUSED_EXPERT_RE.match(name)
-        if m is None:
-            yield name, tensor
-            continue
-        prefix, kind, part = m.group("prefix"), m.group("kind"), m.group("part")
-        num_experts = tensor.shape[0]
-        if kind == "w2" and part == "weight_scale_2":
-            # Last tensor of a layer's fused group (filter emission order is
-            # fixed). Also emit neutral input scales: the quant method
-            # registers w13/w2_input_scale params, so the layerwise reloader
-            # counts them in load_numel_total — without them every
-            # RoutedExperts layer stays "incomplete", vLLM buffers the whole
-            # model (~5.4GB/worker) and defers all processing to finalize.
-            # The per-token method overwrites input scales with 1.0 in
-            # process_weights_after_loading, so streamed 1.0s are consistent.
-            one = torch.ones((), device=tensor.device, dtype=torch.float32)
-            for e in range(num_experts):
-                yield f"{prefix}.{e}.down_proj.weight_scale_2", tensor[e]
-                for proj in ("gate_proj", "up_proj", "down_proj"):
-                    yield f"{prefix}.{e}.{proj}.input_scale", one
-        elif kind == "w2":
-            for e in range(num_experts):
-                yield f"{prefix}.{e}.down_proj.{part}", tensor[e]
-        elif part == "weight_scale_2":
-            # (E, 2) with identical columns (one shared gate+up global scale).
-            for e in range(num_experts):
-                yield f"{prefix}.{e}.gate_proj.weight_scale_2", tensor[e, 0]
-                yield f"{prefix}.{e}.up_proj.weight_scale_2", tensor[e, 1]
-        else:
-            n = tensor.shape[1] // 2
-            for e in range(num_experts):
-                yield f"{prefix}.{e}.gate_proj.{part}", tensor[e, :n]
-                yield f"{prefix}.{e}.up_proj.{part}", tensor[e, n:]
+    conflict_source = (
+        llm_kwargs if explicit_engine_kwargs is None else explicit_engine_kwargs
+    )
+    _reject_conflicting_engine_kwargs(conflict_source)
+    register_nvfp4_pertoken()
+    llm_kwargs["quantization"] = NVFP4_PER_TOKEN_METHOD
+    llm_kwargs["load_format"] = "dummy"
+    hf_overrides = llm_kwargs.setdefault("hf_overrides", {})
+    hf_overrides["quantization_config"] = build_nvfp4_pertoken_hf_quant_config(ignore)
+    llm_kwargs["worker_extension_cls"] = (
+        "nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken."
+        "NvFp4PerTokenWorkerExtension"
+    )
 
 
 def build_nvfp4_pertoken_hf_quant_config(ignore: list[str]) -> dict[str, Any]:
