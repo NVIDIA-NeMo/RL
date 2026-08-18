@@ -71,6 +71,16 @@ uv run tests/json_dump_tb_logs.py "${LOG_DIR}" --output_path "${JSON_METRICS}"
 # passes for a model a no-op would also satisfy. 4 prompts x 8 generations over
 # two steps is sized so that outcome is rare; at the observed ~1/8 solve rate
 # for this model it is on the order of 1e-4.
+#
+# The KL-family check uses js_divergence_error rather than gen_kl_error. Both
+# measure trainer-vs-rollout logprob disagreement, but that disagreement has a
+# non-zero floor set by Megatron-vs-vLLM kernel differences, and the floor grows
+# with model size. Measured with a refit that provably changed no parameter, the
+# gen_kl_error floor is 8.7e-4 to 1.3e-3 on Qwen3-30B-A3B, so an absolute
+# gen_kl_error < 1e-3 gate is unpassable there no matter how correct the refit is.
+# js_divergence_error is bounded and symmetric, and one bound holds across every
+# scale measured: 1.6e-4 here on 0.6B, 1.3e-4 on 4B dense, 5.0e-4 on 30B MoE.
 uv run tests/check_metrics.py "${JSON_METRICS}" \
     'max(data["train/token_mult_prob_error"]) < 1.05' \
+    'max(data["train/js_divergence_error"]) < 1e-3' \
     'max(data["train/grad_norm"]) > 0'
