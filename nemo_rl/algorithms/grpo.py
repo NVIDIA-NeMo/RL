@@ -2119,6 +2119,24 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     return num_masked
 
 
+def _prompt_grouping_ids(
+    prompt_token_ids: torch.Tensor,
+    *,
+    num_prompts: int,
+    num_generations_per_prompt: int,
+    use_nemo_gym: bool,
+) -> torch.Tensor:
+    """Return identities used to group generations from the same prompt."""
+    if not use_nemo_gym:
+        return prompt_token_ids
+
+    return (
+        torch.arange(num_prompts)
+        .repeat_interleave(num_generations_per_prompt)
+        .unsqueeze(1)
+    )
+
+
 def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     """Determine if NeMo-Gym should be used for rollouts and validation based on the configuration."""
     env_config = master_config.env
@@ -2845,7 +2863,12 @@ def grpo_train(
                         repeated_batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
-                    input_ids = batched_flat["token_ids"]
+                    prompt_grouping_ids = _prompt_grouping_ids(
+                        batched_flat["token_ids"],
+                        num_prompts=batch.size,
+                        num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
+                        use_nemo_gym=_should_use_nemo_gym(master_config),
+                    )
 
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 memory_tracker.snapshot_start_of_stage("Generation", dir())
@@ -2951,7 +2974,8 @@ def grpo_train(
                                 master_config.grpo.debug_payload_metrics
                             ),
                         )
-                        input_ids = nemo_gym_rollout_result.input_ids
+                        # Keep the repeated dataset prompt IDs for GRPO grouping.
+                        # Captured first-call prompts may contain harness-specific paths.
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
@@ -3036,7 +3060,7 @@ def grpo_train(
                         # Just fix the device id for now
                         device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids.cuda(device_id),
+                            prompt_grouping_ids.cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
@@ -3050,7 +3074,7 @@ def grpo_train(
                         std = std.cpu()
                     else:
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids,
+                            prompt_grouping_ids,
                             rewards,
                             torch.ones_like(rewards),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
@@ -3110,7 +3134,7 @@ def grpo_train(
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
                     del initial_prompt_message_logs
                     del prompt_batched_flat
-                    del input_ids
+                    del prompt_grouping_ids
                     del baseline
                     del std
 

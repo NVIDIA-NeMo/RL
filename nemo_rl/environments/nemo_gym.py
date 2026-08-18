@@ -401,6 +401,8 @@ def _attach_multimodal_data_to_user_message(
         processor=processor,
         pad_dynamic_image_shapes=pad_dynamic_image_shapes,
     )
+
+
 def _token_capture_metrics(
     per_rollout: list[dict[str, Any]], rebuilt: int, unbuilt: int, masked: int = 0
 ) -> dict[str, float]:
@@ -446,12 +448,12 @@ def _token_capture_metrics(
         # Calls the model returned with no generated tokens. Non-zero usually means the output
         # budget or a content filter is truncating generations before the first token.
         "token_capture/empty_generation_calls": total("empty_generation_calls"),
-        # How often a recorded parent link could not be used, so the builder inferred the parent
-        # from token prefixes instead. Inference is correct but cannot disambiguate a retry.
-        "token_capture/parent_link_fallbacks": float(
+        # Count recorded parent links that could not be used.
+        # Missing parents may fall back to token-prefix inference.
+        # Contradictory parent digests remain quarantined.
+        "token_capture/parent_link_failures": float(
             sum(
-                sum((m.get("parent_link_fallbacks") or {}).values())
-                for m in per_rollout
+                sum((m.get("parent_link_failures") or {}).values()) for m in per_rollout
             )
         ),
         # Counted from the build rather than the metrics dict: Gym puts the verdict at the top of
@@ -462,6 +464,31 @@ def _token_capture_metrics(
             sum(1 for m in per_rollout if m.get("capture_incomplete"))
         ),
     }
+
+
+def _build_token_capture_source(
+    global_config_dict: Any,
+) -> tuple[Any, list[Path]]:
+    """Build the source NeMo-RL uses with Gym's low-level rollout API."""
+    # NeMo Gym is optional outside the Gym environment path.
+    from nemo_gym.token_id_capture import TokenCaptureStore, installed_token_source
+    from nemo_gym.token_id_capture.config import TokenIdCaptureConfig
+    from nemo_gym.token_id_capture.consumer import token_id_capture_dirs_from_config
+
+    capture_config = TokenIdCaptureConfig.model_validate(global_config_dict)
+    capture_dirs = token_id_capture_dirs_from_config(global_config_dict)
+    if not capture_config.enabled:
+        return None, capture_dirs
+
+    source = capture_config.build_source() or installed_token_source()
+    if source is None and capture_dirs:
+        source = TokenCaptureStore(capture_dirs[0])
+    if source is None:
+        raise ValueError(
+            "NeMo-RL owns token-capture finalization when it calls run_examples directly. "
+            "Configure token_id_capture.dir or token_id_capture.source."
+        )
+    return source, capture_dirs
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -478,6 +505,9 @@ class NemoGym(EnvironmentInterface):
         self.head_server_config: Any = None
         self.node_ip: Optional[str] = None
         self.head_server_port: Optional[int] = None
+        self._token_capture_source: Any = None
+        self._token_capture_dirs: list[Path] = []
+        self._resolved_gym_config: Any = {}
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -608,6 +638,17 @@ Depending on your data shape, you may want to change these values."""
             )
         )
 
+        # This actor calls ``run_examples`` directly.
+        # It therefore owns token-source finalization and retirement.
+        from nemo_gym.global_config import get_global_config_dict
+
+        self._resolved_gym_config = get_global_config_dict()
+        self._token_capture_source, self._token_capture_dirs = (
+            _build_token_capture_source(
+                self._resolved_gym_config,
+            )
+        )
+
         # Setup for rollout collection
         self.head_server_config = BaseServerConfig(
             host=self.node_ip,
@@ -641,32 +682,28 @@ Depending on your data shape, you may want to change these values."""
 
         timer.start("_run_rollouts_total")
 
-        # Correlate each rollout so the Gym model server captures its model calls under a stable
-        # id, and resolve the token-capture dirs so a token-bearing response can be rebuilt for
-        # training. NeMo Gym's low-level run_examples (unlike its rollout_collection) does not
-        # stamp the correlation id; without one an external harness's model calls reach the model
-        # server uncorrelated (no /ng-rollout prefix) and nothing is captured.
+        # Correlate each rollout so Gym can capture its model calls.
+        # The low-level ``run_examples`` path does not stamp this id.
         from nemo_gym.global_config import ROLLOUT_ID_KEY_NAME
-        from nemo_gym.token_id_capture import (
-            TokenCaptureStore,
-            token_id_capture_dirs_from_config,
+        from nemo_gym.token_id_capture.config import (
+            token_id_capture_enabled_for_agent,
         )
-        from nemo_gym.token_id_capture.delivery import finalize_rollout_token_capture
+        from nemo_gym.token_id_capture.consumer import (
+            clear_token_captures_for_rollouts,
+        )
+        from nemo_gym.token_id_capture.delivery import (
+            finalize_rollout_token_capture,
+            retire_rollout_token_capture,
+        )
 
-        global_config_dict = self.cfg.get("initial_global_config_dict") or {}
-        token_capture_dirs = token_id_capture_dirs_from_config(global_config_dict)
-        # Where records are read from and retired. The colocated file store for now; a framework
-        # staging records through its own data plane passes its own TokenSource here instead, and
-        # nothing else in this path changes.
-        token_source = (
-            TokenCaptureStore(token_capture_dirs[0]) if token_capture_dirs else None
-        )
-        if token_capture_dirs and not getattr(self, "_checked_capture_dirs", False):
+        token_source = self._token_capture_source
+        if self._token_capture_dirs and not getattr(
+            self, "_checked_capture_dirs", False
+        ):
             self._checked_capture_dirs = True
-            # Writer (the Gym model server) and reader (this actor) are on the same node, so the
-            # directory must be node-local. A shared filesystem adds network latency to the capture
-            # hot path for nothing and, under sharding, lets two shards write the same file.
-            for capture_dir in token_capture_dirs:
+            # The default writer and reader are colocated.
+            # A node-local directory avoids network latency and shard collisions.
+            for capture_dir in self._token_capture_dirs:
                 if any(
                     str(capture_dir).startswith(prefix)
                     for prefix in ("/lustre", "/gpfs", "/mnt/shared")
@@ -689,10 +726,24 @@ Depending on your data shape, you may want to change these values."""
         # as a fallback for callers that have nothing better.
         if not hasattr(self, "_rollout_seq"):
             self._rollout_seq = 0
-            self._rollout_id_base = uuid.uuid4().int % (1 << 24)
+            self._rollout_id_base = uuid.uuid4().hex
         for row in nemo_gym_examples:
             row[ROLLOUT_ID_KEY_NAME] = f"s{self._rollout_id_base}-{self._rollout_seq}"
             self._rollout_seq += 1
+
+        selected_rows = [
+            row
+            for row in nemo_gym_examples
+            if token_id_capture_enabled_for_agent(
+                self._resolved_gym_config,
+                (row.get("agent_ref") or {}).get("name"),
+            )
+        ]
+        if self._token_capture_dirs and selected_rows:
+            clear_token_captures_for_rollouts(
+                selected_rows,
+                self._token_capture_dirs,
+            )
 
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
@@ -725,14 +776,17 @@ Depending on your data shape, you may want to change these values."""
                         raise typed from None
                     raise
 
-            # A rollout whose returned output has no token ids gets them attached from what was
-            # recorded for it; one that already carries them is left alone. Gym decides that from
-            # the rollout itself, so a batch can mix native agents and external harnesses, and this
-            # call does not need to know which this is.
-            if token_source is not None:
-                # run_examples returns the harness result without the correlation key, which the
-                # lookup needs. Gym's rollout collection copies it onto the result for the same
-                # reason; this is that copy for the low-level path.
+            built = None
+            rollout_id = nemo_gym_row[ROLLOUT_ID_KEY_NAME]
+            original_output = (nemo_gym_result.get("response") or {}).get("output")
+            if not isinstance(original_output, list):
+                original_output = None
+            capture_selected = token_id_capture_enabled_for_agent(
+                self._resolved_gym_config,
+                (nemo_gym_row.get("agent_ref") or {}).get("name"),
+            )
+            if token_source is not None and capture_selected:
+                # The low-level path does not copy correlation onto the result.
                 nemo_gym_result[ROLLOUT_ID_KEY_NAME] = nemo_gym_row[ROLLOUT_ID_KEY_NAME]
                 built = await finalize_rollout_token_capture(
                     nemo_gym_result, token_source
@@ -751,6 +805,7 @@ Depending on your data shape, you may want to change these values."""
                     nemo_gym_result,
                     tokenizer,
                     include_initial_multimodal_data=not deduplicate_multimodal_data,
+                    media_output_items=original_output,
                 )
                 if _has_nan_generation_logprobs(nemo_rl_result):
                     raise RuntimeError("Generation logprobs contain NaN")
@@ -792,6 +847,7 @@ Depending on your data shape, you may want to change these values."""
                 )
 
             yield nemo_gym_row["_rowidx"], nemo_rl_result, timing_metrics
+            await retire_rollout_token_capture(rollout_id, token_source, built)
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,
@@ -800,6 +856,7 @@ Depending on your data shape, you may want to change these values."""
         tokenizer: PreTrainedTokenizerBase,
         *,
         include_initial_multimodal_data: bool = True,
+        media_output_items: list[dict] | None = None,
     ) -> dict:
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
@@ -860,7 +917,9 @@ Depending on your data shape, you may want to change these values."""
             )
         per_turn_images = (
             _index_per_turn_images(
-                response["output"],
+                response["output"]
+                if media_output_items is None
+                else media_output_items,
                 input_messages=media_messages,
             )
             if processor is not None
@@ -1060,12 +1119,16 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
         return result
 
-    def shutdown(self) -> None:
-        # Teardown runs in a finally block, so it must not turn a real training error
-        # into a confusing AttributeError from a never-spun-up (e.g. restarted) actor.
-        if self.rh is None:
-            return
-        self.rh.shutdown()
+    async def shutdown(self) -> None:
+        """Close token capture and stop Gym servers."""
+        try:
+            if self._token_capture_source is not None:
+                await self._token_capture_source.close()
+                self._token_capture_source = None
+        finally:
+            # A restarted actor may not have completed spinup.
+            if self.rh is not None:
+                self.rh.shutdown()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.

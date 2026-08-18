@@ -1316,7 +1316,6 @@ def ppo_train(
                             max_rollout_turns=None,
                             greedy=False,
                         )
-                        input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result

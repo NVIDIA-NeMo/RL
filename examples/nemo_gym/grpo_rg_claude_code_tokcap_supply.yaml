@@ -204,6 +204,9 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null # NeMo Gym path rejects a non-null top_k (not OpenAI compatible)
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
@@ -268,6 +271,7 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/reasoning_gym/configs/reasoning_gym_claude_code_agent_model_server.yaml  # claude_code harness bound to the Gym model server
+    - responses_api_models/vllm_model/configs/vllm_model_supply_prefix.yaml  # prefix supply ON; requires the Gym supplying branch or higher
     # The harness builds its own requests and never reads the row, so it sends no sampling
     # params and the engine would apply a default of its own. Pin the training profile on the
     # model server it talks to. setup_nemo_gym_config publishes policy_generation_sampling.
@@ -277,15 +281,13 @@ env:
           sampling_overrides:
             temperature: ${policy.generation.temperature}
             top_p: ${policy.generation.top_p}
-    - responses_api_models/vllm_model/configs/vllm_model_supply_prefix.yaml  # prefix supply ON; requires the Gym supplying branch or higher
-    # External-harness token-id capture: the harness returns no token ids, so capture them and rebuild.
-    # token_capture_dir is node-local (the model server and the reader are colocated on one node).
+    # Capture every agent because this is a training-only recipe.
+    # The NeMo-RL actor owns reconstruction and retirement.
     token_id_capture:
       enabled: true
+      all_agents: true
       dir: /tmp/ng_tokcap_smoke
-      # The read route is not used here: the trainer and the model server are colocated on one
-      # node, so records are read straight off the store. Set read_token to guard that route once
-      # the harness is sandboxed and has to fetch over HTTP.
+      rebuild_response: false
 
 logger:
   log_dir: "logs"  # Base directory for all logs

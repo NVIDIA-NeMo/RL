@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import time
 from copy import deepcopy
@@ -29,9 +30,10 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.environments.nemo_gym import (
-    _token_capture_metrics,
     NemoGym,
     NemoGymConfig,
+    _build_token_capture_source,
+    _token_capture_metrics,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
@@ -48,6 +50,20 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+class _ConfiguredTokenSource:
+    def __init__(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+
+    async def freeze(self, rollout_id: str) -> object:
+        raise NotImplementedError
+
+    async def drop(self, rollout_id: str, *, snapshot_id: str, version: int) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
 
 
 def test_extract_reward_components():
@@ -870,9 +886,9 @@ class TestTokenCaptureMetrics:
             {
                 "capture_incomplete": True,
                 "empty_generation_calls": 1,
-                "parent_link_fallbacks": {"parent_digest_mismatch": 2},
+                "parent_link_failures": {"parent_digest_mismatch": 2},
             },
-            {"empty_generation_calls": 2, "parent_link_fallbacks": {}},
+            {"empty_generation_calls": 2, "parent_link_failures": {}},
         ]
         # The mask verdict is counted from the build, not read out of the metrics dict, because
         # Gym now puts it at the top of the rollout record and leaves only reasons in the dict.
@@ -881,9 +897,168 @@ class TestTokenCaptureMetrics:
         assert got["token_capture/incomplete_rollouts"] == 1.0
         assert got["token_capture/empty_generation_calls"] == 3.0
         # Fallback reasons are counted per reason, then summed across the batch.
-        assert got["token_capture/parent_link_fallbacks"] == 2.0
+        assert got["token_capture/parent_link_failures"] == 2.0
         assert got["token_capture/rollouts_unbuilt"] == 1.0
         assert got["token_capture/rebuilt_fraction"] == 0.5
 
     def test_emits_nothing_when_capture_is_off(self):
         assert _token_capture_metrics([], rebuilt=0, unbuilt=0) == {}
+
+
+@pytest.mark.parametrize(
+    "recipe_name",
+    [
+        "grpo_rg_claude_code_tokcap.yaml",
+        "grpo_rg_claude_code_tokcap_smoke.yaml",
+        "grpo_rg_claude_code_tokcap_supply.yaml",
+        "grpo_rg_claude_code_tokcap_tools.yaml",
+    ],
+)
+def test_token_capture_recipes_use_actor_owned_file_delivery(recipe_name):
+    recipe = safe_load((Path("examples/nemo_gym") / recipe_name).read_text())
+    capture = recipe["env"]["nemo_gym"]["token_id_capture"]
+
+    assert capture == {
+        "enabled": True,
+        "all_agents": True,
+        "dir": capture["dir"],
+        "rebuild_response": False,
+    }
+
+
+def test_build_token_capture_source_uses_the_default_file_store(tmp_path):
+    source, directories = _build_token_capture_source(
+        {
+            "token_id_capture": {
+                "enabled": True,
+                "dir": str(tmp_path),
+                "rebuild_response": False,
+            }
+        }
+    )
+
+    assert source.root == tmp_path
+    assert directories == [tmp_path]
+
+
+def test_build_token_capture_source_loads_a_framework_data_plane():
+    source, directories = _build_token_capture_source(
+        {
+            "token_id_capture": {
+                "enabled": True,
+                "source": f"{__name__}:_ConfiguredTokenSource",
+                "source_kwargs": {"endpoint": "transfer-queue://tokens"},
+                "rebuild_response": False,
+            }
+        }
+    )
+
+    assert isinstance(source, _ConfiguredTokenSource)
+    assert source.endpoint == "transfer-queue://tokens"
+    assert directories == []
+
+
+@pytest.mark.asyncio
+async def test_run_rollouts_retires_capture_after_yield_is_accepted(monkeypatch):
+    """Keep frozen evidence until the rollout consumer requests another item."""
+    from nemo_gym.global_config import ROLLOUT_ID_KEY_NAME
+    from nemo_gym.token_id_capture import config as capture_config
+    from nemo_gym.token_id_capture import delivery
+
+    events = []
+    original_output = [
+        {"type": "function_call_output", "output": "data:image/png;base64,image"}
+    ]
+    rebuilt_output = [{"generation_token_ids": [1]}]
+
+    async def finalize(result, source):
+        rollout_id = result[ROLLOUT_ID_KEY_NAME]
+        assert rollout_id.startswith("s")
+        assert len(rollout_id.split("-", maxsplit=1)[0]) == 33
+        result["response"]["output"] = rebuilt_output
+        events.append("finalize")
+        return {
+            "rebuilt_response": {"output": rebuilt_output},
+            "metrics": {"n_calls": 2},
+            "_capture_snapshot": {"snapshot_id": "snapshot", "version": 1},
+        }
+
+    async def retire(rollout_id, source, built):
+        assert rollout_id.startswith("s")
+        assert built["_capture_snapshot"]["snapshot_id"] == "snapshot"
+        events.append("retire")
+        return True
+
+    monkeypatch.setattr(delivery, "finalize_rollout_token_capture", finalize)
+    monkeypatch.setattr(delivery, "retire_rollout_token_capture", retire)
+    monkeypatch.setattr(
+        capture_config,
+        "token_id_capture_enabled_for_agent",
+        lambda config, agent_name: agent_name == "captured",
+    )
+
+    row = {
+        "_rowidx": 0,
+        "agent_ref": {"name": "captured"},
+        "responses_create_params": {"input": []},
+    }
+    result = {
+        "response": {"output": original_output},
+        "responses_create_params": {"input": []},
+    }
+
+    class RolloutHelper:
+        def run_examples(self, *, examples, head_server_config):
+            async def completed():
+                return examples[0], result
+
+            return [asyncio.create_task(completed())]
+
+    actor_class = NemoGym.__ray_metadata__.modified_class
+    actor = actor_class(
+        NemoGymConfig(model_name="model", base_urls=[], initial_global_config_dict={})
+    )
+    actor.rh = object()
+    actor.rch = RolloutHelper()
+    actor.head_server_config = object()
+    actor._resolved_gym_config = {}
+    actor._token_capture_source = object()
+
+    def postprocess(row, finalized_result, tokenizer, **kwargs):
+        assert finalized_result["response"]["output"] is rebuilt_output
+        assert kwargs["media_output_items"] is original_output
+        return {"message_log": []}
+
+    actor._postprocess_nemo_gym_to_nemo_rl_result = postprocess
+
+    rollouts = actor.run_rollouts([row], object(), "test")
+    await anext(rollouts)
+    assert events == ["finalize"]
+
+    with pytest.raises(StopAsyncIteration):
+        await anext(rollouts)
+    assert events == ["finalize", "retire"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_the_token_source_before_gym_servers():
+    events = []
+
+    class Source:
+        async def close(self):
+            events.append("source")
+
+    class RunHelper:
+        def shutdown(self):
+            events.append("servers")
+
+    actor_class = NemoGym.__ray_metadata__.modified_class
+    actor = actor_class(
+        NemoGymConfig(model_name="model", base_urls=[], initial_global_config_dict={})
+    )
+    actor._token_capture_source = Source()
+    actor.rh = RunHelper()
+
+    await actor.shutdown()
+
+    assert events == ["source", "servers"]
