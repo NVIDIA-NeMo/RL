@@ -120,10 +120,11 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
     def _reject_kv_scales(self, kv_scales: Optional[dict[str, float]]) -> None:
         # The SGLang refit carries no KV-cache scales. Reject them rather than
         # dropping them silently, so an FP8-KV config fails loudly.
-        assert kv_scales is None, (
-            "The SGLang weight transports do not support kv_scales; "
-            f"got {sorted(kv_scales)!r}."
-        )
+        if kv_scales is not None:
+            raise ValueError(
+                "The SGLang weight transports do not support kv_scales; "
+                f"got {sorted(kv_scales)!r}."
+            )
 
     def _refit(self, buffer_size_bytes: int) -> None:
         from nemo_rl.models.generation.sglang.config import (
