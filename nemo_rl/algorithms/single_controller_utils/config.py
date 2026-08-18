@@ -28,6 +28,7 @@ from pydantic import (
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
+    ReadyFirstSamplerConfig,
     SamplerConfig,
     required_buffer_capacity_for_config,
 )
@@ -495,6 +496,18 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         required_capacity=required_capacity,
         sampler_name=async_config.sampler.name,
     )
+
+    if isinstance(async_config.sampler, ReadyFirstSamplerConfig):
+        if not master_config.loss_fn.use_importance_sampling_correction:
+            raise ValueError(
+                "the ready_first sampler requires "
+                "loss_fn.use_importance_sampling_correction=true"
+            )
+        if master_config.loss_fn.force_on_policy_ratio:
+            raise ValueError(
+                "the ready_first sampler requires "
+                "loss_fn.force_on_policy_ratio=false so prev_logprobs are used"
+            )
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no
     # validation loop yet (see _save_checkpoint), so a "val:" metric would

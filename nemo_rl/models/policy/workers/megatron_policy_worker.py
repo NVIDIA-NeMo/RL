@@ -50,6 +50,11 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.multimodal_utils import (
+    attach_media_token_validity_mask,
+    chunks_accept_media_token_validity_mask,
+    media_placeholder_token_id_from_chunks,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -179,6 +184,24 @@ def _model_slices_context_parallel_inputs(model: Any) -> bool:
         bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
         for chunk in chunks
     )
+
+
+def _unwrapped_chunks(model: Any) -> list[Any]:
+    """Model chunks as a flat list, whatever wrapping the caller handed us."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    return list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+
+
+def _model_media_placeholder_token_id(model: Any) -> Optional[int]:
+    """The vocabulary id this model treats as a media placeholder, if any."""
+    return media_placeholder_token_id_from_chunks(_unwrapped_chunks(model))
+
+
+def _model_accepts_media_token_validity_mask(model: Any) -> bool:
+    """Whether the model's forward takes an explicit media-token validity mask."""
+    return chunks_accept_media_token_validity_mask(_unwrapped_chunks(model))
 
 
 def _estimate_refit_tensor_size_in_bytes(
@@ -596,6 +619,14 @@ class MegatronPolicyWorkerImpl(
         self.model_slices_context_parallel_inputs = (
             _model_slices_context_parallel_inputs(self.model)
         )
+        # A media placeholder is an ordinary vocabulary entry, so text that
+        # legitimately contains it must not be read as an anchor demanding a
+        # projected feature. Only models that accept the mask are sent one.
+        self.media_placeholder_token_id = (
+            _model_media_placeholder_token_id(self.model)
+            if _model_accepts_media_token_validity_mask(self.model)
+            else None
+        )
         if self.model_slices_context_parallel_inputs:
             if self.delegate_pack_to_model:
                 raise RuntimeError(
@@ -813,6 +844,8 @@ class MegatronPolicyWorkerImpl(
                         "sample_mask"
                     ].unsqueeze(-1)
                     batch["mtp_loss_mask"] = mtp_loss_mask
+
+                attach_media_token_validity_mask(batch, self.media_placeholder_token_id)
 
                 (
                     data_iterator,
@@ -1648,6 +1681,11 @@ class MegatronPolicyWorkerImpl(
 
         self.model.eval()
 
+        # Logprobs run the same forward as training, so a batch that needs the
+        # mask needs it here too -- otherwise these logprobs would be taken
+        # against a different media alignment than the one trained on.
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
+
         (
             mb_iterator,
             num_microbatches,
@@ -1866,6 +1904,8 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.model.eval()
+
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
 
         (
             mb_iterator,
