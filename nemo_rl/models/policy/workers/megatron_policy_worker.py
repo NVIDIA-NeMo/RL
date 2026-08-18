@@ -71,6 +71,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
+    build_inference_model,
     finalize_megatron_setup,
     handle_model_import,
     setup_distributed,
@@ -495,6 +496,7 @@ class MegatronPolicyWorkerImpl(
         self.offload_optimizer_for_logprob = (
             runtime_config.offload_optimizer_for_logprob
         )
+        self.offload_optimizer_for_refit = runtime_config.offload_optimizer_for_refit
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
@@ -537,6 +539,7 @@ class MegatronPolicyWorkerImpl(
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
+        self._colocated_reshard_plan = model_and_optimizer_state.colocated_reshard_plan
         log_gpu_memory_diagnostics(
             label="after_model_setup", worker_type="MegatronPolicyWorker"
         )
@@ -616,6 +619,11 @@ class MegatronPolicyWorkerImpl(
                     "Nemotron Omni caller-packed THD inputs do not yet support "
                     "virtual pipeline parallelism."
                 )
+
+        # Colocated reshard: build a dedicated inference-layout model container.
+        self.inference_model = None
+        self._swap_weights_plan_prepared = False
+        self._inference_model_offloaded = False
 
         # vars used for refit
         ## will be initialized in prepare_refit_info
@@ -2737,6 +2745,29 @@ class MegatronPolicyWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
+    def _build_colocated_inference_model(self, config: PolicyConfig) -> None:
+        """Build the dedicated inference-layout model planned at setup."""
+        plan = self._colocated_reshard_plan
+        inference_mcfg = plan.inference_megatron_cfg
+        inference_config = {**config, "megatron_cfg": inference_mcfg}
+
+        print(
+            "[colocated-reshard] building dedicated inference model "
+            f"(inference TP={inference_mcfg['tensor_model_parallel_size']} "
+            f"PP={inference_mcfg['pipeline_model_parallel_size']} "
+            f"EP={inference_mcfg['expert_model_parallel_size']} "
+            f"CP={inference_mcfg['context_parallel_size']} "
+            f"impl={inference_mcfg.get('transformer_impl')})",
+            flush=True,
+        )
+        # Built inside the first prepare_for_generation, immediately before the
+        # reshard needs it resident; finish_generation offloads it afterwards.
+        self.inference_model = build_inference_model(
+            inference_config, self.megatron_cfg, plan.initial_model_provider
+        )
+        # The plan is consumed (provider mutated to the inference layout); release it.
+        self._colocated_reshard_plan = None
+
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
         self.model = self.move_model(
@@ -2873,6 +2904,7 @@ class MegatronPolicyWorkerImpl(
             hasattr(self, "optimizer")
             and self.optimizer is not None
             and not self.optimizer_cpu_offload
+            and self.offload_optimizer_for_refit
         ):
             self.move_optimizer("cpu")
 

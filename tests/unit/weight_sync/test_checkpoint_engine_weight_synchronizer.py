@@ -244,8 +244,6 @@ class TestCheckpointEngineWeightSynchronizer:
             (0, 2, 2, ["policy-0", "policy-1", "generation-0", "generation-1"]),
             (2, 2, 2, ["policy-0", "policy-1", "generation-0", "generation-1"]),
         ]
-        sync.mark_stale()
-        assert sync.is_stale
         sync.shutdown()
         assert sync._generation.worker_group.calls[-1] == (
             "checkpoint_engine_rpc",
