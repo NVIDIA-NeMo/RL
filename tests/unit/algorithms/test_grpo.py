@@ -40,6 +40,7 @@ from nemo_rl.algorithms.grpo import (
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
     _needs_hf_refit_handshake,
+    _prompt_grouping_ids,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
@@ -172,6 +173,30 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+def test_nemo_gym_prompt_grouping_does_not_depend_on_placeholder_tokens() -> None:
+    grouping_ids = _prompt_grouping_ids(
+        torch.empty((4, 0)),
+        num_prompts=2,
+        num_generations_per_prompt=2,
+        use_nemo_gym=True,
+    )
+
+    assert torch.equal(grouping_ids, torch.tensor([[0], [0], [1], [1]]))
+
+
+def test_native_prompt_grouping_uses_prompt_tokens() -> None:
+    prompt_token_ids = torch.tensor([[1, 2], [1, 2], [3, 4], [3, 4]])
+
+    grouping_ids = _prompt_grouping_ids(
+        prompt_token_ids,
+        num_prompts=2,
+        num_generations_per_prompt=2,
+        use_nemo_gym=False,
+    )
+
+    assert grouping_ids is prompt_token_ids
 
 
 def test_initial_policy_generation_stale() -> None:

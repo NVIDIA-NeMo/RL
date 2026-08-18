@@ -227,11 +227,18 @@ def _add_r3_fallback_metrics(
 
 
 def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
-    """Return True for samples the environment asks GRPO to mask from loss."""
+    """Return True for samples the environment asks GRPO to mask from loss.
+
+    Two places set it. An agent that decides its own rollout is unusable puts it in the instance
+    config it returns, which is where the SWE agents put it. Gym's token capture puts it at the top
+    of the record, because rollout collection does not own the agent's instance config and a
+    consumer should not have to know the feature exists to find the flag. Either one masks.
+    """
     return torch.tensor(
         [
             bool(
-                (result["full_result"].get("instance_config") or {}).get(
+                result["full_result"].get("mask_sample")
+                or (result["full_result"].get("instance_config") or {}).get(
                     "mask_sample", False
                 )
             )
