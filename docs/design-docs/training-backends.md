@@ -102,6 +102,38 @@ Offloading saves GPU memory but adds CPU transfer and synchronization work, so
 benchmark the memory and throughput tradeoff for the target model, sequence
 length, hardware, and parallelism configuration.
 
+#### Optimizer CPU Offload
+
+The Megatron backend can use Megatron Core's `HybridDeviceOptimizer` to keep a
+fraction of optimizer state and optimizer computation on CPU:
+
+```yaml
+policy:
+  megatron_cfg:
+    optimizer:
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 0.5
+      overlap_cpu_optimizer_d2h_h2d: true
+```
+
+`optimizer_offload_fraction` must be greater than `0` and at most `1`. A value
+of `1.0` fully offloads the optimizer; smaller values trade less GPU memory
+savings for more GPU-resident optimizer work. Optimizer CPU offload requires
+`use_distributed_optimizer: true`; the non-distributed mixed-precision wrapper
+is incompatible with the hybrid optimizer's parameter mapping. The pinned
+Megatron Core version supports optimizer CPU offload only with Adam and SGD.
+Enabling `overlap_cpu_optimizer_d2h_h2d` lets Megatron Core overlap optimizer
+state transfers with CPU optimizer updates. At high offload fractions, CPU Adam
+can dominate iteration time; enable this overlap to hide D2H and H2D transfers
+behind the CPU optimizer step.
+
+Megatron Core owns optimizer state placement while this mode is enabled, so
+NeMo RL does not run its generic per-phase optimizer move during colocated
+training and generation. With fractional offload, the non-offloaded optimizer
+state remains GPU resident; choose a fraction that leaves enough GPU memory for
+the colocated generation backend. Optimizer CPU offload is independent of
+activation CPU offload.
+
 ### DTensor Backend
 To enable DTensor (FSDP2) training:
 

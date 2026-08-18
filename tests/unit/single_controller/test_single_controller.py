@@ -78,6 +78,8 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         tq_buffer=None,
         rollout_manager=SimpleNamespace(_tq_buffer=None),
         env_handles={},
+        fleet_monitor=None,
+        generation_router=None,
         train_cluster=None,
         inference_cluster=None,
     )
@@ -132,6 +134,8 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         tq_buffer=None,
         rollout_manager=SimpleNamespace(_tq_buffer=None),
         env_handles={},
+        fleet_monitor=None,
+        generation_router=None,
         train_cluster=None,
         inference_cluster=None,
         save_state=_initial_grpo_save_state(),

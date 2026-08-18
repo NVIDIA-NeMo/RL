@@ -180,9 +180,13 @@ PYTHONUNBUFFERED=1 uv run "$PROJECT_ROOT"/examples/run_grpo_single_controller.py
     async_rl.max_buffered_rollouts=2 \
     ++async_rl.rollout_failure.native.generation_timeout_s=60 \
     ++async_rl.rollout_failure.max_infra_attempts_per_prompt=3 \
-    ++async_rl.watchdog.interval_s=10 \
-    ++async_rl.watchdog.stall_timeout_s=180 \
-    ++async_rl.watchdog.stall_action=abort \
+    ++async_rl.stall_watchdog.interval_s=10 \
+    ++async_rl.stall_watchdog.stall_timeout_s=180 \
+    ++async_rl.stall_watchdog.stall_action=abort \
+    ++async_rl.generation_fleet_health.enabled=true \
+    ++async_rl.generation_fleet_health.probe_interval_s=5 \
+    ++async_rl.generation_fleet_health.probe_timeout_s=2 \
+    ++async_rl.generation_fleet_health.unhealthy_threshold=3 \
     > "$RUN_LOG" 2>&1 &
 TRAIN_PID=$!
 
@@ -365,9 +369,9 @@ if [[ $EXIT_CODE -eq 0 ]]; then
 fi
 
 # The failure must name the rollout path, not surface as a bare Ray traceback.
-if grep -qE "RolloutRedispatchExhausted|GenerationUnavailable|RolloutStall|RolloutTimeout" "$RUN_LOG"; then
+if grep -qE "RolloutRedispatchExhausted|GenerationUnavailable|RolloutStall|RolloutTimeout|GenerationFleetExhausted" "$RUN_LOG"; then
     echo "[chaos] PASS: bounded, attributable failure ${ELAPSED}s after the kill"
-    grep -oE "RolloutRedispatchExhausted|GenerationUnavailable|RolloutStall|RolloutTimeout" "$RUN_LOG" | sort | uniq -c
+    grep -oE "RolloutRedispatchExhausted|GenerationUnavailable|RolloutStall|RolloutTimeout|GenerationFleetExhausted" "$RUN_LOG" | sort | uniq -c
     exit 0
 fi
 
