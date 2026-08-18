@@ -86,7 +86,7 @@ row=$(awk -F $'\t' -v id="${run_id}" '
   exit 2
 }
 
-IFS=$'\t' read -r _ model_family recipe nodes arm max_steps <<<"${row}"
+IFS=$'\t' read -r _ model_family recipe nodes arm max_steps variant <<<"${row}"
 config_rel="examples/configs/recipes/llm/performance/${recipe}"
 config_path="${PROJECT_ROOT}/${config_rel}"
 if [[ ! -f ${config_path} ]]; then
@@ -110,6 +110,21 @@ if [[ ${model_family} == "DeepSeek-V3" ]]; then
   policy.model_name=${checkpoint_q} \\
   policy.tokenizer.name=${checkpoint_q}"
 fi
+
+variant_overrides=""
+case ${variant} in
+  default)
+    ;;
+  logprob_chunk1024)
+    variant_overrides=" \\
+  policy.logprob_chunk_size=1024 \\
+  policy.megatron_cfg.defer_fp32_logits=true"
+    ;;
+  *)
+    echo "Unsupported matrix variant: ${variant}" >&2
+    exit 2
+    ;;
+esac
 
 expected_nodes=$(awk '
   /^cluster:/ { in_cluster = 1; next }
@@ -179,7 +194,7 @@ UV_NO_SYNC=1 uv run examples/run_grpo.py \\
   logger.wandb_enabled=True \\
   logger.wandb.project=\"${WANDB_PROJECT}\" \\
   logger.wandb.name=\"${run_id}\" \\
-  logger.monitor_gpus=True${model_overrides}"
+  logger.monitor_gpus=True${model_overrides}${variant_overrides}"
 
 export BASE_LOG_DIR="${run_dir}/ray"
 export CONTAINER
@@ -218,6 +233,6 @@ if [[ ${test_only} == "--test-only" ]]; then
   sbatch_args+=("--test-only")
 fi
 
-echo "Submitting ${run_id}: model=${model_family} arm=${arm} nodes=${nodes} steps=${max_steps}"
+echo "Submitting ${run_id}: model=${model_family} arm=${arm} variant=${variant} nodes=${nodes} steps=${max_steps}"
 cd "${PROJECT_ROOT}"
 COMMAND="${command}" sbatch "${sbatch_args[@]}" ray.sub

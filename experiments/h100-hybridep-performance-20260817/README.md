@@ -78,9 +78,13 @@ it, avoiding concurrent multi-node force-rebuild races.
 3. Run three-step HybridEP smoke jobs for the remaining ten recipes to detect
    startup OOMs and initialization failures without duplicating every large
    baseline. A three-step pass is not reported as long-run OOM clearance.
-4. Keep each recipe's inherited validation schedule unchanged so the default
+4. Run a matched Qwen3-30B diagnostic pair with
+   `logprob_chunk_size=1024` and `defer_fp32_logits=true`. This pair determines
+   whether chunking alone makes the existing AllToAll baseline fit on the
+   current H100 allocation; it remains separate from the default-recipe A/B.
+5. Keep each recipe's inherited validation schedule unchanged so the default
    runtime path, including validation at Steps 10 and 20, is exercised.
-5. Compute steady-state training performance over Steps 2 through 20 excluding
+6. Compute steady-state training performance over Steps 2 through 20 excluding
    validation Steps 10 and 20. Report validation-inclusive operational step
    time separately. If a job records fewer steps, report the exact observed
    window and do not compare it as a completed 20-step result.

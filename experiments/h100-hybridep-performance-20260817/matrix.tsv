@@ -1,19 +1,21 @@
-run_id	model_family	recipe	nodes	arm	max_steps
-deepseek-v3-baseline	DeepSeek-V3	grpo-deepseek-v3-32n8g.yaml	32	baseline	20
-deepseek-v3-hybridep	DeepSeek-V3	grpo-deepseek-v3-32n8g.yaml	32	hybridep	20
-nemotron3-super-baseline	Nemotron3-Super-120B-A12B	grpo-nemotron3-super-120BA12B-32n8g.yaml	32	baseline	20
-nemotron3-super-hybridep	Nemotron3-Super-120B-A12B	grpo-nemotron3-super-120BA12B-32n8g.yaml	32	hybridep	20
-qwen3-235b-baseline	Qwen3-235B-A22B	grpo-qwen3-235b-16n8g.yaml	16	baseline	20
-qwen3-235b-hybridep	Qwen3-235B-A22B	grpo-qwen3-235b-16n8g.yaml	16	hybridep	20
-qwen3-30b-baseline	Qwen3-30B-A3B	grpo-qwen3-30ba3b-4n8g.yaml	4	baseline	20
-qwen3-30b-hybridep	Qwen3-30B-A3B	grpo-qwen3-30ba3b-4n8g.yaml	4	hybridep	20
-dapo-deepseek-v3-64n8g-smoke	DeepSeek-V3	dapo-deepseek-v3-64n8g.v2.yaml	64	hybridep	3
-deepseek-v3-64n8g-smoke	DeepSeek-V3	grpo-deepseek-v3-64n8g.yaml	64	hybridep	3
-deepseek-v3-64n8g-async-smoke	DeepSeek-V3	grpo-deepseek-v3-64n8g-async-1off.yaml	64	hybridep	3
-deepseek-v3-64n8g-fp8-async-smoke	DeepSeek-V3	grpo-deepseek-v3-64n8g-fp8-async-1off.yaml	64	hybridep	3
-nemotron3-super-async-smoke	Nemotron3-Super-120B-A12B	grpo-nemotron3-super-120BA12B-32n8g-async-1off.yaml	32	hybridep	3
-qwen3-235b-32n8g-smoke	Qwen3-235B-A22B	grpo-qwen3-235b-32n8g.yaml	32	hybridep	3
-qwen3-235b-32n8g-async-smoke	Qwen3-235B-A22B	grpo-qwen3-235b-32n8g-async-1off.yaml	32	hybridep	3
-qwen3-30b-40k-smoke	Qwen3-30B-A3B	grpo-qwen3-30ba3b-4n8g-40K.yaml	4	hybridep	3
-qwen3-30b-async-smoke	Qwen3-30B-A3B	grpo-qwen3-30ba3b-4n8g-async-1off.yaml	4	hybridep	3
-qwen3-30b-24n8g-async-smoke	Qwen3-30B-A3B	grpo-qwen3-30ba3b-24n8g-async-8off.yaml	24	hybridep	3
+run_id	model_family	recipe	nodes	arm	max_steps	variant
+deepseek-v3-baseline	DeepSeek-V3	grpo-deepseek-v3-32n8g.yaml	32	baseline	20	default
+deepseek-v3-hybridep	DeepSeek-V3	grpo-deepseek-v3-32n8g.yaml	32	hybridep	20	default
+nemotron3-super-baseline	Nemotron3-Super-120B-A12B	grpo-nemotron3-super-120BA12B-32n8g.yaml	32	baseline	20	default
+nemotron3-super-hybridep	Nemotron3-Super-120B-A12B	grpo-nemotron3-super-120BA12B-32n8g.yaml	32	hybridep	20	default
+qwen3-235b-baseline	Qwen3-235B-A22B	grpo-qwen3-235b-16n8g.yaml	16	baseline	20	default
+qwen3-235b-hybridep	Qwen3-235B-A22B	grpo-qwen3-235b-16n8g.yaml	16	hybridep	20	default
+qwen3-30b-baseline	Qwen3-30B-A3B	grpo-qwen3-30ba3b-4n8g.yaml	4	baseline	20	default
+qwen3-30b-hybridep	Qwen3-30B-A3B	grpo-qwen3-30ba3b-4n8g.yaml	4	hybridep	20	default
+qwen3-30b-baseline-chunk1024	Qwen3-30B-A3B	grpo-qwen3-30ba3b-4n8g.yaml	4	baseline	20	logprob_chunk1024
+qwen3-30b-hybridep-chunk1024	Qwen3-30B-A3B	grpo-qwen3-30ba3b-4n8g.yaml	4	hybridep	20	logprob_chunk1024
+dapo-deepseek-v3-64n8g-smoke	DeepSeek-V3	dapo-deepseek-v3-64n8g.v2.yaml	64	hybridep	3	default
+deepseek-v3-64n8g-smoke	DeepSeek-V3	grpo-deepseek-v3-64n8g.yaml	64	hybridep	3	default
+deepseek-v3-64n8g-async-smoke	DeepSeek-V3	grpo-deepseek-v3-64n8g-async-1off.yaml	64	hybridep	3	default
+deepseek-v3-64n8g-fp8-async-smoke	DeepSeek-V3	grpo-deepseek-v3-64n8g-fp8-async-1off.yaml	64	hybridep	3	default
+nemotron3-super-async-smoke	Nemotron3-Super-120B-A12B	grpo-nemotron3-super-120BA12B-32n8g-async-1off.yaml	32	hybridep	3	default
+qwen3-235b-32n8g-smoke	Qwen3-235B-A22B	grpo-qwen3-235b-32n8g.yaml	32	hybridep	3	default
+qwen3-235b-32n8g-async-smoke	Qwen3-235B-A22B	grpo-qwen3-235b-32n8g-async-1off.yaml	32	hybridep	3	default
+qwen3-30b-40k-smoke	Qwen3-30B-A3B	grpo-qwen3-30ba3b-4n8g-40K.yaml	4	hybridep	3	default
+qwen3-30b-async-smoke	Qwen3-30B-A3B	grpo-qwen3-30ba3b-4n8g-async-1off.yaml	4	hybridep	3	default
+qwen3-30b-24n8g-async-smoke	Qwen3-30B-A3B	grpo-qwen3-30ba3b-24n8g-async-8off.yaml	24	hybridep	3	default
