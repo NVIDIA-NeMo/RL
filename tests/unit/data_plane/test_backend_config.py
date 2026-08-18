@@ -55,9 +55,15 @@ def test_nested_block_is_used() -> None:
 
 
 def test_absent_block_falls_back_to_model_defaults() -> None:
-    """The point of the nesting: a config need not mention a backend it isn't using."""
+    """The point of the nesting: a config need not mention a backend it isn't using.
+
+    Pins the literals rather than comparing against MooncakeCpuConfig()'s own
+    attributes — that would hold for any value the class default was changed
+    to and couldn't catch a regression of the sizing itself.
+    """
     resolved = backend_config(_cfg("mooncake_cpu"))
-    assert resolved.global_segment_size == MooncakeCpuConfig().global_segment_size
+    assert resolved.global_segment_size == 68719476736  # 64 GiB per client process
+    assert resolved.local_buffer_size == 4294967296  # 4 GiB per client process
     # The opt-out flag defaults on, so omitting it must not disable the pool.
     assert resolved.reuse_registered_buffers is True
 
