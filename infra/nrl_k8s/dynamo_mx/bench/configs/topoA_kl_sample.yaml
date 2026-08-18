@@ -19,7 +19,7 @@ launch:
     \ TCP. With a live NCCL process group in the same\n# process, destroying a NIXL agent aborts in ud_iface.c \"unable to remove\n# iface timer handler\". rdmacm handles wireup, so dropping UD costs nothing\n\
     # measurable: see dynamo_mx/bench/tools/nixl_teardown_repro.py.\nexport UCX_TLS='^tcp,ud,ud:aux,ud_verbs,ud_mlx5'\nexport NIXL_UCX_TLS='^tcp,ud,ud:aux,ud_verbs,ud_mlx5'\nexport UCX_NET_DEVICES='mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,eth0'\n\
     export UCX_IB_GID_INDEX=3\nexport UCX_CUDA_COPY_DMABUF=yes\nexport UCX_CUDA_COPY_REG_WHOLE_ALLOC=off\nexport MX_RDMA_NIC_PIN=off\nexport NCCL_P2P_DISABLE=1\nexport NCCL_NVLS_ENABLE=0\nexport NCCL_MNNVL_ENABLE=0\n\
-    python -u examples/run_grpo.py \\\n  --config infra/nrl_k8s/dynamo_mx/bench/configs/grpo_moe_qwen3_30b_tp2ep4dp2_tp4dp4_mx_reshard.yaml \\\n  +policy.generation.refit_cfg.mx_reshard.server_url=modelexpress-server.kavin.svc.cluster.local:8001\
+    python -u examples/run_grpo.py \\\n  --config infra/nrl_k8s/dynamo_mx/bench/configs/grpo_moe_qwen3_30b_kl_sample.yaml \\\n  +policy.generation.refit_cfg.mx_reshard.server_url=modelexpress-server.kavin.svc.cluster.local:8001\
     \ \\\n  +policy.generation.refit_cfg.mx_reshard.publisher_listen_port_base=5555 \\\n  +policy.generation.refit_cfg.mx_reshard.receiver_listen_port_base=15555 \
   ++grpo.max_num_steps=4\n"
 kuberay:
