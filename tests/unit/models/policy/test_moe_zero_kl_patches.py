@@ -22,22 +22,15 @@ from nemo_rl.models.policy.workers import moe_zero_kl_patches as moe_patches
 from nemo_rl.models.policy.workers.moe_zero_kl_patches import (
     _nrl_dynamic_step_context_bookkeeping,
     _patched_unpermute,
-    _unpermute_fixed_order_combine,
     _unpermute_gather_combine,
     _unpermute_gather_combine_droppad,
+    _unpermute_segmented_combine,
     apply_moe_unpermute_determinism_patch,
     apply_router_replay_inference_patches,
     configure_moe_combine_for_cuda_graph_inference,
+    configure_moe_combine_for_zero_kl,
     restore_moe_determinism_patches,
 )
-
-
-class TestUnpermuteFixedOrderCombine:
-    def test_sums_per_token(self):
-        permuted = torch.tensor([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]])
-        sorted_indices = torch.tensor([0, 0, 1])
-        out = _unpermute_fixed_order_combine(permuted, sorted_indices, torch.Size([2, 2]))
-        assert torch.allclose(out, torch.tensor([[3.0, 0.0], [3.0, 0.0]]))
 
 
 class TestGatherCombineDroppad:
@@ -57,6 +50,7 @@ class TestGatherCombineDroppad:
         assert torch.allclose(out, torch.tensor([[10.0], [20.0]]))
 
     def test_patched_unpermute_uses_droppad_when_flag_set(self):
+        configure_moe_combine_for_cuda_graph_inference()
         routing_map = torch.tensor([[True, False], [False, True]])
         probs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         permuted = torch.tensor([[3.0], [4.0]])
@@ -98,8 +92,7 @@ class TestGatherCombineUnified:
     def test_patched_unpermute_routes_gather_for_train_and_droppad_for_decode(
         self, monkeypatch
     ):
-        monkeypatch.setenv("NRL_COMBINE_IMPL", "gather")
-        monkeypatch.setenv("NRL_COMBINE_GATHER_DROPPAD", "1")
+        configure_moe_combine_for_cuda_graph_inference()
         routing_map = torch.tensor([[True, False], [False, True]])
         probs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
 
@@ -122,18 +115,17 @@ class TestGatherCombineUnified:
         assert torch.allclose(train_out, torch.tensor([[3.0], [4.0]]))
         assert torch.allclose(decode_out, torch.tensor([[3.0], [4.0]]))
 
-    def test_fixed_train_keeps_gather_droppad_decode(self, monkeypatch):
-        monkeypatch.setenv("NRL_COMBINE_IMPL", "fixed")
-        configure_moe_combine_for_cuda_graph_inference()
+    def test_zero_kl_config_uses_gather_train_and_droppad_decode(self):
+        configure_moe_combine_for_zero_kl(gather_droppad=False)
         routing_map = torch.tensor([[True, False], [False, True]])
         probs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
 
         with (
             patch.object(
                 moe_patches,
-                "_unpermute_fixed_order_combine",
-                wraps=_unpermute_fixed_order_combine,
-            ) as fixed_combine,
+                "_unpermute_gather_combine",
+                wraps=_unpermute_gather_combine,
+            ) as gather_combine,
             patch.object(
                 moe_patches,
                 "_unpermute_gather_combine_droppad",
@@ -148,6 +140,7 @@ class TestGatherCombineUnified:
                 routing_map=routing_map,
                 drop_and_pad=False,
             )
+            configure_moe_combine_for_cuda_graph_inference()
             _patched_unpermute(
                 torch.tensor([[3.0], [0.0], [4.0], [0.0]]),
                 torch.tensor([0, 0, 1, 1]),
@@ -157,7 +150,7 @@ class TestGatherCombineUnified:
                 drop_and_pad=True,
             )
 
-        fixed_combine.assert_called_once()
+        gather_combine.assert_called_once()
         droppad_combine.assert_called_once()
 
 
@@ -192,11 +185,14 @@ class TestApplyMoeDeterminismPatches:
             assert fake_mod.unpermute() == "orig"
             assert fake_dispatcher.unpermute() == "dispatcher_orig"
 
-    def test_patched_unpermute_uses_fixed_order(self):
+    def test_patched_unpermute_falls_back_to_segmented_without_routing_map(self):
         permuted = torch.tensor([[1.0], [2.0]])
         sorted_indices = torch.tensor([0, 0])
+        expected = _unpermute_segmented_combine(
+            permuted, sorted_indices, torch.Size([1, 1])
+        )
         out = _patched_unpermute(permuted, sorted_indices, torch.Size([1, 1]))
-        assert torch.allclose(out, torch.tensor([[3.0]]))
+        assert torch.allclose(out, expected)
 
     def test_router_replay_inference_patch_replaces_methods(self):
         pytest.importorskip("megatron")
