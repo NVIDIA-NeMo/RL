@@ -735,7 +735,6 @@ class TQDataPlaneClient(DataPlaneClient):
         # ``clear_samples`` zeroes rows without popping the partition).
         already = self._warmed_fields.setdefault(partition_id, set())
         fields = [f for f in fields if f not in already]
-        already.update(fields)
         if not fields:
             return
         # Use a unique KV key instead of ``client.put``'s default row id
@@ -756,6 +755,10 @@ class TQDataPlaneClient(DataPlaneClient):
             tags=[{}],
         )
         tq.kv_clear(keys=[schema_key], partition_id=partition_id)
+        # Only mark warmed once the write actually landed — otherwise a
+        # failed put (mooncake's own retries already exhausted) poisons the
+        # cache and a future retry of this call would wrongly skip warmup.
+        already.update(fields)
 
     def claim_meta(
         self,
