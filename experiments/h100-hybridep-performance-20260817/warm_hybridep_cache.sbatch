@@ -30,6 +30,7 @@ srun \
   --container-image="${CONTAINER}" \
   --container-mounts="${MOUNTS},${UV_CACHE_DIR_OVERRIDE}:/root/.cache/uv" \
   --container-workdir="${PROJECT_ROOT}" \
+  --no-container-mount-home \
   bash -lc '
     set -euo pipefail
     export HYBRID_EP_MULTINODE=1
@@ -41,6 +42,8 @@ srun \
     export UV_CACHE_DIR=/root/.cache/uv
     warm_venv="/tmp/hybridep-cache-warm-${SLURM_JOB_ID}"
     export UV_PROJECT_ENVIRONMENT="${warm_venv}"
+    command -v uv
+    uv --version
     uv sync \
       --locked \
       --extra mcore \
