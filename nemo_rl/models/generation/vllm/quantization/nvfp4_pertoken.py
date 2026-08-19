@@ -131,13 +131,20 @@ class NvFp4PerTokenQuantizer:
         """Quantize matching expert weights in one refit batch.
 
         Non-expert names and expert layers outside the quantized scope
-        (``additional_ignore``) pass through untouched.
+        (``additional_ignore``) pass through, cloned off the IPC buffer.
+
+        The clone matters: vLLM's layerwise reload buffers every
+        ``weight_loader`` call's arguments (including the tensor) and replays
+        them at layer completion, which can land after the sender has
+        recycled this batch's IPC buffer for a later one. Freshly-allocated
+        quantized tensors are already safe; passthrough tensors are views
+        into that buffer unless cloned here.
         """
         out: list[tuple[str, torch.Tensor]] = []
         for name, tensor in weights:
             match = _EXPERT_WEIGHT_RE.match(name)
             if match is None or not self._is_quantized_layer(match.group("prefix")):
-                out.append((name, tensor))
+                out.append((name, tensor.clone()))
                 continue
 
             prefix = match.group("prefix")
