@@ -16,8 +16,36 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import Tensor, nn
+
+
+class _CopyToTensorParallelRegion(torch.autograd.Function):
+    """Keep the forward value local and SUM its gradient across TP ranks."""
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        tensor: Tensor,
+        group: torch.distributed.ProcessGroup,
+    ) -> Tensor:
+        ctx.group = group  # pyrefly: ignore[implicitly-defined-attribute]
+        return tensor
+
+    @staticmethod
+    def backward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        grad_output: Tensor,
+    ) -> tuple[Tensor, None]:
+        grad_input = grad_output.clone()
+        torch.distributed.all_reduce(
+            grad_input,
+            op=torch.distributed.ReduceOp.SUM,
+            group=ctx.group,
+        )
+        return grad_input, None
 
 
 class DSparkMarkovHead(nn.Module):
@@ -36,6 +64,7 @@ class DSparkMarkovHead(nn.Module):
         markov_rank: int,
         vocab_start_index: int = 0,
         vocab_end_index: int | None = None,
+        tensor_parallel_group: torch.distributed.ProcessGroup | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -57,6 +86,20 @@ class DSparkMarkovHead(nn.Module):
         self.vocab_start_index = vocab_start_index
         self.vocab_end_index = resolved_vocab_end
         self.local_vocab_size = resolved_vocab_end - vocab_start_index
+        if self.local_vocab_size != vocab_size and tensor_parallel_group is None:
+            raise ValueError("tensor_parallel_group is required for a vocabulary shard")
+        if self.local_vocab_size != vocab_size:
+            assert tensor_parallel_group is not None
+            tp_size = torch.distributed.get_world_size(tensor_parallel_group)
+            tp_rank = torch.distributed.get_rank(tensor_parallel_group)
+            if (
+                self.local_vocab_size * tp_size != vocab_size
+                or vocab_start_index != tp_rank * self.local_vocab_size
+            ):
+                raise ValueError(
+                    "vocab shard must be an even rank-local partition of vocab_size"
+                )
+        self.tensor_parallel_group = tensor_parallel_group
         self.markov_w1 = nn.Embedding(
             vocab_size,
             markov_rank,
@@ -112,11 +155,41 @@ class DSparkMarkovHead(nn.Module):
             torch.zeros_like(previous_token_ids),
         )
         previous_embeddings = self.markov_w1(safe_previous_token_ids)
+        if self.local_vocab_size != self.vocab_size:
+            assert self.tensor_parallel_group is not None
+            previous_embeddings = _CopyToTensorParallelRegion.apply(
+                previous_embeddings,
+                self.tensor_parallel_group,
+            )
         corrected_logits = base_logits + self.markov_w2(previous_embeddings)
         return torch.where(
             slot_valid.unsqueeze(-1),
             corrected_logits,
             torch.zeros_like(corrected_logits),
+        )
+
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple[tuple[int, int, int], ...] = (),
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return Megatron checkpoint metadata for the TP-local output rows."""
+        from megatron.core.transformer.utils import (
+            make_sharded_tensors_for_checkpoint,
+        )
+
+        tensor_parallel_layers_axis_map = (
+            {"markov_w2.weight": 0} if self.local_vocab_size != self.vocab_size else {}
+        )
+        dp_cp_group = None if metadata is None else metadata.get("dp_cp_group")
+        return make_sharded_tensors_for_checkpoint(
+            self.state_dict(prefix="", keep_vars=True),
+            prefix,
+            tensor_parallel_layers_axis_map,
+            sharded_offsets,
+            tp_group=self.tensor_parallel_group,
+            dp_cp_group=dp_cp_group,
         )
 
 
@@ -200,6 +273,11 @@ class DSparkConfidenceHead(nn.Module):
 
         if self.proj.weight.device != hidden_states.device:
             raise ValueError("DSpark confidence inputs and weights must share a device")
+        features = torch.where(
+            slot_valid.unsqueeze(-1),
+            features,
+            torch.zeros_like(features),
+        )
         confidence_logits = self.proj(
             features.to(dtype=self.proj.weight.dtype)
         ).squeeze(-1)

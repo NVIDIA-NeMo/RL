@@ -23,6 +23,8 @@ from types import ModuleType
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch import Tensor, nn
 from torch.nn import functional as F
 
@@ -43,6 +45,229 @@ def _load_heads() -> tuple[type[nn.Module], type[nn.Module]]:
 
 
 DSparkMarkovHead, DSparkConfidenceHead = _load_heads()
+
+
+def _run_tp_markov_gradient(
+    rank: int,
+    world_size: int,
+    init_file: str,
+) -> None:
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank) if use_cuda else torch.device("cpu")
+    dist.init_process_group(
+        backend="nccl" if use_cuda else "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    tp_group = dist.new_group(ranks=list(range(world_size)))
+    assert isinstance(tp_group, dist.ProcessGroup)
+    try:
+        vocab_size = 12
+        markov_rank = 3
+        local_vocab_size = vocab_size // world_size
+        vocab_start = rank * local_vocab_size
+        vocab_end = vocab_start + local_vocab_size
+        head = DSparkMarkovHead(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            vocab_start_index=vocab_start,
+            vocab_end_index=vocab_end,
+            tensor_parallel_group=tp_group,
+            device=device,
+        ).double()
+
+        global_w1 = (
+            torch.arange(
+                vocab_size * markov_rank,
+                dtype=torch.float64,
+                device=device,
+            ).reshape(vocab_size, markov_rank)
+            / 17
+        )
+        global_w2 = (
+            torch.arange(
+                vocab_size * markov_rank,
+                dtype=torch.float64,
+                device=device,
+            ).reshape(vocab_size, markov_rank)
+            / 13
+        )
+        with torch.no_grad():
+            head.markov_w1.weight.copy_(global_w1)
+            head.markov_w2.weight.copy_(global_w2[vocab_start:vocab_end])
+
+        previous_token_ids = torch.tensor(
+            [[1, 4, 7], [2, 5, 9]],
+            device=device,
+        )
+        slot_valid = torch.ones_like(previous_token_ids, dtype=torch.bool)
+        base_logits = torch.zeros(
+            (*previous_token_ids.shape, local_vocab_size),
+            dtype=torch.float64,
+            device=device,
+        )
+        global_coefficients = torch.arange(
+            previous_token_ids.numel() * vocab_size,
+            dtype=torch.float64,
+            device=device,
+        ).reshape(*previous_token_ids.shape, vocab_size)
+
+        actual = head(
+            base_logits,
+            previous_token_ids=previous_token_ids,
+            slot_valid=slot_valid,
+        )
+        expected_local = F.linear(
+            F.embedding(previous_token_ids, global_w1),
+            global_w2[vocab_start:vocab_end],
+        )
+        torch.testing.assert_close(
+            actual,
+            expected_local,
+            rtol=0,
+            atol=0,
+        )
+        (actual * global_coefficients[..., vocab_start:vocab_end]).sum().backward()
+
+        reference_w1 = global_w1.clone().requires_grad_()
+        reference_embeddings = F.embedding(previous_token_ids, reference_w1)
+        reference_loss = sum(
+            (
+                F.linear(
+                    reference_embeddings,
+                    global_w2[shard_start : shard_start + local_vocab_size],
+                )
+                * global_coefficients[..., shard_start : shard_start + local_vocab_size]
+            ).sum()
+            for shard_start in range(0, vocab_size, local_vocab_size)
+        )
+        reference_loss.backward()
+        torch.testing.assert_close(
+            head.markov_w1.weight.grad,
+            reference_w1.grad,
+            rtol=0,
+            atol=0,
+        )
+    finally:
+        dist.destroy_process_group(tp_group)
+        dist.destroy_process_group()
+
+
+def _run_tp_markov_checkpoint(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    checkpoint_dir: str,
+) -> None:
+    from megatron.core import dist_checkpointing
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor
+
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank) if use_cuda else torch.device("cpu")
+    dist.init_process_group(
+        backend="nccl" if use_cuda else "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    tp_group = dist.new_group(ranks=list(range(world_size)))
+    assert isinstance(tp_group, dist.ProcessGroup)
+    dp_group = None
+    for dp_rank in range(world_size):
+        group = dist.new_group(ranks=[dp_rank])
+        if dp_rank == rank:
+            assert isinstance(group, dist.ProcessGroup)
+            dp_group = group
+    assert dp_group is not None
+    try:
+        vocab_size = 12
+        markov_rank = 3
+        local_vocab_size = vocab_size // world_size
+        vocab_start = rank * local_vocab_size
+        vocab_end = vocab_start + local_vocab_size
+        source = DSparkMarkovHead(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            vocab_start_index=vocab_start,
+            vocab_end_index=vocab_end,
+            tensor_parallel_group=tp_group,
+            device=device,
+        ).double()
+        with torch.no_grad():
+            source.markov_w1.weight.copy_(
+                torch.arange(
+                    vocab_size * markov_rank,
+                    dtype=torch.float64,
+                    device=device,
+                ).reshape(vocab_size, markov_rank)
+            )
+            source.markov_w2.weight.copy_(
+                torch.arange(
+                    vocab_start * markov_rank,
+                    vocab_end * markov_rank,
+                    dtype=torch.float64,
+                    device=device,
+                ).reshape(local_vocab_size, markov_rank)
+            )
+
+        metadata = {"dp_cp_group": dp_group}
+        sharded_state = source.sharded_state_dict(
+            prefix="markov_head.",
+            metadata=metadata,
+        )
+        assert set(sharded_state) == {
+            "markov_head.markov_w1.weight",
+            "markov_head.markov_w2.weight",
+        }
+        markov_w2 = sharded_state["markov_head.markov_w2.weight"]
+        assert isinstance(markov_w2, ShardedTensor)
+        assert markov_w2.key == "markov_head.markov_w2.weight"
+        assert markov_w2.local_shape == (local_vocab_size, markov_rank)
+        assert markov_w2.global_shape == (vocab_size, markov_rank)
+        assert markov_w2.global_offset == (vocab_start, 0)
+        assert markov_w2.axis_fragmentations == (world_size, 1)
+
+        dist_checkpointing.save({"model": sharded_state}, checkpoint_dir)
+        restored = DSparkMarkovHead(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            vocab_start_index=vocab_start,
+            vocab_end_index=vocab_end,
+            tensor_parallel_group=tp_group,
+            device=device,
+        ).double()
+        restore_template = restored.sharded_state_dict(
+            prefix="markov_head.",
+            metadata=metadata,
+        )
+        loaded = dist_checkpointing.load(
+            {"model": restore_template},
+            checkpoint_dir,
+        )
+        incompatible = restored.load_state_dict(
+            {
+                key.removeprefix("markov_head."): value
+                for key, value in loaded["model"].items()
+            }
+        )
+        assert not incompatible.missing_keys
+        assert not incompatible.unexpected_keys
+        for name, source_tensor in source.state_dict().items():
+            torch.testing.assert_close(
+                restored.state_dict()[name],
+                source_tensor,
+                rtol=0,
+                atol=0,
+            )
+    finally:
+        dist.destroy_process_group(dp_group)
+        dist.destroy_process_group(tp_group)
+        dist.destroy_process_group()
 
 
 def _run_markov_loss(
@@ -107,6 +332,31 @@ def test_markov_head_matches_dense_math_and_gradients() -> None:
         torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required")
+def test_tp2_markov_head_sums_replicated_w1_gradients(tmp_path: Path) -> None:
+    mp.spawn(
+        _run_tp_markov_gradient,
+        args=(2, str(tmp_path / "tp_init")),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required")
+def test_tp2_markov_head_megatron_checkpoint_round_trip(tmp_path: Path) -> None:
+    pytest.importorskip("megatron.core.dist_checkpointing")
+    mp.spawn(
+        _run_tp_markov_checkpoint,
+        args=(
+            2,
+            str(tmp_path / "tp_checkpoint_init"),
+            str(tmp_path / "checkpoint"),
+        ),
+        nprocs=2,
+        join=True,
+    )
+
+
 def test_markov_head_zeros_invalid_slots_and_their_gradients() -> None:
     torch.manual_seed(456)
     head = DSparkMarkovHead(vocab_size=13, markov_rank=4)
@@ -130,39 +380,12 @@ def test_markov_head_zeros_invalid_slots_and_their_gradients() -> None:
 
 
 def test_markov_head_has_explicit_tp_local_vocab_contract() -> None:
-    torch.manual_seed(789)
-    head = DSparkMarkovHead(
-        vocab_size=17,
-        markov_rank=5,
-        vocab_start_index=6,
-        vocab_end_index=13,
-    )
-    base_logits = torch.randn((2, 3, 7))
-    previous_token_ids = torch.tensor([[0, 8, 16], [2, 4, 6]])
-    slot_valid = torch.ones((2, 3), dtype=torch.bool)
-
-    actual = head(
-        base_logits,
-        previous_token_ids=previous_token_ids,
-        slot_valid=slot_valid,
-    )
-    expected = base_logits + F.linear(
-        F.embedding(previous_token_ids, head.markov_w1.weight),
-        head.markov_w2.weight,
-    )
-
-    assert head.vocab_start_index == 6
-    assert head.vocab_end_index == 13
-    assert head.local_vocab_size == 7
-    assert head.markov_w1.weight.shape == (17, 5)
-    assert head.markov_w2.weight.shape == (7, 5)
-    torch.testing.assert_close(actual, expected)
-
-    with pytest.raises(ValueError, match="local vocab size"):
-        head(
-            torch.randn((2, 3, 8)),
-            previous_token_ids=previous_token_ids,
-            slot_valid=slot_valid,
+    with pytest.raises(ValueError, match="tensor_parallel_group"):
+        DSparkMarkovHead(
+            vocab_size=17,
+            markov_rank=5,
+            vocab_start_index=6,
+            vocab_end_index=13,
         )
     with pytest.raises(ValueError, match="vocab shard"):
         DSparkMarkovHead(
@@ -297,6 +520,85 @@ def test_confidence_head_without_markov_rejects_unexpected_embeddings() -> None:
             hidden_states,
             markov_embeddings=torch.randn((2, 4, 3)),
             slot_valid=slot_valid,
+        )
+
+
+@pytest.mark.parametrize("with_markov", [False, True])
+def test_confidence_head_sanitizes_invalid_nonfinite_features(
+    with_markov: bool,
+) -> None:
+    torch.manual_seed(505)
+    head = DSparkConfidenceHead(
+        hidden_size=4,
+        markov_rank=2,
+        with_markov=with_markov,
+    ).double()
+    hidden_data = torch.randn((1, 4, 4), dtype=torch.float64)
+    hidden_data[0, 1, 0] = torch.nan
+    hidden_data[0, 2, 1] = torch.inf
+    hidden_data[0, 3, 2] = -torch.inf
+    hidden_states = hidden_data.requires_grad_()
+    markov_data = torch.randn((1, 4, 2), dtype=torch.float64)
+    markov_data[0, 1, 0] = torch.inf
+    markov_data[0, 2, 1] = torch.nan
+    markov_embeddings = markov_data.requires_grad_() if with_markov else None
+    slot_valid = torch.tensor([[True, False, False, False]])
+
+    actual = head(
+        hidden_states,
+        markov_embeddings=markov_embeddings,
+        slot_valid=slot_valid,
+    )
+    actual.sum().backward()
+
+    reference_hidden = hidden_data.detach().clone().requires_grad_()
+    reference_features = torch.where(
+        slot_valid.unsqueeze(-1),
+        reference_hidden,
+        torch.zeros_like(reference_hidden),
+    )
+    reference_markov = None
+    if with_markov:
+        assert markov_embeddings is not None
+        reference_markov = markov_data.detach().clone().requires_grad_()
+        safe_reference_markov = torch.where(
+            slot_valid.unsqueeze(-1),
+            reference_markov,
+            torch.zeros_like(reference_markov),
+        )
+        reference_features = torch.cat(
+            (reference_features, safe_reference_markov),
+            dim=-1,
+        )
+    reference_weight = head.proj.weight.detach().clone().requires_grad_()
+    reference_bias = head.proj.bias.detach().clone().requires_grad_()
+    expected = F.linear(
+        reference_features,
+        reference_weight,
+        reference_bias,
+    ).squeeze(-1)
+    expected = torch.where(slot_valid, expected, torch.zeros_like(expected)).float()
+    expected.sum().backward()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    gradient_pairs = [
+        (hidden_states.grad, reference_hidden.grad),
+        (head.proj.weight.grad, reference_weight.grad),
+        (head.proj.bias.grad, reference_bias.grad),
+    ]
+    if with_markov:
+        assert markov_embeddings is not None
+        assert reference_markov is not None
+        gradient_pairs.append((markov_embeddings.grad, reference_markov.grad))
+    for actual_gradient, expected_gradient in gradient_pairs:
+        assert actual_gradient is not None
+        assert expected_gradient is not None
+        assert torch.isfinite(actual_gradient).all()
+        torch.testing.assert_close(
+            actual_gradient,
+            expected_gradient,
+            rtol=0,
+            atol=0,
         )
 
 
