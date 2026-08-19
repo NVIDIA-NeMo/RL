@@ -224,7 +224,11 @@ jobs:
           h100_functional_test_scripts=$(jq -c \
             '[.functional[] | select((ascii_downcase | contains("gb200")) | not)]' \
             <<< "$test_plan")
-          gb200_functional_test_scripts=$(jq -c '.functional' <<< "$test_plan")
+          # The managed Dynamo runtime is currently amd64-only and is not
+          # installed in the arm64 GB200 image.
+          gb200_functional_test_scripts=$(jq -c \
+            '[.functional[] | select(. != "L1_Functional_Tests_Dynamo")]' \
+            <<< "$test_plan")
 
           unit_test_count=$(jq 'length' <<< "$unit_test_scripts")
           h100_functional_test_count=$(jq 'length' <<< "$h100_functional_test_scripts")
@@ -553,6 +557,7 @@ jobs:
       megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
       build-args: |
         MAX_JOBS=4
+        BUILD_DYNAMO=1
         TRTLLM_BUILD_JOBS=24
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
 

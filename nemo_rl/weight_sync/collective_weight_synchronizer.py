@@ -76,8 +76,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             else nullcontext()
         )
         with timer_context:
+            sender_spec = self._generation.get_collective_sender_spec()
             futures_train = self._policy.broadcast_weights_for_collective(
-                kv_scales=kv_scales
+                kv_scales=kv_scales,
+                buffer_size_bytes=sender_spec.buffer_size_bytes,
+                num_buffers=sender_spec.num_buffers,
             )
             futures_inference = self._generation.update_weights_from_collective()
 
@@ -107,11 +110,18 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
 
         ip, port = self._train_cluster.get_master_address_and_port()
         train_world_size = self._train_cluster.world_size()
-        inference_world_size = self._inference_cluster.world_size()
+        inference_world_size = self._generation.get_inference_world_size()
+        if inference_world_size is None:
+            inference_world_size = self._inference_cluster.world_size()
         world_size = train_world_size + inference_world_size
 
+        sender_spec = self._generation.get_collective_sender_spec()
         futures_train = self._policy.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
+            ip,
+            port,
+            world_size,
+            train_world_size=train_world_size,
+            nccl_peer=sender_spec.nccl_peer,
         )
         futures_inference = self._generation.init_collective(
             ip, port, world_size, train_world_size=train_world_size

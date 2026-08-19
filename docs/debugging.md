@@ -1,6 +1,18 @@
 # Debug NeMo RL Applications
 
-This guide explains how to debug NeMo RL applications, covering two scenarios. It first outlines the procedure for debugging distributed Ray worker/actor processes using the Ray Distributed Debugger within a SLURM environment, and then details debugging the main driver script.
+This guide explains how to debug NeMo RL applications. It first covers controlling log verbosity, then outlines the procedure for debugging distributed Ray worker/actor processes using the Ray Distributed Debugger within a SLURM environment, and finally details debugging the main driver script.
+
+## Control Log Verbosity
+
+NeMo RL sets the level of the `nemo_rl` logger from `NRL_LOG_LEVEL`, which defaults to `INFO`. The value must be a standard [`logging` level name](https://docs.python.org/3/library/logging.html#logging-levels): `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
+
+```sh
+NRL_LOG_LEVEL=DEBUG uv run examples/run_grpo.py --config examples/configs/grpo_math_1B.yaml
+```
+
+`DEBUG` additionally enables the per-chunk training records and the CUDA allocator samples on the Megatron training path. Those are emitted once per chunk per rank, which is what you want when investigating gradient accumulation or memory growth across a streaming step, and too verbose for a normal run.
+
+The level applies to the `nemo_rl` logger rather than the root logger, so raising it does not also turn on debug output for `torch`, `ray`, and other third-party libraries. Setting it in the driver environment is enough to cover workers: `nemo_rl/__init__.py` runs in Ray workers too, and their records reach the driver log with a `(pid=..., ip=...)` prefix.
 
 ## Debug Worker/Actors on SLURM
 

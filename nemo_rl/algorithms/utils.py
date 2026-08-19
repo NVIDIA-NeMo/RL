@@ -920,13 +920,13 @@ def print_performance_metrics(
     return performance_metrics
 
 
-def log_generation_metrics_to_wandb(
+def log_generation_metrics(
     generation_logger_metrics: dict[str, dict[int, list[Any]]],
     step: int,
     timeline_interval: float,
     logger: Logger,
 ) -> None:
-    """Log generation metrics to wandb.
+    """Log generation metric timelines to every configured logger backend.
 
     Args:
         generation_logger_metrics: Dictionary of generation logger metrics
