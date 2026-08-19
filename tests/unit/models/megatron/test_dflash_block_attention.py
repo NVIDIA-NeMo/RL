@@ -37,6 +37,9 @@ pytestmark = [
 
 _PLAN_MODULE = "nemo_rl.models.megatron.draft.block_plan"
 _ATTENTION_MODULE = "nemo_rl.models.megatron.draft.block_attention"
+_BENCHMARK_PATH = (
+    Path(__file__).parents[4] / "tools/benchmark_dflash_block_attention.py"
+)
 
 
 @pytest.fixture
@@ -54,6 +57,123 @@ def _load_module(module_name: str) -> ModuleType:
             f"DFlash production contract is missing: {error}",
             pytrace=False,
         )
+
+
+def _load_benchmark() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "benchmark_dflash_block_attention",
+        _BENCHMARK_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _small_benchmark_plan(benchmark: ModuleType) -> Any:
+    return benchmark._build_plan(
+        batch_size=1,
+        sequence_length=32,
+        anchors_per_sample=1,
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+
+
+def test_benchmark_inputs_use_public_dflash_attention_geometry() -> None:
+    """Catches benchmark-only head geometry that production kernels never see."""
+    benchmark = _load_benchmark()
+    inputs = benchmark._make_inputs(
+        _small_benchmark_plan(benchmark),
+        device=torch.device("cpu"),
+    )
+
+    assert [tuple(tensor.shape) for tensor in inputs] == [
+        (1, 32, 8, 128),
+        (1, 32, 8, 128),
+        (1, 16, 32, 128),
+        (1, 16, 8, 128),
+        (1, 16, 8, 128),
+    ]
+
+
+def test_default_train_step_calls_production_block_only_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches default timing of unused trunk-query attention."""
+    benchmark = _load_benchmark()
+    plan = _small_benchmark_plan(benchmark)
+    inputs = benchmark._make_inputs(plan, device=torch.device("cpu"))
+    calls = 0
+
+    def record_block_only_attention(**kwargs: Any) -> Tensor:
+        nonlocal calls
+        calls += 1
+        return _load_module(_ATTENTION_MODULE).dflash_block_only_attention(**kwargs)
+
+    def reject_full_attention(**_kwargs: Any) -> tuple[Tensor, Tensor]:
+        raise AssertionError("the default benchmark must not call full attention")
+
+    monkeypatch.setattr(
+        benchmark,
+        "dflash_block_only_attention",
+        record_block_only_attention,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "dflash_block_attention",
+        reject_full_attention,
+    )
+
+    benchmark._train_step(plan, inputs)
+
+    assert calls == 1
+    assert all(tensor.grad is not None for tensor in inputs)
+
+
+def test_default_correctness_calls_production_block_only_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches correctness evidence for a path the DFlash body does not execute."""
+    benchmark = _load_benchmark()
+    plan = _small_benchmark_plan(benchmark)
+    calls = 0
+
+    def record_block_only_attention(**kwargs: Any) -> Tensor:
+        nonlocal calls
+        calls += 1
+        return _load_module(_ATTENTION_MODULE).dflash_block_only_attention(**kwargs)
+
+    def reject_full_attention(**_kwargs: Any) -> tuple[Tensor, Tensor]:
+        raise AssertionError("default correctness must not call full attention")
+
+    def run_without_cuda_timing(_device: torch.device, operation: Any) -> float:
+        operation()
+        return 0.0
+
+    monkeypatch.setattr(benchmark, "_build_plan", lambda **_kwargs: plan)
+    monkeypatch.setattr(benchmark, "_time_call", run_without_cuda_timing)
+    monkeypatch.setattr(
+        benchmark,
+        "dflash_block_only_attention",
+        record_block_only_attention,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "dflash_block_attention",
+        reject_full_attention,
+    )
+
+    record = benchmark._correctness_comparison(
+        device=torch.device("cpu"),
+        iterations=1,
+    )
+
+    assert calls == 2
+    assert record["kind"] == "block_only_forward_correctness_comparison"
+    assert record["attention_path"] == "dflash_block_only_attention"
 
 
 def _load_attention_contract() -> tuple[type[Any], Any]:
@@ -823,6 +943,81 @@ def test_cuda_forward_and_all_qkv_gradients_match_dense_oracle(
             oracle_gradient,
             atol=tolerance,
             rtol=tolerance,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.usefixtures("_isolated_flex_compile_cache")
+def test_cuda_public_geometry_block_only_forward_and_gradients_match_dense() -> None:
+    """Catches BF16 drift at the public 32Q/8KV/128D/block-16 geometry."""
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("CUDA device does not support bfloat16")
+
+    plan_type, attention = _load_block_only_attention_contract()
+    device = torch.device("cuda")
+    plan = _make_plan(
+        plan_type,
+        token_valid_mask=torch.ones((1, 32), dtype=torch.bool, device=device),
+        sample_rows=[0],
+        anchor_positions=[24],
+        slot_valid=torch.ones((1, 16), dtype=torch.bool, device=device),
+    )
+    tensors = _random_attention_inputs(
+        batch_size=1,
+        sequence_length=32,
+        num_blocks=1,
+        block_size=16,
+        num_query_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        device=device,
+        dtype=torch.bfloat16,
+        seed=32128,
+    )
+    production_inputs = _clone_with_grad(tensors[1:])
+    oracle_inputs = _clone_with_grad(tensors)
+
+    actual = attention(
+        plan=plan,
+        trunk_k=production_inputs[0],
+        trunk_v=production_inputs[1],
+        block_q=production_inputs[2],
+        block_k=production_inputs[3],
+        block_v=production_inputs[4],
+    )
+    expected = _dense_attention_oracle(
+        plan=plan,
+        trunk_q=oracle_inputs[0],
+        trunk_k=oracle_inputs[1],
+        trunk_v=oracle_inputs[2],
+        block_q=oracle_inputs[3],
+        block_k=oracle_inputs[4],
+        block_v=oracle_inputs[5],
+    )[1]
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+    generator = torch.Generator(device=device).manual_seed(16128)
+    weight = torch.randn(
+        actual.shape,
+        dtype=actual.dtype,
+        device=device,
+        generator=generator,
+    )
+    actual_gradients = torch.autograd.grad((actual * weight).sum(), production_inputs)
+    expected_gradients = torch.autograd.grad(
+        (expected * weight).sum(),
+        oracle_inputs[1:],
+    )
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients,
+        expected_gradients,
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            actual_gradient,
+            expected_gradient,
+            atol=5e-2,
+            rtol=5e-2,
         )
 
 
