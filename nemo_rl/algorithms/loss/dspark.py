@@ -404,9 +404,8 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
             slot_bins,
             log_normalizers,
         )
-        ctx.token_chunk_size = (
-            token_chunk_size  # pyrefly: ignore[implicitly-defined-attribute]
-        )
+        # pyrefly: ignore[implicitly-defined-attribute]
+        ctx.token_chunk_size = token_chunk_size
         ctx.vocab_start = vocab_start  # pyrefly: ignore[implicitly-defined-attribute]
         ctx.tp_group = tp_group  # pyrefly: ignore[implicitly-defined-attribute]
         ctx.mark_non_differentiable(verifier_correct)
