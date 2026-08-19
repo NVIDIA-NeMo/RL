@@ -28,9 +28,9 @@ from . import (
 
 pytestmark = pytest.mark.sglang
 
+from nemo_rl.models.generation.sglang.utils import train_utils
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _wrap_ipv6
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_host_info
-from nemo_rl.models.generation.sglang.utils import train_utils
 from nemo_rl.models.generation.sglang.utils.train_utils import (
     MultiprocessingSerializer,
 )
