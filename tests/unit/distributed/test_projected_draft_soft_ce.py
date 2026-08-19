@@ -260,6 +260,38 @@ def test_tp2_dflash_wrapper_matches_dense_hidden_gradient(
     distributed_test_runner(_run_tp2_dflash_projected_soft_ce, world_size=2)
 
 
+def _run_tp2_dflash_invalid_coordinate_aliases(rank: int, world_size: int) -> None:
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    draft_hidden = torch.ones(1, 2, 3, requires_grad=True)
+    output_weight = torch.ones(4, 3)
+    teacher_logits = torch.ones(2, 4, 4)
+    loss_mask = torch.tensor([[False, True]])
+
+    for sample_row, label_position in ((2, -3), (0, 5)):
+        with pytest.raises((IndexError, RuntimeError), match="(?i)index|range"):
+            dflash_projected_vocab_parallel_soft_ce(
+                draft_hidden=draft_hidden,
+                output_weight=output_weight,
+                teacher_logits=teacher_logits,
+                sample_rows=torch.tensor([sample_row]),
+                label_positions=torch.tensor([[-1, label_position]]),
+                loss_mask=loss_mask,
+                position_decay=0.5,
+                token_chunk_size=1,
+                tp_group=tp_group,
+            )
+
+
+def test_tp2_dflash_wrapper_rejects_coordinate_aliases_together(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(
+        _run_tp2_dflash_invalid_coordinate_aliases,
+        world_size=2,
+        backend="gloo",
+    )
+
+
 def _run_tp2_projected_soft_ce_metadata_mismatch(
     rank: int,
     world_size: int,

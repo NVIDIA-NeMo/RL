@@ -141,12 +141,12 @@ def test_dflash_adapter_ignores_invalid_metadata_for_inactive_slots() -> None:
     generator = torch.Generator().manual_seed(31415)
     draft_hidden = torch.randn(2, 3, 4, generator=generator).requires_grad_(True)
     output_weight = torch.randn(7, 4, generator=generator)
-    teacher_logits = torch.randn(2, 2, 7, generator=generator)
-    sample_rows = torch.tensor([0, 7])
+    teacher_logits = torch.randn(2, 4, 7, generator=generator)
+    sample_rows = torch.tensor([0, 2])
     label_positions = torch.tensor(
         [
-            [-999, 1, 3],
-            [-999, -4, 3],
+            [-999, 1, 5],
+            [-999, -3, 3],
         ]
     )
     loss_mask = torch.tensor(
@@ -195,6 +195,38 @@ def test_dflash_adapter_keeps_invalid_active_rows_failing() -> None:
     inputs[3] = torch.tensor([1, 9])
     inputs[5] = inputs[5].clone()
     inputs[5][1, 1] = True
+
+    with pytest.raises((IndexError, RuntimeError), match="(?i)index|range"):
+        dflash_projected_vocab_parallel_soft_ce(
+            draft_hidden=inputs[0],
+            output_weight=inputs[1],
+            teacher_logits=inputs[2],
+            sample_rows=inputs[3],
+            label_positions=inputs[4],
+            loss_mask=inputs[5],
+            position_decay=0.5,
+            token_chunk_size=2,
+            tp_group=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("sample_row", "label_position"),
+    [
+        pytest.param(2, -3, id="invalid_sample_aliases_valid_flat_row"),
+        pytest.param(0, 5, id="invalid_position_aliases_next_sample"),
+    ],
+)
+def test_dflash_adapter_rejects_active_coordinate_aliases(
+    sample_row: int,
+    label_position: int,
+) -> None:
+    """Each active coordinate component must be valid before flattening."""
+    inputs = list(_inputs())
+    inputs[3] = inputs[3].clone()
+    inputs[3][0] = sample_row
+    inputs[4] = inputs[4].clone()
+    inputs[4][0, 1] = label_position
 
     with pytest.raises((IndexError, RuntimeError), match="(?i)index|range"):
         dflash_projected_vocab_parallel_soft_ce(
