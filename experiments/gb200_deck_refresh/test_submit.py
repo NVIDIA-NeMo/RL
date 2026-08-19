@@ -87,6 +87,7 @@ def test_qwen235_legacy_arm_uses_current_mxfp8_recipe_without_reshard() -> None:
     assert "grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml" in result.stdout
     assert "grpo.async_grpo.enabled=false" in result.stdout
     assert "policy.generation.refit_transport=null" in result.stdout
+    assert "policy.generation.vllm_cfg.gpu_memory_utilization=0.88" in result.stdout
     assert "cluster.num_nodes=32" in result.stdout
 
 

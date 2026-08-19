@@ -7,7 +7,7 @@ MODE=${MODE:-sync}
 MODEL=${MODEL:-nano}
 ARM=${ARM:-bf16}
 MAX_STEPS=${MAX_STEPS:-20}
-VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.5}
+VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-}
 RUN_SUFFIX=${RUN_SUFFIX:-$(date +%Y%m%d-%H%M%S)}
 BRANCH=${BRANCH:-sna/exp-gb200-deck-refresh-20260818}
 EXPECTED_HEAD=${EXPECTED_HEAD:-}
@@ -23,6 +23,7 @@ case "${MODEL}:${MODE}:${ARM}" in
     COLOCATED=true
     ASYNC_GRPO=false
     VLLM_TP=1
+    DEFAULT_VLLM_GPU_MEMORY_UTILIZATION=0.5
     ;;
   nano:async:bf16|nano:async:mxfp8)
     CONFIG=examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron-pack-cp.yaml
@@ -34,6 +35,7 @@ case "${MODEL}:${MODE}:${ARM}" in
     COLOCATED=false
     ASYNC_GRPO=true
     VLLM_TP=1
+    DEFAULT_VLLM_GPU_MEMORY_UTILIZATION=0.5
     ;;
   qwen235:sync:mxfp8_legacy)
     CONFIG=examples/configs/recipes/llm/performance/grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml
@@ -45,6 +47,7 @@ case "${MODEL}:${MODE}:${ARM}" in
     COLOCATED=false
     ASYNC_GRPO=false
     VLLM_TP=4
+    DEFAULT_VLLM_GPU_MEMORY_UTILIZATION=0.88
     ;;
   qwen235:sync:mxfp8_nccl)
     CONFIG=examples/configs/recipes/llm/performance/grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml
@@ -56,12 +59,15 @@ case "${MODEL}:${MODE}:${ARM}" in
     COLOCATED=false
     ASYNC_GRPO=false
     VLLM_TP=4
+    DEFAULT_VLLM_GPU_MEMORY_UTILIZATION=0.88
     ;;
   *)
     echo "Combination MODEL=${MODEL}, MODE=${MODE}, ARM=${ARM} is not supported" >&2
     exit 2
     ;;
 esac
+
+VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-${DEFAULT_VLLM_GPU_MEMORY_UTILIZATION}}
 
 case "${ARM}" in
   bf16)
