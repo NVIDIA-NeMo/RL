@@ -33,9 +33,12 @@ single `ValueError` listing every violation. The current requirements are:
 * Megatron `expert_tensor_parallel_size` (i.e., ETP) must be 1; custom PP layouts
   (`pipeline_model_parallel_layout`, virtual PP > 1, embedding/loss pipeline-split
   accounting) are not supported yet.
-* **Precision** must match end to end: BF16 train ↔ BF16 gen, or FP8 train
-  (`fp8_param=true` + blockwise recipe) ↔ FP8 gen (`vllm_cfg.precision=fp8`).
-  BF16 train ↔ FP8 gen is not supported yet.
+* **Precision** must match end to end for BF16 train ↔ BF16 gen and blockwise-FP8
+  train (`fp8_param=true` + blockwise recipe) ↔ FP8 gen
+  (`vllm_cfg.precision=fp8`). BF16 train → MXFP8 gen is also supported with
+  `vllm_cfg.precision=fp8` and `vllm_cfg.is_mx=true`; the generation ranks
+  quantize each received BF16 shard before installing it. Blockwise-FP8 train →
+  MXFP8 gen is not supported.
 * vLLM expert parallelism is supported with the NeMo RL convention
   `expert_parallel_size == tensor_parallel_size`. 
 * Generation-side, PP > 1 is not supported. 

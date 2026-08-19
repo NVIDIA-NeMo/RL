@@ -917,9 +917,22 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         setup(master_config, tokenizer, dataset, None)
 
 
-@pytest.mark.parametrize("refit_transport", [None, "nixl"])
-def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
-    """Smoke test: calling setup with a non-colocated config should succeed."""
+@pytest.mark.parametrize(
+    ("refit_transport", "error_match"),
+    [
+        pytest.param(None, None, id="default-collective"),
+        pytest.param("nixl", None, id="nixl"),
+        pytest.param(
+            "nccl_reshard",
+            "nccl_reshard.*not supported by distillation.*refit_transport=null",
+            id="reject-nccl-reshard",
+        ),
+    ],
+)
+def test_distillation_setup_validates_non_colocated_refit_transport(
+    monkeypatch, refit_transport, error_match
+):
+    """Distillation supports only its initialized non-colocated refit paths."""
     from unittest.mock import MagicMock, patch
 
     import nemo_rl.algorithms.distillation as distil_mod
@@ -1049,7 +1062,14 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         mock_ckpt_mgr.return_value.get_resume_paths.return_value = (None, None)
         mock_ray.get = MagicMock(return_value=None)
 
-        # Should not raise
+        if error_match is not None:
+            with pytest.raises(ValueError, match=error_match):
+                distil_mod.setup(master_config, tokenizer, dataset, None)
+            mock_create_synchronizer.assert_not_called()
+            assert not DummyPolicy.collective_calls
+            assert not DummyVllmGeneration.collective_calls
+            return
+
         result = distil_mod.setup(master_config, tokenizer, dataset, None)
 
         # Basic shape check of returned tuple

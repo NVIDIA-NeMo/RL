@@ -187,10 +187,12 @@ def apply_fp8_patches(self, fp8_config):
 
 
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
-    config = AutoConfig.from_pretrained(model_name)
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
+    if vllm_cfg.get("is_mx") and not use_fp8_weights:
+        raise ValueError("is_mx=True requires precision='fp8'")
+    config = AutoConfig.from_pretrained(model_name)
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
     # Validate configuration: kv_cache_dtype
@@ -441,6 +443,25 @@ def _is_fp8_weight(name, model):
     return name in fp8_state.fp8_param_names
 
 
+def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a checkpoint-layout weight for MXFP8 weight loading and refit.
+
+    FlashInfer represents all-zero blocks with E8M0 scale byte 0. Replace those
+    scale entries with byte 1 because the TRTLLM kernel does not accept byte 0;
+    the represented values remain zero because every quantized value in each
+    affected block is zero.
+    """
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        mxfp8_e4m3_quantize,
+    )
+
+    value, scale = mxfp8_e4m3_quantize(weight)
+    value = value.reshape(weight.shape)
+    scale = scale.reshape(*weight.shape[:-1], weight.shape[-1] // 32)
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    return value, scale
+
+
 def load_weights(weights, model_runner):
     global global_fp8_config
     weights_quantized = []
@@ -452,11 +473,7 @@ def load_weights(weights, model_runner):
             continue
         # Cast the weight into fp8 and its scale factor
         if global_fp8_config.is_mx:
-            from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-                mxfp8_e4m3_quantize,
-            )
-
-            param_lp, param_scale = mxfp8_e4m3_quantize(v)
+            param_lp, param_scale = quantize_mxfp8_weight(v)
         else:
             param_lp, param_scale = cast_tensor_to_fp8_blockwise(
                 v.to(torch.float),

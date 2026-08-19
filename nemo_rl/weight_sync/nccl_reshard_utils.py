@@ -586,6 +586,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     dtensor_cfg = policy.get("dtensor_cfg", {}) or {}
     vllm_cfg = generation.get("vllm_cfg", {}) or {}
     vllm_kwargs = generation.get("vllm_kwargs", {}) or {}
+    real_nvfp4 = bool(generation.get("real_quant"))
 
     violations: list[str] = []
 
@@ -636,6 +637,65 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             "(this initial version supports the Megatron train backend only)."
         )
 
+    if real_nvfp4:
+        if policy.get("quant_cfg") is not None:
+            violations.append(
+                "policy.quant_cfg must be null for real NVFP4 NCCL refit; "
+                "the trainer must keep plain BF16 storage and the vLLM receiver "
+                "performs NVFP4 serialization."
+            )
+        policy_precision = policy.get("precision")
+        if policy_precision != "bfloat16":
+            violations.append(
+                "policy.precision must be 'bfloat16' for real NVFP4 "
+                f"NCCL refit (got {policy_precision!r})."
+            )
+
+        generation_precision = vllm_cfg.get("precision")
+        if generation_precision != "bfloat16" or vllm_cfg.get("is_mx"):
+            violations.append(
+                "real NVFP4 requires policy.generation.vllm_cfg.precision="
+                f"'bfloat16' and is_mx=False (got precision={generation_precision!r}, "
+                f"is_mx={bool(vllm_cfg.get('is_mx'))})."
+            )
+
+        fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
+        if fp8_cfg.get("fp8_param"):
+            violations.append(
+                "real NVFP4 NCCL refit requires plain BF16 Megatron storage; "
+                "policy.megatron_cfg.fp8_cfg.fp8_param must be False."
+            )
+
+        quant_cfg = generation.get("quant_cfg")
+        effective_mode = None
+        if not isinstance(quant_cfg, str) or not quant_cfg.strip():
+            violations.append(
+                "real NVFP4 requires a non-empty policy.generation.quant_cfg."
+            )
+        else:
+            try:
+                from nemo_rl.modelopt.utils import resolve_nvfp4_real_quant_mode
+
+                effective_mode = resolve_nvfp4_real_quant_mode(quant_cfg)
+            except (ImportError, TypeError, ValueError) as error:
+                violations.append(
+                    "policy.generation.quant_cfg must resolve to a supported "
+                    f"NVFP4 mode: {error}"
+                )
+
+        if effective_mode not in {None, "w4a16", "w4a4"}:
+            violations.append(
+                "real NVFP4 effective mode must be 'w4a16' or 'w4a4' "
+                f"(got {effective_mode!r})."
+            )
+        if effective_mode == "w4a4":
+            calibration_path = generation.get("real_quant_calibration_path")
+            if not isinstance(calibration_path, str) or not calibration_path.strip():
+                violations.append(
+                    "real NVFP4 W4A4 requires a non-empty "
+                    "policy.generation.real_quant_calibration_path."
+                )
+
     if megatron_enabled:
         etp = megatron_cfg.get("expert_tensor_parallel_size", 1)
 
@@ -669,11 +729,12 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         # Precision compatibility (train ↔ gen).  Supported combinations:
         #   BF16 train  ↔ BF16 gen   (default, tested)
         #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm precision=fp8)
-        # BF16→FP8 (train-side quant on the fly) is not implemented; FP8→BF16
-        # has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
+        #   BF16 storage → MXFP8 gen  (receiver quantizes the resharded BF16 shard)
+        # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
         fp8_param = fp8_cfg.get("fp8_param", False)
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
+        trainer_precision = policy.get("precision")
         gen_precision = vllm_cfg.get("precision", None)
 
         # The refit byte-copies weights train -> gen, so gen dtype must match
@@ -691,17 +752,35 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             )
 
         if gen_precision == "fp8":
-            if not fp8_param:
+            if fp8_param:
+                if vllm_cfg.get("is_mx"):
+                    violations.append(
+                        "policy.generation.vllm_cfg.is_mx=True does not support "
+                        "blockwise-FP8 storage from "
+                        "policy.megatron_cfg.fp8_cfg.fp8_param; use BF16 training "
+                        "storage for receiver-side MXFP8 quantization."
+                    )
+                elif fp8_recipe != "blockwise":
+                    violations.append(
+                        "policy.megatron_cfg.fp8_cfg.fp8_recipe must be 'blockwise' "
+                        f"when fp8_param=True (got {fp8_recipe!r}); other recipes "
+                        "don't produce export-ready scale_inv tensors."
+                    )
+            elif vllm_cfg.get("is_mx"):
+                # Policy precision uses the canonical NeMo-RL spelling; unlike
+                # vLLM precision, it does not accept "bf16", "auto", or None.
+                if trainer_precision != "bfloat16":
+                    violations.append(
+                        "policy.generation.vllm_cfg.is_mx=True with "
+                        "policy.megatron_cfg.fp8_cfg.fp8_param=False requires "
+                        "policy.precision='bfloat16' for receiver-side MXFP8 "
+                        f"quantization (got {trainer_precision!r})."
+                    )
+            else:
                 violations.append(
                     "policy.generation.vllm_cfg.precision='fp8' requires "
-                    "policy.megatron_cfg.fp8_cfg.fp8_param=True "
-                    "(BF16→FP8 train-side quantization is not implemented yet)."
-                )
-            elif fp8_recipe != "blockwise":
-                violations.append(
-                    "policy.megatron_cfg.fp8_cfg.fp8_recipe must be 'blockwise' "
-                    f"when fp8_param=True (got {fp8_recipe!r}); other recipes "
-                    "don't produce export-ready scale_inv tensors."
+                    "policy.megatron_cfg.fp8_cfg.fp8_param=True, or "
+                    "is_mx=True for BF16-to-MXFP8 refit."
                 )
         elif fp8_param:
             violations.append(
@@ -718,7 +797,18 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         gen_tp = vllm_cfg.get("tensor_parallel_size", 1)
         gen_ep = vllm_cfg.get("expert_parallel_size", 1)
         gen_pp = vllm_cfg.get("pipeline_parallel_size", 1)
-        if gen_ep != 1 and gen_ep != gen_tp:
+        if real_nvfp4 and gen_tp != 1:
+            violations.append(
+                "policy.generation.vllm_cfg.tensor_parallel_size must be 1 for "
+                "real NVFP4 NCCL refit because the receiver serializes TP-local "
+                f"expert shards (got tp={gen_tp})."
+            )
+        if real_nvfp4 and gen_ep != 1:
+            violations.append(
+                "policy.generation.vllm_cfg.expert_parallel_size must be 1 for "
+                f"real NVFP4 NCCL refit (got ep={gen_ep})."
+            )
+        elif gen_ep != 1 and gen_ep != gen_tp:
             violations.append(
                 "policy.generation.vllm_cfg.expert_parallel_size must be 1 or "
                 f"equal to tensor_parallel_size (got ep={gen_ep}, tp={gen_tp})."

@@ -81,6 +81,55 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
 
 
+@pytest.mark.parametrize("precision", [None, "auto", "bf16", "bfloat16"])
+def test_init_fp8_rejects_mxfp8_without_fp8_precision(
+    fp8_module, monkeypatch, precision
+):
+    fp8 = fp8_module
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+
+    with pytest.raises(ValueError, match="is_mx=True requires precision='fp8'"):
+        fp8.init_fp8(
+            {
+                "precision": precision,
+                "kv_cache_dtype": "auto",
+                "is_mx": True,
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+
+def test_quantize_mxfp8_weight_restores_grouped_expert_shape(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    weight = torch.zeros(2, 3, 32, dtype=torch.bfloat16)
+
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    def flattened_quantize(
+        tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows = tensor.numel() // tensor.shape[-1]
+        return (
+            torch.zeros(rows, tensor.shape[-1], dtype=torch.float8_e4m3fn),
+            torch.tensor([0, 2, 0, 127, 255, 5], dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", flattened_quantize)
+
+    value, scale = fp8.quantize_mxfp8_weight(weight)
+
+    assert value.shape == weight.shape
+    assert scale.shape == (2, 3, 1)
+    assert torch.equal(
+        scale.flatten(), torch.tensor([1, 2, 1, 127, 255, 5], dtype=torch.uint8)
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("is_gated", "intermediate_size", "hidden_size"),
