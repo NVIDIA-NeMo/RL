@@ -56,7 +56,9 @@ except ImportError:
     )
 
 
-WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
+WeightUpdateTransport = Literal[
+    "ipc", "collective", "checkpoint_engine", "nccl_reshard"
+]
 WeightUpdateFinalizer = Callable[[], None]
 
 
@@ -184,6 +186,7 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+    _nrl_mxfp8_linear_reload_roots: tuple[torch.nn.Module, ...] | None = None
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -191,6 +194,26 @@ class VllmInternalWorkerExtension:
             params = dict(self.model_runner.model.named_parameters())
             self._nrl_named_parameters = params
         return params
+
+    def _get_mxfp8_linear_reload_roots(self) -> tuple[torch.nn.Module, ...]:
+        roots = self._nrl_mxfp8_linear_reload_roots
+        if roots is None:
+            from nemo_rl.models.generation.vllm.quantization.fp8 import (
+                uses_native_mxfp8_linear_refit,
+            )
+
+            modules = getattr(self.model_runner.model, "modules", None)
+            roots = (
+                tuple(
+                    module
+                    for module in modules()
+                    if uses_native_mxfp8_linear_refit(module)
+                )
+                if modules is not None
+                else ()
+            )
+            self._nrl_mxfp8_linear_reload_roots = roots
+        return roots
 
     def _load_full_hf_weights(
         self, policy_weights: list[tuple[str, torch.Tensor]]
@@ -610,23 +633,106 @@ class VllmInternalWorkerExtension:
         self, transport: WeightUpdateTransport
     ) -> Iterator[WeightUpdateFinalizer]:
         """Provide setup/finalization around a transport-owned weight update."""
-        del transport
         from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.reload import (
+            finalize_layerwise_reload,
+            initialize_layerwise_reload,
+        )
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
         )
 
+        reload_roots = self._get_mxfp8_linear_reload_roots()
+        if not reload_roots:
+
+            def finalize() -> None:
+                with set_current_vllm_config(self.model_runner.vllm_config):
+                    process_weights_after_loading(
+                        self.model_runner.model, self.model_config, self.device
+                    )
+                self._maybe_process_mtp_drafter_after_loading()
+
+            yield finalize
+            if transport != "checkpoint_engine":
+                self._maybe_process_fp8_kv_cache()
+            return
+
+        pending_roots: list[torch.nn.Module] = []
+
+        def abort_root(root: torch.nn.Module) -> None:
+            from vllm.model_executor.model_loader.reload.layerwise import (
+                LOADING_LAYERS,
+                _place_kernel_tensors,
+                get_layerwise_info,
+            )
+
+            if hasattr(root, "_original_do_torchao_reload"):
+                root._do_torchao_reload = root._original_do_torchao_reload
+            for layer in root.modules():
+                info = get_layerwise_info(layer)
+                if info.kernel_tensors is not None:
+                    _place_kernel_tensors(layer, info)
+                info.reset()
+                LOADING_LAYERS.discard(layer)
+
+        def abort_pending_roots() -> None:
+            while pending_roots:
+                root = pending_roots.pop(0)
+                try:
+                    abort_root(root)
+                except Exception:
+                    logger.exception(
+                        "Failed to abort MXFP8 layerwise reload for %s",
+                        type(root).__name__,
+                    )
+
+        def finalize_pending_roots() -> None:
+            first_error: Exception | None = None
+            while pending_roots:
+                root = pending_roots.pop(0)
+                try:
+                    finalize_layerwise_reload(root, self.model_config)
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+                    logger.exception(
+                        "Failed to finalize MXFP8 layerwise reload for %s",
+                        type(root).__name__,
+                    )
+                    try:
+                        abort_root(root)
+                    except Exception:
+                        logger.exception(
+                            "Failed to restore MXFP8 layerwise reload root %s",
+                            type(root).__name__,
+                        )
+            if first_error is not None:
+                raise first_error
+
         def finalize() -> None:
+            finalize_pending_roots()
             with set_current_vllm_config(self.model_runner.vllm_config):
                 process_weights_after_loading(
                     self.model_runner.model, self.model_config, self.device
                 )
             self._maybe_process_mtp_drafter_after_loading()
 
-        yield finalize
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            with torch.device(self.device):
+                try:
+                    for root in reload_roots:
+                        pending_roots.append(root)
+                        initialize_layerwise_reload(root)
+                    yield finalize
+                except BaseException:
+                    abort_pending_roots()
+                    raise
+                else:
+                    finalize_pending_roots()
         # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
         # this optional second pass, just as it was before lifecycle hooks.
-        self._maybe_process_fp8_kv_cache()
+        if transport != "checkpoint_engine":
+            self._maybe_process_fp8_kv_cache()
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
