@@ -35,9 +35,9 @@ from nemo_rl.models.automodel.data import (
     make_processed_microbatch_iterator,
 )
 from nemo_rl.models.automodel.train import (
-    PreparedModelForward,
     LogprobsPostProcessor,
     LossPostProcessor,
+    PreparedModelForward,
     ScorePostProcessor,
     TopkLogitsPostProcessor,
     apply_temperature_scaling,
@@ -225,7 +225,8 @@ class TestModelForward:
             }
         )
 
-        model_forward(model, processed_inputs_multimodal)
+        prepared = _prepare_cp1(model, processed_inputs_multimodal)
+        model_forward(model, prepared.model_batch)
 
         assert (
             model.pixel_values is processed_inputs_multimodal.vlm_kwargs["pixel_values"]
@@ -253,8 +254,10 @@ class TestModelForward:
             }
         )
 
+        # The mixed-resolution guard lives in ``filter_multimodal_kwargs_for_model``,
+        # which ``prepare_model_forward`` invokes while building the model batch.
         with pytest.raises(ValueError, match="mixed-resolution"):
-            model_forward(model, processed_inputs_multimodal)
+            _prepare_cp1(model, processed_inputs_multimodal)
 
     def test_forward_allows_uniform_resolution_without_imgs_sizes_support(
         self, processed_inputs_multimodal
@@ -285,7 +288,8 @@ class TestModelForward:
 
         # Uniform sizes (the shipped fixed-tile case): no raise, and imgs_sizes
         # is filtered out for a model that cannot consume it.
-        model_forward(model, processed_inputs_multimodal)
+        prepared = _prepare_cp1(model, processed_inputs_multimodal)
+        model_forward(model, prepared.model_batch)
 
         assert (
             model.pixel_values is processed_inputs_multimodal.vlm_kwargs["pixel_values"]
@@ -325,7 +329,8 @@ class TestModelForward:
             }
         )
 
-        model_forward(model, processed_inputs_multimodal)
+        prepared = _prepare_cp1(model, processed_inputs_multimodal)
+        model_forward(model, prepared.model_batch)
 
         assert model.forward_kwargs["pixel_values"] is padded_images
         assert model.forward_kwargs["imgs_sizes"] is image_sizes
@@ -345,7 +350,8 @@ class TestModelForward:
         model = KwargsModel()
         processed_inputs_multimodal.vlm_kwargs["num_frames"] = torch.tensor([1])
 
-        model_forward(model, processed_inputs_multimodal)
+        prepared = _prepare_cp1(model, processed_inputs_multimodal)
+        model_forward(model, prepared.model_batch)
 
         assert "num_frames" in model.forward_kwargs
 

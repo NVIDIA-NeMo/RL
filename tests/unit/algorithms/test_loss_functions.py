@@ -2804,9 +2804,7 @@ def test_cross_tokenizer_partitioned_cp_ce_matches_cp1_value_and_gradient(tmp_pa
     )
     data = BatchedDataDict(
         {
-            "token_mask": torch.tensor(
-                [[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]]
-            ),
+            "token_mask": torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]]),
             "sample_mask": torch.tensor([1.0, 0.0]),
         }
     )
@@ -2828,9 +2826,7 @@ def test_cross_tokenizer_partitioned_cp_ce_matches_cp1_value_and_gradient(tmp_pa
     cp1_loss.backward()
 
     cp2_logprobs = cp1_logprobs.detach().clone().requires_grad_(True)
-    cp2_padded = torch.cat(
-        [cp2_logprobs, torch.zeros_like(cp2_logprobs[:, :1])], dim=1
-    )
+    cp2_padded = torch.cat([cp2_logprobs, torch.zeros_like(cp2_logprobs[:, :1])], dim=1)
     cp2_local_seq_len = cp2_padded.shape[1] // 2
     cp2_losses = []
     for cp_rank in range(2):
