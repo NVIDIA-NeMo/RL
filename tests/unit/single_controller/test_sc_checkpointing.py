@@ -332,6 +332,7 @@ class _FakeRolloutManager:
     def __init__(self) -> None:
         self.weight_versions: list[int] = []
         self._tq_buffer = None
+        self.recovery_ledger = None
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
@@ -359,6 +360,10 @@ class _FakeTQBuffer:
         self.metadata_state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
         self.checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
+
+    @property
+    def group_ids(self) -> tuple[str, ...]:
+        return ()
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier

@@ -77,7 +77,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        rollout_manager=SimpleNamespace(_tq_buffer=None, recovery_ledger=None),
         env_handles={},
         train_cluster=None,
         inference_cluster=None,
@@ -131,7 +131,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        rollout_manager=SimpleNamespace(_tq_buffer=None, recovery_ledger=None),
         env_handles={},
         train_cluster=None,
         inference_cluster=None,
@@ -186,7 +186,7 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=None,
-        rollout_manager=SimpleNamespace(_tq_buffer=None),
+        rollout_manager=SimpleNamespace(_tq_buffer=None, recovery_ledger=None),
         train_cluster=None,
         inference_cluster=None,
         # A real field of SingleControllerActorArgs. Read directly rather than via a
@@ -382,6 +382,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._rollout_recovery_ledger = None
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],

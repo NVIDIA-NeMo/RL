@@ -245,6 +245,33 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
 
 
+def test_finalize_group_maps_physical_attempt_to_stable_canonical_id(
+    tq_client, partitions
+):
+    group_id = "stable"
+    physical_id = f"{group_id}_g0_aattempt"
+    canonical_id = f"{group_id}_g0"
+    receipt, _ = _stage_fixture(
+        tq_client,
+        "worked_example",
+        rollout_id=physical_id,
+    )
+    receipt["rollout_id"] = physical_id
+
+    finalized = _finalizer(tq_client).finalize_group(
+        group_id,
+        [physical_id],
+        [receipt],
+        [1.0],
+        fallback_weight_version=4,
+        canonical_sample_ids=[canonical_id],
+    )
+
+    assert finalized.meta is not None
+    assert finalized.meta.sample_ids == [canonical_id]
+    assert _fetch_rows(tq_client, [canonical_id])["input_ids"] is not None
+
+
 def test_finalize_group_min_valid_fraction_drops(tq_client, partitions):
     group_id = "grp2"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]

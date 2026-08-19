@@ -849,6 +849,11 @@ class TQReplayBuffer:
             raise RuntimeError("data-plane checkpoint barrier is already configured")
         self._data_plane_checkpoint_barrier = barrier
 
+    @property
+    def group_ids(self) -> tuple[str, ...]:
+        """Return a stable snapshot of controller-local replay ownership."""
+        return tuple(self._group_ids)
+
     def reserve(
         self,
         *,
@@ -1011,6 +1016,29 @@ class TQReplayBuffer:
             except ValueError as error:
                 raise ValueError(f"unknown group_id={group_id!r}") from error
             return await self._remove_unlocked([idx], clear_data_plane=remove_in_dp)
+
+    async def clear_staging_keys(self, staging_keys: list[str]) -> None:
+        """Clear known token-capture staging rows under the checkpoint barrier."""
+        if not staging_keys:
+            return
+        if self._staging_partition_id is None:
+            raise RuntimeError(
+                "cannot clear token-capture staging keys without a staging partition"
+            )
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint barrier before clearing staging samples"
+            )
+        unique_keys = list(dict.fromkeys(staging_keys))
+        async with self._data_plane_checkpoint_barrier.mutation():
+            await call_data_plane(
+                self._dp_client,
+                "clear_samples",
+                offload_sync=True,
+                sample_ids=unique_keys,
+                partition_id=self._staging_partition_id,
+            )
 
     async def commit_finalized(
         self,
