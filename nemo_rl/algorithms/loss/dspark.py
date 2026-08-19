@@ -29,6 +29,149 @@ from nemo_rl.algorithms.loss.draft import (
 )
 
 
+_VOCAB_GRADIENT_CHUNK_SIZE = 4096
+
+
+def _dtype_code(dtype: torch.dtype) -> int:
+    dtype_names = (
+        "bool",
+        "uint8",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "float16",
+        "bfloat16",
+        "float32",
+        "float64",
+        "complex32",
+        "complex64",
+        "complex128",
+    )
+    return next(
+        (
+            index
+            for index, name in enumerate(dtype_names)
+            if dtype == getattr(torch, name, None)
+        ),
+        -1,
+    )
+
+
+def _tensor_contract(tensor: torch.Tensor | None) -> list[int]:
+    if tensor is None:
+        return [-1, -1, -1, -1, -1, -1]
+    padded_shape = [*tensor.shape[:4], *([-1] * max(0, 4 - tensor.ndim))]
+    return [tensor.ndim, *padded_shape, _dtype_code(tensor.dtype)]
+
+
+def _validate_tp_structural_agreement(
+    *,
+    tensors: tuple[torch.Tensor | None, ...],
+    loss_weights: tuple[float, float, float],
+    token_chunk_size: int,
+    device: torch.device,
+    tp_group: torch.distributed.ProcessGroup | None,
+) -> None:
+    if tp_group is None:
+        return
+    contract_values = [len(loss_weights), token_chunk_size]
+    for tensor in tensors:
+        contract_values.extend(_tensor_contract(tensor))
+    contract = torch.tensor(contract_values, dtype=torch.int64, device=device)
+    contract_minimum = contract.clone()
+    contract_maximum = contract.clone()
+    torch.distributed.all_reduce(
+        contract_minimum,
+        op=torch.distributed.ReduceOp.MIN,
+        group=tp_group,
+    )
+    torch.distributed.all_reduce(
+        contract_maximum,
+        op=torch.distributed.ReduceOp.MAX,
+        group=tp_group,
+    )
+    if not torch.equal(contract_minimum, contract_maximum):
+        raise ValueError(
+            "tensor-parallel ranks must agree on DSpark shapes, dtypes, and chunk size"
+        )
+    if len(loss_weights) == 3:
+        weights = torch.tensor(loss_weights, dtype=torch.float64, device=device)
+        weights_minimum = weights.clone()
+        weights_maximum = weights.clone()
+        torch.distributed.all_reduce(
+            weights_minimum,
+            op=torch.distributed.ReduceOp.MIN,
+            group=tp_group,
+        )
+        torch.distributed.all_reduce(
+            weights_maximum,
+            op=torch.distributed.ReduceOp.MAX,
+            group=tp_group,
+        )
+        if not torch.equal(weights_minimum, weights_maximum):
+            raise ValueError("tensor-parallel ranks must agree on DSpark loss weights")
+
+
+def _raise_if_tp_any(
+    local_invalid: bool,
+    *,
+    message: str,
+    device: torch.device,
+    tp_group: torch.distributed.ProcessGroup | None,
+) -> None:
+    invalid = torch.tensor(local_invalid, dtype=torch.int32, device=device)
+    if tp_group is not None:
+        torch.distributed.all_reduce(
+            invalid,
+            op=torch.distributed.ReduceOp.MAX,
+            group=tp_group,
+        )
+    if bool(invalid):
+        raise ValueError(message)
+
+
+def _validate_tp_metadata_agreement(
+    *,
+    previous_token_ids: torch.Tensor,
+    hard_labels: torch.Tensor,
+    valid_mask: torch.Tensor,
+    slot_bins: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup | None,
+) -> None:
+    if tp_group is None or valid_mask.numel() == 0:
+        return
+    canonical_metadata = torch.stack(
+        (
+            valid_mask.to(dtype=torch.int64),
+            torch.where(valid_mask, hard_labels, 0),
+            torch.where(valid_mask, previous_token_ids, 0),
+            slot_bins,
+        )
+    )
+    metadata_minimum = canonical_metadata.clone()
+    metadata_maximum = canonical_metadata.clone()
+    torch.distributed.all_reduce(
+        metadata_minimum,
+        op=torch.distributed.ReduceOp.MIN,
+        group=tp_group,
+    )
+    torch.distributed.all_reduce(
+        metadata_maximum,
+        op=torch.distributed.ReduceOp.MAX,
+        group=tp_group,
+    )
+    if not torch.equal(metadata_minimum, metadata_maximum):
+        raise ValueError("tensor-parallel ranks must agree on DSpark token metadata")
+
+
+def _compact_retained_view(tensor: torch.Tensor) -> torch.Tensor:
+    compact_nbytes = tensor.numel() * tensor.element_size()
+    if tensor.untyped_storage().nbytes() > compact_nbytes:
+        return tensor.clone()
+    return tensor
+
+
 @dataclass(frozen=True, slots=True)
 class DSparkLossBins:
     """Raw additive numerator and count bins for one DSpark objective."""
@@ -379,15 +522,41 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
                 + tv_gradient * tv_scale.unsqueeze(-1)
             ) * tile_scale
             logits_gradient_fp32 = logits_gradient.float()
-            flat_hidden_gradient[start:end].copy_(
-                logits_gradient_fp32 @ output_weight.detach().float()
+            tile_hidden_gradient = torch.zeros(
+                (end - start, hidden_size),
+                dtype=torch.float32,
+                device=draft_hidden.device,
             )
-            markov_w2_gradient.add_(
-                logits_gradient_fp32.T @ previous_embeddings.detach().float()
+            tile_embedding_gradient = torch.zeros(
+                (end - start, markov_rank),
+                dtype=torch.float32,
+                device=draft_hidden.device,
             )
-            flat_embedding_gradient[start:end].copy_(
-                logits_gradient_fp32 @ markov_w2.detach().float()
-            )
+            previous_embeddings_fp32 = previous_embeddings.detach().float()
+            for vocab_start in range(
+                0,
+                local_vocab_size,
+                _VOCAB_GRADIENT_CHUNK_SIZE,
+            ):
+                vocab_end = min(
+                    vocab_start + _VOCAB_GRADIENT_CHUNK_SIZE,
+                    local_vocab_size,
+                )
+                gradient_chunk = logits_gradient_fp32[:, vocab_start:vocab_end]
+                tile_hidden_gradient.addmm_(
+                    gradient_chunk,
+                    output_weight[vocab_start:vocab_end].detach().float(),
+                )
+                markov_w2_gradient[vocab_start:vocab_end].addmm_(
+                    gradient_chunk.T,
+                    previous_embeddings_fp32,
+                )
+                tile_embedding_gradient.addmm_(
+                    gradient_chunk,
+                    markov_w2[vocab_start:vocab_end].detach().float(),
+                )
+            flat_hidden_gradient[start:end].copy_(tile_hidden_gradient)
+            flat_embedding_gradient[start:end].copy_(tile_embedding_gradient)
 
         if ctx.tp_group is not None and flat_hidden.shape[0] > 0:
             torch.distributed.all_reduce(
@@ -447,6 +616,24 @@ def _validate_inputs(
     vocab_start_index: int,
     tp_group: torch.distributed.ProcessGroup | None,
 ) -> None:
+    _validate_tp_structural_agreement(
+        tensors=(
+            target_logits,
+            draft_hidden,
+            target_output_weight,
+            markov_w1,
+            markov_w2,
+            previous_token_ids,
+            confidence_logits,
+            hard_labels,
+            valid_mask,
+            slot_bins,
+        ),
+        loss_weights=loss_weights,
+        token_chunk_size=token_chunk_size,
+        device=target_logits.device,
+        tp_group=tp_group,
+    )
     if target_logits.ndim != 3 or target_logits.shape[-1] == 0:
         raise ValueError("target_logits must have shape [blocks, slots, local_vocab]")
     if draft_hidden.ndim != 3 or draft_hidden.shape[-1] == 0:
@@ -476,11 +663,13 @@ def _validate_inputs(
         tp_size = torch.distributed.get_world_size(tp_group)
         expected_start = tp_rank * local_vocab_size
         expected_global_vocab_size = tp_size * local_vocab_size
-    if (
+    _raise_if_tp_any(
         vocab_start_index != expected_start
-        or global_vocab_size != expected_global_vocab_size
-    ):
-        raise ValueError("vocabulary shard must be an even rank-local TP partition")
+        or global_vocab_size != expected_global_vocab_size,
+        message="vocabulary shard must be an even rank-local TP partition",
+        device=target_logits.device,
+        tp_group=tp_group,
+    )
     for name, tensor in (
         ("previous_token_ids", previous_token_ids),
         ("hard_labels", hard_labels),
@@ -530,8 +719,12 @@ def _validate_inputs(
     )
     if confidence_logits is not None:
         devices.add(confidence_logits.device)
-    if len(devices) != 1:
-        raise ValueError("all DSpark objective inputs must share a device")
+    _raise_if_tp_any(
+        len(devices) != 1,
+        message="all DSpark objective inputs must share a device",
+        device=target_logits.device,
+        tp_group=tp_group,
+    )
     if token_chunk_size < 1:
         raise ValueError("token_chunk_size must be positive")
     if len(loss_weights) != 3 or any(
@@ -540,10 +733,13 @@ def _validate_inputs(
         raise ValueError("loss_weights must contain three finite nonnegative values")
     if confidence_logits is None and loss_weights[2] != 0:
         raise ValueError("confidence weight must be zero when confidence is disabled")
-    if slot_bins.numel() > 0 and (
-        bool(slot_bins.lt(0).any()) or bool(slot_bins.ge(slot_shape[1]).any())
-    ):
-        raise ValueError("slot_bins must be inside the configured slot bins")
+    _validate_tp_metadata_agreement(
+        previous_token_ids=previous_token_ids,
+        hard_labels=hard_labels,
+        valid_mask=valid_mask,
+        slot_bins=slot_bins,
+        tp_group=tp_group,
+    )
 
     invalid_metadata = torch.stack(
         (
@@ -554,6 +750,7 @@ def _validate_inputs(
                 valid_mask
                 & (previous_token_ids.lt(0) | previous_token_ids.ge(global_vocab_size))
             ).any(),
+            (slot_bins.lt(0) | slot_bins.ge(slot_shape[1])).any(),
         )
     ).to(dtype=torch.int32)
     if tp_group is not None:
@@ -568,6 +765,8 @@ def _validate_inputs(
         raise ValueError(
             "valid previous_token_ids must be inside the global vocabulary"
         )
+    if bool(invalid_metadata[2]):
+        raise ValueError("slot_bins must be inside the configured slot bins")
 
 
 def dspark_tiled_objective(
@@ -605,16 +804,22 @@ def dspark_tiled_objective(
         tp_group=tp_group,
     )
     num_bins = target_logits.shape[1]
+    compact_hidden = _compact_retained_view(draft_hidden)
+    compact_target = _compact_retained_view(target_logits.detach())
+    compact_previous_token_ids = _compact_retained_view(previous_token_ids)
+    compact_hard_labels = _compact_retained_view(hard_labels)
+    compact_valid_mask = _compact_retained_view(valid_mask)
+    compact_slot_bins = _compact_retained_view(slot_bins)
     ce_numerators, tv_numerators, verifier_correct = _TiledProjectedHardCEAndTV.apply(
-        draft_hidden,
+        compact_hidden,
         target_output_weight,
-        target_logits,
-        previous_token_ids,
+        compact_target,
+        compact_previous_token_ids,
         markov_w1,
         markov_w2,
-        hard_labels,
-        valid_mask,
-        slot_bins,
+        compact_hard_labels,
+        compact_valid_mask,
+        compact_slot_bins,
         num_bins,
         token_chunk_size,
         vocab_start_index,
