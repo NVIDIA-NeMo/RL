@@ -37,6 +37,7 @@ def test_submitter_uses_a_pinned_ray_runtime() -> None:
     script = SCRIPT.read_text()
 
     assert "RAY_RUNTIME_VENV" in script
+    assert '"${RAY_RUNTIME_VENV}/READY"' in script
     assert "ray.__version__ == \"2.56.1\"" in script
     assert "export SETUP_COMMAND" in script
 

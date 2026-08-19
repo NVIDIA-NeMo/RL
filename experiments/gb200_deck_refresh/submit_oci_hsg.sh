@@ -154,11 +154,10 @@ if git -C "${REPO}" submodule status --recursive | grep -q '^-'; then
   exit 2
 fi
 for path in "${REPO}/${CONFIG}" "${REPO}/ray.sub" "${CONTAINER}" "${HF_HOME}" \
-  "${RAY_RUNTIME_VENV}/bin/python" "${RAY_RUNTIME_VENV}/bin/ray"; do
+  "${RAY_RUNTIME_VENV}/bin/python" "${RAY_RUNTIME_VENV}/bin/ray" \
+  "${RAY_RUNTIME_VENV}/READY"; do
   test -e "${path}"
 done
-"${RAY_RUNTIME_VENV}/bin/python" -c \
-  'import ray, requests, urllib3; assert ray.__version__ == "2.56.1"'
 
 export SETUP_COMMAND=$(cat <<EOF
 set -euo pipefail

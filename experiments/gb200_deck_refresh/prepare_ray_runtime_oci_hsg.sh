@@ -33,6 +33,7 @@ if [[ -x "\${RUNTIME}/bin/python" ]] && \
      'import ray, requests, sys, urllib3; assert sys.version_info[:3] == (3, 13, 14); assert ray.__version__ == "2.56.1"' 2>/dev/null; then
   "\${RUNTIME}/bin/python" --version
   "\${RUNTIME}/bin/ray" --version
+  touch "\${RUNTIME}/READY"
   exit 0
 fi
 
@@ -51,6 +52,7 @@ test -n "\${PYTHON}"
   'ray[default,client,data]==2.56.1'
 "\${RUNTIME}/bin/python" -c \
   'import ray, requests, sys, urllib3; assert sys.version_info[:3] == (3, 13, 14); assert ray.__version__ == "2.56.1"; print(ray.__version__, requests.__version__, urllib3.__version__)'
+touch "\${RUNTIME}/READY"
 EOF
 )
 
