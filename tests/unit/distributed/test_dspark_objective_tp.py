@@ -209,7 +209,7 @@ def _run_tp2_provider_objective(rank: int, world_size: int) -> None:
         token_chunk_size=2,
         tp_group=tp_group,
     )
-    actual_loss = stats.combined.normalized()
+    actual_loss = stats.combined.normalized(normalization_counts=stats.combined.counts)
     actual_loss.backward()
 
     for actual, expected in zip(
@@ -284,6 +284,148 @@ def _run_dp2_raw_additive_stats(rank: int, world_size: int) -> None:
     if rank == 0:
         torch.testing.assert_close(reduced[0], stats.combined.numerators)
         torch.testing.assert_close(reduced[1], torch.ones(3, device=device))
+
+
+def _run_tp2_tv_only_gradient(rank: int, world_size: int) -> None:
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    device = torch.device("cuda")
+    vocab_size, hidden_size, markov_rank = 4, 1, 1
+    local_vocab_size = vocab_size // world_size
+    vocab_start = rank * local_vocab_size
+    vocab_end = vocab_start + local_vocab_size
+    full_output_weight = torch.tensor(
+        [[-2.0], [-0.5], [1.25], [3.0]], device=device, dtype=torch.float64
+    )
+    full_target_logits = torch.tensor(
+        [[[2.0, -1.0, -2.0, 0.5]]], device=device, dtype=torch.float64
+    )
+    dense_hidden = torch.tensor(
+        [[[0.75]]], device=device, dtype=torch.float64, requires_grad=True
+    )
+    dense_logits = dense_hidden @ full_output_weight.T
+    dense_tv = (
+        0.5
+        * (
+            torch.softmax(full_target_logits, dim=-1)
+            - torch.softmax(dense_logits, dim=-1)
+        )
+        .abs()
+        .sum()
+    )
+    dense_tv.backward()
+
+    provider = build_dspark_provider(
+        body=_CheckpointBody(tp_group=tp_group, device=device),
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        markov_rank=markov_rank,
+        confidence_enabled=False,
+        confidence_with_markov=False,
+        vocab_start_index=vocab_start,
+        vocab_end_index=vocab_end,
+        tensor_parallel_group=tp_group,
+        device=device,
+        dtype=torch.float64,
+    )
+    with torch.no_grad():
+        provider.markov_head.markov_w1.weight.zero_()
+        provider.markov_head.markov_w2.weight.zero_()
+    actual_hidden = dense_hidden.detach().clone().requires_grad_()
+    stats = provider.objective_stats(
+        draft_hidden=actual_hidden,
+        target_output_weight=full_output_weight[vocab_start:vocab_end],
+        target_logits=full_target_logits[..., vocab_start:vocab_end],
+        previous_token_ids=torch.zeros((1, 1), device=device, dtype=torch.long),
+        hard_labels=torch.zeros((1, 1), device=device, dtype=torch.long),
+        valid_mask=torch.ones((1, 1), device=device, dtype=torch.bool),
+        slot_bins=torch.zeros((1, 1), device=device, dtype=torch.long),
+        loss_weights=(0.0, 1.0, 0.0),
+        token_chunk_size=1,
+        tp_group=tp_group,
+    )
+    stats.tv.normalized(normalization_counts=stats.tv.counts).backward()
+    torch.testing.assert_close(
+        actual_hidden.grad, dense_hidden.grad, rtol=0, atol=1e-12
+    )
+
+    empty_hidden = dense_hidden.detach().clone().requires_grad_()
+    empty_stats = provider.objective_stats(
+        draft_hidden=empty_hidden,
+        target_output_weight=full_output_weight[vocab_start:vocab_end],
+        target_logits=full_target_logits[..., vocab_start:vocab_end],
+        previous_token_ids=torch.full((1, 1), -1, device=device, dtype=torch.long),
+        hard_labels=torch.full((1, 1), -1, device=device, dtype=torch.long),
+        valid_mask=torch.zeros((1, 1), device=device, dtype=torch.bool),
+        slot_bins=torch.zeros((1, 1), device=device, dtype=torch.long),
+        loss_weights=(0.0, 1.0, 0.0),
+        token_chunk_size=1,
+        tp_group=tp_group,
+    )
+    empty_stats.tv.normalized(normalization_counts=empty_stats.tv.counts).backward()
+    torch.testing.assert_close(empty_hidden.grad, torch.zeros_like(empty_hidden))
+
+
+def _run_tp2_hard_label_boundaries(rank: int, world_size: int) -> None:
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    device = torch.device("cuda")
+    vocab_size = 4
+    local_vocab_size = vocab_size // world_size
+    vocab_start = rank * local_vocab_size
+    provider = build_dspark_provider(
+        body=_CheckpointBody(tp_group=tp_group, device=device),
+        vocab_size=vocab_size,
+        hidden_size=2,
+        markov_rank=1,
+        confidence_enabled=False,
+        confidence_with_markov=False,
+        vocab_start_index=vocab_start,
+        vocab_end_index=vocab_start + local_vocab_size,
+        tensor_parallel_group=tp_group,
+        device=device,
+        dtype=torch.float64,
+    )
+    common = {
+        "draft_hidden": torch.ones((1, 1, 2), device=device, dtype=torch.float64),
+        "target_output_weight": torch.ones(
+            (local_vocab_size, 2), device=device, dtype=torch.float64
+        ),
+        "target_logits": torch.ones(
+            (1, 1, local_vocab_size), device=device, dtype=torch.float64
+        ),
+        "previous_token_ids": torch.zeros((1, 1), device=device, dtype=torch.long),
+        "valid_mask": torch.ones((1, 1), device=device, dtype=torch.bool),
+        "slot_bins": torch.zeros((1, 1), device=device, dtype=torch.long),
+        "loss_weights": (1.0, 0.0, 0.0),
+        "token_chunk_size": 1,
+        "tp_group": tp_group,
+    }
+    for bad_label in (-1, vocab_size):
+        with pytest.raises(ValueError, match="hard_labels"):
+            provider.objective_stats(
+                **common,
+                hard_labels=torch.full(
+                    (1, 1), bad_label, device=device, dtype=torch.long
+                ),
+            )
+
+
+def _run_dp2_global_normalization_gradient(rank: int, world_size: int) -> None:
+    dp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    device = torch.device("cuda")
+    local_count = torch.tensor([2.0 if rank == 0 else 1.0], device=device)
+    global_count = local_count.clone()
+    torch.distributed.all_reduce(global_count, group=dp_group)
+    differentiable_numerator = torch.tensor(
+        [float(rank + 1)], device=device, requires_grad=True
+    )
+    from nemo_rl.algorithms.loss.dspark import DSparkLossBins
+
+    bins = DSparkLossBins(differentiable_numerator, local_count)
+    bins.normalized(normalization_counts=global_count).backward()
+    torch.testing.assert_close(
+        differentiable_numerator.grad,
+        torch.tensor([1.0 / 3.0], device=device),
+    )
 
 
 def _run_tp2_provider_checkpoint(
@@ -369,6 +511,20 @@ def test_tp2_bf16_output_and_hidden_head_gradients(distributed_test_runner) -> N
 
 def test_dp2_raw_stats_allow_one_rank_with_zero_slots(distributed_test_runner) -> None:
     distributed_test_runner(_run_dp2_raw_additive_stats, world_size=2)
+
+
+def test_tp2_tv_only_gradient_uses_global_softmax_jacobian_expectation(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(_run_tp2_tv_only_gradient, world_size=2)
+
+
+def test_tp2_rejects_global_hard_label_boundaries(distributed_test_runner) -> None:
+    distributed_test_runner(_run_tp2_hard_label_boundaries, world_size=2)
+
+
+def test_dp2_normalized_gradient_uses_global_counts(distributed_test_runner) -> None:
+    distributed_test_runner(_run_dp2_global_normalization_gradient, world_size=2)
 
 
 def test_tp2_real_mcore_checkpoint_round_trip(

@@ -2,19 +2,15 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 import torch
 from torch import nn
 
 
-def _load_provider() -> ModuleType:
+def _load_provider_without_poisoning_packages() -> ModuleType:
     repository_root = Path(__file__).parents[4]
-    provider_path = repository_root / "nemo_rl/models/megatron/draft/dspark_provider.py"
-    if not provider_path.is_file():
-        pytest.fail(
-            f"missing private DSpark provider adapter: {provider_path}", pytrace=False
-        )
     package_names = (
         "nemo_rl",
         "nemo_rl.algorithms",
@@ -23,33 +19,69 @@ def _load_provider() -> ModuleType:
         "nemo_rl.models.megatron",
         "nemo_rl.models.megatron.draft",
     )
-    for package_name in package_names:
-        package = ModuleType(package_name)
-        package.__path__ = []  # type: ignore[attr-defined]
-        sys.modules[package_name] = package
     module_paths = (
-        (
-            "nemo_rl.algorithms.loss.draft",
-            repository_root / "nemo_rl/algorithms/loss/draft.py",
-        ),
-        (
-            "nemo_rl.algorithms.loss.dspark",
-            repository_root / "nemo_rl/algorithms/loss/dspark.py",
-        ),
+        ("nemo_rl.algorithms.loss.draft", "nemo_rl/algorithms/loss/draft.py"),
+        ("nemo_rl.algorithms.loss.dspark", "nemo_rl/algorithms/loss/dspark.py"),
         (
             "nemo_rl.models.megatron.draft.dspark",
-            repository_root / "nemo_rl/models/megatron/draft/dspark.py",
+            "nemo_rl/models/megatron/draft/dspark.py",
         ),
-        ("nemo_rl.models.megatron.draft.dspark_provider", provider_path),
+        (
+            "nemo_rl.models.megatron.draft.dspark_provider",
+            "nemo_rl/models/megatron/draft/dspark_provider.py",
+        ),
     )
-    for module_name, module_path in module_paths:
-        spec = importlib.util.spec_from_file_location(module_name, module_path)
-        if spec is None or spec.loader is None:
-            pytest.fail(f"cannot load {module_path}", pytrace=False)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        spec.loader.exec_module(module)
-    return sys.modules["nemo_rl.models.megatron.draft.dspark_provider"]
+    module_names = (*package_names, *(name for name, _ in module_paths))
+    previous_modules = {name: sys.modules.get(name) for name in module_names}
+    try:
+        for package_name in package_names:
+            package = ModuleType(package_name)
+            package.__path__ = []  # type: ignore[attr-defined]
+            sys.modules[package_name] = package
+        for module_name, relative_path in module_paths:
+            spec = importlib.util.spec_from_file_location(
+                module_name, repository_root / relative_path
+            )
+            if spec is None or spec.loader is None:
+                pytest.fail(f"cannot load {relative_path}", pytrace=False)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+        loaded = sys.modules["nemo_rl.models.megatron.draft.dspark_provider"]
+        assert isinstance(loaded, ModuleType)
+        return loaded
+    finally:
+        for module_name, previous in previous_modules.items():
+            if previous is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = previous
+
+
+_PROVIDER = _load_provider_without_poisoning_packages()
+build_dspark_provider = _PROVIDER.build_dspark_provider
+
+
+class _CheckpointLinear(nn.Linear):
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple[tuple[int, int, int], ...] = (),
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del sharded_offsets, metadata
+        return {f"{prefix}{name}": value for name, value in self.state_dict().items()}
+
+
+class _CheckpointIdentity(nn.Identity):
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple[tuple[int, int, int], ...] = (),
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del prefix, sharded_offsets, metadata
+        return {}
 
 
 def _provider_inputs() -> dict[str, object]:
@@ -76,9 +108,8 @@ def _provider_inputs() -> dict[str, object]:
 
 def test_factory_returns_private_body_and_head_only_adapter() -> None:
     """Provider state cannot capture a caller-owned target embedding or LM head."""
-    provider_module = _load_provider()
-    body = nn.Linear(5, 5, bias=False).double()
-    provider = provider_module.build_dspark_provider(
+    body = _CheckpointLinear(5, 5, bias=False).double()
+    provider = build_dspark_provider(
         body=body,
         vocab_size=9,
         hidden_size=5,
@@ -106,9 +137,8 @@ def test_factory_returns_private_body_and_head_only_adapter() -> None:
 
 def test_provider_uses_live_head_without_owning_or_training_it() -> None:
     """The live target head projects draft hidden state but remains stop-gradient."""
-    provider_module = _load_provider()
-    provider = provider_module.build_dspark_provider(
-        body=nn.Identity(),
+    provider = build_dspark_provider(
+        body=_CheckpointIdentity(),
         vocab_size=9,
         hidden_size=5,
         markov_rank=3,
@@ -119,7 +149,7 @@ def test_provider_uses_live_head_without_owning_or_training_it() -> None:
     inputs = _provider_inputs()
 
     stats = provider.objective_stats(**inputs)
-    stats.combined.normalized().backward()
+    stats.combined.normalized(normalization_counts=stats.combined.counts).backward()
 
     target_output_weight = inputs["target_output_weight"]
     target_logits = inputs["target_logits"]
@@ -138,9 +168,8 @@ def test_provider_uses_live_head_without_owning_or_training_it() -> None:
 
 def test_duplicate_markov_tokens_accumulate_into_one_replicated_w1_row() -> None:
     """Repeated previous tokens must accumulate both Markov and confidence gradients."""
-    provider_module = _load_provider()
-    provider = provider_module.build_dspark_provider(
-        body=nn.Identity(),
+    provider = build_dspark_provider(
+        body=_CheckpointIdentity(),
         vocab_size=9,
         hidden_size=5,
         markov_rank=3,
@@ -150,7 +179,7 @@ def test_duplicate_markov_tokens_accumulate_into_one_replicated_w1_row() -> None
     )
     inputs = _provider_inputs()
     stats = provider.objective_stats(**inputs)
-    stats.combined.normalized().backward()
+    stats.combined.normalized(normalization_counts=stats.combined.counts).backward()
 
     gradient = provider.markov_head.markov_w1.weight.grad
     assert gradient is not None
@@ -160,9 +189,8 @@ def test_duplicate_markov_tokens_accumulate_into_one_replicated_w1_row() -> None
 
 def test_confidence_disabled_provider_has_no_confidence_parameters() -> None:
     """A confidence-disabled capability returns explicit zero raw confidence bins."""
-    provider_module = _load_provider()
-    provider = provider_module.build_dspark_provider(
-        body=nn.Identity(),
+    provider = build_dspark_provider(
+        body=_CheckpointIdentity(),
         vocab_size=9,
         hidden_size=5,
         markov_rank=3,
@@ -183,9 +211,8 @@ def test_confidence_disabled_provider_has_no_confidence_parameters() -> None:
 
 def test_provider_rejects_mismatched_tp_head_and_objective_group() -> None:
     """The provider cannot silently use different TP groups for heads and loss."""
-    provider_module = _load_provider()
-    provider = provider_module.build_dspark_provider(
-        body=nn.Identity(),
+    provider = build_dspark_provider(
+        body=_CheckpointIdentity(),
         vocab_size=9,
         hidden_size=5,
         markov_rank=3,
@@ -199,3 +226,17 @@ def test_provider_rejects_mismatched_tp_head_and_objective_group() -> None:
 
     with pytest.raises(ValueError, match="TP group"):
         provider.objective_stats(**inputs)
+
+
+def test_factory_rejects_body_without_sharded_state_contract() -> None:
+    """A body that cannot checkpoint must fail at construction, not at save time."""
+    with pytest.raises(TypeError, match="sharded_state_dict"):
+        build_dspark_provider(
+            body=nn.Identity(),
+            vocab_size=9,
+            hidden_size=5,
+            markov_rank=3,
+            confidence_enabled=False,
+            confidence_with_markov=False,
+            dtype=torch.float64,
+        )
