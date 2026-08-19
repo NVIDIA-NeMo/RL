@@ -20,6 +20,7 @@ import pytest
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.rollout_recovery import (
+    PromptRef,
     PromptGroupStatus,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
@@ -36,10 +37,16 @@ def _prompt() -> dict:
     }
 
 
+class _NoDeepcopy:
+    def __deepcopy__(self, memo):
+        raise AssertionError("runtime prompt payload must not be deep-copied")
+
+
 def _reserve(ledger: RolloutRecoveryLedger, *, group_id: str = "group-1"):
     return ledger.reserve_group(
         group_id=group_id,
         prompt_id="17",
+        prompt_ref=PromptRef(sample_id="17", task_name="nemo_gym"),
         prompt_payload=_prompt(),  # type: ignore[arg-type]
         expected_generations=2,
         target_step=8,
@@ -56,7 +63,7 @@ def _receipt(gate_rollout_id: str) -> dict:
 
 def _seal(ledger: RolloutRecoveryLedger, group_id: str, generation_index: int) -> None:
     group = ledger.get_group(group_id)
-    gate_id = group.siblings[generation_index].current_attempt.gate_rollout_id
+    gate_id = group.gate_rollout_ids[generation_index]
     ledger.mark_sibling_sealed(
         group_id,
         generation_index=generation_index,
@@ -131,7 +138,7 @@ def test_finalized_group_remains_until_training_cleanup() -> None:
 
     finalized = ledger.get_group(group.group_id)
     assert finalized.status == PromptGroupStatus.FINALIZED
-    assert finalized.prompt_payload is None
+    assert finalized.runtime_prompt_payload is None
     assert len(ledger) == 1
 
     ledger.claim_groups_for_training(
@@ -209,11 +216,45 @@ def test_state_dict_round_trip_preserves_partial_and_claimed_lineage() -> None:
     )
 
     state = ledger.state_dict()
+    assert all("prompt_payload" not in group for group in state["groups"])
+    partial_state = next(
+        group for group in state["groups"] if group["group_id"] == "partial"
+    )
+    assert partial_state["prompt_ref"] == {
+        "sample_id": "17",
+        "task_name": "nemo_gym",
+    }
+    sibling_state = partial_state["siblings"][0]
+    assert "logical_rollout_id" not in sibling_state
+    attempt_state = sibling_state["attempts"][0]
+    assert set(attempt_state).isdisjoint({"attempt_id", "gate_rollout_id"})
+    assert len(attempt_state["attempt_uuid"]) == 16
     restored = RolloutRecoveryLedger.from_state_dict(deepcopy(state))
 
     assert restored.state_dict() == state
     assert restored.open_train_step is not None
     assert restored.open_train_step.group_ids == ["finalized"]
+    assert restored.get_group("partial").runtime_prompt_payload is None
+
+
+def test_state_dict_excludes_runtime_prompt_payload() -> None:
+    ledger = RolloutRecoveryLedger()
+    prompt = _prompt()
+    prompt["__extra__"] = _NoDeepcopy()
+    ledger.reserve_group(
+        group_id="partial",
+        prompt_id="17",
+        prompt_ref=PromptRef(sample_id="17", task_name="nemo_gym"),
+        prompt_payload=prompt,  # type: ignore[arg-type]
+        expected_generations=2,
+        target_step=8,
+        start_weight_version=7,
+    )
+
+    state = ledger.state_dict()
+
+    assert "prompt_payload" not in state["groups"][0]
+    assert state["groups"][0]["prompt_ref"]["sample_id"] == "17"
 
 
 def test_finalizer_unknown_outcome_is_terminal() -> None:

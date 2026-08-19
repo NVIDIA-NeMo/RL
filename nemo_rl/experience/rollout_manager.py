@@ -42,6 +42,7 @@ from nemo_rl.experience.failures import (
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_recovery import (
+    PromptRef,
     PromptGroupStatus,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
@@ -1499,6 +1500,10 @@ class RolloutManager:
             )
         recovery_group = self._recovery_ledger.reserve_group(
             prompt_id=str(input_sample["idx"]),
+            prompt_ref=PromptRef(
+                sample_id=str(input_sample["idx"]),
+                task_name=input_sample.get("task_name"),
+            ),
             prompt_payload=input_sample,
             expected_generations=self._num_generations_per_prompt,
             target_step=target_step,

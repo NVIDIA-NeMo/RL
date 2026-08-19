@@ -853,45 +853,15 @@ class SingleControllerActor:
                 f"contains {len(group_ids)} group IDs"
             )
 
-        # Existing TQ-only checkpoints predate the lineage sidecar. Adopt their
-        # finalized rows lazily so completed-rollout recovery keeps working while
-        # the next stacked change adds persisted ledger restoration.
-        for group_id in group_ids:
-            if group_id in ledger:
-                continue
-            indices = [
-                index
-                for index, sample_id in enumerate(meta.sample_ids)
-                if sample_id.rsplit("_g", 1)[0] == group_id
-            ]
-            group_meta = KVBatchMeta(
-                partition_id=meta.partition_id,
-                task_name=meta.task_name,
-                sample_ids=[meta.sample_ids[index] for index in indices],
-                fields=list(meta.fields) if meta.fields is not None else None,
-                sequence_lengths=(
-                    [meta.sequence_lengths[index] for index in indices]
-                    if meta.sequence_lengths is not None
-                    else None
-                ),
-                extra_info=dict(meta.extra_info),
-                tags=(
-                    [dict(meta.tags[index]) for index in indices]
-                    if meta.tags is not None
-                    else None
-                ),
-            )
-            weights = [
-                int(tag["weight_version"])
-                for tag in group_meta.tags or []
-                if "weight_version" in tag
-            ]
-            fallback_weight = self._trainer_version
-            ledger.adopt_finalized_group(
-                group_id=group_id,
-                meta=group_meta,
-                start_weight_version=min(weights, default=fallback_weight),
-                end_weight_version=max(weights, default=fallback_weight),
+        missing_group_ids = [
+            group_id for group_id in group_ids if group_id not in ledger
+        ]
+        if missing_group_ids:
+            raise RuntimeError(
+                "sampler selected canonical rollout group(s) missing from the "
+                "rollout recovery ledger: "
+                f"{missing_group_ids!r}. Restore TQ, replay metadata, and rollout "
+                "lineage from the same checkpoint."
             )
         ledger.claim_groups_for_training(
             group_ids,
