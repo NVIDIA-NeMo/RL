@@ -1269,7 +1269,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 "reset_prefix_cache can only be used with async_engine=False. Use reset_prefix_cache_async instead."
             )
 
-        self.llm.llm_engine.reset_prefix_cache()
+        self.llm.llm_engine.reset_prefix_cache(reset_connector=True)
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1285,7 +1285,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             )
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
-        self.llm.llm_engine.reset_prefix_cache()
+        self.llm.llm_engine.reset_prefix_cache(reset_connector=True)
         # Clear the renderer's multimodal processor cache (sender side) so it
         # stays in sync with the receiver cache that vLLM clears internally
         # during sleep.  Without this, the sender thinks images are already
