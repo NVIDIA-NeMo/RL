@@ -22,7 +22,6 @@ from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
-
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 register_omegaconf_resolvers()

@@ -237,11 +237,11 @@ from nemo_rl.models.megatron.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
+from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
 from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
-from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
 from nemo_rl.models.megatron.memory_saver import inference_model_alloc_region
 from nemo_rl.models.megatron.router_replay import (
     clear_global_router_replay_instances,
