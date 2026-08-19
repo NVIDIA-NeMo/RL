@@ -62,8 +62,10 @@ class RolloutOutcome(str, enum.Enum):
 
     # The prompt group reached the replay buffer.
     COMMITTED = "committed"
-    # The prompt exhausted its data-failure budget within max_skipped_prompts.
-    # No group was committed, so the caller owns releasing its backpressure permit.
+    # The prompt was given up on within a budget: its data-failure budget within
+    # max_skipped_prompts, or its infrastructure budget within
+    # max_consecutive_dropped_prompts. No group was committed, so the caller owns
+    # releasing its backpressure permit and crediting the step's shortfall.
     SKIPPED = "skipped"
 
 
@@ -92,6 +94,10 @@ class RolloutRetryPolicy:
     # enforced across every generate_and_push call. 0 means none may be: the first
     # exhaustion propagates the original failure.
     max_skipped_prompts: int = 0
+    # Cap on CONSECUTIVE prompts that may exhaust their infra budget and be dropped;
+    # any commit resets the run of failures. 0 means none may be, so the first
+    # exhaustion raises RolloutRedispatchExhausted as it did before this budget existed.
+    max_consecutive_dropped_prompts: int = 0
 
     @classmethod
     def single_attempt(cls, **overrides: Any) -> "RolloutRetryPolicy":
@@ -148,6 +154,15 @@ class RolloutStats:
     data_retries_by_reason: dict[str, int] = field(default_factory=dict)
     # Prompts that ran out of data budget entirely.
     data_failures_by_reason: dict[str, int] = field(default_factory=dict)
+    # Prompts that ran out of INFRA budget and were dropped rather than failing the run.
+    # Distinct from redispatches_by_reason, which counts attempts that were retried: a
+    # fleet that recovers shows redispatches with this flat, and the two diverging is
+    # what says the outage outlasted the per-prompt budget.
+    infra_drops_by_reason: dict[str, int] = field(default_factory=dict)
+    # Longest run of consecutive infra drops seen so far. The live counter resets on
+    # every commit, so without this high-water mark a run that came within one prompt of
+    # aborting is indistinguishable from one that never dropped anything.
+    max_consecutive_infra_drops: int = 0
     # NeMo-Gym row-level re-dispatches. These recover a partial prompt group without
     # redoing the whole thing, so they never reached the counters above and gym could
     # retry rows all run with redispatch_total sitting flat.
@@ -166,6 +181,14 @@ class RolloutStats:
     def record_data_failure(self, reason: str) -> None:
         self.data_failures_by_reason[reason] = (
             self.data_failures_by_reason.get(reason, 0) + 1
+        )
+
+    def record_infra_drop(self, reason: str, consecutive: int) -> None:
+        self.infra_drops_by_reason[reason] = (
+            self.infra_drops_by_reason.get(reason, 0) + 1
+        )
+        self.max_consecutive_infra_drops = max(
+            self.max_consecutive_infra_drops, consecutive
         )
 
     def record_gym_row_redispatch(self, rows: int = 1) -> None:
@@ -188,6 +211,12 @@ class RolloutStats:
                 sum(self.data_failures_by_reason.values())
             ),
             "rollout/gym_row_redispatch_total": float(self.gym_row_redispatches),
+            "rollout/infra_drops_total": float(
+                sum(self.infra_drops_by_reason.values())
+            ),
+            "rollout/max_consecutive_infra_drops": float(
+                self.max_consecutive_infra_drops
+            ),
         }
         for reason, count in self.redispatches_by_reason.items():
             metrics[f"rollout/redispatch_total/{reason}"] = float(count)
@@ -195,6 +224,8 @@ class RolloutStats:
             metrics[f"rollout/data_retry_total/{reason}"] = float(count)
         for reason, count in self.data_failures_by_reason.items():
             metrics[f"rollout/data_failures_total/{reason}"] = float(count)
+        for reason, count in self.infra_drops_by_reason.items():
+            metrics[f"rollout/infra_drops_total/{reason}"] = float(count)
         return metrics
 
 
@@ -1136,6 +1167,10 @@ class RolloutManager:
         # Run-wide, shared across concurrent generate_and_push calls. Safe as a plain
         # int: every caller runs on the SingleController's single event loop.
         self._skipped_prompts: int = 0
+        # Infra drops since the last commit. Shared for the same reason, and shared
+        # deliberately: the question it answers -- "is the fleet still answering
+        # anyone?" -- is about the fleet, not about one prompt's history.
+        self._consecutive_infra_drops: int = 0
 
     @property
     def stats(self) -> RolloutStats:
@@ -1181,12 +1216,17 @@ class RolloutManager:
                 its dispatch task and start weight version.
 
         Returns:
-            ``COMMITTED`` when the group reached the buffer, ``SKIPPED`` when the prompt
-            exhausted its data budget within ``max_skipped_prompts``.
+            ``COMMITTED`` when the group reached the buffer, or ``SKIPPED`` when the
+            prompt was given up on within a budget: its data budget within
+            ``max_skipped_prompts``, or its infra budget within
+            ``max_consecutive_dropped_prompts``. A ``SKIPPED`` prompt committed nothing,
+            so the caller owns both its backpressure permit and the shortfall for the
+            training step it was stamped for.
 
         Raises:
-            RolloutRedispatchExhausted: The infra budget ran out.
-            RolloutDataFailure: The data budget ran out under ``fail_fast``.
+            RolloutRedispatchExhausted: The infra budget ran out and the fleet has not
+                committed anything since ``max_consecutive_dropped_prompts`` drops ago.
+            RolloutDataFailure: The data budget ran out beyond ``max_skipped_prompts``.
         """
         assert self._tq_buffer is not None, (
             "generate_and_push requires tq_buffer to be set at __init__"
@@ -1294,19 +1334,45 @@ class RolloutManager:
                 raise
 
             self._stats.committed += 1
+            # A commit proves the fleet is answering, which is exactly the claim the
+            # consecutive budget is testing, so it clears the run of drops. Placed on
+            # the success path rather than in the infra handler so that a prompt which
+            # succeeded on a retry also counts -- the fleet recovered either way.
+            self._consecutive_infra_drops = 0
             return RolloutOutcome.COMMITTED
 
         # The infrastructure budget ran out. The same failure followed the prompt across
         # repeated shard selections, which says the fleet is broken rather than the
-        # prompt, so this is reported rather than absorbed.
+        # prompt.
         #
         # The budget is >= 1 (enforced in RolloutRetryPolicy), so the loop ran at least
         # once and can only have exited through the infra branch's break.
         assert last_infra_error is not None
-        raise RolloutRedispatchExhausted(
-            f"prompt idx={input_sample['idx']} exhausted its infrastructure retry "
-            f"budget after {infra_attempts} attempt(s) "
-            f"(max_infra_attempts_per_prompt="
-            f"{policy.max_infra_attempts}); last failure was "
-            f"{type(last_infra_error).__name__}: {last_infra_error}"
-        ) from last_infra_error
+        reason = type(last_infra_error).__name__
+        self._consecutive_infra_drops += 1
+        if self._consecutive_infra_drops > policy.max_consecutive_dropped_prompts:
+            raise RolloutRedispatchExhausted(
+                f"prompt idx={input_sample['idx']} exhausted its infrastructure retry "
+                f"budget after {infra_attempts} attempt(s) "
+                f"(max_infra_attempts_per_prompt="
+                f"{policy.max_infra_attempts}), and this was drop "
+                f"{self._consecutive_infra_drops} with no rollout committed in between, "
+                f"exceeding max_consecutive_dropped_prompts="
+                f"{policy.max_consecutive_dropped_prompts}; the generation fleet is not "
+                f"recovering. Last failure was {reason}: {last_infra_error}"
+            ) from last_infra_error
+
+        # Under the budget: give up on this prompt and let the run continue. The caller
+        # owns the backpressure permit for a SKIPPED outcome, and -- because the prompt
+        # may have been stamped for a specific training step that will now never fill --
+        # owns crediting the shortfall so the train pump can close that step short.
+        self._stats.record_infra_drop(reason, self._consecutive_infra_drops)
+        print(
+            f"dropping prompt idx={input_sample['idx']} after {infra_attempts} "
+            f"infrastructure failure(s) ({reason}: {last_infra_error}) "
+            f"[consecutive drop {self._consecutive_infra_drops}/"
+            f"{policy.max_consecutive_dropped_prompts}]",
+            flush=True,
+        )
+        self._stats.skipped += 1
+        return RolloutOutcome.SKIPPED

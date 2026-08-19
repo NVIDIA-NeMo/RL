@@ -39,6 +39,7 @@ import asyncio
 import json
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Optional, Union
 from unittest.mock import MagicMock, patch
@@ -403,16 +404,22 @@ def _run_train_pump(
     actor_args: SingleControllerActorArgs,
     *,
     flush: bool = True,
+    seed: Optional[Callable[[Any], None]] = None,
 ):
     """Construct the actor in-process and drive _train_pump to completion.
 
     flush=True joins the (possibly async) checkpoint finalization afterwards,
     like run()'s exit path does, so step_N dirs are visible to assertions.
+
+    seed runs against the constructed actor before the pump does, for state the
+    pump is expected to persist but that no actor_args field carries.
     """
 
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
         actor._sampler = _FakeSampler()
+        if seed is not None:
+            seed(actor)
         # In-process runs have no Ray runtime; the pump only reads the GPU
         # count for a throughput metric.
         with patch("ray.cluster_resources", return_value={"GPU": 0}):
@@ -437,6 +444,22 @@ def _run_actor_run(mc: MasterConfig, actor_args: SingleControllerActorArgs):
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
         result = await asyncio.wait_for(actor.run(), timeout=60.0)
         return actor, result
+
+    return asyncio.run(_main())
+
+
+def _run_reserve_restore(mc: MasterConfig, actor_args: SingleControllerActorArgs):
+    """Construct the actor and await only the spare-pool restore.
+
+    run() cannot stand in here: it starts the rollout pump, which drains any whole
+    step's worth of spares straight into training, so the pool is empty again by the
+    time the assertion runs.
+    """
+
+    async def _main():
+        actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
+        await actor._maybe_restore_replacement_reserve()
+        return actor
 
     return asyncio.run(_main())
 
@@ -1218,3 +1241,111 @@ class TestReplayBufferPersistence:
         assert buffer.load_calls == []
         assert actor._buffer_capacity._value == 4
         assert any("skipping the buffer restore" in line for line in printed)
+
+
+# ── replacement reserve persistence ──────────────────────────────────────────
+
+
+class TestReplacementReservePersistence:
+    """The spare-prompt pool has to survive a restart, or the batch is lost.
+
+    Diverting a batch into the pool advances the dataloader, so the dataloader state
+    the checkpoint saves already records those prompts as consumed while they exist
+    only in memory. Resuming without them leaves a run whose iterator is positioned
+    past a batch nobody holds, and `_drain_reserve_into_steps` cannot get it back --
+    it only recovers spares held by the process that diverted them.
+    """
+
+    def test_save_writes_the_pooled_spares(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+
+        actor = _run_train_pump(
+            mc,
+            _make_actor_args(),
+            seed=lambda a: a._replacement_reserve.extend(["spare0", "spare1"]),
+        )
+
+        reserve_path = tmp_path / "checkpoints" / "step_2" / "replacement_reserve.pt"
+        assert reserve_path.exists()
+        assert torch.load(reserve_path, weights_only=False) == ["spare0", "spare1"]
+        # Saved, not consumed: the pool the run continues with is untouched.
+        assert list(actor._replacement_reserve) == ["spare0", "spare1"]
+
+    def test_save_omits_the_file_when_the_pool_is_empty(self, tmp_path):
+        """Which is every run that never diverted, i.e. every non-replace run.
+
+        The restore is silent about a missing file for exactly this reason, so an
+        always-written empty file would make that silence indefensible.
+        """
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+
+        _run_train_pump(mc, _make_actor_args())
+
+        step_dir = tmp_path / "checkpoints" / "step_2"
+        assert step_dir.exists()
+        assert not (step_dir / "replacement_reserve.pt").exists()
+
+    def test_run_restores_the_pooled_spares(self, tmp_path):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        torch.save(["spare0", "spare1"], ckpt_dir / "replacement_reserve.pt")
+        mc = _actor_master_config(tmp_path, max_num_steps=0)
+
+        actor = _run_reserve_restore(
+            mc,
+            _make_actor_args(
+                last_checkpoint_path=str(ckpt_dir),
+                save_state=_matching_save_state(),
+            ),
+        )
+
+        assert list(actor._replacement_reserve) == ["spare0", "spare1"]
+
+    def test_run_restores_the_pool_even_when_the_buffer_restore_is_skipped(
+        self, tmp_path
+    ):
+        """The sampler guard that protects the buffer must not cover the pool.
+
+        Spares never reached `admit`, so they carry no target-step stamp and nothing
+        about them depends on which sampler wrote the checkpoint. Skipping them here
+        would strand the batch permanently for the one case -- a sampler change on
+        resume -- where the operator is least likely to look for it.
+        """
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        torch.save({"groups": []}, ckpt_dir / "replay_buffer.pt")
+        # One spare is less than num_prompts_per_step, so the full run() path here
+        # holds it back rather than draining it, and the pool is still observable.
+        torch.save(["spare0"], ckpt_dir / "replacement_reserve.pt")
+        mc = _actor_master_config(tmp_path, max_num_steps=0)
+        save_state = _initial_grpo_save_state()
+        save_state.sampler_name = "in_order"  # current run uses windowed
+        buffer = _FakeTQBuffer(load_return=2)
+
+        actor, _ = _run_actor_run(
+            mc,
+            _make_actor_args(
+                tq_buffer=buffer,
+                last_checkpoint_path=str(ckpt_dir),
+                save_state=save_state,
+            ),
+        )
+
+        assert buffer.load_calls == []
+        assert list(actor._replacement_reserve) == ["spare0"]
+
+    def test_run_without_a_reserve_file_starts_with_an_empty_pool(self, tmp_path):
+        """A checkpoint predating this file, or any run that never diverted."""
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        mc = _actor_master_config(tmp_path, max_num_steps=0)
+
+        actor, _ = _run_actor_run(
+            mc,
+            _make_actor_args(
+                last_checkpoint_path=str(ckpt_dir),
+                save_state=_matching_save_state(),
+            ),
+        )
+
+        assert list(actor._replacement_reserve) == []
