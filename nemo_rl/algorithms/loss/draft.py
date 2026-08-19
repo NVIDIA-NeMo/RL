@@ -101,6 +101,82 @@ def _tile_distributions(
     return teacher_probs, student_probs
 
 
+def _tp_assert_projected_metadata_agreement(
+    *,
+    tp_group: torch.distributed.ProcessGroup | None,
+    reference: torch.Tensor,
+    tensors: tuple[tuple[str, torch.Tensor | None], ...],
+    scalars: tuple[tuple[str, int], ...],
+    exact_tensors: tuple[tuple[str, torch.Tensor | None], ...],
+) -> None:
+    """Fail all TP ranks together before rank-local validation or CE collectives."""
+    if tp_group is None:
+        return
+
+    dtype_codes = {
+        dtype: index
+        for index, dtype in enumerate(
+            (
+                torch.bool,
+                torch.int32,
+                torch.int64,
+                torch.float16,
+                torch.bfloat16,
+                torch.float32,
+                torch.float64,
+            )
+        )
+    }
+    header_values: list[int] = []
+    for _, tensor in tensors:
+        if tensor is None:
+            header_values.extend((0, 0, 0, 0, 0, 0, -1, 0))
+            continue
+        shape = (*tensor.shape[:4], *(0 for _ in range(4 - min(tensor.ndim, 4))))
+        header_values.extend(
+            (
+                1,
+                tensor.ndim,
+                *shape,
+                dtype_codes.get(tensor.dtype, -1),
+                int(tensor.device == reference.device),
+            )
+        )
+    header_values.extend(value for _, value in scalars)
+    header = torch.tensor(header_values, dtype=torch.int64, device=reference.device)
+    world_size = torch.distributed.get_world_size(tp_group)
+    gathered_headers = [torch.empty_like(header) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered_headers, header, group=tp_group)
+    if any(
+        not torch.equal(gathered_headers[0], other) for other in gathered_headers[1:]
+    ):
+        raise ValueError("TP ranks disagree on projected soft-CE structure or scalars.")
+    if any(
+        tensor is not None and tensor.device != reference.device
+        for _, tensor in tensors
+    ):
+        raise ValueError(
+            "projected soft-CE tensors must share a device on every TP rank."
+        )
+
+    source_rank = torch.distributed.get_global_rank(tp_group, 0)
+    for name, tensor in exact_tensors:
+        if tensor is None:
+            continue
+        source_value = tensor.detach().contiguous().clone()
+        torch.distributed.broadcast(source_value, src=source_rank, group=tp_group)
+        mismatch = torch.logical_not(torch.eq(tensor, source_value).all()).to(
+            torch.int64
+        )
+        torch.distributed.all_reduce(
+            mismatch,
+            op=torch.distributed.ReduceOp.MAX,
+            group=tp_group,
+        )
+        if mismatch.item():
+            raise ValueError(f"TP ranks disagree on projected soft-CE {name}.")
+
+
 def _cached_tile_distributions_and_cross_entropy(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
@@ -351,8 +427,7 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
         ctx: Any,
         student_hidden: torch.Tensor,
         output_weight: torch.Tensor,
-        teacher_logits: torch.Tensor,
-        teacher_row_indices: torch.Tensor,
+        selected_teacher_logits: torch.Tensor,
         mask: torch.Tensor,
         bin_ids: torch.Tensor,
         num_bins: int,
@@ -361,8 +436,9 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
     ) -> torch.Tensor:
         hidden_size = student_hidden.shape[-1]
         flat_hidden = student_hidden.reshape(-1, hidden_size)
-        flat_teacher = teacher_logits.reshape(-1, teacher_logits.shape[-1])
-        flat_teacher_row_indices = teacher_row_indices.reshape(-1)
+        flat_teacher = selected_teacher_logits.reshape(
+            -1, selected_teacher_logits.shape[-1]
+        )
         flat_mask = mask.reshape(-1).float()
         flat_bin_ids = bin_ids.reshape(-1)
         numerators = torch.zeros(
@@ -379,10 +455,7 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
         for start in range(0, flat_hidden.shape[0], token_chunk_size):
             end = min(start + token_chunk_size, flat_hidden.shape[0])
             student_logits = flat_hidden[start:end] @ output_weight.T
-            selected_teacher = flat_teacher.index_select(
-                0,
-                flat_teacher_row_indices[start:end],
-            )
+            selected_teacher = flat_teacher[start:end]
             log_normalizers = _tile_log_normalizers(
                 student_logits,
                 selected_teacher,
@@ -411,8 +484,7 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
         ctx.save_for_backward(
             student_hidden,
             output_weight,
-            teacher_logits,
-            teacher_row_indices,
+            selected_teacher_logits,
             mask,
             bin_ids,
             saved_log_normalizers,
@@ -426,21 +498,21 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
     def backward(
         ctx: Any,
         *grad_outputs: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None, None, None, None, None, None]:
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None, None]:
         (grad_numerators,) = grad_outputs
         (
             student_hidden,
             output_weight,
-            teacher_logits,
-            teacher_row_indices,
+            selected_teacher_logits,
             mask,
             bin_ids,
             log_normalizers,
         ) = ctx.saved_tensors
         hidden_size = student_hidden.shape[-1]
         flat_hidden = student_hidden.reshape(-1, hidden_size)
-        flat_teacher = teacher_logits.reshape(-1, teacher_logits.shape[-1])
-        flat_teacher_row_indices = teacher_row_indices.reshape(-1)
+        flat_teacher = selected_teacher_logits.reshape(
+            -1, selected_teacher_logits.shape[-1]
+        )
         flat_mask = mask.reshape(-1).float()
         flat_bin_ids = bin_ids.reshape(-1)
         flat_hidden_gradient = torch.empty_like(flat_hidden, dtype=torch.float32)
@@ -448,10 +520,7 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
         for start in range(0, flat_hidden.shape[0], ctx.token_chunk_size):
             end = min(start + ctx.token_chunk_size, flat_hidden.shape[0])
             student_logits = flat_hidden[start:end] @ output_weight.T
-            selected_teacher = flat_teacher.index_select(
-                0,
-                flat_teacher_row_indices[start:end],
-            )
+            selected_teacher = flat_teacher[start:end]
             teacher_probs, student_probs = _tile_distributions(
                 student_logits,
                 selected_teacher,
@@ -477,7 +546,6 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
             flat_hidden_gradient.reshape_as(student_hidden).to(
                 dtype=student_hidden.dtype
             ),
-            None,
             None,
             None,
             None,
@@ -575,15 +643,32 @@ def projected_streaming_vocab_parallel_soft_ce(
     *,
     student_hidden: torch.Tensor,
     output_weight: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    teacher_row_indices: torch.Tensor,
+    selected_teacher_logits: torch.Tensor,
     mask: torch.Tensor,
     token_chunk_size: int,
     tp_group: torch.distributed.ProcessGroup | None,
     bin_ids: torch.Tensor | None = None,
     weights: torch.Tensor | None = None,
 ) -> DraftLossStats:
-    """Project draft hidden states and stream indexed teacher rows through soft CE."""
+    """Project hidden states against preselected teacher rows with TP-safe metadata.
+
+    TP ranks agree on a fixed structural header and exact mask/bin/weight metadata
+    before validation or loss collectives, so malformed rank-local inputs fail together.
+    """
+    _tp_assert_projected_metadata_agreement(
+        tp_group=tp_group,
+        reference=student_hidden,
+        tensors=(
+            ("student_hidden", student_hidden),
+            ("output_weight", output_weight),
+            ("selected_teacher_logits", selected_teacher_logits),
+            ("mask", mask),
+            ("bin_ids", bin_ids),
+            ("weights", weights),
+        ),
+        scalars=(("token_chunk_size", token_chunk_size),),
+        exact_tensors=(("mask", mask), ("bin_ids", bin_ids), ("weights", weights)),
+    )
     if student_hidden.ndim < 2 or student_hidden.numel() == 0:
         raise ValueError(
             "student_hidden must contain at least one token and one hidden element, "
@@ -599,24 +684,17 @@ def projected_streaming_vocab_parallel_soft_ce(
             "output_weight hidden size must match student_hidden, "
             f"got {output_weight.shape[1]} and {student_hidden.shape[-1]}."
         )
-    if teacher_logits.ndim < 2 or teacher_logits.numel() == 0:
+    if selected_teacher_logits.ndim < 2 or selected_teacher_logits.numel() == 0:
         raise ValueError(
-            "teacher_logits must contain at least one row and vocabulary element, "
-            f"got {teacher_logits.shape}."
+            "selected_teacher_logits must contain at least one row and vocabulary "
+            f"element, got {selected_teacher_logits.shape}."
         )
-    if teacher_logits.shape[-1] != output_weight.shape[0]:
+    expected_teacher_shape = (*student_hidden.shape[:-1], output_weight.shape[0])
+    if selected_teacher_logits.shape != expected_teacher_shape:
         raise ValueError(
-            "teacher_logits and output_weight must have the same local vocabulary "
-            f"size, got {teacher_logits.shape[-1]} and {output_weight.shape[0]}."
-        )
-    if teacher_row_indices.shape != student_hidden.shape[:-1]:
-        raise ValueError(
-            "teacher_row_indices must match the non-hidden student dimensions, "
-            f"got {teacher_row_indices.shape} and {student_hidden.shape[:-1]}."
-        )
-    if teacher_row_indices.dtype != torch.long:
-        raise TypeError(
-            f"teacher_row_indices must use torch.long, got {teacher_row_indices.dtype}."
+            "selected_teacher_logits must match the student token dimensions and "
+            f"local vocabulary, got {selected_teacher_logits.shape} and "
+            f"{expected_teacher_shape}."
         )
     if mask.shape != student_hidden.shape[:-1]:
         raise ValueError(
@@ -626,21 +704,21 @@ def projected_streaming_vocab_parallel_soft_ce(
     if not (
         student_hidden.device
         == output_weight.device
-        == teacher_logits.device
-        == teacher_row_indices.device
+        == selected_teacher_logits.device
         == mask.device
     ):
         raise ValueError(
-            "student_hidden, output_weight, teacher_logits, teacher_row_indices, "
-            "and mask must share a device."
+            "student_hidden, output_weight, selected_teacher_logits, and mask must "
+            "share a device."
         )
     if not (
         student_hidden.is_floating_point()
         and output_weight.is_floating_point()
-        and teacher_logits.is_floating_point()
+        and selected_teacher_logits.is_floating_point()
     ):
         raise TypeError(
-            "student_hidden, output_weight, and teacher_logits must be floating point."
+            "student_hidden, output_weight, and selected_teacher_logits must be "
+            "floating point."
         )
     if student_hidden.dtype != output_weight.dtype:
         raise ValueError(
@@ -680,23 +758,12 @@ def projected_streaming_vocab_parallel_soft_ce(
             vocab_parallel_hidden.reshape(-1, student_hidden.shape[-1])
             @ output_weight.detach().T
         )
-        selected_teacher = (
-            teacher_logits.detach()
-            .reshape(-1, teacher_logits.shape[-1])
-            .index_select(
-                0,
-                teacher_row_indices.reshape(-1),
-            )
-        )
         return streaming_vocab_parallel_soft_ce(
             student_logits=student_logits.reshape(
                 *student_hidden.shape[:-1],
                 output_weight.shape[0],
             ),
-            teacher_logits=selected_teacher.reshape(
-                *student_hidden.shape[:-1],
-                output_weight.shape[0],
-            ),
+            teacher_logits=selected_teacher_logits.detach(),
             mask=mask,
             bin_ids=bin_ids,
             weights=weights,
@@ -706,8 +773,7 @@ def projected_streaming_vocab_parallel_soft_ce(
     numerators = _StreamingProjectedVocabParallelSoftCE.apply(
         student_hidden,
         output_weight,
-        teacher_logits,
-        teacher_row_indices,
+        selected_teacher_logits.detach(),
         mask,
         bin_ids,
         num_bins,
@@ -736,6 +802,24 @@ def dflash_projected_vocab_parallel_soft_ce(
     tp_group: torch.distributed.ProcessGroup | None,
 ) -> DraftLossStats:
     """Map DFlash block slots to the live target head and indexed teacher rows."""
+    _tp_assert_projected_metadata_agreement(
+        tp_group=tp_group,
+        reference=draft_hidden,
+        tensors=(
+            ("draft_hidden", draft_hidden),
+            ("output_weight", output_weight),
+            ("teacher_logits", teacher_logits),
+            ("sample_rows", sample_rows),
+            ("label_positions", label_positions),
+            ("loss_mask", loss_mask),
+        ),
+        scalars=(("token_chunk_size", token_chunk_size),),
+        exact_tensors=(
+            ("sample_rows", sample_rows),
+            ("label_positions", label_positions),
+            ("loss_mask", loss_mask),
+        ),
+    )
     if draft_hidden.ndim != 3 or draft_hidden.shape[1] < 2:
         raise ValueError(
             "draft_hidden must have shape [blocks, gamma + 1, hidden] with "
@@ -781,7 +865,8 @@ def dflash_projected_vocab_parallel_soft_ce(
         raise ValueError(f"position_decay must be in (0, 1], got {position_decay}.")
 
     sequence_length = teacher_logits.shape[1]
-    teacher_row_indices = sample_rows[:, None] * sequence_length + label_positions
+    teacher_positions = label_positions - 1
+    teacher_row_indices = sample_rows[:, None] * sequence_length + teacher_positions
     teacher_row_indices[:, 0] = 0
     effective_loss_mask = loss_mask.clone()
     effective_loss_mask[:, 0] = False
@@ -792,11 +877,16 @@ def dflash_projected_vocab_parallel_soft_ce(
         torch.tensor(position_decay, dtype=torch.float32, device=draft_hidden.device),
         torch.arange(gamma, dtype=torch.float32, device=draft_hidden.device),
     )
+    selected_teacher_logits = (
+        teacher_logits.detach()
+        .reshape(-1, teacher_logits.shape[-1])
+        .index_select(0, teacher_row_indices.reshape(-1))
+        .reshape(*block_shape, teacher_logits.shape[-1])
+    )
     return projected_streaming_vocab_parallel_soft_ce(
         student_hidden=draft_hidden,
         output_weight=output_weight,
-        teacher_logits=teacher_logits,
-        teacher_row_indices=teacher_row_indices,
+        selected_teacher_logits=selected_teacher_logits,
         mask=effective_loss_mask,
         bin_ids=bin_ids,
         weights=weights,

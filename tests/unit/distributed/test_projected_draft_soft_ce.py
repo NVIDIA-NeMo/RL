@@ -173,6 +173,8 @@ def _run_tp2_projected_soft_ce_metadata_mismatch(
             weights[-1] = 0.25
         elif field == "token_chunk_size":
             token_chunk_size = 3
+        elif field == "shape":
+            teacher_logits = teacher_logits[:-1]
 
     with pytest.raises(ValueError, match="TP ranks disagree"):
         projected_streaming_vocab_parallel_soft_ce(
@@ -187,7 +189,9 @@ def _run_tp2_projected_soft_ce_metadata_mismatch(
         )
 
 
-@pytest.mark.parametrize("field", ["mask", "bin_ids", "weights", "token_chunk_size"])
+@pytest.mark.parametrize(
+    "field", ["mask", "bin_ids", "weights", "token_chunk_size", "shape"]
+)
 def test_tp2_projected_soft_ce_rejects_rank_local_metadata(
     distributed_test_runner,
     field: str,

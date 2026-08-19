@@ -1134,15 +1134,6 @@ def validate_dflash_export_state_dict(
         )
 
 
-def export_dflash_weights(
-    model: torch.nn.Module,
-) -> list[tuple[str, Tensor]]:
-    """Export body-only DFlash weights while enforcing target ownership."""
-    source_state = unwrap_model(model).state_dict()
-    validate_dflash_export_state_dict(source_state)
-    return list(source_state.items())
-
-
 def get_policy_lm_head_weight(policy_model_chunk: MegatronModule) -> torch.Tensor:
     """Return the local policy LM-head shard for draft initialization."""
     unwrapped_policy_model = unwrap_model(policy_model_chunk)

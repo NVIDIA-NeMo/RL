@@ -215,11 +215,6 @@ def test_projected_soft_ce_saved_state_contract(
         if tensor.dtype == torch.float32 and tensor.shape == (num_tokens, vocab_size)
     ]
     assert len(vocab_distributions) == expected_vocab_distributions
-    assert not any(
-        tensor.dtype == selected_teacher_logits.dtype
-        and tensor.shape == (num_tokens, vocab_size)
-        for tensor in saved_tensors
-    )
     assert any(
         tensor.dtype == torch.float32 and tensor.shape == (num_tokens, 2)
         for tensor in saved_tensors
