@@ -92,8 +92,8 @@ class _FakeTrainer:
         self.save_calls: list[dict[str, Any]] = []
         self.finalize_calls: int = 0
 
-    def prepare_for_lp_inference(self) -> None:
-        pass
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        del keep_train_buffers
 
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
         pass

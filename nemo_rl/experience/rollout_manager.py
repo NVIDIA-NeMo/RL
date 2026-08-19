@@ -834,7 +834,7 @@ class AsyncNemoGymRolloutImpl:
 
         async for result_ref in nemo_gym_env.run_rollouts.options(
             num_returns="streaming"
-        ).remote(pending, self._tokenizer, timer_prefix):
+        ).remote(pending, timer_prefix):
             rowidx, result, timing_metrics = await result_ref
             # Validated against the original group, not the pending subset: on a
             # re-dispatch the row keeps its original index so results stay ordered.
