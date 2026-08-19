@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 from nemo_rl.algorithms.loss.loss_functions import (
     BlockDraftLossFn,
+    DSparkBlockLossFn,
     resolve_block_draft_slot_weights,
 )
 from nemo_rl.algorithms.loss.utils import (
@@ -27,6 +28,7 @@ from nemo_rl.algorithms.loss.utils import (
     compute_block_draft_slot_valid_counts,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import ChunkedDistributedLabelCEAndTV
 
 
 def _make_block_data(batch_size=2, num_anchors=3, gamma=4, seq_len=16):
@@ -209,6 +211,182 @@ def test_draft_loss_wrapper_block_dispatch(mock_block_loss_cls):
     call_kwargs = block_loss_fn.call_args.kwargs
     assert torch.equal(call_kwargs["student_block_logits"], block_logits)
     assert not call_kwargs["teacher_logits"].requires_grad
+
+
+def test_chunked_label_ce_and_tv_matches_reference():
+    """Chunked custom Function == plain-autograd hard CE + TV (values + grads)."""
+    torch.manual_seed(3)
+    batch, rows, vocab = 2, 11, 17
+    student = torch.randn(batch, rows, vocab, dtype=torch.bfloat16)
+    teacher = torch.randn(batch, rows, vocab, dtype=torch.bfloat16)
+    labels = torch.randint(0, vocab, (batch, rows))
+
+    student_a = student.clone().requires_grad_(True)
+    ce, tv = ChunkedDistributedLabelCEAndTV.apply(
+        student_a, teacher, labels, 0, vocab, 4, None
+    )
+    # Uneven downstream weights exercise both grad_output paths.
+    ce_w = torch.linspace(0.1, 1.0, rows).repeat(batch, 1)
+    tv_w = torch.linspace(1.0, 0.2, rows).repeat(batch, 1)
+    (ce * ce_w + tv * tv_w).sum().backward()
+
+    student_b = student.clone().requires_grad_(True)
+    s32 = student_b.float()
+    t32 = teacher.float()
+    ce_ref = F.cross_entropy(
+        s32.reshape(-1, vocab), labels.reshape(-1), reduction="none"
+    ).reshape(batch, rows)
+    tv_ref = (F.softmax(s32, dim=-1) - F.softmax(t32, dim=-1)).abs().sum(dim=-1)
+    (ce_ref * ce_w + tv_ref * tv_w).sum().backward()
+
+    assert torch.allclose(ce, ce_ref, atol=1e-4), (ce, ce_ref)
+    assert torch.allclose(tv, tv_ref, atol=1e-4)
+    assert torch.allclose(student_a.grad.float(), student_b.grad.float(), atol=2e-3), (
+        (student_a.grad - student_b.grad).abs().max()
+    )
+
+
+def test_dspark_block_loss_matches_official_reference():
+    """DSparkBlockLossFn == the DeepSpec loss math (hard CE + TV + confidence)."""
+    torch.manual_seed(2)
+    batch_size, num_anchors, gamma, seq_len, vocab = 2, 3, 4, 16, 13
+    token_mask, sample_mask, anchors, anchor_valid = _make_block_data(
+        batch_size, num_anchors, gamma, seq_len
+    )
+    input_ids = torch.randint(0, vocab, (batch_size, seq_len))
+    teacher_logits = torch.randn(batch_size, seq_len, vocab)
+    student = torch.randn(batch_size, num_anchors, gamma, vocab, requires_grad=True)
+    confidence_pred = torch.randn(batch_size, num_anchors, gamma, requires_grad=True)
+    # Official decay exp(-j/4) at block 7 == the "exp" scheme; any weights work.
+    slot_weights = [math.exp(-j / 4.0) for j in range(gamma)]
+    ce_alpha, tv_alpha, conf_alpha = 0.1, 0.9, 1.0
+
+    slot_mask = block_draft_slot_mask(
+        token_mask, sample_mask, anchors, anchor_valid, gamma=gamma
+    ).float()
+    local_counts = slot_mask.sum(dim=(0, 1))
+
+    loss_fn = DSparkBlockLossFn(
+        vocab_parallel_group=None,
+        vocab_parallel_rank=0,
+        slot_weights=slot_weights,
+        ce_loss_alpha=ce_alpha,
+        tv_loss_alpha=tv_alpha,
+        confidence_head_alpha=conf_alpha,
+    )
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "draft_anchor_positions": anchors,
+            "draft_anchor_valid": anchor_valid,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "draft_confidence_pred": confidence_pred,
+        }
+    )
+    loss, metrics = loss_fn(
+        teacher_logits=teacher_logits,
+        student_block_logits=student,
+        data=data,
+        global_valid_seqs=torch.tensor(2.0),
+        global_valid_toks=torch.tensor(100.0),
+        global_draft_pass_counts=local_counts,
+    )
+
+    weights = torch.tensor(slot_weights)
+    denominator = (weights * local_counts).sum()
+    ce_num = torch.zeros(())
+    tv_num = torch.zeros(())
+    conf_num = torch.zeros(())
+    for b in range(batch_size):
+        for n in range(num_anchors):
+            for j in range(gamma):
+                if slot_mask[b, n, j] == 0:
+                    continue
+                teacher_pos = min(int(anchors[b, n]) + j, seq_len - 1)
+                label_pos = min(int(anchors[b, n]) + 1 + j, seq_len - 1)
+                label = input_ids[b, label_pos]
+                ce = F.cross_entropy(
+                    student.detach()[b, n, j], label.unsqueeze(0).squeeze(0)
+                )
+                draft_probs = F.softmax(student.detach()[b, n, j], dim=-1)
+                target_probs = F.softmax(teacher_logits[b, teacher_pos], dim=-1)
+                tv = (draft_probs - target_probs).abs().sum()
+                accept = (1.0 - 0.5 * tv).clamp(0.0, 1.0)
+                bce = F.binary_cross_entropy_with_logits(
+                    confidence_pred.detach()[b, n, j], accept
+                )
+                ce_num = ce_num + weights[j] * ce
+                tv_num = tv_num + weights[j] * tv
+                conf_num = conf_num + weights[j] * bce
+    expected = (
+        ce_alpha * ce_num + tv_alpha * tv_num + conf_alpha * conf_num
+    ) / denominator
+
+    assert torch.allclose(loss, expected, atol=1e-5), (loss, expected)
+    assert math.isclose(
+        metrics["dspark_ce_loss"], float((ce_num / denominator)), rel_tol=1e-4
+    )
+    assert math.isclose(
+        metrics["dspark_tv_loss"], float((tv_num / denominator)), rel_tol=1e-4
+    )
+    for key in (
+        "dspark_confidence_loss",
+        "dspark_confidence_abs_error",
+        "dspark_confidence_bias",
+        "dspark_tau_probabilistic",
+        "accept_rate_slot_0",
+        f"draft_loss_slot_{gamma - 1}",
+    ):
+        assert key in metrics
+    assert metrics["dspark_tau_probabilistic"] >= 1.0
+    assert 0.0 <= metrics["accept_rate_slot_0"] <= 1.0
+
+    loss.backward()
+    assert torch.isfinite(student.grad).all()
+    # Masked slots receive no gradient (block [1, 2] is a dummy anchor).
+    assert torch.all(student.grad[1, 2] == 0)
+    assert torch.all(confidence_pred.grad[1, 2] == 0)
+    assert torch.isfinite(confidence_pred.grad).all()
+    assert confidence_pred.grad.abs().sum() > 0
+
+
+@patch("nemo_rl.algorithms.loss.loss_functions.DSparkBlockLossFn")
+def test_draft_loss_wrapper_dspark_dispatch(mock_dspark_loss_cls):
+    """draft_method=dspark routes through DSparkBlockLossFn with the alphas."""
+    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+
+    data = BatchedDataDict({"draft_block_logits": torch.randn(1, 2, 3, 7)})
+    dspark_loss_fn = MagicMock(return_value=(torch.tensor(2.0), {}))
+    mock_dspark_loss_cls.return_value = dspark_loss_fn
+
+    wrapper = DraftLossWrapper(
+        loss_fn=MagicMock(return_value=(torch.tensor(1.0), {})),
+        prepare_fn=MagicMock(),
+        data_dict=data,
+        loss_weight=1.0,
+        draft_loss_kwargs={
+            "slot_weights": [1.0, 0.5, 0.25],
+            "ce_loss_alpha": 0.1,
+            "tv_loss_alpha": 0.9,
+            "confidence_head_alpha": 1.0,
+        },
+        draft_method="dspark",
+    )
+    wrapper(
+        next_token_logits=torch.randn(1, 4, 7),
+        data=data,
+        global_valid_seqs=torch.tensor(1),
+        global_valid_toks=torch.tensor(1),
+    )
+    mock_dspark_loss_cls.assert_called_once_with(
+        vocab_parallel_group=None,
+        vocab_parallel_rank=None,
+        slot_weights=[1.0, 0.5, 0.25],
+        ce_loss_alpha=0.1,
+        tv_loss_alpha=0.9,
+        confidence_head_alpha=1.0,
+    )
 
 
 def test_resolve_block_draft_slot_weights_schemes():

@@ -232,10 +232,12 @@ class DraftLossWrapper:
 
     ``draft_method`` selects the draft loss: ``"eagle3"`` uses the (multi-pass
     TTT) :class:`DraftCrossEntropyLossFn`; ``"dflash"`` uses
-    :class:`BlockDraftLossFn` (soft CE) over the block logits the train loop
-    stashed in ``data_dict["draft_block_logits"]``. ``draft_loss_kwargs`` are
-    the selected LossFn's remaining ctor kwargs — ``slot_weights`` for block
-    drafts, ``pass_weights`` for eagle3.
+    :class:`BlockDraftLossFn` (soft CE) and ``"dspark"``
+    :class:`DSparkBlockLossFn` (the official hard-CE + TV + confidence loss)
+    over the block logits the train loop stashed in
+    ``data_dict["draft_block_logits"]``. ``draft_loss_kwargs`` are the
+    selected LossFn's remaining ctor kwargs — ``slot_weights`` (+ dspark
+    alphas) for block drafts, ``pass_weights`` for eagle3.
     """
 
     def __init__(
@@ -262,10 +264,18 @@ class DraftLossWrapper:
         self.draft_method = draft_method
         draft_loss_kwargs = draft_loss_kwargs or {}
         # Per-method losses are imported in-branch: only the selected one loads.
-        if draft_method == "dflash":
+        if draft_method == "dspark":
+            from nemo_rl.algorithms.loss.loss_functions import DSparkBlockLossFn
+
+            self.draft_loss_fn: Any = DSparkBlockLossFn(
+                vocab_parallel_group=vocab_parallel_group,
+                vocab_parallel_rank=vocab_parallel_rank,
+                **draft_loss_kwargs,
+            )
+        elif draft_method == "dflash":
             from nemo_rl.algorithms.loss.loss_functions import BlockDraftLossFn
 
-            self.draft_loss_fn: Any = BlockDraftLossFn(
+            self.draft_loss_fn = BlockDraftLossFn(
                 vocab_parallel_group=vocab_parallel_group,
                 **draft_loss_kwargs,
             )
@@ -299,7 +309,7 @@ class DraftLossWrapper:
             **kwargs,
         )
 
-        if self.draft_method == "dflash":
+        if self.draft_method in ("dflash", "dspark"):
             # The block loss needs no prepare step: the teacher is the raw
             # (vocab-parallel) policy logits and the student block logits were
             # stashed by the train loop.

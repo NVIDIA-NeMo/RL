@@ -38,7 +38,9 @@ semantics exactly:
 
 The decoder itself is a stock MCore ``TransformerBlock`` (TE layer spec, same
 family as the policy) whose per-layer ``core_attention`` is replaced with
-:class:`BlockDraftCoreAttention`.
+:class:`BlockDraftCoreAttention`. DSpark (``draft/dspark.py``, one file per
+model like ``draft/eagle.py``) subclasses :class:`DFlashDraftModel` and
+reuses all of this machinery.
 """
 
 from __future__ import annotations
@@ -59,7 +61,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from torch import Tensor
 
 
-SUPPORTED_BLOCK_DRAFT_METHODS = ("dflash",)
+SUPPORTED_BLOCK_DRAFT_METHODS = ("dflash", "dspark")
 
 
 def sample_block_anchors(
@@ -889,7 +891,13 @@ class BlockDraftCoreAttention(torch.nn.Module):
 
 
 class DFlashDraftModel(MegatronModule):
-    """DFlash block draft: ``W = gamma + 1`` with a condition-only anchor slot."""
+    """DFlash block draft: ``W = gamma + 1`` with a condition-only anchor slot.
+
+    Also the base class for DSpark, which overrides ``method`` (the
+    serving-aligned dispatch string consumed by the train loop and the
+    weight mapping) and ``block_width``; per-method behavior lives in the
+    subclass, never as branches here.
+    """
 
     method = "dflash"
 
@@ -918,7 +926,8 @@ class DFlashDraftModel(MegatronModule):
             )
         self.config = config
         self.gamma = int(gamma)
-        # W = gamma + 1: the bonus condition-only anchor slot.
+        # W = gamma + 1: the bonus condition-only anchor slot. DSpark
+        # overrides with W = gamma (its anchor slot predicts).
         self.block_width = int(block_width) if block_width is not None else gamma + 1
         self.mask_token_id = int(mask_token_id)
         self.num_aux_hidden_states = int(num_aux_hidden_states)

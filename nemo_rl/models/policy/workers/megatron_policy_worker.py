@@ -794,7 +794,7 @@ class MegatronPolicyWorkerImpl(
                 )
                 global_draft_pass_counts = None
                 if draft_enabled and "token_mask" in batch and "sample_mask" in batch:
-                    if draft_method == "dflash":
+                    if draft_method in ("dflash", "dspark"):
                         # Deferred import: the dflash module pulls mcore
                         # transformer pieces only needed on this path.
                         from nemo_rl.models.megatron.draft.dflash import (

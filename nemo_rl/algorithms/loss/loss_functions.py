@@ -260,7 +260,7 @@ class BlockDraftLossDataDict(TypedDict):
 
 
 class BlockDraftLossFn(LossFunction):
-    """Soft-target cross-entropy for DFlash block draft training.
+    """Soft-target cross-entropy for DFlash/DSpark block draft training.
 
     Slot ``j`` of a block anchored at ``p`` predicts ``x_{p + 1 + j}``; its
     soft target is the (detached) policy logits at position ``p + j``. Both
@@ -373,6 +373,200 @@ class BlockDraftLossFn(LossFunction):
                 )
 
         loss = total / torch.clamp(denominator, min=1.0)
+        return loss, metrics
+
+
+class DSparkBlockLossDataDict(TypedDict):
+    input_ids: torch.Tensor
+    draft_anchor_positions: torch.Tensor
+    draft_anchor_valid: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
+    draft_confidence_pred: torch.Tensor
+
+
+class DSparkBlockLossFn(LossFunction):
+    """DeepSpec's official DSpark loss (deepspec/modeling/dspark/loss.py).
+
+    Per slot ``j`` of a block anchored at ``p``:
+    ``loss = ce_loss_alpha * CE(draft logits, x_{p+1+j})
+    + tv_loss_alpha * sum_v |softmax(draft) - softmax(teacher at p+j)|
+    + confidence_head_alpha * BCE(confidence pred, accept)`` where
+    ``accept = clamp(1 - tv/2, 0, 1)`` is the TV acceptance rate (detached).
+    All terms share the weighted mask (slot validity x ``slot_weights``) in
+    numerator and (DP-global, via ``global_draft_pass_counts``) denominator —
+    the same normalization contract as :class:`BlockDraftLossFn`.
+    """
+
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.DRAFT
+
+    def __init__(
+        self,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        vocab_parallel_rank: Optional[int] = None,
+        slot_weights: Optional[list[float]] = None,
+        ce_loss_alpha: float = 0.1,
+        tv_loss_alpha: float = 0.9,
+        confidence_head_alpha: float = 1.0,
+    ):
+        self.vocab_parallel_group = vocab_parallel_group
+        self.vocab_parallel_rank = int(vocab_parallel_rank or 0)
+        self.slot_weights = slot_weights
+        self.ce_loss_alpha = float(ce_loss_alpha)
+        self.tv_loss_alpha = float(tv_loss_alpha)
+        self.confidence_head_alpha = float(confidence_head_alpha)
+
+    def __call__(
+        self,
+        teacher_logits: torch.Tensor,
+        student_block_logits: torch.Tensor,
+        data: BatchedDataDict[DSparkBlockLossDataDict],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        global_draft_pass_counts: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        batch_size, num_anchors, gamma, vocab_local = student_block_logits.shape
+        seq_len = teacher_logits.shape[1]
+        device = student_block_logits.device
+
+        if self.slot_weights is not None and len(self.slot_weights) != gamma:
+            raise ValueError(
+                f"slot_weights has {len(self.slot_weights)} entries but the "
+                f"draft produced gamma={gamma} slots."
+            )
+        if (
+            global_draft_pass_counts is not None
+            and global_draft_pass_counts.shape[0] != gamma
+        ):
+            raise ValueError(
+                f"global_draft_pass_counts has {global_draft_pass_counts.shape[0]} "
+                f"entries but the draft produced gamma={gamma} slots."
+            )
+
+        anchors = data["draft_anchor_positions"]
+        anchor_valid = data["draft_anchor_valid"]
+        token_mask = data["token_mask"]
+        sample_mask = data["sample_mask"]
+        input_ids = data["input_ids"]
+
+        slot_offsets = torch.arange(gamma, device=device).view(1, 1, -1)
+        # Teacher for slot j sits at position p + j; its label is x_{p+1+j}.
+        teacher_pos = (anchors.unsqueeze(-1) + slot_offsets).clamp(max=seq_len - 1)
+        label_pos = (anchors.unsqueeze(-1) + 1 + slot_offsets).clamp(max=seq_len - 1)
+        gather_index = teacher_pos.reshape(batch_size, num_anchors * gamma, 1).expand(
+            -1, -1, vocab_local
+        )
+        teacher_block = torch.gather(teacher_logits.detach(), 1, gather_index)
+        labels = torch.gather(
+            input_ids, 1, label_pos.reshape(batch_size, num_anchors * gamma)
+        )
+
+        # Deferred import: dspark-path-only dependency.
+        from nemo_rl.distributed.model_utils import ChunkedDistributedLabelCEAndTV
+
+        # Flatten the batch dim into the chunked dim so the fp32 chunk
+        # transients are bounded by chunk_size ROWS regardless of the
+        # dynamic-batching batch size (the a512 OOM lesson).
+        total_rows = batch_size * num_anchors * gamma
+        per_token_ce, per_token_tv = ChunkedDistributedLabelCEAndTV.apply(
+            student_block_logits.reshape(1, total_rows, vocab_local),
+            teacher_block.reshape(1, total_rows, vocab_local),
+            labels.reshape(1, total_rows),
+            self.vocab_parallel_rank * vocab_local,
+            (self.vocab_parallel_rank + 1) * vocab_local,
+            DRAFT_LOSS_SEQ_CHUNK_SIZE,
+            self.vocab_parallel_group,
+        )
+        per_token_ce = per_token_ce.reshape(batch_size, num_anchors, gamma)
+        per_token_tv = per_token_tv.reshape(batch_size, num_anchors, gamma)
+
+        slot_mask = block_draft_slot_mask(
+            token_mask, sample_mask, anchors, anchor_valid, gamma=gamma
+        ).float()
+        weights = (
+            torch.ones(gamma, device=device, dtype=torch.float32)
+            if self.slot_weights is None
+            else torch.tensor(self.slot_weights, device=device, dtype=torch.float32)
+        )
+        weighted_mask = slot_mask * weights
+
+        ce_sum = (per_token_ce.float() * weighted_mask).sum()
+        tv_sum = (per_token_tv.float() * weighted_mask).sum()
+
+        # TV acceptance rate per slot; training target for the confidence head.
+        accept_rate = (1.0 - 0.5 * per_token_tv.detach()).clamp_(0.0, 1.0)
+
+        confidence_pred = data["draft_confidence_pred"]
+        confidence_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            confidence_pred.float(), accept_rate, reduction="none"
+        )
+        confidence_sum = (confidence_bce * weighted_mask).sum()
+
+        if global_draft_pass_counts is not None:
+            slot_counts = global_draft_pass_counts.float()
+            denominator = (weights * slot_counts).sum()
+        else:
+            slot_counts = None
+            denominator = global_valid_toks.float()
+        denominator = torch.clamp(denominator, min=1.0)
+
+        loss = (
+            self.ce_loss_alpha * ce_sum
+            + self.tv_loss_alpha * tv_sum
+            + self.confidence_head_alpha * confidence_sum
+        ) / denominator
+
+        metrics: dict[str, Any] = {}
+        with torch.no_grad():
+            metrics["dspark_ce_loss"] = float((ce_sum / denominator).item())
+            metrics["dspark_tv_loss"] = float((tv_sum / denominator).item())
+            metrics["dspark_confidence_loss"] = float(
+                (confidence_sum / denominator).item()
+            )
+            confidence_error = (
+                torch.sigmoid(confidence_pred.float()) - accept_rate
+            ) * weighted_mask
+            metrics["dspark_confidence_abs_error"] = float(
+                (confidence_error.abs().sum() / denominator).item()
+            )
+            metrics["dspark_confidence_bias"] = float(
+                (confidence_error.sum() / denominator).item()
+            )
+
+            valid_accept = accept_rate * slot_mask
+            per_slot_ce_sum = (per_token_ce.float() * slot_mask).sum(dim=(0, 1))
+            per_slot_accept_sum = valid_accept.sum(dim=(0, 1))
+            for slot in range(gamma):
+                metric_denominator = torch.clamp(
+                    slot_counts[slot]
+                    if slot_counts is not None
+                    else global_valid_toks.float(),
+                    min=1.0,
+                )
+                metrics[f"draft_loss_slot_{slot}"] = float(
+                    (per_slot_ce_sum[slot] / metric_denominator).item()
+                )
+                metrics[f"accept_rate_slot_{slot}"] = float(
+                    (per_slot_accept_sum[slot] / metric_denominator).item()
+                )
+
+            # Expected accepted tokens per block (+1 bonus token), the
+            # probabilistic tau of the DeepSpec logs. Invalid slots zero the
+            # cumprod tail, matching the official eval_mask semantics. Valid
+            # blocks == slot-0-valid blocks (anchor candidates require a
+            # trained first label).
+            tau_per_block = 1.0 + valid_accept.cumprod(dim=-1).sum(dim=-1)
+            tau_sum = (tau_per_block * slot_mask[:, :, 0]).sum()
+            block_count = (
+                float(slot_counts[0].item())
+                if slot_counts is not None
+                else float(tau_per_block.numel())
+            )
+            metrics["dspark_tau_probabilistic"] = float(
+                (tau_sum / max(block_count, 1.0)).item()
+            )
+
         return loss, metrics
 
 

@@ -16,6 +16,7 @@ from nemo_rl.models.megatron.draft.dflash import (
     DFlashDraftModel,
     sample_block_anchors,
 )
+from nemo_rl.models.megatron.draft.dspark import DSparkDraftModel
 from nemo_rl.models.megatron.draft.eagle import EagleModel
 from nemo_rl.models.megatron.draft.hidden_capture import (
     CapturedStates,
@@ -34,6 +35,7 @@ from nemo_rl.models.megatron.draft.utils import (
 __all__ = [
     "CapturedStates",
     "DFlashDraftModel",
+    "DSparkDraftModel",
     "HiddenStateCapture",
     "get_capture_context",
     "EagleModel",

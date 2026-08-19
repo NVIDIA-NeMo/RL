@@ -296,7 +296,7 @@ def block_draft_slot_mask(
     *,
     gamma: int,
 ) -> torch.Tensor:
-    """Validity mask ``[B, N, gamma]`` for DFlash block draft slots.
+    """Validity mask ``[B, N, gamma]`` for DFlash/DSpark block draft slots.
 
     Slot ``j`` of a block anchored at ``p`` predicts ``x_{p + 1 + j}``; it is
     valid when the block is real (``anchor_valid``), the label position is in

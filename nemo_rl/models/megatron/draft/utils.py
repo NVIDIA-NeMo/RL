@@ -1128,7 +1128,7 @@ def get_policy_lm_head_weight(policy_model_chunk: MegatronModule) -> torch.Tenso
 
 
 def _get_draft_output_layer(draft_model: MegatronModule):
-    # Block drafts (DFlash) expose the LM head as `output_layer`;
+    # Block drafts (DFlash/DSpark) expose the LM head as `output_layer`;
     # the Eagle path keeps modelopt's `eagle_module.eagle_output_layer`.
     block_output_layer = getattr(draft_model, "output_layer", None)
     if block_output_layer is not None:
@@ -1401,7 +1401,11 @@ def _build_block_draft_model(
     pg_collection: ProcessGroupCollection,
     policy_model_chunk: MegatronModule,
 ) -> MegatronModule:
-    """Build a DFlash block draft model (full implementation in ``draft/dflash.py``)."""
+    """Build a DFlash/DSpark block draft model.
+
+    The full implementation lives in ``draft/dflash.py``; DSpark subclasses
+    it in ``draft/dspark.py``.
+    """
     from transformers import AutoConfig
 
     from nemo_rl.models.megatron.draft.dflash import (
@@ -1419,28 +1423,38 @@ def _build_block_draft_model(
         )
     if int(model_provider.pipeline_model_parallel_size or 1) != 1:
         raise ValueError(
-            "policy.draft.method dflash requires pipeline_model_parallel_size "
+            "policy.draft.method dflash/dspark requires pipeline_model_parallel_size "
             "== 1 (the policy embedding row for the mask token must live on the "
             "draft owner rank)."
         )
     if int(getattr(model_provider, "context_parallel_size", 1) or 1) != 1:
         raise ValueError(
-            "policy.draft.method dflash requires context_parallel_size == 1."
+            "policy.draft.method dflash/dspark requires context_parallel_size == 1."
         )
     if bool(model_provider.sequence_parallel):
         raise ValueError(
-            "policy.draft.method dflash requires sequence_parallel == false."
+            "policy.draft.method dflash/dspark requires sequence_parallel == false."
         )
 
     model_name = draft_config.get("model_name")
     hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
     hf_drafter_config = dict(hf_config.get("dflash_config") or {})
+    # Official DSpark configs keep the drafter fields flat at the top level
+    # of config.json (no dflash_config sub-dict); sub-dict keys win.
+    for drafter_key in (
+        "mask_token_id",
+        "target_layer_ids",
+        "block_size",
+        "markov_rank",
+    ):
+        if drafter_key not in hf_drafter_config and drafter_key in hf_config:
+            hf_drafter_config[drafter_key] = hf_config[drafter_key]
 
     # Training implements full non-causal block attention with no sliding
-    # window / attention sink. A checkpoint requesting a different
-    # serving-side structure (vLLM resolves these fields in
-    # qwen3_dflash._resolve_layer_attention) would silently train a
-    # mismatched draft — reject it.
+    # window / attention sink and (DSpark) no bonus-anchor slot. A checkpoint
+    # requesting a different serving-side structure (vLLM resolves these
+    # fields in qwen3_dflash._resolve_layer_attention and the DSpark
+    # speculator) would silently train a mismatched draft — reject it.
     unsupported_structure: list[str] = []
     if hf_drafter_config.get("causal"):
         unsupported_structure.append("dflash_config.causal=true")
@@ -1455,6 +1469,8 @@ def _build_block_draft_model(
         "add_swa_attention_sink_bias"
     ):
         unsupported_structure.append("SWA attention-sink bias")
+    if method == "dspark" and hf_config.get("dspark_bonus_anchor"):
+        unsupported_structure.append("dspark_bonus_anchor=true")
     if unsupported_structure:
         raise NotImplementedError(
             "[draft] Block draft training only implements full non-causal "
@@ -1467,7 +1483,7 @@ def _build_block_draft_model(
         mask_token_id = hf_drafter_config.get("mask_token_id")
     if mask_token_id is None:
         raise ValueError(
-            "policy.draft.mask_token_id is required for dflash (pick a "
+            "policy.draft.mask_token_id is required for dflash/dspark (pick a "
             "reserved, unused-in-data token id; its target embedding row "
             "becomes the mask embedding)."
         )
@@ -1549,11 +1565,11 @@ def _build_block_draft_model(
             f"(vocab_size={config.vocab_size})."
         )
 
-    # Block width vs the checkpoint (gamma + the bonus anchor slot) — a
-    # mismatch would train blocks vLLM never runs.
+    # Block width vs the checkpoint (dspark: gamma slots; dflash: gamma + the
+    # bonus anchor slot) — a mismatch would train blocks vLLM never runs.
     gamma = int(draft_config["gamma"])
     ckpt_block_size = hf_drafter_config.get("block_size")
-    expected_block_size = gamma + 1
+    expected_block_size = gamma if method == "dspark" else gamma + 1
     if ckpt_block_size is not None and int(ckpt_block_size) != expected_block_size:
         raise ValueError(
             f"[draft] policy.draft.gamma={gamma} implies {method} "
@@ -1593,9 +1609,24 @@ def _build_block_draft_model(
         target_hidden_size=model_provider.hidden_size,
         trunk_chunk=int(draft_config.get("trunk_chunk") or 1024),
     )
-    from nemo_rl.models.megatron.draft.dflash import DFlashDraftModel
+    if method == "dflash":
+        from nemo_rl.models.megatron.draft.dflash import DFlashDraftModel
 
-    draft_model = DFlashDraftModel(**shared_kwargs)
+        draft_model = DFlashDraftModel(**shared_kwargs)
+    else:
+        from nemo_rl.models.megatron.draft.dspark import DSparkDraftModel
+
+        # Checkpoint config wins (its weight shapes must match); the recipe
+        # value only seeds checkpoint-less builds.
+        markov_rank = (
+            hf_drafter_config.get("markov_rank")
+            or draft_config.get("markov_rank")
+            or 64
+        )
+        draft_model = DSparkDraftModel(
+            markov_rank=int(markov_rank),
+            **shared_kwargs,
+        )
     tp_group = getattr(pg_collection, "tp", None)
     if tp_group is not None:
         for module in draft_model.modules():
@@ -1633,11 +1664,11 @@ def build_draft_model(
     pg_collection: ProcessGroupCollection,
     policy_model_chunk: MegatronModule,
 ) -> MegatronModule | None:
-    """Build a draft model (Eagle or DFlash) before parent DDP wrapping."""
+    """Build a draft model (Eagle or DFlash/DSpark) before parent DDP wrapping."""
     if not draft_config["enabled"]:
         return None
 
-    if draft_config.get("method", "eagle3") != "eagle3":
+    if draft_config.get("method", "eagle3") in ("dflash", "dspark"):
         draft_model = _build_block_draft_model(
             model_provider=model_provider,
             draft_config=draft_config,
@@ -1814,13 +1845,13 @@ def build_draft_model(
 
 
 # ---------------------------------------------------------------------------
-# HF <-> Megatron weight mapping for DFlash block draft models.
+# HF <-> Megatron weight mapping for DFlash/DSpark block draft models.
 #
-# The checkpoint-side names are exactly what vLLM's
-# ``DFlashQwen3ForCausalLM.load_weights`` consumes (root-level ``fc.weight`` /
-# ``hidden_norm.weight`` / ``norm.weight`` /
-# ``layers.{i}.*`` in Qwen3 naming;
-# NO lm_head — official DFlash contract, vLLM shares the target's)
+# The checkpoint-side names are exactly what vLLM 0.26's
+# ``DFlashQwen3ForCausalLM.load_weights`` / ``Qwen3DSparkForCausalLM.load_weights``
+# consume (root-level ``fc.weight`` / ``hidden_norm.weight`` / ``norm.weight`` /
+# ``layers.{i}.*`` in Qwen3 naming, plus ``markov_head.markov_w{1,2}.weight``
+# for DSpark; NO lm_head — official DFlash contract, vLLM shares the target's)
 # — the trainer streams these under a ``draft.`` prefix at refit time and
 # ``vllm_backend`` routes them into the drafter. Sibling of the Eagle mapping
 # above, sharing its TP-aware primitives; the model-side names are the fixed
@@ -1850,7 +1881,9 @@ def _block_layer_model_prefix(layer_index: int) -> str:
 
 
 def _block_split_axis_map(model_state: StateDict) -> dict[str, int]:
-    split_axis: dict[str, int] = {}
+    split_axis: dict[str, int] = {
+        "markov_w2.weight": 0,
+    }
     for key in model_state:
         if key.endswith("self_attention.linear_qkv.weight"):
             split_axis[key] = 0
@@ -1867,7 +1900,7 @@ def load_hf_weights_to_block_draft(
     model: torch.nn.Module,
     model_name: str,
 ) -> tuple[list[str], list[str]]:
-    """Load a DFlash HF checkpoint (local path or Hub repo) into the draft.
+    """Load a DFlash/DSpark HF checkpoint (local path or Hub repo) into the draft.
 
     Returns ``(missing_keys, unexpected_keys)`` from the (non-strict) state
     dict load, after removing the deliberately unmapped model params.
@@ -1910,6 +1943,19 @@ def load_hf_weights_to_block_draft(
         if hf_key == "norm.weight":
             mapped_state["decoder.final_layernorm.weight"] = weight
             continue
+        if hf_key == "markov_head.markov_w1.weight":
+            mapped_state["markov_w1.weight"] = weight
+            continue
+        if hf_key == "markov_head.markov_w2.weight":
+            mapped_state["markov_w2.weight"] = weight
+            continue
+        if hf_key == "confidence_head.proj.weight":
+            mapped_state["confidence_head.weight"] = weight
+            continue
+        if hf_key == "confidence_head.proj.bias":
+            mapped_state["confidence_head.bias"] = weight
+            continue
+
         layer_match = _CHECKPOINT_LAYER_KEY_PATTERN.match(hf_key)
         if layer_match is None:
             skipped.append(hf_key)
@@ -2011,7 +2057,7 @@ def load_hf_weights_to_block_draft(
 def export_block_draft_weights_to_hf(
     model: torch.nn.Module,
 ) -> list[tuple[str, Tensor]]:
-    """Export the block draft model to the vLLM DFlash HF naming."""
+    """Export the block draft model to the vLLM DFlash/DSpark HF naming."""
     unwrapped = unwrap_model(model)
     source_state = unwrapped.state_dict()
     config = unwrapped.config
@@ -2112,6 +2158,32 @@ def export_block_draft_weights_to_hf(
             )
         )
 
+    if "markov_w1.weight" in source_state:
+        hf_state.append(
+            ("markov_head.markov_w1.weight", source_state["markov_w1.weight"])
+        )
+        markov_rank = source_state["markov_w1.weight"].shape[1]
+        hf_state.append(
+            (
+                "markov_head.markov_w2.weight",
+                _gather_tp_weight_if_needed(
+                    _require_state_tensor(source_state, "markov_w2.weight"),
+                    (int(config.draft_vocab_size), markov_rank),
+                    split_axis=0,
+                ),
+            )
+        )
+
+    if "confidence_head.weight" in source_state:
+        # vLLM's drafter loader ignores these at refit (it loads the official
+        # ckpt's copies at init and skips them); kept for the HF export.
+        hf_state.append(
+            ("confidence_head.proj.weight", source_state["confidence_head.weight"])
+        )
+        hf_state.append(
+            ("confidence_head.proj.bias", source_state["confidence_head.bias"])
+        )
+
     return hf_state
 
 
@@ -2121,6 +2193,7 @@ def export_draft_weights_to_hf(
     """Export any supported draft model (Eagle or block draft) to HF naming."""
     from nemo_rl.models.megatron.draft.dflash import DFlashDraftModel
 
+    # DSparkDraftModel subclasses DFlashDraftModel, so this covers both.
     if isinstance(unwrap_model(model), DFlashDraftModel):
         return export_block_draft_weights_to_hf(model)
     return export_eagle_weights_to_hf(model)
