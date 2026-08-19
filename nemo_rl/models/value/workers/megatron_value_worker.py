@@ -75,6 +75,7 @@ from nemo_rl.models.megatron.setup import (
 from nemo_rl.models.megatron.train import (
     LossPostProcessor,
     megatron_forward_backward,
+    suspend_activation_offload_for_forward_only,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -730,16 +731,17 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             return output_tensor, collection_fn
 
         forward_backward_func = get_forward_backward_func()
-        list_of_values = forward_backward_func(
-            forward_step_func=forward_step_fn,
-            data_iterator=mb_iterator,
-            model=self.model,
-            num_microbatches=num_microbatches,
-            seq_length=padded_seq_length,
-            micro_batch_size=micro_batch_size_actual,
-            decoder_seq_length=padded_seq_length,
-            forward_only=True,
-        )
+        with suspend_activation_offload_for_forward_only(self.model, True):
+            list_of_values = forward_backward_func(
+                forward_step_func=forward_step_fn,
+                data_iterator=mb_iterator,
+                model=self.model,
+                num_microbatches=num_microbatches,
+                seq_length=padded_seq_length,
+                micro_batch_size=micro_batch_size_actual,
+                decoder_seq_length=padded_seq_length,
+                forward_only=True,
+            )
 
         if is_pipeline_last_stage(ignore_virtual=True):
             all_values_padded = []

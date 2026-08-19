@@ -60,6 +60,14 @@ inputs:
     description: "Commit SHA to use for test"
     required: false
     default: ""
+  megatron-lm-commit:
+    description: "Full Megatron-LM commit SHA to check out in the Megatron-Bridge submodule"
+    required: false
+    default: ""
+  megatron-lock-artifact:
+    description: "Run-scoped artifact containing the lockfile for the requested Megatron-LM commit"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -93,6 +101,35 @@ runs:
         submodules: "recursive"
         path: ${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl
         ref: ${{ inputs.test-commit-sha }}
+
+    - name: Override Megatron-LM commit
+      if: inputs.megatron-lm-commit != ''
+      shell: bash -e -u -o pipefail {0}
+      working-directory: ${{ github.workspace }}/${{ github.run_id }}/${{ steps.uuid.outputs.id }}/nemo-rl
+      env:
+        MEGATRON_LM_COMMIT: ${{ inputs.megatron-lm-commit }}
+      run: |
+        megatron_lm_dir="3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+        bash .github/scripts/checkout-megatron-lm-commit.sh "$megatron_lm_dir" "$MEGATRON_LM_COMMIT"
+
+    - name: Download Megatron lockfile
+      if: inputs.megatron-lock-artifact != ''
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      with:
+        name: ${{ inputs.megatron-lock-artifact }}
+        path: ${{ runner.temp }}/megatron-lock-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.uuid.outputs.id }}
+
+    - name: Install Megatron lockfile
+      if: inputs.megatron-lock-artifact != ''
+      shell: bash -e -u -o pipefail {0}
+      working-directory: ${{ github.workspace }}/${{ github.run_id }}/${{ steps.uuid.outputs.id }}/nemo-rl
+      env:
+        MEGATRON_LM_COMMIT: ${{ inputs.megatron-lm-commit }}
+        TEST_COMMIT_SHA: ${{ inputs.test-commit-sha }}
+      run: |
+        bash .github/scripts/install-megatron-lock-artifact.sh \
+          "$RUNNER_TEMP/megatron-lock-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${{ steps.uuid.outputs.id }}" \
+          "." "$TEST_COMMIT_SHA" "$MEGATRON_LM_COMMIT"
 
     - name: Run tests
       id: test

@@ -30,6 +30,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_multiple
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import (
@@ -554,15 +555,21 @@ class AsyncTrajectoryCollector:
                 "async_engine", False
             )
         elif backend == "megatron":
-            is_async_engine = generation_cfg.get("mcore_generation_config", {}).get(
-                "async_engine", False
-            )
+            is_async_engine = True
         elif backend == "trtllm":
             assert generation_cfg.get("trtllm_cfg", {}).get("async_engine", False), (
                 "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
                 "synchronous engine path (async_engine=false) is no longer supported."
             )
             is_async_engine = True
+        elif backend == "dynamo":
+            # Dynamo's native layerwise reload temporarily materializes model
+            # parameters while the NCCL update is in progress.  It is not safe
+            # to execute an already-issued vLLM request concurrently with that
+            # reload (in particular for NemotronH/Mamba parameters), even when
+            # the update route accepts allow_unpaused=True.  Stop new trajectory
+            # starts above and drain every active trajectory before refitting.
+            is_async_engine = False
         else:
             is_async_engine = False
         async_grpo_config = self.master_config.grpo.async_grpo
@@ -612,8 +619,17 @@ class AsyncTrajectoryCollector:
                     )
             except Exception as e:
                 print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
-
-        self._refit_pause_cleared.set()
+                if (
+                    "generation" in self.master_config.policy
+                    and self.master_config.policy["generation"]["backend"] == "dynamo"
+                ):
+                    raise RuntimeError(
+                        "Managed Dynamo KV cache invalidation failed after refit"
+                    ) from e
+            finally:
+                self._refit_pause_cleared.set()
+        else:
+            self._refit_pause_cleared.set()
 
     def wait_for_pending_generations(self) -> None:
         """Wait for all in-flight generation threads to complete."""
@@ -686,6 +702,7 @@ class AsyncTrajectoryCollector:
         input_ids: torch.Tensor,
         agent_refs: list[dict[str, Any]],
         input_lengths: Optional[torch.Tensor] = None,
+        multimodal_data: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, float]:
         """Compute teacher logprobs for non-colocated teachers.
 
@@ -695,6 +712,8 @@ class AsyncTrajectoryCollector:
             input_ids: [B, S] tokenized input tensor
             agent_refs: list of B agent reference dicts
             input_lengths: [B] per-sample lengths (required for sequence packing)
+            multimodal_data: batch-level multimodal inputs, row-aligned with
+                ``input_ids`` and sliced per teacher
 
         Returns:
             ([B, S] teacher logprobs tensor, total_time_seconds)
@@ -734,6 +753,7 @@ class AsyncTrajectoryCollector:
             twg = self.teacher_worker_groups[group_key]
             sub_input_ids = input_ids[indices]
             sub_lengths = input_lengths[indices] if input_lengths is not None else None
+            row_indices = list(indices)
 
             # Pad batch to multiple of dp_size (required for DP sharding)
             dp_size = twg.sharding_annotations.get_axis_size("data_parallel")
@@ -749,10 +769,26 @@ class AsyncTrajectoryCollector:
                     sub_lengths = torch.cat(
                         [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
                     )
+                row_indices.extend([row_indices[-1]] * pad_count)
 
             sub_data = BatchedDataDict({"input_ids": sub_input_ids})
             if sub_lengths is not None:
                 sub_data["input_lengths"] = sub_lengths
+            if multimodal_data:
+                selected_multimodal = BatchedDataDict(multimodal_data).select_indices(
+                    row_indices
+                )
+                sub_data.update(
+                    {
+                        key: value
+                        for key, value in selected_multimodal.items()
+                        if value is not None
+                        and not (
+                            isinstance(value, PackedTensor)
+                            and not any(value.logical_segment_counts_by_row())
+                        )
+                    }
+                )
 
             # Serialize calls per teacher to prevent NCCL collective desync
             t_lock_start = time.time()
@@ -1229,6 +1265,7 @@ class AsyncTrajectoryCollector:
                         flat_for_teacher["token_ids"],
                         agent_refs,
                         input_lengths=teacher_input_lengths,
+                        multimodal_data=flat_for_teacher.get_multimodal_dict(as_tensors=False),
                     )
                 else:
                     (
@@ -1242,6 +1279,7 @@ class AsyncTrajectoryCollector:
                         int(teacher_topk),
                         agent_refs,
                         input_lengths=teacher_input_lengths,
+                        multimodal_data=flat_for_teacher.get_multimodal_dict(as_tensors=False),
                     )
                     final_batch_cpu["teacher_topk_indices"] = teacher_topk_indices
                     final_batch_cpu["teacher_topk_logprobs"] = teacher_topk_logprobs

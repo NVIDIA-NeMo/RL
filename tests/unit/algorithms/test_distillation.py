@@ -14,7 +14,7 @@
 
 import copy
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -1281,7 +1281,13 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
     }
     assert master_config.env["nemo_gym"] == nemo_gym_env_before
     nemo_gym_actor._spinup.remote.assert_called_once_with()
-    mock_ray.get.assert_called_once_with("spinup-ref")
+    # Two waits, in order: the spinup, then the tokenizer install. Distillation
+    # builds its actor inline rather than through spinup_nemo_gym_actor, so it
+    # is the one call site that has to set the tokenizer itself -- passing it
+    # per rollout is what made the actor deserialize it once per prompt.
+    assert mock_ray.get.call_args_list[0] == call("spinup-ref")
+    assert mock_ray.get.call_count == 2
+    nemo_gym_actor.set_tokenizer.remote.assert_called_once_with(tokenizer)
 
 
 def test_nemo_gym_distillation_runner_uses_setup_actor():

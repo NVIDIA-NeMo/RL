@@ -1,0 +1,37 @@
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+policy:
+  megatron_cfg:
+    # Multi-Token Prediction, matching the reference Super Omni recipe that
+    # runs MTP at context_parallel_size=2.
+    #
+    # The checkpoint ships one physical MTP layer (num_nextn_predict_layers: 1,
+    # mtp_hybrid_override_pattern: "*E"), so mtp_num_layers: 1 with
+    # use_repeated_layer: false maps directly onto it. Asking for more layers
+    # would require repeating that single layer.
+    #
+    # detach_heads keeps MTP gradients from flowing back into the backbone, so
+    # the main next-token objective is unchanged by the auxiliary head.
+    mtp_num_layers: 1
+    mtp_use_repeated_layer: false
+    mtp_detach_heads: true
+    # Train the MTP head: its loss is added to the training objective at this
+    # weight. Set 0.0 instead to keep the head present and refit into vLLM (so
+    # speculative decoding can use it) without training it, which is what the
+    # reference Super Omni CP=2 recipe does.
+    #
+    # MTP gradients are clipped separately from the backbone, not jointly with
+    # it. With mtp_detach_heads: true above, Megatron tags every MTP parameter
+    # grad_norm_group='mtp' (multi_token_prediction.py), and clip_grad_norm
+    # excludes tagged parameters from the main gradient norm and clips them
+    # against their own group norm (optimizer.py, SEPARATE_GRAD_NORM_GROUPS).
+    # So raising this weight does not feed MTP gradients into the backbone's
+    # clipping. Watch train/grad_norm anyway: measured over 24 steps at this
+    # weight it stayed in 0.03-0.22, so a departure from that range is a signal
+    # worth chasing -- but look past MTP clipping for the cause.
+    mtp_loss_scaling_factor: 0.1
+logger:
+  log_dir: logs/nemotron-super-omni-async-gym-mtp
+  wandb:
+    name: nemotron-super-omni-async-gym-mtp
+checkpointing:
+  checkpoint_dir: results/nemotron-super-omni-async-gym-mtp
