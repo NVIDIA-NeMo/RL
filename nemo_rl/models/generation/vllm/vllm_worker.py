@@ -1180,7 +1180,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             return False
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -1193,7 +1195,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective", args=(refit_timeout_s,)
             )
             worker_results = cast(list[bool], result_or_coro)
 

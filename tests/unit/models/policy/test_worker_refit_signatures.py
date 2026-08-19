@@ -59,6 +59,34 @@ FANOUT_METHODS = [
     ),
 ]
 
+# The same contract on the generation side, and worse there: VllmGeneration picks the
+# method NAME from config --
+#
+#     method_name = "..._async" if cfg["vllm_cfg"]["async_engine"] else "..."
+#     getattr(worker, method_name).remote(refit_timeout_s=refit_timeout_s)
+#
+# -- so the two branches are separate functions in separate files that drift
+# independently, and only the configuration decides which one a run reaches. Adding the
+# kwarg to the async worker and not the sync one type-checks, imports, and passes every
+# async test. It cost two hangs in job 6321283: the generation actor raised TypeError at
+# the Ray boundary, never joined the NCCL broadcast, and the training side blocked in
+# ray.get forever. Both branches, always, or one config value is a hang.
+GEN = REPO_ROOT / "nemo_rl" / "models" / "generation" / "vllm"
+GEN_FANOUT = [
+    (
+        "update_weights_from_collective",
+        "vllm_worker.py",
+        "update_weights_from_collective",
+    ),
+    (
+        "update_weights_from_collective",
+        "vllm_worker_async.py",
+        "update_weights_from_collective_async",
+    ),
+    ("nccl_reshard_refit", "vllm_worker.py", "nccl_reshard_refit"),
+    ("nccl_reshard_refit", "vllm_worker_async.py", "nccl_reshard_refit_async"),
+]
+
 
 def _kwargs_of(path: Path, method: str) -> set[str]:
     """Keyword names accepted by the outermost definition of ``method`` in ``path``."""
@@ -108,6 +136,49 @@ def test_every_worker_accepts_what_policy_forwards(method, impl):
         f"{impl} does not accept {'it' if len(missing) == 1 else 'them'}. "
         "Ray rejects the call at the actor boundary, so this surfaces as a TypeError "
         "at refit rather than anywhere near this signature."
+    )
+
+
+def _forwarded_by_vllm_generation(method: str) -> set[str]:
+    """Keywords ``VllmGeneration.<method>`` passes to whichever worker method it picked.
+
+    The call is ``getattr(worker, method_name).remote(...)``, so the callee is not named
+    at the call site -- it is picked from config. Anchor on the enclosing def instead.
+    """
+    tree = ast.parse((GEN / "vllm_generation.py").read_text())
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == method
+        ):
+            continue
+        for call in ast.walk(node):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "remote"
+            ):
+                return {kw.arg for kw in call.keywords if kw.arg is not None}
+    raise AssertionError(f"VllmGeneration.{method}() has no .remote() fan-out")
+
+
+@pytest.mark.parametrize(
+    ("method", "worker_file", "worker_method"),
+    [(m, f, wm) for m, f, wm in GEN_FANOUT],
+    ids=[f"{m}->{f}::{wm}" for m, f, wm in GEN_FANOUT],
+)
+def test_both_engine_branches_accept_what_generation_forwards(
+    method, worker_file, worker_method
+):
+    forwarded = _forwarded_by_vllm_generation(method)
+    accepted = _kwargs_of(GEN / worker_file, worker_method)
+    missing = forwarded - accepted
+    assert not missing, (
+        f"VllmGeneration.{method}() forwards {sorted(missing)}, but "
+        f"{worker_file}::{worker_method}() does not accept {'it' if len(missing) == 1 else 'them'}. "
+        "Which branch a run takes is decided by vllm_cfg.async_engine, so this is a "
+        "config-dependent hang: the generation actor raises TypeError, never joins the "
+        "collective, and the training side blocks in ray.get with no error anywhere."
     )
 
 
