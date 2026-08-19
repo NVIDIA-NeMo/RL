@@ -19,11 +19,17 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, Optional
 
 import torch
 import torch.distributed as dist
+from megatron.bridge.training.config import (
+    OptimizerConfigOverrideProvider,
+    OptimizerConfigOverrideProviderContext,
+)
 from megatron.core import parallel_state
+from megatron.core.optimizer import ParamKey
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.utils import unwrap_model
@@ -1252,6 +1258,117 @@ def register_draft_grad_norm_group() -> None:
         )
 
 
+@dataclass
+class DraftOptimizerConfigOverrideProvider(OptimizerConfigOverrideProvider):
+    """Give ``draft_model.*`` params their own optimizer param group.
+
+    The draft trains at its own lr / weight decay while the policy keeps the
+    ``megatron_cfg.optimizer`` settings; the schedule shape (warmup, decay
+    style) stays shared. mcore matches checkpointed param groups to runtime
+    groups by ``param_group_identifier_keys`` (which include ``max_lr`` /
+    ``min_lr`` / ``start_wd`` / ``end_wd`` since Megatron-LM#4705), so the
+    override must differ from the policy group in at least one of those
+    fields — indistinguishable groups collapse at load and a resumed run
+    silently swaps hyperparameters. :meth:`build_config_overrides` rejects an
+    indistinguishable override.
+    """
+
+    draft_lr: Optional[float]
+    draft_min_lr: Optional[float]
+    draft_weight_decay: Optional[float]
+
+    def build_config_overrides(
+        self, context: OptimizerConfigOverrideProviderContext
+    ) -> dict[ParamKey, ParamGroupOverride] | None:
+        overrides = super().build_config_overrides(context) or {}
+        draft_override = ParamGroupOverride()
+        if self.draft_lr is not None:
+            draft_override["max_lr"] = float(self.draft_lr)
+            # A draft head generally wants to keep a high LR even when the
+            # policy LR decays, so min_lr follows the draft LR unless set.
+            draft_override["min_lr"] = float(
+                self.draft_min_lr if self.draft_min_lr is not None else self.draft_lr
+            )
+        elif self.draft_min_lr is not None:
+            draft_override["min_lr"] = float(self.draft_min_lr)
+        if self.draft_weight_decay is not None:
+            draft_override["start_wd"] = float(self.draft_weight_decay)
+            draft_override["end_wd"] = float(self.draft_weight_decay)
+
+        base_config = context.optimizer_config
+        effective_max_lr = draft_override.get("max_lr", base_config.lr)
+        effective_min_lr = draft_override.get("min_lr", base_config.min_lr)
+        # Must differ from the policy group in at least one of mcore's
+        # param_group_identifier_keys, or the two collapse at checkpoint load
+        # and swap params. The policy group carries no start_wd/end_wd at all,
+        # so setting them on the draft is itself distinguishing.
+        distinguishes = (
+            "start_wd" in draft_override
+            or "end_wd" in draft_override
+            or (effective_max_lr, effective_min_lr)
+            != (base_config.lr, base_config.min_lr)
+        )
+        if not distinguishes:
+            raise ValueError(
+                "[draft] draft (lr, min_lr, weight_decay) must differ from the "
+                "policy's in at least one field."
+            )
+
+        overrides[ParamKey(name="*draft_model.*")] = draft_override
+        return overrides
+
+
+def build_draft_optimizer_override_provider(
+    draft_config: Mapping[str, Any],
+) -> Optional[DraftOptimizerConfigOverrideProvider]:
+    """Build the draft optimizer override provider from ``policy.draft`` config.
+
+    Returns None when the config requests no draft-specific optimizer settings,
+    so the caller falls back to megatron-bridge's default provider and the
+    optimizer param-group partition is byte-identical to a no-override run.
+    """
+    draft_lr = draft_config.get("lr")
+    draft_min_lr = draft_config.get("min_lr")
+    draft_weight_decay = draft_config.get("weight_decay")
+    if draft_lr is None and draft_min_lr is None and draft_weight_decay is None:
+        return None
+    return DraftOptimizerConfigOverrideProvider(
+        draft_lr=draft_lr,
+        draft_min_lr=draft_min_lr,
+        draft_weight_decay=draft_weight_decay,
+    )
+
+
+def resolve_draft_aux_layer_ids(
+    draft_config: Mapping[str, Any], num_layers: int
+) -> tuple[int, ...]:
+    """Resolve the policy aux-layer ids the draft taps, rank-independently.
+
+    Every PP stage must resolve the same list: the hidden-state capture posts
+    one P2P send/recv per id, so stages disagreeing about it desync the
+    pipeline — and only the last stage owns a draft model to read the resolved
+    value from. Sources, in order: the draft checkpoint's
+    ``eagle_aux_hidden_state_layer_ids`` when ``model_name`` is set (a config
+    read, identical on every rank), else ``policy.draft.aux_layer_indices``,
+    else modelopt's defaults (unless the checkpoint disables aux states).
+    """
+    from transformers import AutoConfig
+
+    from nemo_rl.models.megatron.draft.hidden_capture import (
+        get_eagle3_aux_hidden_state_layers,
+    )
+
+    model_name = draft_config.get("model_name")
+    hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
+    if model_name is not None:
+        ids = hf_config.get("eagle_aux_hidden_state_layer_ids", [])
+    else:
+        ids = draft_config.get("aux_layer_indices") or []
+    if not ids and hf_config.get("use_aux_hidden_state", True):
+        ids = get_eagle3_aux_hidden_state_layers(num_layers)
+    return tuple(int(i) for i in ids)
+
+
 def build_draft_model(
     model_provider,
     draft_config: dict[str, Any],
@@ -1265,9 +1382,6 @@ def build_draft_model(
     from transformers import AutoConfig
 
     from nemo_rl.models.megatron.draft.eagle import EagleModel
-    from nemo_rl.models.megatron.draft.hidden_capture import (
-        get_eagle3_aux_hidden_state_layers,
-    )
 
     model_name = draft_config.get("model_name")
     hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
@@ -1323,11 +1437,14 @@ def build_draft_model(
     )
     config.rotary_percent = model_provider.rotary_percent
     config.rotary_base = hf_config.get("rope_theta", model_provider.rotary_base)
+    # Official z-lab configs carry an explicit "rope_scaling": null — a
+    # present-but-null key must read as "no scaling", not crash on None.get.
+    hf_rope_scaling = (hf_config.get("rope_scaling") or {}) if hf_config else None
     config.rope_scaling = (
-        "rope_scaling" in hf_config if hf_config else model_provider.rope_scaling
+        bool(hf_rope_scaling) if hf_config else model_provider.rope_scaling
     )
     config.rope_scaling_factor = (
-        hf_config.get("rope_scaling", {}).get("factor")
+        hf_rope_scaling.get("factor", model_provider.rope_scaling_factor)
         if hf_config
         else model_provider.rope_scaling_factor
     )
@@ -1337,27 +1454,34 @@ def build_draft_model(
     )
     config.use_last_layernorm = hf_config.get("use_last_layernorm", True)
     config.use_aux_hidden_state = hf_config.get("use_aux_hidden_state", True)
-    if model_name is not None:
-        config.eagle_aux_hidden_state_layer_ids = hf_config.get(
-            "eagle_aux_hidden_state_layer_ids", []
-        )
-    else:
-        config.eagle_aux_hidden_state_layer_ids = (
-            draft_config.get("aux_layer_indices") or []
-        )
-    if (
-        config.use_aux_hidden_state
-        and len(config.eagle_aux_hidden_state_layer_ids) == 0
-    ):
-        config.eagle_aux_hidden_state_layer_ids = get_eagle3_aux_hidden_state_layers(
-            model_provider.num_layers
-        )
+    # Shared with the worker's capture threading so every PP stage resolves
+    # the same list (see resolve_draft_aux_layer_ids).
+    config.eagle_aux_hidden_state_layer_ids = list(
+        resolve_draft_aux_layer_ids(draft_config, model_provider.num_layers)
+    )
 
     config.parallel_draft_step = 1
     config.use_mtp_layernorm = config.parallel_draft_heads_num_layers = None
     config.has_lm_head = True
 
-    draft_model = EagleModel(config=config)
+    raw_ttt_steps = draft_config.get("ttt_steps", 1)
+    ttt_steps = 1 if raw_ttt_steps is None else int(raw_ttt_steps)
+    if ttt_steps > 1:
+        # The TTT attention/loss path slices sequences locally and stashes
+        # per-pass KV; both require every rank to see the full sequence.
+        if int(getattr(model_provider, "context_parallel_size", 1) or 1) != 1:
+            raise ValueError(
+                "policy.draft.ttt_steps > 1 requires context_parallel_size == 1."
+            )
+        if bool(model_provider.sequence_parallel):
+            raise ValueError(
+                "policy.draft.ttt_steps > 1 requires sequence_parallel == false."
+            )
+
+    draft_model = EagleModel(
+        config=config,
+        ttt_steps=ttt_steps,
+    )
     tp_group = getattr(pg_collection, "tp", None)
     if tp_group is not None:
         for module in draft_model.modules():

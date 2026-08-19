@@ -242,6 +242,7 @@ from nemo_rl.models.megatron.config import (
 )
 from nemo_rl.models.megatron.draft.utils import (
     build_draft_model,
+    build_draft_optimizer_override_provider,
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
@@ -2019,11 +2020,20 @@ def setup_model_and_optimizer(
     )
 
     if load_optimizer:
+        # Draft co-training may give `draft_model.*` params their own LR/WD
+        # param group (policy.draft.{lr,min_lr,weight_decay}); None keeps the
+        # stock megatron-bridge provider and param-group partition.
+        optimizer_config_override_provider = (
+            build_draft_optimizer_override_provider(policy_cfg["draft"])
+            if draft_enabled
+            else None
+        )
         optimizer, scheduler = setup_optimizer(
             optimizer_config=megatron_cfg.optimizer,
             scheduler_config=megatron_cfg.scheduler,
             model=model,
             use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
+            optimizer_config_override_provider=optimizer_config_override_provider,
         )
     else:
         optimizer = None

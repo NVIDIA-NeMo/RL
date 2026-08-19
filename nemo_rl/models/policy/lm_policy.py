@@ -173,6 +173,52 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "which the fused path never materializes. Disable one of the "
                 "two."
             )
+        if draft_enabled:
+            raw_ttt_steps = config["draft"].get("ttt_steps", 1)
+            draft_ttt_steps = 1 if raw_ttt_steps is None else int(raw_ttt_steps)
+            if draft_ttt_steps < 1:
+                raise ValueError(
+                    f"policy.draft.ttt_steps must be >= 1, got {raw_ttt_steps}."
+                )
+            draft_pass_weights = config["draft"].get("ttt_pass_weights")
+            if (
+                draft_pass_weights is not None
+                and len(draft_pass_weights) != draft_ttt_steps
+            ):
+                raise ValueError(
+                    "policy.draft.ttt_pass_weights must have ttt_steps="
+                    f"{draft_ttt_steps} entries, got {len(draft_pass_weights)}."
+                )
+            if draft_ttt_steps > 1 and bool(
+                config.get("sequence_packing", {}).get("enabled", False)
+            ):
+                # Multi-pass TTT slices the unshifted teacher per pass to build
+                # its targets, which assumes the [B, S] layout; the packed
+                # draft loss pre-shifts and packs a single mask instead.
+                raise ValueError(
+                    "policy.draft.ttt_steps > 1 does not support sequence packing "
+                    "yet. Set policy.draft.ttt_steps=1 or disable "
+                    "policy.sequence_packing."
+                )
+            # The TTT attention slices sequences locally and stashes per-pass
+            # KV; both need every rank to see the full sequence
+            # (build_draft_model re-checks on the worker).
+            if (
+                draft_ttt_steps > 1
+                and int(config["megatron_cfg"].get("context_parallel_size", 1) or 1)
+                != 1
+            ):
+                raise ValueError(
+                    "policy.draft.ttt_steps > 1 requires "
+                    "policy.megatron_cfg.context_parallel_size=1."
+                )
+            if draft_ttt_steps > 1 and bool(
+                config["megatron_cfg"].get("sequence_parallel")
+            ):
+                raise ValueError(
+                    "policy.draft.ttt_steps > 1 requires "
+                    "policy.megatron_cfg.sequence_parallel=false."
+                )
         if megatron_enable:
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
