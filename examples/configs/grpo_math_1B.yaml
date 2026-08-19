@@ -389,10 +389,17 @@ policy:
     enabled: false
     model_name: null
     loss_weight: 0.1
-    # Drafter family: "eagle3" (Megatron backend, or Automodel with the
-    # speculators-style TTT trainer), "dspark" / "dflash" (Automodel backend;
-    # dflash is the markov-free, confidence-free, bonus-anchor variant).
+    # Drafter family: "eagle3" (Megatron or Automodel backend, both trained
+    # with TTT), "dspark" / "dflash" (Automodel backend; dflash is the
+    # markov-free, confidence-free, bonus-anchor variant).
     speculator_type: "eagle3"
+    # --- eagle3 (both backends) ---
+    # TTT unroll depth; align generation's num_speculative_tokens with it.
+    # On Megatron, 1 is single-pass training; >1 requires
+    # megatron_cfg.sequence_parallel=false and no sequence packing.
+    ttt_steps: 3
+    # Per-step loss decay gamma (loss_k *= gamma^k).
+    ttt_step_loss_decay: 1.0
     # --- eagle3 (Megatron path) ---
     num_layers: null
     aux_layer_indices: null
@@ -409,10 +416,6 @@ policy:
     # Draft param-group lr; must far exceed the policy RL lr so the draft
     # tracks policy drift.
     learning_rate: 1.0e-04
-    # TTT unroll depth; align generation's num_speculative_tokens with it.
-    ttt_steps: 3
-    # Per-step loss decay gamma (loss_k *= gamma^k).
-    ttt_step_loss_decay: 1.0
     train_embed_and_head: true
     # --- dspark/dflash (Automodel only; set speculator_type above to use).
     # Architecture fields (block_size, target_layer_ids, mask_token_id,

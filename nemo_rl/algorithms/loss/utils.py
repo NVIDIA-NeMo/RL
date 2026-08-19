@@ -50,6 +50,7 @@ def map_teacher_logits_to_draft_vocab(
     d2t: Optional[torch.Tensor],
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    token_chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Restrict full-vocab teacher logits to the draft vocabulary via ``d2t``.
 
@@ -58,6 +59,10 @@ def map_teacher_logits_to_draft_vocab(
     are gathered to the full vocab and re-sliced to this rank's shard of the
     draft vocabulary (the draft output layer is sharded the same way). No-op
     when ``d2t`` is None (full-vocab drafts).
+
+    ``token_chunk_size`` gathers and subsets that many tokens at a time: the
+    full ``[B, S, V_full]`` gather peaks at several GiB at long sequence
+    lengths while only the ``[B, S, draft_vocab/tp]`` subset survives.
     """
     if d2t is None:
         return teacher_logits
@@ -69,15 +74,28 @@ def map_teacher_logits_to_draft_vocab(
             gather_from_tensor_model_parallel_region,
         )
 
-        teacher_logits = gather_from_tensor_model_parallel_region(
-            teacher_logits, vocab_parallel_group
-        )
         tp_size = torch.distributed.get_world_size(vocab_parallel_group)
         local_draft_size = len(d2t) // tp_size
         assert vocab_parallel_rank is not None
         start_index = vocab_parallel_rank * local_draft_size
         end_index = (vocab_parallel_rank + 1) * local_draft_size
         reverse_mapping = reverse_mapping[start_index:end_index]
+
+        if token_chunk_size is None:
+            teacher_logits = gather_from_tensor_model_parallel_region(
+                teacher_logits, vocab_parallel_group
+            )
+        else:
+            flat_teacher = teacher_logits.reshape(-1, teacher_logits.shape[-1])
+            subset_teacher = flat_teacher.new_empty(
+                flat_teacher.shape[0], reverse_mapping.shape[0]
+            )
+            for start in range(0, flat_teacher.shape[0], token_chunk_size):
+                end = min(start + token_chunk_size, flat_teacher.shape[0])
+                subset_teacher[start:end] = gather_from_tensor_model_parallel_region(
+                    flat_teacher[start:end], vocab_parallel_group
+                )[:, reverse_mapping]
+            return subset_teacher.reshape(*teacher_logits.shape[:-1], -1)
     return teacher_logits[:, :, reverse_mapping]
 
 
@@ -350,6 +368,46 @@ def reconstruct_opd_full_teacher_logits(
             f"width; got {teacher_logits.shape[-1]} vs {vocab_shard_size}."
         )
     return teacher_logits
+
+
+def draft_pass_token_mask(token_mask: torch.Tensor, ttt_pass: int) -> torch.Tensor:
+    """Per-pass draft loss mask (before the sample_mask factor).
+
+    Pass ``d`` position ``i`` predicts token ``x_{i+d+1}``, so its validity is
+    ``token_mask[i + d + 1]``: a left shift by ``d + 1`` that also drops the
+    out-of-bounds tail. Returned shape is ``[B, S - d - 1]``, aligned with the
+    ``student[:, :S-d-1]`` / ``teacher[:, d:S-1]`` slices used by
+    ``DraftTTTCrossEntropyLossFn``.
+    """
+    return token_mask[:, ttt_pass + 1 :]
+
+
+def compute_draft_pass_valid_counts(
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    *,
+    ttt_steps: int,
+) -> torch.Tensor:
+    """Local per-pass valid-token counts for the draft TTT loss.
+
+    Returns a fp32 tensor of shape ``[ttt_steps]`` where entry ``d-1`` is this
+    rank's ``#valid pass-d targets``. The caller must all-reduce it over the
+    data-parallel group (and only DP: every CP/TP rank computes the loss over
+    the full sequence/vocab, so reducing over those groups would double-count).
+
+    The loss consumes the vector twice: the gradient denominator is
+    ``sum_d alpha_d * counts[d-1]``, and the per-pass diagnostic metrics divide
+    by ``counts[d-1]`` so that the driver's sum-over-microbatches aggregation
+    (grpo.py logs mb-metric lists with ``np.sum``) reconstructs the global
+    per-token mean instead of summing per-microbatch means.
+    """
+    counts = token_mask.new_zeros((ttt_steps,), dtype=torch.float32)
+    for ttt_pass in range(1, ttt_steps + 1):
+        pass_mask = draft_pass_token_mask(token_mask, ttt_pass) * sample_mask.unsqueeze(
+            -1
+        )
+        counts[ttt_pass - 1] = pass_mask.sum().float()
+    return counts
 
 
 def _pack_input_ids(

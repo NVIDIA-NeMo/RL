@@ -43,8 +43,8 @@ def test_eagle3_draft_config_preserves_legacy_defaults() -> None:
         "num_layers": None,
         "aux_layer_indices": None,
         "optimizer": None,
-        # Automodel TTT training options; the Megatron single-step path
-        # ignores these.
+        # learning_rate/train_embed_and_head are Automodel-only; both
+        # backends read the ttt_* options.
         "learning_rate": 1.0e-4,
         "ttt_steps": 3,
         "ttt_step_loss_decay": 1.0,
@@ -97,6 +97,12 @@ def test_eagle3_draft_config_rejects_near_miss_typo_keys() -> None:
         Eagle3DraftConfig.model_validate({"enalbed": True})
     with pytest.raises(ValidationError, match="did you mean 'loss_weight'"):
         Eagle3DraftConfig.model_validate({"loss_wieght": 0.5})
+
+
+def test_eagle3_draft_config_validates_ttt_fields() -> None:
+    assert Eagle3DraftConfig(ttt_steps=1).ttt_steps == 1
+    with pytest.raises(ValidationError, match="ttt_steps"):
+        Eagle3DraftConfig(ttt_steps=0)
 
 
 def test_eagle3_draft_config_rejects_unknown_speculator_type() -> None:

@@ -269,6 +269,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                         "the teacher, which the fused path never materializes. "
                         "Disable one of the two."
                     )
+                if draft_config.ttt_steps > 1:
+                    if bool(config.get("sequence_packing", {}).get("enabled", False)):
+                        # Multi-pass TTT slices the unshifted teacher per pass to
+                        # build its targets, which assumes the [B, S] layout; the
+                        # packed draft loss pre-shifts and packs a single mask.
+                        # TODO(#4059): drop once forward_ttt takes packed input.
+                        raise ValueError(
+                            "policy.draft.ttt_steps > 1 does not support sequence "
+                            "packing yet. Set policy.draft.ttt_steps=1 or disable "
+                            "policy.sequence_packing."
+                        )
+                    if config["megatron_cfg"]["sequence_parallel"]:
+                        # The TTT attention slices sequences locally and stashes
+                        # per-pass KV, so every rank must see the full sequence.
+                        raise ValueError(
+                            "policy.draft.ttt_steps > 1 requires "
+                            "policy.megatron_cfg.sequence_parallel=false."
+                        )
             else:
                 # Automodel draft (eagle3 TTT, dspark, dflash).
                 automodel_cfg = config["automodel_cfg"]
