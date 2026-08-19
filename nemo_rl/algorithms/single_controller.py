@@ -345,6 +345,15 @@ class SingleControllerActor:
 
     # ── internal helpers ───────────────────────────────────────────────────
 
+    async def _call_dp(self, method_name: str, **kwargs: Any) -> Any:
+        """Call a local or Ray data-plane client without blocking the actor loop."""
+        return await call_data_plane(
+            self._dp_client,
+            method_name,
+            offload_sync=True,
+            **kwargs,
+        )
+
     async def _maybe_restore_replay_buffer(self) -> None:
         """Restore the local replay index for the native TQ checkpoint.
 
