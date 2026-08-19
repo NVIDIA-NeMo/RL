@@ -97,9 +97,7 @@ class TestAggregateStepMetrics:
         assert "grad_norm" not in out
 
     def test_draft_grad_norm_tensor_is_preserved(self) -> None:
-        out = aggregate_step_metrics(
-            {"draft_grad_norm": torch.tensor([1.0, 3.0])}
-        )
+        out = aggregate_step_metrics({"draft_grad_norm": torch.tensor([1.0, 3.0])})
 
         assert out["draft_grad_norm"] == pytest.approx(2.0)
 
