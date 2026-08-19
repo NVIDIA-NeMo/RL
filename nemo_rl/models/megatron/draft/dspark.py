@@ -51,64 +51,78 @@ class _CopyToTensorParallelRegion(torch.autograd.Function):
 class DSparkMarkovHead(nn.Module):
     """Add a previous-token low-rank bias to caller-owned base logits.
 
-    ``markov_w1`` remains a replicated global-vocabulary embedding. The output
-    rows of ``markov_w2`` may cover either the full vocabulary or one explicit
-    tensor-parallel vocabulary shard. This module owns neither embeddings used
-    by the draft backbone nor an LM head.
+    ``markov_w1`` remains a replicated target-vocabulary embedding. The output
+    rows of ``markov_w2`` cover either the full draft vocabulary or one explicit
+    tensor-parallel draft-vocabulary shard. This module owns neither embeddings
+    used by the draft backbone nor an LM head.
     """
 
     def __init__(
         self,
         *,
-        vocab_size: int,
+        target_vocab_size: int,
+        draft_vocab_size: int,
         markov_rank: int,
-        vocab_start_index: int = 0,
-        vocab_end_index: int | None = None,
+        draft_vocab_start_index: int = 0,
+        draft_vocab_end_index: int | None = None,
         tensor_parallel_group: torch.distributed.ProcessGroup | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
-        if vocab_size <= 0:
-            raise ValueError("vocab_size must be positive")
+        if target_vocab_size <= 0:
+            raise ValueError("target_vocab_size must be positive")
+        if draft_vocab_size <= 0:
+            raise ValueError("draft_vocab_size must be positive")
         if markov_rank <= 0:
             raise ValueError("markov_rank must be positive")
 
-        resolved_vocab_end = vocab_size if vocab_end_index is None else vocab_end_index
-        if not 0 <= vocab_start_index < resolved_vocab_end <= vocab_size:
+        resolved_draft_vocab_end = (
+            draft_vocab_size if draft_vocab_end_index is None else draft_vocab_end_index
+        )
+        if not (
+            0 <= draft_vocab_start_index < resolved_draft_vocab_end <= draft_vocab_size
+        ):
             raise ValueError(
-                "vocab shard must satisfy "
-                "0 <= vocab_start_index < vocab_end_index <= vocab_size"
+                "draft vocab shard must satisfy 0 <= draft_vocab_start_index "
+                "< draft_vocab_end_index <= draft_vocab_size"
             )
 
-        self.vocab_size = vocab_size
+        self.target_vocab_size = target_vocab_size
+        self.draft_vocab_size = draft_vocab_size
         self.markov_rank = markov_rank
-        self.vocab_start_index = vocab_start_index
-        self.vocab_end_index = resolved_vocab_end
-        self.local_vocab_size = resolved_vocab_end - vocab_start_index
-        if self.local_vocab_size != vocab_size and tensor_parallel_group is None:
-            raise ValueError("tensor_parallel_group is required for a vocabulary shard")
-        if self.local_vocab_size != vocab_size:
+        self.draft_vocab_start_index = draft_vocab_start_index
+        self.draft_vocab_end_index = resolved_draft_vocab_end
+        self.local_draft_vocab_size = resolved_draft_vocab_end - draft_vocab_start_index
+        if (
+            self.local_draft_vocab_size != draft_vocab_size
+            and tensor_parallel_group is None
+        ):
+            raise ValueError(
+                "tensor_parallel_group is required for a draft vocabulary shard"
+            )
+        if self.local_draft_vocab_size != draft_vocab_size:
             assert tensor_parallel_group is not None
             tp_size = torch.distributed.get_world_size(tensor_parallel_group)
             tp_rank = torch.distributed.get_rank(tensor_parallel_group)
             if (
-                self.local_vocab_size * tp_size != vocab_size
-                or vocab_start_index != tp_rank * self.local_vocab_size
+                self.local_draft_vocab_size * tp_size != draft_vocab_size
+                or draft_vocab_start_index != tp_rank * self.local_draft_vocab_size
             ):
                 raise ValueError(
-                    "vocab shard must be an even rank-local partition of vocab_size"
+                    "draft vocab shard must be an even rank-local partition of "
+                    "draft_vocab_size"
                 )
         self.tensor_parallel_group = tensor_parallel_group
         self.markov_w1 = nn.Embedding(
-            vocab_size,
+            target_vocab_size,
             markov_rank,
             device=device,
             dtype=dtype,
         )
         self.markov_w2 = nn.Linear(
             markov_rank,
-            self.local_vocab_size,
+            self.local_draft_vocab_size,
             bias=False,
             device=device,
             dtype=dtype,
@@ -131,9 +145,10 @@ class DSparkMarkovHead(nn.Module):
             )
         if slot_valid.shape != leading_shape:
             raise ValueError("slot_valid must match the base_logits leading shape")
-        if base_logits.shape[-1] != self.local_vocab_size:
+        if base_logits.shape[-1] != self.local_draft_vocab_size:
             raise ValueError(
-                "base_logits local vocab size does not match the configured vocab shard"
+                "base_logits local draft vocab size does not match the configured "
+                "draft vocab shard"
             )
         if not base_logits.dtype.is_floating_point:
             raise TypeError("base_logits must use a floating dtype")
@@ -155,7 +170,7 @@ class DSparkMarkovHead(nn.Module):
             torch.zeros_like(previous_token_ids),
         )
         previous_embeddings = self.markov_w1(safe_previous_token_ids)
-        if self.local_vocab_size != self.vocab_size:
+        if self.local_draft_vocab_size != self.draft_vocab_size:
             assert self.tensor_parallel_group is not None
             previous_embeddings = _CopyToTensorParallelRegion.apply(
                 previous_embeddings,
@@ -180,7 +195,9 @@ class DSparkMarkovHead(nn.Module):
         )
 
         tensor_parallel_layers_axis_map = (
-            {"markov_w2.weight": 0} if self.local_vocab_size != self.vocab_size else {}
+            {"markov_w2.weight": 0}
+            if self.local_draft_vocab_size != self.draft_vocab_size
+            else {}
         )
         dp_cp_group = None if metadata is None else metadata.get("dp_cp_group")
         return make_sharded_tensors_for_checkpoint(
