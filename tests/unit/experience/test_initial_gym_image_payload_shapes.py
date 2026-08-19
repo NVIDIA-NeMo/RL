@@ -143,3 +143,32 @@ def test_with_the_flag_the_prompt_is_padded_and_keeps_its_true_sizes():
     # The true per-image extents survive the pad: (height, width). Read off the
     # unpadded tiles, so the smaller image still reports 3x2 rather than 5x4.
     assert user_message["imgs_sizes"].as_tensor().tolist() == [[3, 2], [5, 4]]
+
+
+# --------------------------------------------------------------------------
+# reading the flag out of the config
+# --------------------------------------------------------------------------
+
+
+class _Config:
+    def __init__(self, env):
+        self.env = env
+
+
+def test_flag_is_read_from_the_nemo_gym_env_config():
+    from nemo_rl.algorithms.grpo import get_pad_dynamic_image_shapes
+
+    assert (
+        get_pad_dynamic_image_shapes(
+            _Config({"nemo_gym": {"pad_dynamic_image_shapes": True}})
+        )
+        is True
+    )
+
+
+def test_flag_defaults_off_when_unset_or_absent():
+    """A run without NeMo-Gym must not fabricate a value for it."""
+    from nemo_rl.algorithms.grpo import get_pad_dynamic_image_shapes
+
+    assert get_pad_dynamic_image_shapes(_Config({"nemo_gym": {}})) is False
+    assert get_pad_dynamic_image_shapes(_Config({})) is False
