@@ -71,6 +71,30 @@ def test_rejects_non_eagle_bins_and_shape_drift() -> None:
         state.accumulate(state.metric_payload(two_bins))
 
 
+def test_rejects_non_unit_eagle_weight() -> None:
+    state = DraftStepState()
+    weighted = DraftLossStats(
+        numerators=torch.ones(1),
+        counts=torch.ones(1),
+        weights=torch.tensor([0.5]),
+    )
+
+    with pytest.raises(ValueError, match="unit weight"):
+        state.accumulate(state.metric_payload(weighted))
+
+
+def test_inactive_state_contributes_no_collective_counts() -> None:
+    state = DraftStepState()
+    reference = torch.tensor([4.0, 16.0], dtype=torch.float64)
+
+    counts = state.counts_for_reduction(reference)
+
+    assert counts.shape == (0,)
+    assert counts.dtype == reference.dtype
+    with pytest.raises(ValueError, match="inactive draft step"):
+        state.set_global_counts(reference.new_ones(1))
+
+
 def test_corrects_only_draft_main_grads_relative_to_policy_scaling() -> None:
     state = DraftStepState()
     state.accumulate(state.metric_payload(_stats(12.0, 4.0)))
@@ -103,3 +127,19 @@ def test_zero_draft_count_has_zero_scale_and_finite_metrics() -> None:
 
     assert draft_param.main_grad.item() == 0.0
     assert state.normalize_metric(torch.tensor(0.0)).item() == 0.0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_zero_policy_count_zeroes_draft_gradient(dtype: torch.dtype) -> None:
+    state = DraftStepState()
+    state.accumulate(state.metric_payload(_stats(4.0, 2.0)))
+    state.set_global_counts(torch.tensor([2.0]))
+    draft_param = torch.nn.Parameter(torch.tensor(1.0, dtype=dtype))
+    draft_param.grad_norm_group = "draft"
+    draft_param.main_grad = torch.tensor(3.0, dtype=dtype)
+
+    state.correct_main_grads(
+        [draft_param], policy_normalization_count=torch.tensor(0.0)
+    )
+
+    assert draft_param.main_grad.item() == 0.0
