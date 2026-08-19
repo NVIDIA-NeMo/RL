@@ -114,6 +114,10 @@ def _run_distributed_contract_case(
             inputs["previous_token_ids"] = torch.full((1, 3), 2, dtype=torch.long)
         elif case == "valid_mask" and rank == 1:
             inputs["valid_mask"] = torch.tensor([[True, True, False]])
+        elif case == "slot_weights":
+            inputs["slot_weights"] = torch.tensor(
+                [1.0, 0.5 if rank == 0 else 0.25, 0.125]
+            )
         elif case == "rank_local_validation" and rank == 0:
             inputs["slot_bins"] = torch.tensor([[-1, 1, 2]])
 
@@ -620,6 +624,47 @@ def test_normalized_requires_externally_reduced_counts() -> None:
     torch.testing.assert_close(local_numerator.grad, torch.tensor([1.0 / 3.0]))
 
 
+def test_slot_weights_are_detached_and_scale_global_normalization() -> None:
+    """Per-slot schedules scale both numerators and globally reduced counts."""
+    local_numerators = torch.tensor([2.0, 90.0], requires_grad=True)
+    slot_weights = torch.tensor([1.0, 0.25], requires_grad=True)
+    stats = DSparkLossBins(
+        numerators=local_numerators,
+        counts=torch.tensor([2.0, 40.0]),
+        weights=slot_weights,
+    )
+    global_counts = torch.tensor([2.0, 100.0])
+
+    loss = stats.normalized(normalization_counts=global_counts)
+    expected_denominator = torch.tensor(2.0 + 0.25 * 100.0)
+    torch.testing.assert_close(loss, torch.tensor((2.0 + 0.25 * 90.0) / 27.0))
+    loss.backward()
+
+    assert not stats.weights.requires_grad
+    assert slot_weights.grad is None
+    torch.testing.assert_close(
+        local_numerators.grad,
+        torch.tensor([1.0, 0.25]) / expected_denominator,
+    )
+
+
+def test_objective_carries_typed_detached_slot_weights() -> None:
+    inputs = _inputs()
+    slot_weights = torch.tensor([1.0, 0.5, 0.125], requires_grad=True)
+
+    stats = dspark_tiled_objective(
+        **inputs,
+        loss_weights=(1.0, 1.0, 1.0),
+        slot_weights=slot_weights,
+    )
+
+    for component in (stats.ce, stats.tv, stats.confidence, stats.combined):
+        torch.testing.assert_close(component.weights, slot_weights.detach())
+        assert not component.weights.requires_grad
+    stats.combined.normalized(normalization_counts=stats.combined.counts).backward()
+    assert slot_weights.grad is None
+
+
 @pytest.mark.parametrize("bad_label", [-1, 7])
 def test_valid_hard_labels_must_be_inside_global_vocabulary(bad_label: int) -> None:
     """Valid labels below zero or at vocab_size cannot be clamped to a shard."""
@@ -713,6 +758,10 @@ def test_tp_token_metadata_must_agree_exactly(
 ) -> None:
     """Valid-but-different token metadata cannot define one global distribution."""
     _assert_distributed_contract_failure_is_synchronous(tmp_path, case)
+
+
+def test_tp_slot_weights_must_agree_exactly(tmp_path: Path) -> None:
+    _assert_distributed_contract_failure_is_synchronous(tmp_path, "slot_weights")
 
 
 def test_backward_never_casts_a_full_large_vocab_weight_to_float32() -> None:

@@ -571,20 +571,28 @@ def _run_tp2_split_vocab_mapping_and_bounds(rank: int, world_size: int) -> None:
 def _run_dp2_global_normalization_gradient(rank: int, world_size: int) -> None:
     dp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
-    local_count = torch.tensor([2.0 if rank == 0 else 1.0], device=device)
+    local_count = torch.tensor([2.0, 0.0] if rank == 0 else [0.0, 100.0], device=device)
     global_count = local_count.clone()
     torch.distributed.all_reduce(global_count, group=dp_group)
     differentiable_numerator = torch.tensor(
-        [float(rank + 1)], device=device, requires_grad=True
+        [2.0, 0.0] if rank == 0 else [0.0, 90.0],
+        device=device,
+        requires_grad=True,
     )
+    slot_weights = torch.tensor([1.0, 0.25], device=device, requires_grad=True)
     from nemo_rl.algorithms.loss.dspark import DSparkLossBins
 
-    bins = DSparkLossBins(differentiable_numerator, local_count)
-    bins.normalized(normalization_counts=global_count).backward()
+    bins = DSparkLossBins(differentiable_numerator, local_count, slot_weights)
+    local_loss = bins.normalized(normalization_counts=global_count)
+    global_loss = local_loss.detach().clone()
+    torch.distributed.all_reduce(global_loss, group=dp_group)
+    torch.testing.assert_close(global_loss, torch.tensor(24.5 / 27.0, device=device))
+    local_loss.backward()
     torch.testing.assert_close(
         differentiable_numerator.grad,
-        torch.tensor([1.0 / 3.0], device=device),
+        torch.tensor([1.0, 0.25], device=device) / 27.0,
     )
+    assert slot_weights.grad is None
 
 
 def _run_tp2_provider_checkpoint(
