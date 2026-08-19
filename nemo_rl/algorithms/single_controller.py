@@ -264,6 +264,10 @@ class SingleControllerActor:
         # dispatched tasks finish successfully. Rollout failures propagate
         # through run() instead of being reported as normal exhaustion.
         self._rollout_exhausted: asyncio.Event = asyncio.Event()
+        # Restored groups run beside the normal pumps. Dataloader exhaustion is
+        # not terminal until this source has also drained.
+        self._rollout_recovery_complete: asyncio.Event = asyncio.Event()
+        self._rollout_recovery_complete.set()
 
         # Count of in-flight generate_and_push calls
         self._inflight_rollouts: int = 0
@@ -278,6 +282,12 @@ class SingleControllerActor:
         # drops a group (sampler.evict or post-train buffer.remove).
         self._buffer_capacity: asyncio.Semaphore = asyncio.Semaphore(
             self._async_cfg.max_buffered_rollouts
+        )
+        # Recovery and fresh dispatch share one generation budget. Restored
+        # groups reserve buffer ownership first, then compete for worker slots
+        # without blocking genuinely spare capacity from serving fresh prompts.
+        self._rollout_slots: asyncio.Semaphore = asyncio.Semaphore(
+            self._async_cfg.max_inflight_prompts
         )
 
         self._trainer_version: int = restored_trainer_version
@@ -306,29 +316,42 @@ class SingleControllerActor:
         await self._sync_weights()
 
         restored_replay_groups = await self._maybe_restore_replay_buffer()
-        await self._maybe_restore_rollout_recovery(
+        recovery_groups = await self._prepare_rollout_recovery(
             restored_replay_groups=restored_replay_groups
         )
 
-        # Start the rollout and train pumps, plus the watchdog
+        # Start restored work and normal pumps together. Preparation above has
+        # already reconstructed sampler state and reserved restored capacity,
+        # so fresh dispatch can use only genuine headroom.
+        recovery_task = (
+            asyncio.create_task(self._recover_prepared_rollout_groups(recovery_groups))
+            if recovery_groups
+            else None
+        )
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
         watchdog_task = asyncio.create_task(self._watchdog_pump())
-        tasks = (rollout_task, train_task, watchdog_task)
+        tasks = {rollout_task, train_task, watchdog_task}
+        if recovery_task is not None:
+            tasks.add(recovery_task)
         try:
-            done, _ = await asyncio.wait(
-                set(tasks), return_when=asyncio.FIRST_COMPLETED
-            )
-            if watchdog_task in done:
-                # The watchdog loops forever, so finishing at all means it raised --
-                # a stall or an unhealthy environment. Surface that ahead of the
-                # pumps, whose own symptom would just be "waiting".
-                await watchdog_task
-            if rollout_task in done:
-                # Propagate rollout failures immediately. A normally exhausted
-                # rollout pump leaves the train pump to drain committed groups.
-                await rollout_task
-            await train_task
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    # Propagate recovery, rollout, training, and watchdog
+                    # failures as soon as their owning task reports them.
+                    await task
+                if train_task in done:
+                    # A max-step exit can happen before recovery drains. Do not
+                    # leave restored lineage half-mutated merely because enough
+                    # other groups completed the requested training steps.
+                    if recovery_task is not None and not recovery_task.done():
+                        rollout_task.cancel()
+                        await recovery_task
+                    break
         finally:
             for task in tasks:
                 task.cancel()
@@ -812,16 +835,17 @@ class SingleControllerActor:
             flush=True,
         )
 
-    async def _maybe_restore_rollout_recovery(
+    async def _prepare_rollout_recovery(
         self, *, restored_replay_groups: int
-    ) -> None:
-        """Complete restored unfinished groups before starting either SC pump."""
+    ) -> list[PromptGroupRecoverySummary]:
+        """Validate restored lineage and reclaim its durable buffer permits."""
+        self._rollout_recovery_complete.set()
         metadata = self._data_plane_checkpoint_metadata or {}
         if "rollout_recovery_payload_sha256" not in metadata:
             self._restore_sampler_dispatch_state(
                 [], restored_replay_groups=restored_replay_groups
             )
-            return
+            return []
         ledger = self._rollout_recovery_ledger
         if ledger is None:
             raise RuntimeError(
@@ -885,25 +909,119 @@ class SingleControllerActor:
                 f"capacity={self._async_cfg.max_buffered_rollouts}"
             )
 
-        for group in unfinished:
-            await self._buffer_capacity.acquire()
-            try:
-                request = await self._rollout_manager.recover_for_finalization(
-                    group.group_id,
-                    inflight_registry=self._inflight_by_group_id,
-                )
-                if request is None:
-                    self._buffer_capacity.release()
-                    continue
-                await self._finalize_with_actor(request)
-            except BaseException:
+        # Reclaim all saved permits before fresh dataloader work can run. The
+        # capacity check above makes these acquisitions immediate and prevents
+        # new work from stealing ownership represented by the durable ledger.
+        acquired = 0
+        try:
+            for _ in unfinished:
+                await self._buffer_capacity.acquire()
+                acquired += 1
+        except BaseException:
+            for _ in range(acquired):
                 self._buffer_capacity.release()
-                raise
+            raise
+
         if unfinished:
+            self._rollout_recovery_complete.clear()
+        return unfinished
+
+    @staticmethod
+    def _release_recovery_permit_if_task_not_started(
+        _: asyncio.Task[Any],
+        *,
+        task_started_event: asyncio.Event,
+        buffer_capacity: asyncio.Semaphore,
+    ) -> None:
+        """Return preclaimed capacity if cancellation beats coroutine startup."""
+        if not task_started_event.is_set():
+            buffer_capacity.release()
+
+    async def _recover_one_prepared_group(
+        self,
+        group: PromptGroupRecoverySummary,
+        *,
+        task_started_event: asyncio.Event,
+    ) -> bool:
+        """Recover one capacity-owned group through the shared worker budget."""
+        task_started_event.set()
+        buffer_permit_owned = True
+        rollout_slot_owned = False
+        counted_inflight = False
+        try:
+            await self._rollout_slots.acquire()
+            rollout_slot_owned = True
+            await self._rollout_permitted.wait()
+            self._inflight_rollouts += 1
+            counted_inflight = True
+
+            request = await self._rollout_manager.recover_for_finalization(
+                group.group_id,
+                inflight_registry=self._inflight_by_group_id,
+            )
+
+            # Generation capacity protects vLLM/Gym work, not the independent
+            # finalizer pool. Release it as soon as token capture is complete.
+            self._inflight_rollouts -= 1
+            counted_inflight = False
+            self._rollout_slots.release()
+            rollout_slot_owned = False
+
+            if request is None:
+                return False
+            await self._finalize_with_actor(request)
+            buffer_permit_owned = False
+            return True
+        finally:
+            if counted_inflight:
+                self._inflight_rollouts -= 1
+            if rollout_slot_owned:
+                self._rollout_slots.release()
+            if buffer_permit_owned:
+                self._buffer_capacity.release()
+
+    async def _recover_prepared_rollout_groups(
+        self, groups: list[PromptGroupRecoverySummary]
+    ) -> None:
+        """Recover restored groups concurrently beside fresh rollout dispatch."""
+        recovery_tasks: list[asyncio.Task[bool]] = []
+        try:
+            async with asyncio.TaskGroup() as task_group:
+                for group in groups:
+                    task_started_event = asyncio.Event()
+                    task = task_group.create_task(
+                        self._recover_one_prepared_group(
+                            group,
+                            task_started_event=task_started_event,
+                        )
+                    )
+                    task.add_done_callback(
+                        partial(
+                            self._release_recovery_permit_if_task_not_started,
+                            task_started_event=task_started_event,
+                            buffer_capacity=self._buffer_capacity,
+                        )
+                    )
+                    recovery_tasks.append(task)
+
+            completed = sum(task.result() for task in recovery_tasks)
             print(
-                f"📦 Rollout recovery completed: groups={len(unfinished)}",
+                "📦 Rollout recovery completed: "
+                f"groups={len(groups)}, finalized={completed}, "
+                f"dropped={len(groups) - completed}",
                 flush=True,
             )
+        finally:
+            self._rollout_recovery_complete.set()
+
+    async def _maybe_restore_rollout_recovery(
+        self, *, restored_replay_groups: int
+    ) -> None:
+        """Compatibility helper for focused recovery callers and tests."""
+        groups = await self._prepare_rollout_recovery(
+            restored_replay_groups=restored_replay_groups
+        )
+        await self._recover_prepared_rollout_groups(groups)
 
     def _restore_sampler_dispatch_state(
         self,
@@ -1100,13 +1218,12 @@ class SingleControllerActor:
 
         Per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
-          2. Acquire sem (cap concurrent in-flight rollouts)
+          2. Acquire _rollout_slots shared with startup recovery
           3. Wait for _rollout_permitted (paused during weight sync)
           4. Run the rollout, then either commit it directly or submit its
              metadata-only request to the finalizer actor pool.
           5. Decrement _inflight_rollouts
         """
-        sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
         self._rollout_exhausted.clear()
         print("rollout_pump: starting", flush=True)
 
@@ -1114,13 +1231,21 @@ class SingleControllerActor:
             prompt: DatumSpec,
             target_step: Optional[int],
             task_started_event: asyncio.Event,
+            dispatch_admitted_event: asyncio.Event,
         ) -> None:
             task_started_event.set()
-            self._inflight_rollouts += 1
             generation_permit_released = False
             inflight_count_released = False
+            counted_inflight = False
             ownership_transferred = False
+            rollout_slot_owned = False
             try:
+                await self._rollout_slots.acquire()
+                rollout_slot_owned = True
+                await self._rollout_permitted.wait()
+                dispatch_admitted_event.set()
+                self._inflight_rollouts += 1
+                counted_inflight = True
                 if self._finalizer_actors:
                     request = await self._rollout_manager.generate_for_finalization(
                         prompt,
@@ -1132,7 +1257,8 @@ class SingleControllerActor:
                     else:
                         self._inflight_rollouts -= 1
                         inflight_count_released = True
-                        sem.release()
+                        self._rollout_slots.release()
+                        rollout_slot_owned = False
                         generation_permit_released = True
                         await self._finalize_with_actor(request)
                         self._rollout_manager.stats.committed += 1
@@ -1151,10 +1277,13 @@ class SingleControllerActor:
                     self._buffer_capacity.release()
                 raise
             finally:
-                if not inflight_count_released:
+                # Never leave the producer waiting if this task fails or is
+                # cancelled before it passes the generation gates.
+                dispatch_admitted_event.set()
+                if counted_inflight and not inflight_count_released:
                     self._inflight_rollouts -= 1
-                if not generation_permit_released:
-                    sem.release()
+                if not generation_permit_released and rollout_slot_owned:
+                    self._rollout_slots.release()
 
             if outcome is RolloutOutcome.SKIPPED:
                 # Nothing was committed, so the train pump will never see this group
@@ -1170,14 +1299,15 @@ class SingleControllerActor:
                         break
                 print(f"  rollout done for prompt='{content[:20]}...'", flush=True)
 
-        def _release_permits_if_task_not_started(
+        def _release_buffer_if_task_not_started(
             _: asyncio.Task[Any],
             *,
             task_started_event: asyncio.Event,
+            dispatch_admitted_event: asyncio.Event,
         ) -> None:
             if not task_started_event.is_set():
                 self._buffer_capacity.release()
-                sem.release()
+                dispatch_admitted_event.set()
 
         max_epochs = self._master_config.grpo.max_num_epochs
         async with asyncio.TaskGroup() as rollout_tasks:
@@ -1206,26 +1336,31 @@ class SingleControllerActor:
 
                         # check if buffer is full
                         await self._buffer_capacity.acquire()
-                        # check if inflight rollouts is full
-                        await sem.acquire()
-                        # wait for rollout to be permitted
-                        await self._rollout_permitted.wait()
 
                         task_started_event = asyncio.Event()
+                        dispatch_admitted_event = asyncio.Event()
                         # dispatch rollout
                         task = rollout_tasks.create_task(
                             _dispatch_one_prompt(
-                                prompt, target_step, task_started_event
+                                prompt,
+                                target_step,
+                                task_started_event,
+                                dispatch_admitted_event,
                             )
                         )
                         self._dispatched_rollouts.add(task)
                         task.add_done_callback(self._dispatched_rollouts.discard)
                         task.add_done_callback(
                             partial(
-                                _release_permits_if_task_not_started,
+                                _release_buffer_if_task_not_started,
                                 task_started_event=task_started_event,
+                                dispatch_admitted_event=dispatch_admitted_event,
                             )
                         )
+                        # Keep dataloader production bounded by actual worker
+                        # admission instead of filling the buffer with tasks
+                        # queued behind recovery.
+                        await dispatch_admitted_event.wait()
 
                 self._current_epoch += 1
 
@@ -1328,7 +1463,10 @@ class SingleControllerActor:
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
-                            if self._rollout_exhausted.is_set():
+                            if (
+                                self._rollout_exhausted.is_set()
+                                and self._rollout_recovery_complete.is_set()
+                            ):
                                 buffered_groups = len(self._buffer)
                                 if groups_dispatched == 0 and buffered_groups == 0:
                                     print(
@@ -1484,7 +1622,9 @@ class SingleControllerActor:
                 self._timeout.mark_iteration()
 
                 is_last_step = self._train_steps >= grpo_cfg.max_num_steps or (
-                    self._rollout_exhausted.is_set() and len(self._buffer) == 0
+                    self._rollout_exhausted.is_set()
+                    and self._rollout_recovery_complete.is_set()
+                    and len(self._buffer) == 0
                 )
                 ft_save_period = self._master_config.checkpointing.get("ft_save_period")
                 # _train_steps was already incremented above, so it equals

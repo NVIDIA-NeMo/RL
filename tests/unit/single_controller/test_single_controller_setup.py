@@ -351,6 +351,10 @@ class TestSetup:
             ("global_batch_size", "must equal policy.train_global_batch_size"),
             ("buffer_capacity", "required capacity"),
             (
+                "streaming_buffer_capacity",
+                "max_buffered_rollouts.*must be >=.*min_groups_for_streaming_train",
+            ),
+            (
                 "deferred_routes_without_capture",
                 "defer_routed_experts_to_policy requires",
             ),
@@ -369,6 +373,12 @@ class TestSetup:
             mc.policy["train_global_batch_size"] = 7
         elif invalid_case == "buffer_capacity":
             mc.async_rl.max_buffered_rollouts = 7
+        elif invalid_case == "streaming_buffer_capacity":
+            # WindowedSampler has no stronger sampler-specific capacity floor. A
+            # buffer smaller than the streaming threshold would let the producer
+            # consume every permit while the trainer waits for an unreachable count.
+            mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
+            mc.async_rl.max_buffered_rollouts = 3
         elif invalid_case == "deferred_routes_without_capture":
             mc.token_capture.defer_routed_experts_to_policy = True
         else:  # pragma: no cover

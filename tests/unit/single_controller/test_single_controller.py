@@ -374,6 +374,8 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._rollout_exhausted.set()
+    ctrl._rollout_recovery_complete = asyncio.Event()
+    ctrl._rollout_recovery_complete.set()
     ctrl._trainer = _NoOpTrainer()
     ctrl._gen = SimpleNamespace(requires_kv_scale_sync=False)
     ctrl._loss_fn = None
@@ -397,6 +399,21 @@ def test_train_pump_stops_after_rollout_exhaustion_and_buffer_drain() -> None:
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert ctrl._train_steps == 0
+
+
+def test_train_pump_waits_for_recovery_after_dataloader_exhaustion() -> None:
+    async def _main() -> None:
+        ctrl = _train_pump_controller(sampler=_EmptySampler())
+        ctrl._rollout_recovery_complete.clear()
+
+        train_task = asyncio.create_task(ctrl._train_pump())
+        await asyncio.sleep(0.02)
+        assert not train_task.done()
+
+        ctrl._rollout_recovery_complete.set()
+        await asyncio.wait_for(train_task, timeout=1.0)
+
+    asyncio.run(_main())
 
 
 def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:
