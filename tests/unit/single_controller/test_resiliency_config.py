@@ -22,10 +22,12 @@ hour three of a run.
 
 import warnings
 from types import SimpleNamespace
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
 
+from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -37,6 +39,17 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
+
+
+def _all_sampler_names() -> list[str]:
+    """Every name the sampler union accepts, read off the union itself.
+
+    ``SamplerConfig`` is ``Annotated[Union[...], Field(discriminator=...)]``, so the
+    variants are one level in. Deriving the list rather than restating it is the point:
+    a sampler added later shows up here on its own.
+    """
+    variants = get_args(get_args(SamplerConfig)[0])
+    return [variant.model_fields["name"].default for variant in variants]
 
 
 def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterConfig:
@@ -52,7 +65,13 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
             skip_reference_policy_logprobs_calculation=False,
         ),
         policy={"train_global_batch_size": num_prompts_per_step * 4},
-        loss_fn=SimpleNamespace(reference_policy_kl_penalty=0),
+        # The last two are read only on the ready_first branch, which rejects a run
+        # without them before it reaches anything under test here.
+        loss_fn=SimpleNamespace(
+            reference_policy_kl_penalty=0,
+            use_importance_sampling_correction=True,
+            force_on_policy_ratio=False,
+        ),
         env={"should_use_nemo_gym": True},
         checkpointing={"enabled": False, "metric_name": None},
     )
@@ -607,3 +626,83 @@ class TestCombinationsThatCannotDoWhatTheyWereSetFor:
 
     def test_an_untouched_config_warns_about_nothing(self):
         assert self._messages(_master_config()) == []
+
+
+class TestADropBudgetNeedsASamplerThatStamps:
+    """The one combination in this area that is rejected rather than warned about.
+
+    An unstamped drop is not a pair of knobs cancelling out: the prompt is given up on
+    and no step is credited for it, so that step waits on a group nobody is generating.
+    Under ``weight_fifo`` the gate that stops the rollout pump running ahead also stops
+    it reaching exhaustion, so the "rollout exhausted" error never fires and the run
+    stalls silently -- which is why config load is the last place that can object.
+    """
+
+    @pytest.mark.parametrize("sampler_name", ["windowed", "weight_fifo", "ready_first"])
+    @pytest.mark.parametrize(
+        "budget",
+        [{"max_skipped_prompts": 1}, {"max_consecutive_dropped_prompts": 1}],
+    )
+    def test_either_budget_under_any_unstamped_sampler_is_rejected(
+        self, sampler_name, budget
+    ):
+        cfg = _master_config(sampler={"name": sampler_name}, rollout_failure=budget)
+        with pytest.raises(ValueError, match="stamps no target step"):
+            validate_single_controller_config(cfg)
+
+    def test_every_built_in_but_in_order_and_custom_is_covered(self):
+        """Read off the union, so a sampler added later is caught by default.
+
+        ready_first (#3582) landed between this PR's base and its rebase, inheriting the
+        None stamp like the rest. An allow-list would have let it straight through, and a
+        test that hardcoded the same list would have stayed green while it did.
+        """
+        exempt = {"in_order", "custom"}
+        covered = [n for n in _all_sampler_names() if n not in exempt]
+        assert covered, "the union should carry at least one unstamped sampler"
+        for sampler_name in covered:
+            cfg = _master_config(
+                sampler={"name": sampler_name},
+                rollout_failure={"max_consecutive_dropped_prompts": 1},
+            )
+            with pytest.raises(ValueError, match="stamps no target step"):
+                validate_single_controller_config(cfg)
+
+    def test_shrink_mode_is_rejected_too_not_only_replace(self):
+        """The gap this closes: shrink is the default, so it was the silent one."""
+        cfg = _master_config(
+            sampler={"name": "weight_fifo"},
+            rollout_failure={
+                "max_consecutive_dropped_prompts": 2,
+                "on_dropped_prompt": "shrink",
+            },
+        )
+        with pytest.raises(ValueError, match="stamps no target step"):
+            validate_single_controller_config(cfg)
+
+    def test_a_stamping_sampler_carries_the_same_budget(self):
+        cfg = _master_config(
+            sampler={"name": "in_order"},
+            rollout_failure={
+                "max_consecutive_dropped_prompts": 2,
+                "min_step_batch_fraction": 0.5,
+            },
+        )
+        validate_single_controller_config(cfg)
+
+    def test_a_zero_budget_is_left_to_the_warnings(self):
+        """No drop is tolerated at all, so the shortfall path is unreachable anyway."""
+        cfg = _master_config(
+            sampler={"name": "windowed"},
+            rollout_failure={"on_dropped_prompt": "replace"},
+        )
+        with pytest.warns(UserWarning, match="on_dropped_prompt"):
+            validate_single_controller_config(cfg)
+
+    def test_a_custom_sampler_is_not_second_guessed(self):
+        """Whether it stamps is knowable only to its author, so neither set claims it."""
+        cfg = _master_config(
+            sampler={"name": "custom", "target": "my_pkg.samplers:MySampler"},
+            rollout_failure={"max_consecutive_dropped_prompts": 2},
+        )
+        validate_single_controller_config(cfg)

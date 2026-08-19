@@ -565,21 +565,26 @@ def validate_sampler_buffer_capacity(
         )
 
 
-def _warn_on_inert_failure_settings(
+def _validate_failure_settings(
     async_config: AsyncRLConfig,
     num_prompts_per_step: int,
 ) -> None:
-    """Warn about rollout_failure settings that cannot do what they were set for.
+    """Check rollout_failure settings that cannot do what they were set for.
 
     ``RolloutFailureConfig._check_consistent`` rejects the two combinations that make
     ``on_dropped_prompt="replace"`` unable to ever produce a replacement. These are the
     combinations it cannot see, because each depends on a field outside that block.
 
-    Warnings rather than errors, deliberately: every one of these is a coherent thing
-    to have typed -- a strict "never train a short batch" run, one base YAML whose
-    sampler is overridden per experiment, a deliberately deep spare pool -- so
-    rejecting them would forbid configurations somebody wants. What is not acceptable
-    is finding out hours into a run, or not at all.
+    Warnings rather than errors for most of them, deliberately: a strict "never train a
+    short batch" run, one base YAML whose sampler is overridden per experiment, a
+    deliberately deep spare pool are all coherent things to have typed, so rejecting
+    them would forbid configurations somebody wants. What is not acceptable is finding
+    out hours into a run, or not at all.
+
+    The exception, and the only hard error here, is a drop budget under a sampler that
+    stamps no target step. That one is not a knob cancelling itself out; it converts a
+    recoverable prompt failure into a stalled run, so there is no configuration it
+    could be the intent of.
     """
     failure_config = async_config.rollout_failure
     drop_budget = (
@@ -591,9 +596,39 @@ def _warn_on_inert_failure_settings(
     # stamped step can be credited short, so for the others the floor is unreachable
     # and the spare pool is never filled. A "custom" sampler may or may not stamp,
     # which is why it is in neither set -- a warning nobody can act on is noise.
+    #
+    # Named by exclusion rather than by list so that a sampler added later is guarded
+    # by default instead of silently exempt: every built-in but InOrderSampler leaves
+    # _GatedSampler._stamp returning None, and ready_first (#3582) landed doing exactly
+    # that after this check was first written.
     sampler_name = async_config.sampler.name
     sampler_stamps = sampler_name == "in_order"
-    sampler_never_stamps = sampler_name in ("windowed", "weight_fifo")
+    sampler_never_stamps = sampler_name not in ("in_order", "custom")
+
+    # A budget that permits drops is worse than inert under an unstamped sampler: the
+    # prompt is still given up on, but _credit_shortfall has no step to charge it to,
+    # so the step's target never falls and the train pump waits on a group nobody is
+    # generating. How that ends depends on the sampler. Under weight_fifo the wait never
+    # does: the same gate that stops the rollout pump running ahead also stops it
+    # reaching exhaustion, so the "rollout exhausted" error never fires and the run
+    # holds its GPUs until the wall clock kills it. Under windowed and ready_first the
+    # shortfall instead migrates from batch to batch until the last one, which has none
+    # left to borrow from, and the run dies there hours in. A zero budget is exempt: no
+    # drop is tolerated at all then, so nothing reaches the shortfall path and the
+    # warnings below are the right register.
+    if sampler_never_stamps and drop_budget:
+        raise ValueError(
+            f"async_rl.sampler.name={sampler_name!r} stamps no target step, so the drop "
+            f"budget (max_skipped_prompts={failure_config.max_skipped_prompts}, "
+            f"max_consecutive_dropped_prompts="
+            f"{failure_config.max_consecutive_dropped_prompts}) cannot be honoured: a "
+            "prompt that is given up on is never subtracted from the step waiting for "
+            "it, so that step waits on a group no one is generating -- ending the run "
+            "at its final step, or stalling it outright with no error at all. Set "
+            "async_rl.sampler.name='in_order' to get the tolerance these budgets "
+            "promise, or set both budgets to 0 to end the run on the first dropped "
+            "prompt instead."
+        )
 
     if (
         sampler_stamps
@@ -723,7 +758,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "loss_fn.reference_policy_kl_penalty=0."
         )
 
-    _warn_on_inert_failure_settings(async_config, num_prompts_per_step)
+    _validate_failure_settings(async_config, num_prompts_per_step)
 
     # Nesting says which knob applies to which path, but nothing stops an operator
     # filling in the block for the path this run is not taking -- and a populated
