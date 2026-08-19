@@ -35,6 +35,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import threading
@@ -55,7 +56,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
-    InOrderSamplerConfig,
+    WeightFifoSamplerConfig,
     WindowedSamplerConfig,
 )
 from nemo_rl.algorithms.grpo import (
@@ -75,6 +76,12 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
+from nemo_rl.experience.rollout_recovery import (
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+    ROLLOUT_RECOVERY_STATE_FILENAME,
+    PromptRef,
+    RolloutRecoveryLedger,
+)
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
@@ -329,13 +336,31 @@ class _FakeWeightSynchronizer:
 
 
 class _FakeRolloutManager:
-    def __init__(self) -> None:
+    def __init__(self, recovery_ledger: Optional[RolloutRecoveryLedger] = None) -> None:
         self.weight_versions: list[int] = []
         self._tq_buffer = None
-        self.recovery_ledger = None
+        self.recovery_ledger = recovery_ledger
+        self.checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
+        self.recovery_calls: list[str] = []
+        self.discard_calls: list[str] = []
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        self.checkpoint_barrier = barrier
+
+    async def recover_for_finalization(self, group_id: str, **_: Any) -> None:
+        self.recovery_calls.append(group_id)
+        assert self.recovery_ledger is not None
+        self.recovery_ledger.discard_group(group_id)
+
+    async def discard_recovery_group(self, group_id: str) -> None:
+        self.discard_calls.append(group_id)
+        assert self.recovery_ledger is not None
+        self.recovery_ledger.discard_group(group_id)
 
 
 class _FakeTQBuffer:
@@ -357,13 +382,19 @@ class _FakeTQBuffer:
             "groups": [],
         }
         self.load_return = load_return
+        self._group_ids: tuple[str, ...] = ()
+        self._target_step_list: list[Optional[int]] = []
         self.metadata_state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
         self.checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
 
     @property
     def group_ids(self) -> tuple[str, ...]:
-        return ()
+        return self._group_ids
+
+    @property
+    def target_step_list(self) -> tuple[Optional[int], ...]:
+        return tuple(self._target_step_list)
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
@@ -392,6 +423,10 @@ class _FakeTQBuffer:
                 "expected_manifest_digest": expected_manifest_digest,
             }
         )
+        groups = state.get("groups", [])
+        self._group_ids = tuple(group["group_id"] for group in groups)
+        self._target_step_list = [group.get("target_step") for group in groups]
+        self._num_groups = self.load_return
         return self.load_return
 
     def __len__(self) -> int:
@@ -444,7 +479,7 @@ def _actor_master_config(
     sampler_cfg = (
         WindowedSamplerConfig(max_staleness_versions=1)
         if buffer_checkpoint
-        else InOrderSamplerConfig(max_lookahead_versions=1)
+        else WeightFifoSamplerConfig(max_staleness_versions=1)
     )
     return MasterConfig.model_construct(
         policy={
@@ -505,6 +540,7 @@ def _make_actor_args(
     dp_client: Optional[_FakeDPClient] = None,
     last_checkpoint_path: Optional[str] = None,
     data_plane_checkpoint_metadata: Optional[dict[str, Any]] = None,
+    rollout_manager: Optional[_FakeRolloutManager] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=object(),
@@ -517,7 +553,9 @@ def _make_actor_args(
         weight_synchronizer=_FakeWeightSynchronizer(),  # type: ignore[arg-type]
         advantage_estimator=None,
         loss_fn=object(),  # type: ignore[arg-type]
-        rollout_manager=_FakeRolloutManager(),  # type: ignore[arg-type]
+        rollout_manager=(
+            rollout_manager if rollout_manager is not None else _FakeRolloutManager()
+        ),  # type: ignore[arg-type]
         tq_buffer=tq_buffer if tq_buffer is not None else _FakeTQBuffer(),  # type: ignore[arg-type]
         partition_id=_PARTITION_ID,
         finalizer_actors=[],
@@ -856,6 +894,66 @@ class TestSaveTrigger:
 
 
 class TestDataPlaneCheckpoint:
+    def test_saves_digest_bound_rollout_lineage_without_prompt_payload(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1,
+            save_period=1,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+        )
+        mc.token_capture.enabled = True
+        ledger = RolloutRecoveryLedger()
+        ledger.reserve_group(
+            group_id="partial-group",
+            prompt_id="17",
+            prompt_ref=PromptRef(sample_id="17", task_name="nemo_gym"),
+            prompt_payload={
+                "idx": 17,
+                "task_name": "nemo_gym",
+                "message_log": [{"role": "user", "content": "solve"}],
+            },
+            expected_generations=2,
+            target_step=None,
+            start_weight_version=0,
+        )
+        manager = _FakeRolloutManager(ledger)
+        dp_client = _FakeDPClient()
+
+        async def _main() -> None:
+            actor = _ACTOR_CLS(
+                mc,
+                _make_actor_args(
+                    dp_client=dp_client,
+                    rollout_manager=manager,
+                ),
+                SetupTimingMetrics(),
+            )
+            actor._train_steps = 1
+            actor._trainer_version = 1
+            await actor._save_checkpoint({})
+            actor._checkpointer.shutdown()
+
+        asyncio.run(_main())
+
+        step_dir = tmp_path / "checkpoints" / "step_1"
+        payload = (step_dir / ROLLOUT_RECOVERY_STATE_FILENAME).read_bytes()
+        metadata = dp_client.save_calls[0]["metadata"]
+        assert metadata["rollout_recovery_schema_version"] == (
+            ROLLOUT_RECOVERY_SCHEMA_VERSION
+        )
+        assert metadata["rollout_recovery_group_count"] == 1
+        assert (
+            metadata["rollout_recovery_payload_sha256"]
+            == hashlib.sha256(payload).hexdigest()
+        )
+        state = torch.load(
+            step_dir / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=False
+        )
+        assert state["groups"][0]["group_id"] == "partial-group"
+        assert "prompt_payload" not in state["groups"][0]
+        assert manager.checkpoint_barrier is not None
+
     def test_saves_authoritative_tq_state_and_metadata_only_replay_index(
         self, tmp_path
     ):
@@ -1457,6 +1555,50 @@ class TestDataloaderState:
 
 
 class TestReplayBufferPersistence:
+    def test_run_recovers_unfinished_groups_before_starting_pumps(self, tmp_path):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        torch.save({"groups": []}, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=0,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+        )
+        mc.token_capture.enabled = True
+        ledger = RolloutRecoveryLedger()
+        ledger.reserve_group(
+            group_id="partial-group",
+            prompt_id="17",
+            prompt_ref=PromptRef(sample_id="17", task_name="nemo_gym"),
+            prompt_payload={"idx": 17, "task_name": "nemo_gym"},
+            expected_generations=2,
+            target_step=None,
+            start_weight_version=0,
+        )
+        manager = _FakeRolloutManager(ledger)
+        metadata = {
+            "replay_manifest_digest": "digest-1",
+            "replay_group_count": 0,
+            "rollout_recovery_payload_sha256": "recovery-digest",
+            "rollout_recovery_group_count": 1,
+        }
+
+        actor, result = _run_actor_run(
+            mc,
+            _make_actor_args(
+                rollout_manager=manager,
+                tq_buffer=_FakeTQBuffer(load_return=0),
+                last_checkpoint_path=str(ckpt_dir),
+                data_plane_checkpoint_metadata=metadata,
+            ),
+        )
+
+        assert manager.recovery_calls == ["partial-group"]
+        assert len(ledger) == 0
+        assert actor._buffer_capacity._value == 4
+        assert result["train_steps"] == 0
+
     def test_checkpoint_capable_sampler_without_native_tq_is_rejected(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
@@ -1521,7 +1663,7 @@ class TestReplayBufferPersistence:
                 ),
                 "start_weight": 0,
                 "end_weight": 0,
-                "target_step": i,
+                "target_step": None,
                 "group_id": f"g{i}",
             }
             for i in range(2)
@@ -1646,7 +1788,7 @@ class TestReplayBufferPersistence:
                     ),
                     "start_weight": 0,
                     "end_weight": 0,
-                    "target_step": 0,
+                    "target_step": None,
                     "group_id": "g0",
                 }
             ]
