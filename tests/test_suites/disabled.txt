@@ -23,3 +23,9 @@ tests/test_suites/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep
 tests/test_suites/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp-specdec.v1.sh
 tests/test_suites/vlm/mopd-nemotron-super-omni-120ba12b-10n8g-megatron-tp8ep16cp2-async-gym.v1.sh
 tests/test_suites/vlm/mopd-nemotron-super-omni-120ba12b-4n8g-smoke.v1.sh
+
+# ready_first SC sampler recipe (10-step smoke, same shape as the streaming2
+# base). Verified e2e manually; kept out of nightly.txt only because the
+# nightly budget is at 3922 of its 3928 GPU-hour cap and this run's ~27
+# GPU-hours would exceed it. Move to nightly.txt when the budget has room.
+tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-ready-first-single-controller.sh

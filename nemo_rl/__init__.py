@@ -21,6 +21,24 @@ logging.basicConfig(
     format="%(levelname)s:%(name)s:%(filename)s:%(lineno)d: %(message)s",
 )
 
+# The call above installs the root handler but sets no level, so the root logger
+# stays at WARNING -- and because basicConfig returns early once handlers exist,
+# no later call can raise it (virtual_cluster.py's level=INFO is already a
+# no-op). Every nemo_rl logger inherited that, so until this line no log.info or
+# log.debug record anywhere in the package could reach a run's output, and the
+# instrumentation that emits them was unreachable rather than merely quiet.
+#
+# Set the level on the `nemo_rl` logger rather than on root: records still reach
+# the root handler, but raising the level does not also turn on debug output for
+# torch, ray, httpx and every other third-party logger.
+#
+# INFO by default. That is a change -- it surfaces the package's existing info
+# records, which are ~50 call sites concentrated in venv, cluster and vLLM-patch
+# setup, so they land at startup rather than per step. DEBUG additionally
+# enables the per-chunk and CUDA-allocator records on the training path, which
+# are per chunk per rank and are not meant for a normal run.
+logging.getLogger("nemo_rl").setLevel(os.environ.get("NRL_LOG_LEVEL", "INFO").upper())
+
 """
 This is a work around to ensure whenever NeMo RL is imported, that we
 add Megatron-LM to the python path. The editable install of megatron-core

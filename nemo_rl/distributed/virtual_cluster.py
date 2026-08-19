@@ -89,6 +89,9 @@ class PY_EXECUTABLES:
 #   3000-4999    NeMo RL generation HTTP servers + SGLang engine NCCL/dist_init
 #                                                 (policy.generation.port_range_low/high)
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
+#   6000-6099    SingleController gen. router    (async_rl.generation_router.port_range_low/high;
+#                                                 one fixed port per run — NeMo-Gym holds the
+#                                                 URL for the whole run and never re-resolves)
 #   7000-8999    vLLM engine rendezvous          (VLLM_PORT env var, 100-port spacing)
 #   8600-8799    SGLang router                   (DEFAULT_SGLANG_ROUTER_PORT_RANGE_*, hard-coded;
 #                                                 carved out of the vLLM band — only one rollout
