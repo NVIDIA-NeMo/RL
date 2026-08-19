@@ -10,6 +10,11 @@ the legacy packed-broadcast refit with NCCL Reshard for the same non-colocated
 Sync MXFP8 rollout used by the B200 result. Report means use completed steps
 3-20.
 
+The PR 3294 full ablation reproduces the prior GCP-NRT on/off controls on
+commit `313f41a9654cd67e44d783128543fe1638c778da`, which pins vLLM 0.25.1.
+It compares prequantization, batched MXFP8 shuffle, and cached loaders disabled
+against all three enabled on 4x4 GB200 GPUs.
+
 Render a command locally:
 
 ```bash

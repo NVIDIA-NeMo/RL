@@ -159,7 +159,7 @@ for path in "${REPO}/${CONFIG}" "${REPO}/ray.sub" "${CONTAINER}" "${HF_HOME}" \
   test -e "${path}"
 done
 
-export SETUP_COMMAND=$(cat <<EOF
+SETUP_COMMAND=$(cat <<EOF
 set -euo pipefail
 rm -f /opt/nemo_rl_venv/bin/ray
 ln -s '${RAY_RUNTIME_VENV}/bin/ray' /opt/nemo_rl_venv/bin/ray
@@ -168,6 +168,7 @@ ln -s '${RAY_RUNTIME_VENV}/bin/ray' /opt/nemo_rl_venv/bin/ray
 ray --version
 EOF
 )
+export SETUP_COMMAND
 
 mkdir -p "${EXPERIMENT_ROOT}" "${CACHE_ROOT}"
 WANDB_KEY_FILE=${CACHE_ROOT}/.wandb_key

@@ -6,12 +6,24 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).with_name("submit_oci_hsg.sh")
+ABLATION_SCRIPT = Path(__file__).with_name("submit_pr3294_ablation_oci_hsg.sh")
 
 
 def render(**overrides: str) -> subprocess.CompletedProcess[str]:
     env = os.environ | {"ACTION": "render", **overrides}
     return subprocess.run(
         ["bash", str(SCRIPT)],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+
+def render_ablation(**overrides: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ | {"ACTION": "render", **overrides}
+    return subprocess.run(
+        ["bash", str(ABLATION_SCRIPT)],
         check=False,
         capture_output=True,
         env=env,
@@ -69,3 +81,21 @@ def test_invalid_async_legacy_combination_is_rejected() -> None:
 
     assert result.returncode != 0
     assert "not supported" in result.stderr
+
+
+def test_pr3294_baseline_disables_all_three_refit_optimizations() -> None:
+    result = render_ablation(ARM="baseline")
+
+    assert result.returncode == 0, result.stderr
+    assert "policy.generation.vllm_cfg.refit_prequantize=false" in result.stdout
+    assert "NRL_MXFP8_BATCHED_SHUFFLE=0" in result.stdout
+    assert "NRL_REFIT_CACHED_LOADERS=0" in result.stdout
+
+
+def test_pr3294_optimized_enables_all_three_refit_optimizations() -> None:
+    result = render_ablation(ARM="optimized")
+
+    assert result.returncode == 0, result.stderr
+    assert "policy.generation.vllm_cfg.refit_prequantize=true" in result.stdout
+    assert "NRL_MXFP8_BATCHED_SHUFFLE=1" in result.stdout
+    assert "NRL_REFIT_CACHED_LOADERS=1" in result.stdout
