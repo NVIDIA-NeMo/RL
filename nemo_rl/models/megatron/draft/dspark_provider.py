@@ -77,7 +77,7 @@ class _DSparkProviderAdapter(nn.Module):
         if target_output_weight.ndim != 2:
             raise ValueError("target_output_weight must be a matrix")
         if target_output_weight.shape != (
-            self.markov_head.local_vocab_size,
+            self.markov_head.local_draft_vocab_size,
             draft_hidden.shape[-1],
         ):
             raise ValueError(
@@ -98,7 +98,7 @@ class _DSparkProviderAdapter(nn.Module):
                     valid_mask,
                     previous_token_ids,
                     torch.zeros_like(previous_token_ids),
-                ).clamp(0, self.markov_head.vocab_size - 1)
+                ).clamp(0, self.markov_head.target_vocab_size - 1)
                 markov_embeddings = self.markov_head.markov_w1(safe_previous_token_ids)
             confidence_logits = self.confidence_head(
                 draft_hidden,
@@ -119,7 +119,7 @@ class _DSparkProviderAdapter(nn.Module):
             slot_bins=slot_bins,
             loss_weights=loss_weights,
             token_chunk_size=token_chunk_size,
-            vocab_start_index=self.markov_head.vocab_start_index,
+            draft_vocab_start_index=self.markov_head.draft_vocab_start_index,
             tp_group=tp_group,
         )
 
@@ -166,13 +166,14 @@ class _DSparkProviderAdapter(nn.Module):
 def build_dspark_provider(
     *,
     body: nn.Module,
-    vocab_size: int,
+    target_vocab_size: int,
+    draft_vocab_size: int,
     hidden_size: int,
     markov_rank: int,
     confidence_enabled: bool,
     confidence_with_markov: bool,
-    vocab_start_index: int = 0,
-    vocab_end_index: int | None = None,
+    draft_vocab_start_index: int = 0,
+    draft_vocab_end_index: int | None = None,
     tensor_parallel_group: torch.distributed.ProcessGroup | None = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
@@ -183,10 +184,11 @@ def build_dspark_provider(
     if not callable(getattr(body, "sharded_state_dict", None)):
         raise TypeError("DSpark body must implement sharded_state_dict")
     markov_head = DSparkMarkovHead(
-        vocab_size=vocab_size,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
         markov_rank=markov_rank,
-        vocab_start_index=vocab_start_index,
-        vocab_end_index=vocab_end_index,
+        draft_vocab_start_index=draft_vocab_start_index,
+        draft_vocab_end_index=draft_vocab_end_index,
         tensor_parallel_group=tensor_parallel_group,
         device=device,
         dtype=dtype,

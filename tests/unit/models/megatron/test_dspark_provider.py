@@ -130,7 +130,8 @@ def test_factory_returns_private_body_and_head_only_adapter() -> None:
     body = _CheckpointLinear(5, 5, bias=False).double()
     provider = build_dspark_provider(
         body=body,
-        vocab_size=9,
+        target_vocab_size=9,
+        draft_vocab_size=9,
         hidden_size=5,
         markov_rank=3,
         confidence_enabled=True,
@@ -158,7 +159,8 @@ def test_provider_uses_live_head_without_owning_or_training_it() -> None:
     """The live target head projects draft hidden state but remains stop-gradient."""
     provider = build_dspark_provider(
         body=_CheckpointIdentity(),
-        vocab_size=9,
+        target_vocab_size=9,
+        draft_vocab_size=9,
         hidden_size=5,
         markov_rank=3,
         confidence_enabled=True,
@@ -189,7 +191,8 @@ def test_duplicate_markov_tokens_accumulate_into_one_replicated_w1_row() -> None
     """Repeated previous tokens must accumulate both Markov and confidence gradients."""
     provider = build_dspark_provider(
         body=_CheckpointIdentity(),
-        vocab_size=9,
+        target_vocab_size=9,
+        draft_vocab_size=9,
         hidden_size=5,
         markov_rank=3,
         confidence_enabled=True,
@@ -210,7 +213,8 @@ def test_confidence_disabled_provider_has_no_confidence_parameters() -> None:
     """A confidence-disabled capability returns explicit zero raw confidence bins."""
     provider = build_dspark_provider(
         body=_CheckpointIdentity(),
-        vocab_size=9,
+        target_vocab_size=9,
+        draft_vocab_size=9,
         hidden_size=5,
         markov_rank=3,
         confidence_enabled=False,
@@ -232,7 +236,8 @@ def test_provider_rejects_mismatched_tp_head_and_objective_group() -> None:
     """The provider cannot silently use different TP groups for heads and loss."""
     provider = build_dspark_provider(
         body=_CheckpointIdentity(),
-        vocab_size=9,
+        target_vocab_size=9,
+        draft_vocab_size=9,
         hidden_size=5,
         markov_rank=3,
         confidence_enabled=False,
@@ -252,7 +257,8 @@ def test_factory_rejects_body_without_sharded_state_contract() -> None:
     with pytest.raises(TypeError, match="sharded_state_dict"):
         build_dspark_provider(
             body=nn.Identity(),
-            vocab_size=9,
+            target_vocab_size=9,
+            draft_vocab_size=9,
             hidden_size=5,
             markov_rank=3,
             confidence_enabled=False,

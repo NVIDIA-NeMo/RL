@@ -175,13 +175,14 @@ def _run_tp2_provider_objective(rank: int, world_size: int) -> None:
 
     provider = build_dspark_provider(
         body=_CheckpointBody(tp_group=tp_group, device=device),
-        vocab_size=vocab_size,
+        target_vocab_size=vocab_size,
+        draft_vocab_size=vocab_size,
         hidden_size=hidden_size,
         markov_rank=markov_rank,
         confidence_enabled=True,
         confidence_with_markov=True,
-        vocab_start_index=vocab_start,
-        vocab_end_index=vocab_end,
+        draft_vocab_start_index=vocab_start,
+        draft_vocab_end_index=vocab_end,
         tensor_parallel_group=tp_group,
         device=device,
         dtype=torch.bfloat16,
@@ -280,7 +281,7 @@ def _run_dp2_raw_additive_stats(rank: int, world_size: int) -> None:
         slot_bins=torch.tensor([[0, 1, 2]], device=device),
         loss_weights=(1.25, 0.5, 2.0),
         token_chunk_size=2,
-        vocab_start_index=0,
+        draft_vocab_start_index=0,
         tp_group=None,
     )
     reduced = torch.stack((stats.combined.numerators, stats.combined.counts))
@@ -365,13 +366,14 @@ def _run_tp2_tv_only_gradient(rank: int, world_size: int) -> None:
 
     provider = build_dspark_provider(
         body=_CheckpointBody(tp_group=tp_group, device=device),
-        vocab_size=vocab_size,
+        target_vocab_size=vocab_size,
+        draft_vocab_size=vocab_size,
         hidden_size=hidden_size,
         markov_rank=markov_rank,
         confidence_enabled=False,
         confidence_with_markov=False,
-        vocab_start_index=vocab_start,
-        vocab_end_index=vocab_end,
+        draft_vocab_start_index=vocab_start,
+        draft_vocab_end_index=vocab_end,
         tensor_parallel_group=tp_group,
         device=device,
         dtype=torch.float64,
@@ -427,13 +429,14 @@ def _run_tp2_hard_label_boundaries(rank: int, world_size: int) -> None:
     vocab_start = rank * local_vocab_size
     provider = build_dspark_provider(
         body=_CheckpointBody(tp_group=tp_group, device=device),
-        vocab_size=vocab_size,
+        target_vocab_size=vocab_size,
+        draft_vocab_size=vocab_size,
         hidden_size=2,
         markov_rank=1,
         confidence_enabled=False,
         confidence_with_markov=False,
-        vocab_start_index=vocab_start,
-        vocab_end_index=vocab_start + local_vocab_size,
+        draft_vocab_start_index=vocab_start,
+        draft_vocab_end_index=vocab_start + local_vocab_size,
         tensor_parallel_group=tp_group,
         device=device,
         dtype=torch.float64,
@@ -492,7 +495,7 @@ def _run_tp2_global_acceptance_overlap(rank: int, world_size: int) -> None:
         slot_bins=torch.zeros(1, 1, dtype=torch.long, device=device),
         loss_weights=(0.0, 0.0, 1.0),
         token_chunk_size=1,
-        vocab_start_index=vocab_start,
+        draft_vocab_start_index=vocab_start,
         tp_group=tp_group,
     )
     global_acceptance = torch.minimum(target_probabilities, draft_probabilities).sum()
@@ -618,13 +621,14 @@ def _run_tp2_provider_checkpoint(
     def make_provider() -> Any:
         return build_dspark_provider(
             body=_CheckpointBody(tp_group=tp_group, device=device),
-            vocab_size=vocab_size,
+            target_vocab_size=vocab_size,
+            draft_vocab_size=vocab_size,
             hidden_size=hidden_size,
             markov_rank=markov_rank,
             confidence_enabled=True,
             confidence_with_markov=True,
-            vocab_start_index=vocab_start,
-            vocab_end_index=vocab_end,
+            draft_vocab_start_index=vocab_start,
+            draft_vocab_end_index=vocab_end,
             tensor_parallel_group=tp_group,
             device=device,
             dtype=torch.float32,

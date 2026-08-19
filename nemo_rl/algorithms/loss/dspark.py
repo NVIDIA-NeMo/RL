@@ -322,7 +322,9 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
             dtype=torch.float32,
             device=draft_hidden.device,
         )
-        global_vocab_size = markov_w1.shape[0]
+        global_draft_vocab_size = local_vocab_size
+        if tp_group is not None:
+            global_draft_vocab_size *= torch.distributed.get_world_size(tp_group)
 
         for start in range(0, flat_hidden.shape[0], token_chunk_size):
             end = min(start + token_chunk_size, flat_hidden.shape[0])
@@ -374,7 +376,7 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
             predicted_tokens = _global_argmax(
                 draft_logits.float(),
                 vocab_start=vocab_start,
-                global_vocab_size=global_vocab_size,
+                global_vocab_size=global_draft_vocab_size,
                 tp_group=tp_group,
             )
             flat_correct[start:end].copy_(
@@ -614,7 +616,7 @@ def _validate_inputs(
     slot_bins: torch.Tensor,
     loss_weights: tuple[float, float, float],
     token_chunk_size: int,
-    vocab_start_index: int,
+    draft_vocab_start_index: int,
     tp_group: torch.distributed.ProcessGroup | None,
 ) -> None:
     _validate_tp_structural_agreement(
@@ -653,21 +655,20 @@ def _validate_inputs(
         markov_w1.shape[-1],
     ):
         raise ValueError("Markov weights must be global-vocab W1 and local-vocab W2")
-    global_vocab_size = markov_w1.shape[0]
-    if global_vocab_size == 0 or markov_w1.shape[1] == 0:
+    target_vocab_size = markov_w1.shape[0]
+    if target_vocab_size == 0 or markov_w1.shape[1] == 0:
         raise ValueError("Markov weights must be nonempty")
     if tp_group is None:
         expected_start = 0
-        expected_global_vocab_size = local_vocab_size
+        draft_vocab_size = local_vocab_size
     else:
         tp_rank = torch.distributed.get_rank(tp_group)
         tp_size = torch.distributed.get_world_size(tp_group)
         expected_start = tp_rank * local_vocab_size
-        expected_global_vocab_size = tp_size * local_vocab_size
+        draft_vocab_size = tp_size * local_vocab_size
     _raise_if_tp_any(
-        vocab_start_index != expected_start
-        or global_vocab_size != expected_global_vocab_size,
-        message="vocabulary shard must be an even rank-local TP partition",
+        draft_vocab_start_index != expected_start,
+        message="draft vocabulary shard must be an even rank-local TP partition",
         device=target_logits.device,
         tp_group=tp_group,
     )
@@ -744,12 +745,10 @@ def _validate_inputs(
 
     invalid_metadata = torch.stack(
         (
-            (
-                valid_mask & (hard_labels.lt(0) | hard_labels.ge(global_vocab_size))
-            ).any(),
+            (valid_mask & (hard_labels.lt(0) | hard_labels.ge(draft_vocab_size))).any(),
             (
                 valid_mask
-                & (previous_token_ids.lt(0) | previous_token_ids.ge(global_vocab_size))
+                & (previous_token_ids.lt(0) | previous_token_ids.ge(target_vocab_size))
             ).any(),
             (slot_bins.lt(0) | slot_bins.ge(slot_shape[1])).any(),
         )
@@ -761,10 +760,10 @@ def _validate_inputs(
             group=tp_group,
         )
     if bool(invalid_metadata[0]):
-        raise ValueError("valid hard_labels must be inside the global vocabulary")
+        raise ValueError("valid hard_labels must be inside the draft vocabulary")
     if bool(invalid_metadata[1]):
         raise ValueError(
-            "valid previous_token_ids must be inside the global vocabulary"
+            "valid previous_token_ids must be inside the target vocabulary"
         )
     if bool(invalid_metadata[2]):
         raise ValueError("slot_bins must be inside the configured slot bins")
@@ -784,7 +783,7 @@ def dspark_tiled_objective(
     slot_bins: torch.Tensor,
     loss_weights: tuple[float, float, float],
     token_chunk_size: int,
-    vocab_start_index: int,
+    draft_vocab_start_index: int,
     tp_group: torch.distributed.ProcessGroup | None,
 ) -> DSparkObjectiveStats:
     """Project selected slots tile-by-tile and return raw DSpark objective bins."""
@@ -801,7 +800,7 @@ def dspark_tiled_objective(
         slot_bins=slot_bins,
         loss_weights=loss_weights,
         token_chunk_size=token_chunk_size,
-        vocab_start_index=vocab_start_index,
+        draft_vocab_start_index=draft_vocab_start_index,
         tp_group=tp_group,
     )
     num_bins = target_logits.shape[1]
@@ -823,7 +822,7 @@ def dspark_tiled_objective(
         compact_slot_bins,
         num_bins,
         token_chunk_size,
-        vocab_start_index,
+        draft_vocab_start_index,
         tp_group,
     )
     counts = torch.zeros(num_bins, dtype=torch.float32, device=valid_mask.device)

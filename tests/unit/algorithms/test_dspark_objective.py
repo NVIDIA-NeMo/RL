@@ -83,7 +83,7 @@ def _distributed_inputs(
         "slot_bins": torch.arange(3).expand(slot_shape),
         "loss_weights": (1.0, 1.0, 0.0),
         "token_chunk_size": token_chunk_size,
-        "vocab_start_index": rank * local_vocab_size,
+        "draft_vocab_start_index": rank * local_vocab_size,
         "tp_group": torch.distributed.group.WORLD,
     }
 
@@ -208,7 +208,7 @@ def _inputs() -> dict[str, object]:
         "valid_mask": torch.tensor([[True, True, False], [True, False, True]]),
         "slot_bins": torch.tensor([[0, 1, 2], [0, 1, 2]]),
         "token_chunk_size": 2,
-        "vocab_start_index": 0,
+        "draft_vocab_start_index": 0,
         "tp_group": None,
     }
 
@@ -394,7 +394,7 @@ def test_empty_or_all_invalid_slots_return_zero_raw_bins(num_blocks: int) -> Non
         slot_bins=torch.arange(num_slots).expand(num_blocks, num_slots),
         loss_weights=(2.0, 3.0, 4.0),
         token_chunk_size=2,
-        vocab_start_index=0,
+        draft_vocab_start_index=0,
         tp_group=None,
     )
 
@@ -551,7 +551,7 @@ def test_confidence_uses_detached_selected_vocab_acceptance_overlap() -> None:
         slot_bins=torch.zeros(1, 1, dtype=torch.long),
         loss_weights=(0.0, 0.0, 1.0),
         token_chunk_size=1,
-        vocab_start_index=0,
+        draft_vocab_start_index=0,
         tp_group=None,
     )
 
@@ -787,7 +787,7 @@ def test_backward_never_casts_a_full_large_vocab_weight_to_float32() -> None:
         "slot_bins": torch.zeros(1, 1, dtype=torch.long),
         "loss_weights": (1.0, 1.0, 0.0),
         "token_chunk_size": 1,
-        "vocab_start_index": 0,
+        "draft_vocab_start_index": 0,
         "tp_group": None,
     }
     inputs["draft_hidden"] = inputs["draft_hidden"].to(torch.bfloat16).requires_grad_()
@@ -855,7 +855,7 @@ def test_selected_slots_do_not_retain_long_context_backing_storage(
             slot_bins=bins_backing[:, selected],
             loss_weights=(1.0, 1.0, 0.0),
             token_chunk_size=2,
-            vocab_start_index=0,
+            draft_vocab_start_index=0,
             tp_group=None,
         )
         stats.combined.normalized(normalization_counts=stats.combined.counts).backward()
