@@ -31,6 +31,93 @@ from nemo_rl.models.megatron.draft.dspark import (
 )
 
 
+def _dtype_code(dtype: torch.dtype) -> int:
+    dtype_names = (
+        "bool",
+        "uint8",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "float16",
+        "bfloat16",
+        "float32",
+        "float64",
+    )
+    return next(
+        (
+            index
+            for index, name in enumerate(dtype_names)
+            if dtype == getattr(torch, name, None)
+        ),
+        -1,
+    )
+
+
+def _provider_tensor_descriptor(
+    tensor: torch.Tensor | None,
+    *,
+    collective_device: torch.device,
+) -> list[int]:
+    if tensor is None:
+        return [-1, -1, -1, -1, -1, -1, -1]
+    shape = [*tensor.shape[:3], *([-1] * max(0, 3 - tensor.ndim))]
+    return [
+        tensor.ndim,
+        *shape,
+        _dtype_code(tensor.dtype),
+        int(tensor.device == collective_device),
+        int(tensor.is_floating_point()),
+    ]
+
+
+def _preflight_provider_inputs(
+    *,
+    draft_hidden: torch.Tensor,
+    target_output_weight: torch.Tensor,
+    target_logits: torch.Tensor,
+    previous_token_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    slot_bins: torch.Tensor,
+    slot_weights: torch.Tensor | None,
+    configured_tp_group: torch.distributed.ProcessGroup | None,
+    requested_tp_group: torch.distributed.ProcessGroup | None,
+) -> None:
+    if configured_tp_group is None:
+        return
+    descriptor = [int(configured_tp_group is requested_tp_group)]
+    for tensor in (
+        draft_hidden,
+        target_output_weight,
+        target_logits,
+        previous_token_ids,
+        valid_mask,
+        slot_bins,
+        slot_weights,
+    ):
+        descriptor.extend(
+            _provider_tensor_descriptor(
+                tensor,
+                collective_device=draft_hidden.device,
+            )
+        )
+    local = torch.tensor(descriptor, dtype=torch.int64, device=draft_hidden.device)
+    minimum = local.clone()
+    maximum = local.clone()
+    torch.distributed.all_reduce(
+        minimum,
+        op=torch.distributed.ReduceOp.MIN,
+        group=configured_tp_group,
+    )
+    torch.distributed.all_reduce(
+        maximum,
+        op=torch.distributed.ReduceOp.MAX,
+        group=configured_tp_group,
+    )
+    if not torch.equal(minimum, maximum):
+        raise ValueError("tensor-parallel ranks must agree on DSpark provider inputs")
+
+
 class _CheckpointableBody(Protocol):
     def sharded_state_dict(
         self,
@@ -62,7 +149,6 @@ class _DSparkProviderAdapter(nn.Module):
         target_output_weight: torch.Tensor,
         target_logits: torch.Tensor,
         previous_token_ids: torch.Tensor,
-        hard_labels: torch.Tensor,
         valid_mask: torch.Tensor,
         slot_bins: torch.Tensor,
         slot_weights: torch.Tensor | None = None,
@@ -71,6 +157,17 @@ class _DSparkProviderAdapter(nn.Module):
         tp_group: torch.distributed.ProcessGroup | None,
     ) -> DSparkObjectiveStats:
         """Project with the detached live head and evaluate raw DSpark loss bins."""
+        _preflight_provider_inputs(
+            draft_hidden=draft_hidden,
+            target_output_weight=target_output_weight,
+            target_logits=target_logits,
+            previous_token_ids=previous_token_ids,
+            valid_mask=valid_mask,
+            slot_bins=slot_bins,
+            slot_weights=slot_weights,
+            configured_tp_group=self.markov_head.tensor_parallel_group,
+            requested_tp_group=tp_group,
+        )
         if self.markov_head.tensor_parallel_group is not tp_group:
             raise ValueError("objective TP group must match the DSpark head TP group")
         if draft_hidden.ndim != 3:
@@ -115,7 +212,6 @@ class _DSparkProviderAdapter(nn.Module):
             markov_w2=self.markov_head.markov_w2.weight,
             previous_token_ids=previous_token_ids,
             confidence_logits=confidence_logits,
-            hard_labels=hard_labels,
             valid_mask=valid_mask,
             slot_bins=slot_bins,
             slot_weights=slot_weights,

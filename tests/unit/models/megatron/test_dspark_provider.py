@@ -97,7 +97,6 @@ def _provider_inputs() -> dict[str, object]:
             2, 3, 9, generator=generator, dtype=torch.float64, requires_grad=True
         ),
         "previous_token_ids": torch.tensor([[2, 2, 4], [2, 6, 2]]),
-        "hard_labels": torch.tensor([[1, 4, 2], [5, 0, 6]]),
         "valid_mask": torch.tensor([[True, True, False], [True, False, True]]),
         "slot_bins": torch.tensor([[0, 1, 2], [0, 1, 2]]),
         "loss_weights": (1.5, 0.25, 2.0),

@@ -78,7 +78,6 @@ def _distributed_inputs(
         "markov_w2": torch.randn(local_vocab_size, 2, generator=generator),
         "previous_token_ids": torch.zeros(slot_shape, dtype=torch.long),
         "confidence_logits": None,
-        "hard_labels": torch.zeros(slot_shape, dtype=torch.long),
         "valid_mask": torch.ones(slot_shape, dtype=torch.bool),
         "slot_bins": torch.arange(3).expand(slot_shape),
         "loss_weights": (1.0, 1.0, 0.0),
@@ -108,9 +107,7 @@ def _run_distributed_contract_case(
             num_blocks=num_blocks,
             token_chunk_size=token_chunk_size,
         )
-        if case == "hard_labels" and rank == 1:
-            inputs["hard_labels"] = torch.full((1, 3), 2, dtype=torch.long)
-        elif case == "previous_token_ids" and rank == 1:
+        if case == "previous_token_ids" and rank == 1:
             inputs["previous_token_ids"] = torch.full((1, 3), 2, dtype=torch.long)
         elif case == "valid_mask" and rank == 1:
             inputs["valid_mask"] = torch.tensor([[True, True, False]])
@@ -204,7 +201,6 @@ def _inputs() -> dict[str, object]:
         "markov_w2": markov_w2,
         "previous_token_ids": torch.tensor([[2, 2, 4], [2, 6, 2]]),
         "confidence_logits": confidence_logits,
-        "hard_labels": torch.tensor([[1, 4, 2], [5, 0, 6]]),
         "valid_mask": torch.tensor([[True, True, False], [True, False, True]]),
         "slot_bins": torch.tensor([[0, 1, 2], [0, 1, 2]]),
         "token_chunk_size": 2,
@@ -221,7 +217,6 @@ def _dense_oracle(inputs: dict[str, object]) -> tuple[DSparkLossBins, ...]:
     markov_w2 = inputs["markov_w2"]
     previous_token_ids = inputs["previous_token_ids"]
     confidence_logits = inputs["confidence_logits"]
-    hard_labels = inputs["hard_labels"]
     valid_mask = inputs["valid_mask"]
     slot_bins = inputs["slot_bins"]
     assert isinstance(target_logits, torch.Tensor)
@@ -231,7 +226,6 @@ def _dense_oracle(inputs: dict[str, object]) -> tuple[DSparkLossBins, ...]:
     assert isinstance(markov_w2, torch.Tensor)
     assert isinstance(previous_token_ids, torch.Tensor)
     assert isinstance(confidence_logits, torch.Tensor)
-    assert isinstance(hard_labels, torch.Tensor)
     assert isinstance(valid_mask, torch.Tensor)
     assert isinstance(slot_bins, torch.Tensor)
 
@@ -241,9 +235,10 @@ def _dense_oracle(inputs: dict[str, object]) -> tuple[DSparkLossBins, ...]:
     ).float()
     target_probs = torch.softmax(target_logits.detach().float(), dim=-1)
     draft_probs = torch.softmax(corrected_logits, dim=-1)
+    teacher_labels = target_logits.detach().argmax(dim=-1)
     ce_rows = (
         -torch.log_softmax(corrected_logits, dim=-1)
-        .gather(-1, hard_labels.unsqueeze(-1))
+        .gather(-1, teacher_labels.unsqueeze(-1))
         .squeeze(-1)
     )
     tv_rows = 0.5 * (target_probs - draft_probs).abs().sum(dim=-1)
@@ -279,9 +274,7 @@ def _teacher_label_inputs() -> dict[str, object]:
     return {
         "target_logits": torch.tensor([[[4.0, 4.0, -3.0]]]),
         "draft_hidden": torch.tensor([[[0.25, -0.5]]], requires_grad=True),
-        "target_output_weight": torch.tensor(
-            [[-1.0, 0.5], [2.0, -0.25], [0.75, 1.5]]
-        ),
+        "target_output_weight": torch.tensor([[-1.0, 0.5], [2.0, -0.25], [0.75, 1.5]]),
         "markov_w1": torch.zeros(3, 1, requires_grad=True),
         "markov_w2": torch.zeros(3, 1, requires_grad=True),
         "previous_token_ids": torch.zeros(1, 1, dtype=torch.long),
@@ -447,7 +440,6 @@ def test_empty_or_all_invalid_slots_return_zero_raw_bins(num_blocks: int) -> Non
         markov_w2=torch.randn(vocab_size, 2, requires_grad=True),
         previous_token_ids=torch.full(logits_shape, -1, dtype=torch.long),
         confidence_logits=torch.full(logits_shape, torch.nan, requires_grad=True),
-        hard_labels=torch.zeros(logits_shape, dtype=torch.long),
         valid_mask=torch.zeros(logits_shape, dtype=torch.bool),
         slot_bins=torch.arange(num_slots).expand(num_blocks, num_slots),
         loss_weights=(2.0, 3.0, 4.0),
@@ -478,7 +470,6 @@ def test_raw_stats_add_across_dp_splits_with_one_zero_rank() -> None:
         "draft_hidden",
         "previous_token_ids",
         "confidence_logits",
-        "hard_labels",
         "valid_mask",
         "slot_bins",
     }
@@ -594,8 +585,6 @@ def test_confidence_uses_detached_selected_vocab_acceptance_overlap() -> None:
         markov_w1[1].copy_(draft_probabilities.log())
     draft_hidden = torch.zeros(1, 1, 1, requires_grad=True)
     confidence_logits = torch.tensor([[1.25]], requires_grad=True)
-    hard_labels = torch.tensor([[1]])
-
     stats = dspark_tiled_objective(
         target_logits=selected_target_logits,
         draft_hidden=draft_hidden,
@@ -604,7 +593,6 @@ def test_confidence_uses_detached_selected_vocab_acceptance_overlap() -> None:
         markov_w2=torch.eye(2, requires_grad=True),
         previous_token_ids=torch.tensor([[1]]),
         confidence_logits=confidence_logits,
-        hard_labels=hard_labels,
         valid_mask=torch.ones(1, 1, dtype=torch.bool),
         slot_bins=torch.zeros(1, 1, dtype=torch.long),
         loss_weights=(0.0, 0.0, 1.0),
@@ -619,7 +607,10 @@ def test_confidence_uses_detached_selected_vocab_acceptance_overlap() -> None:
         draft_probabilities.reshape(1, 1, -1),
     ).sum(dim=-1)
     assert acceptance_target.item() == pytest.approx(0.8)
-    assert draft_probabilities.argmax().item() != hard_labels.item()
+    assert (
+        draft_probabilities.argmax().item()
+        != selected_target_logits.detach().argmax(dim=-1).item()
+    )
     assert torch.softmax(full_target_logits.detach(), dim=-1)[..., d2t].sum() < 1e-8
     expected = F.binary_cross_entropy_with_logits(
         confidence_logits,
@@ -647,7 +638,6 @@ def test_confidence_uses_detached_selected_vocab_acceptance_overlap() -> None:
     ("field", "value", "error"),
     [
         ("valid_mask", torch.ones(2, 3), TypeError),
-        ("hard_labels", torch.zeros(2, 3, dtype=torch.int32), TypeError),
         ("slot_bins", torch.zeros(2, 3, dtype=torch.int32), TypeError),
         ("loss_weights", (1.0, -1.0, 1.0), ValueError),
     ],
@@ -724,20 +714,8 @@ def test_objective_carries_typed_detached_slot_weights() -> None:
     assert slot_weights.grad is None
 
 
-@pytest.mark.parametrize("bad_label", [-1, 7])
-def test_valid_hard_labels_must_be_inside_global_vocabulary(bad_label: int) -> None:
-    """Valid labels below zero or at vocab_size cannot be clamped to a shard."""
-    inputs = _inputs()
-    hard_labels = inputs["hard_labels"]
-    assert isinstance(hard_labels, torch.Tensor)
-    hard_labels[0, 0] = bad_label
-
-    with pytest.raises(ValueError, match="hard_labels"):
-        dspark_tiled_objective(**inputs, loss_weights=(1.0, 1.0, 1.0))
-
-
 def test_split_vocab_uses_mapped_draft_rows_and_independent_id_bounds() -> None:
-    """Teacher rows/labels use draft space while previous IDs use target space."""
+    """Teacher rows use draft space while previous IDs use target space."""
     generator = torch.Generator().manual_seed(20260819)
     target_vocab_size, draft_vocab_size = 11, 8
     d2t = torch.tensor([10, 2, 8, 0, 6, 1, 9, 4])
@@ -755,7 +733,6 @@ def test_split_vocab_uses_mapped_draft_rows_and_independent_id_bounds() -> None:
         ),
         "previous_token_ids": torch.tensor([[10, 0]]),
         "confidence_logits": None,
-        "hard_labels": torch.tensor([[7, 0]]),
         "valid_mask": torch.ones(1, 2, dtype=torch.bool),
         "slot_bins": torch.tensor([[0, 1]]),
         "loss_weights": (1.0, 1.0, 0.0),
@@ -771,20 +748,15 @@ def test_split_vocab_uses_mapped_draft_rows_and_independent_id_bounds() -> None:
         dspark_tiled_objective(
             **{**common, "previous_token_ids": torch.tensor([[11, 0]])}
         )
-    with pytest.raises(ValueError, match="hard_labels"):
-        dspark_tiled_objective(**{**common, "hard_labels": torch.tensor([[8, 0]])})
 
 
-def test_invalid_slots_may_carry_out_of_range_sentinel_labels_and_tokens() -> None:
-    """Only valid slots participate in label and previous-token validation."""
+def test_invalid_slots_may_carry_out_of_range_sentinel_tokens() -> None:
+    """Only valid slots participate in previous-token validation."""
     inputs = _inputs()
     valid_mask = inputs["valid_mask"]
-    hard_labels = inputs["hard_labels"]
     previous_token_ids = inputs["previous_token_ids"]
     assert isinstance(valid_mask, torch.Tensor)
-    assert isinstance(hard_labels, torch.Tensor)
     assert isinstance(previous_token_ids, torch.Tensor)
-    hard_labels[~valid_mask] = 999
     previous_token_ids[~valid_mask] = -999
 
     stats = dspark_tiled_objective(**inputs, loss_weights=(1.0, 1.0, 1.0))
@@ -810,7 +782,7 @@ def test_tp_contract_mismatch_fails_synchronously_on_every_rank(
     _assert_distributed_contract_failure_is_synchronous(tmp_path, case)
 
 
-@pytest.mark.parametrize("case", ["hard_labels", "previous_token_ids", "valid_mask"])
+@pytest.mark.parametrize("case", ["previous_token_ids", "valid_mask"])
 def test_tp_token_metadata_must_agree_exactly(
     tmp_path: Path,
     case: str,
@@ -841,7 +813,6 @@ def test_backward_never_casts_a_full_large_vocab_weight_to_float32() -> None:
         ),
         "previous_token_ids": torch.zeros(1, 1, dtype=torch.long),
         "confidence_logits": None,
-        "hard_labels": torch.zeros(1, 1, dtype=torch.long),
         "valid_mask": torch.ones(1, 1, dtype=torch.bool),
         "slot_bins": torch.zeros(1, 1, dtype=torch.long),
         "loss_weights": (1.0, 1.0, 0.0),
@@ -875,7 +846,6 @@ def test_selected_slots_do_not_retain_long_context_backing_storage(
         1, source_length, 2, generator=generator, requires_grad=True
     )
     previous_backing = torch.zeros(1, source_length, dtype=torch.long)
-    labels_backing = torch.zeros(1, source_length, dtype=torch.long)
     valid_backing = torch.ones(1, source_length, dtype=torch.bool)
     bins_backing = torch.arange(source_length).remainder(3).reshape(1, -1)
     long_storage_pointers = {
@@ -884,7 +854,6 @@ def test_selected_slots_do_not_retain_long_context_backing_storage(
             target_backing,
             hidden_backing,
             previous_backing,
-            labels_backing,
             valid_backing,
             bins_backing,
         )
@@ -909,7 +878,6 @@ def test_selected_slots_do_not_retain_long_context_backing_storage(
             markov_w2=torch.randn(5, 1, generator=generator, requires_grad=True),
             previous_token_ids=previous_backing[:, selected],
             confidence_logits=None,
-            hard_labels=labels_backing[:, selected],
             valid_mask=valid_backing[:, selected],
             slot_bins=bins_backing[:, selected],
             loss_weights=(1.0, 1.0, 0.0),

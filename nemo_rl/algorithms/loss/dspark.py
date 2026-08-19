@@ -134,7 +134,6 @@ def _raise_if_tp_any(
 def _validate_tp_metadata_agreement(
     *,
     previous_token_ids: torch.Tensor,
-    hard_labels: torch.Tensor,
     valid_mask: torch.Tensor,
     slot_bins: torch.Tensor,
     tp_group: torch.distributed.ProcessGroup | None,
@@ -144,7 +143,6 @@ def _validate_tp_metadata_agreement(
     canonical_metadata = torch.stack(
         (
             valid_mask.to(dtype=torch.int64),
-            torch.where(valid_mask, hard_labels, 0),
             torch.where(valid_mask, previous_token_ids, 0),
             slot_bins,
         )
@@ -309,6 +307,42 @@ def _local_label_logits(
     return selected
 
 
+def _selected_teacher_labels(
+    target_logits: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    vocab_start: int,
+    tp_group: torch.distributed.ProcessGroup | None,
+) -> torch.Tensor:
+    selected_target = torch.where(
+        valid_mask.unsqueeze(-1),
+        target_logits.detach(),
+        torch.zeros_like(target_logits),
+    )
+    local_maximum, local_index = selected_target.max(dim=-1)
+    global_index = local_index.add(vocab_start)
+    if tp_group is None:
+        return global_index
+    global_maximum = local_maximum.clone()
+    torch.distributed.all_reduce(
+        global_maximum,
+        op=torch.distributed.ReduceOp.MAX,
+        group=tp_group,
+    )
+    sentinel = torch.iinfo(torch.int64).max
+    candidate = torch.where(
+        local_maximum.eq(global_maximum),
+        global_index,
+        sentinel,
+    )
+    torch.distributed.all_reduce(
+        candidate,
+        op=torch.distributed.ReduceOp.MIN,
+        group=tp_group,
+    )
+    return candidate
+
+
 class _TiledProjectedHardCEAndTV(torch.autograd.Function):
     @staticmethod
     def forward(  # pyrefly: ignore[bad-override]
@@ -319,7 +353,7 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
         previous_token_ids: torch.Tensor,
         markov_w1: torch.Tensor,
         markov_w2: torch.Tensor,
-        hard_labels: torch.Tensor,
+        teacher_labels: torch.Tensor,
         valid_mask: torch.Tensor,
         slot_bins: torch.Tensor,
         num_bins: int,
@@ -332,7 +366,7 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
         flat_hidden = draft_hidden.reshape(-1, hidden_size)
         flat_target = target_logits.reshape(-1, local_vocab_size)
         flat_previous_token_ids = previous_token_ids.reshape(-1)
-        flat_labels = hard_labels.reshape(-1)
+        flat_labels = teacher_labels.reshape(-1)
         flat_valid = valid_mask.reshape(-1)
         flat_mask = flat_valid.float()
         flat_bins = slot_bins.reshape(-1)
@@ -421,7 +455,7 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
             previous_token_ids,
             markov_w1,
             markov_w2,
-            hard_labels,
+            teacher_labels,
             valid_mask,
             slot_bins,
             log_normalizers,
@@ -461,7 +495,7 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
             previous_token_ids,
             markov_w1,
             markov_w2,
-            hard_labels,
+            teacher_labels,
             valid_mask,
             slot_bins,
             log_normalizers,
@@ -472,7 +506,7 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
         flat_hidden = draft_hidden.reshape(-1, hidden_size)
         flat_target = target_logits.reshape(-1, local_vocab_size)
         flat_previous_token_ids = previous_token_ids.reshape(-1)
-        flat_labels = hard_labels.reshape(-1)
+        flat_labels = teacher_labels.reshape(-1)
         flat_valid = valid_mask.reshape(-1)
         flat_mask = flat_valid.float()
         flat_bins = slot_bins.reshape(-1)
@@ -631,7 +665,6 @@ def _validate_inputs(
     markov_w2: torch.Tensor,
     previous_token_ids: torch.Tensor,
     confidence_logits: torch.Tensor | None,
-    hard_labels: torch.Tensor,
     valid_mask: torch.Tensor,
     slot_bins: torch.Tensor,
     slot_weights: torch.Tensor | None,
@@ -649,7 +682,6 @@ def _validate_inputs(
             markov_w2,
             previous_token_ids,
             confidence_logits,
-            hard_labels,
             valid_mask,
             slot_bins,
             slot_weights,
@@ -682,12 +714,9 @@ def _validate_inputs(
         raise ValueError("Markov weights must be nonempty")
     if tp_group is None:
         expected_start = 0
-        draft_vocab_size = local_vocab_size
     else:
         tp_rank = torch.distributed.get_rank(tp_group)
-        tp_size = torch.distributed.get_world_size(tp_group)
         expected_start = tp_rank * local_vocab_size
-        draft_vocab_size = tp_size * local_vocab_size
     _raise_if_tp_any(
         draft_vocab_start_index != expected_start,
         message="draft vocabulary shard must be an even rank-local TP partition",
@@ -696,7 +725,6 @@ def _validate_inputs(
     )
     for name, tensor in (
         ("previous_token_ids", previous_token_ids),
-        ("hard_labels", hard_labels),
         ("valid_mask", valid_mask),
         ("slot_bins", slot_bins),
     ):
@@ -708,8 +736,6 @@ def _validate_inputs(
         raise ValueError("slot_weights must have one value per DSpark slot bin")
     if previous_token_ids.dtype != torch.long:
         raise TypeError("previous_token_ids must use torch.long")
-    if hard_labels.dtype != torch.long:
-        raise TypeError("hard_labels must use torch.long")
     if slot_bins.dtype != torch.long:
         raise TypeError("slot_bins must use torch.long")
     if valid_mask.dtype != torch.bool:
@@ -740,7 +766,6 @@ def _validate_inputs(
     devices.update(
         {
             previous_token_ids.device,
-            hard_labels.device,
             valid_mask.device,
             slot_bins.device,
         }
@@ -770,7 +795,6 @@ def _validate_inputs(
     )
     _validate_tp_metadata_agreement(
         previous_token_ids=previous_token_ids,
-        hard_labels=hard_labels,
         valid_mask=valid_mask,
         slot_bins=slot_bins,
         tp_group=tp_group,
@@ -778,7 +802,6 @@ def _validate_inputs(
 
     invalid_metadata = torch.stack(
         (
-            (valid_mask & (hard_labels.lt(0) | hard_labels.ge(draft_vocab_size))).any(),
             (
                 valid_mask
                 & (previous_token_ids.lt(0) | previous_token_ids.ge(target_vocab_size))
@@ -793,12 +816,10 @@ def _validate_inputs(
             group=tp_group,
         )
     if bool(invalid_metadata[0]):
-        raise ValueError("valid hard_labels must be inside the draft vocabulary")
-    if bool(invalid_metadata[1]):
         raise ValueError(
             "valid previous_token_ids must be inside the target vocabulary"
         )
-    if bool(invalid_metadata[2]):
+    if bool(invalid_metadata[1]):
         raise ValueError("slot_bins must be inside the configured slot bins")
 
 
@@ -811,7 +832,6 @@ def dspark_tiled_objective(
     markov_w2: torch.Tensor,
     previous_token_ids: torch.Tensor,
     confidence_logits: torch.Tensor | None,
-    hard_labels: torch.Tensor,
     valid_mask: torch.Tensor,
     slot_bins: torch.Tensor,
     slot_weights: torch.Tensor | None = None,
@@ -820,7 +840,21 @@ def dspark_tiled_objective(
     draft_vocab_start_index: int,
     tp_group: torch.distributed.ProcessGroup | None,
 ) -> DSparkObjectiveStats:
-    """Project selected slots tile-by-tile and return raw DSpark objective bins."""
+    """Return raw DSpark bins over a selected draft-vocabulary ordering.
+
+    ``target_logits``, ``target_output_weight``, and ``markov_w2`` use the same
+    selected draft-vocabulary order. Their positions are draft IDs, whereas
+    ``previous_token_ids`` are target-model vocabulary IDs for ``markov_w1``.
+    With tensor parallelism, each rank owns the contiguous selected-vocabulary
+    shard beginning at ``draft_vocab_start_index``. Hard-CE labels are derived
+    internally from the global selected-vocabulary teacher argmax; equal logits
+    choose the lowest draft ID.
+
+    The returned numerators and counts remain additive across data-parallel
+    ranks. Reduce counts externally before calling ``normalized``. Detached
+    ``slot_weights`` scale both numerator contribution and normalization, which
+    supports fixed per-slot schedules but not example-dependent reweighting.
+    """
     _validate_inputs(
         target_logits=target_logits,
         draft_hidden=draft_hidden,
@@ -829,7 +863,6 @@ def dspark_tiled_objective(
         markov_w2=markov_w2,
         previous_token_ids=previous_token_ids,
         confidence_logits=confidence_logits,
-        hard_labels=hard_labels,
         valid_mask=valid_mask,
         slot_bins=slot_bins,
         slot_weights=slot_weights,
@@ -847,7 +880,14 @@ def dspark_tiled_objective(
     compact_hidden = _compact_retained_view(draft_hidden)
     compact_target = _compact_retained_view(target_logits.detach())
     compact_previous_token_ids = _compact_retained_view(previous_token_ids)
-    compact_hard_labels = _compact_retained_view(hard_labels)
+    compact_teacher_labels = _compact_retained_view(
+        _selected_teacher_labels(
+            compact_target,
+            valid_mask,
+            vocab_start=draft_vocab_start_index,
+            tp_group=tp_group,
+        )
+    )
     compact_valid_mask = _compact_retained_view(valid_mask)
     compact_slot_bins = _compact_retained_view(slot_bins)
     ce_numerators, tv_numerators, acceptance_targets = _TiledProjectedHardCEAndTV.apply(
@@ -857,7 +897,7 @@ def dspark_tiled_objective(
         compact_previous_token_ids,
         markov_w1,
         markov_w2,
-        compact_hard_labels,
+        compact_teacher_labels,
         compact_valid_mask,
         compact_slot_bins,
         num_bins,
