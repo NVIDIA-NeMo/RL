@@ -54,16 +54,21 @@ RUN_ARGS=(
   "++grpo.val_at_end=false"
   "checkpointing.enabled=false"
 )
+RUNTIME_TOGGLE_EXPORTS=
 if [[ "${USE_RUNTIME_TOGGLES}" == true ]]; then
-  RUN_ARGS+=(
-    "++policy.generation.vllm_cfg.env_vars.NRL_MXFP8_BATCHED_SHUFFLE=${BATCHED_SHUFFLE}"
-    "++policy.generation.vllm_cfg.env_vars.NRL_REFIT_CACHED_LOADERS=${CACHED_LOADERS}"
-    "++policy.generation.vllm_cfg.env_vars.VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=NRL_MXFP8_BATCHED_SHUFFLE,NRL_REFIT_CACHED_LOADERS"
-  )
+  RUNTIME_TOGGLE_EXPORTS=$(cat <<EOF
+export NRL_MXFP8_BATCHED_SHUFFLE=${BATCHED_SHUFFLE}
+export NRL_REFIT_CACHED_LOADERS=${CACHED_LOADERS}
+export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=NRL_MXFP8_BATCHED_SHUFFLE,NRL_REFIT_CACHED_LOADERS
+EOF
+)
 fi
 printf -v RUN_COMMAND '%q ' uv run --frozen examples/run_grpo.py "${RUN_ARGS[@]}"
 
 if [[ "${ACTION}" == render ]]; then
+  if [[ -n "${RUNTIME_TOGGLE_EXPORTS}" ]]; then
+    printf '%s\n' "${RUNTIME_TOGGLE_EXPORTS}"
+  fi
   printf '%s\n' "${RUN_COMMAND}"
   exit 0
 fi
@@ -178,6 +183,7 @@ export UV_PROJECT_ENVIRONMENT=${CACHE_ROOT}/driver-venv
 export UV_PYTHON_INSTALL_DIR=${CACHE_ROOT}/uv-python
 export UV_LOCK_TIMEOUT=7200
 export WANDB_API_KEY="\$(cat ${WANDB_KEY_FILE})"
+${RUNTIME_TOGGLE_EXPORTS}
 printf 'NEMO_RL_SOURCE_COMMIT=%s\n' "\$(git rev-parse HEAD)"
 ${RUN_COMMAND} \
   logger.log_dir=${EXPERIMENT_ROOT}/logs \

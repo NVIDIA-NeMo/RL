@@ -43,7 +43,7 @@ def test_sync_mxfp8_renders_matched_two_logprob_cuda_graph_run() -> None:
     assert "++policy.generation.vllm_kwargs.moe_backend=flashinfer_trtllm" in result.stdout
     assert "loss_fn.force_on_policy_ratio=false" in result.stdout
     assert "loss_fn.use_importance_sampling_correction=true" in result.stdout
-    assert "grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout
+    assert "++grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout
 
 
 def test_submitter_uses_a_pinned_ray_runtime() -> None:
@@ -63,7 +63,7 @@ def test_async_bf16_renders_nccl_reshard_with_same_logprob_work() -> None:
     assert "policy.generation.refit_transport=nccl_reshard" in result.stdout
     assert "policy.generation.vllm_cfg.precision=bfloat16" in result.stdout
     assert "loss_fn.force_on_policy_ratio=false" in result.stdout
-    assert "grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout
+    assert "++grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout
 
 
 def test_qwen235_legacy_arm_uses_current_mxfp8_recipe_without_reshard() -> None:
@@ -90,6 +90,23 @@ def test_pr3294_baseline_disables_all_three_refit_optimizations() -> None:
     assert "policy.generation.vllm_cfg.refit_prequantize=false" in result.stdout
     assert "NRL_MXFP8_BATCHED_SHUFFLE=0" in result.stdout
     assert "NRL_REFIT_CACHED_LOADERS=0" in result.stdout
+
+
+def test_full_ablation_exports_runtime_toggles_outside_hydra() -> None:
+    script = ABLATION_SCRIPT.read_text()
+    result = render_ablation(ARM="baseline")
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "++policy.generation.vllm_cfg.env_vars.VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"
+        not in result.stdout
+    )
+    assert "export NRL_MXFP8_BATCHED_SHUFFLE=${BATCHED_SHUFFLE}" in script
+    assert "export NRL_REFIT_CACHED_LOADERS=${CACHED_LOADERS}" in script
+    assert (
+        "export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="
+        "NRL_MXFP8_BATCHED_SHUFFLE,NRL_REFIT_CACHED_LOADERS" in script
+    )
 
 
 def test_pr3294_optimized_enables_all_three_refit_optimizations() -> None:
