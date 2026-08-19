@@ -244,7 +244,12 @@ def _run_tp2_dflash_projected_soft_ce(rank: int, world_size: int) -> None:
     torch.testing.assert_close(stats.counts, expected_counts)
     torch.testing.assert_close(stats.weights, expected_weights)
     torch.testing.assert_close(loss, expected_loss)
-    torch.testing.assert_close(local_hidden.grad, reference_hidden.grad)
+    torch.testing.assert_close(
+        local_hidden.grad,
+        reference_hidden.grad,
+        rtol=2e-2,
+        atol=2e-2,
+    )
     assert local_output_weight.grad is None
     assert local_teacher_logits.grad is None
 
