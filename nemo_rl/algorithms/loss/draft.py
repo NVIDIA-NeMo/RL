@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass
 from typing import Any
 
@@ -99,6 +100,11 @@ def _tile_distributions(
     teacher_probs = (teacher_logits.float() - log_normalizers[:, :1]).exp()
     student_probs = (student_logits.float() - log_normalizers[:, 1:]).exp()
     return teacher_probs, student_probs
+
+
+def _float64_bits(value: float) -> int:
+    """Encode a Python float as its signed IEEE-754 bit pattern."""
+    return struct.unpack("!q", struct.pack("!d", value))[0]
 
 
 def _tp_assert_projected_metadata_agreement(
@@ -812,7 +818,10 @@ def dflash_projected_vocab_parallel_soft_ce(
             ("label_positions", label_positions),
             ("loss_mask", loss_mask),
         ),
-        scalars=(("token_chunk_size", token_chunk_size),),
+        scalars=(
+            ("token_chunk_size", token_chunk_size),
+            ("position_decay", _float64_bits(position_decay)),
+        ),
         exact_tensors=(
             ("sample_rows", sample_rows),
             ("label_positions", label_positions),
