@@ -225,6 +225,53 @@ def test_projected_soft_ce_saved_state_contract(
     assert output_weight.grad is None
 
 
+def test_projected_soft_ce_casts_full_head_once_per_backward() -> None:
+    """Token tiling must not repeat the full output-head FP32 conversion."""
+    generator = torch.Generator().manual_seed(2468)
+    num_tokens, hidden_size, vocab_size = 5, 7, 11
+    student_hidden = torch.randn(
+        num_tokens,
+        hidden_size,
+        generator=generator,
+        dtype=torch.bfloat16,
+    ).requires_grad_(True)
+    output_weight = torch.randn(
+        vocab_size,
+        hidden_size,
+        generator=generator,
+        dtype=torch.bfloat16,
+    )
+    selected_teacher_logits = torch.randn(
+        num_tokens,
+        vocab_size,
+        generator=generator,
+        dtype=torch.bfloat16,
+    )
+    stats = projected_streaming_vocab_parallel_soft_ce(
+        student_hidden=student_hidden,
+        output_weight=output_weight,
+        selected_teacher_logits=selected_teacher_logits,
+        mask=torch.ones(num_tokens),
+        token_chunk_size=2,
+        tp_group=None,
+    )
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        record_shapes=True,
+    ) as profile:
+        stats.normalized(normalization_counts=stats.counts).backward()
+
+    full_head_cast_count = sum(
+        event.count
+        for event in profile.key_averages(group_by_input_shape=True)
+        if event.key == "aten::_to_copy"
+        and event.input_shapes
+        and event.input_shapes[0] == [vocab_size, hidden_size]
+    )
+    assert full_head_cast_count == 1
+
+
 @pytest.mark.parametrize("context_length", [32_768, 262_144])
 def test_projected_soft_ce_does_not_retain_full_context_teacher_logits(
     context_length: int,
