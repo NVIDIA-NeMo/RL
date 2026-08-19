@@ -1,0 +1,659 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import os
+import time
+from collections.abc import Mapping
+from typing import Any, Optional
+
+try:
+    from mlperf_common.frameworks.pyt import PyTCommunicationHandler
+    from mlperf_common.logging import MLLoggerWrapper
+except ImportError:  # pragma: no cover - exercised without mlperf_common installed
+    PyTCommunicationHandler = None  # type: ignore[assignment]
+    MLLoggerWrapper = None  # type: ignore[assignment]
+
+
+def mlperf_enabled(config: Mapping[str, Any]) -> bool:
+    """Return whether MLPerf logging is enabled in a NeMo-RL config."""
+    logger_cfg = config.get("logger", {})
+    if not isinstance(logger_cfg, Mapping):
+        return False
+
+    mlperf_cfg = logger_cfg.get("mlperf", {})
+    if not isinstance(mlperf_cfg, Mapping):
+        mlperf_cfg = {}
+
+    return bool(logger_cfg.get("mlperf_enabled", mlperf_cfg.get("enabled", False)))
+
+
+def create_mlperf_logger(
+    config: dict[str, Any],
+    mllogger: Optional[Any] = None,
+) -> Optional["MLPerfGRPOLogger"]:
+    """Create an MLPerf GRPO logger when enabled, otherwise return None."""
+    if not mlperf_enabled(config):
+        return None
+    return MLPerfGRPOLogger(config=config, mllogger=mllogger)
+
+
+class MLPerfGRPOLogger:
+    """Small direct MLPerf lifecycle logger for GRPO training."""
+
+    def __init__(self, config: dict[str, Any], mllogger: Optional[Any] = None) -> None:
+        self.config = config
+        self.mlperf_config = self._get_mlperf_config(config)
+        self.mllogger = mllogger or self._create_mllogger()
+
+        self.global_batch_size = int(
+            config["policy"].get(
+                "train_global_batch_size",
+                config["grpo"]["num_prompts_per_step"]
+                * config["grpo"]["num_generations_per_prompt"],
+            )
+        )
+        target_accuracy = self.mlperf_config.get("target_accuracy")
+        self.target_accuracy = (
+            None if target_accuracy is None else float(target_accuracy)
+        )
+        self.force_success_status = bool(
+            self.mlperf_config.get("force_success_status", False)
+        )
+
+        self.run_started = False
+        self.run_stopped = False
+        self.target_reached = False
+        self.block_started = False
+        self.block_start_step = 0
+        self.last_step = 0
+        self.pending_run_stop_status: Optional[str] = None
+        self._pending_val_metrics: dict[int, dict[str, Any]] = {}
+        self._pending_val_timings: dict[int, dict[str, Any]] = {}
+        self._deferred_evals: dict[
+            int, tuple[dict[str, Any], dict[str, Any], Optional[float]]
+        ] = {}
+
+        log_file = self.mlperf_config.get("log_file")
+        if log_file:
+            self._configure_output(str(log_file))
+
+    @staticmethod
+    def _get_mlperf_config(config: Mapping[str, Any]) -> dict[str, Any]:
+        logger_cfg = config.get("logger", {})
+        if isinstance(logger_cfg, Mapping) and isinstance(
+            logger_cfg.get("mlperf"), Mapping
+        ):
+            return dict(logger_cfg["mlperf"])
+        return {}
+
+    @staticmethod
+    def _create_mllogger() -> Any:
+        if MLLoggerWrapper is None or PyTCommunicationHandler is None:
+            raise ImportError(
+                "MLPerf logging is enabled, but mlperf_common is not installed. "
+                "Install git+https://github.com/NVIDIA/mlperf-common.git before running."
+            )
+        return MLLoggerWrapper(PyTCommunicationHandler())
+
+    @staticmethod
+    def _configure_output(log_file: str) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+        try:
+            from mlperf_logging import mllog
+        except ImportError:
+            return
+
+        try:
+            mllog.config(filename=log_file)
+        except TypeError:
+            mllog.config(filename=log_file, root_dir=os.getcwd())
+
+    @property
+    def constants(self) -> Any:
+        return self.mllogger.constants
+
+    def _call(self, method_name: str, *args: Any, **kwargs: Any) -> None:
+        method = getattr(self.mllogger, method_name)
+        try:
+            method(*args, **kwargs)
+        except TypeError:
+            kwargs.pop("unique", None)
+            try:
+                method(*args, **kwargs)
+            except TypeError:
+                kwargs.pop("time_ms", None)
+                method(*args, **kwargs)
+
+    def _start(
+        self,
+        key: str,
+        metadata: Optional[dict[str, Any]] = None,
+        time_ms: Optional[float] = None,
+    ) -> None:
+        kwargs: dict[str, Any] = {"key": key, "metadata": metadata or {}}
+        if time_ms is not None:
+            # JET's mllog ingester requires integral time_ms; a fractional
+            # stamp (e.g. the back-dated eval_start) fails its schema.
+            kwargs["time_ms"] = int(time_ms)
+        self._call("start", **kwargs)
+
+    def _end(
+        self,
+        key: str,
+        metadata: Optional[dict[str, Any]] = None,
+        time_ms: Optional[float] = None,
+    ) -> None:
+        kwargs: dict[str, Any] = {"key": key, "metadata": metadata or {}}
+        if time_ms is not None:
+            kwargs["time_ms"] = int(time_ms)
+        self._call("end", **kwargs)
+
+    def _event(
+        self,
+        key: str,
+        value: Any,
+        metadata: Optional[dict[str, Any]] = None,
+        unique: Optional[bool] = None,
+    ) -> None:
+        kwargs: dict[str, Any] = {
+            "key": key,
+            "value": value,
+            "metadata": metadata or {},
+        }
+        if unique is not None:
+            kwargs["unique"] = unique
+        self._call("event", **kwargs)
+
+    def sample_count(self, step: int) -> int:
+        return int(step) * self.global_batch_size
+
+    def block_size_samples(self, start_step: int) -> int:
+        start_step = int(start_step)
+        max_num_steps = int(self.config["grpo"].get("max_num_steps", 0))
+        val_period = int(self.config["grpo"].get("val_period", 0))
+        if val_period > 0:
+            val_start_at = int(self.config["grpo"].get("val_start_at", 0))
+            block_end_step = (
+                val_start_at
+                if start_step < val_start_at
+                else start_step + val_period
+            )
+        else:
+            block_end_step = max_num_steps
+        block_end_step = min(block_end_step, max_num_steps)
+        return max(0, block_end_step - start_step) * self.global_batch_size
+
+    def log_init_start(self) -> None:
+        self._start(self.constants.INIT_START)
+
+    def log_hyperparams(
+        self,
+        train_dataset: Any = None,
+        val_dataset: Any = None,
+    ) -> None:
+        cfg = self.config
+        grpo_cfg = cfg["grpo"]
+        loss_fn_cfg = cfg["loss_fn"]
+        policy_cfg = cfg["policy"]
+        megatron_cfg = policy_cfg.get("megatron_cfg") or {}
+        # Fall back to the policy-level optimizer for non-Megatron (dtensor) runs.
+        optimizer_cfg = (
+            megatron_cfg.get("optimizer") or policy_cfg.get("optimizer") or {}
+        )
+        scheduler_cfg = megatron_cfg.get("scheduler") or {}
+        generation_cfg = policy_cfg.get("generation") or {}
+        backend_cfg = generation_cfg.get("vllm_cfg") or {}
+
+        benchmark = str(self.mlperf_config.get("benchmark", "grpo_nemo_gym"))
+
+        if num_nodes := cfg.get("cluster", {}).get("num_nodes"):
+            self.mllogger.mlperf_submission_log(
+                benchmark=benchmark,
+                num_nodes=num_nodes,
+            )
+        else:
+            self.mllogger.mlperf_submission_log(benchmark)
+
+        train_samples = self._dataset_len(train_dataset)
+        if train_samples is not None:
+            train_samples *= int(grpo_cfg["num_generations_per_prompt"])
+        else:
+            train_samples = int(grpo_cfg["max_num_steps"]) * self.global_batch_size
+        eval_samples = self._dataset_len(val_dataset)
+        if eval_samples is None:
+            eval_samples = grpo_cfg.get("max_val_samples")
+
+        # fmt: off
+        logging_configs = {
+            self.constants.SEED: grpo_cfg.get("seed"),
+            self.constants.MAX_STEPS: grpo_cfg.get("max_num_steps"),
+            self.constants.GLOBAL_BATCH_SIZE: self.global_batch_size,
+            self.constants.MICRO_BATCH_SIZE: policy_cfg.get("train_micro_batch_size"),
+            self.constants.MAX_SEQUENCE_LENGTH: policy_cfg.get("max_total_sequence_length"),
+            self.constants.TRAIN_SAMPLES: train_samples,
+            self.constants.EVAL_SAMPLES: eval_samples,
+            self.constants.INIT_CHECKPOINT_STEP: 0,
+            self.constants.OPT_NAME: self.constants.ADAMW,
+            self.constants.OPT_BASE_LR: optimizer_cfg.get("lr"),
+            self.constants.OPT_END_LR: optimizer_cfg.get("min_lr"),
+            self.constants.OPT_ADAMW_BETA_1: optimizer_cfg.get("adam_beta1"),
+            self.constants.OPT_ADAMW_BETA_2: optimizer_cfg.get("adam_beta2"),
+            self.constants.OPT_ADAMW_EPSILON: optimizer_cfg.get("adam_eps"),
+            self.constants.OPT_ADAMW_WEIGHT_DECAY: optimizer_cfg.get("weight_decay"),
+            self.constants.OPT_GRADIENT_CLIP_NORM: optimizer_cfg.get("clip_grad"),
+            self.constants.OPT_LR_WARMUP_STEPS: scheduler_cfg.get("lr_warmup_iters"),
+            self.constants.OPT_LR_DECAY_STEPS: scheduler_cfg.get("lr_decay_iters"),
+            self.constants.OPT_LR_DECAY_SCHEDULE: scheduler_cfg.get("lr_decay_style"),
+            # Training step parallelism
+            self.constants.TENSOR_PARALLELISM: megatron_cfg.get("tensor_model_parallel_size"),
+            self.constants.PIPELINE_PARALLELISM: megatron_cfg.get("pipeline_model_parallel_size"),
+            self.constants.CONTEXT_PARALLELISM: megatron_cfg.get("context_parallel_size"),
+            self.constants.EXPERT_PARALLELISM: megatron_cfg.get("expert_model_parallel_size"),
+            # Generation parallelism
+            "generation_backend": generation_cfg.get("backend"),
+            "generation_tensor_parallelism": backend_cfg.get("tensor_parallel_size"),
+            "generation_pipeline_parallelism": backend_cfg.get("pipeline_parallel_size"),
+            "generation_expert_parallelism": backend_cfg.get("expert_parallel_size"),
+            "generation_training_rollout_temperature": generation_cfg.get("temperature"),
+            "generation_training_rollout_top_p": generation_cfg.get("top_p"),
+            "generation_validation_rollout_temperature": generation_cfg.get(
+                "val_temperature"
+            ),
+            "generation_validation_rollout_top_p": generation_cfg.get("val_top_p"),
+            "num_prompts_per_step": grpo_cfg.get("num_prompts_per_step"),
+            "num_generations_per_prompt": grpo_cfg.get("num_generations_per_prompt"),
+            "truncated_importance_sampling_ratio_min": loss_fn_cfg.get(
+                "truncated_importance_sampling_ratio_min"
+            ),
+            "truncated_importance_sampling_ratio": loss_fn_cfg.get(
+                "truncated_importance_sampling_ratio"
+            ),
+            "truncated_importance_sampling_type": loss_fn_cfg.get(
+                "truncated_importance_sampling_type"
+            ),
+            "target_accuracy": self.target_accuracy,
+        }
+        # fmt: on
+
+        for key, value in logging_configs.items():
+            if value is not None:
+                self._event(key=key, value=value)
+
+    def log_hyperparams_after_setup(self, data_parallel_size: int) -> None:
+        micro_batch_size = int(self.config["policy"]["train_micro_batch_size"])
+        denominator = micro_batch_size * int(data_parallel_size)
+        if denominator <= 0 or self.global_batch_size % denominator != 0:
+            raise ValueError(
+                "train_global_batch_size must be divisible by "
+                "train_micro_batch_size * data_parallel_size"
+            )
+        self._event(
+            key=self.constants.GRADIENT_ACCUMULATION_STEPS,
+            value=self.global_batch_size // denominator,
+        )
+
+    @staticmethod
+    def _dataset_len(dataset: Any) -> Optional[int]:
+        if dataset is None:
+            return None
+        if isinstance(dataset, Mapping):
+            return sum(len(ds) for ds in dataset.values())
+        return len(dataset)
+
+    def log_init_stop_run_start(self) -> None:
+        if self.run_started:
+            return
+        self.mllogger.log_init_stop_run_start()
+        self.run_started = True
+
+    def start_train_block(self, step: int) -> None:
+        if self.run_stopped or self.block_started:
+            return
+        self.last_step = max(self.last_step, int(step))
+        self.block_started = True
+        self.block_start_step = int(step)
+        self._start(
+            self.constants.BLOCK_START,
+            metadata={
+                self.constants.SAMPLES_COUNT: self.block_size_samples(step),
+                "step": int(step),
+            },
+        )
+
+    def stop_train_block(self, step: int, time_ms: Optional[float] = None) -> None:
+        if not self.block_started:
+            return
+        step = int(step)
+        self.last_step = max(self.last_step, step)
+        block_samples = max(0, step - self.block_start_step) * self.global_batch_size
+        self._end(
+            self.constants.BLOCK_STOP,
+            metadata={
+                self.constants.SAMPLES_COUNT: block_samples,
+                "step": step,
+            },
+            time_ms=time_ms,
+        )
+        self.block_started = False
+
+    def start_eval(self, step: int, time_ms: Optional[float] = None) -> None:
+        step = int(step)
+        self.stop_train_block(step, time_ms=time_ms)
+        self._start(
+            self.constants.EVAL_START,
+            metadata={
+                self.constants.SAMPLES_COUNT: self.sample_count(step),
+                "step": step,
+            },
+            time_ms=time_ms,
+        )
+
+    def end_eval(
+        self,
+        step: int,
+        val_metrics: Mapping[str, Any],
+        validation_timings: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        if self.run_stopped:
+            return
+        step = int(step)
+        self.last_step = max(self.last_step, step)
+        samples_count = self.sample_count(step)
+        # pass_k is the benchmark metric when grouped validation is on.
+        accuracy = self._to_scalar(
+            val_metrics.get("pass_k", val_metrics.get("accuracy", 0.0))
+        )
+
+        if validation_timings:
+            validation_time = self._to_scalar(
+                validation_timings.get("total_validation_time")
+            )
+            if validation_time is not None:
+                self._event(
+                    key="tracked_stats",
+                    metadata={"step": step},
+                    value={"validation_time": validation_time},
+                    unique=False,
+                )
+
+        self._event(
+            key=self.constants.EVAL_ACCURACY,
+            metadata={self.constants.SAMPLES_COUNT: samples_count},
+            value=accuracy,
+        )
+        self._end(
+            self.constants.EVAL_STOP,
+            metadata={
+                self.constants.SAMPLES_COUNT: samples_count,
+                "step": step,
+            },
+        )
+
+        if (
+            accuracy is not None
+            and self.target_accuracy is not None
+            and accuracy >= self.target_accuracy
+        ):
+            self.config["grpo"]["max_num_steps"] = step
+            self.stop_run(status="success", samples_count=samples_count)
+        elif step >= int(self.config["grpo"].get("max_num_steps", step)):
+            self.pending_run_stop_status = "aborted"
+        else:
+            self.start_train_block(step)
+
+    def end_eval_with_error(self, step: int) -> None:
+        self._end(
+            self.constants.EVAL_STOP,
+            metadata={
+                self.constants.SAMPLES_COUNT: self.sample_count(int(step)),
+                "step": int(step),
+            },
+        )
+        self.stop_run(status="aborted", samples_count=self.sample_count(int(step)))
+
+    def observe_logged_metrics(
+        self,
+        metrics: Mapping[str, Any],
+        step: int,
+        prefix: str,
+        step_finished: bool = False,
+    ) -> None:
+        """Dispatch a NeMo-RL logger.log_metrics call into MLPerf events.
+
+        Driven by MLPerfMetricsLoggerShim: validation metrics/timings are
+        buffered per step and form a complete eval block once both have
+        arrived (the trainers log them adjacently, in either order). While a
+        train block is open the eval is held until the step's train metrics
+        (logged after validation) have been emitted, so they land before
+        BLOCK_STOP; train metrics flow to observe_metrics unchanged.
+        """
+        if prefix == "validation":
+            self._pending_val_metrics[int(step)] = dict(metrics)
+            self._maybe_flush_eval(int(step))
+        elif prefix == "timing/validation":
+            self._pending_val_timings[int(step)] = dict(metrics)
+            self._maybe_flush_eval(int(step))
+        else:
+            self.observe_metrics(metrics, step, prefix, step_finished=step_finished)
+
+    def _maybe_flush_eval(self, step: int) -> None:
+        if (
+            step not in self._pending_val_metrics
+            or step not in self._pending_val_timings
+        ):
+            return
+        val_metrics = self._pending_val_metrics.pop(step)
+        validation_timings = self._pending_val_timings.pop(step)
+        if not self.run_started or self.run_stopped:
+            return
+        # The trainers log validation results after the eval finished, so
+        # backdate BLOCK_STOP/EVAL_START by the measured validation time to
+        # keep the mllog timeline faithful (mllog accepts explicit time_ms;
+        # _call degrades gracefully if the wrapper does not forward it).
+        eval_start_ms: Optional[float] = None
+        validation_time = self._to_scalar(
+            validation_timings.get("total_validation_time")
+        )
+        if validation_time is not None:
+            eval_start_ms = (time.time() - float(validation_time)) * 1000.0
+        if self.block_started:
+            # The trainers log the step's train metrics after validation.
+            # Hold the eval so those metrics land inside the open block,
+            # before BLOCK_STOP; observe_metrics/finalize flush it.
+            self._deferred_evals[step] = (
+                val_metrics,
+                validation_timings,
+                eval_start_ms,
+            )
+            return
+        self._flush_eval(step, val_metrics, validation_timings, eval_start_ms)
+
+    def _flush_eval(
+        self,
+        step: int,
+        val_metrics: Mapping[str, Any],
+        validation_timings: Mapping[str, Any],
+        eval_start_ms: Optional[float],
+    ) -> None:
+        self.start_eval(step, time_ms=eval_start_ms)
+        self.end_eval(step, val_metrics, validation_timings)
+
+    def _flush_deferred_evals(self, up_to_step: Optional[int] = None) -> None:
+        for step in sorted(self._deferred_evals):
+            if up_to_step is not None and step > up_to_step:
+                break
+            if self.run_stopped:
+                break
+            self._flush_eval(step, *self._deferred_evals.pop(step))
+
+    def observe_metrics(
+        self,
+        metrics: Mapping[str, Any],
+        step: int,
+        prefix: str,
+        step_finished: bool = False,
+    ) -> None:
+        step = int(step)
+        self.last_step = max(self.last_step, step)
+        if not self.run_started or self.run_stopped:
+            return
+
+        # A held eval flushes once the trainer moves past its step.
+        self._flush_deferred_evals(up_to_step=step - 1)
+        if self.run_stopped:
+            return
+
+        if prefix == "train":
+            tracked = self._extract_train_stats(metrics)
+        elif prefix == "timing/train":
+            tracked = self._extract_timing_stats(metrics)
+            if not step_finished and not tracked:
+                return
+        else:
+            return
+
+        if tracked:
+            self._event(
+                key="tracked_stats",
+                metadata={
+                    self.constants.SAMPLES_COUNT: self.sample_count(step),
+                    "step": step,
+                },
+                value=tracked,
+                unique=False,
+            )
+
+        if step_finished:
+            # The step's metrics are all logged; the held eval can close
+            # the block now: BLOCK_STOP, then EVAL_START..EVAL_STOP.
+            self._flush_deferred_evals(up_to_step=step)
+
+    def _extract_train_stats(self, metrics: Mapping[str, Any]) -> dict[str, Any]:
+        key_map = {
+            "loss": "reduced_train_loss",
+            "reward": "reward",
+            "grad_norm": "grad_norm",
+            "global_valid_toks": "global_valid_toks",
+            "global_valid_seqs": "global_valid_seqs",
+        }
+        tracked = {}
+        for source_key, output_key in key_map.items():
+            if source_key in metrics:
+                tracked[output_key] = self._to_scalar(metrics[source_key])
+        return {k: v for k, v in tracked.items() if v is not None}
+
+    def _extract_timing_stats(self, metrics: Mapping[str, Any]) -> dict[str, Any]:
+        key_map = {
+            "total_step_time": "train_step_time",
+            "policy_training": "policy_training_time",
+            "generation": "generation_time",
+            "exposed_generation": "exposed_generation_time",
+            "weight_sync": "weight_sync_time",
+            "valid_tokens_per_sec_per_gpu": "valid_tokens_per_sec_per_gpu",
+        }
+        tracked = {}
+        for source_key, output_key in key_map.items():
+            if source_key in metrics:
+                tracked[output_key] = self._to_scalar(metrics[source_key])
+        return {k: v for k, v in tracked.items() if v is not None}
+
+    @staticmethod
+    def _to_scalar(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (int, float, bool, str)):
+            return value
+        if hasattr(value, "item"):
+            try:
+                return value.item()
+            except (TypeError, ValueError):
+                pass
+        if hasattr(value, "mean"):
+            try:
+                mean_value = value.mean()
+                return mean_value.item() if hasattr(mean_value, "item") else mean_value
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def stop_run(self, status: str, samples_count: Optional[int] = None) -> None:
+        if self.run_stopped:
+            return
+        self.pending_run_stop_status = None
+        if status != "success" and self.force_success_status:
+            status = "success"
+        if samples_count is None:
+            samples_count = self.sample_count(self.last_step)
+        self._end(
+            self.constants.RUN_STOP,
+            metadata={
+                self.constants.SAMPLES_COUNT: samples_count,
+                "status": status,
+            },
+        )
+        self.target_reached = status == "success"
+        self.run_stopped = True
+        self.block_started = False
+        # Terminal state: any evals still held for later steps can never be
+        # flushed (every entry point returns early once run_stopped).
+        self._deferred_evals.clear()
+
+    def finalize(self, status: str = "aborted") -> None:
+        if not self.run_started or self.run_stopped:
+            return
+        self._flush_deferred_evals()
+        if self.run_stopped:
+            return
+        status = self.pending_run_stop_status or status
+        self.stop_train_block(self.last_step)
+        self.stop_run(status=status, samples_count=self.sample_count(self.last_step))
+
+
+class MLPerfMetricsLoggerShim:
+    """Wrap the NeMo-RL logger so metric logging drives MLPerf lifecycle events.
+
+    Every log_metrics call is forwarded to the wrapped logger unchanged, then
+    mirrored into MLPerfGRPOLogger.observe_logged_metrics. All other logger
+    attributes delegate to the wrapped logger, so the shim is a drop-in
+    replacement for the logger object the trainers receive — no NeMo-RL
+    changes are required for MLPerf logging.
+    """
+
+    def __init__(self, logger: Any, mlperf_logger: "MLPerfGRPOLogger") -> None:
+        self._logger = logger
+        self._mlperf_logger = mlperf_logger
+
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: Optional[str] = "",
+        step_metric: Optional[str] = None,
+        step_finished: bool = False,
+    ) -> None:
+        self._logger.log_metrics(
+            metrics,
+            step,
+            prefix=prefix,
+            step_metric=step_metric,
+            step_finished=step_finished,
+        )
+        self._mlperf_logger.observe_logged_metrics(
+            metrics, int(step), prefix or "", step_finished=step_finished
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._logger, name)
