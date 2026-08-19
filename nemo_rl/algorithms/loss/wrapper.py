@@ -20,7 +20,10 @@ import torch.distributed
 
 from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    DraftCrossEntropyLossFn,
+    DraftTTTCrossEntropyLossFn,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
@@ -263,6 +266,11 @@ class DraftLossWrapper:
       vocabulary, and the token mask is packed with the same per-sequence
       shift; ``student_logits`` must be passed explicitly (it is kept out of
       the data dict so the packing loss wrappers never slice it).
+
+    ``ttt_steps > 1`` selects the multi-pass loss
+    (:class:`DraftTTTCrossEntropyLossFn`, weighted per pass by
+    ``ttt_pass_weights``), which returns per-pass metrics alongside the loss
+    and needs ``global_draft_pass_counts``.
     """
 
     def __init__(
@@ -271,6 +279,7 @@ class DraftLossWrapper:
         prepare_fn: Optional[Callable[Any, Any]],
         data_dict: BatchedDataDict[Any],
         loss_weight: float = 1.0,
+        global_draft_pass_counts: Optional[torch.Tensor] = None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -280,11 +289,14 @@ class DraftLossWrapper:
         d2t: Optional[torch.Tensor] = None,
         student_logits: Optional[torch.Tensor] = None,
         token_chunk_size: int = DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
+        ttt_steps: int = 1,
+        ttt_pass_weights: Optional[list[float]] = None,
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
         self.data_dict = data_dict
         self.loss_weight = loss_weight
+        self.global_draft_pass_counts = global_draft_pass_counts
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
@@ -306,10 +318,21 @@ class DraftLossWrapper:
             )
         if cu_seqlens_q is None and prepare_fn is None:
             raise ValueError("prepare_fn is required in unpacked mode.")
-        self.draft_loss_fn = DraftCrossEntropyLossFn(
-            vocab_parallel_group=vocab_parallel_group,
-            token_chunk_size=token_chunk_size,
-        )
+        # TODO(#3698): a single pass is DraftTTTCrossEntropyLossFn with one bin;
+        # fold DraftCrossEntropyLossFn into it with the forward merge in
+        # train.py, once the TTT loss also covers the packed layout.
+        self.multi_pass = ttt_steps > 1
+        if self.multi_pass:
+            self.draft_loss_fn: Any = DraftTTTCrossEntropyLossFn(
+                vocab_parallel_group=vocab_parallel_group,
+                pass_weights=ttt_pass_weights,
+                token_chunk_size=token_chunk_size,
+            )
+        else:
+            self.draft_loss_fn = DraftCrossEntropyLossFn(
+                vocab_parallel_group=vocab_parallel_group,
+                token_chunk_size=token_chunk_size,
+            )
 
     def _packed_draft_loss(
         self,
@@ -398,6 +421,15 @@ class DraftLossWrapper:
                 )
                 # Deferred payloads are only consumed by the Megatron split API.
                 metrics[DRAFT_STEP_PAYLOAD_KEY] = DraftStepState.metric_payload(stats)
+            elif self.multi_pass:
+                draft_loss, pass_metrics = self.draft_loss_fn(
+                    data=data,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    global_draft_pass_counts=self.global_draft_pass_counts,
+                    **loss_input,
+                )
+                metrics.update(pass_metrics)
             else:
                 draft_loss = self.draft_loss_fn(
                     data=data,

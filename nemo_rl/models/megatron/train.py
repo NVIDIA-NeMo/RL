@@ -301,11 +301,14 @@ def forward_with_post_processing_fn(
     defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    global_draft_pass_counts: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
     enable_opd_full_capture: bool = False,
+    draft_ttt_steps: int = 1,
+    draft_aux_layer_indices: Optional[Tuple[int, ...]] = None,
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
@@ -330,6 +333,10 @@ def forward_with_post_processing_fn(
         enable_hidden_capture: Whether to enable hidden state capture for draft model training
         enable_opd_full_capture: Whether to capture pre-LM-head hidden states for
             the full-vocabulary MOPD teacher payload
+        draft_ttt_steps: Number of TTT draft passes (policy.draft.ttt_steps)
+        draft_aux_layer_indices: Aux-layer ids to capture, resolved
+            rank-independently by the worker (every PP stage must agree; see
+            resolve_draft_aux_layer_ids)
         model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
 
     Returns:
@@ -369,7 +376,17 @@ def forward_with_post_processing_fn(
     # opd_full capture below the unqualified name reads as the generic one. Not
     # done here: it would pull draft/*.py and three @patch paths in
     # test_train.py into an unrelated feature's review.
-    capture_context, capture = get_capture_context(model, enable_hidden_capture)
+    #
+    # Capture the aux layers the DRAFT was built for (checkpoint
+    # eagle_aux_hidden_state_layer_ids / policy.draft.aux_layer_indices): the
+    # serving-side drafter taps exactly these policy layers. The worker resolves
+    # the list rank-independently and threads it in: under PP only the last
+    # stage owns a draft model to read it from, and the capture posts one P2P
+    # send/recv per id, so stages disagreeing about the list would desync the
+    # pipeline.
+    capture_context, capture = get_capture_context(
+        model, enable_hidden_capture, aux_layer_indices=draft_aux_layer_indices
+    )
     # Independent of the draft capture above: grabs the pre-LM-head hidden states
     # a frozen MOPD teacher ships for full-vocabulary distillation.
     opd_full_capture_context, opd_full_capture = get_opd_full_capture_context(
@@ -436,12 +453,26 @@ def forward_with_post_processing_fn(
                 dims=0,
                 cp_group=get_context_parallel_group(),
             )[0]
-        data_dict["student_logits"] = draft_model(
-            hidden_states=captured_states.hidden_states,
-            input_embeds=shifted_input_embeds,
-            attention_mask=attention_mask,
-            packed_seq_params=packed_seq_params,
-        )
+        if draft_ttt_steps > 1:
+            # Multi-pass TTT self-conditions on its own output, so it drives the
+            # draft decoder itself instead of the single forward below. Packing
+            # is rejected for TTT (per-pass slicing needs the unpacked [B, S]
+            # layout).
+            # TODO(#3698): ttt_steps == 1 is the one-pass case of forward_ttt;
+            # it stays on the forward below only because that one handles
+            # packed THD input. Merge the two once the CP/packing follow-up
+            # teaches forward_ttt packing.
+            data_dict["student_logits_by_pass"] = draft_model.forward_ttt(
+                hidden_states=captured_states.hidden_states,
+                input_embeds=shifted_input_embeds,
+            )
+        else:
+            data_dict["student_logits"] = draft_model(
+                hidden_states=captured_states.hidden_states,
+                input_embeds=shifted_input_embeds,
+                attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
+            )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
     # Loss computation should use unscaled logits.
@@ -467,6 +498,7 @@ def forward_with_post_processing_fn(
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
             prepacked_loss_mask=loss_mask_cp_sharded,
+            global_draft_pass_counts=global_draft_pass_counts,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         assert original_seq_length is not None
@@ -515,11 +547,14 @@ def megatron_forward_backward(
     defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    global_draft_pass_counts: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
     enable_opd_full_capture: bool = False,
+    draft_ttt_steps: int = 1,
+    draft_aux_layer_indices: Optional[Tuple[int, ...]] = None,
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
@@ -548,6 +583,8 @@ def megatron_forward_backward(
         enable_hidden_capture: Whether to enable hidden state capture for draft model training
         enable_opd_full_capture: Whether to capture pre-LM-head hidden states for
             the full-vocabulary MOPD teacher payload
+        draft_ttt_steps: Number of TTT draft passes (policy.draft.ttt_steps)
+        draft_aux_layer_indices: Aux-layer ids for the draft hidden-state capture
         model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
 
     Returns:
@@ -559,11 +596,14 @@ def megatron_forward_backward(
         defer_fp32_logits=defer_fp32_logits,
         global_valid_seqs=global_valid_seqs,
         global_valid_toks=global_valid_toks,
+        global_draft_pass_counts=global_draft_pass_counts,
         sampling_params=sampling_params,
         straggler_timer=straggler_timer,
         draft_model=draft_model,
         enable_hidden_capture=enable_hidden_capture,
         enable_opd_full_capture=enable_opd_full_capture,
+        draft_ttt_steps=draft_ttt_steps,
+        draft_aux_layer_indices=draft_aux_layer_indices,
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         use_router_replay=use_router_replay,
         router_replay_train=router_replay_train,
@@ -648,6 +688,7 @@ class LossPostProcessor:
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
         prepacked_loss_mask: Optional[torch.Tensor] = None,
+        global_draft_pass_counts: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -662,6 +703,8 @@ class LossPostProcessor:
             global_valid_toks: Global valid token count for loss normalization
             prepacked_loss_mask: CP-local target-aligned mask when MCore returned
                 per-token losses for a direct packed row
+            global_draft_pass_counts: DP-reduced per-pass valid-token counts for
+                the multi-pass (TTT) draft loss
 
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
@@ -807,12 +850,28 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
-            if "student_logits" in data_dict:
+            if "student_logits" in data_dict or "student_logits_by_pass" in data_dict:
+                ttt_steps = self.cfg["draft"].ttt_steps
+                # ttt_steps reaches the forward independently (the
+                # draft_ttt_steps argument threaded into
+                # megatron_forward_backward); a caller omitting it with a
+                # multi-pass config would otherwise surface as a KeyError far
+                # from the cause.
+                multi_pass = "student_logits_by_pass" in data_dict
+                if multi_pass != (ttt_steps > 1):
+                    raise RuntimeError(
+                        f"draft forward produced "
+                        f"{'multi-pass' if multi_pass else 'single-pass'} logits "
+                        f"but policy.draft.ttt_steps={ttt_steps}; the "
+                        "draft_ttt_steps argument threaded into "
+                        "megatron_forward_backward disagrees with the config."
+                    )
                 loss_fn_wrapped = DraftLossWrapper(
                     loss_fn=loss_fn_wrapped,
                     prepare_fn=prepare_loss_input_wrapped,
                     data_dict=data_dict,
                     loss_weight=float(self.cfg["draft"].loss_weight),
+                    global_draft_pass_counts=global_draft_pass_counts,
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=get_context_parallel_group(),
@@ -824,6 +883,8 @@ class LossPostProcessor:
                         )
                     ),
                     defer_normalization=self.defer_draft_normalization,
+                    ttt_steps=ttt_steps,
+                    ttt_pass_weights=self.cfg["draft"].ttt_pass_weights,
                 )
 
         loss_fn_wrapped = partial(

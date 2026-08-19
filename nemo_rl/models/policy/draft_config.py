@@ -44,6 +44,25 @@ class Eagle3DraftConfig(BaseModel, extra="allow"):
     num_layers: int | None = None
     aux_layer_indices: list[int] | None = None
     optimizer: DraftOptimizerConfig | None = None
+    # Multi-pass TTT: >1 runs that many sequential draft passes with the
+    # trunk+branch two-part attention (requires CP=1, no sequence parallel,
+    # no sequence packing). Pass-d RoPE positions are offset by d-1, matching
+    # modelopt's reference TTT.
+    ttt_steps: Annotated[int, Field(ge=1)] = 1
+    # Per-pass loss weights alpha_d (len == ttt_steps); None = uniform 1.0.
+    ttt_pass_weights: list[float] | None = None
+
+    @model_validator(mode="after")
+    def _validate_ttt_pass_weights(self) -> Self:
+        if (
+            self.ttt_pass_weights is not None
+            and len(self.ttt_pass_weights) != self.ttt_steps
+        ):
+            raise ValueError(
+                f"ttt_pass_weights must have ttt_steps={self.ttt_steps} entries, "
+                f"got {len(self.ttt_pass_weights)}."
+            )
+        return self
 
     @model_validator(mode="after")
     def _reject_near_miss_extra_keys(self) -> "Eagle3DraftConfig":

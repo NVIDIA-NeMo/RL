@@ -67,6 +67,7 @@ pytest.importorskip("megatron.bridge")
 # ``nemo_rl.models.policy.workers.megatron_policy_worker.<symbol>`` fails
 # at ``getattr(workers, "megatron_policy_worker")``.
 import nemo_rl.models.policy.workers.megatron_policy_worker  # noqa: E402,F401
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig  # noqa: E402
 
 pytestmark = pytest.mark.mcore
 
@@ -182,6 +183,7 @@ def _make_worker(loss_type):
     w.delegate_mtp_loss_mask_to_model = False
     w.model_slices_context_parallel_inputs = False
     w.mtp_enabled = False
+    w.draft_aux_layer_ids = None
     w._first_train_step_forward_pre_hook_disabled = False
     w._first_train_step_param_sync_func = None
     # Normally set from get_rank_safe() in __init__, which object.__new__ skips.
@@ -818,7 +820,7 @@ class TestFinish:
         w = _make_worker(
             LossType.TOKEN_LEVEL if token_level_loss else LossType.SEQUENCE_LEVEL
         )
-        w.cfg["draft"] = SimpleNamespace(enabled=True, loss_weight=draft_loss_weight)
+        w.cfg["draft"] = Eagle3DraftConfig(enabled=True, loss_weight=draft_loss_weight)
         draft_param = torch.nn.Parameter(torch.tensor(1.0))
         draft_param.grad_norm_group = "draft"
         draft_param.main_grad = torch.tensor(3.0)
@@ -877,7 +879,7 @@ class TestFinish:
             ],
         ]
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.cfg["draft"] = SimpleNamespace(enabled=True, loss_weight=0.5)
+        w.cfg["draft"] = Eagle3DraftConfig(enabled=True, loss_weight=0.5)
         draft_param = torch.nn.Parameter(torch.tensor(1.0))
         draft_param.grad_norm_group = "draft"
         draft_param.main_grad = torch.tensor(3.0)
@@ -921,7 +923,7 @@ class TestFinish:
             }
         ]
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.cfg["draft"] = SimpleNamespace(enabled=True, loss_weight=0.5)
+        w.cfg["draft"] = Eagle3DraftConfig(enabled=True, loss_weight=0.5)
         draft_param = torch.nn.Parameter(torch.tensor(1.0))
         draft_param.grad_norm_group = "draft"
         draft_param.main_grad = torch.tensor(3.0)

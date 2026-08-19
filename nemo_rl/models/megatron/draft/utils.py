@@ -1291,6 +1291,36 @@ def register_draft_grad_norm_group() -> None:
         )
 
 
+def resolve_draft_aux_layer_ids(
+    draft_config: Eagle3DraftConfig, num_layers: int
+) -> tuple[int, ...]:
+    """Resolve the policy aux-layer ids the draft taps, rank-independently.
+
+    Every PP stage must resolve the same list: the hidden-state capture posts
+    one P2P send/recv per id, so stages disagreeing about it desync the
+    pipeline — and only the last stage owns a draft model to read the resolved
+    value from. Sources, in order: the draft checkpoint's
+    ``eagle_aux_hidden_state_layer_ids`` when ``model_name`` is set (a config
+    read, identical on every rank), else ``policy.draft.aux_layer_indices``,
+    else modelopt's defaults (unless the checkpoint disables aux states).
+    """
+    from transformers import AutoConfig
+
+    from nemo_rl.models.megatron.draft.hidden_capture import (
+        get_eagle3_aux_hidden_state_layers,
+    )
+
+    model_name = draft_config.model_name
+    hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
+    if model_name is not None:
+        ids = hf_config.get("eagle_aux_hidden_state_layer_ids", [])
+    else:
+        ids = draft_config.aux_layer_indices or []
+    if not ids and hf_config.get("use_aux_hidden_state", True):
+        ids = get_eagle3_aux_hidden_state_layers(num_layers)
+    return tuple(int(i) for i in ids)
+
+
 def build_draft_model(
     model_provider,
     draft_config: Eagle3DraftConfig,
@@ -1304,9 +1334,6 @@ def build_draft_model(
     from transformers import AutoConfig
 
     from nemo_rl.models.megatron.draft.eagle import EagleModel
-    from nemo_rl.models.megatron.draft.hidden_capture import (
-        get_eagle3_aux_hidden_state_layers,
-    )
 
     model_name = draft_config.model_name
     hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
@@ -1362,11 +1389,14 @@ def build_draft_model(
     )
     config.rotary_percent = model_provider.rotary_percent
     config.rotary_base = hf_config.get("rope_theta", model_provider.rotary_base)
+    # Official z-lab configs carry an explicit "rope_scaling": null — a
+    # present-but-null key must read as "no scaling", not crash on None.get.
+    hf_rope_scaling = (hf_config.get("rope_scaling") or {}) if hf_config else None
     config.rope_scaling = (
-        "rope_scaling" in hf_config if hf_config else model_provider.rope_scaling
+        bool(hf_rope_scaling) if hf_config else model_provider.rope_scaling
     )
     config.rope_scaling_factor = (
-        hf_config.get("rope_scaling", {}).get("factor")
+        hf_rope_scaling.get("factor", model_provider.rope_scaling_factor)
         if hf_config
         else model_provider.rope_scaling_factor
     )
@@ -1376,25 +1406,17 @@ def build_draft_model(
     )
     config.use_last_layernorm = hf_config.get("use_last_layernorm", True)
     config.use_aux_hidden_state = hf_config.get("use_aux_hidden_state", True)
-    if model_name is not None:
-        config.eagle_aux_hidden_state_layer_ids = hf_config.get(
-            "eagle_aux_hidden_state_layer_ids", []
-        )
-    else:
-        config.eagle_aux_hidden_state_layer_ids = draft_config.aux_layer_indices or []
-    if (
-        config.use_aux_hidden_state
-        and len(config.eagle_aux_hidden_state_layer_ids) == 0
-    ):
-        config.eagle_aux_hidden_state_layer_ids = get_eagle3_aux_hidden_state_layers(
-            model_provider.num_layers
-        )
+    # Shared with the worker's capture threading so every PP stage resolves
+    # the same list (see resolve_draft_aux_layer_ids).
+    config.eagle_aux_hidden_state_layer_ids = list(
+        resolve_draft_aux_layer_ids(draft_config, model_provider.num_layers)
+    )
 
     config.parallel_draft_step = 1
     config.use_mtp_layernorm = config.parallel_draft_heads_num_layers = None
     config.has_lm_head = True
 
-    draft_model = EagleModel(config=config)
+    draft_model = EagleModel(config=config, ttt_steps=draft_config.ttt_steps)
     tp_group = getattr(pg_collection, "tp", None)
     if tp_group is not None:
         for module in draft_model.modules():

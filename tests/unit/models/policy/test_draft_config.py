@@ -43,6 +43,8 @@ def test_eagle3_draft_config_preserves_legacy_defaults() -> None:
         "num_layers": None,
         "aux_layer_indices": None,
         "optimizer": None,
+        "ttt_steps": 1,
+        "ttt_pass_weights": None,
     }
 
 
@@ -91,6 +93,15 @@ def test_eagle3_draft_config_rejects_near_miss_typo_keys() -> None:
         Eagle3DraftConfig.model_validate({"enalbed": True})
     with pytest.raises(ValidationError, match="did you mean 'loss_weight'"):
         Eagle3DraftConfig.model_validate({"loss_wieght": 0.5})
+
+
+def test_eagle3_draft_config_validates_ttt_fields() -> None:
+    config = Eagle3DraftConfig(ttt_steps=3, ttt_pass_weights=[1.0, 0.5, 0.25])
+    assert config.ttt_steps == 3
+    with pytest.raises(ValidationError, match="ttt_steps"):
+        Eagle3DraftConfig(ttt_steps=0)
+    with pytest.raises(ValidationError, match="ttt_pass_weights"):
+        Eagle3DraftConfig(ttt_steps=2, ttt_pass_weights=[1.0])
 
 
 def test_eagle3_draft_config_rejects_unknown_speculator_type() -> None:

@@ -20,8 +20,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
-from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
+from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE, DraftLossStats
+from nemo_rl.algorithms.loss.loss_functions import (
+    DraftCrossEntropyLossFn,
+    DraftTTTCrossEntropyLossFn,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 DRAFT_STEP_PAYLOAD_KEY = "_draft_step_payload"
@@ -406,3 +409,83 @@ def test_packed_mode_rejects_deferred_normalization():
             student_logits=batch["packed_student"],
             defer_normalization=True,
         )
+
+
+@patch("nemo_rl.algorithms.loss.wrapper.DraftTTTCrossEntropyLossFn")
+def test_draft_loss_wrapper_threads_ttt_pass_counts_and_metrics(mock_draft_loss_cls):
+    """ttt_steps > 1 selects the multi-pass loss and threads its inputs/outputs."""
+    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+
+    data = BatchedDataDict({})
+    global_valid = torch.tensor(1)
+    draft_pass_counts = torch.tensor([42.0, 17.0])
+    draft_loss_fn = MagicMock(
+        return_value=(torch.tensor(0.5), {"draft_loss_pass_1": 2.0})
+    )
+    mock_draft_loss_cls.return_value = draft_loss_fn
+
+    wrapper = DraftLossWrapper(
+        loss_fn=MagicMock(return_value=(torch.tensor(1.0), {"loss": 1.0})),
+        prepare_fn=MagicMock(return_value=({}, data)),
+        data_dict=data,
+        loss_weight=1.0,
+        global_draft_pass_counts=draft_pass_counts,
+        ttt_steps=2,
+        ttt_pass_weights=[1.0, 0.5],
+    )
+    combined_loss, metrics = wrapper(
+        next_token_logits=torch.randn(1, 2, 3),
+        data=data,
+        global_valid_seqs=global_valid,
+        global_valid_toks=global_valid,
+    )
+
+    mock_draft_loss_cls.assert_called_once_with(
+        vocab_parallel_group=None,
+        pass_weights=[1.0, 0.5],
+        token_chunk_size=DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
+    )
+    assert (
+        draft_loss_fn.call_args.kwargs["global_draft_pass_counts"] is draft_pass_counts
+    )
+    assert combined_loss.item() == 1.5
+    assert metrics["draft_loss"] == 0.5
+    assert metrics["draft_loss_pass_1"] == 2.0
+    assert metrics["total_loss"] == 1.5
+
+
+@patch("nemo_rl.algorithms.loss.loss_functions.streaming_vocab_parallel_soft_ce")
+def test_draft_ttt_cross_entropy_loss_slices_each_pass_for_streaming_path(
+    mock_streaming_ce,
+):
+    """Each TTT pass feeds the streaming soft-CE its own shifted slices."""
+    seq_len = 4
+    teacher_logits = torch.randn(2, seq_len, 5)
+    student_logits = torch.randn(2, seq_len, 5)
+    token_mask = torch.ones(2, seq_len)
+    sample_mask = torch.ones(2)
+    # Pass 1 slices to valid_len = S - 2 = 2 positions: 4 valid targets.
+    mock_streaming_ce.return_value = DraftLossStats(
+        numerators=torch.tensor([8.0]),
+        counts=torch.tensor([4.0]),
+        weights=torch.ones(1),
+    )
+
+    loss_fn = DraftTTTCrossEntropyLossFn(vocab_parallel_group=MagicMock())
+    loss, metrics = loss_fn(
+        teacher_logits=teacher_logits,
+        student_logits_by_pass=[student_logits],
+        data=BatchedDataDict({"sample_mask": sample_mask, "token_mask": token_mask}),
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(1.0),
+        global_draft_pass_counts=torch.tensor([4.0]),
+    )
+
+    call_kwargs = mock_streaming_ce.call_args.kwargs
+    assert torch.equal(call_kwargs["student_logits"], student_logits[:, :2])
+    assert torch.equal(call_kwargs["teacher_logits"], teacher_logits[:, 1:3])
+    assert call_kwargs["mask"].shape == (2, 2)
+    assert call_kwargs["token_chunk_size"] == DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
+    assert call_kwargs["tp_group"] is loss_fn.vocab_parallel_group
+    assert loss.item() == pytest.approx(2.0)
+    assert metrics["draft_loss_pass_1"] == pytest.approx(2.0)
