@@ -275,6 +275,58 @@ def _dense_oracle(inputs: dict[str, object]) -> tuple[DSparkLossBins, ...]:
     return tuple(components)
 
 
+def _teacher_label_inputs() -> dict[str, object]:
+    return {
+        "target_logits": torch.tensor([[[4.0, 4.0, -3.0]]]),
+        "draft_hidden": torch.tensor([[[0.25, -0.5]]], requires_grad=True),
+        "target_output_weight": torch.tensor(
+            [[-1.0, 0.5], [2.0, -0.25], [0.75, 1.5]]
+        ),
+        "markov_w1": torch.zeros(3, 1, requires_grad=True),
+        "markov_w2": torch.zeros(3, 1, requires_grad=True),
+        "previous_token_ids": torch.zeros(1, 1, dtype=torch.long),
+        "confidence_logits": None,
+        "valid_mask": torch.ones(1, 1, dtype=torch.bool),
+        "slot_bins": torch.zeros(1, 1, dtype=torch.long),
+        "loss_weights": (1.0, 0.0, 0.0),
+        "token_chunk_size": 1,
+        "draft_vocab_start_index": 0,
+        "tp_group": None,
+    }
+
+
+def test_hard_ce_uses_first_selected_teacher_argmax_and_matches_gradient() -> None:
+    """A selected-logit tie must choose its first draft-vocabulary position."""
+    inputs = _teacher_label_inputs()
+    hidden = inputs["draft_hidden"]
+    output_weight = inputs["target_output_weight"]
+    assert isinstance(hidden, torch.Tensor)
+    assert isinstance(output_weight, torch.Tensor)
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    reference_logits = reference_hidden @ output_weight.T
+    reference_loss = F.cross_entropy(
+        reference_logits.reshape(1, -1),
+        torch.tensor([0]),
+    )
+    reference_loss.backward()
+
+    stats = dspark_tiled_objective(**inputs)
+    loss = stats.ce.normalized(normalization_counts=stats.ce.counts)
+    loss.backward()
+
+    torch.testing.assert_close(loss, reference_loss)
+    torch.testing.assert_close(hidden.grad, reference_hidden.grad)
+
+
+def test_public_objective_rejects_external_hard_labels() -> None:
+    """Dataset or full-vocabulary IDs cannot override the selected teacher mode."""
+    with pytest.raises(TypeError, match="hard_labels"):
+        dspark_tiled_objective(
+            **_teacher_label_inputs(),
+            hard_labels=torch.tensor([[2]]),
+        )
+
+
 @pytest.mark.parametrize(
     "loss_weights",
     [

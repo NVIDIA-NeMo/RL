@@ -676,6 +676,54 @@ def _run_tp2_provider_checkpoint(
         )
 
 
+def _run_tp2_teacher_argmax_tie(rank: int, world_size: int) -> None:
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    device = torch.device("cuda")
+    full_target_logits = torch.tensor(
+        [[[0.0, 5.0, 5.0, -1.0]]],
+        device=device,
+    )
+    full_output_weight = torch.tensor(
+        [[-2.0], [-1.0], [2.0], [4.0]],
+        device=device,
+    )
+    local_vocab_size = full_target_logits.shape[-1] // world_size
+    vocab_start = rank * local_vocab_size
+    vocab_end = vocab_start + local_vocab_size
+    hidden = torch.tensor([[[0.5]]], device=device, requires_grad=True)
+    stats = dspark_tiled_objective(
+        target_logits=full_target_logits[..., vocab_start:vocab_end],
+        draft_hidden=hidden,
+        target_output_weight=full_output_weight[vocab_start:vocab_end],
+        markov_w1=torch.zeros(4, 1, device=device, requires_grad=True),
+        markov_w2=torch.zeros(
+            local_vocab_size,
+            1,
+            device=device,
+            requires_grad=True,
+        ),
+        previous_token_ids=torch.zeros(1, 1, dtype=torch.long, device=device),
+        confidence_logits=None,
+        valid_mask=torch.ones(1, 1, dtype=torch.bool, device=device),
+        slot_bins=torch.zeros(1, 1, dtype=torch.long, device=device),
+        loss_weights=(1.0, 0.0, 0.0),
+        token_chunk_size=1,
+        draft_vocab_start_index=vocab_start,
+        tp_group=tp_group,
+    )
+    actual_loss = stats.ce.normalized(normalization_counts=stats.ce.counts)
+    actual_loss.backward()
+
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    reference_loss = F.cross_entropy(
+        (reference_hidden @ full_output_weight.T).reshape(1, -1),
+        torch.tensor([1], device=device),
+    )
+    reference_loss.backward()
+    torch.testing.assert_close(actual_loss, reference_loss)
+    torch.testing.assert_close(hidden.grad, reference_hidden.grad)
+
+
 def _run_tp2_provider_preflight(rank: int, world_size: int, case: str) -> None:
     tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
@@ -752,6 +800,12 @@ def test_tp2_split_vocab_mapping_and_bounds(distributed_test_runner) -> None:
 
 def test_dp2_normalized_gradient_uses_global_counts(distributed_test_runner) -> None:
     distributed_test_runner(_run_dp2_global_normalization_gradient, world_size=2)
+
+
+def test_tp2_teacher_argmax_tie_uses_lowest_selected_vocab_id(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(_run_tp2_teacher_argmax_tie, world_size=2)
 
 
 @pytest.mark.parametrize("case", ["shape", "dtype", "device"])
