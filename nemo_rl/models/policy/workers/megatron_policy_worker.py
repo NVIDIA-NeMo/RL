@@ -1683,10 +1683,9 @@ class MegatronPolicyWorkerImpl(
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, mp_group=pg_collection.mp
         )
-        if draft_step_state.active:
-            draft_grad_norm = reduce_max_stat_across_model_parallel_group(
-                draft_grad_norm, mp_group=pg_collection.mp
-            )
+        draft_grad_norm = reduce_max_stat_across_model_parallel_group(
+            draft_grad_norm, mp_group=pg_collection.mp
+        )
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
             torch.cuda.empty_cache()
