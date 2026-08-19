@@ -46,6 +46,48 @@ def _dense_projected_stats(
 
 
 @pytest.mark.parametrize(
+    ("num_tokens", "expected_grad_fn"),
+    [
+        pytest.param(4, "_CachedVocabParallelSoftCEBackward", id="one_tile_native"),
+        pytest.param(
+            5,
+            "_StreamingProjectedVocabParallelSoftCEBackward",
+            id="multiple_tiles_projected",
+        ),
+    ],
+)
+def test_projected_soft_ce_routes_at_tile_boundary(
+    num_tokens: int,
+    expected_grad_fn: str,
+) -> None:
+    """Only one-tile inputs bypass the projected custom-autograd implementation."""
+    generator = torch.Generator().manual_seed(7531)
+    student_hidden = torch.randn(
+        num_tokens,
+        3,
+        generator=generator,
+    ).requires_grad_(True)
+    output_weight = torch.randn(7, 3, generator=generator).requires_grad_(True)
+    teacher_logits = torch.randn(3, 7, generator=generator).requires_grad_(True)
+
+    stats = projected_streaming_vocab_parallel_soft_ce(
+        student_hidden=student_hidden,
+        output_weight=output_weight,
+        teacher_logits=teacher_logits,
+        teacher_row_indices=torch.tensor([2, 0, 2, 1, 0])[:num_tokens],
+        mask=torch.ones(num_tokens),
+        token_chunk_size=4,
+        tp_group=None,
+    )
+    assert type(stats.numerators.grad_fn).__name__ == expected_grad_fn
+    stats.normalized(normalization_counts=stats.counts).backward()
+
+    assert student_hidden.grad is not None
+    assert output_weight.grad is None
+    assert teacher_logits.grad is None
+
+
+@pytest.mark.parametrize(
     "num_tokens",
     [pytest.param(4, id="one_tile"), pytest.param(5, id="multiple_tiles")],
 )

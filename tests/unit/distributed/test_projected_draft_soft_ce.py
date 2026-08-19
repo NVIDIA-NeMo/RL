@@ -84,10 +84,23 @@ def _run_tp2_projected_soft_ce(
         * mask
         / ((expected_counts * weights).sum() + 1e-8)
     )
-    expected_hidden_gradient = (
-        (student_log_probs.exp() - teacher_probs).mul(row_scale.unsqueeze(-1))
-        @ full_output_weight.float()
-    ).to(student_hidden.dtype)
+    logits_gradient = (student_log_probs.exp() - teacher_probs).mul(
+        row_scale.unsqueeze(-1)
+    )
+    if token_chunk_size >= num_tokens:
+        expected_hidden_gradient = (
+            logits_gradient[:, vocab_start:vocab_end].to(student_hidden.dtype)
+            @ full_output_weight[vocab_start:vocab_end]
+        )
+        torch.distributed.all_reduce(
+            expected_hidden_gradient,
+            op=torch.distributed.ReduceOp.SUM,
+            group=tp_group,
+        )
+    else:
+        expected_hidden_gradient = (logits_gradient @ full_output_weight.float()).to(
+            student_hidden.dtype
+        )
     expected_loss.backward()
 
     local_output_weight = (
