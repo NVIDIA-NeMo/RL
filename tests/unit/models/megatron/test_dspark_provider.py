@@ -105,6 +105,66 @@ def _provider_inputs() -> dict[str, object]:
     }
 
 
+def _run_requested_none_group_drift(
+    rank: int,
+    world_size: int,
+    init_method: str,
+) -> None:
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        provider = build_dspark_provider(
+            body=_CheckpointIdentity(),
+            target_vocab_size=9,
+            draft_vocab_size=9,
+            hidden_size=5,
+            markov_rank=3,
+            confidence_enabled=False,
+            confidence_with_markov=False,
+            tensor_parallel_group=(
+                None if rank == 0 else torch.distributed.group.WORLD
+            ),
+            dtype=torch.float64,
+        )
+        inputs = _provider_inputs()
+        inputs["loss_weights"] = (1.0, 1.0, 0.0)
+
+        if rank == 0:
+            stats = provider.objective_stats(**inputs)
+            assert torch.isfinite(stats.combined.numerators).all()
+        else:
+            with pytest.raises(ValueError, match="objective TP group must match"):
+                provider.objective_stats(**inputs)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def _assert_requested_none_group_drift_terminates(tmp_path: Path) -> None:
+    context = torch.multiprocessing.get_context("spawn")
+    init_method = f"file://{tmp_path / 'requested-none-group-drift.init'}"
+    processes = [
+        context.Process(
+            target=_run_requested_none_group_drift,
+            args=(rank, 2, init_method),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=15)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join()
+    assert not alive, "requested=None left a rank blocked in a TP collective"
+    assert [process.exitcode for process in processes] == [0, 0]
+
+
 def test_factory_preserves_public_split_vocab_shapes() -> None:
     """The public DSpark artifact keeps target W1 and draft W2 vocabularies split."""
     provider = build_dspark_provider(
@@ -249,6 +309,13 @@ def test_provider_rejects_mismatched_tp_head_and_objective_group() -> None:
 
     with pytest.raises(ValueError, match="TP group"):
         provider.objective_stats(**inputs)
+
+
+def test_requested_none_group_drift_terminates_without_collective(
+    tmp_path: Path,
+) -> None:
+    """A missing requested group must not strand a rank in its configured group."""
+    _assert_requested_none_group_drift_terminates(tmp_path)
 
 
 def test_factory_rejects_body_without_sharded_state_contract() -> None:
