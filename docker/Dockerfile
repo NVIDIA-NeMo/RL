@@ -486,8 +486,8 @@ EOF
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN if git -C /opt/nemo-rl rev-parse --is-shallow-repository | grep -q true; then \
-        git -C /opt/nemo-rl -c fetch.recurseSubmodules=false fetch --unshallow; \
-    fi && \
+        git -C /opt/nemo-rl -c fetch.recurseSubmodules=false fetch --unshallow || true; \
+    fi; \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl/.git
 ARG BASE_IMAGE
 RUN --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/opt/nemo_rl_cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
