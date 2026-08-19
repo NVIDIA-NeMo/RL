@@ -16,7 +16,7 @@ import asyncio
 import copy
 import enum
 import json
-import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -41,6 +41,11 @@ from nemo_rl.experience.failures import (
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.rollout_recovery import (
+    PromptGroupStatus,
+    RolloutAttemptStatus,
+    RolloutRecoveryLedger,
+)
 from nemo_rl.experience.rollouts import (
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
@@ -56,6 +61,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 
 if TYPE_CHECKING:
     from nemo_rl.experience.finalizer_actor import FinalizationRequest
@@ -347,7 +353,12 @@ class AsyncRolloutImpl:
         self._timeouts = timeouts
 
     async def run_rollout(
-        self, input_sample: DatumSpec, *, rollout_ids: Optional[list[str]] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        rollout_ids: Optional[list[str]] = None,
+        generation_indices: Optional[list[int]] = None,
+        on_completion: Optional[RolloutCompletionCallback] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
@@ -360,6 +371,12 @@ class AsyncRolloutImpl:
         """
         assert rollout_ids is None, (
             "token capture (rollout_ids) is only supported on the NeMo-Gym path"
+        )
+        assert generation_indices is None, (
+            "partial sibling dispatch is only supported on the NeMo-Gym path"
+        )
+        assert on_completion is None, (
+            "streamed completion callbacks are only supported on the NeMo-Gym path"
         )
         timer = Timer()
         timer_prefix = "timing/rollout"
@@ -747,7 +764,12 @@ class AsyncNemoGymRolloutImpl:
         self._validate_init_params()
 
     async def run_rollout(
-        self, input_sample: DatumSpec, *, rollout_ids: Optional[list[str]] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        rollout_ids: Optional[list[str]] = None,
+        generation_indices: Optional[list[int]] = None,
+        on_completion: Optional[RolloutCompletionCallback] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
@@ -765,9 +787,16 @@ class AsyncNemoGymRolloutImpl:
         timer_prefix = "timing/rollout"
         timer.start(f"{timer_prefix}/total")
 
-        rollout_inputs = self._build_inputs(input_sample, rollout_ids=rollout_ids)
+        rollout_inputs = self._build_inputs(
+            input_sample,
+            rollout_ids=rollout_ids,
+            generation_indices=generation_indices,
+        )
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
-            rollout_inputs, timer, timer_prefix
+            rollout_inputs,
+            timer,
+            timer_prefix,
+            on_completion=on_completion,
         )
 
         timer.stop(f"{timer_prefix}/total")
@@ -797,7 +826,11 @@ class AsyncNemoGymRolloutImpl:
         )
 
     def _build_inputs(
-        self, input_sample: DatumSpec, *, rollout_ids: Optional[list[str]] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        rollout_ids: Optional[list[str]] = None,
+        generation_indices: Optional[list[int]] = None,
     ) -> list[dict]:
         """Build N row dicts from input_sample, applying generation config params."""
         # Build a template row from the input_sample's extra_env_info, applying generation params.
@@ -823,8 +856,19 @@ class AsyncNemoGymRolloutImpl:
             assert len(rollout_ids) == self._num_generations_per_prompt, (
                 "token-capture rollout ids must be one per generation"
             )
+        indices = (
+            list(range(self._num_generations_per_prompt))
+            if generation_indices is None
+            else list(generation_indices)
+        )
+        if len(indices) != len(set(indices)) or any(
+            not 0 <= index < self._num_generations_per_prompt for index in indices
+        ):
+            raise ValueError(
+                "generation_indices must be unique and within the prompt group"
+            )
         rows = []
-        for i in range(self._num_generations_per_prompt):
+        for i in indices:
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
             if rollout_ids is not None:
@@ -842,6 +886,7 @@ class AsyncNemoGymRolloutImpl:
         results: list[Optional[dict]],
         total_rows: int,
         timer_prefix: str,
+        on_completion: Optional[RolloutCompletionCallback] = None,
     ) -> Optional[dict[str, Any]]:
         """Dispatch ``pending`` rows and fill their slots in ``results`` as they land.
 
@@ -879,13 +924,20 @@ class AsyncNemoGymRolloutImpl:
                 raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
             received.add(rowidx)
             results[rowidx] = result
+            if on_completion is not None:
+                await on_completion(rowidx, self._result_to_completion(result))
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics
 
         return env_timing_metrics
 
     async def _run_rollouts(
-        self, inputs: list[dict], timer: Timer, timer_prefix: str
+        self,
+        inputs: list[dict],
+        timer: Timer,
+        timer_prefix: str,
+        *,
+        on_completion: Optional[RolloutCompletionCallback] = None,
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics.
 
@@ -896,21 +948,26 @@ class AsyncNemoGymRolloutImpl:
         attempts, which is the same shape as the legacy collector's pending-group retry.
         """
         nemo_gym_env = self._task_to_env["nemo_gym"]
-        total_rows = len(inputs)
+        if not inputs:
+            raise ValueError("NeMo-Gym rollout dispatch requires at least one row")
+        total_rows = self._num_generations_per_prompt
         # Re-dispatch maps NeMo-Gym's echoed _rowidx back onto the original group, so
         # the rows must carry the index _build_inputs stamped on them. Checked here
         # because the alternative is a KeyError several frames deeper.
-        for position, row in enumerate(inputs):
-            if row.get("_rowidx") != position:
+        for row in inputs:
+            rowidx = row.get("_rowidx")
+            if not isinstance(rowidx, int) or not 0 <= rowidx < total_rows:
                 raise ValueError(
-                    f"NeMo-Gym input row {position} carries _rowidx="
-                    f"{row.get('_rowidx')!r}; rows must be stamped with their own "
-                    "position for re-dispatch to preserve ordering"
+                    f"NeMo-Gym input row carries invalid _rowidx={rowidx!r}; "
+                    f"expected an index within {total_rows} generations"
                 )
+        expected_indices = [row["_rowidx"] for row in inputs]
+        if len(expected_indices) != len(set(expected_indices)):
+            raise ValueError("NeMo-Gym input rows contain duplicate _rowidx values")
 
         # Run generation and restore input order as results stream back.
         with timer.time(f"{timer_prefix}/run_rollouts"):
-            results: list[dict | None] = [None for _ in inputs]
+            results: list[dict | None] = [None for _ in range(total_rows)]
             env_timing_metrics: dict[str, Any] = {}
             # One deadline for the whole prompt group, re-dispatches included -- it is
             # the group that has a budget, not each attempt. It also spans the stream
@@ -944,7 +1001,12 @@ class AsyncNemoGymRolloutImpl:
                             self._stats.record_gym_row_redispatch(len(pending))
                     try:
                         timing_metrics = await self._stream_rows(
-                            nemo_gym_env, pending, results, total_rows, timer_prefix
+                            nemo_gym_env,
+                            pending,
+                            results,
+                            total_rows,
+                            timer_prefix,
+                            on_completion=on_completion,
                         )
                     except Exception as error:
                         last_error = error
@@ -959,7 +1021,7 @@ class AsyncNemoGymRolloutImpl:
                         if timing_metrics is not None:
                             env_timing_metrics = timing_metrics
 
-            missing = [i for i, result in enumerate(results) if result is None]
+            missing = [index for index in expected_indices if results[index] is None]
             if missing:
                 failure = GymTransportError(
                     "NeMo-Gym rollout stream ended before all rows arrived; missing "
@@ -972,7 +1034,11 @@ class AsyncNemoGymRolloutImpl:
                     raise failure
                 raise failure from last_error
 
-            completed_results = [result for result in results if result is not None]
+            completed_results: list[dict] = []
+            for index in expected_indices:
+                result = results[index]
+                assert result is not None
+                completed_results.append(result)
             # All N rollouts share the same input prompt; tensorize one copy.
             prompt_message_log = completed_results[0]["input_message_log"]
             _tensorize_by_key(prompt_message_log, "token_ids")
@@ -1158,6 +1224,7 @@ class RolloutManager:
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
+        recovery_ledger: Optional[RolloutRecoveryLedger] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1202,7 +1269,7 @@ class RolloutManager:
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
-        self._env_handles = task_to_env
+        self._recovery_ledger = recovery_ledger
         self._weight_version: int = 0
         # Run-wide, shared across concurrent generate_and_push calls. Safe as a plain
         # int: every caller runs on the SingleController's single event loop.
@@ -1213,6 +1280,11 @@ class RolloutManager:
         """Counters describing retry/skip activity so far."""
         return self._stats
 
+    @property
+    def recovery_ledger(self) -> Optional[RolloutRecoveryLedger]:
+        """Return the controller-owned token-capture lineage ledger."""
+        return self._recovery_ledger
+
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
 
@@ -1222,12 +1294,24 @@ class RolloutManager:
         self._weight_version = int(version)
 
     async def run_rollout(
-        self, input_sample: DatumSpec, *, rollout_ids: Optional[list[str]] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        rollout_ids: Optional[list[str]] = None,
+        generation_indices: Optional[list[int]] = None,
+        on_completion: Optional[RolloutCompletionCallback] = None,
     ) -> PromptGroupRecord:
         if rollout_ids is None:
+            assert generation_indices is None
+            assert on_completion is None
             # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
-        return await self._impl.run_rollout(input_sample, rollout_ids=rollout_ids)
+        return await self._impl.run_rollout(
+            input_sample,
+            rollout_ids=rollout_ids,
+            generation_indices=generation_indices,
+            on_completion=on_completion,
+        )
 
     async def generate_and_push(
         self,
@@ -1396,50 +1480,177 @@ class RolloutManager:
     ) -> "FinalizationRequest":
         """Run capture generation and return a metadata-only actor request.
 
-        Canonical sibling IDs are stable logical row names. Gate rollout IDs
-        identify the physical capture attempts and are kept separate so later
-        retry/recovery layers can replace an attempt without changing its row.
-        """
-        from nemo_rl.experience.finalizer_actor import FinalizationRequest
+        The replay-buffer slot remains reserved and unready. Logical sibling
+        IDs remain stable across retries; only unfinished siblings receive new
+        physical Gate attempt IDs. Sealed sibling receipts are therefore reused
+        instead of paying for the whole GRPO group again.
 
+        Returns:
+            A metadata-only finalizer request after successful generation, or
+            ``None`` when a deterministic prompt failure exhausts its budget
+            within ``max_skipped_prompts``.
+        """
         assert self._tq_buffer is not None, (
             "generate_for_finalization requires tq_buffer to be set at __init__"
         )
-        start_version = self._weight_version
-        group_id = str(uuid.uuid4())
-        canonical_sample_ids = tuple(
-            f"{group_id}_g{i}" for i in range(self._num_generations_per_prompt)
+        if self._recovery_ledger is None:
+            raise RuntimeError(
+                "generate_for_finalization requires a rollout recovery ledger"
+            )
+        recovery_group = self._recovery_ledger.reserve_group(
+            prompt_id=str(input_sample["idx"]),
+            prompt_payload=input_sample,
+            expected_generations=self._num_generations_per_prompt,
+            target_step=target_step,
+            start_weight_version=self._weight_version,
         )
-        rollout_ids = tuple(
-            f"{sample_id}_a{uuid.uuid4().hex}" for sample_id in canonical_sample_ids
-        )
+        recovery_group_id = recovery_group.group_id
+        policy = self._retry_policy
+        infra_attempts = 0
+        data_attempts = 0
+        last_infra_error: Optional[Exception] = None
+
+        while infra_attempts < policy.max_infra_attempts:
+            try:
+                return await self._generate_for_finalization_attempt(
+                    input_sample,
+                    recovery_group_id=recovery_group_id,
+                    inflight_registry=inflight_registry,
+                )
+            except Exception as error:
+                reason = type(error).__name__
+                if classify_rollout_failure(error) is FailureClass.INFRA:
+                    infra_attempts += 1
+                    last_infra_error = error
+                    if infra_attempts >= policy.max_infra_attempts:
+                        break
+                    self._stats.record_redispatch(reason)
+                    await asyncio.sleep(policy.backoff_for(infra_attempts))
+                    continue
+
+                data_attempts += 1
+                if data_attempts >= policy.max_data_attempts:
+                    self._stats.record_data_failure(reason)
+                    if self._skipped_prompts >= policy.max_skipped_prompts:
+                        if policy.max_skipped_prompts == 0:
+                            raise
+                        raise RolloutDataFailure(
+                            f"skipped {self._skipped_prompts} prompts and this one "
+                            "also exhausted its data budget, exceeding "
+                            f"max_skipped_prompts={policy.max_skipped_prompts}; "
+                            "the dataset or sequence-length configuration is likely "
+                            "wrong"
+                        ) from error
+                    self._skipped_prompts += 1
+                    await self._discard_recovery_group(recovery_group_id)
+                    print(
+                        f"skipping prompt idx={input_sample['idx']} after "
+                        f"{data_attempts} deterministic failure(s) "
+                        f"({reason}: {error})",
+                        flush=True,
+                    )
+                    self._stats.skipped += 1
+                    return None
+                self._stats.record_data_retry(reason)
+
+        assert last_infra_error is not None
+        raise RolloutRedispatchExhausted(
+            f"prompt idx={input_sample['idx']} exhausted its infrastructure retry "
+            f"budget after {infra_attempts} attempt(s) "
+            f"(max_infra_attempts_per_prompt={policy.max_infra_attempts}); "
+            f"last failure was {type(last_infra_error).__name__}: "
+            f"{last_infra_error}"
+        ) from last_infra_error
+
+    async def _generate_for_finalization_attempt(
+        self,
+        input_sample: DatumSpec,
+        *,
+        recovery_group_id: str,
+        inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]],
+    ) -> "FinalizationRequest":
+        """Dispatch only unfinished siblings and leave one reserved slot unready."""
+        from nemo_rl.experience.finalizer_actor import FinalizationRequest
+
+        assert self._tq_buffer is not None
+        assert self._recovery_ledger is not None
+        recovery_group = self._recovery_ledger.get_group(recovery_group_id)
+        if recovery_group.status == PromptGroupStatus.GENERATING:
+            recovery_group = self._recovery_ledger.prepare_incomplete_retry(
+                recovery_group_id
+            )
+        pending_indices = [
+            sibling.generation_index
+            for sibling in recovery_group.siblings
+            if sibling.current_attempt.status != RolloutAttemptStatus.SEALED
+        ]
+        group_id = recovery_group.group_id
+        start_version = recovery_group.start_weight_version
+        rollout_ids = tuple(recovery_group.gate_rollout_ids)
         self._tq_buffer.reserve(
             weight_version=start_version,
-            target_step=target_step,
+            target_step=recovery_group.target_step,
             group_id=group_id,
             rollout_ids=list(rollout_ids),
         )
+
+        async def _record_streamed_completion(
+            generation_index: int, completion: Completion
+        ) -> None:
+            env_extras = completion.env_extras
+            if env_extras is None:
+                raise ValueError(
+                    "token-capture completion must contain environment extras"
+                )
+            receipt = env_extras.get("ng_receipt")
+            gate_rollout_id = env_extras.get("ng_rollout_id")
+            if not isinstance(receipt, dict):
+                raise ValueError(
+                    "token-capture completion must contain a receipt mapping"
+                )
+            if not isinstance(gate_rollout_id, str):
+                raise ValueError(
+                    "token-capture completion must contain its Gate rollout ID"
+                )
+            self._recovery_ledger.mark_sibling_sealed(
+                group_id,
+                generation_index=generation_index,
+                gate_rollout_id=gate_rollout_id,
+                receipt=receipt,
+                reward=completion.reward,
+            )
+
         try:
             if inflight_registry is not None:
                 current_task = asyncio.current_task()
                 assert current_task is not None
                 inflight_registry[group_id] = (current_task, start_version)
             try:
-                record = await self.run_rollout(
-                    input_sample,
-                    rollout_ids=list(rollout_ids),
-                )
+                if pending_indices:
+                    self._recovery_ledger.mark_group_dispatched(
+                        group_id, generation_indices=pending_indices
+                    )
+                    await self.run_rollout(
+                        input_sample,
+                        rollout_ids=list(rollout_ids),
+                        generation_indices=pending_indices,
+                        on_completion=_record_streamed_completion,
+                    )
             finally:
                 if inflight_registry is not None:
                     inflight_registry.pop(group_id, None)
-            receipts = tuple(c.env_extras.get("ng_receipt") for c in record.completions)
-            rewards = tuple(float(c.reward) for c in record.completions)
+            (
+                physical_rollout_ids,
+                canonical_sample_ids,
+                receipts,
+                rewards,
+            ) = self._recovery_ledger.finalization_inputs(group_id)
             request = FinalizationRequest(
                 group_id=group_id,
-                rollout_ids=rollout_ids,
-                canonical_sample_ids=canonical_sample_ids,
-                receipts=receipts,
-                rewards=rewards,
+                rollout_ids=tuple(physical_rollout_ids),
+                canonical_sample_ids=tuple(canonical_sample_ids),
+                receipts=tuple(receipts),
+                rewards=tuple(rewards),
                 fallback_weight_version=start_version,
             )
             from nemo_rl.experience.finalizer_actor import assert_metadata_only
@@ -1448,4 +1659,21 @@ class RolloutManager:
             return request
         except BaseException:
             self._tq_buffer.abort(group_id)
+            self._recovery_ledger.abandon_unsealed(group_id)
+            # The capture ledger has no per-rollout fail endpoint. Rows from
+            # abandoned attempts are unreferenced and are swept with the
+            # staging partition at run teardown.
             raise
+
+    async def _discard_recovery_group(self, group_id: str) -> None:
+        """Clean known staged rows before intentionally dropping lineage."""
+        assert self._tq_buffer is not None
+        assert self._recovery_ledger is not None
+        group = self._recovery_ledger.get_group(group_id)
+        staging_keys = [
+            key
+            for sibling in group.siblings
+            for key in sibling.current_attempt.staging_keys
+        ]
+        await self._tq_buffer.clear_staging_keys(staging_keys)
+        self._recovery_ledger.discard_group(group_id)
