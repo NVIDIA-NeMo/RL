@@ -30,6 +30,7 @@ from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
+    RETAINED_TASK_INDICES_KEY,
     PromptGroupRecord,
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
@@ -361,8 +362,20 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         num_prompts_per_step: int | None = None,
         current_training_step: int | None = None,
         max_age_steps: int | None = None,
-    ) -> dict[str, int]:
-        """Restore inside the actor and return only compact coordination metadata."""
+    ) -> dict[str, Any]:
+        """Restore inside the actor and return only compact coordination metadata.
+
+        Returns:
+            Mapping with ``num_trajectories`` (pre-filter count),
+            ``NEXT_NEMO_GYM_TASK_INDEX_KEY`` (one past the highest saved task
+            index, computed before age/step filtering; on a legacy resume this
+            keeps used indices from being re-issued, while a frontier-aligned
+            resume deliberately rewinds the counter to the saved base ordinal
+            so the covered window re-yields under its original indices), and
+            ``RETAINED_TASK_INDICES_KEY`` (the sorted task indices of the
+            groups that survived filtering — what a frontier-aligned resume
+            must not regenerate).
+        """
         state = torch.load(path, weights_only=False)
         saved_task_indices = [
             int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
@@ -379,9 +392,17 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         )
         del state
         gc.collect()
+        with self._lock:
+            retained_task_indices = sorted(
+                int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
+                for trajectory in self.trajectories
+                if isinstance(trajectory, dict)
+                and trajectory.get(NEMO_GYM_TASK_INDEX_KEY) is not None
+            )
         return {
             "num_trajectories": num_trajectories,
             NEXT_NEMO_GYM_TASK_INDEX_KEY: next_task_index,
+            RETAINED_TASK_INDICES_KEY: retained_task_indices,
         }
 
     def load_state_dict(
