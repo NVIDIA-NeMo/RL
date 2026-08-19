@@ -298,3 +298,73 @@ def test_confidence_head_without_markov_rejects_unexpected_embeddings() -> None:
             markov_embeddings=torch.randn((2, 4, 3)),
             slot_valid=slot_valid,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_heads_support_cuda_bfloat16_forward_and_backward() -> None:
+    torch.manual_seed(404)
+    device = torch.device("cuda")
+    markov_head = DSparkMarkovHead(
+        vocab_size=23,
+        markov_rank=6,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    confidence_head = DSparkConfidenceHead(
+        hidden_size=10,
+        markov_rank=6,
+        with_markov=True,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    base_logits = torch.randn(
+        (2, 4, 23),
+        device=device,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    hidden_states = torch.randn(
+        (2, 4, 10),
+        device=device,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    previous_token_ids = torch.tensor(
+        [[1, 2, 3, 4], [5, 6, 7, 8]],
+        device=device,
+    )
+    slot_valid = torch.tensor(
+        [[True, True, False, True], [True, False, True, True]],
+        device=device,
+    )
+    markov_embeddings = markov_head.markov_w1(previous_token_ids)
+
+    corrected_logits = markov_head(
+        base_logits,
+        previous_token_ids=previous_token_ids,
+        slot_valid=slot_valid,
+    )
+    confidence_logits = confidence_head(
+        hidden_states,
+        markov_embeddings=markov_embeddings,
+        slot_valid=slot_valid,
+    )
+    (
+        corrected_logits.float().square().mean() + confidence_logits.square().mean()
+    ).backward()
+
+    assert corrected_logits.dtype == torch.bfloat16
+    assert confidence_logits.dtype == torch.float32
+    assert torch.isfinite(corrected_logits).all()
+    assert torch.isfinite(confidence_logits).all()
+    assert torch.equal(
+        corrected_logits[~slot_valid],
+        torch.zeros_like(corrected_logits[~slot_valid]),
+    )
+    assert torch.equal(
+        confidence_logits[~slot_valid],
+        torch.zeros_like(confidence_logits[~slot_valid]),
+    )
+    for parameter in (*markov_head.parameters(), *confidence_head.parameters()):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
