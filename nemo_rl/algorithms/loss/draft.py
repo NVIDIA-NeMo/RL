@@ -321,88 +321,28 @@ class _StreamingVocabParallelSoftCE(torch.autograd.Function):
         )
 
 
-class _CachedProjectedVocabParallelSoftCE(torch.autograd.Function):
+class _SumTensorParallelHiddenGradient(torch.autograd.Function):
     @staticmethod
     def forward(  # pyrefly: ignore[bad-override]
         ctx: Any,
         student_hidden: torch.Tensor,
-        output_weight: torch.Tensor,
-        teacher_logits: torch.Tensor,
-        teacher_row_indices: torch.Tensor,
-        mask: torch.Tensor,
-        bin_ids: torch.Tensor,
-        num_bins: int,
         tp_group: torch.distributed.ProcessGroup | None,
     ) -> torch.Tensor:
-        hidden_size = student_hidden.shape[-1]
-        flat_hidden = student_hidden.reshape(-1, hidden_size)
-        flat_teacher = teacher_logits.reshape(-1, teacher_logits.shape[-1])
-        student_logits = flat_hidden @ output_weight.T
-        selected_teacher = flat_teacher.index_select(
-            0,
-            teacher_row_indices.reshape(-1),
-        )
-        teacher_probs, student_probs, cross_entropy = (
-            _cached_tile_distributions_and_cross_entropy(
-                student_logits,
-                selected_teacher,
-                tp_group,
-            )
-        )
-        numerators = torch.zeros(
-            num_bins,
-            dtype=torch.float32,
-            device=student_hidden.device,
-        )
-        numerators.scatter_add_(
-            0,
-            bin_ids.reshape(-1),
-            cross_entropy.mul_(mask.reshape(-1).float()),
-        )
-        ctx.save_for_backward(
-            teacher_probs,
-            student_probs,
-            output_weight,
-            mask,
-            bin_ids,
-        )
-        # pyrefly: ignore[implicitly-defined-attribute]
-        ctx.student_shape = student_hidden.shape
-        # pyrefly: ignore[implicitly-defined-attribute]
-        ctx.student_dtype = student_hidden.dtype
         ctx.tp_group = tp_group  # pyrefly: ignore[implicitly-defined-attribute]
-        return numerators
+        return student_hidden
 
     @staticmethod
     def backward(
         ctx: Any,
-        *grad_outputs: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None, None, None, None, None]:
-        (grad_numerators,) = grad_outputs
-        teacher_probs, student_probs, output_weight, mask, bin_ids = ctx.saved_tensors
-        row_scale = (
-            grad_numerators.index_select(0, bin_ids.reshape(-1))
-            * mask.reshape(-1).float()
-        )
-        logits_gradient = student_probs.sub(teacher_probs)
-        logits_gradient.mul_(row_scale.unsqueeze(-1))
-        hidden_gradient = logits_gradient @ output_weight.float()
+        hidden_gradient: torch.Tensor,
+    ) -> tuple[torch.Tensor, None]:
         if ctx.tp_group is not None:
             torch.distributed.all_reduce(
                 hidden_gradient,
                 op=torch.distributed.ReduceOp.SUM,
                 group=ctx.tp_group,
             )
-        return (
-            hidden_gradient.reshape(ctx.student_shape).to(dtype=ctx.student_dtype),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        return hidden_gradient, None
 
 
 class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
@@ -732,28 +672,48 @@ def projected_streaming_vocab_parallel_soft_ce(
 
     num_tokens = student_hidden.numel() // student_hidden.shape[-1]
     if num_tokens <= token_chunk_size:
-        numerators = _CachedProjectedVocabParallelSoftCE.apply(
+        vocab_parallel_hidden = _SumTensorParallelHiddenGradient.apply(
             student_hidden,
-            output_weight,
-            teacher_logits,
-            teacher_row_indices,
-            mask,
-            bin_ids,
-            num_bins,
             tp_group,
         )
-    else:
-        numerators = _StreamingProjectedVocabParallelSoftCE.apply(
-            student_hidden,
-            output_weight,
-            teacher_logits,
-            teacher_row_indices,
-            mask,
-            bin_ids,
-            num_bins,
-            token_chunk_size,
-            tp_group,
+        student_logits = (
+            vocab_parallel_hidden.reshape(-1, student_hidden.shape[-1])
+            @ output_weight.detach().T
         )
+        selected_teacher = (
+            teacher_logits.detach()
+            .reshape(-1, teacher_logits.shape[-1])
+            .index_select(
+                0,
+                teacher_row_indices.reshape(-1),
+            )
+        )
+        return streaming_vocab_parallel_soft_ce(
+            student_logits=student_logits.reshape(
+                *student_hidden.shape[:-1],
+                output_weight.shape[0],
+            ),
+            teacher_logits=selected_teacher.reshape(
+                *student_hidden.shape[:-1],
+                output_weight.shape[0],
+            ),
+            mask=mask,
+            bin_ids=bin_ids,
+            weights=weights,
+            token_chunk_size=token_chunk_size,
+            tp_group=tp_group,
+        )
+    numerators = _StreamingProjectedVocabParallelSoftCE.apply(
+        student_hidden,
+        output_weight,
+        teacher_logits,
+        teacher_row_indices,
+        mask,
+        bin_ids,
+        num_bins,
+        token_chunk_size,
+        tp_group,
+    )
     counts = torch.zeros(num_bins, dtype=torch.float32, device=mask.device)
     counts.scatter_add_(0, bin_ids.reshape(-1), mask.reshape(-1).float())
     return DraftLossStats(
