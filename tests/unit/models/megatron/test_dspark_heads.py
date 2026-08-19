@@ -16,20 +16,33 @@
 
 from __future__ import annotations
 
+import importlib.util
 import io
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from torch.nn import functional as F
 
-from nemo_rl.models.megatron.draft.dspark import (
-    DSparkConfidenceHead,
-    DSparkMarkovHead,
-)
+
+def _load_heads() -> tuple[type[nn.Module], type[nn.Module]]:
+    module_path = (
+        Path(__file__).resolve().parents[4] / "nemo_rl/models/megatron/draft/dspark.py"
+    )
+    spec = importlib.util.spec_from_file_location("dspark_head_contract", module_path)
+    if spec is None or spec.loader is None:
+        pytest.fail("Could not load the DSpark head module", pytrace=False)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    loaded_module = module if isinstance(module, ModuleType) else None
+    if loaded_module is None:
+        pytest.fail("DSpark head module did not load", pytrace=False)
+    return loaded_module.DSparkMarkovHead, loaded_module.DSparkConfidenceHead
 
 
-pytestmark = pytest.mark.mcore
+DSparkMarkovHead, DSparkConfidenceHead = _load_heads()
 
 
 def _run_markov_loss(
@@ -58,9 +71,7 @@ def test_markov_head_matches_dense_math_and_gradients() -> None:
     head = DSparkMarkovHead(vocab_size=11, markov_rank=3).double()
     base_logits = torch.randn((2, 4, 11), dtype=torch.float64, requires_grad=True)
     previous_token_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
-    slot_valid = torch.tensor(
-        [[True, True, False, True], [True, False, True, True]]
-    )
+    slot_valid = torch.tensor([[True, True, False, True], [True, False, True, True]])
 
     actual = head(
         base_logits,
@@ -163,17 +174,36 @@ def test_markov_head_has_explicit_tp_local_vocab_contract() -> None:
 
 
 def test_markov_head_checkpoint_names_and_tp1_shapes_match_public_dspark() -> None:
-    head = DSparkMarkovHead(vocab_size=151936, markov_rank=256)
+    heads = nn.ModuleDict(
+        {
+            "markov_head": DSparkMarkovHead(
+                vocab_size=151936,
+                markov_rank=256,
+                device="meta",
+            ),
+            "confidence_head": DSparkConfidenceHead(
+                hidden_size=4096,
+                markov_rank=256,
+                with_markov=True,
+                device="meta",
+            ),
+        }
+    )
+    state = heads.state_dict()
 
-    assert set(head.state_dict()) == {
-        "markov_w1.weight",
-        "markov_w2.weight",
+    assert set(state) == {
+        "markov_head.markov_w1.weight",
+        "markov_head.markov_w2.weight",
+        "confidence_head.proj.weight",
+        "confidence_head.proj.bias",
     }
-    assert head.state_dict()["markov_w1.weight"].shape == (151936, 256)
-    assert head.state_dict()["markov_w2.weight"].shape == (151936, 256)
+    assert state["markov_head.markov_w1.weight"].shape == (151936, 256)
+    assert state["markov_head.markov_w2.weight"].shape == (151936, 256)
+    assert state["confidence_head.proj.weight"].shape == (1, 4352)
+    assert state["confidence_head.proj.bias"].shape == (1,)
     assert not any(
         forbidden in name
-        for name, _ in head.named_parameters()
+        for name, _ in heads.named_parameters()
         for forbidden in ("lm_head", "embed_tokens", "mask")
     )
 
@@ -227,12 +257,8 @@ def test_confidence_head_matches_public_checkpoint_contract() -> None:
         with_markov=True,
     ).double()
     hidden_states = torch.randn((2, 4, 8), dtype=torch.float64, requires_grad=True)
-    markov_embeddings = torch.randn(
-        (2, 4, 3), dtype=torch.float64, requires_grad=True
-    )
-    slot_valid = torch.tensor(
-        [[True, True, False, True], [True, False, True, True]]
-    )
+    markov_embeddings = torch.randn((2, 4, 3), dtype=torch.float64, requires_grad=True)
+    slot_valid = torch.tensor([[True, True, False, True], [True, False, True, True]])
 
     actual = head(
         hidden_states,
