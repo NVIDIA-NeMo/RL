@@ -853,8 +853,9 @@ def dspark_tiled_objective(
 
     The returned numerators and counts remain additive across data-parallel
     ranks. Reduce counts externally before calling ``normalized``. Detached
-    ``slot_weights`` scale both numerator contribution and normalization, which
-    supports fixed per-slot schedules but not example-dependent reweighting.
+    ``slot_weights`` scale numerator contributions only; normalization uses the
+    unweighted global valid-slot count. This supports fixed per-slot schedules
+    but not example-dependent reweighting.
     """
     _validate_inputs(
         target_logits=target_logits,
