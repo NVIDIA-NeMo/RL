@@ -305,26 +305,63 @@ def _run_tp2_tv_only_gradient(rank: int, world_size: int) -> None:
     )
     dense_hidden = torch.tensor([[[0.75]]], device=device, dtype=torch.float64)
     with torch.no_grad():
-        draft_probs = torch.softmax(
-            (dense_hidden @ full_output_weight.T).float(), dim=-1
-        )
-        target_probs = torch.softmax(full_target_logits.float(), dim=-1)
-        probability_gradient = 0.5 * torch.sign(draft_probs - target_probs)
-        local_expectations = [
+        local_output_weight = full_output_weight[vocab_start:vocab_end]
+        local_target_logits = full_target_logits[..., vocab_start:vocab_end]
+        local_draft_logits = (dense_hidden @ local_output_weight.T).float()
+        local_target_logits_fp32 = local_target_logits.float()
+        normalizer_maxima = torch.stack(
             (
-                probability_gradient[..., start : start + local_vocab_size]
-                * draft_probs[..., start : start + local_vocab_size]
-            ).sum(dim=-1, keepdim=True)
-            for start in range(0, vocab_size, local_vocab_size)
-        ]
-        probability_expectation = torch.stack(local_expectations).sum(dim=0)
+                local_target_logits_fp32.amax(dim=-1),
+                local_draft_logits.amax(dim=-1),
+            ),
+            dim=-1,
+        )
+        torch.distributed.all_reduce(
+            normalizer_maxima,
+            op=torch.distributed.ReduceOp.MAX,
+            group=tp_group,
+        )
+        normalizer_exp_sums = torch.stack(
+            (
+                (local_target_logits_fp32 - normalizer_maxima[..., :1])
+                .exp()
+                .sum(dim=-1),
+                (local_draft_logits - normalizer_maxima[..., 1:]).exp().sum(dim=-1),
+            ),
+            dim=-1,
+        )
+        torch.distributed.all_reduce(
+            normalizer_exp_sums,
+            op=torch.distributed.ReduceOp.SUM,
+            group=tp_group,
+        )
+        log_normalizers = normalizer_maxima + normalizer_exp_sums.log()
+        target_probs = (local_target_logits_fp32 - log_normalizers[..., :1]).exp()
+        draft_probs = (local_draft_logits - log_normalizers[..., 1:]).exp()
+        probability_gradient = 0.5 * torch.sign(draft_probs - target_probs)
+        probability_expectation = (probability_gradient * draft_probs).sum(
+            dim=-1, keepdim=True
+        )
+        torch.distributed.all_reduce(
+            probability_expectation,
+            op=torch.distributed.ReduceOp.SUM,
+            group=tp_group,
+        )
         logits_gradient = draft_probs * (probability_gradient - probability_expectation)
-        local_hidden_gradients = [
-            logits_gradient[..., start : start + local_vocab_size]
-            @ full_output_weight[start : start + local_vocab_size].float()
-            for start in range(0, vocab_size, local_vocab_size)
-        ]
-        expected_hidden_gradient = torch.stack(local_hidden_gradients).sum(dim=0)
+        expected_hidden_gradient = torch.zeros(
+            (dense_hidden.numel() // hidden_size, hidden_size),
+            device=device,
+            dtype=torch.float32,
+        )
+        expected_hidden_gradient.addmm_(
+            logits_gradient.reshape(-1, local_vocab_size),
+            local_output_weight.float(),
+        )
+        torch.distributed.all_reduce(
+            expected_hidden_gradient,
+            op=torch.distributed.ReduceOp.SUM,
+            group=tp_group,
+        )
 
     provider = build_dspark_provider(
         body=_CheckpointBody(tp_group=tp_group, device=device),
@@ -358,7 +395,9 @@ def _run_tp2_tv_only_gradient(rank: int, world_size: int) -> None:
     stats.tv.normalized(normalization_counts=stats.tv.counts).backward()
     torch.testing.assert_close(
         actual_hidden.grad,
-        expected_hidden_gradient.to(dtype=actual_hidden.dtype),
+        expected_hidden_gradient.reshape_as(actual_hidden).to(
+            dtype=actual_hidden.dtype
+        ),
         rtol=0,
         atol=0,
     )
