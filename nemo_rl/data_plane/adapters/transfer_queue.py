@@ -88,9 +88,9 @@ def rdma_devices(dedupe_per_numa_domain: bool = True) -> str:
 
     ``dedupe_per_numa_domain`` (default true — see
     ``MooncakeCpuConfig.dedupe_rails_per_numa_domain``) additionally keeps
-    only the *first* rail on each domain when more than one is eligible
-    there. Offering more than one rail per domain is not extra bandwidth,
-    it is ambiguity: peer-rail selection depends on
+    only the *first* RoCE rail on each domain when more than one is eligible
+    there. Offering more than one rail per domain is not extra bandwidth, it
+    is ambiguity: peer-rail selection depends on
     ``MC_ENABLE_DEST_DEVICE_AFFINITY``, whose same-name peer hint silently
     falls back to picking at random whenever the lookup misses (measured to
     happen in the pinned wheel — see ``maybe_configure_engine_env``), and
@@ -98,11 +98,19 @@ def rdma_devices(dedupe_per_numa_domain: bool = True) -> str:
     about. On this fleet's RoCE fabric each rail is its own subnet, so a
     random cross-rail draw has no route and fails with "transport retry
     counter exceeded" (measured: every cross-rail pair among 4 same-node
-    rails failed, zero same-rail pairs ever did). Deduplication does not
-    reduce the number of domains in use — every domain still gets a
+    RoCE rails failed, zero same-rail pairs ever did). Deduplication does
+    not reduce the number of domains in use — every domain still gets a
     dedicated rail, so a job's aggregate multi-rail bandwidth across domains
     is unaffected — only the redundant extra rail(s) on an
-    already-represented domain are dropped. IB and RoCE are never mixed.
+    already-represented domain are dropped.
+
+    This applies to the RoCE fallback only. InfiniBand is never deduped,
+    dedup or not: this PR's own intent is to expose every IB rail (see
+    ``feat(data-plane): use all IB rails and reuse RDMA-registered
+    buffers``), and the cross-rail-ambiguity failure above has only been
+    measured on RoCE — collapsing IB down to one rail per domain by default
+    would be an unmeasured, unjustified bandwidth regression for IB fleets.
+    IB and RoCE are never mixed.
 
     Also the skip predicate for the mooncake tests — ``mooncake_cpu`` is
     RDMA-only, so they cannot run without a device.
@@ -117,42 +125,41 @@ def rdma_devices(dedupe_per_numa_domain: bool = True) -> str:
     if not glob.glob("/dev/infiniband/uverbs*"):
         return ""
     ib, roce = [], []
-    ib_domains, roce_domains = set(), set()
+    roce_domains: set[str] = set()
     for path in sorted(glob.glob("/sys/class/infiniband/mlx5_*/ports/1/link_layer")):
         name = Path(path).parents[2].name
         try:
             layer = Path(path).read_text().strip()
         except OSError:
             continue
-        if dedupe_per_numa_domain:
-            # "-1" (or absent) means sysfs has no NUMA affinity for this
-            # device — never treat two such devices as the same domain, or
-            # every rail on the host would collapse to one; fall back to
-            # the device's own name so it is only ever deduplicated against
-            # a real, matching domain.
-            try:
-                numa = (
-                    Path(path)
-                    .parents[2]
-                    .joinpath("device", "numa_node")
-                    .read_text()
-                    .strip()
-                )
-            except OSError:
-                numa = ""
-            domain = numa if numa not in ("", "-1") else name
-        else:
-            domain = name  # every device is its own "domain": never deduped
         if layer == "InfiniBand":
-            if domain in ib_domains:
-                continue
-            ib_domains.add(domain)
-            ib.append(name)
-        elif layer == "Ethernet":
-            if domain in roce_domains:
-                continue
-            roce_domains.add(domain)
+            ib.append(name)  # never deduped — see docstring
+            continue
+        if layer != "Ethernet":
+            continue
+        if not dedupe_per_numa_domain:
             roce.append(name)
+            continue
+        # "-1" (or absent) means sysfs has no NUMA affinity for this device —
+        # never treat two such devices as the same domain, or every RoCE
+        # rail on the host would collapse to one; fall back to the device's
+        # own name so it is only ever deduplicated against a real, matching
+        # domain.
+        try:
+            numa = (
+                Path(path)
+                .parents[2]
+                .joinpath("device", "numa_node")
+                .read_text()
+                .strip()
+            )
+        except OSError:
+            numa = ""
+        domain = numa if numa not in ("", "-1") else name
+        if domain in roce_domains:
+            continue
+        roce_domains.add(domain)
+        roce.append(name)
     # No space after the comma: mooncake splits on "," only.
     return ",".join(ib or roce)
 
