@@ -227,6 +227,8 @@ def test_dflash_adapter_rejects_active_coordinate_aliases(
     inputs[3][0] = sample_row
     inputs[4] = inputs[4].clone()
     inputs[4][0, 1] = label_position
+    inputs[5] = inputs[5].clone()
+    inputs[5][0, 2] = False
 
     with pytest.raises((IndexError, RuntimeError), match="(?i)index|range"):
         dflash_projected_vocab_parallel_soft_ce(
