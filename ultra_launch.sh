@@ -676,6 +676,12 @@ export SETUP_COMMAND
 # learning rate, etc.) live in CONFIG_PATH. The launcher only passes the
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
+if [[ -n "${UV_CACHE_DIR:-}" ]]; then
+  TRAIN_UV_CACHE_DIR="${UV_CACHE_DIR}"
+else
+  TRAIN_UV_CACHE_DIR='/tmp/nemo-gym-uv-cache-${SLURM_JOB_ID:-default}'
+fi
+
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 ${NRL_DRIVER_PIP_INSTALL:+uv pip install --python /opt/nemo_rl_venv/bin/python ${NRL_DRIVER_PIP_INSTALL} ; }\
 ${GENRM_RUNTIME_SETUP}\
@@ -689,7 +695,7 @@ NRL_VLLM_CACHE_SEED_DIR=${NRL_VLLM_CACHE_SEED_DIR} \
 DG_JIT_CACHE_DIR=${NRL_VLLM_LOCAL_CACHE_DIR}/deep_gemm \
 TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
 TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
-UV_CACHE_DIR=${UV_CACHE_DIR:-/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default}} \
+UV_CACHE_DIR=${TRAIN_UV_CACHE_DIR} \
 UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
