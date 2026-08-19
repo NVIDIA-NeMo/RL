@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import hashlib
 import json
 import os
@@ -301,8 +302,25 @@ def setup_distributed() -> None:
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
-    # Initialize process group
-    torch.distributed.init_process_group("nccl")
+    # Pin the communicator to the correct GPU explicitly.
+    local_rank = int(os.environ["LOCAL_RANK"])
+    # The default 10-minute NCCL watchdog kills ranks that wait on peers stuck
+    # in transient first-hit stalls (e.g. triton JIT of GDN kernels for new
+    # packed-sequence shapes): observed as coordinated SIGABRTs
+    # ("Terminating the process after attempting to dump debug info") during
+    # step-2 collectives in jobs 2274348/2280396. Sub-process-groups inherit
+    # the default group's timeout, so raising it here covers TP/PP/EP/DP
+    # groups too. True hangs remain bounded by the SLURM walltime.
+    timeout_minutes = int(os.environ.get("NRL_NCCL_TIMEOUT_MINUTES", "60"))
+    print(
+        f"NEMO_RL_NCCL_TIMEOUT default_process_group={timeout_minutes}m "
+        f"local_rank={local_rank}"
+    )
+    torch.distributed.init_process_group(
+        "nccl",
+        device_id=torch.device(f"cuda:{local_rank}"),
+        timeout=datetime.timedelta(minutes=timeout_minutes),
+    )
 
 
 def validate_and_set_config(
@@ -1329,6 +1347,19 @@ def setup_model_and_optimizer(
     state.initialize_async_checkpoint_worker()
 
     megatron_cfg.dist.external_gpu_device_mapping = True
+    # initialize_megatron creates the TP/PP/EP/DP sub-groups with an EXPLICIT
+    # timeout from dist.distributed_timeout_minutes (mcore default 10), which
+    # overrides the default-group timeout set in setup_distributed(). The
+    # 10-minute NCCL watchdog kept SIGABRT'ing ranks that waited on peers in
+    # transient step-2 stalls (jobs 2274348/2280396/2282178) — keep both
+    # knobs on the same env var.
+    megatron_cfg.dist.distributed_timeout_minutes = int(
+        os.environ.get("NRL_NCCL_TIMEOUT_MINUTES", "60")
+    )
+    print(
+        "NEMO_RL_NCCL_TIMEOUT megatron_subgroups="
+        f"{megatron_cfg.dist.distributed_timeout_minutes}m"
+    )
     initialize_megatron(
         cfg=megatron_cfg,
         get_embedding_ranks=get_embedding_ranks,
