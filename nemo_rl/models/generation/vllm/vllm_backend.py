@@ -198,11 +198,7 @@ class VllmInternalWorkerExtension:
             self._nrl_named_parameters = params
         return params
 
-    def initialize_model_express(
-        self,
-        server_url: str | None = None,
-        metadata_port_offset: int = 0,
-    ) -> None:
+    def initialize_model_express(self, server_url: str | None = None) -> None:
         """Initialize ModelExpress inside the vLLM rank that owns live weights."""
         if self._model_express is not None:
             return
@@ -217,7 +213,6 @@ class VllmInternalWorkerExtension:
                 engine_context=VllmGeneratorContext(
                     model=self.model_runner.model,
                     vllm_config=self.model_runner.vllm_config,
-                    metadata_port_offset=metadata_port_offset,
                 ),
                 model_name=self.model_runner.model_config.model,
                 server_url=server_url,

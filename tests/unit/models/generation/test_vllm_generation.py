@@ -51,31 +51,29 @@ from nemo_rl.models.policy.lm_policy import Policy
 model_name = "Qwen/Qwen3-0.6B"
 
 
-def test_model_express_uses_engine_bundle_index_for_metadata_port() -> None:
+def test_model_express_initializes_every_vllm_rank() -> None:
     worker = object.__new__(VllmGenerationWorkerImpl)
     worker.llm = MagicMock()
-    worker._bundle_indices = [3]
 
     worker.initialize_model_express(server_url="mx-server:8000")
 
     worker.llm.collective_rpc.assert_called_once_with(
         "initialize_model_express",
-        args=("mx-server:8000", 3),
+        args=("mx-server:8000",),
     )
 
 
 @pytest.mark.asyncio
-async def test_async_model_express_uses_engine_bundle_index_for_metadata_port() -> None:
+async def test_async_model_express_initializes_every_vllm_rank() -> None:
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker.llm = MagicMock()
     worker.llm.collective_rpc = AsyncMock()
-    worker._bundle_indices = [4]
 
     await worker.initialize_model_express_async(server_url="mx-server:8000")
 
     worker.llm.collective_rpc.assert_awaited_once_with(
         "initialize_model_express",
-        args=("mx-server:8000", 4),
+        args=("mx-server:8000",),
     )
 
 

@@ -1150,10 +1150,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
     def initialize_model_express(self, *, server_url: str | None = None) -> None:
         """Initialize the rank-local MX clients owned by this vLLM engine."""
         assert self.llm is not None, "vLLM must be initialized before ModelExpress"
-        assert self._bundle_indices is not None
         self.llm.collective_rpc(
             "initialize_model_express",
-            args=(server_url, self._bundle_indices[0]),
+            args=(server_url,),
         )
 
     def update_weights_from_model_express(self, *, version: Any) -> bool:

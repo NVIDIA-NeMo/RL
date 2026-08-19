@@ -1412,10 +1412,9 @@ class VllmAsyncGenerationWorkerImpl(
     ) -> None:
         """Initialize the rank-local MX clients owned by this vLLM engine."""
         assert self.llm is not None, "vLLM must be initialized before ModelExpress"
-        assert self._bundle_indices is not None
         await self.llm.collective_rpc(
             "initialize_model_express",
-            args=(server_url, self._bundle_indices[0]),
+            args=(server_url,),
         )
 
     async def update_weights_from_model_express_async(self, *, version: Any) -> bool:
