@@ -95,6 +95,7 @@ from tests.unit.single_controller.test_single_controller_setup import (
 _ACTOR_CLS = SingleControllerActor.__ray_metadata__.modified_class
 
 _PARTITION_ID = "rollout_data"
+_STAGING_PARTITION_ID = "rollout_staging"
 
 
 # ── fakes ────────────────────────────────────────────────────────────────────
@@ -278,22 +279,35 @@ class _FakeDPClient:
         *,
         save_error: Optional[Exception] = None,
         sample_ids: Optional[list[str]] = None,
+        staging_sample_ids: Optional[list[str]] = None,
     ) -> None:
         self.clear_calls: list[tuple[list[str], str]] = []
         self.clear_thread_ids: list[int] = []
+        self.list_calls: list[str] = []
         self.save_calls: list[dict[str, Any]] = []
         self.save_error = save_error
-        self.sample_ids = list(sample_ids or [])
+        self.sample_ids_by_partition = {
+            _PARTITION_ID: list(sample_ids or []),
+            _STAGING_PARTITION_ID: list(staging_sample_ids or []),
+        }
+        # Preserve the existing canonical-row test surface while modelling the
+        # staging partition independently.
+        self.sample_ids = self.sample_ids_by_partition[_PARTITION_ID]
 
     def list_sample_ids(self, partition_id: str) -> list[str]:
-        assert partition_id == _PARTITION_ID
-        return sorted(self.sample_ids)
+        self.list_calls.append(partition_id)
+        assert partition_id in self.sample_ids_by_partition
+        return sorted(self.sample_ids_by_partition[partition_id])
 
     def clear_samples(self, sample_ids: list[str], partition_id: str) -> None:
+        assert partition_id in self.sample_ids_by_partition
         self.clear_thread_ids.append(threading.get_ident())
         self.clear_calls.append((list(sample_ids), partition_id))
         cleared = set(sample_ids)
-        self.sample_ids = [sid for sid in self.sample_ids if sid not in cleared]
+        partition_sample_ids = self.sample_ids_by_partition[partition_id]
+        partition_sample_ids[:] = [
+            sample_id for sample_id in partition_sample_ids if sample_id not in cleared
+        ]
 
     def save_checkpoint(
         self,
@@ -976,6 +990,10 @@ class TestDataPlaneCheckpoint:
         assert state["groups"][0]["group_id"] == "partial-group"
         assert "prompt_payload" not in state["groups"][0]
         assert manager.checkpoint_barrier is not None
+        assert dp_client.list_calls == [
+            _PARTITION_ID,
+            mc.token_capture.staging_partition,
+        ]
 
     def test_saves_authoritative_tq_state_and_metadata_only_replay_index(
         self, tmp_path
