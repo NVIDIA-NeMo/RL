@@ -56,9 +56,8 @@ recipe; validate longer training separately for the target workload.
 
 #### 100-Step Functional Validation Results
 
-The reference curves below were produced by starting from the example recipe,
-setting `grpo.num_prompts_per_step=32` and
-`policy.train_global_batch_size=256`, and running for more than 100 steps.
+The reference curves below were produced by running the example recipe for more
+than 100 steps.
 
 The recipe's OpenMathInstruct-2 dataset is relatively easy for Qwen3.8-27B, and
 the maximum sequence length is limited to 4,096 tokens. Consequently, the
