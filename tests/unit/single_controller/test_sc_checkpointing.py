@@ -357,6 +357,18 @@ class _FakeWeightSynchronizer:
         self.shutdown_count += 1
 
 
+class _FakeGeneration:
+    """Generation stand-in for weight-version updates during actor startup."""
+
+    requires_kv_scale_sync = False
+
+    def __init__(self) -> None:
+        self.rollout_weight_versions: list[int] = []
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        self.rollout_weight_versions.append(version)
+
+
 class _FakeRolloutManager:
     def __init__(self, recovery_ledger: Optional[RolloutRecoveryLedger] = None) -> None:
         self.weight_versions: list[int] = []
@@ -580,7 +592,7 @@ def _make_actor_args(
     rollout_manager: Optional[_FakeRolloutManager] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
-        gen_handle=object(),
+        gen_handle=_FakeGeneration(),
         trainer_handle=trainer if trainer is not None else _FakeTrainer(),
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]
@@ -1005,7 +1017,7 @@ class TestDataPlaneCheckpoint:
             buffer_checkpoint=True,
             data_plane_checkpoint=True,
         )
-        sample_ids = ["g0-0", "g0-1"]
+        sample_ids = ["g0_g0", "g0_g1"]
         dp_client = _FakeDPClient(sample_ids=sample_ids)
         replay_metadata = {
             "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
@@ -1071,10 +1083,10 @@ class TestDataPlaneCheckpoint:
     @pytest.mark.parametrize(
         ("actual_sample_ids", "error_fragment"),
         [
-            (["g0-0"], r"missing=\['g0-1'\]"),
+            (["g0_g0"], r"missing=\['g0_g1'\]"),
             (
-                ["g0-0", "g0-1", "orphan-0"],
-                r"unexpected=\['orphan-0'\]",
+                ["g0_g0", "g0_g1", "orphan_g0"],
+                r"unexpected=\['orphan_g0'\]",
             ),
         ],
     )
@@ -1088,7 +1100,7 @@ class TestDataPlaneCheckpoint:
             buffer_checkpoint=True,
             data_plane_checkpoint=True,
         )
-        sample_ids = ["g0-0", "g0-1"]
+        sample_ids = ["g0_g0", "g0_g1"]
         replay_metadata = {
             "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
             "storage": REPLAY_BUFFER_METADATA_STORAGE,
@@ -1921,13 +1933,13 @@ class TestReplayBufferPersistence:
     ):
         ckpt_dir = tmp_path / "resume_ckpt"
         ckpt_dir.mkdir()
-        sample_ids = ["g0-0", "g0-1", "g1-0", "g1-1"]
+        sample_ids = ["g0_g0", "g0_g1", "g1_g0", "g1_g1"]
         groups = [
             {
                 "meta": KVBatchMeta(
                     partition_id=_PARTITION_ID,
                     task_name=None,
-                    sample_ids=[f"g{i}-0", f"g{i}-1"],
+                    sample_ids=[f"g{i}_g0", f"g{i}_g1"],
                     sequence_lengths=[16, 16],
                     tags=[{"weight_version": 0}, {"weight_version": 0}],
                 ),
@@ -1985,13 +1997,13 @@ class TestReplayBufferPersistence:
         # acquisition shape.
         ckpt_dir = tmp_path / "resume_ckpt"
         ckpt_dir.mkdir()
-        sample_ids = [f"g{i}-{j}" for i in range(4) for j in range(2)]
+        sample_ids = [f"g{i}_g{j}" for i in range(4) for j in range(2)]
         groups = [
             {
                 "meta": KVBatchMeta(
                     partition_id=_PARTITION_ID,
                     task_name=None,
-                    sample_ids=[f"g{i}-0", f"g{i}-1"],
+                    sample_ids=[f"g{i}_g0", f"g{i}_g1"],
                     sequence_lengths=[16, 16],
                     tags=[{"weight_version": 0}, {"weight_version": 0}],
                 ),
@@ -2036,10 +2048,10 @@ class TestReplayBufferPersistence:
     @pytest.mark.parametrize(
         ("actual_sample_ids", "error_fragment"),
         [
-            (["g0-0"], r"missing=\['g0-1'\]"),
+            (["g0_g0"], r"missing=\['g0_g1'\]"),
             (
-                ["g0-0", "g0-1", "orphan-0"],
-                r"unexpected=\['orphan-0'\]",
+                ["g0_g0", "g0_g1", "orphan_g0"],
+                r"unexpected=\['orphan_g0'\]",
             ),
         ],
     )
@@ -2054,7 +2066,7 @@ class TestReplayBufferPersistence:
                     "meta": KVBatchMeta(
                         partition_id=_PARTITION_ID,
                         task_name=None,
-                        sample_ids=["g0-0", "g0-1"],
+                        sample_ids=["g0_g0", "g0_g1"],
                         sequence_lengths=[16, 16],
                         tags=[{"weight_version": 0}, {"weight_version": 0}],
                     ),
