@@ -1461,7 +1461,7 @@ class TestAsyncTrajectoryCollector:
         assert collector.algorithm_config is master_config.ppo
         assert collector.async_config is async_config
         assert collector.async_config.max_trajectory_age_steps == 3
-        assert collector._reward_penalty_config is reward_penalties
+        assert collector.master_config.reward_penalties is reward_penalties
 
         collector.set_generation_window(
             weight_version=2,
@@ -1472,14 +1472,6 @@ class TestAsyncTrajectoryCollector:
         assert collector._generation_lead_steps == 3
         assert collector._max_trajectory_age_steps == 5
         assert collector._calculate_target_weights(2) == [3, 4, 5]
-
-    def test_collector_preserves_grpo_reward_penalty_config(self):
-        """The shared collector keeps Async GRPO's Gym penalty behavior."""
-        collector = self.create_local_collector()
-
-        assert collector._reward_penalty_config is (
-            collector.master_config.reward_penalties
-        )
 
     def test_collector_grpo_window_remains_fixed(self):
         collector = self.create_local_collector()
@@ -2146,6 +2138,10 @@ class TestAsyncTrajectoryCollector:
             assert kwargs["generation_config"]["stop_token_ids"] is None
             assert kwargs["generation_config"]["stop_strings"] is None
             assert kwargs["log_full_result_tables"] is False
+            assert (
+                kwargs["reward_penalty_config"]
+                is collector.master_config.reward_penalties
+            )
             rollout_calls += 1
             yield _rollout_result(7)
             if rollout_calls == 1:

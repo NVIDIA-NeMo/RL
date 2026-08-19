@@ -18,8 +18,13 @@ import pprint
 
 from omegaconf import OmegaConf
 
-from examples.run_ppo import _validate_async_ppo_config
-from nemo_rl.algorithms.ppo import MasterConfig, async_ppo_train, ppo_train, setup
+from nemo_rl.algorithms.ppo import (
+    MasterConfig,
+    async_ppo_train,
+    ppo_train,
+    setup,
+    validate_async_ppo_config,
+)
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -114,7 +119,7 @@ def main() -> None:
     val_task_to_env = task_to_env
     async_ppo_enabled = config.ppo.async_ppo.enabled
     if async_ppo_enabled:
-        _validate_async_ppo_config(config, policy_generation)
+        validate_async_ppo_config(config, policy_generation)
 
     with checkpointer:
         if async_ppo_enabled:

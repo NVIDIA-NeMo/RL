@@ -2056,9 +2056,16 @@ def test_vllm_setup_spins_up_nemo_gym_with_deferred_model_load(monkeypatch):
         spinup_nemo_gym_actor,
     )
 
-    result, _, _, generation, _, _, generation_factory, _ = _run_noncolocated_setup(
-        monkeypatch, config
-    )
+    (
+        result,
+        _,
+        _,
+        generation,
+        policy_factory,
+        _,
+        generation_factory,
+        _,
+    ) = _run_noncolocated_setup(monkeypatch, config)
 
     assert result[2] is nemo_gym_actor
     assert generation_factory.call_args.kwargs["defer_model_load"] is True
@@ -2067,6 +2074,7 @@ def test_vllm_setup_spins_up_nemo_gym_with_deferred_model_load(monkeypatch):
         env_configs=config.env,
         base_urls=generation.dp_openai_server_base_urls,
         model_name=config.policy["model_name"],
+        tokenizer=policy_factory.call_args.kwargs["tokenizer"],
         enable_router_replay=False,
         routed_experts_dtype="int16",
         use_fastokens=False,
@@ -2249,11 +2257,11 @@ def _call_async_ppo_until_guard(
 def _validate_async_ppo_entry_config(
     master_config: SimpleNamespace, *, requires_kv_scale_sync: bool = False
 ) -> None:
-    from examples.run_ppo import _validate_async_ppo_config
+    from nemo_rl.algorithms.ppo import validate_async_ppo_config
 
     generation = MagicMock()
     generation.requires_kv_scale_sync = requires_kv_scale_sync
-    _validate_async_ppo_config(master_config, generation)
+    validate_async_ppo_config(master_config, generation)
 
 
 @pytest.mark.parametrize(

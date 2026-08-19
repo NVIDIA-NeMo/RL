@@ -11,8 +11,6 @@ JSON_METRICS="${EXP_DIR}/metrics.json"
 RUN_LOG="${EXP_DIR}/run.log"
 CHECKPOINT_DIR="${EXP_DIR}/checkpoints"
 DATA_DIR="${EXP_DIR}/data"
-export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
-
 rm -rf "${EXP_DIR}"
 mkdir -p "${LOG_DIR}" "${CHECKPOINT_DIR}" "${DATA_DIR}"
 trap 'rm -rf "${CHECKPOINT_DIR}"' EXIT
@@ -88,4 +86,4 @@ uv run tests/check_metrics.py "${JSON_METRICS}" \
     'len(data["train/reward"]) == 10' \
     'median(data["train/gen_kl_error"]) < 1.3' \
     'max(data["train/avg_trajectory_age"]) <= 1' \
-    'data["validation/accuracy"]["10"] >= 0.0'
+    'data["validation/accuracy"]["10"] > 0.1'

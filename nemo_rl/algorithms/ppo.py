@@ -301,6 +301,57 @@ class MasterConfig(BaseModel, extra="allow"):
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
 
 
+def validate_async_ppo_config(
+    config: MasterConfig, policy_generation: GenerationInterface | None
+) -> None:
+    """Validate Async PPO requirements and unsupported features.
+
+    Args:
+        config: Resolved PPO configuration.
+        policy_generation: Configured generation backend, when available.
+
+    Raises:
+        ValueError: If a required Async PPO setting is disabled.
+        NotImplementedError: If an unsupported feature is enabled.
+    """
+    generation_config = config.policy["generation"]
+    backend = generation_config.get("backend") if generation_config else None
+    vllm_config = generation_config.get("vllm_cfg") if generation_config else None
+    async_engine = bool(vllm_config and vllm_config.get("async_engine"))
+    if backend != "vllm" or not async_engine:
+        raise ValueError(
+            "Async PPO requires policy.generation.backend=vllm and "
+            "policy.generation.vllm_cfg.async_engine=true"
+        )
+    if not config.loss_fn.use_importance_sampling_correction:
+        raise ValueError(
+            "Async PPO requires loss_fn.use_importance_sampling_correction=true"
+        )
+    if config.loss_fn.force_on_policy_ratio:
+        raise ValueError("Async PPO requires loss_fn.force_on_policy_ratio=false")
+    if generation_config["colocated"]["enabled"]:
+        raise ValueError("Async PPO requires non-colocated generation")
+    if config.ppo.max_num_epochs != -1:
+        raise NotImplementedError(
+            "Async PPO does not support an epoch limit; set "
+            "ppo.max_num_epochs=-1 and use ppo.max_num_steps to control "
+            "training length"
+        )
+
+    unsupported_features = {
+        "Dynamic sampling": config.ppo.use_dynamic_sampling,
+        "Reward scaling": config.ppo.reward_scaling.enabled,
+        "Reward shaping": config.ppo.reward_shaping.enabled,
+        "Multiple dataloaders": config.data["use_multiple_dataloader"],
+        "FP8 KV-scale synchronization": bool(
+            getattr(policy_generation, "requires_kv_scale_sync", False)
+        ),
+    }
+    for feature, enabled in unsupported_features.items():
+        if enabled:
+            raise NotImplementedError(f"{feature} is not supported with async PPO")
+
+
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
@@ -846,6 +897,7 @@ def setup(
             env_configs=env_configs,
             base_urls=base_urls,
             model_name=generation_config["model_name"],
+            tokenizer=tokenizer,
             enable_router_replay=False,
             routed_experts_dtype="int16",
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
