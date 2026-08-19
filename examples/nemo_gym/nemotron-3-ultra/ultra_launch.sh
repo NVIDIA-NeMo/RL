@@ -76,8 +76,9 @@ set -euo pipefail
 # Hydra overrides are forwarded verbatim as positional arguments:
 #   bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh policy.megatron_cfg.optimizer.lr=1e-6 grpo.val_period=50
 #
-# GB200 NVL72 nodes have 4 GPUs each. SLURM total = NUM_TRAIN + NUM_GEN + NUM_GYM
-# and must be a multiple of SEGMENT_SIZE (default 16, one NVLink domain group).
+# NVL72 nodes (GB200 and GB300) have 4 GPUs each. SLURM total = NUM_TRAIN +
+# NUM_GEN + NUM_GYM and must be a multiple of SEGMENT_SIZE (default 16, one
+# NVLink domain group).
 # =============================================================================
 
 # =============================================================================
@@ -439,10 +440,14 @@ CHECKPOINTING_SAVE_BY="${CHECKPOINTING_SAVE_BY:-}"
 export CONTAINER
 MOUNTS="${MOUNTS:-}"
 
-# GB200 NVL72 defaults to 4 GPUs/node. Allow H100 smoke configs to request
-# their native 8-GPU node shape through the launch environment.
+# NVL72 trays hold 4 GPUs on both GB200 and GB300. Allow H100 smoke configs to
+# request their native 8-GPU node shape through the launch environment.
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
-export CPUS_PER_WORKER="${CPUS_PER_WORKER:-144}"
+# Left empty on purpose: ray.sub resolves this from CPUTot on the nodes the job is
+# actually allocated. The per-node core count varies by platform (GB200 144,
+# GB300 140) and by site config (CoreSpecCount), so no launcher-side default is
+# portable. Set it in the environment only to override a specific allocation.
+export CPUS_PER_WORKER="${CPUS_PER_WORKER:-}"
 
 # =============================================================================
 # HuggingFace configuration
@@ -560,7 +565,8 @@ if (( NUM_GYM_NODES < 0 )); then
   echo "ERROR: NUM_GYM_NODES must be >= 0 (got ${NUM_GYM_NODES})" >&2; exit 1
 fi
 
-# GB200 NVL72 topology: 18 nodes per NVLink domain, allocate in groups of 16.
+# NVL72 topology (GB200 and GB300): 18 nodes per NVLink domain, allocate in
+# groups of 16 so each segment stays inside one domain.
 # With external judges, Slurm schedules two heterogeneous components, so the
 # NeMo RL nodes and the external-service nodes are validated separately.
 SEGMENT_SIZE="${SEGMENT_SIZE:-16}"

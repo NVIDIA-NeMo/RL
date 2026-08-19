@@ -260,6 +260,17 @@ COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 # homogeneous allocation; set CPUS_PER_WORKER explicitly to override.
 if [[ -n "${CPUS_PER_WORKER:-}" ]]; then
   echo "[INFO] Using user-provided CPUS_PER_WORKER=$CPUS_PER_WORKER."
+  # An over-large --cpus-per-task is not rejected by srun: step creation retries
+  # "Requested nodes are busy" indefinitely, so the job holds its reservation
+  # until walltime with no error. Validate up front and fail loudly instead.
+  log_phase "validating CPUS_PER_WORKER against node CPUTot (scontrol show node)"
+  detected_cpus=$(detect_cpus_per_node)
+  if (( CPUS_PER_WORKER > detected_cpus )); then
+    echo "Error: CPUS_PER_WORKER=$CPUS_PER_WORKER exceeds CPUTot=$detected_cpus on the allocated nodes." >&2
+    echo "  srun would retry 'Requested nodes are busy' forever rather than failing." >&2
+    echo "  Unset CPUS_PER_WORKER to auto-detect, or set it to <= $detected_cpus." >&2
+    exit 1
+  fi
 else
   log_phase "auto-detecting CPUs per node (scontrol show node)"
   CPUS_PER_WORKER=$(detect_cpus_per_node)
