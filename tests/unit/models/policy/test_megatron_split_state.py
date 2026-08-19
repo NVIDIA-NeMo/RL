@@ -709,6 +709,21 @@ class TestFinish:
         reduced = mock_module_symbols["all_reduce"].call_args.args[0]
         assert torch.equal(reduced, reduced.new_tensor([8.0, 2048.0]))
 
+    def test_without_draft_payload_still_reduces_draft_grad_norm(
+        self, mock_module_symbols
+    ):
+        """Non-owner PP ranks must join the draft grad-norm collective."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        w.optimizer.grad_norms_by_group = {}
+
+        w.finish_train_step()
+
+        reduce_calls = mock_module_symbols["rmax"].call_args_list
+        assert len(reduce_calls) == 3
+        assert reduce_calls[-1].args[0] is None
+
     def test_restores_grad_sync_func(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
