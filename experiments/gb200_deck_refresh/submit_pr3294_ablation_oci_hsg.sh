@@ -4,23 +4,33 @@ set -euo pipefail
 
 ACTION=${ACTION:-render}
 ARM=${ARM:-baseline}
+STUDY=${STUDY:-full_ablation}
 MAX_STEPS=${MAX_STEPS:-20}
 RUN_SUFFIX=${RUN_SUFFIX:-$(date +%Y%m%d-%H%M%S)}
-TARGET_COMMIT=${TARGET_COMMIT:-313f41a9654cd67e44d783128543fe1638c778da}
 
-case "${ARM}" in
-  baseline)
-    REFIT_PREQUANTIZE=false
-    BATCHED_SHUFFLE=0
-    CACHED_LOADERS=0
+case "${STUDY}:${ARM}" in
+  full_ablation:baseline)
+    TARGET_COMMIT=${TARGET_COMMIT:-313f41a9654cd67e44d783128543fe1638c778da}
+    REFIT_PREQUANTIZE=false; BATCHED_SHUFFLE=0; CACHED_LOADERS=0
+    USE_RUNTIME_TOGGLES=true
     ;;
-  optimized)
-    REFIT_PREQUANTIZE=true
-    BATCHED_SHUFFLE=1
-    CACHED_LOADERS=1
+  full_ablation:optimized)
+    TARGET_COMMIT=${TARGET_COMMIT:-313f41a9654cd67e44d783128543fe1638c778da}
+    REFIT_PREQUANTIZE=true; BATCHED_SHUFFLE=1; CACHED_LOADERS=1
+    USE_RUNTIME_TOGGLES=true
+    ;;
+  shuffle_only:baseline)
+    TARGET_COMMIT=${TARGET_COMMIT:-e45e29da7266a7a219d2a0bc4adb0a1f78456985}
+    REFIT_PREQUANTIZE=true; BATCHED_SHUFFLE=0; CACHED_LOADERS=unchanged
+    USE_RUNTIME_TOGGLES=false
+    ;;
+  shuffle_only:optimized)
+    TARGET_COMMIT=${TARGET_COMMIT:-d5fb8d044031420e9170aae66ee0c3166b798381}
+    REFIT_PREQUANTIZE=true; BATCHED_SHUFFLE=1; CACHED_LOADERS=unchanged
+    USE_RUNTIME_TOGGLES=false
     ;;
   *)
-    echo "ARM must be baseline or optimized" >&2
+    echo "STUDY must be full_ablation or shuffle_only; ARM must be baseline or optimized" >&2
     exit 2
     ;;
 esac
@@ -38,15 +48,19 @@ RUN_ARGS=(
   "policy.generation.vllm_cfg.enforce_eager=false"
   "policy.generation.vllm_cfg.async_engine=false"
   "policy.generation.vllm_cfg.refit_prequantize=${REFIT_PREQUANTIZE}"
-  "++policy.generation.vllm_cfg.env_vars.NRL_MXFP8_BATCHED_SHUFFLE=${BATCHED_SHUFFLE}"
-  "++policy.generation.vllm_cfg.env_vars.NRL_REFIT_CACHED_LOADERS=${CACHED_LOADERS}"
-  "++policy.generation.vllm_cfg.env_vars.VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=NRL_MXFP8_BATCHED_SHUFFLE,NRL_REFIT_CACHED_LOADERS"
   "grpo.max_num_steps=${MAX_STEPS}"
   "grpo.seed=42"
   "grpo.val_at_start=false"
   "++grpo.val_at_end=false"
   "checkpointing.enabled=false"
 )
+if [[ "${USE_RUNTIME_TOGGLES}" == true ]]; then
+  RUN_ARGS+=(
+    "++policy.generation.vllm_cfg.env_vars.NRL_MXFP8_BATCHED_SHUFFLE=${BATCHED_SHUFFLE}"
+    "++policy.generation.vllm_cfg.env_vars.NRL_REFIT_CACHED_LOADERS=${CACHED_LOADERS}"
+    "++policy.generation.vllm_cfg.env_vars.VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=NRL_MXFP8_BATCHED_SHUFFLE,NRL_REFIT_CACHED_LOADERS"
+  )
+fi
 printf -v RUN_COMMAND '%q ' uv run --frozen examples/run_grpo.py "${RUN_ARGS[@]}"
 
 if [[ "${ACTION}" == render ]]; then
@@ -62,19 +76,24 @@ esac
 
 BASE=${BASE:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna}
 CONTROLLER_REPO=${CONTROLLER_REPO:-${BASE}/RL-gb200-deck-refresh-20260818}
-TARGET_REPO=${TARGET_REPO:-${BASE}/RL-gb200-pr3294-ablation-313f}
+if [[ "${STUDY}" == full_ablation ]]; then
+  DEFAULT_TARGET_REPO=${BASE}/RL-gb200-pr3294-ablation-313f
+else
+  DEFAULT_TARGET_REPO=${BASE}/RL-gb200-pr3478-${ARM}-${TARGET_COMMIT:0:8}
+fi
+TARGET_REPO=${TARGET_REPO:-${DEFAULT_TARGET_REPO}}
 CONTAINER=${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/mkar/containers/nemo-rl-nightly-ngc-20260815_212622.sqsh}
 HF_HOME=${HF_HOME:-${BASE}/hf_home}
 ACCOUNT=${SLURM_ACCOUNT:-nemotron_sw_post}
 PARTITION=${PARTITION:-batch}
 WALLTIME=${WALLTIME:-04:00:00}
-RESULT_ROOT=${RESULT_ROOT:-${BASE}/experiments/gb200-deck-refresh/pr3294-full-ablation}
+RESULT_ROOT=${RESULT_ROOT:-${BASE}/experiments/gb200-deck-refresh/${STUDY}}
 EXPERIMENT_ROOT=${EXPERIMENT_ROOT:-${RESULT_ROOT}/${ARM}/${RUN_SUFFIX}}
-CACHE_ROOT=${CACHE_ROOT:-${BASE}/.cache/gb200-deck-refresh/pr3294-full-ablation/${ARM}}
-WORKER_VENV_ROOT=${WORKER_VENV_ROOT:-/tmp/nemo_rl_worker_venvs/gb200-deck-refresh/pr3294-full-ablation/${ARM}/${RUN_SUFFIX}}
+CACHE_ROOT=${CACHE_ROOT:-${BASE}/.cache/gb200-deck-refresh/${STUDY}/${ARM}}
+WORKER_VENV_ROOT=${WORKER_VENV_ROOT:-/tmp/nemo_rl_worker_venvs/gb200-deck-refresh/${STUDY}/${ARM}/${RUN_SUFFIX}}
 RAY_RUNTIME_VENV=${RAY_RUNTIME_VENV:-${BASE}/.cache/gb200-deck-refresh/ray-runtime-py31314}
-WANDB_PROJECT=${WANDB_PROJECT:-sna-gb200-pr3294-full-ablation}
-WANDB_NAME=${WANDB_NAME:-qwen30-sync-${ARM}-${MAX_STEPS}step-${RUN_SUFFIX}}
+WANDB_PROJECT=${WANDB_PROJECT:-sna-gb200-${STUDY}}
+WANDB_NAME=${WANDB_NAME:-qwen30-sync-${STUDY}-${ARM}-${MAX_STEPS}step-${RUN_SUFFIX}}
 
 git -C "${CONTROLLER_REPO}" pull --ff-only origin sna/exp-gb200-deck-refresh-20260818
 test "$(git -C "${TARGET_REPO}" rev-parse HEAD)" = "${TARGET_COMMIT}"
@@ -124,6 +143,7 @@ container=${CONTAINER}
 hardware=GB200
 model=Qwen3-30B-A3B
 mode=sync_colocated
+study=${STUDY}
 arm=${ARM}
 nodes=4
 gpus_per_node=4
@@ -188,7 +208,7 @@ exec sbatch "${SBATCH_ACTION[@]}" \
   --partition="${PARTITION}" \
   --time="${WALLTIME}" \
   --segment=4 \
-  --job-name="${ACCOUNT}-gb200-deck.pr3294-${ARM}" \
+  --job-name="${ACCOUNT}-gb200-deck.${STUDY}-${ARM}" \
   --output="${EXPERIMENT_ROOT}/slurm-%j.out" \
   --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"180","reason":"model_loading","description":"NeMo-RL environment build, model load, FlashInfer autotuning, and CUDA Graph capture"}}' \
   "${CONTROLLER_REPO}/ray.sub"

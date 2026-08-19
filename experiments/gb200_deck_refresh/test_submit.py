@@ -99,3 +99,15 @@ def test_pr3294_optimized_enables_all_three_refit_optimizations() -> None:
     assert "policy.generation.vllm_cfg.refit_prequantize=true" in result.stdout
     assert "NRL_MXFP8_BATCHED_SHUFFLE=1" in result.stdout
     assert "NRL_REFIT_CACHED_LOADERS=1" in result.stdout
+
+
+def test_shuffle_only_changes_commit_but_keeps_prequantization_enabled() -> None:
+    baseline = render_ablation(STUDY="shuffle_only", ARM="baseline")
+    optimized = render_ablation(STUDY="shuffle_only", ARM="optimized")
+
+    assert baseline.returncode == 0, baseline.stderr
+    assert optimized.returncode == 0, optimized.stderr
+    assert "policy.generation.vllm_cfg.refit_prequantize=true" in baseline.stdout
+    assert "policy.generation.vllm_cfg.refit_prequantize=true" in optimized.stdout
+    assert "NRL_MXFP8_BATCHED_SHUFFLE" not in baseline.stdout
+    assert "NRL_MXFP8_BATCHED_SHUFFLE" not in optimized.stdout

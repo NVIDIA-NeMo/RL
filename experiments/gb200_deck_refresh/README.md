@@ -15,6 +15,11 @@ commit `313f41a9654cd67e44d783128543fe1638c778da`, which pins vLLM 0.25.1.
 It compares prequantization, batched MXFP8 shuffle, and cached loaders disabled
 against all three enabled on 4x4 GB200 GPUs.
 
+Set `STUDY=shuffle_only` to compare the PR 3478 parent
+`e45e29da7266a7a219d2a0bc4adb0a1f78456985` against the merged implementation
+`d5fb8d044031420e9170aae66ee0c3166b798381`. Both arms keep prequantization
+enabled, so this pair isolates the batched MXFP8 MoE shuffle.
+
 Render a command locally:
 
 ```bash
