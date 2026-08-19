@@ -1028,12 +1028,7 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
-
-    # Enable the dynamic-inference engine's MoE routing recorder when router replay (R3)
-    # is on, so the Megatron-inference generate path produces routing_indices to replay.
     model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
-    if router_replay_enabled(config):
-        model_cfg.moe_router_fusion = False
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -1563,8 +1558,7 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     deterministic MoE fixed-order combine (train + generation) via moe_zero_kl_patches.py,
     and Mamba train/prefill/decode alignment via mamba_zero_kl_patches.py.
     Generation uses ``logprobs_mode=raw_logprobs`` so gen uses ``F.log_softmax``
-    (not FlashInfer processed log-probs). Router replay and moe_grouped_gemm must
-    be configured explicitly.
+    (not FlashInfer processed log-probs). moe_grouped_gemm must be configured explicitly.
     """
     if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
