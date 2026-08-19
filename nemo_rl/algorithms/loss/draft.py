@@ -321,6 +321,233 @@ class _StreamingVocabParallelSoftCE(torch.autograd.Function):
         )
 
 
+class _CachedProjectedVocabParallelSoftCE(torch.autograd.Function):
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        student_hidden: torch.Tensor,
+        output_weight: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        teacher_row_indices: torch.Tensor,
+        mask: torch.Tensor,
+        bin_ids: torch.Tensor,
+        num_bins: int,
+        tp_group: torch.distributed.ProcessGroup | None,
+    ) -> torch.Tensor:
+        hidden_size = student_hidden.shape[-1]
+        flat_hidden = student_hidden.reshape(-1, hidden_size)
+        flat_teacher = teacher_logits.reshape(-1, teacher_logits.shape[-1])
+        student_logits = flat_hidden @ output_weight.T
+        selected_teacher = flat_teacher.index_select(
+            0,
+            teacher_row_indices.reshape(-1),
+        )
+        teacher_probs, student_probs, cross_entropy = (
+            _cached_tile_distributions_and_cross_entropy(
+                student_logits,
+                selected_teacher,
+                tp_group,
+            )
+        )
+        numerators = torch.zeros(
+            num_bins,
+            dtype=torch.float32,
+            device=student_hidden.device,
+        )
+        numerators.scatter_add_(
+            0,
+            bin_ids.reshape(-1),
+            cross_entropy.mul_(mask.reshape(-1).float()),
+        )
+        ctx.save_for_backward(
+            teacher_probs,
+            student_probs,
+            output_weight,
+            mask,
+            bin_ids,
+        )
+        # pyrefly: ignore[implicitly-defined-attribute]
+        ctx.student_shape = student_hidden.shape
+        # pyrefly: ignore[implicitly-defined-attribute]
+        ctx.student_dtype = student_hidden.dtype
+        ctx.tp_group = tp_group  # pyrefly: ignore[implicitly-defined-attribute]
+        return numerators
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        *grad_outputs: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None, None]:
+        (grad_numerators,) = grad_outputs
+        teacher_probs, student_probs, output_weight, mask, bin_ids = ctx.saved_tensors
+        row_scale = (
+            grad_numerators.index_select(0, bin_ids.reshape(-1))
+            * mask.reshape(-1).float()
+        )
+        logits_gradient = student_probs.sub(teacher_probs)
+        logits_gradient.mul_(row_scale.unsqueeze(-1))
+        hidden_gradient = logits_gradient @ output_weight.float()
+        if ctx.tp_group is not None:
+            torch.distributed.all_reduce(
+                hidden_gradient,
+                op=torch.distributed.ReduceOp.SUM,
+                group=ctx.tp_group,
+            )
+        return (
+            hidden_gradient.reshape(ctx.student_shape).to(dtype=ctx.student_dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        student_hidden: torch.Tensor,
+        output_weight: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        teacher_row_indices: torch.Tensor,
+        mask: torch.Tensor,
+        bin_ids: torch.Tensor,
+        num_bins: int,
+        token_chunk_size: int,
+        tp_group: torch.distributed.ProcessGroup | None,
+    ) -> torch.Tensor:
+        hidden_size = student_hidden.shape[-1]
+        flat_hidden = student_hidden.reshape(-1, hidden_size)
+        flat_teacher = teacher_logits.reshape(-1, teacher_logits.shape[-1])
+        flat_teacher_row_indices = teacher_row_indices.reshape(-1)
+        flat_mask = mask.reshape(-1).float()
+        flat_bin_ids = bin_ids.reshape(-1)
+        numerators = torch.zeros(
+            num_bins,
+            dtype=torch.float32,
+            device=student_hidden.device,
+        )
+        saved_log_normalizers = torch.empty(
+            (flat_hidden.shape[0], 2),
+            dtype=torch.float32,
+            device=student_hidden.device,
+        )
+
+        for start in range(0, flat_hidden.shape[0], token_chunk_size):
+            end = min(start + token_chunk_size, flat_hidden.shape[0])
+            student_logits = flat_hidden[start:end] @ output_weight.T
+            selected_teacher = flat_teacher.index_select(
+                0,
+                flat_teacher_row_indices[start:end],
+            )
+            log_normalizers = _tile_log_normalizers(
+                student_logits,
+                selected_teacher,
+                tp_group,
+            )
+            teacher_probs = (selected_teacher.float() - log_normalizers[:, :1]).exp()
+            local_teacher_expectation = torch.einsum(
+                "tv,tv->t",
+                teacher_probs,
+                student_logits.float(),
+            )
+            if tp_group is not None:
+                torch.distributed.all_reduce(
+                    local_teacher_expectation,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=tp_group,
+                )
+            cross_entropy = log_normalizers[:, 1] - local_teacher_expectation
+            numerators.scatter_add_(
+                0,
+                flat_bin_ids[start:end],
+                cross_entropy.mul_(flat_mask[start:end]),
+            )
+            saved_log_normalizers[start:end].copy_(log_normalizers)
+
+        ctx.save_for_backward(
+            student_hidden,
+            output_weight,
+            teacher_logits,
+            teacher_row_indices,
+            mask,
+            bin_ids,
+            saved_log_normalizers,
+        )
+        # pyrefly: ignore[implicitly-defined-attribute]
+        ctx.token_chunk_size = token_chunk_size
+        ctx.tp_group = tp_group  # pyrefly: ignore[implicitly-defined-attribute]
+        return numerators
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        *grad_outputs: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None, None, None]:
+        (grad_numerators,) = grad_outputs
+        (
+            student_hidden,
+            output_weight,
+            teacher_logits,
+            teacher_row_indices,
+            mask,
+            bin_ids,
+            log_normalizers,
+        ) = ctx.saved_tensors
+        hidden_size = student_hidden.shape[-1]
+        flat_hidden = student_hidden.reshape(-1, hidden_size)
+        flat_teacher = teacher_logits.reshape(-1, teacher_logits.shape[-1])
+        flat_teacher_row_indices = teacher_row_indices.reshape(-1)
+        flat_mask = mask.reshape(-1).float()
+        flat_bin_ids = bin_ids.reshape(-1)
+        flat_hidden_gradient = torch.empty_like(flat_hidden, dtype=torch.float32)
+
+        for start in range(0, flat_hidden.shape[0], ctx.token_chunk_size):
+            end = min(start + ctx.token_chunk_size, flat_hidden.shape[0])
+            student_logits = flat_hidden[start:end] @ output_weight.T
+            selected_teacher = flat_teacher.index_select(
+                0,
+                flat_teacher_row_indices[start:end],
+            )
+            teacher_probs, student_probs = _tile_distributions(
+                student_logits,
+                selected_teacher,
+                log_normalizers[start:end],
+            )
+            row_scale = (
+                grad_numerators.index_select(0, flat_bin_ids[start:end])
+                * flat_mask[start:end]
+            )
+            logits_gradient = student_probs.sub_(teacher_probs)
+            logits_gradient.mul_(row_scale.unsqueeze(-1))
+            flat_hidden_gradient[start:end].copy_(
+                logits_gradient @ output_weight.float()
+            )
+
+        if ctx.tp_group is not None:
+            torch.distributed.all_reduce(
+                flat_hidden_gradient,
+                op=torch.distributed.ReduceOp.SUM,
+                group=ctx.tp_group,
+            )
+        return (
+            flat_hidden_gradient.reshape_as(student_hidden).to(
+                dtype=student_hidden.dtype
+            ),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def streaming_vocab_parallel_soft_ce(
     *,
     student_logits: torch.Tensor,
@@ -389,6 +616,138 @@ def streaming_vocab_parallel_soft_ce(
         numerators = _StreamingVocabParallelSoftCE.apply(
             student_logits,
             teacher_logits,
+            mask,
+            bin_ids,
+            num_bins,
+            token_chunk_size,
+            tp_group,
+        )
+    counts = torch.zeros(num_bins, dtype=torch.float32, device=mask.device)
+    counts.scatter_add_(0, bin_ids.reshape(-1), mask.reshape(-1).float())
+    return DraftLossStats(
+        numerators=numerators,
+        counts=counts.detach(),
+        weights=weights.to(device=mask.device, dtype=torch.float32).detach(),
+    )
+
+
+def projected_streaming_vocab_parallel_soft_ce(
+    *,
+    student_hidden: torch.Tensor,
+    output_weight: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    teacher_row_indices: torch.Tensor,
+    mask: torch.Tensor,
+    token_chunk_size: int,
+    tp_group: torch.distributed.ProcessGroup | None,
+    bin_ids: torch.Tensor | None = None,
+    weights: torch.Tensor | None = None,
+) -> DraftLossStats:
+    """Project draft hidden states and stream indexed teacher rows through soft CE."""
+    if student_hidden.ndim < 2 or student_hidden.numel() == 0:
+        raise ValueError(
+            "student_hidden must contain at least one token and one hidden element, "
+            f"got {student_hidden.shape}."
+        )
+    if output_weight.ndim != 2 or output_weight.numel() == 0:
+        raise ValueError(
+            "output_weight must be a nonempty vocabulary-by-hidden matrix, "
+            f"got {output_weight.shape}."
+        )
+    if output_weight.shape[1] != student_hidden.shape[-1]:
+        raise ValueError(
+            "output_weight hidden size must match student_hidden, "
+            f"got {output_weight.shape[1]} and {student_hidden.shape[-1]}."
+        )
+    if teacher_logits.ndim < 2 or teacher_logits.numel() == 0:
+        raise ValueError(
+            "teacher_logits must contain at least one row and vocabulary element, "
+            f"got {teacher_logits.shape}."
+        )
+    if teacher_logits.shape[-1] != output_weight.shape[0]:
+        raise ValueError(
+            "teacher_logits and output_weight must have the same local vocabulary "
+            f"size, got {teacher_logits.shape[-1]} and {output_weight.shape[0]}."
+        )
+    if teacher_row_indices.shape != student_hidden.shape[:-1]:
+        raise ValueError(
+            "teacher_row_indices must match the non-hidden student dimensions, "
+            f"got {teacher_row_indices.shape} and {student_hidden.shape[:-1]}."
+        )
+    if teacher_row_indices.dtype != torch.long:
+        raise TypeError(
+            f"teacher_row_indices must use torch.long, got {teacher_row_indices.dtype}."
+        )
+    if mask.shape != student_hidden.shape[:-1]:
+        raise ValueError(
+            "mask must match the non-hidden student dimensions, "
+            f"got {mask.shape} and {student_hidden.shape[:-1]}."
+        )
+    if not (
+        student_hidden.device
+        == output_weight.device
+        == teacher_logits.device
+        == teacher_row_indices.device
+        == mask.device
+    ):
+        raise ValueError(
+            "student_hidden, output_weight, teacher_logits, teacher_row_indices, "
+            "and mask must share a device."
+        )
+    if not (
+        student_hidden.is_floating_point()
+        and output_weight.is_floating_point()
+        and teacher_logits.is_floating_point()
+    ):
+        raise TypeError(
+            "student_hidden, output_weight, and teacher_logits must be floating point."
+        )
+    if student_hidden.dtype != output_weight.dtype:
+        raise ValueError(
+            "student_hidden and output_weight must have the same dtype, "
+            f"got {student_hidden.dtype} and {output_weight.dtype}."
+        )
+    if token_chunk_size < 1:
+        raise ValueError(f"token_chunk_size must be positive, got {token_chunk_size}.")
+    if weights is None:
+        weights = torch.ones(1, dtype=torch.float32, device=mask.device)
+    elif weights.ndim != 1 or weights.shape[0] < 1:
+        raise ValueError(f"weights must be a nonempty vector, got {weights.shape}.")
+    num_bins = weights.shape[0]
+
+    if bin_ids is None:
+        if num_bins != 1:
+            raise ValueError("bin_ids is required when weights contains multiple bins.")
+        bin_ids = torch.zeros_like(mask, dtype=torch.long)
+    elif bin_ids.shape != mask.shape:
+        raise ValueError(
+            f"bin_ids must match mask, got {bin_ids.shape} and {mask.shape}."
+        )
+    elif bin_ids.dtype != torch.long:
+        raise TypeError(f"bin_ids must use torch.long, got {bin_ids.dtype}.")
+    elif bin_ids.device != mask.device:
+        raise ValueError(
+            f"bin_ids and mask must share a device, got {bin_ids.device} and {mask.device}."
+        )
+
+    num_tokens = student_hidden.numel() // student_hidden.shape[-1]
+    if num_tokens <= token_chunk_size:
+        numerators = _CachedProjectedVocabParallelSoftCE.apply(
+            student_hidden,
+            output_weight,
+            teacher_logits,
+            teacher_row_indices,
+            mask,
+            bin_ids,
+            num_bins,
+            tp_group,
+        )
+    else:
+        numerators = _StreamingProjectedVocabParallelSoftCE.apply(
+            student_hidden,
+            output_weight,
+            teacher_logits,
+            teacher_row_indices,
             mask,
             bin_ids,
             num_bins,

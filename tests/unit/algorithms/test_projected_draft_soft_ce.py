@@ -1,0 +1,198 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import pytest
+import torch
+
+from nemo_rl.algorithms.loss.draft import (
+    projected_streaming_vocab_parallel_soft_ce,
+)
+
+
+def _dense_projected_stats(
+    student_hidden: torch.Tensor,
+    output_weight: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    teacher_row_indices: torch.Tensor,
+    mask: torch.Tensor,
+    bin_ids: torch.Tensor,
+    num_bins: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    student_logits = student_hidden.reshape(-1, student_hidden.shape[-1]) @ (
+        output_weight.T
+    )
+    selected_teacher = teacher_logits.reshape(
+        -1, teacher_logits.shape[-1]
+    ).index_select(0, teacher_row_indices.reshape(-1))
+    teacher_probs = torch.softmax(selected_teacher.float(), dim=-1)
+    student_log_probs = torch.log_softmax(student_logits.float(), dim=-1)
+    per_token = -(teacher_probs * student_log_probs).sum(dim=-1)
+    numerators = torch.zeros(num_bins, dtype=torch.float32)
+    counts = torch.zeros_like(numerators)
+    numerators.scatter_add_(0, bin_ids.reshape(-1), per_token * mask.reshape(-1))
+    counts.scatter_add_(0, bin_ids.reshape(-1), mask.reshape(-1).float())
+    return numerators, counts
+
+
+@pytest.mark.parametrize(
+    "num_tokens",
+    [pytest.param(4, id="one_tile"), pytest.param(5, id="multiple_tiles")],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_projected_soft_ce_matches_dense_hidden_gradient(
+    num_tokens: int,
+    dtype: torch.dtype,
+) -> None:
+    """Both routes match dense soft CE with indexed and duplicate teacher rows."""
+    generator = torch.Generator().manual_seed(1357)
+    hidden_size, vocab_size = 5, 7
+    student_hidden = torch.randn(
+        num_tokens,
+        hidden_size,
+        generator=generator,
+        dtype=dtype,
+    ).requires_grad_(True)
+    output_weight = torch.randn(
+        vocab_size,
+        hidden_size,
+        generator=generator,
+        dtype=dtype,
+    ).requires_grad_(True)
+    teacher_logits = torch.randn(
+        2,
+        3,
+        vocab_size,
+        generator=generator,
+        dtype=dtype,
+    ).requires_grad_(True)
+    teacher_row_indices = torch.tensor([4, 1, 4, 0, 5])[:num_tokens]
+    mask = torch.tensor([1.0, 0.0, 1.0, 1.0, 1.0])[:num_tokens]
+    bin_ids = torch.tensor([0, 0, 1, 1, 0])[:num_tokens]
+    weights = torch.tensor([0.25, 1.5, 0.75])
+
+    stats = projected_streaming_vocab_parallel_soft_ce(
+        student_hidden=student_hidden,
+        output_weight=output_weight,
+        teacher_logits=teacher_logits,
+        teacher_row_indices=teacher_row_indices,
+        mask=mask,
+        bin_ids=bin_ids,
+        weights=weights,
+        token_chunk_size=4,
+        tp_group=None,
+    )
+    loss = stats.normalized(normalization_counts=stats.counts)
+    loss.backward()
+
+    reference_hidden = student_hidden.detach().clone().requires_grad_(True)
+    expected_numerators, expected_counts = _dense_projected_stats(
+        reference_hidden,
+        output_weight.detach(),
+        teacher_logits.detach(),
+        teacher_row_indices,
+        mask,
+        bin_ids,
+        num_bins=3,
+    )
+    expected_loss = (expected_numerators * weights).sum() / (
+        (expected_counts * weights).sum() + 1e-8
+    )
+    expected_loss.backward()
+
+    tolerance = {"rtol": 2e-2, "atol": 2e-2} if dtype == torch.bfloat16 else {}
+    torch.testing.assert_close(stats.numerators, expected_numerators, **tolerance)
+    torch.testing.assert_close(stats.counts, expected_counts)
+    torch.testing.assert_close(loss, expected_loss, **tolerance)
+    torch.testing.assert_close(
+        student_hidden.grad,
+        reference_hidden.grad,
+        **tolerance,
+    )
+    assert stats.counts[2] == 0
+    assert teacher_logits.grad is None
+    assert output_weight.grad is None
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_vocab_distributions"),
+    [
+        pytest.param(4, 2, id="one_tile_caches_distributions"),
+        pytest.param(5, 0, id="multiple_tiles_recompute_distributions"),
+    ],
+)
+def test_projected_soft_ce_saved_state_contract(
+    num_tokens: int,
+    expected_vocab_distributions: int,
+) -> None:
+    """Only the one-tile route saves FP32 projected-vocabulary distributions."""
+    generator = torch.Generator().manual_seed(9753)
+    hidden_size, vocab_size = 3, 7
+    student_hidden = torch.randn(
+        num_tokens,
+        hidden_size,
+        generator=generator,
+        dtype=torch.bfloat16,
+    ).requires_grad_(True)
+    output_weight = torch.randn(
+        vocab_size,
+        hidden_size,
+        generator=generator,
+        dtype=torch.bfloat16,
+    ).requires_grad_(True)
+    teacher_logits = torch.randn(
+        1,
+        3,
+        vocab_size,
+        generator=generator,
+        dtype=torch.bfloat16,
+    ).requires_grad_(True)
+    teacher_row_indices = torch.tensor([2, 0, 2, 1, 2])[:num_tokens]
+    mask = torch.ones(num_tokens)
+    saved_tensors: list[torch.Tensor] = []
+
+    def record(tensor: torch.Tensor) -> torch.Tensor:
+        saved_tensors.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(record, lambda tensor: tensor):
+        stats = projected_streaming_vocab_parallel_soft_ce(
+            student_hidden=student_hidden,
+            output_weight=output_weight,
+            teacher_logits=teacher_logits,
+            teacher_row_indices=teacher_row_indices,
+            mask=mask,
+            token_chunk_size=4,
+            tp_group=None,
+        )
+        stats.normalized(normalization_counts=stats.counts).backward()
+
+    vocab_distributions = [
+        tensor
+        for tensor in saved_tensors
+        if tensor.dtype == torch.float32 and tensor.shape == (num_tokens, vocab_size)
+    ]
+    assert len(vocab_distributions) == expected_vocab_distributions
+    assert not any(
+        tensor.dtype == teacher_logits.dtype
+        and tensor.shape == (num_tokens, vocab_size)
+        for tensor in saved_tensors
+    )
+    assert any(
+        tensor.dtype == torch.float32 and tensor.shape == (num_tokens, 2)
+        for tensor in saved_tensors
+    ) is (expected_vocab_distributions == 0)
+    assert student_hidden.grad is not None
+    assert student_hidden.grad.dtype == torch.bfloat16
+    assert teacher_logits.grad is None
+    assert output_weight.grad is None
