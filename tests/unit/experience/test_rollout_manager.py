@@ -46,7 +46,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutStats,
 )
-from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+from nemo_rl.experience.rollout_recovery import PromptRef, RolloutRecoveryLedger
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -1051,6 +1051,7 @@ def _make_capture_manager(buf, *, on_run=None, num_generations=2):
     mgr._stats = RolloutStats()
     mgr._skipped_prompts = 0
     mgr._recovery_ledger = RolloutRecoveryLedger()
+    mgr._data_plane_checkpoint_barrier = None
 
     class _CaptureImpl:
         def __init__(self):
@@ -1213,3 +1214,46 @@ class TestGenerateForFinalizationFlow:
         assert second_ids[0] == first_ids[0]
         assert second_ids[1] != first_ids[1]
         assert request.rollout_ids == (second_ids[0], second_ids[1])
+
+    def test_recovery_redispatches_only_sibling_missing_from_snapshot(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+        prompt = {"prompt": "p", "idx": 12, "task_name": "nemo_gym"}
+        group = mgr._recovery_ledger.reserve_group(
+            group_id="restored-group",
+            prompt_id="12",
+            prompt_ref=PromptRef(sample_id="12", task_name="nemo_gym"),
+            prompt_payload=prompt,
+            expected_generations=2,
+            target_step=6,
+            start_weight_version=7,
+        )
+        mgr._recovery_ledger.mark_group_dispatched(group.group_id)
+        first_rollout_id = group.gate_rollout_ids[0]
+        mgr._recovery_ledger.mark_sibling_sealed(
+            group.group_id,
+            generation_index=0,
+            gate_rollout_id=first_rollout_id,
+            receipt={
+                "rollout_id": first_rollout_id,
+                "manifest": [{"staging_key": f"{first_rollout_id}/call"}],
+            },
+            reward=0.5,
+        )
+        restored = RolloutRecoveryLedger.from_state_dict(
+            mgr._recovery_ledger.state_dict()
+        )
+        restored.prepare_for_restart()
+        restored.bind_runtime_prompt(group.group_id, prompt)
+        mgr._recovery_ledger = restored
+
+        request = _run(mgr.recover_for_finalization(group.group_id))
+
+        assert request is not None
+        assert mgr._impl.seen_rollout_ids is not None
+        assert buf.reserve_rollout_ids[-1] is not None
+        restored_ids = buf.reserve_rollout_ids[-1]
+        assert restored_ids is not None
+        assert restored_ids[0] == first_rollout_id
+        assert restored_ids[1] != group.gate_rollout_ids[1]
+        assert request.rollout_ids == tuple(restored_ids)

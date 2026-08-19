@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
@@ -47,6 +49,12 @@ from nemo_rl.algorithms.single_controller_utils import (
     setup_single_controller,
 )
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
+from nemo_rl.experience.rollout_recovery import (
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+    ROLLOUT_RECOVERY_STATE_FILENAME,
+    PromptRef,
+    RolloutRecoveryLedger,
+)
 
 
 class _CheckpointingCustomSampler(WindowedSampler):
@@ -925,3 +933,92 @@ class TestNativeTQRecoverySetup:
                 partition_id="rollout_data",
                 sampler_name="in_order",
             )
+
+
+class TestRolloutRecoverySetup:
+    @staticmethod
+    def _write_partial_ledger(checkpoint_path) -> tuple[dict[str, Any], str]:
+        ledger = RolloutRecoveryLedger()
+        ledger.reserve_group(
+            group_id="partial-group",
+            prompt_id="2",
+            prompt_ref=PromptRef(sample_id="2", task_name="nemo_gym"),
+            prompt_payload={"idx": 2, "task_name": "nemo_gym"},
+            expected_generations=2,
+            target_step=3,
+            start_weight_version=3,
+        )
+        buffer = io.BytesIO()
+        torch.save(ledger.state_dict(), buffer)
+        payload = buffer.getvalue()
+        (checkpoint_path / ROLLOUT_RECOVERY_STATE_FILENAME).write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        return (
+            {
+                "rollout_recovery_schema_version": (ROLLOUT_RECOVERY_SCHEMA_VERSION),
+                "rollout_recovery_payload_sha256": digest,
+                "rollout_recovery_group_count": 1,
+            },
+            digest,
+        )
+
+    def test_restores_digest_bound_lineage_and_rehydrates_prompt(self, tmp_path):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        metadata, _ = self._write_partial_ledger(checkpoint_path)
+
+        ledger = sc_setup_mod._maybe_restore_rollout_recovery_ledger(
+            last_checkpoint_path=str(checkpoint_path),
+            data_plane_checkpoint_metadata=metadata,
+            token_capture_enabled=True,
+        )
+        assert ledger is not None
+        dataset = [
+            {"idx": index, "task_name": "nemo_gym", "payload": f"prompt-{index}"}
+            for index in range(4)
+        ]
+
+        sc_setup_mod._rehydrate_rollout_recovery_prompts(ledger, dataset)
+
+        restored = ledger.get_group("partial-group")
+        assert restored.runtime_prompt_payload is dataset[2]
+
+    def test_rejects_corrupt_rollout_recovery_sidecar(self, tmp_path):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        metadata, _ = self._write_partial_ledger(checkpoint_path)
+        (checkpoint_path / ROLLOUT_RECOVERY_STATE_FILENAME).write_bytes(b"corrupt")
+
+        with pytest.raises(ValueError, match="digest does not match"):
+            sc_setup_mod._maybe_restore_rollout_recovery_ledger(
+                last_checkpoint_path=str(checkpoint_path),
+                data_plane_checkpoint_metadata=metadata,
+                token_capture_enabled=True,
+            )
+
+    def test_rejects_native_token_capture_checkpoint_without_lineage(self, tmp_path):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+
+        with pytest.raises(FileNotFoundError, match="older checkpoints"):
+            sc_setup_mod._maybe_restore_rollout_recovery_ledger(
+                last_checkpoint_path=str(checkpoint_path),
+                data_plane_checkpoint_metadata={"mode": "authoritative"},
+                token_capture_enabled=True,
+            )
+
+    def test_static_prompt_reference_must_match_current_dataset(self, tmp_path):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        metadata, _ = self._write_partial_ledger(checkpoint_path)
+        ledger = sc_setup_mod._maybe_restore_rollout_recovery_ledger(
+            last_checkpoint_path=str(checkpoint_path),
+            data_plane_checkpoint_metadata=metadata,
+            token_capture_enabled=True,
+        )
+        assert ledger is not None
+        dataset = [{"idx": index, "task_name": "nemo_gym"} for index in range(4)]
+        dataset[2] = {"idx": 99, "task_name": "nemo_gym"}
+
+        with pytest.raises(ValueError, match="durable sample reference"):
+            sc_setup_mod._rehydrate_rollout_recovery_prompts(ledger, dataset)

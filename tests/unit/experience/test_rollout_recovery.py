@@ -274,6 +274,83 @@ def test_state_dict_rejects_missing_status_with_context(missing_status: str) -> 
         RolloutRecoveryLedger.from_state_dict(state)
 
 
+def test_restored_partial_group_rebinds_runtime_prompt_by_reference() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger, group_id="partial")
+    ledger.mark_group_dispatched(group.group_id)
+    _seal(ledger, group.group_id, 0)
+
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    assert restored.get_group(group.group_id).runtime_prompt_payload is None
+
+    prompt = _prompt()
+    restored.bind_runtime_prompt(group.group_id, prompt)  # type: ignore[arg-type]
+
+    rebound = restored.get_group(group.group_id)
+    assert rebound.runtime_prompt_payload is prompt
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        {**_prompt(), "idx": 18},
+        {**_prompt(), "task_name": "different-task"},
+    ],
+)
+def test_runtime_prompt_reference_mismatch_is_rejected(prompt: dict) -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+
+    with pytest.raises(ValueError, match="durable|task"):
+        ledger.bind_runtime_prompt(group.group_id, prompt)  # type: ignore[arg-type]
+
+
+def test_prepare_for_restart_preserves_sealed_and_abandons_inflight() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    ledger.mark_group_dispatched(group.group_id)
+    _seal(ledger, group.group_id, 0)
+
+    ledger.prepare_for_restart()
+
+    restored = ledger.get_group(group.group_id)
+    assert restored.status == PromptGroupStatus.GENERATING
+    assert restored.siblings[0].current_attempt.status == RolloutAttemptStatus.SEALED
+    assert restored.siblings[1].current_attempt.status == RolloutAttemptStatus.ABANDONED
+    assert ledger.expected_staging_keys() == {f"{restored.gate_rollout_ids[0]}/call"}
+
+
+def test_full_step_checkpoint_rejects_open_train_step() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    ledger.mark_group_dispatched(group.group_id)
+    _seal(ledger, group.group_id, 0)
+    _seal(ledger, group.group_id, 1)
+    _finalize(ledger, group.group_id)
+    ledger.claim_groups_for_training(
+        [group.group_id],
+        train_step=3,
+        trainer_version=3,
+        expected_group_count=1,
+    )
+
+    with pytest.raises(RuntimeError, match="open optimizer step"):
+        ledger.assert_full_step_checkpoint_safe()
+
+
+def test_full_step_checkpoint_rejects_unknown_finalizer_outcome() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    ledger.mark_group_dispatched(group.group_id)
+    _seal(ledger, group.group_id, 0)
+    _seal(ledger, group.group_id, 1)
+    ledger.mark_finalization_started(group.group_id)
+    ledger.mark_finalization_unknown(group.group_id)
+
+    with pytest.raises(RuntimeError, match="checkpoint-unsafe"):
+        ledger.assert_full_step_checkpoint_safe()
+
+
 def test_finalizer_unknown_outcome_is_terminal() -> None:
     ledger = RolloutRecoveryLedger()
     group = _reserve(ledger)
