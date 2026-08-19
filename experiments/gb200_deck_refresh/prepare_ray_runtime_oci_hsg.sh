@@ -25,7 +25,7 @@ test -f "${CONTAINER}"
 test -f "${REPO}/ray.sub"
 mkdir -p "${LOG_DIR}" "${CACHE_ROOT}" "${UV_CACHE_DIR}"
 
-export SETUP_COMMAND=$(cat <<EOF
+SETUP_COMMAND=$(cat <<EOF
 set -euo pipefail
 RUNTIME='${RAY_RUNTIME_VENV}'
 if [[ -x "\${RUNTIME}/bin/python" ]] && \
@@ -55,6 +55,7 @@ test -n "\${PYTHON}"
 touch "\${RUNTIME}/READY"
 EOF
 )
+export SETUP_COMMAND
 
 export BASE_LOG_DIR=${LOG_DIR}
 export COMMAND="${RAY_RUNTIME_VENV}/bin/python -c 'import ray, requests, urllib3; assert ray.__version__ == \"2.56.1\"'"

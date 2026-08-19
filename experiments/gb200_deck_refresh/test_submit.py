@@ -38,12 +38,25 @@ def test_sync_mxfp8_renders_matched_two_logprob_cuda_graph_run() -> None:
     assert "policy.generation.colocated.enabled=true" in result.stdout
     assert "policy.generation.refit_transport=null" in result.stdout
     assert "policy.generation.vllm_cfg.enforce_eager=false" in result.stdout
+    assert "policy.generation.vllm_cfg.gpu_memory_utilization=0.5" in result.stdout
     assert "policy.generation.vllm_cfg.precision=fp8" in result.stdout
     assert "++policy.generation.vllm_cfg.is_mx=true" in result.stdout
     assert "++policy.generation.vllm_kwargs.moe_backend=flashinfer_trtllm" in result.stdout
     assert "loss_fn.force_on_policy_ratio=false" in result.stdout
     assert "loss_fn.use_importance_sampling_correction=true" in result.stdout
     assert "++grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout
+
+
+def test_gpu_memory_utilization_can_be_overridden() -> None:
+    result = render(
+        MODE="sync",
+        MODEL="nano",
+        ARM="bf16",
+        VLLM_GPU_MEMORY_UTILIZATION="0.45",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "policy.generation.vllm_cfg.gpu_memory_utilization=0.45" in result.stdout
 
 
 def test_submitter_uses_a_pinned_ray_runtime() -> None:
