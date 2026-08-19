@@ -562,9 +562,10 @@ fi
 # =============================================================================
 # Container mounts
 # =============================================================================
-# By default, the project metadata/lock, nemo_rl (Python package), and
-# examples/configs (YAML configs) from the code snapshot are overlaid into the
-# container. Everything else uses the container's built-in code at /opt/nemo-rl.
+# By default, the project metadata/lock, nemo_rl (Python package),
+# examples/configs (YAML configs), and local uv sources/workspace members from
+# the code snapshot are overlaid into the container. Keeping the project files
+# and their local sources together is required for `uv sync --locked`.
 #
 # To overlay additional components (e.g. a local Megatron-LM checkout), pass
 # EXTRA_MOUNTS as a comma-separated list of host:container pairs:
@@ -601,10 +602,19 @@ if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
   _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
   echo "  Mount: configs → /opt/nemo-rl/examples/configs"
 fi
-if [[ -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
-  echo "  Mount: Gym → /opt/nemo-rl/3rdparty/Gym-workspace/Gym"
-fi
+_local_project_paths=(
+  "3rdparty/TensorRT-LLM-workspace"
+  "3rdparty/Automodel-workspace/Automodel"
+  "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+  "3rdparty/Gym-workspace/Gym"
+  "research/template_project"
+)
+for _local_project_path in "${_local_project_paths[@]}"; do
+  if [[ -d "${OVERLAY_SOURCE}/${_local_project_path}" ]]; then
+    _append_mount "${OVERLAY_SOURCE}/${_local_project_path}:/opt/nemo-rl/${_local_project_path}"
+    echo "  Mount: ${_local_project_path} → /opt/nemo-rl/${_local_project_path}"
+  fi
+done
 
 if [[ "${USE_SNAPSHOT}" == "1" ]]; then
   _append_mount "${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
