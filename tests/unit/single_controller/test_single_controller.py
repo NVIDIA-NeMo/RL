@@ -22,7 +22,7 @@ import pytest
 import torch
 
 import nemo_rl.algorithms.single_controller as single_controller
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
@@ -33,11 +33,25 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
 class FakeWeightSynchronizer:
     pass
+
+
+def _checkpointing_config(tmp_path) -> dict:
+    """Minimal checkpointing block for actors built through __init__."""
+    return {
+        "enabled": False,
+        "checkpoint_dir": str(tmp_path / "checkpoints"),
+        "metric_name": None,
+        "higher_is_better": True,
+        "keep_top_k": None,
+        "save_period": 10,
+        "save_optimizer": True,
+        "checkpoint_must_save_by": None,
+    }
 
 
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
@@ -50,6 +64,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         ),
         async_rl=AsyncRLConfig(min_groups_for_streaming_train=1),
         logger={},
+        env={},
     )
     actor_args = SimpleNamespace(
         partition_id="rollout_data",
@@ -62,6 +77,9 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         loss_fn=None,
         tq_buffer=None,
         rollout_manager=SimpleNamespace(_tq_buffer=None),
+        env_handles={},
+        fleet_monitor=None,
+        generation_router=None,
         train_cluster=None,
         inference_cluster=None,
     )
@@ -84,6 +102,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
 def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     monkeypatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path,
 ) -> None:
     logger = MagicMock()
     monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
@@ -99,6 +118,9 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
             max_buffered_rollouts=4,
         ),
         logger={},
+        env={},
+        # __init__ builds a CheckpointManager + TimeoutChecker from this block.
+        checkpointing=_checkpointing_config(tmp_path),
     )
     actor_args = SimpleNamespace(
         partition_id="rollout_data",
@@ -111,8 +133,13 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         loss_fn=None,
         tq_buffer=None,
         rollout_manager=SimpleNamespace(_tq_buffer=None),
+        env_handles={},
+        fleet_monitor=None,
+        generation_router=None,
         train_cluster=None,
         inference_cluster=None,
+        save_state=_initial_grpo_save_state(),
+        last_checkpoint_path=None,
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
@@ -128,7 +155,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     assert "transport=stub" not in output
 
 
-def test_logs_setup_timing_metrics(monkeypatch) -> None:
+def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
     """setup_timing_metrics is forwarded to Logger.log_metrics under timing/setup."""
     logger = MagicMock()
     monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
@@ -144,6 +171,9 @@ def test_logs_setup_timing_metrics(monkeypatch) -> None:
             max_buffered_rollouts=4,
         ),
         logger={},
+        env={},
+        # __init__ builds a CheckpointManager + TimeoutChecker from this block.
+        checkpointing=_checkpointing_config(tmp_path),
     )
     setup_metrics = SetupTimingMetrics(
         generation_init_time_s=1.5, policy_init_time_s=2.5
@@ -161,6 +191,12 @@ def test_logs_setup_timing_metrics(monkeypatch) -> None:
         rollout_manager=SimpleNamespace(_tq_buffer=None),
         train_cluster=None,
         inference_cluster=None,
+        # A real field of SingleControllerActorArgs. Read directly rather than via a
+        # getattr default, so omitting it breaks here instead of silently degrading
+        # watchdog.gym_subprocess_check into a no-op at runtime.
+        env_handles={},
+        save_state=_initial_grpo_save_state(),
+        last_checkpoint_path=None,
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
@@ -281,14 +317,34 @@ class _EvictingSampler(_OneThenEmptySampler):
         return meta, 2 if num_groups else 0
 
 
+class _ChunkedSampler(_EmptySampler):
+    """Assembles one step out of several single-group chunks, then goes empty.
+
+    This is the shape the streaming path actually produces and the reason
+    ``keep_train_buffers`` exists: every chunk after the first runs against an
+    already-open train step.
+    """
+
+    def __init__(self, meta: KVBatchMeta, chunks: int) -> None:
+        self._meta = meta
+        self._remaining = chunks
+
+    async def select(self, **kwargs):
+        del kwargs
+        if self._remaining == 0:
+            return None, 0
+        self._remaining -= 1
+        return self._meta, 1
+
+
 class _EmptyBuffer:
     def __len__(self) -> int:
         return 0
 
 
 class _NoOpTrainer:
-    def prepare_for_lp_inference(self) -> None:
-        pass
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        del keep_train_buffers
 
     def prepare_for_training(self) -> None:
         pass
@@ -303,6 +359,19 @@ class _NoOpTrainer:
         return {}
 
 
+class _LpRecordingTrainer(_NoOpTrainer):
+    """Records the ``keep_train_buffers`` flag the pump passes on each chunk."""
+
+    def __init__(self) -> None:
+        self.keep_train_buffers_calls: list[bool] = []
+
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        self.keep_train_buffers_calls.append(keep_train_buffers)
+
+    def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
+        del meta
+
+
 class _NoOpDataPlane:
     def clear_samples(self, **kwargs) -> None:
         del kwargs
@@ -315,9 +384,16 @@ def _train_pump_controller(*, sampler) -> object:
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=2,
             max_num_steps=1,
-        )
+        ),
+        # The pump's step epilogue reads the save triggers even when saving
+        # is disabled.
+        checkpointing={"enabled": False, "save_period": 10},
     )
     ctrl._async_cfg = SimpleNamespace(min_groups_for_streaming_train=1)
+    ctrl._consumed_samples = 0
+    ctrl._total_valid_tokens = 0
+    ctrl._timeout = TimeoutChecker(timeout=None, fit_last_save_time=True)
+    ctrl._timeout.start_iterations()
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
@@ -392,3 +468,35 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["evicted_stale_prompt_groups"] == 2
     assert train_metrics["aborted_stale_inflight_groups"] == 1
+
+
+def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> None:
+    """The logprob detour between chunks must not offload the trainer's grad
+    buffers, because mcore's offload frees the gradients the earlier chunks of
+    this step accumulated rather than copying them out.
+
+    First chunk: no step open yet, nothing to preserve, so the offload is still
+    worth taking. Every later chunk: step open, buffers must stay resident.
+    """
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    # num_prompts_per_step is 2 in the harness, so two single-group chunks close
+    # the step.
+    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    ctrl._policy_logprobs_required = True
+    trainer = _LpRecordingTrainer()
+    ctrl._trainer = trainer
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._train_steps == 1
+    assert trainer.keep_train_buffers_calls == [False, True]

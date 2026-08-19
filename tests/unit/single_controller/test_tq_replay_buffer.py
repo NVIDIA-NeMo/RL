@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from typing import Any
 
 import pytest
 import torch
+from tensordict import TensorDict
 
 import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
@@ -63,6 +65,7 @@ class FakeDataPlaneClient:
         self._rows: dict[str, dict[str, Any]] = {}
         self.put_calls: list[dict[str, Any]] = []
         self.clear_calls: list[list[str]] = []
+        self.get_calls: list[dict[str, Any]] = []
 
     def put_samples(
         self,
@@ -97,6 +100,24 @@ class FakeDataPlaneClient:
         self.clear_calls.append(list(ids))
         for sid in ids:
             self._rows.pop(sid, None)
+
+    def get_samples(
+        self,
+        sample_ids: list[str],
+        partition_id: str,
+        select_fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        assert partition_id == self._partition_id
+        self.get_calls.append(
+            {
+                "sample_ids": list(sample_ids),
+                "select_fields": (
+                    list(select_fields) if select_fields is not None else None
+                ),
+            }
+        )
+        # Opaque per-group payload; load_state_dict must re-put it verbatim.
+        return {"payload_for": list(sample_ids)}
 
     def depth(self) -> int:
         return len(self._rows)
@@ -146,11 +167,14 @@ def _make_buffer(
 
 
 def _add_group(
-    buf: TQReplayBuffer, weight: int, end_weight: int | None = None
+    buf: TQReplayBuffer,
+    weight: int,
+    end_weight: int | None = None,
+    target_step: int | None = None,
 ) -> KVBatchMeta:
     if end_weight is None:
         end_weight = weight
-    group_id = buf.reserve(weight_version=weight)
+    group_id = buf.reserve(weight_version=weight, target_step=target_step)
     return _run(
         buf.commit(
             group_id,
@@ -401,3 +425,341 @@ class TestTQReplayBufferSize:
         _run(buf.remove([0], remove_in_dp=True))
         assert buf.size() == 1
         assert len(buf) == 1
+
+    def test_count_for_target_step_includes_reserved_slots(self):
+        # The rollout pump uses this to size the top-up of a restored target
+        # step, so in-flight (reserved, not yet committed) slots must count.
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=0, target_step=5)
+        _add_group(buf, weight=0, target_step=6)
+        buf.reserve(weight_version=0, target_step=5)
+
+        assert buf.count_for_target_step(5) == 2
+        assert buf.count_for_target_step(6) == 1
+        assert buf.count_for_target_step(7) == 0
+
+
+# ── state_dict / load_state_dict (checkpointing) ─────────────────────────────
+
+
+def _group_id_of(meta: KVBatchMeta) -> str:
+    head, _, _ = meta.sample_ids[0].rpartition("_g")
+    return head
+
+
+def _make_group_entry(
+    group_id: str,
+    weight: int,
+    *,
+    n: int = _N_GENS,
+    target_step: int | None = None,
+    sample_ids: list[str] | None = None,
+    sequence_lengths: list[int] | None = None,
+    partition_id: str = "rollout_data",
+) -> dict[str, Any]:
+    """Hand-built envelope group (bypasses commit) for preflight tests."""
+    sids = (
+        list(sample_ids)
+        if sample_ids is not None
+        else [f"{group_id}_g{i}" for i in range(n)]
+    )
+    meta = KVBatchMeta(
+        partition_id=partition_id,
+        task_name="train",
+        sample_ids=sids,
+        fields=["input_ids", "input_lengths", "total_reward"],
+        sequence_lengths=(
+            sequence_lengths if sequence_lengths is not None else [3] * len(sids)
+        ),
+        tags=[{"weight_version": weight}] * len(sids),
+    )
+    return {
+        "meta": meta,
+        "start_weight": weight,
+        "end_weight": weight,
+        "target_step": target_step,
+        "group_id": group_id,
+        "fields_data": {"payload_for": sids},
+    }
+
+
+def _make_envelope(
+    groups: list[dict[str, Any]],
+    *,
+    partition_id: str = "rollout_data",
+    saved_capacity: int = 8,
+) -> dict[str, Any]:
+    return {
+        "partition_id": partition_id,
+        "saved_capacity": saved_capacity,
+        "groups": list(groups),
+    }
+
+
+def _load(
+    buf: TQReplayBuffer,
+    state: dict[str, Any],
+    *,
+    max_groups: int = 8,
+    expected_partition_id: str = "rollout_data",
+    expected_group_size: int = _N_GENS,
+) -> int:
+    return _run(
+        buf.load_state_dict(
+            state,
+            max_groups=max_groups,
+            expected_partition_id=expected_partition_id,
+            expected_group_size=expected_group_size,
+        )
+    )
+
+
+class TestTQReplayBufferStateDict:
+    def test_state_dict_serializes_ready_and_skips_unready(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        metas = [_add_group(buf, weight=w) for w in (1, 2)]
+        buf.reserve(weight_version=3)  # in-flight: must be excluded
+
+        state = _run(buf.state_dict(saved_capacity=8))
+
+        assert state["partition_id"] == "rollout_data"
+        assert state["saved_capacity"] == 8
+        assert len(state["groups"]) == 2
+        assert [g["start_weight"] for g in state["groups"]] == [1, 2]
+        assert [g["end_weight"] for g in state["groups"]] == [1, 2]
+        assert [g["target_step"] for g in state["groups"]] == [None, None]
+        assert [g["group_id"] for g in state["groups"]] == [
+            _group_id_of(metas[0]),
+            _group_id_of(metas[1]),
+        ]
+        # Payloads are fetched from the DataPlane rows of each group.
+        assert [c["sample_ids"] for c in dp.get_calls] == [
+            list(metas[0].sample_ids),
+            list(metas[1].sample_ids),
+        ]
+        assert dp.get_calls[0]["select_fields"] == list(metas[0].fields)
+        assert state["groups"][0]["fields_data"] == {
+            "payload_for": list(metas[0].sample_ids)
+        }
+
+    def test_round_trip_restores_lists_and_rows(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        metas = [_add_group(buf, weight=w) for w in (1, 2)]
+        state = _run(buf.state_dict(saved_capacity=8))
+
+        dp2 = FakeDataPlaneClient()
+        buf2 = _make_buffer(dp2)
+        restored = _load(buf2, state)
+
+        assert restored == 2
+        assert buf2.size() == 2
+        # Parallel lists rebuilt in order, all ready.
+        assert buf2.start_weight_list == [1, 2]
+        assert buf2.end_weight_list == [1, 2]
+        assert buf2.target_step_list == [None, None]
+        assert buf2.ready_list == [True, True]
+        assert buf2._group_ids == [_group_id_of(m) for m in metas]
+        assert [m.sample_ids for m in buf2.meta_list] == [
+            list(metas[0].sample_ids),
+            list(metas[1].sample_ids),
+        ]
+        # Rows re-put with identical sample_ids / fields payload / tags.
+        assert len(dp2.put_calls) == 2
+        for put, meta in zip(dp2.put_calls, metas):
+            assert put["sample_ids"] == list(meta.sample_ids)
+            assert put["fields"] == {"payload_for": list(meta.sample_ids)}
+            assert put["tags"] == [dict(t) for t in meta.tags]
+
+    def test_round_trip_preserves_end_weight_and_target_step(self):
+        # start != end and a non-None target_step must survive the round-trip:
+        # a load that swapped start/end or dropped target_step (the
+        # InOrderSampler's selection key) would corrupt resume silently.
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=1, end_weight=2)
+        _add_group(buf, weight=5, target_step=7)
+        state = _run(buf.state_dict(saved_capacity=8))
+
+        buf2 = _make_buffer(FakeDataPlaneClient())
+        assert _load(buf2, state) == 2
+
+        assert buf2.start_weight_list == [1, 5]
+        assert buf2.end_weight_list == [2, 5]
+        assert buf2.target_step_list == [None, 7]
+
+    def test_round_trip_empty_buffer(self):
+        # Common resume shape: no group committed before the checkpoint.
+        buf = _make_buffer(FakeDataPlaneClient())
+        state = _run(buf.state_dict(saved_capacity=8))
+        assert state["groups"] == []
+
+        dp2 = FakeDataPlaneClient()
+        buf2 = _make_buffer(dp2)
+        assert _load(buf2, state) == 0
+        assert buf2.size() == 0
+        assert dp2.put_calls == []
+
+    def test_state_dict_skips_middle_unready(self):
+        # An unready slot between two ready ones: the by-index skip must not
+        # shift the neighbouring groups' fields.
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        first = _add_group(buf, weight=1)
+        buf.reserve(weight_version=2)  # in-flight, sandwiched
+        third = _add_group(buf, weight=3)
+
+        state = _run(buf.state_dict(saved_capacity=8))
+
+        assert [g["start_weight"] for g in state["groups"]] == [1, 3]
+        assert [g["group_id"] for g in state["groups"]] == [
+            _group_id_of(first),
+            _group_id_of(third),
+        ]
+        assert [g["meta"].sample_ids for g in state["groups"]] == [
+            list(first.sample_ids),
+            list(third.sample_ids),
+        ]
+
+    def test_round_trip_tensordict_payload_through_torch_save(self):
+        # The production checkpoint file is torch.save(envelope) with
+        # TensorDict-valued fields_data; exercise that serialization for real
+        # (mixed dtypes + a non-contiguous view) instead of the opaque fake.
+        fields = TensorDict(
+            {
+                "input_ids": torch.arange(12, dtype=torch.long).reshape(2, 6),
+                "prev_logprobs": torch.randn(2, 12, dtype=torch.float32)[:, ::2],
+                "sample_mask": torch.ones(2, dtype=torch.long),
+            },
+            batch_size=(2,),
+        )
+        group = _make_group_entry("g0", weight=1)
+        group["fields_data"] = fields
+        state = _make_envelope([group])
+
+        buffer_bytes = io.BytesIO()
+        torch.save(state, buffer_bytes)
+        buffer_bytes.seek(0)
+        loaded_state = torch.load(buffer_bytes, weights_only=False)
+
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        assert (
+            _load(buf, loaded_state, expected_group_size=len(group["meta"].sample_ids))
+            == 1
+        )
+        put_fields = dp.put_calls[0]["fields"]
+        for key in fields.keys():
+            assert torch.equal(put_fields[key], fields[key])
+
+
+class TestTQReplayBufferLoadPreflight:
+    """Malformed envelopes raise ValueError before any DataPlane write."""
+
+    def _assert_rejected(self, state: dict[str, Any], match: str, **load_kwargs):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        with pytest.raises(ValueError, match=match):
+            _load(buf, state, **load_kwargs)
+        assert dp.put_calls == []
+        assert buf.size() == 0
+
+    def test_missing_envelope_keys(self):
+        self._assert_rejected({"groups": []}, match="missing required keys")
+
+    def test_partition_id_mismatch(self):
+        state = _make_envelope([], partition_id="other_partition")
+        self._assert_rejected(state, match="partition_id mismatch")
+
+    def test_group_missing_keys(self):
+        group = _make_group_entry("g0", weight=1)
+        del group["fields_data"]
+        self._assert_rejected(_make_envelope([group]), match="group missing keys")
+
+    def test_group_misaligned_sequence_lengths(self):
+        group = _make_group_entry("g0", weight=1, sequence_lengths=[3])
+        self._assert_rejected(_make_envelope([group]), match="misaligned")
+
+    def test_group_size_mismatch(self):
+        state = _make_envelope([_make_group_entry("g0", weight=1, n=2)])
+        self._assert_rejected(state, match="misaligned", expected_group_size=3)
+
+    def test_duplicate_sample_ids_across_groups(self):
+        g0 = _make_group_entry("g0", weight=1)
+        g1 = _make_group_entry(
+            "g1", weight=2, sample_ids=["g0_g0", "g1_g1"]
+        )  # g0_g0 collides
+        self._assert_rejected(_make_envelope([g0, g1]), match="duplicate sample_id")
+
+
+class TestTQReplayBufferLoadTruncation:
+    def test_capacity_change_truncates_to_freshest(self, monkeypatch):
+        state = _make_envelope(
+            [_make_group_entry(f"g{w}", weight=w) for w in (1, 2, 3)],
+            saved_capacity=8,
+        )
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        printed: list[str] = []
+        monkeypatch.setattr(
+            "builtins.print",
+            lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
+        )
+
+        restored = _load(buf, state, max_groups=2)
+
+        assert restored == 2
+        # The freshest max_groups groups survive, original order preserved.
+        assert buf.start_weight_list == [2, 3]
+        put_sample_ids = [sid for c in dp.put_calls for sid in c["sample_ids"]]
+        assert "g1_g0" not in put_sample_ids and "g1_g1" not in put_sample_ids
+        assert any("capacity changed" in line for line in printed)
+
+    def test_over_capacity_target_stamped_groups_raise(self):
+        # start_weight and target_step are both monotonic for the InOrder
+        # family, so freshest-first would keep the far-future targets and drop
+        # the near-term ones. InOrderSampler.evict only drops
+        # target < current_train_weight, so those permits are never released:
+        # rollout blocks on capacity while the train pump waits for a target
+        # that can no longer be filled. Fail loudly instead of truncating.
+        state = _make_envelope(
+            [_make_group_entry(f"g{w}", weight=w, target_step=w) for w in (1, 2, 3)],
+            saved_capacity=8,
+        )
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+
+        with pytest.raises(ValueError, match="max_buffered_rollouts >= 3"):
+            _load(buf, state, max_groups=2)
+
+        # Preflight semantics: nothing reached the DataPlane or the buffer.
+        assert dp.put_calls == []
+        assert buf.size() == 0
+
+    def test_over_capacity_mixed_stamps_raise(self):
+        # One target-stamped group is enough to make truncation unsafe.
+        state = _make_envelope(
+            [
+                _make_group_entry("g1", weight=1),
+                _make_group_entry("g2", weight=2),
+                _make_group_entry("g3", weight=3, target_step=3),
+            ],
+            saved_capacity=8,
+        )
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        with pytest.raises(ValueError, match="target_step stamps"):
+            _load(buf, state, max_groups=2)
+
+    def test_target_stamped_groups_within_capacity_load_fine(self):
+        # The guard is scoped to the over-capacity case only.
+        state = _make_envelope(
+            [_make_group_entry(f"g{w}", weight=w, target_step=w) for w in (1, 2)],
+            saved_capacity=8,
+        )
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        assert _load(buf, state, max_groups=2) == 2
+        assert buf.target_step_list == [1, 2]

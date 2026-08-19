@@ -19,6 +19,8 @@ This module provides:
   shared torch.distributed process group (needed for cross-world transfers)
 - Placement rules: mapping param names to TP/EP sharding strategies
 - build_nccl_reshard_refit_info: compute per-layer param metadata for refit
+- make_nccl_reshard_refit_info_wire_safe: convert placements and meshes into
+  plain dicts/lists before the refit metadata crosses a process boundary
 - restore_refit_info_placements: undo msgspec dict-flattening of placements
   and meshes on the receiving side
 
@@ -191,8 +193,16 @@ def is_nccl_reshard_param(param_name: str) -> bool:
     ``load_weights`` path.
 
     Shared-expert FFN weights (``*.shared_expert.*``) are routed to misc path.
+    Bare ``mtp.``-prefixed HF names are routed to misc too, because vLLM keeps
+    the MTP drafter separate and updates it through ``load_weights``. That only
+    covers families whose HF names keep the ``mtp.`` prefix. DeepSeek exports
+    MTP under ``model.layers.N`` HF names (the ``mtp.`` appears only on the
+    Megatron side), so those return True here; the caller drops them instead,
+    using the layer set from ``_collect_mtp_hf_layer_names``.
     """
     if "shared_expert" in param_name:
+        return False
+    if param_name.startswith("mtp."):
         return False
     return param_name.endswith(FFN_PROJ_WEIGHT_SUFFIXES) or param_name.endswith(
         FFN_GROUPED_EXPERT_SUFFIXES
@@ -245,6 +255,45 @@ def _restore_placement(p):
             return Shard(p["dim"])
         return Replicate()
     return Replicate()
+
+
+def make_nccl_reshard_refit_info_wire_safe(refit_info: dict) -> dict:
+    """Copy refit metadata into types safe for vLLM's subprocess RPC.
+
+    Importing ``megatron.core`` replaces ``torch.storage._load_from_bytes`` with
+    a Megatron function, so Tensor pickles require Megatron at unpickle time.
+    vLLM subprocesses may not have it importable; convert the metadata to the
+    plain representation accepted by ``restore_refit_info_placements``.
+    """
+
+    def _wire_mesh(mesh):
+        if isinstance(mesh, MeshInfo):
+            return {"mesh": mesh.mesh.tolist()}
+        return mesh
+
+    def _wire_placement(placement):
+        if isinstance(placement, Shard):
+            return {"dim": placement.dim}
+        if isinstance(placement, Replicate):
+            return {}
+        return placement
+
+    wire_info = dict(refit_info)
+    wire_layers = {}
+    for layer_name, params in refit_info.get("per_layer_params", {}).items():
+        wire_params = []
+        for param_info in params:
+            wire_param = dict(param_info)
+            for key in ("src_mesh_info", "dst_mesh_info"):
+                if key in wire_param:
+                    wire_param[key] = _wire_mesh(wire_param[key])
+            for key in ("src_placements", "dst_placements"):
+                if key in wire_param:
+                    wire_param[key] = [_wire_placement(p) for p in wire_param[key]]
+            wire_params.append(wire_param)
+        wire_layers[layer_name] = wire_params
+    wire_info["per_layer_params"] = wire_layers
+    return wire_info
 
 
 def restore_refit_info_placements(refit_info: dict) -> dict:
@@ -559,6 +608,16 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             "policy.generation.vllm_kwargs.enable_eplb must be False "
             "(nccl_reshard_refit fixes the expert->rank mapping at setup; "
             "dynamic expert load balancing can change ownership afterwards)."
+        )
+
+    # ModelOpt real-quant rollout holds NVFP4-packed vLLM params and refits
+    # through vLLM's layerwise-reload weight loaders; the bulk xferdtensor
+    # path writes directly into param storage, bypassing both.
+    if generation.get("real_quant"):
+        violations.append(
+            "policy.generation.real_quant must be False "
+            "(nccl_reshard_refit's bulk xferdtensor writes bypass the "
+            "layerwise-reload weight loaders that ModelOpt real quant requires)."
         )
 
     # This initial version supports only the Megatron train + vLLM gen
