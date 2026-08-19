@@ -303,20 +303,28 @@ def _run_tp2_tv_only_gradient(rank: int, world_size: int) -> None:
     full_target_logits = torch.tensor(
         [[[2.0, -1.0, -2.0, 0.5]]], device=device, dtype=torch.float64
     )
-    dense_hidden = torch.tensor(
-        [[[0.75]]], device=device, dtype=torch.float64, requires_grad=True
-    )
-    dense_logits = dense_hidden @ full_output_weight.T
-    dense_tv = (
-        0.5
-        * (
-            torch.softmax(full_target_logits, dim=-1)
-            - torch.softmax(dense_logits, dim=-1)
+    dense_hidden = torch.tensor([[[0.75]]], device=device, dtype=torch.float64)
+    with torch.no_grad():
+        draft_probs = torch.softmax(
+            (dense_hidden @ full_output_weight.T).float(), dim=-1
         )
-        .abs()
-        .sum()
-    )
-    dense_tv.backward()
+        target_probs = torch.softmax(full_target_logits.float(), dim=-1)
+        probability_gradient = 0.5 * torch.sign(draft_probs - target_probs)
+        local_expectations = [
+            (
+                probability_gradient[..., start : start + local_vocab_size]
+                * draft_probs[..., start : start + local_vocab_size]
+            ).sum(dim=-1, keepdim=True)
+            for start in range(0, vocab_size, local_vocab_size)
+        ]
+        probability_expectation = torch.stack(local_expectations).sum(dim=0)
+        logits_gradient = draft_probs * (probability_gradient - probability_expectation)
+        local_hidden_gradients = [
+            logits_gradient[..., start : start + local_vocab_size]
+            @ full_output_weight[start : start + local_vocab_size].float()
+            for start in range(0, vocab_size, local_vocab_size)
+        ]
+        expected_hidden_gradient = torch.stack(local_hidden_gradients).sum(dim=0)
 
     provider = build_dspark_provider(
         body=_CheckpointBody(tp_group=tp_group, device=device),
@@ -349,7 +357,10 @@ def _run_tp2_tv_only_gradient(rank: int, world_size: int) -> None:
     )
     stats.tv.normalized(normalization_counts=stats.tv.counts).backward()
     torch.testing.assert_close(
-        actual_hidden.grad, dense_hidden.grad, rtol=0, atol=1e-12
+        actual_hidden.grad,
+        expected_hidden_gradient.to(dtype=actual_hidden.dtype),
+        rtol=0,
+        atol=0,
     )
 
     empty_hidden = dense_hidden.detach().clone().requires_grad_()
