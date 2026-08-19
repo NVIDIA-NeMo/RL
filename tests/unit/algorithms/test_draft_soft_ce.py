@@ -78,8 +78,8 @@ def test_streaming_soft_ce_matches_dense_stats_and_gradient(
         num_bins=3,
     )
     expected_loss = (expected_numerators * weights).sum() / (
-        expected_counts * weights
-    ).sum() + 1e-8
+        (expected_counts * weights).sum() + 1e-8
+    )
     expected_loss.backward()
 
     torch.testing.assert_close(stats.numerators, expected_numerators)

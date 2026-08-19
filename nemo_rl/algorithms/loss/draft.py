@@ -101,6 +101,115 @@ def _tile_distributions(
     return teacher_probs, student_probs
 
 
+def _cached_tile_distributions_and_cross_entropy(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    student_shifted = student_logits.to(dtype=torch.float32, copy=True)
+    teacher_probs = teacher_logits.to(dtype=torch.float32, copy=True)
+    maxima = torch.stack(
+        (teacher_probs.amax(dim=-1), student_shifted.amax(dim=-1)),
+        dim=-1,
+    )
+    if tp_group is not None:
+        torch.distributed.all_reduce(
+            maxima,
+            op=torch.distributed.ReduceOp.MAX,
+            group=tp_group,
+        )
+    teacher_probs.sub_(maxima[:, :1]).exp_()
+    student_shifted.sub_(maxima[:, 1:])
+    local_teacher_expectation = torch.einsum(
+        "tv,tv->t",
+        teacher_probs,
+        student_shifted,
+    )
+    student_probs = student_shifted.exp_()
+    reductions = torch.stack(
+        (
+            teacher_probs.sum(dim=-1),
+            student_probs.sum(dim=-1),
+            local_teacher_expectation,
+        ),
+        dim=-1,
+    )
+    if tp_group is not None:
+        torch.distributed.all_reduce(
+            reductions,
+            op=torch.distributed.ReduceOp.SUM,
+            group=tp_group,
+        )
+    teacher_probs.div_(reductions[:, :1])
+    student_probs.div_(reductions[:, 1:2])
+    cross_entropy = reductions[:, 1].log() - reductions[:, 2].div_(reductions[:, 0])
+    return teacher_probs, student_probs, cross_entropy
+
+
+class _CachedVocabParallelSoftCE(torch.autograd.Function):
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        mask: torch.Tensor,
+        bin_ids: torch.Tensor,
+        num_bins: int,
+        tp_group: torch.distributed.ProcessGroup | None,
+    ) -> torch.Tensor:
+        vocab_size = student_logits.shape[-1]
+        flat_student = student_logits.reshape(-1, vocab_size)
+        flat_teacher = teacher_logits.reshape(-1, vocab_size)
+        teacher_probs, student_probs, cross_entropy = (
+            _cached_tile_distributions_and_cross_entropy(
+                flat_student,
+                flat_teacher,
+                tp_group,
+            )
+        )
+        numerators = torch.zeros(
+            num_bins,
+            dtype=torch.float32,
+            device=student_logits.device,
+        )
+        numerators.scatter_add_(
+            0,
+            bin_ids.reshape(-1),
+            cross_entropy.mul_(mask.reshape(-1).float()),
+        )
+        ctx.save_for_backward(
+            teacher_probs.reshape_as(teacher_logits),
+            student_probs.reshape_as(student_logits),
+            mask,
+            bin_ids,
+        )
+        # pyrefly: ignore[implicitly-defined-attribute]
+        ctx.student_dtype = student_logits.dtype
+        return numerators
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        *grad_outputs: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None, None, None]:
+        (grad_numerators,) = grad_outputs
+        teacher_probs, student_probs, mask, bin_ids = ctx.saved_tensors
+        row_scale = (
+            grad_numerators.index_select(0, bin_ids.reshape(-1))
+            * mask.reshape(-1).float()
+        )
+        gradient = student_probs.sub(teacher_probs)
+        gradient.mul_(row_scale.reshape(*mask.shape, 1))
+        return (
+            gradient.to(dtype=ctx.student_dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 class _StreamingVocabParallelSoftCE(torch.autograd.Function):
     @staticmethod
     def forward(  # pyrefly: ignore[bad-override]
@@ -266,15 +375,26 @@ def streaming_vocab_parallel_soft_ce(
             f"bin_ids and mask must share a device, got {bin_ids.device} and {mask.device}."
         )
 
-    numerators = _StreamingVocabParallelSoftCE.apply(
-        student_logits,
-        teacher_logits,
-        mask,
-        bin_ids,
-        num_bins,
-        token_chunk_size,
-        tp_group,
-    )
+    num_tokens = student_logits.numel() // student_logits.shape[-1]
+    if num_tokens <= token_chunk_size:
+        numerators = _CachedVocabParallelSoftCE.apply(
+            student_logits,
+            teacher_logits,
+            mask,
+            bin_ids,
+            num_bins,
+            tp_group,
+        )
+    else:
+        numerators = _StreamingVocabParallelSoftCE.apply(
+            student_logits,
+            teacher_logits,
+            mask,
+            bin_ids,
+            num_bins,
+            token_chunk_size,
+            tp_group,
+        )
     counts = torch.zeros(num_bins, dtype=torch.float32, device=mask.device)
     counts.scatter_add_(0, bin_ids.reshape(-1), mask.reshape(-1).float())
     return DraftLossStats(
