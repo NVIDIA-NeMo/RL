@@ -77,7 +77,7 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     admitted and never shrink — so raise it only when a per-key payload (one
     sample of one field) genuinely exceeds it, not for headroom.
 
-    ``dedupe_rails_per_numa_domain`` keeps only the first *RoCE* rail per
+    ``dedupe_roce_rails_per_numa_domain`` keeps only the first *RoCE* rail per
     NUMA domain instead of every RoCE rail (InfiniBand is never deduped —
     see ``rdma_devices``). Default true: peer-rail selection depends on
     ``MC_ENABLE_DEST_DEVICE_AFFINITY``'s same-name hint, which silently
@@ -97,7 +97,7 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
     staging_buffer_size: int = 268435456  # 256 MiB per pool slot
-    dedupe_rails_per_numa_domain: bool = True
+    dedupe_roce_rails_per_numa_domain: bool = True
 
 
 class DataPlaneConfig(TypedDict):

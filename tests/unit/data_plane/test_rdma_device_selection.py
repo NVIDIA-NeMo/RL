@@ -144,12 +144,15 @@ def test_infiniband_is_never_deduped(fake_fabric):
 
 
 def test_dedupe_can_be_disabled(fake_fabric):
-    """MooncakeCpuConfig.dedupe_rails_per_numa_domain=False escape hatch."""
+    """MooncakeCpuConfig.dedupe_roce_rails_per_numa_domain=False escape hatch."""
     fake_fabric(
         {"mlx5_0": "Ethernet", "mlx5_1": "Ethernet"},
         numa={"mlx5_0": "0", "mlx5_1": "0"},
     )
-    assert tq_adapter.rdma_devices(dedupe_per_numa_domain=False) == "mlx5_0,mlx5_1"
+    assert (
+        tq_adapter.rdma_devices(dedupe_roce_rails_per_numa_domain=False)
+        == "mlx5_0,mlx5_1"
+    )
 
 
 def test_mc_mooncake_device_override_bypasses_dedupe(fake_fabric, monkeypatch):

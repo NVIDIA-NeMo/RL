@@ -81,7 +81,7 @@ def _get_local_node_ip() -> str:
         return ""
 
 
-def rdma_devices(dedupe_per_numa_domain: bool = True) -> str:
+def rdma_devices(dedupe_roce_rails_per_numa_domain: bool = True) -> str:
     """Return this host's RDMA devices as mooncake's comma-separated list.
 
     ``MC_MOONCAKE_DEVICE`` wins and is passed through verbatim (one device or
@@ -89,8 +89,8 @@ def rdma_devices(dedupe_per_numa_domain: bool = True) -> str:
     across NUMA domains, so naming only one device makes the other domain's
     ranks cross the socket on every transfer.
 
-    ``dedupe_per_numa_domain`` (default true — see
-    ``MooncakeCpuConfig.dedupe_rails_per_numa_domain``) additionally keeps
+    ``dedupe_roce_rails_per_numa_domain`` (default true — see
+    ``MooncakeCpuConfig.dedupe_roce_rails_per_numa_domain``) additionally keeps
     only the *first* RoCE rail on each domain when more than one is eligible
     there. Offering more than one rail per domain is not extra bandwidth, it
     is ambiguity: peer-rail selection depends on
@@ -141,7 +141,7 @@ def rdma_devices(dedupe_per_numa_domain: bool = True) -> str:
             continue
         if layer != "Ethernet":
             continue
-        if not dedupe_per_numa_domain:
+        if not dedupe_roce_rails_per_numa_domain:
             roce.append(name)
             continue
         # "-1" (or absent) means sysfs has no NUMA affinity for this device —
@@ -169,7 +169,7 @@ def rdma_devices(dedupe_per_numa_domain: bool = True) -> str:
         logger.info(
             "rdma_devices: kept one RoCE rail per NUMA domain %s, dropped "
             "redundant same-domain rail(s) %s — set "
-            "data_plane.mooncake_cpu.dedupe_rails_per_numa_domain=false to "
+            "data_plane.mooncake_cpu.dedupe_roce_rails_per_numa_domain=false to "
             "keep every rail instead.",
             roce_domains,
             dropped,
@@ -178,13 +178,13 @@ def rdma_devices(dedupe_per_numa_domain: bool = True) -> str:
     return ",".join(ib or roce)
 
 
-def _mooncake_transport_config(dedupe_per_numa_domain: bool = True) -> dict:
+def _mooncake_transport_config(dedupe_roce_rails_per_numa_domain: bool = True) -> dict:
     # mooncake_cpu exists for the zero-copy RDMA MooncakeStore path (TQ v0.1.8),
     # so RDMA is the only transport it runs: there is no TCP fallback, and a
     # host without an RDMA device fails here rather than quietly degrading.
     # Runs on the driver only, so it assumes homogeneous nodes — the device it
     # finds is broadcast to every client.
-    devices = rdma_devices(dedupe_per_numa_domain)
+    devices = rdma_devices(dedupe_roce_rails_per_numa_domain)
     if not devices:
         raise RuntimeError(
             "data_plane.backend='mooncake_cpu' requires RDMA, but no usable "
@@ -565,7 +565,7 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     "metadata_server": f"{local_ip}:50050",
                     "master_server_address": f"{local_ip}:50051",
                     **_mooncake_transport_config(
-                        mooncake_cfg.dedupe_rails_per_numa_domain
+                        mooncake_cfg.dedupe_roce_rails_per_numa_domain
                     ),
                 },
             },
