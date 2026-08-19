@@ -79,6 +79,9 @@ COMMON_OVERRIDES=(
     checkpointing.enabled=true
     checkpointing.checkpoint_dir="$CHECKPOINT_DIR"
     checkpointing.save_period=1
+    # The inherited Gym recipe tracks val:accuracy, but SC has no validation
+    # loop. This test exercises checkpoint mechanics, not top-k retention.
+    checkpointing.metric_name=null
     ++data_plane.checkpointing_enabled=true
     async_rl.sampler.name=in_order
     async_rl.sampler.max_lookahead_versions=0
@@ -110,6 +113,7 @@ uv run --no-sync python - \
     "$CHECKPOINT_DIR/step_1/rollout_snapshots" \
     "$SELECTION_FILE" \
     "$PHASE1_PID" \
+    "$PHASE1_LOG" \
     "$CLAIMED_GROUPS" \
     "$SNAPSHOT_TIMEOUT_S" <<'PY'
 import json
@@ -121,8 +125,16 @@ from pathlib import Path
 root = Path(sys.argv[1])
 selection = Path(sys.argv[2])
 phase_pid = int(sys.argv[3])
-expected_claimed = int(sys.argv[4])
-deadline = time.monotonic() + float(sys.argv[5])
+phase_log = Path(sys.argv[4])
+expected_claimed = int(sys.argv[5])
+deadline = time.monotonic() + float(sys.argv[6])
+
+
+def phase_log_tail() -> str:
+    if not phase_log.is_file():
+        return f"phase-one log was not created at {phase_log}"
+    lines = phase_log.read_text(errors="replace").splitlines()
+    return "\n".join(lines[-40:])
 
 while time.monotonic() < deadline:
     for snapshot in sorted(root.glob("snapshot_*"), reverse=True):
@@ -146,7 +158,8 @@ while time.monotonic() < deadline:
         os.kill(phase_pid, 0)
     except ProcessLookupError as error:
         raise RuntimeError(
-            "phase one exited before producing the requested streamed-step cut"
+            "phase one exited before producing the requested streamed-step cut; "
+            f"last log lines from {phase_log}:\n{phase_log_tail()}"
         ) from error
     time.sleep(0.1)
 

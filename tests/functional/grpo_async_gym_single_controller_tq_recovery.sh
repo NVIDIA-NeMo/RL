@@ -64,6 +64,9 @@ COMMON_OVERRIDES=(
     checkpointing.enabled=true
     checkpointing.checkpoint_dir="$CHECKPOINT_DIR"
     checkpointing.save_period=1
+    # The inherited Gym recipe tracks val:accuracy, but SC has no validation
+    # loop. This test exercises checkpoint mechanics, not top-k retention.
+    checkpointing.metric_name=null
     ++data_plane.checkpointing_enabled=true
     async_rl.sampler.name=windowed
     '~async_rl.sampler.max_lookahead_versions'
@@ -96,6 +99,7 @@ uv run --no-sync python - \
     "$CHECKPOINT_DIR/bootstrap/rollout_snapshots" \
     "$SELECTION_FILE" \
     "$PHASE1_PID" \
+    "$PHASE1_LOG" \
     "$NUM_GENERATIONS" \
     "$MIN_SEALED" \
     "$SNAPSHOT_TIMEOUT_S" <<'PY'
@@ -109,9 +113,17 @@ import torch
 root = Path(sys.argv[1])
 selection = Path(sys.argv[2])
 phase_pid = int(sys.argv[3])
-expected_generations = int(sys.argv[4])
-min_sealed = int(sys.argv[5])
-deadline = time.monotonic() + float(sys.argv[6])
+phase_log = Path(sys.argv[4])
+expected_generations = int(sys.argv[5])
+min_sealed = int(sys.argv[6])
+deadline = time.monotonic() + float(sys.argv[7])
+
+
+def phase_log_tail() -> str:
+    if not phase_log.is_file():
+        return f"phase-one log was not created at {phase_log}"
+    lines = phase_log.read_text(errors="replace").splitlines()
+    return "\n".join(lines[-40:])
 
 while time.monotonic() < deadline:
     for snapshot in sorted(root.glob("snapshot_*"), reverse=True):
@@ -141,7 +153,8 @@ while time.monotonic() < deadline:
         os.kill(phase_pid, 0)
     except ProcessLookupError as error:
         raise RuntimeError(
-            "phase one exited before producing a partial-sibling snapshot"
+            "phase one exited before producing a partial-sibling snapshot; "
+            f"last log lines from {phase_log}:\n{phase_log_tail()}"
         ) from error
     time.sleep(0.25)
 
