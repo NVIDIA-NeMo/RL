@@ -255,6 +255,20 @@ class TestGenerateAndPushFlow:
         assert record == "r0"
         assert start_v == 0
         assert end_v == 0
+        assert mgr.telemetry_snapshot()["canonical_groups_finalized"] == 1
+
+    def test_publication_and_recovery_telemetry_are_cumulative(self):
+        mgr = _make_manager(_FakeBuffer(), _FakeImpl())
+
+        mgr.record_canonical_publication(42)
+        mgr.record_recovery_siblings(reused=3, redispatched=1)
+
+        assert mgr.telemetry_snapshot() == {
+            "canonical_groups_finalized": 1,
+            "canonical_output_tokens": 42,
+            "recovery_siblings_reused": 3,
+            "recovery_siblings_redispatched": 1,
+        }
 
     def test_start_weight_version_pinned_at_reserve_time(self):
         """If set_weight_version is called mid-rollout, start != end."""

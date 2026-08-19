@@ -122,6 +122,7 @@ def _controller(actor: object) -> Any:
     ctrl._finalizer_metrics_by_group = {}
     ctrl._rollout_recovery_ledger = MagicMock()
     ctrl._rollout_recovery_ledger.__contains__.return_value = False
+    ctrl._rollout_manager = MagicMock()
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
