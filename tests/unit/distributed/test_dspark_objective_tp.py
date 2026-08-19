@@ -676,6 +676,52 @@ def _run_tp2_provider_checkpoint(
         )
 
 
+def _run_tp2_provider_preflight(rank: int, world_size: int, case: str) -> None:
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    device = torch.device("cuda")
+    local_vocab_size, hidden_size = 4, 3
+    provider = build_dspark_provider(
+        body=_CheckpointBody(tp_group=tp_group, device=device),
+        target_vocab_size=8,
+        draft_vocab_size=local_vocab_size * world_size,
+        hidden_size=hidden_size,
+        markov_rank=2,
+        confidence_enabled=False,
+        confidence_with_markov=False,
+        draft_vocab_start_index=rank * local_vocab_size,
+        draft_vocab_end_index=(rank + 1) * local_vocab_size,
+        tensor_parallel_group=tp_group,
+        device=device,
+        dtype=torch.float32,
+    )
+    target_output_weight = torch.ones(
+        local_vocab_size,
+        hidden_size,
+        device=device,
+    )
+    if rank == 0:
+        if case == "shape":
+            target_output_weight = target_output_weight[:-1]
+        elif case == "dtype":
+            target_output_weight = target_output_weight.double()
+        elif case == "device":
+            target_output_weight = target_output_weight.cpu()
+
+    with pytest.raises(ValueError, match="ranks must agree on DSpark provider inputs"):
+        provider.objective_stats(
+            draft_hidden=torch.ones(1, 2, hidden_size, device=device),
+            target_output_weight=target_output_weight,
+            target_logits=torch.ones(1, 2, local_vocab_size, device=device),
+            previous_token_ids=torch.zeros(1, 2, dtype=torch.long, device=device),
+            hard_labels=torch.zeros(1, 2, dtype=torch.long, device=device),
+            valid_mask=torch.ones(1, 2, dtype=torch.bool, device=device),
+            slot_bins=torch.tensor([[0, 1]], device=device),
+            loss_weights=(1.0, 1.0, 0.0),
+            token_chunk_size=1,
+            tp_group=tp_group,
+        )
+
+
 def test_tp2_bf16_output_and_hidden_head_gradients(distributed_test_runner) -> None:
     distributed_test_runner(_run_tp2_provider_objective, world_size=2)
 
@@ -708,6 +754,15 @@ def test_dp2_normalized_gradient_uses_global_counts(distributed_test_runner) -> 
     distributed_test_runner(_run_dp2_global_normalization_gradient, world_size=2)
 
 
+@pytest.mark.parametrize("case", ["shape", "dtype", "device"])
+def test_tp2_provider_preflight_rejects_rank_local_live_head_mismatch(
+    distributed_test_runner,
+    case: str,
+) -> None:
+    distributed_test_runner(partial(_run_tp2_provider_preflight, case=case), world_size=2)
+
+
+@pytest.mark.mcore
 def test_tp2_real_mcore_checkpoint_round_trip(
     distributed_test_runner,
     tmp_path: Path,
