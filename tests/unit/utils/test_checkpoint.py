@@ -555,15 +555,27 @@ def test_get_resume_paths_propagates_megatron_load_failure(
 
 @pytest.mark.parametrize("model_component", ["policy", "value"])
 def test_get_resume_paths_torch_dist_megatron_optimizer(
-    checkpoint_dir, model_component
+    checkpoint_dir, monkeypatch, model_component
 ):
-    """Modern MCore manifests optimizer shards through run_config.yaml."""
+    """Modern MCore manifests optimizer shards through torch_dist metadata."""
     checkpoint_path = checkpoint_dir / "step_1"
     expected_weights_path = checkpoint_path / model_component / "weights"
     iteration_path = expected_weights_path / "iter_0000000"
     iteration_path.mkdir(parents=True)
+    (iteration_path / "metadata.json").touch()
     with open(iteration_path / "run_config.yaml", "w") as f:
         yaml.safe_dump({"checkpoint": {"save_optim": True}}, f)
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_common_state_dict",
+        MagicMock(return_value={"args": {}}),
+    )
+    load_sharded_keys = MagicMock(return_value={"optimizer.state.exp_avg"})
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_sharded_metadata_keys",
+        load_sharded_keys,
+    )
 
     expected_optimizer_path = checkpoint_path / model_component / "optimizer"
     assert not expected_optimizer_path.exists()
@@ -576,6 +588,38 @@ def test_get_resume_paths_torch_dist_megatron_optimizer(
 
     assert weights_path == expected_weights_path
     assert optimizer_path == expected_optimizer_path
+    load_sharded_keys.assert_called_once_with(iteration_path)
+
+
+def test_get_resume_paths_ignores_save_optim_without_optimizer_shards(
+    checkpoint_dir, monkeypatch
+):
+    """run_config records intent and must not masquerade as saved optimizer state."""
+    checkpoint_path = checkpoint_dir / "step_1"
+    weights_path = checkpoint_path / "policy" / "weights"
+    iteration_path = weights_path / "iter_0000000"
+    iteration_path.mkdir(parents=True)
+    (iteration_path / "metadata.json").touch()
+    with open(iteration_path / "run_config.yaml", "w") as f:
+        yaml.safe_dump({"checkpoint": {"save_optim": True}}, f)
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_common_state_dict",
+        MagicMock(return_value={"args": {}}),
+    )
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_sharded_metadata_keys",
+        MagicMock(return_value={"model.decoder.layers.weight"}),
+    )
+
+    with pytest.warns(UserWarning, match="Optimizer state not found"):
+        returned_weights_path, optimizer_path = CheckpointManager.get_resume_paths(
+            checkpoint_path
+        )
+
+    assert returned_weights_path == weights_path
+    assert optimizer_path is None
 
 
 def test_get_best_checkpoint_path_no_checkpoints(checkpoint_manager, checkpoint_dir):
