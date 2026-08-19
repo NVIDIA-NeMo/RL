@@ -206,9 +206,12 @@ def test_reset_clears_pending_after_failure_and_after_success(
 def test_non_expert_names_pass_through(nvfp4_module):
     M = nvfp4_module
     quantizer = _quantizer_with_layer_quantized(M, True)
+    name = "model.layers.0.self_attn.q_proj.weight"
     tensor = torch.randn(4, 4)
-    out = quantizer.process([("model.layers.0.self_attn.q_proj.weight", tensor)])
-    assert out == [("model.layers.0.self_attn.q_proj.weight", tensor)]
+    out = quantizer.process([(name, tensor)])
+    assert len(out) == 1
+    assert out[0][0] == name
+    assert torch.equal(out[0][1], tensor)
 
 
 def test_ignored_expert_layer_passes_through_bf16(nvfp4_module):
@@ -218,7 +221,28 @@ def test_ignored_expert_layer_passes_through_bf16(nvfp4_module):
     name = "model.layers.0.mlp.experts.0.gate_proj.weight"
     tensor = torch.randn(8, 32)
     out = quantizer.process([(name, tensor)])
-    assert out == [(name, tensor)]
+    assert len(out) == 1
+    assert out[0][0] == name
+    assert torch.equal(out[0][1], tensor)
+
+
+def test_passthrough_clones_off_recycled_source_buffer(nvfp4_module):
+    """Cross-batch staleness guard: passthrough tensors must not be IPC-buffer views.
+
+    vLLM's layerwise reload buffers every weight_loader call's arguments
+    (including the tensor) and replays them at layer completion, which can
+    land after the sender has recycled this batch's IPC buffer for a later
+    one. A passthrough tensor handed through un-cloned would silently
+    corrupt whatever layer it belongs to once replayed.
+    """
+    M = nvfp4_module
+    quantizer = _quantizer_with_layer_quantized(M, True)
+    name = "model.layers.0.self_attn.q_proj.weight"
+    tensor = torch.ones(4, 4)
+    out = quantizer.process([(name, tensor)])
+    assert out[0][1].data_ptr() != tensor.data_ptr()
+    tensor.fill_(999.0)  # simulate the sender overwriting the recycled buffer
+    assert torch.equal(out[0][1], torch.ones(4, 4))
     assert not quantizer._pending
 
 
