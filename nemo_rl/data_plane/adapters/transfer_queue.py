@@ -78,27 +78,31 @@ def _get_local_node_ip() -> str:
         return ""
 
 
-def rdma_devices() -> str:
+def rdma_devices(dedupe_per_numa_domain: bool = True) -> str:
     """Return this host's RDMA devices as mooncake's comma-separated list.
 
     ``MC_MOONCAKE_DEVICE`` wins and is passed through verbatim (one device or
-    a list). Otherwise lists one rail per NUMA domain: the NICs are split
+    a list). Otherwise every domain must be represented: the NICs are split
     across NUMA domains, so naming only one device makes the other domain's
-    ranks cross the socket on every transfer — every domain must be
-    represented. But offering *more than one* rail on the same domain is
-    worse, not better: peer-rail selection depends on
+    ranks cross the socket on every transfer.
+
+    ``dedupe_per_numa_domain`` (default true — see
+    ``MooncakeCpuConfig.dedupe_rails_per_numa_domain``) additionally keeps
+    only the *first* rail on each domain when more than one is eligible
+    there. Offering more than one rail per domain is not extra bandwidth,
+    it is ambiguity: peer-rail selection depends on
     ``MC_ENABLE_DEST_DEVICE_AFFINITY``, whose same-name peer hint silently
     falls back to picking at random whenever the lookup misses (measured to
-    happen in the pinned wheel — see ``maybe_configure_engine_env``), and two
-    same-domain rails give that fallback something to be ambiguous about.
-    On this fleet's RoCE fabric each rail is its own subnet, so a random
-    cross-rail draw has no route and fails with "transport retry counter
-    exceeded" (measured: every cross-rail pair among 4 same-node rails
-    failed, zero same-rail pairs ever did). Deduplicating each domain to its
-    first rail removes the ambiguity by construction — every domain still
-    gets a dedicated rail, so a job's aggregate multi-rail bandwidth is
-    unaffected; only the redundant *extra* rails on an already-represented
-    domain are dropped. IB and RoCE are never mixed.
+    happen in the pinned wheel — see ``maybe_configure_engine_env``), and
+    two same-domain rails give that fallback something to be ambiguous
+    about. On this fleet's RoCE fabric each rail is its own subnet, so a
+    random cross-rail draw has no route and fails with "transport retry
+    counter exceeded" (measured: every cross-rail pair among 4 same-node
+    rails failed, zero same-rail pairs ever did). Deduplication does not
+    reduce the number of domains in use — every domain still gets a
+    dedicated rail, so a job's aggregate multi-rail bandwidth across domains
+    is unaffected — only the redundant extra rail(s) on an
+    already-represented domain are dropped. IB and RoCE are never mixed.
 
     Also the skip predicate for the mooncake tests — ``mooncake_cpu`` is
     RDMA-only, so they cannot run without a device.
@@ -120,21 +124,25 @@ def rdma_devices() -> str:
             layer = Path(path).read_text().strip()
         except OSError:
             continue
-        # "-1" (or absent) means sysfs has no NUMA affinity for this device —
-        # never treat two such devices as the same domain, or every rail on
-        # the host would collapse to one; fall back to the device's own name
-        # so it is only ever deduplicated against a real, matching domain.
-        try:
-            numa = (
-                Path(path)
-                .parents[2]
-                .joinpath("device", "numa_node")
-                .read_text()
-                .strip()
-            )
-        except OSError:
-            numa = ""
-        domain = numa if numa not in ("", "-1") else name
+        if dedupe_per_numa_domain:
+            # "-1" (or absent) means sysfs has no NUMA affinity for this
+            # device — never treat two such devices as the same domain, or
+            # every rail on the host would collapse to one; fall back to
+            # the device's own name so it is only ever deduplicated against
+            # a real, matching domain.
+            try:
+                numa = (
+                    Path(path)
+                    .parents[2]
+                    .joinpath("device", "numa_node")
+                    .read_text()
+                    .strip()
+                )
+            except OSError:
+                numa = ""
+            domain = numa if numa not in ("", "-1") else name
+        else:
+            domain = name  # every device is its own "domain": never deduped
         if layer == "InfiniBand":
             if domain in ib_domains:
                 continue
@@ -149,13 +157,13 @@ def rdma_devices() -> str:
     return ",".join(ib or roce)
 
 
-def _mooncake_transport_config() -> dict:
+def _mooncake_transport_config(dedupe_per_numa_domain: bool = True) -> dict:
     # mooncake_cpu exists for the zero-copy RDMA MooncakeStore path (TQ v0.1.8),
     # so RDMA is the only transport it runs: there is no TCP fallback, and a
     # host without an RDMA device fails here rather than quietly degrading.
     # Runs on the driver only, so it assumes homogeneous nodes — the device it
     # finds is broadcast to every client.
-    devices = rdma_devices()
+    devices = rdma_devices(dedupe_per_numa_domain)
     if not devices:
         raise RuntimeError(
             "data_plane.backend='mooncake_cpu' requires RDMA, but no usable "
@@ -526,7 +534,9 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     # mooncake_master + the metadata server bind to.
                     "metadata_server": f"{local_ip}:50050",
                     "master_server_address": f"{local_ip}:50051",
-                    **_mooncake_transport_config(),
+                    **_mooncake_transport_config(
+                        mooncake_cfg.dedupe_rails_per_numa_domain
+                    ),
                 },
             },
         }
