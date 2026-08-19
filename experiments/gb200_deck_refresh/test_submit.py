@@ -28,6 +28,7 @@ def test_sync_mxfp8_renders_matched_two_logprob_cuda_graph_run() -> None:
     assert "policy.generation.vllm_cfg.enforce_eager=false" in result.stdout
     assert "policy.generation.vllm_cfg.precision=fp8" in result.stdout
     assert "policy.generation.vllm_cfg.is_mx=true" in result.stdout
+    assert "++policy.generation.vllm_kwargs.moe_backend=flashinfer_trtllm" in result.stdout
     assert "loss_fn.force_on_policy_ratio=false" in result.stdout
     assert "loss_fn.use_importance_sampling_correction=true" in result.stdout
     assert "grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout
@@ -54,16 +55,17 @@ def test_async_bf16_renders_nccl_reshard_with_same_logprob_work() -> None:
 
 
 def test_qwen235_legacy_arm_uses_current_mxfp8_recipe_without_reshard() -> None:
-    result = render(MODE="async", MODEL="qwen235", ARM="mxfp8_legacy")
+    result = render(MODE="sync", MODEL="qwen235", ARM="mxfp8_legacy")
 
     assert result.returncode == 0, result.stderr
     assert "grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml" in result.stdout
+    assert "grpo.async_grpo.enabled=false" in result.stdout
     assert "policy.generation.refit_transport=null" in result.stdout
     assert "cluster.num_nodes=32" in result.stdout
 
 
-def test_invalid_sync_legacy_combination_is_rejected() -> None:
-    result = render(MODE="sync", MODEL="qwen235", ARM="mxfp8_legacy")
+def test_invalid_async_legacy_combination_is_rejected() -> None:
+    result = render(MODE="async", MODEL="qwen235", ARM="mxfp8_legacy")
 
     assert result.returncode != 0
     assert "not supported" in result.stderr

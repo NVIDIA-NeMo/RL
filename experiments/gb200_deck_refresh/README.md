@@ -6,8 +6,9 @@ current NeMo-RL integration commit and GB200 GPUs.
 The Nano matrix compares BF16 and MoE-only MXFP8 rollout in both colocated Sync
 and non-colocated Async modes. Every arm enables CUDA Graphs and computes both
 previous-policy and reference-policy logprobs. The Qwen3-235B matrix compares
-the legacy packed-broadcast refit with NCCL Reshard for the same MXFP8 rollout.
-Report means use completed steps 3-20.
+the legacy packed-broadcast refit with NCCL Reshard for the same non-colocated
+Sync MXFP8 rollout used by the B200 result. Report means use completed steps
+3-20.
 
 Render a command locally:
 

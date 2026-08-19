@@ -34,7 +34,7 @@ case "${MODEL}:${MODE}:${ARM}" in
     ASYNC_GRPO=true
     VLLM_TP=1
     ;;
-  qwen235:async:mxfp8_legacy)
+  qwen235:sync:mxfp8_legacy)
     CONFIG=examples/configs/recipes/llm/performance/grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml
     TOTAL_NODES=32
     GEN_NODES=16
@@ -42,10 +42,10 @@ case "${MODEL}:${MODE}:${ARM}" in
     TRAIN_GLOBAL_BATCH_SIZE=512
     REFIT_TRANSPORT=null
     COLOCATED=false
-    ASYNC_GRPO=true
+    ASYNC_GRPO=false
     VLLM_TP=4
     ;;
-  qwen235:async:mxfp8_nccl)
+  qwen235:sync:mxfp8_nccl)
     CONFIG=examples/configs/recipes/llm/performance/grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml
     TOTAL_NODES=32
     GEN_NODES=16
@@ -53,7 +53,7 @@ case "${MODEL}:${MODE}:${ARM}" in
     TRAIN_GLOBAL_BATCH_SIZE=512
     REFIT_TRANSPORT=nccl_reshard
     COLOCATED=false
-    ASYNC_GRPO=true
+    ASYNC_GRPO=false
     VLLM_TP=4
     ;;
   *)
@@ -95,7 +95,7 @@ RUN_ARGS=(
   "policy.generation.vllm_cfg.enforce_eager=false"
   "policy.generation.vllm_cfg.use_tqdm=false"
   "policy.generation.vllm_cfg.precision=${ROLLOUT_PRECISION}"
-  "policy.generation.vllm_kwargs.moe_backend=flashinfer_trtllm"
+  "++policy.generation.vllm_kwargs.moe_backend=flashinfer_trtllm"
   "++policy.generation.vllm_kwargs.distributed_timeout_seconds=2400"
   "policy.megatron_cfg.expert_tensor_parallel_size=1"
   "policy.train_global_batch_size=${TRAIN_GLOBAL_BATCH_SIZE}"
