@@ -32,6 +32,7 @@ from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.experience.route_plan import decode_route_plan
 
 if TYPE_CHECKING:
+    from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayGroupMetadata
     from nemo_rl.data.interfaces import DatumSpec
 
 ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
@@ -677,6 +678,65 @@ class RolloutRecoveryLedger:
             record.status = PromptGroupStatus.FINALIZED
             record.claimed_train_step = None
         self._open_train_step = None
+
+    def training_owned_replay_groups(self) -> list[TQReplayGroupMetadata]:
+        """Return replay metadata for rows claimed by the open train step.
+
+        Sampler selection removes these groups from the live replay index, but
+        their canonical rows intentionally remain in TQ until optimizer-step
+        completion. A periodic snapshot includes this metadata so restart can
+        discard uncommitted gradients and train those groups again.
+        """
+        open_step = self._open_train_step
+        if open_step is None:
+            return []
+        if open_step.status != TrainStepStatus.OPEN:
+            raise RuntimeError(
+                "cannot snapshot an optimizer step after it was applied but "
+                "before its data-plane cleanup completed"
+            )
+        groups: list[TQReplayGroupMetadata] = []
+        for group_id in open_step.group_ids:
+            record = self._require_group(group_id)
+            if (
+                record.status != PromptGroupStatus.CLAIMED_FOR_TRAINING
+                or record.canonical_meta is None
+                or record.group_min_weight_version is None
+                or record.group_max_weight_version is None
+            ):
+                raise RuntimeError(
+                    f"open train step has incomplete replay metadata for {group_id!r}"
+                )
+            groups.append(
+                {
+                    "meta": copy.deepcopy(record.canonical_meta),
+                    "start_weight": record.group_min_weight_version,
+                    "end_weight": record.group_max_weight_version,
+                    "target_step": record.target_step,
+                    "group_id": group_id,
+                }
+            )
+        return groups
+
+    def periodic_snapshot_state_dict(self) -> dict[str, Any]:
+        """Return restart-ready lineage without mutating the live train step.
+
+        The trainer state is not part of a lightweight rollout snapshot. On
+        restart it comes from the snapshot's durable trainer anchor, so every
+        group claimed by the current optimizer step must become ``FINALIZED``
+        and replayable again in the persisted lineage.
+        """
+        snapshot = type(self).from_state_dict(self.state_dict())
+        open_step = snapshot.open_train_step
+        if open_step is not None:
+            if open_step.status != TrainStepStatus.OPEN:
+                raise RuntimeError(
+                    "cannot create a periodic snapshot after optimizer apply "
+                    "but before data-plane cleanup"
+                )
+            snapshot.rollback_open_train_step(open_step.train_step)
+        snapshot.prepare_for_restart()
+        return snapshot.state_dict()
 
     def discard_group(self, group_id: str) -> None:
         """Drop a group only after its external TQ/Gate ownership is cleaned."""
