@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import math
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -83,12 +84,13 @@ class DFlashBodyConfig:
             )
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        if self.rope_theta <= 0.0:
-            raise ValueError("rope_theta must be positive")
-        if self.rms_norm_eps <= 0.0:
-            raise ValueError("rms_norm_eps must be positive")
-        if self.initializer_range <= 0.0:
-            raise ValueError("initializer_range must be positive")
+        for field_name, value in (
+            ("rope_theta", self.rope_theta),
+            ("rms_norm_eps", self.rms_norm_eps),
+            ("initializer_range", self.initializer_range),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{field_name} must be finite and positive")
 
 
 class QwenRMSNorm(nn.Module):
