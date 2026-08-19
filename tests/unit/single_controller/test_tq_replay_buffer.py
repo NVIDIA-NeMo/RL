@@ -261,6 +261,40 @@ class TestDataPlaneCheckpointBarrier:
 
         asyncio.run(exercise())
 
+    def test_nested_mutation_does_not_deadlock_with_waiting_checkpoint(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            outer_entered = asyncio.Event()
+            allow_nested = asyncio.Event()
+            nested_entered = asyncio.Event()
+            checkpoint_entered = asyncio.Event()
+
+            async def mutate() -> None:
+                async with barrier.mutation():
+                    outer_entered.set()
+                    await allow_nested.wait()
+                    async with barrier.mutation():
+                        nested_entered.set()
+
+            async def checkpoint() -> None:
+                async with barrier.checkpoint():
+                    checkpoint_entered.set()
+
+            mutation_task = asyncio.create_task(mutate())
+            await outer_entered.wait()
+            checkpoint_task = asyncio.create_task(checkpoint())
+            await asyncio.sleep(0)
+            allow_nested.set()
+
+            await asyncio.wait_for(nested_entered.wait(), timeout=5.0)
+            assert not checkpoint_entered.is_set()
+            await asyncio.wait_for(
+                asyncio.gather(mutation_task, checkpoint_task), timeout=5.0
+            )
+            assert checkpoint_entered.is_set()
+
+        asyncio.run(exercise())
+
     def test_two_checkpoints_serialize_without_deadlock(self):
         async def exercise() -> None:
             barrier = DataPlaneCheckpointBarrier()
