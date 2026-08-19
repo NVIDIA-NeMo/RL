@@ -30,6 +30,7 @@ from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.experience.blackbox_finalizer import FinalizedGroup
 from nemo_rl.experience.finalizer_actor import FinalizationRequest
 from nemo_rl.experience.rollout_recovery import (
+    PromptRef,
     PromptGroupStatus,
     RolloutRecoveryLedger,
 )
@@ -334,11 +335,33 @@ def test_train_selection_transfers_finalized_group_to_open_step() -> None:
     )
     ctrl = _controller(SimpleNamespace())
     ledger = RolloutRecoveryLedger()
-    ledger.adopt_finalized_group(
+    group = ledger.reserve_group(
         group_id="group",
-        meta=meta,
+        prompt_id="17",
+        prompt_ref=PromptRef(sample_id="17", task_name="nemo_gym"),
+        prompt_payload={"idx": 17},  # type: ignore[arg-type]
+        expected_generations=1,
+        target_step=None,
         start_weight_version=3,
-        end_weight_version=3,
+    )
+    ledger.mark_group_dispatched(group.group_id)
+    gate_id = group.gate_rollout_ids[0]
+    ledger.mark_sibling_sealed(
+        group.group_id,
+        generation_index=0,
+        gate_rollout_id=gate_id,
+        receipt={
+            "rollout_id": gate_id,
+            "manifest": [{"staging_key": f"{gate_id}/call"}],
+        },
+        reward=1.0,
+    )
+    ledger.mark_finalization_started(group.group_id)
+    ledger.mark_group_finalized(
+        group.group_id,
+        meta=meta,
+        group_min_weight_version=3,
+        group_max_weight_version=3,
     )
     ctrl._rollout_recovery_ledger = ledger
 
@@ -348,3 +371,19 @@ def test_train_selection_transfers_finalized_group_to_open_step() -> None:
     assert ledger.get_group("group").status == PromptGroupStatus.CLAIMED_FOR_TRAINING
     assert ledger.open_train_step is not None
     assert ledger.open_train_step.group_ids == ["group"]
+
+
+def test_train_selection_rejects_group_missing_from_lineage() -> None:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    ctrl = _controller(SimpleNamespace())
+    ctrl._rollout_recovery_ledger = RolloutRecoveryLedger()
+
+    with pytest.raises(RuntimeError, match="missing from the rollout recovery ledger"):
+        ctrl._claim_train_meta(meta, num_groups=1)

@@ -26,14 +26,14 @@ import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Optional, Self, cast
+from typing import TYPE_CHECKING, Any, Optional, Self
 
 from nemo_rl.data_plane import KVBatchMeta
 
 if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 1
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
 
 
 class RolloutAttemptStatus(StrEnum):
@@ -65,16 +65,37 @@ class TrainStepStatus(StrEnum):
     APPLIED_UNCHECKPOINTED = "applied_uncheckpointed"
 
 
+@dataclass(frozen=True)
+class PromptRef:
+    """Small durable locator for a prompt owned by the input dataset.
+
+    The persistence layer will resolve this reference and validate the dataset
+    identity before redispatch. The full ``DatumSpec`` is runtime-only state and
+    is deliberately excluded from the serialized ledger.
+    """
+
+    sample_id: str
+    task_name: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not self.sample_id:
+            raise ValueError("prompt sample_id must not be empty")
+
+
 @dataclass
 class RolloutAttemptRecord:
     """One physical attempt for a stable logical sibling."""
 
-    attempt_id: str
-    gate_rollout_id: str
+    attempt_uuid: uuid.UUID
     status: RolloutAttemptStatus
     receipt: Optional[dict[str, Any]] = None
     reward: Optional[float] = None
     staging_keys: list[str] = field(default_factory=list)
+
+    @property
+    def attempt_id(self) -> str:
+        """Return the compact external representation of this attempt UUID."""
+        return self.attempt_uuid.hex
 
 
 @dataclass
@@ -82,14 +103,13 @@ class RolloutSiblingRecord:
     """One stable GRPO generation slot and its physical attempts."""
 
     generation_index: int
-    logical_rollout_id: str
     attempts: list[RolloutAttemptRecord]
 
     @property
     def current_attempt(self) -> RolloutAttemptRecord:
         if not self.attempts:
             raise RuntimeError(
-                f"logical rollout {self.logical_rollout_id!r} has no attempts"
+                f"generation index {self.generation_index} has no attempts"
             )
         return self.attempts[-1]
 
@@ -100,7 +120,8 @@ class PromptGroupRecoveryRecord:
 
     group_id: str
     prompt_id: str
-    prompt_payload: Optional[DatumSpec]
+    prompt_ref: PromptRef
+    runtime_prompt_payload: Optional[DatumSpec]
     expected_generations: int
     target_step: Optional[int]
     start_weight_version: int
@@ -113,11 +134,28 @@ class PromptGroupRecoveryRecord:
 
     @property
     def logical_rollout_ids(self) -> list[str]:
-        return [sibling.logical_rollout_id for sibling in self.siblings]
+        return [
+            self.logical_rollout_id(sibling.generation_index)
+            for sibling in self.siblings
+        ]
 
     @property
     def gate_rollout_ids(self) -> list[str]:
-        return [sibling.current_attempt.gate_rollout_id for sibling in self.siblings]
+        return [
+            self.gate_rollout_id(sibling.generation_index) for sibling in self.siblings
+        ]
+
+    def logical_rollout_id(self, generation_index: int) -> str:
+        """Derive the stable sibling ID instead of storing another UUID string."""
+        return f"{self.group_id}_g{generation_index}"
+
+    def gate_rollout_id(self, generation_index: int) -> str:
+        """Derive the physical Gate ID from group, sibling, and attempt UUID."""
+        sibling = self.siblings[generation_index]
+        return (
+            f"{self.logical_rollout_id(generation_index)}"
+            f"_a{sibling.current_attempt.attempt_id}"
+        )
 
     @property
     def sealed_generation_indices(self) -> list[int]:
@@ -139,11 +177,9 @@ class OpenTrainStepRecord:
     status: TrainStepStatus = TrainStepStatus.OPEN
 
 
-def _new_attempt(logical_rollout_id: str) -> RolloutAttemptRecord:
-    attempt_id = str(uuid.uuid4())
+def _new_attempt() -> RolloutAttemptRecord:
     return RolloutAttemptRecord(
-        attempt_id=attempt_id,
-        gate_rollout_id=f"{logical_rollout_id}_a{attempt_id}",
+        attempt_uuid=uuid.uuid4(),
         status=RolloutAttemptStatus.RESERVED,
     )
 
@@ -182,6 +218,7 @@ class RolloutRecoveryLedger:
         self,
         *,
         prompt_id: str,
+        prompt_ref: PromptRef,
         prompt_payload: DatumSpec,
         expected_generations: int,
         target_step: Optional[int],
@@ -191,6 +228,11 @@ class RolloutRecoveryLedger:
         """Create one logical group and its first physical sibling attempts."""
         if not prompt_id:
             raise ValueError("prompt_id must not be empty")
+        if prompt_ref.sample_id != prompt_id:
+            raise ValueError(
+                "dataset prompt reference must match prompt_id: "
+                f"{prompt_ref.sample_id!r} != {prompt_id!r}"
+            )
         if expected_generations < 1:
             raise ValueError("expected_generations must be at least one")
         group_id = group_id or str(uuid.uuid4())
@@ -199,21 +241,20 @@ class RolloutRecoveryLedger:
 
         siblings = []
         for generation_index in range(expected_generations):
-            logical_rollout_id = f"{group_id}_g{generation_index}"
             siblings.append(
                 RolloutSiblingRecord(
                     generation_index=generation_index,
-                    logical_rollout_id=logical_rollout_id,
-                    attempts=[_new_attempt(logical_rollout_id)],
+                    attempts=[_new_attempt()],
                 )
             )
         record = PromptGroupRecoveryRecord(
             group_id=group_id,
             prompt_id=prompt_id,
+            prompt_ref=prompt_ref,
             # Retain the immutable dataloader sample by reference instead of copying
-            # a potentially 131k-token payload. It is released as soon as canonical
-            # rows take over recovery ownership.
-            prompt_payload=prompt_payload,
+            # a potentially 131k-token payload. This cache is never serialized and
+            # is released as soon as canonical rows take over recovery ownership.
+            runtime_prompt_payload=prompt_payload,
             expected_generations=expected_generations,
             target_step=target_step,
             start_weight_version=start_weight_version,
@@ -240,10 +281,11 @@ class RolloutRecoveryLedger:
                 RolloutAttemptStatus.FAILED,
             }:
                 raise ValueError(
-                    f"cannot retry logical rollout {sibling.logical_rollout_id!r} "
+                    "cannot retry logical rollout "
+                    f"{record.logical_rollout_id(sibling.generation_index)!r} "
                     f"from status {attempt.status.value!r}"
                 )
-            sibling.attempts.append(_new_attempt(sibling.logical_rollout_id))
+            sibling.attempts.append(_new_attempt())
         return self._copy_group(record)
 
     def mark_group_dispatched(
@@ -281,11 +323,12 @@ class RolloutRecoveryLedger:
         record = self._require_group(group_id)
         sibling = self._require_sibling(record, generation_index)
         attempt = sibling.current_attempt
+        expected_gate_rollout_id = record.gate_rollout_id(generation_index)
         staging_keys = _receipt_staging_keys(receipt)
-        if gate_rollout_id != attempt.gate_rollout_id:
+        if gate_rollout_id != expected_gate_rollout_id:
             raise ValueError(
                 "streamed rollout identity mismatch: "
-                f"result={gate_rollout_id!r}, expected={attempt.gate_rollout_id!r}"
+                f"result={gate_rollout_id!r}, expected={expected_gate_rollout_id!r}"
             )
         if receipt.get("rollout_id") != gate_rollout_id:
             raise ValueError(
@@ -300,11 +343,13 @@ class RolloutRecoveryLedger:
             ):
                 return
             raise ValueError(
-                f"conflicting duplicate seal for {sibling.logical_rollout_id!r}"
+                "conflicting duplicate seal for "
+                f"{record.logical_rollout_id(generation_index)!r}"
             )
         if attempt.status != RolloutAttemptStatus.DISPATCHED:
             raise ValueError(
-                f"cannot seal logical rollout {sibling.logical_rollout_id!r} "
+                "cannot seal logical rollout "
+                f"{record.logical_rollout_id(generation_index)!r} "
                 f"from status {attempt.status.value!r}"
             )
 
@@ -361,7 +406,9 @@ class RolloutRecoveryLedger:
                 or attempt.reward is None
             ):
                 raise ValueError(
-                    f"logical rollout {sibling.logical_rollout_id!r} is not sealed"
+                    "logical rollout "
+                    f"{record.logical_rollout_id(sibling.generation_index)!r} "
+                    "is not sealed"
                 )
             receipts.append(copy.deepcopy(attempt.receipt))
             rewards.append(attempt.reward)
@@ -413,57 +460,8 @@ class RolloutRecoveryLedger:
         record.canonical_meta = copy.deepcopy(meta)
         record.group_min_weight_version = int(group_min_weight_version)
         record.group_max_weight_version = int(group_max_weight_version)
-        record.prompt_payload = None
+        record.runtime_prompt_payload = None
         record.status = PromptGroupStatus.FINALIZED
-
-    def adopt_finalized_group(
-        self,
-        *,
-        group_id: str,
-        meta: KVBatchMeta,
-        start_weight_version: int,
-        end_weight_version: int,
-        target_step: Optional[int] = None,
-    ) -> None:
-        """Adopt a canonical-only group restored by the existing TQ checkpoint.
-
-        Older completed-rollout checkpoints have canonical rows and replay metadata
-        but no partial lineage sidecar. They remain trainable during the transition
-        to persisted lineage; synthetic abandoned attempts represent the fact that
-        their physical Gate history is no longer needed.
-        """
-        if group_id in self._groups:
-            raise ValueError(f"duplicate recovery group_id={group_id!r}")
-        expected_ids = [f"{group_id}_g{i}" for i in range(len(meta.sample_ids))]
-        if list(meta.sample_ids) != expected_ids:
-            raise ValueError(
-                "restored canonical sample IDs do not form one logical group: "
-                f"{meta.sample_ids!r}"
-            )
-        siblings = []
-        for generation_index, logical_id in enumerate(expected_ids):
-            attempt = _new_attempt(logical_id)
-            attempt.status = RolloutAttemptStatus.ABANDONED
-            siblings.append(
-                RolloutSiblingRecord(
-                    generation_index=generation_index,
-                    logical_rollout_id=logical_id,
-                    attempts=[attempt],
-                )
-            )
-        self._groups[group_id] = PromptGroupRecoveryRecord(
-            group_id=group_id,
-            prompt_id=group_id,
-            prompt_payload=None,
-            expected_generations=len(expected_ids),
-            target_step=target_step,
-            start_weight_version=int(start_weight_version),
-            siblings=siblings,
-            status=PromptGroupStatus.FINALIZED,
-            canonical_meta=copy.deepcopy(meta),
-            group_min_weight_version=int(start_weight_version),
-            group_max_weight_version=int(end_weight_version),
-        )
 
     def claim_groups_for_training(
         self,
@@ -588,7 +586,10 @@ class RolloutRecoveryLedger:
                 {
                     "group_id": record.group_id,
                     "prompt_id": record.prompt_id,
-                    "prompt_payload": copy.deepcopy(record.prompt_payload),
+                    "prompt_ref": {
+                        "sample_id": record.prompt_ref.sample_id,
+                        "task_name": record.prompt_ref.task_name,
+                    },
                     "expected_generations": record.expected_generations,
                     "target_step": record.target_step,
                     "start_weight_version": record.start_weight_version,
@@ -600,11 +601,9 @@ class RolloutRecoveryLedger:
                     "siblings": [
                         {
                             "generation_index": sibling.generation_index,
-                            "logical_rollout_id": sibling.logical_rollout_id,
                             "attempts": [
                                 {
-                                    "attempt_id": attempt.attempt_id,
-                                    "gate_rollout_id": attempt.gate_rollout_id,
+                                    "attempt_uuid": attempt.attempt_uuid.bytes,
                                     "status": attempt.status.value,
                                     "receipt": copy.deepcopy(attempt.receipt),
                                     "reward": attempt.reward,
@@ -647,15 +646,11 @@ class RolloutRecoveryLedger:
             raise ValueError("rollout-recovery state must contain a groups list")
 
         ledger = cls()
-        seen_logical_ids: set[str] = set()
-        seen_attempt_ids: set[str] = set()
-        seen_gate_ids: set[str] = set()
+        seen_attempt_uuids: set[uuid.UUID] = set()
         for raw_group in raw_groups:
             record = cls._group_from_state(
                 raw_group,
-                seen_logical_ids=seen_logical_ids,
-                seen_attempt_ids=seen_attempt_ids,
-                seen_gate_ids=seen_gate_ids,
+                seen_attempt_uuids=seen_attempt_uuids,
             )
             if record.group_id in ledger._groups:
                 raise ValueError(f"duplicate recovery group_id={record.group_id!r}")
@@ -716,9 +711,7 @@ class RolloutRecoveryLedger:
         cls,
         raw_group: Any,
         *,
-        seen_logical_ids: set[str],
-        seen_attempt_ids: set[str],
-        seen_gate_ids: set[str],
+        seen_attempt_uuids: set[uuid.UUID],
     ) -> PromptGroupRecoveryRecord:
         if not isinstance(raw_group, dict):
             raise ValueError("rollout-recovery group must be a mapping")
@@ -753,17 +746,7 @@ class RolloutRecoveryLedger:
                 raise ValueError("rollout-recovery sibling must be a mapping")
             if sibling_state.get("generation_index") != generation_index:
                 raise ValueError("generation indices must be contiguous")
-            logical_id = sibling_state.get("logical_rollout_id")
-            expected_logical_id = f"{group_id}_g{generation_index}"
-            if (
-                not isinstance(logical_id, str)
-                or logical_id != expected_logical_id
-                or logical_id in seen_logical_ids
-            ):
-                raise ValueError(
-                    f"logical rollout ID mismatch or duplicate: {logical_id!r}"
-                )
-            seen_logical_ids.add(logical_id)
+            logical_id = f"{group_id}_g{generation_index}"
             attempts_state = sibling_state.get("attempts")
             if not isinstance(attempts_state, list) or not attempts_state:
                 raise ValueError(f"logical rollout {logical_id!r} has no attempts")
@@ -771,18 +754,17 @@ class RolloutRecoveryLedger:
             for attempt_state in attempts_state:
                 if not isinstance(attempt_state, dict):
                     raise ValueError("rollout-recovery attempt must be a mapping")
-                attempt_id = attempt_state.get("attempt_id")
-                gate_id = attempt_state.get("gate_rollout_id")
-                if not isinstance(attempt_id, str) or not attempt_id:
-                    raise ValueError("attempt_id must be a non-empty string")
-                if not isinstance(gate_id, str) or gate_id != (
-                    f"{logical_id}_a{attempt_id}"
+                raw_attempt_uuid = attempt_state.get("attempt_uuid")
+                if (
+                    not isinstance(raw_attempt_uuid, bytes)
+                    or len(raw_attempt_uuid) != 16
                 ):
-                    raise ValueError("gate rollout ID does not match attempt identity")
-                if attempt_id in seen_attempt_ids or gate_id in seen_gate_ids:
+                    raise ValueError("attempt_uuid must contain exactly 16 bytes")
+                attempt_uuid = uuid.UUID(bytes=raw_attempt_uuid)
+                if attempt_uuid in seen_attempt_uuids:
                     raise ValueError("duplicate rollout attempt identity")
-                seen_attempt_ids.add(attempt_id)
-                seen_gate_ids.add(gate_id)
+                seen_attempt_uuids.add(attempt_uuid)
+                gate_id = f"{logical_id}_a{attempt_uuid.hex}"
                 try:
                     attempt_status = RolloutAttemptStatus(attempt_state.get("status"))
                 except ValueError as error:
@@ -807,8 +789,7 @@ class RolloutRecoveryLedger:
                     raise ValueError("only sealed attempts may retain receipt data")
                 attempts.append(
                     RolloutAttemptRecord(
-                        attempt_id=attempt_id,
-                        gate_rollout_id=gate_id,
+                        attempt_uuid=attempt_uuid,
                         status=attempt_status,
                         receipt=copy.deepcopy(receipt),
                         reward=float(reward) if reward is not None else None,
@@ -818,14 +799,21 @@ class RolloutRecoveryLedger:
             siblings.append(
                 RolloutSiblingRecord(
                     generation_index=generation_index,
-                    logical_rollout_id=logical_id,
                     attempts=attempts,
                 )
             )
 
-        prompt_payload = raw_group.get("prompt_payload")
-        if prompt_payload is not None and not isinstance(prompt_payload, dict):
-            raise ValueError("prompt_payload must be a mapping or None")
+        raw_prompt_ref = raw_group.get("prompt_ref")
+        if not isinstance(raw_prompt_ref, dict):
+            raise ValueError("prompt_ref must be a mapping")
+        sample_id = raw_prompt_ref.get("sample_id")
+        task_name = raw_prompt_ref.get("task_name")
+        if not isinstance(sample_id, str) or not sample_id:
+            raise ValueError("prompt_ref sample_id must be a non-empty string")
+        if task_name is not None and not isinstance(task_name, str):
+            raise ValueError("prompt_ref task_name must be a string or None")
+        if sample_id != prompt_id:
+            raise ValueError("prompt_ref sample_id must match prompt_id")
         canonical_meta = raw_group.get("canonical_meta")
         if canonical_meta is not None and not isinstance(canonical_meta, KVBatchMeta):
             raise ValueError("canonical_meta must be KVBatchMeta or None")
@@ -867,7 +855,7 @@ class RolloutRecoveryLedger:
             if canonical_meta is None or min_weight is None or max_weight is None:
                 raise ValueError("finalized group state requires canonical metadata")
             if list(canonical_meta.sample_ids) != [
-                s.logical_rollout_id for s in siblings
+                f"{group_id}_g{s.generation_index}" for s in siblings
             ]:
                 raise ValueError("canonical sample IDs do not match logical lineage")
         elif canonical_meta is not None:
@@ -884,11 +872,8 @@ class RolloutRecoveryLedger:
         return PromptGroupRecoveryRecord(
             group_id=group_id,
             prompt_id=prompt_id,
-            prompt_payload=(
-                copy.deepcopy(cast("DatumSpec", prompt_payload))
-                if prompt_payload is not None
-                else None
-            ),
+            prompt_ref=PromptRef(sample_id=sample_id, task_name=task_name),
+            runtime_prompt_payload=None,
             expected_generations=expected_generations,
             target_step=target_step,
             start_weight_version=start_weight,
@@ -912,7 +897,8 @@ class RolloutRecoveryLedger:
         return PromptGroupRecoveryRecord(
             group_id=record.group_id,
             prompt_id=record.prompt_id,
-            prompt_payload=record.prompt_payload,
+            prompt_ref=record.prompt_ref,
+            runtime_prompt_payload=record.runtime_prompt_payload,
             expected_generations=record.expected_generations,
             target_step=record.target_step,
             start_weight_version=record.start_weight_version,
