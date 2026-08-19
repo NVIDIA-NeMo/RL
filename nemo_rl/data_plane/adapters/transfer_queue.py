@@ -82,10 +82,23 @@ def rdma_devices() -> str:
     """Return this host's RDMA devices as mooncake's comma-separated list.
 
     ``MC_MOONCAKE_DEVICE`` wins and is passed through verbatim (one device or
-    a list). Otherwise every InfiniBand rail is listed: the NICs are split
-    across NUMA domains and mooncake keeps a per-domain preference only if
-    handed the full set, so naming one device makes the other domain's ranks
-    cross the socket on every transfer. IB and RoCE are never mixed.
+    a list). Otherwise lists one rail per NUMA domain: the NICs are split
+    across NUMA domains, so naming only one device makes the other domain's
+    ranks cross the socket on every transfer — every domain must be
+    represented. But offering *more than one* rail on the same domain is
+    worse, not better: peer-rail selection depends on
+    ``MC_ENABLE_DEST_DEVICE_AFFINITY``, whose same-name peer hint silently
+    falls back to picking at random whenever the lookup misses (measured to
+    happen in the pinned wheel — see ``maybe_configure_engine_env``), and two
+    same-domain rails give that fallback something to be ambiguous about.
+    On this fleet's RoCE fabric each rail is its own subnet, so a random
+    cross-rail draw has no route and fails with "transport retry counter
+    exceeded" (measured: every cross-rail pair among 4 same-node rails
+    failed, zero same-rail pairs ever did). Deduplicating each domain to its
+    first rail removes the ambiguity by construction — every domain still
+    gets a dedicated rail, so a job's aggregate multi-rail bandwidth is
+    unaffected; only the redundant *extra* rails on an already-represented
+    domain are dropped. IB and RoCE are never mixed.
 
     Also the skip predicate for the mooncake tests — ``mooncake_cpu`` is
     RDMA-only, so they cannot run without a device.
@@ -100,15 +113,37 @@ def rdma_devices() -> str:
     if not glob.glob("/dev/infiniband/uverbs*"):
         return ""
     ib, roce = [], []
+    ib_domains, roce_domains = set(), set()
     for path in sorted(glob.glob("/sys/class/infiniband/mlx5_*/ports/1/link_layer")):
         name = Path(path).parents[2].name
         try:
             layer = Path(path).read_text().strip()
         except OSError:
             continue
+        # "-1" (or absent) means sysfs has no NUMA affinity for this device —
+        # never treat two such devices as the same domain, or every rail on
+        # the host would collapse to one; fall back to the device's own name
+        # so it is only ever deduplicated against a real, matching domain.
+        try:
+            numa = (
+                Path(path)
+                .parents[2]
+                .joinpath("device", "numa_node")
+                .read_text()
+                .strip()
+            )
+        except OSError:
+            numa = ""
+        domain = numa if numa not in ("", "-1") else name
         if layer == "InfiniBand":
+            if domain in ib_domains:
+                continue
+            ib_domains.add(domain)
             ib.append(name)
         elif layer == "Ethernet":
+            if domain in roce_domains:
+                continue
+            roce_domains.add(domain)
             roce.append(name)
     # No space after the comma: mooncake splits on "," only.
     return ",".join(ib or roce)
