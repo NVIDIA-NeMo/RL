@@ -241,10 +241,14 @@ class DSparkLossBins:
             device=self.numerators.device,
             dtype=self.numerators.dtype,
         )
-        denominator = normalization_counts.detach().to(
-            device=self.weights.device,
-            dtype=torch.float32,
-        ).sum()
+        denominator = (
+            normalization_counts.detach()
+            .to(
+                device=self.weights.device,
+                dtype=torch.float32,
+            )
+            .sum()
+        )
         return (self.numerators * weights).sum() / (denominator + 1e-8)
 
     def __add__(self, other: object) -> DSparkLossBins:

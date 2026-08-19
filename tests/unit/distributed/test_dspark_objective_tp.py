@@ -522,9 +522,7 @@ def _run_tp2_split_vocab_mapping_and_bounds(rank: int, world_size: int) -> None:
 def _run_dp2_global_normalization_gradient(rank: int, world_size: int) -> None:
     dp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
-    local_count = torch.tensor(
-        [0.0, 0.0] if rank == 0 else [1.0, 1.0], device=device
-    )
+    local_count = torch.tensor([0.0, 0.0] if rank == 0 else [1.0, 1.0], device=device)
     global_count = local_count.clone()
     torch.distributed.all_reduce(global_count, group=dp_group)
     numerator_source = torch.tensor(
