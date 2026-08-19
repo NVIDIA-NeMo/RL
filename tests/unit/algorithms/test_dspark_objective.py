@@ -6,6 +6,7 @@ from types import ModuleType
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.utils._python_dispatch import TorchDispatchMode
 
 
 def _load_objective_without_poisoning_packages() -> ModuleType:
@@ -49,6 +50,123 @@ def _load_objective_without_poisoning_packages() -> ModuleType:
 _OBJECTIVE = _load_objective_without_poisoning_packages()
 DSparkLossBins = _OBJECTIVE.DSparkLossBins
 dspark_tiled_objective = _OBJECTIVE.dspark_tiled_objective
+
+
+def _distributed_inputs(
+    *,
+    rank: int,
+    num_blocks: int = 1,
+    token_chunk_size: int = 2,
+) -> dict[str, object]:
+    generator = torch.Generator().manual_seed(90210)
+    local_vocab_size = 2
+    global_vocab_size = 4
+    hidden_size = 3
+    slot_shape = (num_blocks, 3)
+    return {
+        "target_logits": torch.randn(
+            *slot_shape, local_vocab_size, generator=generator
+        ),
+        "draft_hidden": torch.randn(*slot_shape, hidden_size, generator=generator),
+        "target_output_weight": torch.randn(
+            local_vocab_size, hidden_size, generator=generator
+        ),
+        "markov_w1": torch.randn(global_vocab_size, 2, generator=generator),
+        "markov_w2": torch.randn(local_vocab_size, 2, generator=generator),
+        "previous_token_ids": torch.zeros(slot_shape, dtype=torch.long),
+        "confidence_logits": None,
+        "hard_labels": torch.zeros(slot_shape, dtype=torch.long),
+        "valid_mask": torch.ones(slot_shape, dtype=torch.bool),
+        "slot_bins": torch.arange(3).expand(slot_shape),
+        "loss_weights": (1.0, 1.0, 0.0),
+        "token_chunk_size": token_chunk_size,
+        "vocab_start_index": rank * local_vocab_size,
+        "tp_group": torch.distributed.group.WORLD,
+    }
+
+
+def _run_distributed_contract_case(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    case: str,
+) -> None:
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        num_blocks = 0 if case == "zero_rows" and rank == 0 else 1
+        token_chunk_size = rank + 1 if case == "chunk_size" else 2
+        inputs = _distributed_inputs(
+            rank=rank,
+            num_blocks=num_blocks,
+            token_chunk_size=token_chunk_size,
+        )
+        if case == "hard_labels" and rank == 1:
+            inputs["hard_labels"] = torch.full((1, 3), 2, dtype=torch.long)
+        elif case == "previous_token_ids" and rank == 1:
+            inputs["previous_token_ids"] = torch.full((1, 3), 2, dtype=torch.long)
+        elif case == "valid_mask" and rank == 1:
+            inputs["valid_mask"] = torch.tensor([[True, True, False]])
+        elif case == "rank_local_validation" and rank == 0:
+            inputs["slot_bins"] = torch.tensor([[-1, 1, 2]])
+
+        with pytest.raises(ValueError, match="tensor-parallel ranks"):
+            dspark_tiled_objective(**inputs)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def _assert_distributed_contract_failure_is_synchronous(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    context = torch.multiprocessing.get_context("fork")
+    init_method = f"file://{tmp_path / f'{case}.init'}"
+    processes = [
+        context.Process(
+            target=_run_distributed_contract_case,
+            args=(rank, 2, init_method, case),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=5)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join()
+    assert not alive, f"{case} left a tensor-parallel rank blocked in a collective"
+    assert [process.exitcode for process in processes] == [0, 0]
+
+
+class _FloatCastRecorder(TorchDispatchMode):
+    def __init__(self) -> None:
+        super().__init__()
+        self.float_cast_shapes: list[tuple[int, ...]] = []
+
+    def __torch_dispatch__(
+        self,
+        func: object,
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        del types
+        resolved_kwargs = {} if kwargs is None else kwargs
+        if (
+            func is torch.ops.aten._to_copy.default
+            and resolved_kwargs.get("dtype") == torch.float32
+        ):
+            tensor = args[0]
+            assert isinstance(tensor, torch.Tensor)
+            self.float_cast_shapes.append(tuple(tensor.shape))
+        return func(*args, **resolved_kwargs)  # type: ignore[operator]
 
 
 def _inputs() -> dict[str, object]:
@@ -471,46 +589,121 @@ def test_dspark_imports_coexist_with_normal_package_modules() -> None:
     assert existing_nemo is None or getattr(existing_nemo, "__file__", None) is not None
 
 
-@pytest.mark.parametrize("source_position", [32_767, 262_143])
-def test_qwen_vocab_retained_state_is_independent_of_source_position(
-    source_position: int,
+@pytest.mark.parametrize(
+    "case",
+    ["zero_rows", "chunk_size", "rank_local_validation"],
+)
+def test_tp_contract_mismatch_fails_synchronously_on_every_rank(
+    tmp_path: Path,
+    case: str,
 ) -> None:
-    """Only selected slots and one projected tile may be retained for long context."""
-    generator = torch.Generator().manual_seed(source_position)
-    local_vocab_size = 151_936 // 8
+    """TP ranks must reject divergent collective schedules without blocking."""
+    _assert_distributed_contract_failure_is_synchronous(tmp_path, case)
+
+
+@pytest.mark.parametrize("case", ["hard_labels", "previous_token_ids", "valid_mask"])
+def test_tp_token_metadata_must_agree_exactly(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    """Valid-but-different token metadata cannot define one global distribution."""
+    _assert_distributed_contract_failure_is_synchronous(tmp_path, case)
+
+
+def test_backward_never_casts_a_full_large_vocab_weight_to_float32() -> None:
+    """Backward FP32 accuracy may not allocate a full live-head or W2 copy."""
+    generator = torch.Generator().manual_seed(161803)
+    local_vocab_size = 4097
     inputs = {
-        "target_logits": torch.randn(2, 3, local_vocab_size, generator=generator),
-        "draft_hidden": torch.randn(2, 3, 16, generator=generator, requires_grad=True),
+        "target_logits": torch.randn(1, 1, local_vocab_size, generator=generator),
+        "draft_hidden": torch.randn(1, 1, 2, generator=generator, requires_grad=True),
         "target_output_weight": torch.randn(
-            local_vocab_size, 16, generator=generator, requires_grad=True
+            local_vocab_size, 2, generator=generator, dtype=torch.bfloat16
         ),
         "markov_w1": torch.randn(
-            local_vocab_size, 2, generator=generator, requires_grad=True
+            local_vocab_size, 1, generator=generator, dtype=torch.bfloat16
         ),
         "markov_w2": torch.randn(
-            local_vocab_size, 2, generator=generator, requires_grad=True
+            local_vocab_size, 1, generator=generator, dtype=torch.bfloat16
         ),
-        "previous_token_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+        "previous_token_ids": torch.zeros(1, 1, dtype=torch.long),
         "confidence_logits": None,
-        "hard_labels": torch.tensor([[1, 2, 3], [4, 5, 6]]),
-        "valid_mask": torch.ones(2, 3, dtype=torch.bool),
-        "slot_bins": torch.tensor([[0, 1, 2], [0, 1, 2]]),
+        "hard_labels": torch.zeros(1, 1, dtype=torch.long),
+        "valid_mask": torch.ones(1, 1, dtype=torch.bool),
+        "slot_bins": torch.zeros(1, 1, dtype=torch.long),
         "loss_weights": (1.0, 1.0, 0.0),
-        "token_chunk_size": 2,
+        "token_chunk_size": 1,
         "vocab_start_index": 0,
         "tp_group": None,
     }
-    saved_shapes: list[tuple[int, ...]] = []
-    with torch.autograd.graph.saved_tensors_hooks(
-        lambda tensor: saved_shapes.append(tuple(tensor.shape)) or tensor,
-        lambda tensor: tensor,
-    ):
+    inputs["draft_hidden"] = inputs["draft_hidden"].to(torch.bfloat16).requires_grad_()
+    for name in ("markov_w1", "markov_w2"):
+        tensor = inputs[name]
+        assert isinstance(tensor, torch.Tensor)
+        inputs[name] = tensor.requires_grad_()
+
+    recorder = _FloatCastRecorder()
+    with recorder:
         stats = dspark_tiled_objective(**inputs)
         stats.combined.normalized(normalization_counts=stats.combined.counts).backward()
 
-    full_vocab_shape = (2, 3, local_vocab_size)
-    assert saved_shapes.count(full_vocab_shape) <= 1
-    assert (2, local_vocab_size) not in saved_shapes
-    assert not any(
-        len(shape) >= 2 and shape[0] in (32_768, 262_144) for shape in saved_shapes
+    assert (local_vocab_size, 2) not in recorder.float_cast_shapes
+    assert (local_vocab_size, 1) not in recorder.float_cast_shapes
+
+
+@pytest.mark.parametrize("source_length", [32_768, 262_144])
+def test_selected_slots_do_not_retain_long_context_backing_storage(
+    source_length: int,
+) -> None:
+    """Saved objective state must own only selected slots, not their source storage."""
+    generator = torch.Generator().manual_seed(source_length)
+    target_backing = torch.randn(1, source_length, 5, generator=generator)
+    hidden_backing = torch.randn(
+        1, source_length, 2, generator=generator, requires_grad=True
     )
+    previous_backing = torch.zeros(1, source_length, dtype=torch.long)
+    labels_backing = torch.zeros(1, source_length, dtype=torch.long)
+    valid_backing = torch.ones(1, source_length, dtype=torch.bool)
+    bins_backing = torch.arange(source_length).remainder(3).reshape(1, -1)
+    long_storage_pointers = {
+        tensor.untyped_storage().data_ptr()
+        for tensor in (
+            target_backing,
+            hidden_backing,
+            previous_backing,
+            labels_backing,
+            valid_backing,
+            bins_backing,
+        )
+    }
+    retained_long_storages: list[int] = []
+
+    def record_saved_storage(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.untyped_storage().data_ptr() in long_storage_pointers:
+            retained_long_storages.append(tensor.untyped_storage().nbytes())
+        return tensor
+
+    selected = slice(source_length - 3, source_length)
+    with torch.autograd.graph.saved_tensors_hooks(
+        record_saved_storage,
+        lambda tensor: tensor,
+    ):
+        stats = dspark_tiled_objective(
+            target_logits=target_backing[:, selected],
+            draft_hidden=hidden_backing[:, selected],
+            target_output_weight=torch.randn(5, 2, generator=generator),
+            markov_w1=torch.randn(5, 1, generator=generator, requires_grad=True),
+            markov_w2=torch.randn(5, 1, generator=generator, requires_grad=True),
+            previous_token_ids=previous_backing[:, selected],
+            confidence_logits=None,
+            hard_labels=labels_backing[:, selected],
+            valid_mask=valid_backing[:, selected],
+            slot_bins=bins_backing[:, selected],
+            loss_weights=(1.0, 1.0, 0.0),
+            token_chunk_size=2,
+            vocab_start_index=0,
+            tp_group=None,
+        )
+        stats.combined.normalized(normalization_counts=stats.combined.counts).backward()
+
+    assert retained_long_storages == []
