@@ -30,7 +30,6 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
-    get_pad_dynamic_image_shapes,
 )
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
@@ -48,7 +47,10 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym import (
+    get_pad_dynamic_image_shapes,
+    should_use_nemo_gym,
+)
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -524,7 +526,7 @@ class AsyncTrajectoryCollector:
                         rollout_batch,
                         self.processor,
                         pad_dynamic_image_shapes=get_pad_dynamic_image_shapes(
-                            self.master_config
+                            self.master_config.env
                         ),
                     )
             repeated_batch = rollout_batch.repeat_interleave(

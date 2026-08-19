@@ -32,6 +32,7 @@ from PIL import Image
 import nemo_rl.experience.rollouts as rollouts_mod
 from nemo_rl.data.multimodal_utils import image_to_data_url
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.nemo_gym import get_pad_dynamic_image_shapes
 
 
 class NemotronNanoVLV2Processor:
@@ -150,25 +151,15 @@ def test_with_the_flag_the_prompt_is_padded_and_keeps_its_true_sizes():
 # --------------------------------------------------------------------------
 
 
-class _Config:
-    def __init__(self, env):
-        self.env = env
-
-
 def test_flag_is_read_from_the_nemo_gym_env_config():
-    from nemo_rl.algorithms.grpo import get_pad_dynamic_image_shapes
-
     assert (
-        get_pad_dynamic_image_shapes(
-            _Config({"nemo_gym": {"pad_dynamic_image_shapes": True}})
-        )
+        get_pad_dynamic_image_shapes({"nemo_gym": {"pad_dynamic_image_shapes": True}})
         is True
     )
 
 
 def test_flag_defaults_off_when_unset_or_absent():
     """A run without NeMo-Gym must not fabricate a value for it."""
-    from nemo_rl.algorithms.grpo import get_pad_dynamic_image_shapes
-
-    assert get_pad_dynamic_image_shapes(_Config({"nemo_gym": {}})) is False
-    assert get_pad_dynamic_image_shapes(_Config({})) is False
+    assert get_pad_dynamic_image_shapes({"nemo_gym": {}}) is False
+    assert get_pad_dynamic_image_shapes({}) is False
+    assert get_pad_dynamic_image_shapes({"nemo_gym": None}) is False
