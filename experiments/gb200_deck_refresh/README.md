@@ -18,6 +18,8 @@ ACTION=render MODEL=nano MODE=sync ARM=mxfp8 ./submit_oci_hsg.sh
 Run scheduler preflight before submission:
 
 ```bash
+ACTION=test-only ./prepare_ray_runtime_oci_hsg.sh
+ACTION=submit ./prepare_ray_runtime_oci_hsg.sh
 ACTION=test-only MODEL=nano MODE=sync ARM=mxfp8 ./submit_oci_hsg.sh
 ACTION=submit MODEL=nano MODE=sync ARM=mxfp8 ./submit_oci_hsg.sh
 ```

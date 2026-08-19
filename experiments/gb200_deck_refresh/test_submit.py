@@ -33,6 +33,14 @@ def test_sync_mxfp8_renders_matched_two_logprob_cuda_graph_run() -> None:
     assert "grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout
 
 
+def test_submitter_uses_a_pinned_ray_runtime() -> None:
+    script = SCRIPT.read_text()
+
+    assert "RAY_RUNTIME_VENV" in script
+    assert "ray.__version__ == \"2.56.1\"" in script
+    assert "export SETUP_COMMAND" in script
+
+
 def test_async_bf16_renders_nccl_reshard_with_same_logprob_work() -> None:
     result = render(MODE="async", MODEL="nano", ARM="bf16")
 

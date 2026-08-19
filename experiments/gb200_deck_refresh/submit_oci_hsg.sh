@@ -135,6 +135,7 @@ RESULT_ROOT=${RESULT_ROOT:-${BASE}/experiments/gb200-deck-refresh}
 EXPERIMENT_ROOT=${EXPERIMENT_ROOT:-${RESULT_ROOT}/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}}
 CACHE_ROOT=${CACHE_ROOT:-${BASE}/.cache/gb200-deck-refresh/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}}
 WORKER_VENV_ROOT=${WORKER_VENV_ROOT:-/tmp/nemo_rl_worker_venvs/gb200-deck-refresh/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}}
+RAY_RUNTIME_VENV=${RAY_RUNTIME_VENV:-${BASE}/.cache/gb200-deck-refresh/ray-runtime-py31314}
 WANDB_PROJECT=${WANDB_PROJECT:-sna-gb200-deck-refresh}
 WANDB_NAME=${WANDB_NAME:-${MODEL}-${MODE}-${ARM}-${MAX_STEPS}step-${RUN_SUFFIX}}
 
@@ -152,9 +153,22 @@ if git -C "${REPO}" submodule status --recursive | grep -q '^-'; then
   echo "All pinned submodules must be initialized" >&2
   exit 2
 fi
-for path in "${REPO}/${CONFIG}" "${REPO}/ray.sub" "${CONTAINER}" "${HF_HOME}"; do
+for path in "${REPO}/${CONFIG}" "${REPO}/ray.sub" "${CONTAINER}" "${HF_HOME}" \
+  "${RAY_RUNTIME_VENV}/bin/python" "${RAY_RUNTIME_VENV}/bin/ray"; do
   test -e "${path}"
 done
+"${RAY_RUNTIME_VENV}/bin/python" -c \
+  'import ray, requests, urllib3; assert ray.__version__ == "2.56.1"'
+
+export SETUP_COMMAND=$(cat <<EOF
+set -euo pipefail
+rm -f /opt/nemo_rl_venv/bin/ray
+ln -s '${RAY_RUNTIME_VENV}/bin/ray' /opt/nemo_rl_venv/bin/ray
+'${RAY_RUNTIME_VENV}/bin/python' -c \
+  'import ray, requests, urllib3; assert ray.__version__ == "2.56.1"'
+ray --version
+EOF
+)
 
 mkdir -p "${EXPERIMENT_ROOT}" "${CACHE_ROOT}"
 WANDB_KEY_FILE=${CACHE_ROOT}/.wandb_key
@@ -193,6 +207,7 @@ cuda_graphs=enabled
 moe_backend=flashinfer_trtllm
 logprob_work=previous_policy_and_reference_policy
 generation_logprob_reuse=disabled
+ray_runtime=${RAY_RUNTIME_VENV}
 aggregate_steps=3-20
 max_steps=${MAX_STEPS}
 seed=42
