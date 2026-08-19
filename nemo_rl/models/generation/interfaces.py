@@ -345,6 +345,15 @@ class GenerationOutputSpec(TypedDict):
     __extra__: Any
 
 
+@dataclass(frozen=True)
+class CollectiveSenderSpec:
+    """Policy-side protocol and packing geometry for NCCL weight transfer."""
+
+    nccl_peer: str = "nemo"
+    buffer_size_bytes: int | None = None
+    num_buffers: int | None = None
+
+
 class GenerationInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
@@ -369,6 +378,11 @@ class GenerationInterface(ABC):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         pass
 
+    @abstractmethod
+    def shutdown(self) -> bool:
+        """Shut down generation resources; repeated calls must be safe."""
+        pass
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Whether the generation backend requires KV cache scales synchronization."""
@@ -385,6 +399,14 @@ class GenerationInterface(ABC):
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
         raise NotImplementedError
+
+    def get_collective_sender_spec(self) -> CollectiveSenderSpec:
+        """Return policy-side NCCL protocol and packed-buffer requirements."""
+        return CollectiveSenderSpec()
+
+    def get_inference_world_size(self) -> int | None:
+        """Return a backend-specific collective world size when required."""
+        return None
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""

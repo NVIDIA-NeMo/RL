@@ -562,6 +562,14 @@ class AsyncTrajectoryCollector:
                 "synchronous engine path (async_engine=false) is no longer supported."
             )
             is_async_engine = True
+        elif backend == "dynamo":
+            # Dynamo's native layerwise reload temporarily materializes model
+            # parameters while the NCCL update is in progress.  It is not safe
+            # to execute an already-issued vLLM request concurrently with that
+            # reload (in particular for NemotronH/Mamba parameters), even when
+            # the update route accepts allow_unpaused=True.  Stop new trajectory
+            # starts above and drain every active trajectory before refitting.
+            is_async_engine = False
         else:
             is_async_engine = False
         async_grpo_config = self.master_config.grpo.async_grpo
@@ -611,8 +619,17 @@ class AsyncTrajectoryCollector:
                     )
             except Exception as e:
                 print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
-
-        self._refit_pause_cleared.set()
+                if (
+                    "generation" in self.master_config.policy
+                    and self.master_config.policy["generation"]["backend"] == "dynamo"
+                ):
+                    raise RuntimeError(
+                        "Managed Dynamo KV cache invalidation failed after refit"
+                    ) from e
+            finally:
+                self._refit_pause_cleared.set()
+        else:
+            self._refit_pause_cleared.set()
 
     def wait_for_pending_generations(self) -> None:
         """Wait for all in-flight generation threads to complete."""

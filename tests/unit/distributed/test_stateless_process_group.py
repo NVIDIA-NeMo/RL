@@ -12,26 +12,197 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lifecycle of the refit process group.
+"""Two independent concerns that share this module.
 
-Elastic recovery rebuilds this group whenever the generation fleet's membership
-changes, so it runs many times per job rather than once. That makes two things load
-bearing: releasing a group must never hang (its peer may be dead, which is the whole
-reason we are rebuilding), and it must actually release, or every recovery strands a
-NCCL communicator and a TCPStore for the life of the worker.
+Peer protocol: which NCCL metadata and warmup a receiver expects, "nemo" or "vllm".
+
+Lifecycle of the refit process group: elastic recovery rebuilds this group whenever the
+generation fleet's membership changes, so it runs many times per job rather than once.
+That makes two things load bearing -- releasing a group must never hang (its peer may be
+dead, which is the whole reason we are rebuilding), and it must actually release, or
+every recovery strands a NCCL communicator and a TCPStore for the life of the worker.
 
 Building a real communicator needs CUDA and peers, so these drive the lifecycle against
 a stub communicator. The runtime behaviour of abort() against a genuinely dead peer was
 verified separately on 2xA6000 (design doc 8.4.1).
 """
 
+import ctypes
+import pickle
+import sys
+import types
+from contextlib import contextmanager, nullcontext
 from typing import Optional
 
 import pytest
 import torch
 
-import nemo_rl.distributed.stateless_process_group as spg_module
+from nemo_rl.distributed import stateless_process_group as spg
 from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
+
+
+@contextmanager
+def _vllm_unique_id_type():
+    module_names = [
+        "vllm",
+        "vllm.distributed",
+        "vllm.distributed.device_communicators",
+        spg._VLLM_NCCL_MODULE,
+    ]
+    previous_modules = {name: sys.modules.get(name) for name in module_names}
+    modules = {name: types.ModuleType(name) for name in module_names}
+    for name in module_names[:-1]:
+        modules[name].__path__ = []
+
+    modules["vllm"].distributed = modules["vllm.distributed"]
+    modules["vllm.distributed"].device_communicators = modules[
+        "vllm.distributed.device_communicators"
+    ]
+    modules["vllm.distributed.device_communicators"].pynccl_wrapper = modules[
+        spg._VLLM_NCCL_MODULE
+    ]
+    unique_id_type = type(
+        "ncclUniqueId",
+        (ctypes.Structure,),
+        {
+            "__module__": spg._VLLM_NCCL_MODULE,
+            "_fields_": [("internal", ctypes.c_byte * 128)],
+        },
+    )
+    modules[spg._VLLM_NCCL_MODULE].ncclUniqueId = unique_id_type
+
+    try:
+        sys.modules.update(modules)
+        yield unique_id_type
+    finally:
+        for name, previous_module in previous_modules.items():
+            if previous_module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous_module
+
+
+def test_vllm_unique_id_pickle_unpickles_as_vllm_ctypes_type():
+    unique_id_bytes = bytes(range(128))
+    payload = spg._pickle_vllm_unique_id(unique_id_bytes)
+
+    with _vllm_unique_id_type() as unique_id_type:
+        unique_id = pickle.loads(payload)
+
+    assert isinstance(unique_id, unique_id_type)
+    assert bytes(unique_id) == unique_id_bytes
+
+
+def test_vllm_unique_id_pickle_requires_nccl_id_size():
+    with pytest.raises(ValueError, match="128-byte NCCL unique ID"):
+        spg._pickle_vllm_unique_id(b"too short")
+
+
+class _Store:
+    def __init__(self):
+        self.data = {}
+
+    def set(self, key, value):
+        self.data[key] = value
+
+
+class _Stream:
+    cuda_stream = 123
+
+    def __init__(self):
+        self.synchronized = False
+
+    def synchronize(self):
+        self.synchronized = True
+
+
+class _Communicator:
+    def __init__(self):
+        self.allreduce_calls = []
+        self.broadcast_calls = []
+
+    def allreduce(self, **kwargs):
+        self.allreduce_calls.append(kwargs)
+
+    def broadcast(self, **kwargs):
+        self.broadcast_calls.append(kwargs)
+
+
+def _make_process_group(monkeypatch):
+    store = _Store()
+    stream = _Stream()
+    communicator = _Communicator()
+    unique_id_bytes = bytes(range(128))
+    unique_id = types.SimpleNamespace(as_bytes=unique_id_bytes)
+
+    monkeypatch.setattr(spg.torch.distributed, "TCPStore", lambda **_kwargs: store)
+    monkeypatch.setattr(spg, "get_unique_id", lambda: unique_id)
+    monkeypatch.setattr(spg.Communicator, "init", lambda **_kwargs: communicator)
+    monkeypatch.setattr(spg.torch.cuda, "device", lambda _device: nullcontext())
+    monkeypatch.setattr(spg.torch.cuda, "current_stream", lambda: stream)
+
+    group = spg.StatelessProcessGroup(
+        master_address="127.0.0.1", port=1234, rank=0, world_size=2
+    )
+    return group, store, stream, communicator, unique_id_bytes
+
+
+def test_vllm_peer_uses_vllm_metadata_and_allreduce_warmup(monkeypatch):
+    # Coupled to vLLM 0.23.0's stateless process-group wire protocol. Reverify
+    # this literal whenever the isolated Dynamo vLLM pin changes.
+    assert spg._VLLM_UNIQUE_ID_KEY == "broadcast_from/0/0"
+    group, store, stream, communicator, unique_id_bytes = _make_process_group(
+        monkeypatch
+    )
+    warmup_tensor = object()
+    monkeypatch.setattr(spg.torch, "zeros", lambda *_args, **_kwargs: warmup_tensor)
+
+    group.init_nccl_communicator(device=0, peer="vllm")
+
+    assert store.data[spg._NEMO_UNIQUE_ID_KEY] == unique_id_bytes
+    with _vllm_unique_id_type():
+        stored_unique_id = pickle.loads(store.data[spg._VLLM_UNIQUE_ID_KEY])
+    assert bytes(stored_unique_id) == unique_id_bytes
+    assert communicator.allreduce_calls == [
+        {
+            "sendbuf": warmup_tensor,
+            "recvbuf": warmup_tensor,
+            "op": spg.SUM,
+            "stream": 123,
+        }
+    ]
+    assert communicator.broadcast_calls == []
+    assert stream.synchronized
+
+
+def test_nemo_peer_preserves_broadcast_warmup(monkeypatch):
+    group, store, stream, communicator, unique_id_bytes = _make_process_group(
+        monkeypatch
+    )
+    warmup_tensor = object()
+    expected_tensor = object()
+    monkeypatch.setattr(spg.torch, "ones", lambda *_args, **_kwargs: warmup_tensor)
+    monkeypatch.setattr(spg.torch, "allclose", lambda actual, expected: True)
+    monkeypatch.setattr(spg.torch, "zeros", lambda *_args, **_kwargs: expected_tensor)
+
+    group.init_nccl_communicator(device=0)
+
+    assert store.data == {spg._NEMO_UNIQUE_ID_KEY: unique_id_bytes}
+    assert communicator.broadcast_calls == [
+        {
+            "sendbuf": warmup_tensor,
+            "recvbuf": warmup_tensor,
+            "root": 0,
+            "stream": 123,
+        }
+    ]
+    assert communicator.allreduce_calls == []
+    assert stream.synchronized
+
+
+# ---------------------------------------------------------------------------
+# Refit process group lifecycle
+# ---------------------------------------------------------------------------
 
 
 class _FakeCommunicator:
@@ -130,8 +301,12 @@ class _RecordingGroup:
         self.aborts = 0
         _RecordingGroup.instances.append(self)
 
-    def init_nccl_communicator(self, device) -> None:
-        del device
+    def init_nccl_communicator(self, device, *, peer: str = "nemo") -> None:
+        # Mirrors the real signature including ``peer``, which init_collective now
+        # forwards. A stub that omits a kwarg its caller sends fails at the call with a
+        # TypeError, which is the same shape of break this branch has hit three times in
+        # the product code -- worth not reproducing in the fakes as well.
+        del device, peer
 
     def abort(self) -> None:
         self.aborts += 1
@@ -140,7 +315,7 @@ class _RecordingGroup:
 @pytest.fixture
 def recording_group(monkeypatch):
     _RecordingGroup.instances = []
-    monkeypatch.setattr(spg_module, "StatelessProcessGroup", _RecordingGroup)
+    monkeypatch.setattr(spg, "StatelessProcessGroup", _RecordingGroup)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     return _RecordingGroup
