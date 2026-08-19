@@ -227,8 +227,9 @@ class SingleControllerActor:
         # index exactly. Generation may continue, but completed rollouts wait at
         # commit; _buffer_capacity bounds reservations and eventually stalls
         # dispatch instead of allowing unbounded TQ growth.
-        # A future staging/finalizer path must join the same barrier before
-        # native restore can be authoritative.
+        # The finalizer actor RPC and its local replay-index commit also join
+        # this barrier, so native restore sees canonical rows and controller
+        # metadata from the same mutation boundary.
         self._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         if self._buffer is not None:
             self._buffer.set_data_plane_checkpoint_barrier(
@@ -616,76 +617,83 @@ class SingleControllerActor:
         finally:
             self._finalizer_waiters -= 1
         queue_wait_ms = (time.perf_counter() - queue_start) * 1000.0
-        self._active_finalizers += 1
-        active_actor_count = self._active_finalizers
-        finalize_start = time.perf_counter()
-        try:
-            finalized = await actor.finalize.remote(request)
-        except BaseException:
-            self._finalizer_unknown_outcomes += 1
-            print(
-                "FATAL: finalizer actor RPC failed after submission; canonical "
-                f"publication outcome is unknown for group {request.group_id}. "
-                "Stopping validation without actor replacement or retry.",
-                flush=True,
-            )
-            raise
-        else:
-            self._available_finalizers.put_nowait(actor)
-        finally:
-            self._active_finalizers -= 1
-        finalize_total_ms = (time.perf_counter() - finalize_start) * 1000.0
-
-        if finalized.dropped:
+        # The actor publishes canonical rows before returning metadata. Keep
+        # that remote write and the matching local replay-index transition in
+        # one mutation section so a native TQ checkpoint cannot split them.
+        async with self._data_plane_checkpoint_barrier.mutation():
+            self._active_finalizers += 1
+            active_actor_count = self._active_finalizers
+            finalize_start = time.perf_counter()
             try:
-                await self._cleanup_known_finalization_request(request)
-            except BaseException as cleanup_error:
-                raise RuntimeError(
-                    "finalizer dropped the group and known-key cleanup failed "
-                    f"for group {request.group_id}"
-                ) from cleanup_error
-            raise RuntimeError(
-                f"token capture: group {request.group_id} dropped "
-                "(min_valid_fraction_per_group)"
-            )
-        if finalized.meta is None:
-            try:
-                await self._cleanup_known_finalization_request(request)
-            except BaseException as cleanup_error:
-                raise RuntimeError(
-                    "finalizer returned no metadata and known-key cleanup failed "
-                    f"for group {request.group_id}"
-                ) from cleanup_error
-            raise RuntimeError(
-                f"finalizer returned no metadata for non-dropped group {request.group_id}"
-            )
-        try:
-            await self._buffer.commit_finalized(
-                request.group_id,
-                finalized.meta,
-                finalized.group_min_wv,
-                finalized.group_max_wv,
-                staging_keys=finalized.staging_keys,
-            )
-        except BaseException as commit_error:
-            try:
-                await self._cleanup_known_finalization_request(request)
-            except BaseException as cleanup_error:
-                raise BaseExceptionGroup(
-                    f"finalizer commit and known-key cleanup failed for "
-                    f"group {request.group_id}",
-                    [commit_error, cleanup_error],
+                finalized = await actor.finalize.remote(request)
+            except BaseException:
+                self._finalizer_unknown_outcomes += 1
+                print(
+                    "FATAL: finalizer actor RPC failed after submission; canonical "
+                    f"publication outcome is unknown for group {request.group_id}. "
+                    "Stopping validation without actor replacement or retry.",
+                    flush=True,
                 )
-            raise
-        finalized.metrics.update(
-            {
-                "finalize/queue_wait_ms": queue_wait_ms,
-                "finalize/total_ms": finalize_total_ms,
-                "finalize/queue_depth": float(queue_depth),
-                "finalize/active_actor_count": float(active_actor_count),
-            }
-        )
-        self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
+                raise
+            else:
+                self._available_finalizers.put_nowait(actor)
+            finally:
+                self._active_finalizers -= 1
+            finalize_total_ms = (time.perf_counter() - finalize_start) * 1000.0
+
+            if finalized.dropped:
+                try:
+                    await self._cleanup_known_finalization_request(request)
+                except BaseException as cleanup_error:
+                    raise RuntimeError(
+                        "finalizer dropped the group and known-key cleanup failed "
+                        f"for group {request.group_id}"
+                    ) from cleanup_error
+                raise RuntimeError(
+                    f"token capture: group {request.group_id} dropped "
+                    "(min_valid_fraction_per_group)"
+                )
+            if finalized.meta is None:
+                try:
+                    await self._cleanup_known_finalization_request(request)
+                except BaseException as cleanup_error:
+                    raise RuntimeError(
+                        "finalizer returned no metadata and known-key cleanup failed "
+                        f"for group {request.group_id}"
+                    ) from cleanup_error
+                raise RuntimeError(
+                    "finalizer returned no metadata for non-dropped group "
+                    f"{request.group_id}"
+                )
+            try:
+                await self._buffer.commit_finalized(
+                    request.group_id,
+                    finalized.meta,
+                    finalized.group_min_wv,
+                    finalized.group_max_wv,
+                    staging_keys=finalized.staging_keys,
+                )
+            except BaseException as commit_error:
+                try:
+                    await self._cleanup_known_finalization_request(request)
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        f"finalizer commit and known-key cleanup failed for "
+                        f"group {request.group_id}",
+                        [commit_error, cleanup_error],
+                    )
+                raise
+            finalized.metrics.update(
+                {
+                    "finalize/queue_wait_ms": queue_wait_ms,
+                    "finalize/total_ms": finalize_total_ms,
+                    "finalize/queue_depth": float(queue_depth),
+                    "finalize/active_actor_count": float(active_actor_count),
+                }
+            )
+            self._finalizer_metrics_by_group[request.group_id] = dict(
+                finalized.metrics
+            )
 
     async def _cleanup_consumed_metas(self, metas: list[KVBatchMeta]) -> None:
         """Clear canonical rows and full-manifest staging keys after train success."""
@@ -776,18 +784,22 @@ class SingleControllerActor:
                         target_step=target_step,
                         inflight_registry=self._inflight_by_group_id,
                     )
-                    self._inflight_rollouts -= 1
-                    inflight_count_released = True
-                    sem.release()
-                    generation_permit_released = True
-                    await self._finalize_with_actor(request)
+                    if request is None:
+                        outcome = RolloutOutcome.SKIPPED
+                    else:
+                        self._inflight_rollouts -= 1
+                        inflight_count_released = True
+                        sem.release()
+                        generation_permit_released = True
+                        await self._finalize_with_actor(request)
+                        self._rollout_manager.stats.committed += 1
+                        outcome = RolloutOutcome.COMMITTED
                 else:
-                    await self._rollout_manager.generate_and_push(
+                    outcome = await self._rollout_manager.generate_and_push(
                         prompt,
                         target_step=target_step,
                         inflight_registry=self._inflight_by_group_id,
                     )
-                    outcome = RolloutOutcome.COMMITTED
                 ownership_transferred = True
             except BaseException:
                 # On success ownership transfers to the train pump, which

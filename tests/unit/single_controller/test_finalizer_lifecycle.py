@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
@@ -95,6 +96,7 @@ def _controller(actor: object) -> Any:
     ctrl._finalizer_waiters = 0
     ctrl._finalizer_unknown_outcomes = 0
     ctrl._finalizer_metrics_by_group = {}
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
@@ -140,6 +142,60 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         staging_keys=["group_g0/call"],
     )
     assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
+
+
+def test_checkpoint_waits_for_actor_publication_and_local_commit() -> None:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+
+    async def _main() -> None:
+        actor_started = asyncio.Event()
+        release_actor = asyncio.Event()
+        checkpoint_entered = asyncio.Event()
+
+        class _BlockingFinalize:
+            def remote(self, request: FinalizationRequest) -> Any:
+                del request
+
+                async def _result() -> FinalizedGroup:
+                    actor_started.set()
+                    await release_actor.wait()
+                    return result
+
+                return _result()
+
+        ctrl = _controller(SimpleNamespace(finalize=_BlockingFinalize()))
+        finalize_task = asyncio.create_task(ctrl._finalize_with_actor(_request()))
+        await actor_started.wait()
+
+        async def _checkpoint() -> None:
+            async with ctrl._data_plane_checkpoint_barrier.checkpoint():
+                checkpoint_entered.set()
+
+        checkpoint_task = asyncio.create_task(_checkpoint())
+        await asyncio.sleep(0)
+        assert not checkpoint_entered.is_set()
+
+        release_actor.set()
+        await finalize_task
+        await checkpoint_task
+        assert checkpoint_entered.is_set()
+        ctrl._buffer.commit_finalized.assert_awaited_once()
+
+    asyncio.run(_main())
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:

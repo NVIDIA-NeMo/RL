@@ -1408,18 +1408,90 @@ class RolloutManager:
         *,
         target_step: Optional[int] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
-    ) -> "FinalizationRequest":
-        """Run capture generation and return a metadata-only actor request.
+    ) -> Optional["FinalizationRequest"]:
+        """Run capture generation with bounded retries for actor finalization.
 
         The replay-buffer slot remains reserved and unready. The caller owns
         finalizer submission and must either commit the returned group or stop
-        the validation run on an unknown publication outcome.
-        """
-        from nemo_rl.experience.finalizer_actor import FinalizationRequest
+        the validation run on an unknown publication outcome. Each retry owns
+        a fresh group and rollout IDs so failed gate/staging state cannot
+        collide with the next attempt.
 
+        Returns:
+            A metadata-only finalizer request after successful generation, or
+            ``None`` when a deterministic prompt failure exhausts its budget
+            within ``max_skipped_prompts``.
+        """
         assert self._tq_buffer is not None, (
             "generate_for_finalization requires tq_buffer to be set at __init__"
         )
+        policy = self._retry_policy
+        infra_attempts = 0
+        data_attempts = 0
+        last_infra_error: Optional[Exception] = None
+
+        while infra_attempts < policy.max_infra_attempts:
+            try:
+                return await self._generate_for_finalization_attempt(
+                    input_sample,
+                    target_step=target_step,
+                    inflight_registry=inflight_registry,
+                )
+            except Exception as error:
+                reason = type(error).__name__
+                if classify_rollout_failure(error) is FailureClass.INFRA:
+                    infra_attempts += 1
+                    last_infra_error = error
+                    if infra_attempts >= policy.max_infra_attempts:
+                        break
+                    self._stats.record_redispatch(reason)
+                    await asyncio.sleep(policy.backoff_for(infra_attempts))
+                    continue
+
+                data_attempts += 1
+                if data_attempts >= policy.max_data_attempts:
+                    self._stats.record_data_failure(reason)
+                    if self._skipped_prompts >= policy.max_skipped_prompts:
+                        if policy.max_skipped_prompts == 0:
+                            raise
+                        raise RolloutDataFailure(
+                            f"skipped {self._skipped_prompts} prompts and this one "
+                            "also exhausted its data budget, exceeding "
+                            f"max_skipped_prompts={policy.max_skipped_prompts}; "
+                            "the dataset or sequence-length configuration is likely "
+                            "wrong"
+                        ) from error
+                    self._skipped_prompts += 1
+                    print(
+                        f"skipping prompt idx={input_sample['idx']} after "
+                        f"{data_attempts} deterministic failure(s) "
+                        f"({reason}: {error})",
+                        flush=True,
+                    )
+                    self._stats.skipped += 1
+                    return None
+                self._stats.record_data_retry(reason)
+
+        assert last_infra_error is not None
+        raise RolloutRedispatchExhausted(
+            f"prompt idx={input_sample['idx']} exhausted its infrastructure retry "
+            f"budget after {infra_attempts} attempt(s) "
+            f"(max_infra_attempts_per_prompt={policy.max_infra_attempts}); "
+            f"last failure was {type(last_infra_error).__name__}: "
+            f"{last_infra_error}"
+        ) from last_infra_error
+
+    async def _generate_for_finalization_attempt(
+        self,
+        input_sample: DatumSpec,
+        *,
+        target_step: Optional[int],
+        inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]],
+    ) -> "FinalizationRequest":
+        """Run one capture attempt and leave its reserved slot unready."""
+        from nemo_rl.experience.finalizer_actor import FinalizationRequest
+
+        assert self._tq_buffer is not None
         start_version = self._weight_version
         group_id = str(uuid.uuid4())
         rollout_ids = tuple(
@@ -1461,7 +1533,14 @@ class RolloutManager:
             self._tq_buffer.abort(group_id)
             nemo_gym_env = self._env_handles.get("nemo_gym")
             if nemo_gym_env is not None:
-                await nemo_gym_env.fail_rollouts.remote(
-                    list(rollout_ids), reason="dispatch_failed"
-                )
+                try:
+                    await nemo_gym_env.fail_rollouts.remote(
+                        list(rollout_ids), reason="dispatch_failed"
+                    )
+                except Exception as cleanup_error:
+                    print(
+                        "  warn: gate cleanup failed for capture attempt "
+                        f"group={group_id}: {cleanup_error!r}",
+                        flush=True,
+                    )
             raise

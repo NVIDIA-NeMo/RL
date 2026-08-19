@@ -19,8 +19,8 @@ per rollout, fetch the staged rows the receipt manifest names through the
 shape/mask/finite-logprob checks, length chaining, weight-version tag
 equality), then delegate semantics to Gym's pure ``linearize``
 (``main_chain_only`` + ``terminal_hint``). Any rejection becomes a masked
-placeholder row — the group always builds exactly N rows so GRPO group shape
-survives; validity folds into ``sample_mask`` (no new train field) and
+placeholder row — the group always publishes exactly N rows so GRPO group
+shape survives; validity folds into ``sample_mask`` (no new train field) and
 placeholders copy ``prompt_ids_for_adv`` from a valid sibling so per-prompt
 baselines stay well-formed.
 
@@ -124,6 +124,8 @@ class BlackboxFinalizer:
         # sentinel tensors consistently with the model.
         self._routed_dims: Optional[tuple[int, int]] = None
         self._source = TQTokenSource(dp_client, staging_partition=staging_partition)
+        # The sink's clear() is the staging-partition delete; no staging
+        # writes happen here.
         self._staging = TQTokenSink(dp_client, staging_partition=staging_partition)
 
     # ── per rollout ─────────────────────────────────────────────────────────
@@ -337,7 +339,7 @@ class BlackboxFinalizer:
         *,
         fallback_weight_version: int,
     ) -> FinalizedGroup:
-        """Build exactly N canonical rows for one prompt group.
+        """Publish exactly N canonical rows for one prompt group.
 
         Blocking (TQ round trips); run via ``asyncio.to_thread`` from the
         dispatch task. ``fallback_weight_version`` stamps a group none of
@@ -381,12 +383,13 @@ class BlackboxFinalizer:
             self._min_valid_fraction is not None
             and valid_fraction < self._min_valid_fraction
         ):
+            self._clear_staging(staging_keys)
             metrics["finalize/group_dropped"] = 1.0
             return FinalizedGroup(
                 meta=None,
                 group_min_wv=group_min_wv,
                 group_max_wv=group_max_wv,
-                staging_keys=staging_keys,
+                staging_keys=[],
                 metrics=metrics,
                 dropped=True,
             )
@@ -440,12 +443,13 @@ class BlackboxFinalizer:
                     "unknown yet",
                     flush=True,
                 )
+                self._clear_staging(staging_keys)
                 metrics["finalize/group_dropped"] = 1.0
                 return FinalizedGroup(
                     meta=None,
                     group_min_wv=group_min_wv,
                     group_max_wv=group_max_wv,
-                    staging_keys=staging_keys,
+                    staging_keys=[],
                     metrics=metrics,
                     dropped=True,
                 )

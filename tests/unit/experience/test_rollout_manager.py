@@ -38,6 +38,7 @@ from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.failures import GenerationUnavailable
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
@@ -1062,6 +1063,9 @@ def _make_capture_manager(buf, *, on_run=None, num_generations=2):
     mgr._tq_buffer = buf
     mgr._env_handles = {"nemo_gym": _FakeGymEnvHandle()}
     mgr._weight_version = 7
+    mgr._retry_policy = RolloutRetryPolicy.single_attempt()
+    mgr._stats = RolloutStats()
+    mgr._skipped_prompts = 0
 
     class _CaptureImpl:
         def __init__(self):
@@ -1085,6 +1089,7 @@ class TestGenerateForFinalizationFlow:
         mgr = _make_capture_manager(buf)
 
         request = _run(mgr.generate_for_finalization({"prompt": "p"}, target_step=5))
+        assert request is not None
 
         # Rollout ids were minted from the reserved group id and threaded
         # end to end: reserve -> impl -> metadata-only actor request.
@@ -1116,3 +1121,30 @@ class TestGenerateForFinalizationFlow:
         (group_id,) = [buf.abort_calls[0]]
         assert failed_ids == [f"{group_id}_g0", f"{group_id}_g1"]
         assert reason == "dispatch_failed"
+
+    def test_retries_infrastructure_failure_with_fresh_rollout_ids(self):
+        buf = _FakeCaptureBuffer()
+        attempts = 0
+
+        async def _fail_once(_sample):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise GenerationUnavailable("worker disappeared")
+
+        mgr = _make_capture_manager(buf, on_run=_fail_once)
+        mgr._retry_policy = RolloutRetryPolicy.single_attempt(
+            max_infra_attempts=2,
+            backoff_base_s=0.0,
+        )
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 4}))
+
+        assert request is not None
+        assert attempts == 2
+        assert len(buf.reserve_rollout_ids) == 2
+        assert buf.reserve_rollout_ids[0] != buf.reserve_rollout_ids[1]
+        assert len(buf.abort_calls) == 1
+        assert buf.abort_calls[0] != request.group_id
+        assert len(mgr._env_handles["nemo_gym"].failed) == 1
+        assert mgr.stats.as_metrics()["rollout/redispatch_total"] == 1.0
