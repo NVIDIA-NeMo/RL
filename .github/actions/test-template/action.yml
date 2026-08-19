@@ -157,16 +157,10 @@ runs:
         #
         # --device against a missing path makes docker run itself fail, which
         # would break every test rather than only the RDMA ones — hence the
-        # host-side check. Gate on uverbs* specifically, not just the
-        # /dev/infiniband directory: a host can have the directory without a
-        # verbs node, which is what libibverbs actually opens and what
-        # rdma_devices() requires — that mismatch would pass this gate, set
-        # NEMO_RL_REQUIRE_MOONCAKE, and then hard-fail every mooncake unit
-        # test once rdma_devices() finds nothing.
+        # host-side check (see detect_rdma.sh for what it gates on).
+        source "${{ github.workspace }}/${{ github.run_id }}/${{ steps.uuid.outputs.id }}/nemo-rl/tests/scripts/detect_rdma.sh"
         RDMA_FLAGS=()
-        if [[ "${{ inputs.is_doc_test }}" != "true" ]] &&
-           compgen -G "/dev/infiniband/uverbs*" >/dev/null &&
-           compgen -G "/sys/class/infiniband/mlx5_*/ports/1/link_layer" >/dev/null; then
+        if [[ "${{ inputs.is_doc_test }}" != "true" ]] && rdma_device_available; then
           RDMA_FLAGS=(--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1
                       --env NEMO_RL_REQUIRE_MOONCAKE=1)
         fi
