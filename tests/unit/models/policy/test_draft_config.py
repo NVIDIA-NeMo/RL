@@ -19,7 +19,10 @@ from omegaconf import OmegaConf
 from pydantic import ValidationError
 
 from nemo_rl.algorithms.grpo import MasterConfig
-from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.models.policy.draft_config import (
+    DraftOptimizerConfig,
+    Eagle3DraftConfig,
+)
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -39,7 +42,25 @@ def test_eagle3_draft_config_preserves_legacy_defaults() -> None:
         "loss_weight": 0.1,
         "num_layers": None,
         "aux_layer_indices": None,
+        "optimizer": None,
     }
+
+
+def test_draft_optimizer_config_is_typed() -> None:
+    draft = Eagle3DraftConfig(
+        enabled=True,
+        optimizer={
+            "lr": 1.0e-5,
+            "min_lr": 1.0e-6,
+            "weight_decay": 0.02,
+        },
+    )
+
+    assert draft.optimizer == DraftOptimizerConfig(
+        lr=1.0e-5,
+        min_lr=1.0e-6,
+        weight_decay=0.02,
+    )
 
 
 def test_eagle3_draft_config_accepts_legacy_mapping_without_speculator_type() -> None:

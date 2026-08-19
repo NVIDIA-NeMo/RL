@@ -321,6 +321,9 @@ policy:
     loss_weight: 0.1
     num_layers: null
     aux_layer_indices: null
+    # Optional draft-only optimizer schedule. Set a mapping with `lr` and
+    # optional `min_lr`/`weight_decay` to enable it.
+    optimizer: null
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.
