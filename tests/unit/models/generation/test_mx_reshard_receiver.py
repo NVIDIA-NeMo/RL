@@ -2,7 +2,7 @@
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 
@@ -11,12 +11,25 @@ from nemo_rl.distributed.mx_vllm_reshard_receiver import (
 )
 
 
-def _build_receiver():
+# The adapter picks its call by inspecting MX's signature, so a bare MagicMock
+# (which reports only *args/**kwargs) cannot stand in for either contract. These
+# two stubs carry the real shapes, and autospec'ing them makes a call the
+# installed MX would reject fail here too.
+def _discover_with_flag(count, *, timeout=None, with_tensors=True):
+    """MX that can skip building the shard tables."""
+
+
+def _discover_without_flag(count, *, timeout=None):
+    """MX predating the flag, which always builds them."""
+
+
+def _build_receiver(discover=_discover_with_flag):
     manager = MagicMock()
     receiver_client = MagicMock()
     raw_receiver = MagicMock(_manager=manager, _mx_client=receiver_client)
     client = MagicMock()
     rendezvous = MagicMock()
+    rendezvous.discover_trainers = create_autospec(discover)
     with (
         patch(
             "modelexpress.engines.vllm.refit.receiver.VllmReshardReceiver",
@@ -55,7 +68,7 @@ def _build_receiver():
     )
 
 
-def test_exact_modelexpress_635_constructor_arguments():
+def test_receiver_is_constructed_with_the_expected_mx_arguments():
     (
         _wrapper,
         _raw,
@@ -187,23 +200,36 @@ def test_quorum_skips_shard_tables_it_does_not_need():
     )
 
 
-def test_quorum_falls_back_when_mx_predates_the_flag(capsys):
+def test_quorum_omits_the_flag_when_mx_predates_it(capsys):
     """The two changes need not land in lockstep, so an MX without the flag must
-    still work rather than fail every refit with a TypeError."""
-    wrapper, raw, _, _, _, rendezvous, *_ = _build_receiver()
-    payloads = [SimpleNamespace(publisher_step=5, tensors=(1, 2)) for _ in range(16)]
-
-    def only_old_signature(count, timeout=None, with_tensors=None):
-        if with_tensors is not None:
-            raise TypeError("unexpected keyword argument 'with_tensors'")
-        return payloads
-
-    rendezvous.discover_trainers.side_effect = only_old_signature
+    still work rather than fail every refit with a TypeError. The autospec would
+    raise that TypeError if the adapter passed the flag anyway."""
+    wrapper, raw, _, _, _, rendezvous, *_ = _build_receiver(
+        discover=_discover_without_flag
+    )
+    rendezvous.discover_trainers.return_value = [
+        SimpleNamespace(publisher_step=5, tensors=(1, 2)) for _ in range(16)
+    ]
     raw.update_weights.return_value = {"step": 5}
 
     assert wrapper.update_weights(5) == {"step": 5}
+
+    rendezvous.discover_trainers.assert_called_once_with(16, timeout=77.0)
     record = json.loads(capsys.readouterr().out.split("MX_RECV_PHASE ", 1)[1])
     assert record["tensors_seen"] == 32
+
+
+def test_a_real_typeerror_from_discovery_is_not_swallowed():
+    """Detecting the flag by catching TypeError also caught TypeErrors raised
+    *inside* discovery, silently retrying them as the slower full fetch. A bug in
+    MX has to surface as a bug rather than as an unexplained per-step slowdown."""
+    wrapper, _, _, _, _, rendezvous, *_ = _build_receiver()
+    rendezvous.discover_trainers.side_effect = TypeError("boom inside MX")
+
+    with pytest.raises(TypeError, match="boom inside MX"):
+        wrapper.update_weights(1)
+
+    rendezvous.discover_trainers.assert_called_once()
 
 
 def test_recorded_entry_count_is_preferred_over_the_built_table(capsys):

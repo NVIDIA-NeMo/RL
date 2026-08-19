@@ -3,24 +3,29 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Pinned compatibility adapter for ModelExpress #635 reshard receivers.
+"""Compatibility adapter around ModelExpress' vLLM reshard receiver.
 
-ModelExpress #635 exposes ``VllmReshardReceiver.update_weights(step)`` but no
-public API to require a publisher step before the first lazy discovery, and no
-receiver shutdown method. This adapter owns the extra metadata client used for
-the version preflight and confines the one pinned private cleanup dependency
-(``receiver._manager.shutdown()``) to a checked boundary.
+MX exposes ``VllmReshardReceiver.update_weights(step)`` but two things this path
+needs are missing from its public surface: a way to require a publisher step
+before the receiver's first lazy discovery, and a receiver shutdown method.
+
+So this adapter owns the extra metadata client used for the version preflight,
+and confines the one private dependency it cannot avoid
+(``receiver._manager.shutdown()``) to a boundary that is checked at
+construction rather than assumed at teardown. If MX grows public equivalents,
+this adapter is what shrinks.
 """
 
 from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from inspect import signature
+from typing import Any, Optional
 
 
 class MxVllmReshardReceiver:
-    """Version-gated lifecycle around the exact ModelExpress #635 receiver API."""
+    """Version-gated lifecycle around ModelExpress' reshard receiver API."""
 
     def __init__(
         self,
@@ -45,6 +50,9 @@ class MxVllmReshardReceiver:
         self._num_trainer_sources = num_trainer_sources
         self._timeout = timeout
         self._global_rank = global_rank
+        # Resolved on first discovery and cached: the installed MX cannot change
+        # under a live receiver.
+        self._tensorless_discovery: Optional[bool] = None
         # Held for parameter-equality verification, which needs the live params
         # both before and after an install. MX's receiver keeps its own reference.
         self._model = model
@@ -77,8 +85,10 @@ class MxVllmReshardReceiver:
         if manager is None or not callable(getattr(manager, "shutdown", None)):
             self._client.close()
             raise RuntimeError(
-                "ModelExpress #635 compatibility error: "
-                "VllmReshardReceiver._manager.shutdown() is unavailable"
+                "ModelExpress compatibility error: "
+                "VllmReshardReceiver._manager.shutdown() is unavailable. This "
+                "adapter needs it to release the receiver's NIXL registrations; "
+                "check the installed modelexpress version."
             )
         self._closed = False
 
@@ -128,20 +138,32 @@ class MxVllmReshardReceiver:
         identical every step. On Qwen3-30B-A3B that is 78,760 entries across 16
         ranks, and skipping the rebuild removes ~0.8 s of a ~5.2 s check.
 
-        Falls back to the full fetch against an MX that predates the flag, so this
-        does not have to land in lockstep with the client change.
+        Omits the flag against an MX that predates it, so this does not have to
+        land in lockstep with the client change.
         """
-        try:
-            return self._rendezvous.discover_trainers(
-                self._num_trainer_sources,
-                timeout=self._timeout,
-                with_tensors=False,
-            )
-        except TypeError:
-            return self._rendezvous.discover_trainers(
-                self._num_trainer_sources,
-                timeout=self._timeout,
-            )
+        kwargs: dict[str, Any] = {"timeout": self._timeout}
+        if self._supports_tensorless_discovery():
+            kwargs["with_tensors"] = False
+        return self._rendezvous.discover_trainers(self._num_trainer_sources, **kwargs)
+
+    def _supports_tensorless_discovery(self) -> bool:
+        """Whether the installed MX accepts ``with_tensors``.
+
+        Asked of the signature rather than by calling and catching TypeError: a
+        genuine TypeError raised *inside* discovery would otherwise be swallowed
+        and retried as the expensive full fetch, turning a real bug into an
+        unexplained per-step slowdown.
+        """
+        if self._tensorless_discovery is None:
+            try:
+                parameters = signature(self._rendezvous.discover_trainers).parameters
+            except (TypeError, ValueError):
+                # Unintrospectable callable (C extension, some mocks). Assume the
+                # older contract; the full fetch is slower but always correct.
+                self._tensorless_discovery = False
+            else:
+                self._tensorless_discovery = "with_tensors" in parameters
+        return self._tensorless_discovery
 
     def _report_phases(
         self,
@@ -157,6 +179,7 @@ class MxVllmReshardReceiver:
         AttributeError on any payload shape that lacked it, which would abort a
         refit that had already succeeded.
         """
+
         def entries(payload) -> int:
             # Prefer the recorded count: the quorum path deliberately does not
             # build the shard tables, so len(payload.tensors) would read 0 and
@@ -190,7 +213,7 @@ class MxVllmReshardReceiver:
             pass
 
     def shutdown(self) -> None:
-        """Release #635's receiver-owned NIXL manager and both gRPC clients."""
+        """Release the receiver-owned NIXL manager and both gRPC clients."""
         if self._closed:
             return
         self._closed = True
