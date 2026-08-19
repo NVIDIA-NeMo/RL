@@ -354,6 +354,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             f"must be >= async_rl.min_groups_for_streaming_train "
             f"({async_config.min_groups_for_streaming_train})"
         )
+    if async_config.max_buffered_rollouts < async_config.min_groups_for_streaming_train:
+        raise ValueError(
+            "async_rl.max_buffered_rollouts "
+            f"({async_config.max_buffered_rollouts}) must be >= "
+            f"async_rl.min_groups_for_streaming_train "
+            f"({async_config.min_groups_for_streaming_train}); otherwise the rollout "
+            "pump can fill every buffer slot while the trainer waits for more groups."
+        )
 
     rl_step_samples = (
         num_prompts_per_step * master_config.grpo.num_generations_per_prompt
