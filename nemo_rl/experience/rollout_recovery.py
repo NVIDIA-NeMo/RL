@@ -15,9 +15,8 @@
 """Controller-owned lineage for recoverable token-capture prompt groups.
 
 The ledger deliberately contains control-plane metadata only. Token tensors and
-router-replay payloads remain in TQ. Persistence is added by a later change; the
-versioned ``state_dict`` boundary lives here so that change does not have to
-invent a second lifecycle model.
+router-replay payloads remain in TQ. The versioned ``state_dict`` boundary is
+persisted beside the native TQ snapshot.
 """
 
 from __future__ import annotations
@@ -34,6 +33,7 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
 
 ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
+ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 
 
 class RolloutAttemptStatus(StrEnum):
@@ -166,6 +166,17 @@ class PromptGroupRecoveryRecord:
         ]
 
 
+@dataclass(frozen=True)
+class PromptGroupRecoverySummary:
+    """Small immutable view used for restore planning at large group counts."""
+
+    group_id: str
+    prompt_ref: PromptRef
+    target_step: Optional[int]
+    start_weight_version: int
+    status: PromptGroupStatus
+
+
 @dataclass
 class OpenTrainStepRecord:
     """Groups contributing to the current, not-yet-durable optimizer step."""
@@ -213,6 +224,92 @@ class RolloutRecoveryLedger:
 
     def groups(self) -> list[PromptGroupRecoveryRecord]:
         return [self._copy_group(group) for group in self._groups.values()]
+
+    def summaries(self) -> list[PromptGroupRecoverySummary]:
+        """Return restore-planning fields without copying receipts or metadata."""
+        return [
+            PromptGroupRecoverySummary(
+                group_id=record.group_id,
+                prompt_ref=record.prompt_ref,
+                target_step=record.target_step,
+                start_weight_version=record.start_weight_version,
+                status=record.status,
+            )
+            for record in self._groups.values()
+        ]
+
+    def bind_runtime_prompt(self, group_id: str, prompt_payload: DatumSpec) -> None:
+        """Attach a dataset-reconstructed prompt without serializing it.
+
+        Only unfinished generation needs the prompt body. Finalization and
+        training consume durable TQ rows referenced by the ledger instead.
+        """
+        record = self._require_group(group_id)
+        if record.status != PromptGroupStatus.GENERATING:
+            raise ValueError(
+                f"cannot bind a prompt to group {group_id!r} in "
+                f"state {record.status.value!r}"
+            )
+        sample_id = str(prompt_payload.get("idx"))
+        task_name = prompt_payload.get("task_name")
+        if sample_id != record.prompt_ref.sample_id:
+            raise ValueError(
+                "reconstructed prompt does not match its durable sample reference: "
+                f"sample={sample_id!r}, expected={record.prompt_ref.sample_id!r}"
+            )
+        if task_name != record.prompt_ref.task_name:
+            raise ValueError(
+                "reconstructed prompt task does not match its durable reference: "
+                f"task={task_name!r}, expected={record.prompt_ref.task_name!r}"
+            )
+        record.runtime_prompt_payload = prompt_payload
+
+    def prepare_for_restart(self) -> None:
+        """Convert crash-interrupted attempts into retryable ledger state.
+
+        A valid full-step checkpoint cannot contain an open optimizer step or
+        an in-progress/unknown finalizer publication. Those states need the
+        periodic-checkpoint protocol and are rejected rather than guessed at.
+        """
+        self.assert_full_step_checkpoint_safe()
+        for record in self._groups.values():
+            if record.status == PromptGroupStatus.GENERATING:
+                self.abandon_unsealed(record.group_id)
+
+    def assert_full_step_checkpoint_safe(self) -> None:
+        """Reject states that require the periodic mid-step protocol."""
+        if self._open_train_step is not None:
+            raise RuntimeError(
+                "rollout recovery contains an open optimizer step; restoring "
+                "mid-step snapshots is not supported by full-step recovery"
+            )
+        unsupported = [
+            record.group_id
+            for record in self._groups.values()
+            if record.status
+            in {
+                PromptGroupStatus.FINALIZING,
+                PromptGroupStatus.FINALIZATION_UNKNOWN,
+                PromptGroupStatus.CLAIMED_FOR_TRAINING,
+                PromptGroupStatus.APPLIED_UNCHECKPOINTED,
+            }
+        ]
+        if unsupported:
+            raise RuntimeError(
+                "rollout recovery contains checkpoint-unsafe group states: "
+                f"groups={unsupported!r}"
+            )
+
+    def expected_staging_keys(self) -> set[str]:
+        """Return every durable staging row still owned by the ledger."""
+        return {
+            staging_key
+            for record in self._groups.values()
+            for sibling in record.siblings
+            for attempt in sibling.attempts[-1:]
+            if attempt.status == RolloutAttemptStatus.SEALED
+            for staging_key in attempt.staging_keys
+        }
 
     def reserve_group(
         self,
@@ -855,11 +952,15 @@ class RolloutRecoveryLedger:
             sibling.current_attempt.status == RolloutAttemptStatus.SEALED
             for sibling in siblings
         )
+        if status == PromptGroupStatus.GENERATING and all_current_attempts_sealed:
+            raise ValueError("generating group must retain an unfinished sibling")
         if status in prefinalization_sealed_states and not all_current_attempts_sealed:
             raise ValueError(
                 f"group state {status.value!r} requires every sibling to be sealed"
             )
         if status in finalized_states:
+            if not all_current_attempts_sealed:
+                raise ValueError("finalized group state requires sealed siblings")
             if canonical_meta is None or min_weight is None or max_weight is None:
                 raise ValueError("finalized group state requires canonical metadata")
             if list(canonical_meta.sample_ids) != [
