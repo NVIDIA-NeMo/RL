@@ -31,7 +31,7 @@ def _load_objective_without_poisoning_packages() -> ModuleType:
                 module_name, repository_root / relative_path
             )
             if spec is None or spec.loader is None:
-                pytest.fail(f"cannot load {relative_path}", pytrace=False)
+                raise RuntimeError(f"cannot load {relative_path}")
             module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = module
             spec.loader.exec_module(module)
@@ -290,10 +290,19 @@ def test_raw_stats_add_across_dp_splits_with_one_zero_rank() -> None:
         loss_weights=(1.25, 0.5, 2.0),
     )
     rank_stats = []
+    per_block_inputs = {
+        "target_logits",
+        "draft_hidden",
+        "previous_token_ids",
+        "confidence_logits",
+        "hard_labels",
+        "valid_mask",
+        "slot_bins",
+    }
     for block_index in range(2):
         rank_inputs: dict[str, object] = {}
         for name, value in inputs.items():
-            if isinstance(value, torch.Tensor) and value.ndim >= 2:
+            if name in per_block_inputs and isinstance(value, torch.Tensor):
                 rank_inputs[name] = value[block_index : block_index + 1]
             else:
                 rank_inputs[name] = value
@@ -307,7 +316,7 @@ def test_raw_stats_add_across_dp_splits_with_one_zero_rank() -> None:
         )
     first_rank_inputs = dict(inputs)
     for name, value in tuple(first_rank_inputs.items()):
-        if isinstance(value, torch.Tensor) and value.ndim >= 2:
+        if name in per_block_inputs and isinstance(value, torch.Tensor):
             first_rank_inputs[name] = value[:1]
     expected_nonzero_rank = dspark_tiled_objective(
         **first_rank_inputs,
@@ -475,7 +484,9 @@ def test_qwen_vocab_retained_state_is_independent_of_source_position(
         "target_output_weight": torch.randn(
             local_vocab_size, 16, generator=generator, requires_grad=True
         ),
-        "markov_w1": torch.randn(151_936, 2, generator=generator, requires_grad=True),
+        "markov_w1": torch.randn(
+            local_vocab_size, 2, generator=generator, requires_grad=True
+        ),
         "markov_w2": torch.randn(
             local_vocab_size, 2, generator=generator, requires_grad=True
         ),

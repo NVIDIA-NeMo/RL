@@ -16,12 +16,11 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Protocol, cast
 
 import torch
 from torch import nn
 
-from nemo_rl.algorithms.loss.draft import _SumTensorParallelHiddenGradient
 from nemo_rl.algorithms.loss.dspark import (
     DSparkObjectiveStats,
     dspark_tiled_objective,
@@ -30,6 +29,15 @@ from nemo_rl.models.megatron.draft.dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
 )
+
+
+class _CheckpointableBody(Protocol):
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple[tuple[int, int, int], ...] = (),
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
 
 
 class _DSparkProviderAdapter(nn.Module):
@@ -82,17 +90,6 @@ class _DSparkProviderAdapter(nn.Module):
                 "target output weight and draft hidden must share a device"
             )
 
-        vocab_parallel_hidden = _SumTensorParallelHiddenGradient.apply(
-            draft_hidden,
-            tp_group,
-        )
-        base_logits = vocab_parallel_hidden @ target_output_weight.detach().T
-        markov_bias = self.markov_head(
-            torch.zeros_like(base_logits),
-            previous_token_ids=previous_token_ids,
-            slot_valid=valid_mask,
-        )
-
         confidence_logits = None
         if self.confidence_head is not None:
             markov_embeddings = None
@@ -101,7 +98,7 @@ class _DSparkProviderAdapter(nn.Module):
                     valid_mask,
                     previous_token_ids,
                     torch.zeros_like(previous_token_ids),
-                )
+                ).clamp(0, self.markov_head.vocab_size - 1)
                 markov_embeddings = self.markov_head.markov_w1(safe_previous_token_ids)
             confidence_logits = self.confidence_head(
                 draft_hidden,
@@ -111,14 +108,18 @@ class _DSparkProviderAdapter(nn.Module):
 
         return dspark_tiled_objective(
             target_logits=target_logits,
-            base_logits=base_logits,
-            markov_bias=markov_bias,
+            draft_hidden=draft_hidden,
+            target_output_weight=target_output_weight,
+            markov_w1=self.markov_head.markov_w1.weight,
+            markov_w2=self.markov_head.markov_w2.weight,
+            previous_token_ids=previous_token_ids,
             confidence_logits=confidence_logits,
             hard_labels=hard_labels,
             valid_mask=valid_mask,
             slot_bins=slot_bins,
             loss_weights=loss_weights,
             token_chunk_size=token_chunk_size,
+            vocab_start_index=self.markov_head.vocab_start_index,
             tp_group=tp_group,
         )
 
@@ -129,7 +130,8 @@ class _DSparkProviderAdapter(nn.Module):
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Compose body and head checkpoint metadata without target tensors."""
-        body_state = self.body.sharded_state_dict(  # type: ignore[attr-defined]
+        checkpointable_body = cast(_CheckpointableBody, self.body)
+        body_state = checkpointable_body.sharded_state_dict(
             prefix=f"{prefix}body.",
             sharded_offsets=sharded_offsets,
             metadata=metadata,
@@ -178,6 +180,8 @@ def build_dspark_provider(
     """Construct the private DSpark adapter without registering a generic loss."""
     if confidence_with_markov and not confidence_enabled:
         raise ValueError("confidence_with_markov requires confidence_enabled")
+    if not callable(getattr(body, "sharded_state_dict", None)):
+        raise TypeError("DSpark body must implement sharded_state_dict")
     markov_head = DSparkMarkovHead(
         vocab_size=vocab_size,
         markov_rank=markov_rank,

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tiled hard-CE, total-variation, and confidence objectives for DSpark."""
+"""Token-tiled hard-CE, total-variation, and confidence objectives for DSpark."""
 
 from __future__ import annotations
 
@@ -47,18 +47,14 @@ class DSparkLossBins:
     def normalized(
         self,
         *,
-        normalization_counts: torch.Tensor | None = None,
+        normalization_counts: torch.Tensor,
     ) -> torch.Tensor:
         """Normalize a local differentiable numerator by externally reduced counts."""
-        counts = self.counts if normalization_counts is None else normalization_counts
-        if counts.shape != self.counts.shape:
+        if normalization_counts.shape != self.counts.shape:
             raise ValueError("normalization_counts must match the local count bins")
         denominator = (
-            counts.detach()
-            .to(
-                device=self.numerators.device,
-                dtype=torch.float32,
-            )
+            normalization_counts.detach()
+            .to(device=self.numerators.device, dtype=torch.float32)
             .sum()
         )
         return self.numerators.sum() / (denominator + 1e-8)
@@ -94,30 +90,18 @@ class DSparkObjectiveStats:
         )
 
 
-def _tp_vocab_contract(
-    local_vocab_size: int,
-    tp_group: torch.distributed.ProcessGroup | None,
-) -> tuple[int, int]:
-    if tp_group is None:
-        return 0, local_vocab_size
-    rank = torch.distributed.get_rank(tp_group)
-    world_size = torch.distributed.get_world_size(tp_group)
-    return rank * local_vocab_size, world_size * local_vocab_size
-
-
 def _local_label_logits(
     logits: torch.Tensor,
     labels: torch.Tensor,
     *,
     vocab_start: int,
-    global_vocab_size: int,
     tp_group: torch.distributed.ProcessGroup | None,
 ) -> torch.Tensor:
     local_vocab_size = logits.shape[-1]
     owns_label = labels.ge(vocab_start) & labels.lt(vocab_start + local_vocab_size)
     local_labels = labels.sub(vocab_start).clamp(0, local_vocab_size - 1)
     selected = logits.gather(-1, local_labels.unsqueeze(-1)).squeeze(-1)
-    selected = torch.where(owns_label & labels.lt(global_vocab_size), selected, 0.0)
+    selected = torch.where(owns_label, selected, 0.0)
     if tp_group is not None:
         torch.distributed.all_reduce(
             selected,
@@ -157,58 +141,83 @@ def _global_argmax(
     return candidates
 
 
-class _TiledHardCEAndTV(torch.autograd.Function):
+class _TiledProjectedHardCEAndTV(torch.autograd.Function):
     @staticmethod
     def forward(  # pyrefly: ignore[bad-override]
         ctx: Any,
-        draft_logits: torch.Tensor,
+        draft_hidden: torch.Tensor,
+        output_weight: torch.Tensor,
         target_logits: torch.Tensor,
+        previous_token_ids: torch.Tensor,
+        markov_w1: torch.Tensor,
+        markov_w2: torch.Tensor,
         hard_labels: torch.Tensor,
         valid_mask: torch.Tensor,
         slot_bins: torch.Tensor,
         num_bins: int,
         token_chunk_size: int,
+        vocab_start: int,
         tp_group: torch.distributed.ProcessGroup | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        local_vocab_size = draft_logits.shape[-1]
-        flat_draft = draft_logits.reshape(-1, local_vocab_size)
+        hidden_size = draft_hidden.shape[-1]
+        local_vocab_size = output_weight.shape[0]
+        flat_hidden = draft_hidden.reshape(-1, hidden_size)
         flat_target = target_logits.reshape(-1, local_vocab_size)
+        flat_previous_token_ids = previous_token_ids.reshape(-1)
         flat_labels = hard_labels.reshape(-1)
-        flat_mask = valid_mask.reshape(-1).float()
+        flat_valid = valid_mask.reshape(-1)
+        flat_mask = flat_valid.float()
         flat_bins = slot_bins.reshape(-1)
         ce_numerators = torch.zeros(
-            num_bins, dtype=torch.float32, device=draft_logits.device
+            num_bins, dtype=torch.float32, device=draft_hidden.device
         )
         tv_numerators = torch.zeros_like(ce_numerators)
         verifier_correct = torch.zeros_like(valid_mask, dtype=torch.float32)
         flat_correct = verifier_correct.reshape(-1)
         log_normalizers = torch.empty(
-            (flat_draft.shape[0], 2),
+            (flat_hidden.shape[0], 2),
             dtype=torch.float32,
-            device=draft_logits.device,
+            device=draft_hidden.device,
         )
-        vocab_start, global_vocab_size = _tp_vocab_contract(
-            local_vocab_size,
-            tp_group,
-        )
+        global_vocab_size = markov_w1.shape[0]
 
-        for start in range(0, flat_draft.shape[0], token_chunk_size):
-            end = min(start + token_chunk_size, flat_draft.shape[0])
+        for start in range(0, flat_hidden.shape[0], token_chunk_size):
+            end = min(start + token_chunk_size, flat_hidden.shape[0])
+            tile_valid = flat_valid[start:end]
+            tile_hidden = torch.where(
+                tile_valid.unsqueeze(-1),
+                flat_hidden[start:end],
+                torch.zeros_like(flat_hidden[start:end]),
+            )
+            safe_previous_token_ids = torch.where(
+                tile_valid,
+                flat_previous_token_ids[start:end],
+                torch.zeros_like(flat_previous_token_ids[start:end]),
+            )
+            previous_embeddings = F.embedding(safe_previous_token_ids, markov_w1)
+            draft_logits = (
+                tile_hidden @ output_weight.detach().T
+                + previous_embeddings @ markov_w2.T
+            )
+            selected_target = torch.where(
+                tile_valid.unsqueeze(-1),
+                flat_target[start:end].detach(),
+                torch.zeros_like(flat_target[start:end]),
+            )
             tile_normalizers = _tile_log_normalizers(
-                flat_draft[start:end],
-                flat_target[start:end],
+                draft_logits,
+                selected_target,
                 tp_group,
             )
             target_probs, draft_probs = _tile_distributions(
-                flat_draft[start:end],
-                flat_target[start:end],
+                draft_logits,
+                selected_target,
                 tile_normalizers,
             )
             label_logits = _local_label_logits(
-                flat_draft[start:end].float(),
+                draft_logits.float(),
                 flat_labels[start:end],
                 vocab_start=vocab_start,
-                global_vocab_size=global_vocab_size,
                 tp_group=tp_group,
             )
             ce_rows = tile_normalizers[:, 1] - label_logits
@@ -220,7 +229,7 @@ class _TiledHardCEAndTV(torch.autograd.Function):
                     group=tp_group,
                 )
             predicted_tokens = _global_argmax(
-                flat_draft[start:end].float(),
+                draft_logits.float(),
                 vocab_start=vocab_start,
                 global_vocab_size=global_vocab_size,
                 tp_group=tp_group,
@@ -241,16 +250,20 @@ class _TiledHardCEAndTV(torch.autograd.Function):
             log_normalizers[start:end].copy_(tile_normalizers)
 
         ctx.save_for_backward(
-            draft_logits,
+            draft_hidden,
+            output_weight,
             target_logits,
+            previous_token_ids,
+            markov_w1,
+            markov_w2,
             hard_labels,
             valid_mask,
             slot_bins,
             log_normalizers,
         )
-        # pyrefly: ignore[implicitly-defined-attribute]
-        ctx.token_chunk_size = token_chunk_size
+        ctx.token_chunk_size = token_chunk_size  # pyrefly: ignore[implicitly-defined-attribute]
         ctx.vocab_start = vocab_start  # pyrefly: ignore[implicitly-defined-attribute]
+        ctx.tp_group = tp_group  # pyrefly: ignore[implicitly-defined-attribute]
         ctx.mark_non_differentiable(verifier_correct)
         return ce_numerators, tv_numerators, verifier_correct
 
@@ -260,28 +273,77 @@ class _TiledHardCEAndTV(torch.autograd.Function):
         grad_ce: torch.Tensor,
         grad_tv: torch.Tensor,
         _grad_correct: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None, None, None, None, None]:
+    ) -> tuple[
+        torch.Tensor,
+        None,
+        None,
+        None,
+        torch.Tensor,
+        torch.Tensor,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]:
         (
-            draft_logits,
+            draft_hidden,
+            output_weight,
             target_logits,
+            previous_token_ids,
+            markov_w1,
+            markov_w2,
             hard_labels,
             valid_mask,
             slot_bins,
             log_normalizers,
         ) = ctx.saved_tensors
-        local_vocab_size = draft_logits.shape[-1]
-        flat_draft = draft_logits.reshape(-1, local_vocab_size)
+        hidden_size = draft_hidden.shape[-1]
+        local_vocab_size = output_weight.shape[0]
+        markov_rank = markov_w1.shape[-1]
+        flat_hidden = draft_hidden.reshape(-1, hidden_size)
         flat_target = target_logits.reshape(-1, local_vocab_size)
+        flat_previous_token_ids = previous_token_ids.reshape(-1)
         flat_labels = hard_labels.reshape(-1)
-        flat_mask = valid_mask.reshape(-1).float()
+        flat_valid = valid_mask.reshape(-1)
+        flat_mask = flat_valid.float()
         flat_bins = slot_bins.reshape(-1)
-        flat_gradient = torch.empty_like(flat_draft)
+        flat_hidden_gradient = torch.zeros_like(flat_hidden, dtype=torch.float32)
+        flat_embedding_gradient = torch.zeros(
+            (flat_hidden.shape[0], markov_rank),
+            dtype=torch.float32,
+            device=draft_hidden.device,
+        )
+        markov_w2_gradient = torch.zeros_like(markov_w2, dtype=torch.float32)
 
-        for start in range(0, flat_draft.shape[0], ctx.token_chunk_size):
-            end = min(start + ctx.token_chunk_size, flat_draft.shape[0])
+        for start in range(0, flat_hidden.shape[0], ctx.token_chunk_size):
+            end = min(start + ctx.token_chunk_size, flat_hidden.shape[0])
+            tile_valid = flat_valid[start:end]
+            tile_hidden = torch.where(
+                tile_valid.unsqueeze(-1),
+                flat_hidden[start:end],
+                torch.zeros_like(flat_hidden[start:end]),
+            )
+            safe_previous_token_ids = torch.where(
+                tile_valid,
+                flat_previous_token_ids[start:end],
+                torch.zeros_like(flat_previous_token_ids[start:end]),
+            )
+            previous_embeddings = F.embedding(safe_previous_token_ids, markov_w1)
+            draft_logits = (
+                tile_hidden @ output_weight.detach().T
+                + previous_embeddings @ markov_w2.T
+            )
+            selected_target = torch.where(
+                tile_valid.unsqueeze(-1),
+                flat_target[start:end].detach(),
+                torch.zeros_like(flat_target[start:end]),
+            )
             target_probs, draft_probs = _tile_distributions(
-                flat_draft[start:end],
-                flat_target[start:end],
+                draft_logits,
+                selected_target,
                 log_normalizers[start:end],
             )
             ce_gradient = draft_probs.clone()
@@ -299,21 +361,65 @@ class _TiledHardCEAndTV(torch.autograd.Function):
             )
 
             probability_gradient = 0.5 * torch.sign(draft_probs - target_probs)
-            tv_gradient = draft_probs * (
-                probability_gradient
-                - (probability_gradient * draft_probs).sum(dim=-1, keepdim=True)
+            probability_expectation = (probability_gradient * draft_probs).sum(
+                dim=-1, keepdim=True
             )
+            if ctx.tp_group is not None:
+                torch.distributed.all_reduce(
+                    probability_expectation,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=ctx.tp_group,
+                )
+            tv_gradient = draft_probs * (probability_gradient - probability_expectation)
             ce_scale = grad_ce.index_select(0, flat_bins[start:end])
             tv_scale = grad_tv.index_select(0, flat_bins[start:end])
             tile_scale = flat_mask[start:end].unsqueeze(-1)
-            tile_gradient = (
+            logits_gradient = (
                 ce_gradient * ce_scale.unsqueeze(-1)
                 + tv_gradient * tv_scale.unsqueeze(-1)
             ) * tile_scale
-            flat_gradient[start:end].copy_(tile_gradient.to(flat_gradient.dtype))
+            logits_gradient_fp32 = logits_gradient.float()
+            flat_hidden_gradient[start:end].copy_(
+                logits_gradient_fp32 @ output_weight.detach().float()
+            )
+            markov_w2_gradient.add_(
+                logits_gradient_fp32.T @ previous_embeddings.detach().float()
+            )
+            flat_embedding_gradient[start:end].copy_(
+                logits_gradient_fp32 @ markov_w2.detach().float()
+            )
+
+        if ctx.tp_group is not None and flat_hidden.shape[0] > 0:
+            torch.distributed.all_reduce(
+                flat_hidden_gradient,
+                op=torch.distributed.ReduceOp.SUM,
+                group=ctx.tp_group,
+            )
+            torch.distributed.all_reduce(
+                flat_embedding_gradient,
+                op=torch.distributed.ReduceOp.SUM,
+                group=ctx.tp_group,
+            )
+        markov_w1_gradient = torch.zeros_like(markov_w1, dtype=torch.float32)
+        if flat_hidden.shape[0] > 0:
+            safe_previous_token_ids = torch.where(
+                flat_valid,
+                flat_previous_token_ids,
+                torch.zeros_like(flat_previous_token_ids),
+            )
+            markov_w1_gradient.index_add_(
+                0,
+                safe_previous_token_ids,
+                flat_embedding_gradient,
+            )
 
         return (
-            flat_gradient.reshape_as(draft_logits),
+            flat_hidden_gradient.reshape_as(draft_hidden).to(draft_hidden.dtype),
+            None,
+            None,
+            None,
+            markov_w1_gradient.to(markov_w1.dtype),
+            markov_w2_gradient.to(markov_w2.dtype),
             None,
             None,
             None,
@@ -327,52 +433,101 @@ class _TiledHardCEAndTV(torch.autograd.Function):
 def _validate_inputs(
     *,
     target_logits: torch.Tensor,
-    base_logits: torch.Tensor,
-    markov_bias: torch.Tensor,
+    draft_hidden: torch.Tensor,
+    target_output_weight: torch.Tensor,
+    markov_w1: torch.Tensor,
+    markov_w2: torch.Tensor,
+    previous_token_ids: torch.Tensor,
     confidence_logits: torch.Tensor | None,
     hard_labels: torch.Tensor,
     valid_mask: torch.Tensor,
     slot_bins: torch.Tensor,
     loss_weights: tuple[float, float, float],
     token_chunk_size: int,
+    vocab_start_index: int,
+    tp_group: torch.distributed.ProcessGroup | None,
 ) -> None:
     if target_logits.ndim != 3 or target_logits.shape[-1] == 0:
-        raise ValueError("DSpark logits must have shape [blocks, slots, vocab]")
-    if (
-        target_logits.shape != base_logits.shape
-        or base_logits.shape != markov_bias.shape
-    ):
-        raise ValueError("target, base, and Markov logits must have matching shapes")
+        raise ValueError("target_logits must have shape [blocks, slots, local_vocab]")
+    if draft_hidden.ndim != 3 or draft_hidden.shape[-1] == 0:
+        raise ValueError("draft_hidden must have shape [blocks, slots, hidden]")
     slot_shape = target_logits.shape[:-1]
-    if hard_labels.shape != slot_shape or valid_mask.shape != slot_shape:
-        raise ValueError("hard labels and valid mask must match DSpark slots")
-    if slot_bins.shape != slot_shape:
-        raise ValueError("slot bins must match DSpark slots")
+    if draft_hidden.shape[:-1] != slot_shape:
+        raise ValueError("target logits and draft hidden must describe the same slots")
+    local_vocab_size = target_logits.shape[-1]
+    hidden_size = draft_hidden.shape[-1]
+    if target_output_weight.shape != (local_vocab_size, hidden_size):
+        raise ValueError(
+            "target_output_weight must match local vocabulary and hidden size"
+        )
+    if markov_w1.ndim != 2 or markov_w2.shape != (
+        local_vocab_size,
+        markov_w1.shape[-1],
+    ):
+        raise ValueError("Markov weights must be global-vocab W1 and local-vocab W2")
+    global_vocab_size = markov_w1.shape[0]
+    if global_vocab_size == 0 or markov_w1.shape[1] == 0:
+        raise ValueError("Markov weights must be nonempty")
+    if tp_group is None:
+        expected_start = 0
+        expected_global_vocab_size = local_vocab_size
+    else:
+        tp_rank = torch.distributed.get_rank(tp_group)
+        tp_size = torch.distributed.get_world_size(tp_group)
+        expected_start = tp_rank * local_vocab_size
+        expected_global_vocab_size = tp_size * local_vocab_size
+    if (
+        vocab_start_index != expected_start
+        or global_vocab_size != expected_global_vocab_size
+    ):
+        raise ValueError("vocabulary shard must be an even rank-local TP partition")
+    for name, tensor in (
+        ("previous_token_ids", previous_token_ids),
+        ("hard_labels", hard_labels),
+        ("valid_mask", valid_mask),
+        ("slot_bins", slot_bins),
+    ):
+        if tensor.shape != slot_shape:
+            raise ValueError(f"{name} must match DSpark slots")
     if confidence_logits is not None and confidence_logits.shape != slot_shape:
         raise ValueError("confidence logits must match DSpark slots")
+    if previous_token_ids.dtype != torch.long:
+        raise TypeError("previous_token_ids must use torch.long")
     if hard_labels.dtype != torch.long:
         raise TypeError("hard_labels must use torch.long")
     if slot_bins.dtype != torch.long:
         raise TypeError("slot_bins must use torch.long")
     if valid_mask.dtype != torch.bool:
         raise TypeError("valid_mask must be boolean")
-    if not (
-        target_logits.is_floating_point()
-        and base_logits.is_floating_point()
-        and markov_bias.is_floating_point()
-        and (confidence_logits is None or confidence_logits.is_floating_point())
+    floating_inputs = (
+        target_logits,
+        draft_hidden,
+        target_output_weight,
+        markov_w1,
+        markov_w2,
+    )
+    if not all(tensor.is_floating_point() for tensor in floating_inputs) or (
+        confidence_logits is not None and not confidence_logits.is_floating_point()
     ):
-        raise TypeError("DSpark logits must use floating dtypes")
-    if base_logits.dtype != markov_bias.dtype:
-        raise ValueError("base logits and Markov bias must have the same dtype")
-    devices = {
-        target_logits.device,
-        base_logits.device,
-        markov_bias.device,
-        hard_labels.device,
-        valid_mask.device,
-        slot_bins.device,
-    }
+        raise TypeError("DSpark model and objective tensors must use floating dtypes")
+    if not (
+        draft_hidden.dtype
+        == target_output_weight.dtype
+        == markov_w1.dtype
+        == markov_w2.dtype
+    ):
+        raise ValueError(
+            "draft hidden, live head, and Markov weights must share a dtype"
+        )
+    devices = {tensor.device for tensor in floating_inputs}
+    devices.update(
+        {
+            previous_token_ids.device,
+            hard_labels.device,
+            valid_mask.device,
+            slot_bins.device,
+        }
+    )
     if confidence_logits is not None:
         devices.add(confidence_logits.device)
     if len(devices) != 1:
@@ -385,66 +540,87 @@ def _validate_inputs(
         raise ValueError("loss_weights must contain three finite nonnegative values")
     if confidence_logits is None and loss_weights[2] != 0:
         raise ValueError("confidence weight must be zero when confidence is disabled")
+    if slot_bins.numel() > 0 and (
+        bool(slot_bins.lt(0).any()) or bool(slot_bins.ge(slot_shape[1]).any())
+    ):
+        raise ValueError("slot_bins must be inside the configured slot bins")
+
+    invalid_metadata = torch.stack(
+        (
+            (
+                valid_mask & (hard_labels.lt(0) | hard_labels.ge(global_vocab_size))
+            ).any(),
+            (
+                valid_mask
+                & (previous_token_ids.lt(0) | previous_token_ids.ge(global_vocab_size))
+            ).any(),
+        )
+    ).to(dtype=torch.int32)
+    if tp_group is not None:
+        torch.distributed.all_reduce(
+            invalid_metadata,
+            op=torch.distributed.ReduceOp.MAX,
+            group=tp_group,
+        )
+    if bool(invalid_metadata[0]):
+        raise ValueError("valid hard_labels must be inside the global vocabulary")
+    if bool(invalid_metadata[1]):
+        raise ValueError(
+            "valid previous_token_ids must be inside the global vocabulary"
+        )
 
 
 def dspark_tiled_objective(
     *,
     target_logits: torch.Tensor,
-    base_logits: torch.Tensor,
-    markov_bias: torch.Tensor,
+    draft_hidden: torch.Tensor,
+    target_output_weight: torch.Tensor,
+    markov_w1: torch.Tensor,
+    markov_w2: torch.Tensor,
+    previous_token_ids: torch.Tensor,
     confidence_logits: torch.Tensor | None,
     hard_labels: torch.Tensor,
     valid_mask: torch.Tensor,
     slot_bins: torch.Tensor,
     loss_weights: tuple[float, float, float],
     token_chunk_size: int,
+    vocab_start_index: int,
     tp_group: torch.distributed.ProcessGroup | None,
 ) -> DSparkObjectiveStats:
-    """Compute raw per-slot DSpark CE, TV, confidence, and combined bins."""
+    """Project selected slots tile-by-tile and return raw DSpark objective bins."""
     _validate_inputs(
         target_logits=target_logits,
-        base_logits=base_logits,
-        markov_bias=markov_bias,
+        draft_hidden=draft_hidden,
+        target_output_weight=target_output_weight,
+        markov_w1=markov_w1,
+        markov_w2=markov_w2,
+        previous_token_ids=previous_token_ids,
         confidence_logits=confidence_logits,
         hard_labels=hard_labels,
         valid_mask=valid_mask,
         slot_bins=slot_bins,
         loss_weights=loss_weights,
         token_chunk_size=token_chunk_size,
+        vocab_start_index=vocab_start_index,
+        tp_group=tp_group,
     )
     num_bins = target_logits.shape[1]
-    safe_labels = torch.where(valid_mask, hard_labels, 0)
-    safe_target = torch.where(
-        valid_mask.unsqueeze(-1),
-        target_logits.detach(),
-        torch.zeros_like(target_logits),
-    )
-    safe_base = torch.where(
-        valid_mask.unsqueeze(-1),
-        base_logits,
-        torch.zeros_like(base_logits),
-    )
-    safe_markov = torch.where(
-        valid_mask.unsqueeze(-1),
-        markov_bias,
-        torch.zeros_like(markov_bias),
-    )
-    corrected_logits = safe_base + safe_markov
-    ce_numerators, tv_numerators, verifier_correct = _TiledHardCEAndTV.apply(
-        corrected_logits,
-        safe_target,
-        safe_labels,
+    ce_numerators, tv_numerators, verifier_correct = _TiledProjectedHardCEAndTV.apply(
+        draft_hidden,
+        target_output_weight,
+        target_logits,
+        previous_token_ids,
+        markov_w1,
+        markov_w2,
+        hard_labels,
         valid_mask,
         slot_bins,
         num_bins,
         token_chunk_size,
+        vocab_start_index,
         tp_group,
     )
-    counts = torch.zeros(
-        num_bins,
-        dtype=torch.float32,
-        device=valid_mask.device,
-    )
+    counts = torch.zeros(num_bins, dtype=torch.float32, device=valid_mask.device)
     counts.scatter_add_(
         0,
         slot_bins.reshape(-1),

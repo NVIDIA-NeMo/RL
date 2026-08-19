@@ -43,7 +43,7 @@ def _load_provider_without_poisoning_packages() -> ModuleType:
                 module_name, repository_root / relative_path
             )
             if spec is None or spec.loader is None:
-                pytest.fail(f"cannot load {relative_path}", pytrace=False)
+                raise RuntimeError(f"cannot load {relative_path}")
             module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = module
             spec.loader.exec_module(module)

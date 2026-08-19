@@ -174,7 +174,7 @@ def _run_tp2_provider_objective(rank: int, world_size: int) -> None:
     expected_loss.backward()
 
     provider = build_dspark_provider(
-        body=torch.nn.Identity(),
+        body=_CheckpointBody(tp_group=tp_group, device=device),
         vocab_size=vocab_size,
         hidden_size=hidden_size,
         markov_rank=markov_rank,
@@ -269,14 +269,18 @@ def _run_dp2_raw_additive_stats(rank: int, world_size: int) -> None:
     )
     stats = dspark_tiled_objective(
         target_logits=torch.randn(shape, generator=generator, device=device),
-        base_logits=torch.randn(shape, generator=generator, device=device),
-        markov_bias=torch.randn(shape, generator=generator, device=device),
+        draft_hidden=torch.randn((1, 3, 4), generator=generator, device=device),
+        target_output_weight=torch.randn((8, 4), generator=generator, device=device),
+        markov_w1=torch.randn((8, 2), generator=generator, device=device),
+        markov_w2=torch.randn((8, 2), generator=generator, device=device),
+        previous_token_ids=torch.tensor([[1, 3, 5]], device=device),
         confidence_logits=torch.randn((1, 3), generator=generator, device=device),
         hard_labels=torch.tensor([[1, 3, 5]], device=device),
         valid_mask=valid_mask,
         slot_bins=torch.tensor([[0, 1, 2]], device=device),
         loss_weights=(1.25, 0.5, 2.0),
         token_chunk_size=2,
+        vocab_start_index=0,
         tp_group=None,
     )
     reduced = torch.stack((stats.combined.numerators, stats.combined.counts))
@@ -384,7 +388,7 @@ def _run_tp2_hard_label_boundaries(rank: int, world_size: int) -> None:
         device=device,
         dtype=torch.float64,
     )
-    common = {
+    common: dict[str, Any] = {
         "draft_hidden": torch.ones((1, 1, 2), device=device, dtype=torch.float64),
         "target_output_weight": torch.ones(
             (local_vocab_size, 2), device=device, dtype=torch.float64
