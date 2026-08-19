@@ -75,7 +75,13 @@ from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
+    RolloutCheckpointConfig,
     setup_single_controller,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+    BOOTSTRAP_DIRNAME,
+    ROLLOUT_SNAPSHOT_COMMITTED_FILENAME,
+    ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
@@ -470,6 +476,7 @@ def _actor_master_config(
     max_num_epochs: int = 1,
     buffer_checkpoint: bool = False,
     data_plane_checkpoint: bool = True,
+    rollout_checkpoint_interval_s: Optional[float] = None,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
@@ -529,6 +536,9 @@ def _actor_master_config(
             max_inflight_prompts=4,
             max_buffered_rollouts=4,
         ),
+        rollout_checkpointing=RolloutCheckpointConfig(
+            interval_s=rollout_checkpoint_interval_s
+        ),
     )
 
 
@@ -541,6 +551,7 @@ def _make_actor_args(
     dp_client: Optional[_FakeDPClient] = None,
     last_checkpoint_path: Optional[str] = None,
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None,
+    bootstrap_fingerprint: Optional[str] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=object(),
@@ -562,6 +573,7 @@ def _make_actor_args(
         last_checkpoint_path=last_checkpoint_path,
         finalizer_actors=[],
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
+        bootstrap_fingerprint=bootstrap_fingerprint,
     )
 
 
@@ -955,6 +967,63 @@ class TestSaveTrigger:
 
         # step_2 from ft_save_period, step_3 from last-step.
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_2", "step_3"}
+
+
+class TestPeriodicRolloutCheckpoint:
+    def _actor(self, tmp_path: Path):
+        config = _actor_master_config(
+            tmp_path,
+            buffer_checkpoint=True,
+            rollout_checkpoint_interval_s=120.0,
+        )
+        return _ACTOR_CLS(
+            config,
+            _make_actor_args(bootstrap_fingerprint="bootstrap-digest"),
+            SetupTimingMetrics(),
+        )
+
+    def test_pre_step_snapshot_contains_only_rollout_state(self, tmp_path: Path):
+        actor = self._actor(tmp_path)
+        try:
+            assert asyncio.run(actor._save_rollout_checkpoint(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+
+        snapshot = (
+            tmp_path
+            / "checkpoints"
+            / BOOTSTRAP_DIRNAME
+            / "rollout_snapshots"
+            / "snapshot_000001"
+        )
+        assert (snapshot / ROLLOUT_SNAPSHOT_COMMITTED_FILENAME).is_file()
+        assert (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).is_file()
+        assert (snapshot / "data_plane" / "metadata.json").is_file()
+        assert (snapshot / "train_dataloader.pt").is_file()
+        assert (snapshot / REPLAY_BUFFER_METADATA_FILENAME).is_file()
+        assert (snapshot / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
+        assert not (snapshot / "policy").exists()
+
+    def test_snapshot_waits_until_no_training_rows_are_owned(self, tmp_path: Path):
+        actor = self._actor(tmp_path)
+
+        async def exercise() -> None:
+            actor._train_step_idle.clear()
+            save_task = asyncio.create_task(
+                actor._save_rollout_checkpoint(force=True)
+            )
+            await asyncio.sleep(0)
+            assert not save_task.done()
+            assert actor._dp_client.save_calls == []
+
+            async with actor._data_plane_checkpoint_barrier.mutation():
+                actor._train_step_idle.set()
+            assert await asyncio.wait_for(save_task, timeout=5.0)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            actor._checkpointer.shutdown()
 
 
 class TestDataPlaneCheckpoint:
