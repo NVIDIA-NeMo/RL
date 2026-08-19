@@ -42,9 +42,11 @@ import asyncio
 import contextlib
 import hashlib
 import io
+import json
 import logging
 import math
 import os
+import shutil
 import statistics
 import threading
 import time
@@ -52,6 +54,7 @@ import uuid
 import warnings
 from collections import deque
 from collections.abc import Iterator
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Union, cast
@@ -90,6 +93,15 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     is_ppo_run,
     validate_sampler_buffer_capacity,
     validate_single_controller_config,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+    ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
+    ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+    RolloutSnapshotManifest,
+    commit_snapshot,
+    ensure_bootstrap_anchor,
+    prepare_snapshot_paths,
+    prune_bootstrap_snapshots,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
@@ -134,6 +146,18 @@ Generation = Union[VllmGeneration, SGLangGeneration]
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _RolloutCheckpointCut:
+    """Controller sidecars captured with one native TQ snapshot."""
+
+    dataloader_state: dict[str, Any]
+    replacement_reserve: list[DatumSpec]
+    replay_metadata: Optional[TQReplayMetadataState]
+    rollout_recovery_payload: Optional[bytes]
+    rollout_recovery_group_count: Optional[int]
+    mutation_version: int
 
 
 def _pooled_opd_metrics(
@@ -363,6 +387,17 @@ class SingleControllerActor:
         self._rollout_manager.set_data_plane_checkpoint_barrier(
             self._data_plane_checkpoint_barrier
         )
+        # Full trainer checkpoints and lightweight rollout snapshots share one
+        # namespace and must never publish concurrently.
+        self._checkpoint_save_lock = asyncio.Lock()
+        self._last_rollout_snapshot_mutation_version: Optional[int] = None
+        self._last_missing_rollout_snapshot_anchor: Optional[tuple[int, int]] = None
+        self._bootstrap_fingerprint = getattr(actor_args, "bootstrap_fingerprint", None)
+        self._rollout_checkpoint_stop_requested = asyncio.Event()
+        # Periodic snapshots intentionally skip an optimizer step in progress.
+        # The transition to/from idle joins the data-plane barrier below.
+        self._train_step_idle = asyncio.Event()
+        self._train_step_idle.set()
 
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
@@ -462,6 +497,16 @@ class SingleControllerActor:
         train_task = asyncio.create_task(self._train_pump())
         watchdog_task = asyncio.create_task(self._stall_watchdog_pump())
         tasks = [rollout_task, train_task, watchdog_task]
+        rollout_checkpoint_cfg = getattr(
+            self._master_config, "rollout_checkpointing", None
+        )
+        rollout_checkpoint_task = (
+            asyncio.create_task(self._rollout_checkpoint_pump())
+            if getattr(rollout_checkpoint_cfg, "interval_s", None) is not None
+            else None
+        )
+        if rollout_checkpoint_task is not None:
+            tasks.append(rollout_checkpoint_task)
         # Only with fleet health on. Created unconditionally it would be a timer firing
         # every probe_interval_s for every run that does not use the feature, which is
         # the default.
@@ -476,19 +521,31 @@ class SingleControllerActor:
             done, _ = await asyncio.wait(
                 set(tasks), return_when=asyncio.FIRST_COMPLETED
             )
+            stop_after_rollout_checkpoint = False
+            if (
+                rollout_checkpoint_task is not None
+                and rollout_checkpoint_task in done
+            ):
+                await rollout_checkpoint_task
+                if not self._rollout_checkpoint_stop_requested.is_set():
+                    raise RuntimeError(
+                        "rollout checkpoint pump exited without requesting stop"
+                    )
+                stop_after_rollout_checkpoint = True
             if probe_task is not None and probe_task in done:
                 # Loops forever like the watchdog, so finishing at all means it raised.
                 await probe_task
-            if watchdog_task in done:
+            if not stop_after_rollout_checkpoint and watchdog_task in done:
                 # The watchdog loops forever, so finishing at all means it raised --
                 # a stall or an unhealthy environment. Surface that ahead of the
                 # pumps, whose own symptom would just be "waiting".
                 await watchdog_task
-            if rollout_task in done:
+            if not stop_after_rollout_checkpoint and rollout_task in done:
                 # Propagate rollout failures immediately. A normally exhausted
                 # rollout pump leaves the train pump to drain committed groups.
                 await rollout_task
-            await train_task
+            if not stop_after_rollout_checkpoint:
+                await train_task
         finally:
             for task in tasks:
                 task.cancel()
@@ -2148,11 +2205,18 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
-                        train_meta, num_groups = await self._sampler.select(
-                            current_train_weight=self._trainer_version,
-                            min_prompt_groups=min_prompt_groups,
-                            max_prompt_groups=max_prompt_groups,
-                        )
+                        async with self._data_plane_checkpoint_barrier.mutation():
+                            train_meta, num_groups = await self._sampler.select(
+                                current_train_weight=self._trainer_version,
+                                min_prompt_groups=min_prompt_groups,
+                                max_prompt_groups=max_prompt_groups,
+                            )
+                            if train_meta is not None:
+                                train_step_idle = getattr(
+                                    self, "_train_step_idle", None
+                                )
+                                if train_step_idle is not None:
+                                    train_step_idle.clear()
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
@@ -2573,6 +2637,11 @@ class SingleControllerActor:
                 f"lag={lag}  ",
                 flush=True,
             )
+
+            train_step_idle = getattr(self, "_train_step_idle", None)
+            if train_step_idle is not None:
+                async with self._data_plane_checkpoint_barrier.mutation():
+                    train_step_idle.set()
 
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
@@ -3133,7 +3202,277 @@ class SingleControllerActor:
         )
         return len(stale_tasks)
 
+    async def _capture_rollout_checkpoint_cut(
+        self,
+        checkpoint_path: PathLike,
+    ) -> _RolloutCheckpointCut:
+        """Save TQ and capture matching rollout sidecars under the barrier."""
+        if not self._train_step_idle.is_set():
+            raise RuntimeError(
+                "periodic rollout snapshot attempted after training consumed rows"
+            )
+
+        save_state = self._save_state
+        save_state.current_step = self._train_steps
+        save_state.total_steps = self._train_steps
+        save_state.trainer_version = self._trainer_version
+        save_state.current_epoch = self._current_epoch
+        save_state.consumed_samples = self._consumed_samples
+        save_state.total_valid_tokens = self._total_valid_tokens
+        save_state.sampler_name = self._async_cfg.sampler.name
+        save_state.sampler_dispatch_index = self._sampler.dispatch_index
+
+        dataloader_state = self._dataloader.state_dict()
+        replacement_reserve = list(self._replacement_reserve)
+        replay_metadata = self._buffer.metadata_state_dict(
+            saved_capacity=self._async_cfg.max_buffered_rollouts
+        )
+        await self._validate_replay_inventory(replay_metadata)
+
+        recovery_state = self._rollout_manager.recovery_ledger.state_dict()
+        recovery_state["batch_shortfall"] = self._batch_shortfall.copy()
+        recovery_state["sampler_stamps_target_steps"] = (
+            self._sampler_stamps_target_steps
+        )
+        canonical_group_ids = {
+            group["group_id"] for group in replay_metadata["groups"]
+        }
+        recovery_state["groups"] = [
+            group
+            for group in recovery_state["groups"]
+            if group["group_id"] not in canonical_group_ids
+        ]
+        payload_buffer = io.BytesIO()
+        await asyncio.to_thread(torch.save, recovery_state, payload_buffer)
+        recovery_payload = payload_buffer.getvalue()
+        recovery_digest = hashlib.sha256(recovery_payload).hexdigest()
+
+        if self._master_config.token_capture.enabled:
+            await self._validate_rollout_recovery_inventory(
+                replay_metadata=replay_metadata,
+                clear_unreferenced=False,
+            )
+        await self._save_data_plane_checkpoint(
+            checkpoint_path,
+            replay_metadata=replay_metadata,
+            rollout_recovery_payload_sha256=recovery_digest,
+            rollout_recovery_group_count=len(recovery_state["groups"]),
+        )
+        return _RolloutCheckpointCut(
+            dataloader_state=dataloader_state,
+            replacement_reserve=replacement_reserve,
+            replay_metadata=replay_metadata,
+            rollout_recovery_payload=recovery_payload,
+            rollout_recovery_group_count=len(recovery_state["groups"]),
+            mutation_version=self._data_plane_checkpoint_barrier.mutation_version,
+        )
+
+    async def _write_rollout_checkpoint_sidecars(
+        self,
+        checkpoint_path: Path,
+        cut: _RolloutCheckpointCut,
+    ) -> None:
+        """Write metadata-only controller state beside a native TQ snapshot."""
+        await asyncio.to_thread(
+            torch.save,
+            cut.dataloader_state,
+            checkpoint_path / "train_dataloader.pt",
+        )
+        if cut.replacement_reserve:
+            await asyncio.to_thread(
+                torch.save,
+                cut.replacement_reserve,
+                checkpoint_path / "replacement_reserve.pt",
+            )
+        if cut.replay_metadata is not None:
+            await asyncio.to_thread(
+                torch.save,
+                cut.replay_metadata,
+                checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME,
+            )
+        if cut.rollout_recovery_payload is not None:
+            await asyncio.to_thread(
+                (checkpoint_path / ROLLOUT_RECOVERY_STATE_FILENAME).write_bytes,
+                cut.rollout_recovery_payload,
+            )
+
+        def _write_config() -> None:
+            import yaml
+
+            dumped = self._master_config.model_dump(mode="json")
+            with (checkpoint_path / "config.yaml").open("w") as config_file:
+                yaml.safe_dump(dumped, config_file)
+
+        await asyncio.to_thread(_write_config)
+
+    async def _save_rollout_checkpoint(self, *, force: bool = False) -> bool:
+        """Publish one rollout-only snapshot anchored to durable trainer state."""
+        # Never hold the filesystem publication lock while waiting for the train
+        # step. A full checkpoint runs before the step becomes idle and needs the
+        # same lock, so reversing these waits would deadlock both save paths.
+        await self._train_step_idle.wait()
+        async with self._checkpoint_save_lock:
+            if (
+                not force
+                and self._last_rollout_snapshot_mutation_version
+                == self._data_plane_checkpoint_barrier.mutation_version
+            ):
+                return False
+
+            await asyncio.to_thread(self._checkpointer.finalize_pending)
+            if self._train_steps == 0:
+                if self._trainer_version != 0:
+                    raise RuntimeError(
+                        "bootstrap rollout snapshot requires trainer version zero"
+                    )
+                if self._bootstrap_fingerprint is None:
+                    raise RuntimeError(
+                        "rollout snapshotting requires a bootstrap fingerprint"
+                    )
+                anchor = await asyncio.to_thread(
+                    ensure_bootstrap_anchor,
+                    self._checkpointer.checkpoint_dir,
+                    fingerprint=self._bootstrap_fingerprint,
+                )
+                snapshot_fingerprint = self._bootstrap_fingerprint
+            else:
+                if self._trainer_version != self._train_steps:
+                    raise RuntimeError(
+                        "rollout snapshot trainer identity is ambiguous: "
+                        f"step={self._train_steps}, "
+                        f"trainer_version={self._trainer_version}"
+                    )
+                anchor = self._checkpointer.checkpoint_dir / f"step_{self._train_steps}"
+                if not anchor.is_dir():
+                    skip_key = (self._train_steps, self._trainer_version)
+                    if self._last_missing_rollout_snapshot_anchor != skip_key:
+                        print(
+                            "rollout checkpoint skipped: matching trainer "
+                            f"checkpoint is not durable yet: {anchor}",
+                            flush=True,
+                        )
+                    self._last_missing_rollout_snapshot_anchor = skip_key
+                    return False
+                try:
+                    await asyncio.to_thread(
+                        prune_bootstrap_snapshots,
+                        self._checkpointer.checkpoint_dir,
+                        durable_trainer_checkpoint=anchor,
+                    )
+                except OSError as error:
+                    warnings.warn(
+                        "Failed to prune obsolete bootstrap rollout snapshots: "
+                        f"{type(error).__name__}: {error}",
+                        stacklevel=2,
+                    )
+                snapshot_fingerprint = None
+
+            expected_train_step = self._train_steps
+            expected_trainer_version = self._trainer_version
+            tmp_path, final_path, _ = await asyncio.to_thread(
+                prepare_snapshot_paths, anchor
+            )
+            try:
+                async with self._data_plane_checkpoint_barrier.checkpoint():
+                    if (
+                        not self._train_step_idle.is_set()
+                        or self._train_steps != expected_train_step
+                        or self._trainer_version != expected_trainer_version
+                    ):
+                        await asyncio.to_thread(shutil.rmtree, tmp_path)
+                        return False
+                    snapshot_epoch = self._current_epoch
+                    cut = await self._capture_rollout_checkpoint_cut(tmp_path)
+
+                await self._write_rollout_checkpoint_sidecars(tmp_path, cut)
+                manifest = RolloutSnapshotManifest(
+                    schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+                    base_train_step=expected_train_step,
+                    trainer_version=expected_trainer_version,
+                    current_epoch=snapshot_epoch,
+                    mutation_version=cut.mutation_version,
+                    rolled_back_train_group_count=0,
+                    bootstrap_fingerprint=snapshot_fingerprint,
+                )
+                await asyncio.to_thread(
+                    (tmp_path / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text,
+                    json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n",
+                )
+                await asyncio.to_thread(
+                    commit_snapshot,
+                    tmp_path,
+                    final_path,
+                    keep_latest_k=(
+                        self._master_config.rollout_checkpointing.keep_latest_k
+                    ),
+                )
+            except BaseException:
+                if tmp_path.exists():
+                    await asyncio.to_thread(shutil.rmtree, tmp_path)
+                raise
+
+            self._last_rollout_snapshot_mutation_version = cut.mutation_version
+            self._last_missing_rollout_snapshot_anchor = None
+            print(
+                "rollout checkpoint save completed: "
+                f"{final_path} (step={expected_train_step}, "
+                f"trainer_version={expected_trainer_version}, "
+                f"ledger_groups={cut.rollout_recovery_group_count or 0})",
+                flush=True,
+            )
+            return True
+
+    async def _rollout_checkpoint_pump(self) -> None:
+        """Persist rollout state periodically at trainer-safe boundaries."""
+        interval_s = self._master_config.rollout_checkpointing.interval_s
+        if interval_s is None:
+            raise RuntimeError("rollout checkpoint pump started while disabled")
+        while True:
+            await asyncio.sleep(interval_s)
+            deadline_due = self._train_steps == 0 and self._timeout.would_save()
+            try:
+                saved = await self._save_rollout_checkpoint(force=deadline_due)
+            except Exception as error:
+                if deadline_due:
+                    raise RuntimeError(
+                        "failed to save the required pre-step rollout checkpoint"
+                    ) from error
+                warnings.warn(
+                    "Periodic rollout checkpoint failed; retaining the previous "
+                    f"committed snapshot: {type(error).__name__}: {error}",
+                    stacklevel=2,
+                )
+                continue
+            if deadline_due and saved and self._timeout.check_save():
+                print(
+                    "Checkpoint deadline reached before the first train step; "
+                    "stopping after a durable rollout snapshot",
+                    flush=True,
+                )
+                self._rollout_checkpoint_stop_requested.set()
+                return
+
     async def _save_checkpoint(
+        self,
+        step_metrics: dict[str, Any],
+        *,
+        is_policy_training_step: bool,
+    ) -> None:
+        """Serialize full and rollout-only checkpoint publication."""
+        lock = getattr(self, "_checkpoint_save_lock", None)
+        if lock is None:
+            await self._save_checkpoint_impl(
+                step_metrics,
+                is_policy_training_step=is_policy_training_step,
+            )
+            return
+        async with lock:
+            await self._save_checkpoint_impl(
+                step_metrics,
+                is_policy_training_step=is_policy_training_step,
+            )
+
+    async def _save_checkpoint_impl(
         self,
         step_metrics: dict[str, Any],
         *,
@@ -3256,6 +3595,9 @@ class SingleControllerActor:
                         if rollout_recovery_state is not None
                         else None
                     ),
+                )
+                self._last_rollout_snapshot_mutation_version = (
+                    self._data_plane_checkpoint_barrier.mutation_version
                 )
 
         # Save value model
