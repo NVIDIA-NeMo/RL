@@ -124,7 +124,7 @@ def _assert_distributed_contract_failure_is_synchronous(
     tmp_path: Path,
     case: str,
 ) -> None:
-    context = torch.multiprocessing.get_context("fork")
+    context = torch.multiprocessing.get_context("spawn")
     init_method = f"file://{tmp_path / f'{case}.init'}"
     processes = [
         context.Process(
@@ -136,7 +136,7 @@ def _assert_distributed_contract_failure_is_synchronous(
     for process in processes:
         process.start()
     for process in processes:
-        process.join(timeout=5)
+        process.join(timeout=15)
     alive = [process for process in processes if process.is_alive()]
     for process in alive:
         process.terminate()
