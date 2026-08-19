@@ -67,6 +67,7 @@ set -euo pipefail
 #   NEMO_GYM_VENV_DIR=                     Gym service venv root forwarded to the driver
 #   UV_PYTHON=                              Python request used for uv-managed worker venvs
 #   UV_PYTHON_INSTALL_DIR=                  Managed Python root forwarded to the driver
+#   NRL_UV_BIN_DIR=                         Directory containing the uv binary used by workers
 #   WANDB_API_KEY=                         Weights & Biases API key
 #   WANDB_PROJ=nemotron-3-ultra            W&B project
 #   WANDB_ENTITY=                          W&B entity
@@ -561,9 +562,9 @@ fi
 # =============================================================================
 # Container mounts
 # =============================================================================
-# By default, nemo_rl (Python package) and examples/configs (YAML configs) from
-# the code snapshot are overlaid into the container. Everything else uses the
-# container's built-in code at /opt/nemo-rl.
+# By default, the project metadata/lock, nemo_rl (Python package), and
+# examples/configs (YAML configs) from the code snapshot are overlaid into the
+# container. Everything else uses the container's built-in code at /opt/nemo-rl.
 #
 # To overlay additional components (e.g. a local Megatron-LM checkout), pass
 # EXTRA_MOUNTS as a comma-separated list of host:container pairs:
@@ -590,6 +591,12 @@ if [[ -d "${OVERLAY_SOURCE}/nemo_rl" ]]; then
   _append_mount "${OVERLAY_SOURCE}/nemo_rl:/opt/nemo-rl/nemo_rl"
   echo "  Mount: nemo_rl → /opt/nemo-rl/nemo_rl"
 fi
+for _project_file in pyproject.toml uv.lock .python-version; do
+  if [[ -f "${OVERLAY_SOURCE}/${_project_file}" ]]; then
+    _append_mount "${OVERLAY_SOURCE}/${_project_file}:/opt/nemo-rl/${_project_file}"
+    echo "  Mount: ${_project_file} → /opt/nemo-rl/${_project_file}"
+  fi
+done
 if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
   _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
   echo "  Mount: configs → /opt/nemo-rl/examples/configs"
@@ -690,6 +697,11 @@ TRAIN_NEMO_RL_VENV_DIR="${NEMO_RL_VENV_DIR:-}"
 TRAIN_NEMO_GYM_VENV_DIR="${NEMO_GYM_VENV_DIR:-}"
 TRAIN_UV_PYTHON="${UV_PYTHON:-}"
 TRAIN_UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-}"
+if [[ -n "${NRL_UV_BIN_DIR:-}" ]]; then
+  TRAIN_NRL_PATH="${NRL_UV_BIN_DIR}:\${PATH}"
+else
+  TRAIN_NRL_PATH=""
+fi
 
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 ${NRL_DRIVER_PIP_INSTALL:+uv pip install --python /opt/nemo_rl_venv/bin/python ${NRL_DRIVER_PIP_INSTALL} ; }\
@@ -709,6 +721,7 @@ ${TRAIN_NEMO_RL_VENV_DIR:+NEMO_RL_VENV_DIR=${TRAIN_NEMO_RL_VENV_DIR} }\
 ${TRAIN_NEMO_GYM_VENV_DIR:+NEMO_GYM_VENV_DIR=${TRAIN_NEMO_GYM_VENV_DIR} }\
 ${TRAIN_UV_PYTHON:+UV_PYTHON=${TRAIN_UV_PYTHON} }\
 ${TRAIN_UV_PYTHON_INSTALL_DIR:+UV_PYTHON_INSTALL_DIR=${TRAIN_UV_PYTHON_INSTALL_DIR} }\
+${TRAIN_NRL_PATH:+PATH=${TRAIN_NRL_PATH} }\
 UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
