@@ -218,8 +218,8 @@ policy:
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
-    # Set true for HybridEP sequence packing to align uneven inputs once before
-    # forward. Requires NeMo-owned packing, pipeline parallel size 1, and MTP disabled.
+    # For HybridEP sequence packing with PP=1 and MTP disabled, set true to align
+    # uneven rank-local inputs before forward and avoid collective-order hangs.
     moe_hybridep_prepad_packed_inputs: false
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
