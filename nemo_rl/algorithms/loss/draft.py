@@ -865,13 +865,24 @@ def dflash_projected_vocab_parallel_soft_ce(
 
     effective_loss_mask = loss_mask.clone()
     effective_loss_mask[:, 0] = False
+    batch_size = teacher_logits.shape[0]
     sequence_length = teacher_logits.shape[1]
     teacher_positions = label_positions - 1
     teacher_row_indices = sample_rows[:, None] * sequence_length + teacher_positions
+    valid_coordinates = (
+        (sample_rows[:, None].ge(0) & sample_rows[:, None].lt(batch_size))
+        & teacher_positions.ge(0)
+        & teacher_positions.lt(sequence_length)
+    )
+    teacher_row_indices = torch.where(
+        valid_coordinates,
+        teacher_row_indices,
+        teacher_row_indices.new_full((), batch_size * sequence_length),
+    )
     teacher_row_indices = torch.where(
         effective_loss_mask,
         teacher_row_indices,
-        torch.zeros((), dtype=torch.long, device=draft_hidden.device),
+        teacher_row_indices.new_zeros(()),
     )
     gamma = block_size - 1
     slot_offsets = torch.arange(block_size, device=draft_hidden.device)
