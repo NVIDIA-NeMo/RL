@@ -70,6 +70,9 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.models.megatron.draft.optimizer import (
+    build_draft_optimizer_override_provider,
+)
 
 _HF_CONFIG_PATCHED = False
 
@@ -1839,6 +1842,9 @@ def setup_model_and_optimizer(
             scheduler_config=megatron_cfg.scheduler,
             model=model,
             use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
+            optimizer_config_override_provider=build_draft_optimizer_override_provider(
+                policy_cfg.get("draft")
+            ),
         )
     else:
         optimizer = None
