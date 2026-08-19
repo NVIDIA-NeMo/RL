@@ -53,3 +53,17 @@ uv run examples/run_grpo.py \
 
 This is a functional validation recipe rather than a long-run convergence
 recipe; validate longer training separately for the target workload.
+
+#### 100-Step Functional Validation Results
+
+The reference curves below were produced by starting from the example recipe,
+setting `grpo.num_prompts_per_step=32` and
+`policy.train_global_batch_size=256`, and running for more than 100 steps.
+
+The recipe's OpenMathInstruct-2 dataset is relatively easy for Qwen3.8-27B, and
+the maximum sequence length is limited to 4,096 tokens. Consequently, the
+reward curve does not show a pronounced upward trend. These curves are provided
+only as a functional validation reference for training beyond 100 steps, not as
+evidence of long-run convergence.
+
+![100-step functional validation curves for grpo-qwen3.8-27b-2n8g-megatron-tp4pp2cp2: validation accuracy, training reward, mean generated tokens per sample, approximate entropy, generation KL error, and gradient norm](../../../assets/qwen3-8/grpo-qwen3.8-27b-2n8g-megatron-tp4pp2cp2-100steps.png)
