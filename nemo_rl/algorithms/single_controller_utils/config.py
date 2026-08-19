@@ -690,6 +690,20 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         return RecoveryGranularityResolution(agent_name, self.default_granularity)
 
 
+class RolloutCheckpointConfig(BaseModel, extra="forbid"):
+    """Frequent rollout-state snapshots anchored to durable trainer state.
+
+    ``interval_s=None`` disables the periodic pump. ``latest`` restores the
+    newest compatible rollout snapshot, ``trainer_checkpoint`` ignores newer
+    rollout-only snapshots, and ``none`` restores trainer state without any
+    replay, lineage, or dataloader state.
+    """
+
+    interval_s: Optional[float] = Field(default=None, gt=0)
+    keep_latest_k: int = Field(default=2, ge=1)
+    restore_mode: Literal["latest", "trainer_checkpoint", "none"] = "latest"
+
+
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
@@ -709,6 +723,9 @@ class MasterConfig(BaseModel, extra="allow"):
     async_rl: AsyncRLConfig
     rollout_recovery: RolloutRecoveryConfig = Field(
         default_factory=RolloutRecoveryConfig
+    )
+    rollout_checkpointing: RolloutCheckpointConfig = Field(
+        default_factory=RolloutCheckpointConfig
     )
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
