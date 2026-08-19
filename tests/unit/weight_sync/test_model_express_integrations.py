@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from modelexpress_rl import ModelExpressGeneratorConfig, VllmGeneratorContext
 
 from nemo_rl.weight_sync.model_express.generator import (
     ModelExpressGeneratorIntegration,
@@ -60,11 +61,15 @@ def test_generator_initialize_constructs_public_client():
 
     assert integration._client is client
     initialize.assert_called_once_with(
-        model=model,
-        vllm_config=vllm_config,
-        model_config=model_config,
-        model_name="test/model",
-        server_url="mx-server:50051",
+        ModelExpressGeneratorConfig(
+            engine_context=VllmGeneratorContext(
+                model=model,
+                vllm_config=vllm_config,
+                model_config=model_config,
+            ),
+            model_name="test/model",
+            server_url="mx-server:50051",
+        )
     )
 
 

@@ -31,18 +31,26 @@ class ModelExpressGeneratorIntegration:
     ) -> ModelExpressGeneratorIntegration:
         # ModelExpress is optional and only imported when this transport is selected.
         try:
-            from modelexpress_rl import ModelExpressGeneratorClient
+            from modelexpress_rl import (
+                ModelExpressGeneratorClient,
+                ModelExpressGeneratorConfig,
+                VllmGeneratorContext,
+            )
         except ImportError as error:
             raise RuntimeError(
                 "ModelExpress refit requires the modelexpress_rl package in "
                 "the vLLM worker environment"
             ) from error
         client = ModelExpressGeneratorClient.initialize(
-            model=model,
-            vllm_config=vllm_config,
-            model_config=model_config,
-            model_name=model_config.model,
-            server_url=server_url,
+            ModelExpressGeneratorConfig(
+                engine_context=VllmGeneratorContext(
+                    model=model,
+                    vllm_config=vllm_config,
+                    model_config=model_config,
+                ),
+                model_name=model_config.model,
+                server_url=server_url,
+            )
         )
         return ModelExpressGeneratorIntegration(client)
 
