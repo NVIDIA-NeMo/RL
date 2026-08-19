@@ -23,8 +23,7 @@ from nemo_rl.algorithms.loss.draft import (
 def _dense_projected_stats(
     student_hidden: torch.Tensor,
     output_weight: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    teacher_row_indices: torch.Tensor,
+    selected_teacher_logits: torch.Tensor,
     mask: torch.Tensor,
     bin_ids: torch.Tensor,
     num_bins: int,
@@ -32,10 +31,7 @@ def _dense_projected_stats(
     student_logits = student_hidden.reshape(-1, student_hidden.shape[-1]) @ (
         output_weight.T
     )
-    selected_teacher = teacher_logits.reshape(
-        -1, teacher_logits.shape[-1]
-    ).index_select(0, teacher_row_indices.reshape(-1))
-    teacher_probs = torch.softmax(selected_teacher.float(), dim=-1)
+    teacher_probs = torch.softmax(selected_teacher_logits.float(), dim=-1)
     student_log_probs = torch.log_softmax(student_logits.float(), dim=-1)
     per_token = -(teacher_probs * student_log_probs).sum(dim=-1)
     numerators = torch.zeros(num_bins, dtype=torch.float32)
@@ -68,13 +64,14 @@ def test_projected_soft_ce_routes_at_tile_boundary(
         generator=generator,
     ).requires_grad_(True)
     output_weight = torch.randn(7, 3, generator=generator).requires_grad_(True)
-    teacher_logits = torch.randn(3, 7, generator=generator).requires_grad_(True)
+    selected_teacher_logits = torch.randn(
+        num_tokens, 7, generator=generator
+    ).requires_grad_(True)
 
     stats = projected_streaming_vocab_parallel_soft_ce(
         student_hidden=student_hidden,
         output_weight=output_weight,
-        teacher_logits=teacher_logits,
-        teacher_row_indices=torch.tensor([2, 0, 2, 1, 0])[:num_tokens],
+        selected_teacher_logits=selected_teacher_logits,
         mask=torch.ones(num_tokens),
         token_chunk_size=4,
         tp_group=None,
@@ -84,7 +81,7 @@ def test_projected_soft_ce_routes_at_tile_boundary(
 
     assert student_hidden.grad is not None
     assert output_weight.grad is None
-    assert teacher_logits.grad is None
+    assert selected_teacher_logits.grad is None
 
 
 @pytest.mark.parametrize(
@@ -111,14 +108,12 @@ def test_projected_soft_ce_matches_dense_hidden_gradient(
         generator=generator,
         dtype=dtype,
     ).requires_grad_(True)
-    teacher_logits = torch.randn(
-        2,
-        3,
+    selected_teacher_logits = torch.randn(
+        num_tokens,
         vocab_size,
         generator=generator,
         dtype=dtype,
     ).requires_grad_(True)
-    teacher_row_indices = torch.tensor([4, 1, 4, 0, 5])[:num_tokens]
     mask = torch.tensor([1.0, 0.0, 1.0, 1.0, 1.0])[:num_tokens]
     bin_ids = torch.tensor([0, 0, 1, 1, 0])[:num_tokens]
     weights = torch.tensor([0.25, 1.5, 0.75])
@@ -126,8 +121,7 @@ def test_projected_soft_ce_matches_dense_hidden_gradient(
     stats = projected_streaming_vocab_parallel_soft_ce(
         student_hidden=student_hidden,
         output_weight=output_weight,
-        teacher_logits=teacher_logits,
-        teacher_row_indices=teacher_row_indices,
+        selected_teacher_logits=selected_teacher_logits,
         mask=mask,
         bin_ids=bin_ids,
         weights=weights,
@@ -141,8 +135,7 @@ def test_projected_soft_ce_matches_dense_hidden_gradient(
     expected_numerators, expected_counts = _dense_projected_stats(
         reference_hidden,
         output_weight.detach(),
-        teacher_logits.detach(),
-        teacher_row_indices,
+        selected_teacher_logits.detach(),
         mask,
         bin_ids,
         num_bins=3,
@@ -162,7 +155,7 @@ def test_projected_soft_ce_matches_dense_hidden_gradient(
         **tolerance,
     )
     assert stats.counts[2] == 0
-    assert teacher_logits.grad is None
+    assert selected_teacher_logits.grad is None
     assert output_weight.grad is None
 
 
@@ -192,14 +185,12 @@ def test_projected_soft_ce_saved_state_contract(
         generator=generator,
         dtype=torch.bfloat16,
     ).requires_grad_(True)
-    teacher_logits = torch.randn(
-        1,
-        3,
+    selected_teacher_logits = torch.randn(
+        num_tokens,
         vocab_size,
         generator=generator,
         dtype=torch.bfloat16,
     ).requires_grad_(True)
-    teacher_row_indices = torch.tensor([2, 0, 2, 1, 2])[:num_tokens]
     mask = torch.ones(num_tokens)
     saved_tensors: list[torch.Tensor] = []
 
@@ -211,8 +202,7 @@ def test_projected_soft_ce_saved_state_contract(
         stats = projected_streaming_vocab_parallel_soft_ce(
             student_hidden=student_hidden,
             output_weight=output_weight,
-            teacher_logits=teacher_logits,
-            teacher_row_indices=teacher_row_indices,
+            selected_teacher_logits=selected_teacher_logits,
             mask=mask,
             token_chunk_size=4,
             tp_group=None,
@@ -226,7 +216,7 @@ def test_projected_soft_ce_saved_state_contract(
     ]
     assert len(vocab_distributions) == expected_vocab_distributions
     assert not any(
-        tensor.dtype == teacher_logits.dtype
+        tensor.dtype == selected_teacher_logits.dtype
         and tensor.shape == (num_tokens, vocab_size)
         for tensor in saved_tensors
     )
@@ -236,5 +226,54 @@ def test_projected_soft_ce_saved_state_contract(
     ) is (expected_vocab_distributions == 0)
     assert student_hidden.grad is not None
     assert student_hidden.grad.dtype == torch.bfloat16
-    assert teacher_logits.grad is None
+    assert selected_teacher_logits.grad is None
     assert output_weight.grad is None
+
+
+@pytest.mark.parametrize("context_length", [32_768, 262_144])
+def test_projected_soft_ce_does_not_retain_full_context_teacher_logits(
+    context_length: int,
+) -> None:
+    """The projected seam accepts and saves only requested teacher rows."""
+    generator = torch.Generator().manual_seed(86420)
+    num_tokens, hidden_size, vocab_size = 5, 3, 17
+    full_teacher_logits = torch.randn(
+        context_length,
+        vocab_size,
+        generator=generator,
+        dtype=torch.bfloat16,
+    )
+    selected_teacher_logits = full_teacher_logits.index_select(
+        0, torch.tensor([1, 7, 42, context_length - 1, 7])
+    )
+    full_teacher_storage_bytes = full_teacher_logits.untyped_storage().nbytes()
+    student_hidden = torch.randn(
+        num_tokens,
+        hidden_size,
+        generator=generator,
+        dtype=torch.bfloat16,
+    ).requires_grad_(True)
+    output_weight = torch.randn(
+        vocab_size,
+        hidden_size,
+        generator=generator,
+        dtype=torch.bfloat16,
+    )
+    saved_storage_bytes: list[int] = []
+
+    def record(tensor: torch.Tensor) -> torch.Tensor:
+        saved_storage_bytes.append(tensor.untyped_storage().nbytes())
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(record, lambda tensor: tensor):
+        stats = projected_streaming_vocab_parallel_soft_ce(
+            student_hidden=student_hidden,
+            output_weight=output_weight,
+            selected_teacher_logits=selected_teacher_logits,
+            mask=torch.ones(num_tokens),
+            token_chunk_size=2,
+            tp_group=None,
+        )
+
+    assert max(saved_storage_bytes) < full_teacher_storage_bytes
+    stats.normalized(normalization_counts=stats.counts).backward()

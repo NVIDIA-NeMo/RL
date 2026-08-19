@@ -14,10 +14,10 @@
 
 import pytest
 import torch
-from torch import nn
 
+import nemo_rl.models.megatron.draft as draft_api
+import nemo_rl.models.megatron.draft.utils as draft_utils
 from nemo_rl.models.megatron.draft.utils import (
-    export_dflash_weights,
     validate_dflash_export_state_dict,
 )
 
@@ -25,24 +25,10 @@ from nemo_rl.models.megatron.draft.utils import (
 pytestmark = pytest.mark.mcore
 
 
-class _DraftBody(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.trunk = nn.Linear(4, 4, bias=False)
-        self.branch_norm = nn.LayerNorm(4)
-
-
-def test_allowed_dflash_export_round_trips_exactly() -> None:
-    """Body-only export preserves every trainable DFlash tensor exactly."""
-    torch.manual_seed(123)
-    source = _DraftBody()
-    exported = dict(export_dflash_weights(source))
-    restored = _DraftBody()
-    restored.load_state_dict(exported)
-
-    assert exported.keys() == source.state_dict().keys()
-    for name, tensor in source.state_dict().items():
-        assert torch.equal(restored.state_dict()[name], tensor), name
+def test_raw_dflash_export_is_not_a_public_api() -> None:
+    """Raw TP-local state must not masquerade as an interoperable export."""
+    assert not hasattr(draft_api, "export_dflash_weights")
+    assert not hasattr(draft_utils, "export_dflash_weights")
 
 
 @pytest.mark.parametrize(

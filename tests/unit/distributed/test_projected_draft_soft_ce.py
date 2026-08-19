@@ -113,8 +113,9 @@ def _run_tp2_projected_soft_ce(
     stats = projected_streaming_vocab_parallel_soft_ce(
         student_hidden=local_hidden,
         output_weight=local_output_weight,
-        teacher_logits=local_teacher_logits,
-        teacher_row_indices=teacher_row_indices,
+        selected_teacher_logits=local_teacher_logits.index_select(
+            0, teacher_row_indices
+        ),
         mask=mask,
         bin_ids=bin_ids,
         weights=weights,
@@ -146,5 +147,52 @@ def test_tp2_projected_soft_ce_sums_hidden_gradient(
             _run_tp2_projected_soft_ce,
             token_chunk_size=token_chunk_size,
         ),
+        world_size=2,
+    )
+
+
+def _run_tp2_projected_soft_ce_metadata_mismatch(
+    rank: int,
+    world_size: int,
+    field: str,
+) -> None:
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    student_hidden = torch.ones(5, 3, device="cuda", dtype=torch.bfloat16)
+    output_weight = torch.ones(8, 3, device="cuda", dtype=torch.bfloat16)
+    teacher_logits = torch.ones(5, 8, device="cuda", dtype=torch.bfloat16)
+    mask = torch.ones(5, device="cuda")
+    bin_ids = torch.tensor([0, 0, 1, 1, 1], device="cuda")
+    weights = torch.tensor([1.0, 0.5], device="cuda")
+    token_chunk_size = 2
+    if rank == 1:
+        if field == "mask":
+            mask[-1] = 0
+        elif field == "bin_ids":
+            bin_ids[-1] = 0
+        elif field == "weights":
+            weights[-1] = 0.25
+        elif field == "token_chunk_size":
+            token_chunk_size = 3
+
+    with pytest.raises(ValueError, match="TP ranks disagree"):
+        projected_streaming_vocab_parallel_soft_ce(
+            student_hidden=student_hidden,
+            output_weight=output_weight,
+            selected_teacher_logits=teacher_logits,
+            mask=mask,
+            bin_ids=bin_ids,
+            weights=weights,
+            token_chunk_size=token_chunk_size,
+            tp_group=tp_group,
+        )
+
+
+@pytest.mark.parametrize("field", ["mask", "bin_ids", "weights", "token_chunk_size"])
+def test_tp2_projected_soft_ce_rejects_rank_local_metadata(
+    distributed_test_runner,
+    field: str,
+) -> None:
+    distributed_test_runner(
+        partial(_run_tp2_projected_soft_ce_metadata_mismatch, field=field),
         world_size=2,
     )

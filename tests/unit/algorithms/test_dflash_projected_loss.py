@@ -70,7 +70,8 @@ def test_dflash_adapter_maps_blocks_to_teacher_rows_and_position_bins() -> None:
     )
 
     student_logits = draft_hidden.reshape(-1, draft_hidden.shape[-1]) @ output_weight.T
-    teacher_rows = torch.tensor([[5, 6, 7], [0, 1, 2]])
+    # Official DFlash KD alignment: the teacher logit predicting token p is row p - 1.
+    teacher_rows = torch.tensor([[0, 5, 6], [0, 0, 1]])
     selected_teacher = teacher_logits.reshape(
         -1, teacher_logits.shape[-1]
     ).index_select(
