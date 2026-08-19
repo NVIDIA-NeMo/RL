@@ -39,7 +39,7 @@ def test_sync_mxfp8_renders_matched_two_logprob_cuda_graph_run() -> None:
     assert "policy.generation.refit_transport=null" in result.stdout
     assert "policy.generation.vllm_cfg.enforce_eager=false" in result.stdout
     assert "policy.generation.vllm_cfg.precision=fp8" in result.stdout
-    assert "policy.generation.vllm_cfg.is_mx=true" in result.stdout
+    assert "++policy.generation.vllm_cfg.is_mx=true" in result.stdout
     assert "++policy.generation.vllm_kwargs.moe_backend=flashinfer_trtllm" in result.stdout
     assert "loss_fn.force_on_policy_ratio=false" in result.stdout
     assert "loss_fn.use_importance_sampling_correction=true" in result.stdout
@@ -53,6 +53,7 @@ def test_submitter_uses_a_pinned_ray_runtime() -> None:
     assert '"${RAY_RUNTIME_VENV}/READY"' in script
     assert "ray.__version__ == \"2.56.1\"" in script
     assert "export SETUP_COMMAND" in script
+    assert "export UV_PYTHON=${RAY_RUNTIME_VENV}/bin/python" in script
 
 
 def test_async_bf16_renders_nccl_reshard_with_same_logprob_work() -> None:
@@ -124,7 +125,13 @@ def test_shuffle_only_changes_commit_but_keeps_prequantization_enabled() -> None
 
     assert baseline.returncode == 0, baseline.stderr
     assert optimized.returncode == 0, optimized.stderr
-    assert "policy.generation.vllm_cfg.refit_prequantize=true" in baseline.stdout
-    assert "policy.generation.vllm_cfg.refit_prequantize=true" in optimized.stdout
+    assert "++policy.generation.vllm_cfg.refit_prequantize=true" in baseline.stdout
+    assert "++policy.generation.vllm_cfg.refit_prequantize=true" in optimized.stdout
     assert "NRL_MXFP8_BATCHED_SHUFFLE" not in baseline.stdout
     assert "NRL_MXFP8_BATCHED_SHUFFLE" not in optimized.stdout
+
+
+def test_ablation_driver_uses_same_python_as_ray_cluster() -> None:
+    script = ABLATION_SCRIPT.read_text()
+
+    assert "export UV_PYTHON=${RAY_RUNTIME_VENV}/bin/python" in script

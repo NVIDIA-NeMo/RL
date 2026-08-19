@@ -109,7 +109,7 @@ RUN_ARGS=(
   "checkpointing.enabled=false"
 )
 if [[ "${IS_MX}" == true ]]; then
-  RUN_ARGS+=("policy.generation.vllm_cfg.is_mx=true")
+  RUN_ARGS+=("++policy.generation.vllm_cfg.is_mx=true")
 fi
 
 printf -v RUN_COMMAND '%q ' uv run --frozen examples/run_grpo.py "${RUN_ARGS[@]}"
@@ -229,7 +229,8 @@ export NVTE_CUDA_ARCHS=100
 export TORCH_CUDA_ARCH_LIST=10.0
 export PYTHONPATH=${REPO}
 export UV_CACHE_DIR=${CACHE_ROOT}/uv-cache
-export UV_PROJECT_ENVIRONMENT=${CACHE_ROOT}/driver-venv
+export UV_PYTHON=${RAY_RUNTIME_VENV}/bin/python
+export UV_PROJECT_ENVIRONMENT=${CACHE_ROOT}/driver-venv-py31314
 export UV_PYTHON_INSTALL_DIR=${CACHE_ROOT}/uv-python
 export UV_LOCK_TIMEOUT=7200
 export WANDB_API_KEY="\$(cat ${WANDB_KEY_FILE})"
