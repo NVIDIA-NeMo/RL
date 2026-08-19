@@ -19,10 +19,12 @@ import json
 import math
 import statistics
 import threading as _threading
+import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from numbers import Integral, Real
 from typing import (
     Any,
@@ -57,6 +59,37 @@ REPLAY_BUFFER_METADATA_FILENAME = "replay_buffer_metadata.pt"
 LEGACY_REPLAY_BUFFER_FILENAME = "replay_buffer.pt"
 REPLAY_BUFFER_METADATA_SCHEMA_VERSION = 1
 REPLAY_BUFFER_METADATA_STORAGE: Literal["tq_checkpoint"] = "tq_checkpoint"
+
+CheckpointMutationKind = Literal[
+    "group_commits",
+    "group_removals",
+    "other",
+    "prompt_reservations",
+    "recovery_retries",
+    "sample_clears",
+    "sibling_seals",
+]
+CHECKPOINT_MUTATION_KINDS: tuple[CheckpointMutationKind, ...] = (
+    "group_commits",
+    "group_removals",
+    "prompt_reservations",
+    "recovery_retries",
+    "sample_clears",
+    "sibling_seals",
+    "other",
+)
+
+
+@dataclass(frozen=True)
+class DataPlaneCheckpointBarrierTelemetry:
+    """Bounded interval telemetry for checkpoint-induced mutation waits."""
+
+    blocked_by_kind: dict[CheckpointMutationKind, int]
+    wait_durations_s: tuple[float, ...]
+    active_mutations: int
+    waiting_mutations: int
+    max_waiting_mutations: int
+    checkpoint_active: bool
 
 # These TypedDicts describe the versioned, plain-mapping checkpoint wire
 # format. They are intentionally not dataclass instances: persisting a
@@ -197,9 +230,21 @@ class DataPlaneCheckpointBarrier:
         self._checkpoint_active = False
         self._active_mutations = 0
         self._mutation_depth_by_task: dict[asyncio.Task[Any], int] = {}
+        self._mutation_version = 0
+        self._waiting_mutations = 0
+        self._max_waiting_mutations = 0
+        self._blocked_by_kind: Counter[CheckpointMutationKind] = Counter()
+        self._wait_durations_s: deque[float] = deque(maxlen=10_000)
+
+    @property
+    def mutation_version(self) -> int:
+        """Monotonic count of completed outer mutation sections."""
+        return self._mutation_version
 
     @asynccontextmanager
-    async def mutation(self) -> AsyncIterator[None]:
+    async def mutation(
+        self, kind: CheckpointMutationKind = "other"
+    ) -> AsyncIterator[None]:
         """Enter a commit/clear section, waiting only for an active checkpoint."""
         task = asyncio.current_task()
         if task is None:
@@ -216,7 +261,20 @@ class DataPlaneCheckpointBarrier:
                 self._mutation_depth_by_task[task] -= 1
             return
         async with self._condition:
-            await self._condition.wait_for(lambda: not self._checkpoint_active)
+            wait_started: Optional[float] = None
+            if self._checkpoint_active:
+                wait_started = time.monotonic()
+                self._waiting_mutations += 1
+                self._max_waiting_mutations = max(
+                    self._max_waiting_mutations, self._waiting_mutations
+                )
+            try:
+                await self._condition.wait_for(lambda: not self._checkpoint_active)
+            finally:
+                if wait_started is not None:
+                    self._waiting_mutations -= 1
+                    self._blocked_by_kind[kind] += 1
+                    self._wait_durations_s.append(time.monotonic() - wait_started)
             self._active_mutations += 1
             self._mutation_depth_by_task[task] = 1
         try:
@@ -225,8 +283,28 @@ class DataPlaneCheckpointBarrier:
             del self._mutation_depth_by_task[task]
             async with self._condition:
                 self._active_mutations -= 1
+                self._mutation_version += 1
                 if self._active_mutations == 0:
                     self._condition.notify_all()
+
+    async def drain_telemetry(self) -> DataPlaneCheckpointBarrierTelemetry:
+        """Return and reset interval waits while preserving current state."""
+        async with self._condition:
+            telemetry = DataPlaneCheckpointBarrierTelemetry(
+                blocked_by_kind={
+                    kind: self._blocked_by_kind.get(kind, 0)
+                    for kind in CHECKPOINT_MUTATION_KINDS
+                },
+                wait_durations_s=tuple(self._wait_durations_s),
+                active_mutations=self._active_mutations,
+                waiting_mutations=self._waiting_mutations,
+                max_waiting_mutations=self._max_waiting_mutations,
+                checkpoint_active=self._checkpoint_active,
+            )
+            self._blocked_by_kind.clear()
+            self._wait_durations_s.clear()
+            self._max_waiting_mutations = self._waiting_mutations
+            return telemetry
 
     @asynccontextmanager
     async def checkpoint(self) -> AsyncIterator[None]:
@@ -1121,7 +1199,7 @@ class TQReplayBuffer:
             weight_version=start_weight_version,
         )
         trace_rollout_payload(keys=sample_ids, data=train_batch)
-        async with self._data_plane_checkpoint_barrier.mutation():
+        async with self._data_plane_checkpoint_barrier.mutation("group_commits"):
             try:
                 await call_data_plane(
                     self._dp_client,
@@ -1198,7 +1276,7 @@ class TQReplayBuffer:
                 "TQReplayBuffer must be bound to the controller data-plane "
                 "checkpoint barrier before removing a group"
             )
-        async with self._data_plane_checkpoint_barrier.mutation():
+        async with self._data_plane_checkpoint_barrier.mutation("group_removals"):
             try:
                 idx = self._group_ids.index(group_id)
             except ValueError as error:
@@ -1219,7 +1297,7 @@ class TQReplayBuffer:
                 "checkpoint barrier before clearing staging samples"
             )
         unique_keys = list(dict.fromkeys(staging_keys))
-        async with self._data_plane_checkpoint_barrier.mutation():
+        async with self._data_plane_checkpoint_barrier.mutation("sample_clears"):
             await call_data_plane(
                 self._dp_client,
                 "clear_samples",
@@ -1349,7 +1427,7 @@ class TQReplayBuffer:
                 "TQReplayBuffer must be bound to the controller data-plane "
                 "checkpoint barrier before removing groups"
             )
-        async with self._data_plane_checkpoint_barrier.mutation():
+        async with self._data_plane_checkpoint_barrier.mutation("group_removals"):
             drop_idxs = sorted(idxs, reverse=True)
             if drop_idxs[0] >= len(self.meta_list):
                 raise IndexError(

@@ -219,6 +219,20 @@ def _add_group(
 
 
 class TestDataPlaneCheckpointBarrier:
+    def test_mutation_version_counts_completed_outer_cuts(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            assert barrier.mutation_version == 0
+            async with barrier.mutation("prompt_reservations"):
+                async with barrier.mutation("sibling_seals"):
+                    assert barrier.mutation_version == 0
+            assert barrier.mutation_version == 1
+            async with barrier.mutation("group_commits"):
+                pass
+            assert barrier.mutation_version == 2
+
+        asyncio.run(exercise())
+
     def test_mutations_run_concurrently_without_checkpoint(self):
         async def exercise() -> None:
             barrier = DataPlaneCheckpointBarrier()

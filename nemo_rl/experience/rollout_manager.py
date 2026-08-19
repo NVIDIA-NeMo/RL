@@ -16,6 +16,7 @@ import asyncio
 import copy
 import enum
 import json
+import math
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -27,6 +28,7 @@ from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     PostWriteEnrichmentError,
     TQReplayBuffer,
@@ -1355,6 +1357,10 @@ class RolloutManager:
         ] = None
         self._env_handles = task_to_env
         self._weight_version: int = 0
+        self._canonical_groups_finalized = 0
+        self._canonical_output_tokens = 0
+        self._recovery_siblings_reused = 0
+        self._recovery_siblings_redispatched = 0
         # Run-wide, shared across concurrent generate_and_push calls. Safe as a plain
         # int: every caller runs on the SingleController's single event loop.
         self._skipped_prompts: int = 0
@@ -1380,14 +1386,47 @@ class RolloutManager:
         self._data_plane_checkpoint_barrier = barrier
 
     @asynccontextmanager
-    async def _recovery_mutation(self) -> AsyncIterator[None]:
+    async def _recovery_mutation(
+        self, kind: CheckpointMutationKind = "recovery_retries"
+    ) -> AsyncIterator[None]:
         """Serialize short lineage transitions with native TQ snapshots."""
         barrier = getattr(self, "_data_plane_checkpoint_barrier", None)
         if barrier is None:
             yield
             return
-        async with barrier.mutation():
+        async with barrier.mutation(kind):
             yield
+
+    def telemetry_snapshot(self) -> dict[str, int]:
+        """Return cumulative canonical-publication and recovery counters."""
+        return {
+            "canonical_groups_finalized": getattr(
+                self, "_canonical_groups_finalized", 0
+            ),
+            "canonical_output_tokens": getattr(self, "_canonical_output_tokens", 0),
+            "recovery_siblings_reused": getattr(self, "_recovery_siblings_reused", 0),
+            "recovery_siblings_redispatched": getattr(
+                self, "_recovery_siblings_redispatched", 0
+            ),
+        }
+
+    def record_canonical_publication(self, output_tokens: int) -> None:
+        """Count one prompt group after its canonical TQ commit succeeds."""
+        self._canonical_groups_finalized = (
+            getattr(self, "_canonical_groups_finalized", 0) + 1
+        )
+        self._canonical_output_tokens = getattr(
+            self, "_canonical_output_tokens", 0
+        ) + max(0, int(output_tokens))
+
+    def record_recovery_siblings(self, *, reused: int, redispatched: int) -> None:
+        """Count sibling work avoided and repeated after a process restart."""
+        self._recovery_siblings_reused = getattr(
+            self, "_recovery_siblings_reused", 0
+        ) + max(0, int(reused))
+        self._recovery_siblings_redispatched = getattr(
+            self, "_recovery_siblings_redispatched", 0
+        ) + max(0, int(redispatched))
 
     def reserve_prompt_group(
         self,
@@ -1638,6 +1677,16 @@ class RolloutManager:
                 raise
 
             self._stats.committed += 1
+            rollout_metrics = getattr(record, "rollout_metrics", {})
+            mean_output_tokens = rollout_metrics.get("mean_gen_tokens_per_sample", 0)
+            output_tokens = 0
+            if isinstance(mean_output_tokens, (int, float)):
+                total_output_tokens = float(mean_output_tokens) * len(
+                    getattr(record, "completions", ())
+                )
+                if math.isfinite(total_output_tokens):
+                    output_tokens = max(0, round(total_output_tokens))
+            self.record_canonical_publication(output_tokens)
             # A commit proves the fleet is answering, which is exactly the claim the
             # consecutive budget is testing, so it clears the run of drops. Placed on
             # the success path rather than in the infra handler so that a prompt which
@@ -1698,11 +1747,12 @@ class RolloutManager:
         )
         recovery_group_id = lineage_group_id
         if recovery_group_id is None:
-            recovery_group_id = self.reserve_prompt_group(
-                input_sample,
-                target_step=target_step,
-                admitted=True,
-            )
+            async with self._recovery_mutation("prompt_reservations"):
+                recovery_group_id = self.reserve_prompt_group(
+                    input_sample,
+                    target_step=target_step,
+                    admitted=True,
+                )
         recovery_group = self._recovery_ledger.get_group(recovery_group_id)
         if recovery_group.phase is not PromptGroupPhase.ADMITTED:
             raise RuntimeError(
@@ -1814,7 +1864,7 @@ class RolloutManager:
                 raise ValueError(
                     "token-capture completion must contain its Gate rollout ID"
                 )
-            async with self._recovery_mutation():
+            async with self._recovery_mutation("sibling_seals"):
                 self._recovery_ledger.mark_sibling_sealed(
                     group_id,
                     generation_index=generation_index,
@@ -1889,6 +1939,6 @@ class RolloutManager:
             for sibling in group.siblings
             for key in sibling.current_attempt.staging_keys
         ]
-        async with self._recovery_mutation():
+        async with self._recovery_mutation("group_removals"):
             await self._tq_buffer.clear_staging_keys(staging_keys)
             self._recovery_ledger.discard_group(group_id)

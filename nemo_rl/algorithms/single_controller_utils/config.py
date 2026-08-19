@@ -595,9 +595,14 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     SingleController has no validation loop, so checkpoint selection must use
     ``checkpointing.metric_name=None`` or a ``train:<name>`` metric. Inherited
     ``val:<name>`` settings are rejected during setup.
+
+    ``telemetry_interval_s=None`` disables the independent wall-clock sampler
+    for rollout/checkpoint benchmark metrics. It does not enable checkpointing
+    and may be configured without ``interval_s``.
     """
 
     interval_s: Optional[float] = Field(default=None, gt=0)
+    telemetry_interval_s: Optional[float] = Field(default=None, gt=0)
     keep_latest_k: int = Field(default=2, ge=1)
     restore_mode: Literal["latest", "trainer_checkpoint", "none"] = "latest"
 
