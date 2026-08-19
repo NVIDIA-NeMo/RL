@@ -30,3 +30,11 @@ def pad_flashinfer_scale_k(input_tensor: Any) -> Any:
     padded = input_tensor.new_zeros(padded_shape)
     padded[..., : input_tensor.shape[-1]] = input_tensor
     return padded
+
+
+def supports_batched_moe_shuffle(
+    w13_scale_rows: int, w2_scale_rows: int, *, tile_m: int
+) -> bool:
+    if tile_m <= 0:
+        raise ValueError("MXFP8 MoE shuffle tile size must be positive")
+    return w13_scale_rows % tile_m == 0 and w2_scale_rows % tile_m == 0
