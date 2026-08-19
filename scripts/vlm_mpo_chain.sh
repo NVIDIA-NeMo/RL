@@ -19,6 +19,10 @@ final_max_steps="${MPO_MAX_NUM_STEPS:-}"
   echo "CHAIN_SEGMENTS must be a positive integer" >&2
   exit 2
 }
+if ((CHAIN_SEGMENTS > 1)) && [[ -z "${CHAIN_STEP_TARGETS}" ]]; then
+  echo "CHAIN_STEP_TARGETS is required when CHAIN_SEGMENTS is greater than 1" >&2
+  exit 2
+fi
 step_targets=()
 if [[ -n "${CHAIN_STEP_TARGETS}" ]]; then
   IFS=',' read -r -a step_targets <<<"${CHAIN_STEP_TARGETS}"

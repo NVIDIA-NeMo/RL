@@ -35,6 +35,14 @@ uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' "$JSON_METRICS") -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py "$JSON_METRICS" \
         'max(data["train/loss"]) < 1000000' \
-        'min(data["train/loss"]) > -1000000'
+        'min(data["train/loss"]) > -1000000' \
+        'len(data["train/preference_loss"]) == 2' \
+        'data["train/preference_loss"]["1"] > 0.69' \
+        'data["train/preference_loss"]["1"] < 0.70' \
+        'len(data["train/bco_loss"]) == 2' \
+        'data["train/bco_loss"]["1"] > 1.38' \
+        'data["train/bco_loss"]["1"] < 1.40' \
+        'len(data["train/reward_shift"]) == 2' \
+        'abs(data["train/reward_shift"]["1"]) < 0.01'
     rm -rf "$CKPT_DIR"
 fi

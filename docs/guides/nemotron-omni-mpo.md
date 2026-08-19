@@ -25,7 +25,7 @@ docker buildx build --build-context nemo-rl=. \
 ```
 
 At this revision, `docker/Dockerfile` defaults to
-`nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04`; use the
+`nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04`; use the
 repository build rather than treating that base image as a complete NeMo-RL
 runtime.
 
@@ -98,6 +98,14 @@ insertion implementation, so NeMo-RL rejects that combination early. Follow
 [Megatron-Bridge #5181](https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/5181)
 for no-pack enablement.
 
+## Support and qualification status
+
+This change provides packed single-image MPO recipes for Nemotron Omni Nano and
+Super. Nano has completed an end-to-end parity run on an earlier revision.
+Super and the corrected chained-resume path have smoke coverage but still
+require final-head convergence, resume, throughput, and memory qualification
+before they should be treated as production-qualified.
+
 ## Qualification order
 
 1. Run a short Nano single-image MMPR smoke test with CP=1 and MTP disabled.
@@ -107,5 +115,6 @@ for no-pack enablement.
 4. Qualify CP>1 separately with a valid parallel topology and
    `make_sequence_length_divisible_by` divisible by `2 * CP * TP` when
    sequence parallelism is enabled.
-5. Defer multi-image, video/audio, Super, and MTP qualification until the Nano
-   image baseline is stable.
+5. Repeat the parity and chained-resume checks on the packed Super recipes.
+6. Defer multi-image, video/audio, and MTP qualification until the
+   single-image baselines are stable.

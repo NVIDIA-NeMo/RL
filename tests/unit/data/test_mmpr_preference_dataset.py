@@ -14,6 +14,7 @@
 
 import json
 
+import pytest
 from datasets import Dataset
 from pydantic import TypeAdapter
 
@@ -99,6 +100,108 @@ def test_mmpr_preference_dataset_loads_legacy_meta_recipe(tmp_path):
         cache_dir=str(tmp_path / "cache"),
     )
     assert len(cached_dataset.dataset) == 1
+
+    annotation_path.write_text(
+        json.dumps(
+            {
+                "question": "<image> What changed?",
+                "image": "example.png",
+                "chosen_response": "The annotation",
+                "rejected_response": "Nothing",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    refreshed_dataset = MMPRPreferenceDataset(
+        data_path=str(recipe_path),
+        split_validation_size=0,
+        cache_dir=str(tmp_path / "cache"),
+    )
+    assert refreshed_dataset.dataset[0]["question"] == "<image> What changed?"
+    assert (
+        refreshed_dataset.dataset[0]["chosen_response"]
+        == "<think></think>\n\nThe annotation"
+    )
+
+
+def test_mmpr_preference_dataset_normalizes_responses_independently(tmp_path):
+    recipe_dir = tmp_path / "recipes"
+    recipe_dir.mkdir()
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    (image_dir / "example.png").write_bytes(b"image")
+    annotation_path = tmp_path / "annotations.jsonl"
+    records = [
+        {
+            "question": "<image> First?",
+            "image": "example.png",
+            "chosen": "<think>chosen reasoning</think>\n\nChosen",
+            "rejected": "Rejected",
+        },
+        {
+            "question": "<image> Second?",
+            "image": "example.png",
+            "chosen": "Chosen",
+            "rejected": "<think>rejected reasoning</think>\n\nRejected",
+        },
+    ]
+    annotation_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    recipe_path = recipe_dir / "meta.json"
+    recipe_path.write_text(
+        json.dumps(
+            {
+                "tiny": {
+                    "root": "images",
+                    "annotation": "annotations.jsonl",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = MMPRPreferenceDataset(
+        data_path=str(recipe_path),
+        split_validation_size=0,
+        cache_dir=str(tmp_path / "cache"),
+    )
+    rows = sorted(dataset.dataset, key=lambda row: row["question"])
+
+    assert rows[0]["chosen"] == "<think>chosen reasoning</think>\n\nChosen"
+    assert rows[0]["rejected"] == "<think></think>\n\nRejected"
+    assert rows[1]["chosen"] == "<think></think>\n\nChosen"
+    assert rows[1]["rejected"] == "<think>rejected reasoning</think>\n\nRejected"
+
+
+def test_format_mmpr_preference_dataset_preserves_no_placeholder_rows():
+    formatted = format_mmpr_preference_dataset(
+        {
+            "question": "Describe the image.",
+            "image": ["/data/example.png"],
+            "chosen_response": "correct",
+            "rejected_response": "incorrect",
+        }
+    )
+
+    assert formatted["context"][0]["content"] == [
+        {"type": "image", "image": "/data/example.png"},
+        {"type": "text", "text": "Describe the image."},
+    ]
+
+
+def test_format_mmpr_preference_dataset_rejects_image_mismatch():
+    with pytest.raises(ValueError, match="exactly one placeholder per image"):
+        format_mmpr_preference_dataset(
+            {
+                "question": "<image> <image_2>",
+                "image": ["/data/example.png"],
+                "chosen_response": "correct",
+                "rejected_response": "incorrect",
+            }
+        )
 
 
 def test_mmpr_preference_dataset_reproduces_legacy_validation_slice(tmp_path):
