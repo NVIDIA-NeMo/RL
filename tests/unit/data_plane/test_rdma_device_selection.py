@@ -231,8 +231,15 @@ def test_peer_rail_is_pinned_to_the_local_rail(stub_client, monkeypatch):
     assert os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
 
 
-def test_peer_rail_pairing_is_overridable(stub_client, monkeypatch):
-    """A fully-routable fabric can opt back into random peer selection."""
+def test_setdefault_respects_an_already_set_value(stub_client, monkeypatch):
+    """setdefault must not clobber a value an operator already set.
+
+    Does NOT prove the mooncake engine treats "0" as disabled — verified
+    against the pinned wheel, MC_ENABLE_DEST_DEVICE_AFFINITY parsing is
+    ``if (std::getenv(...))``: presence, not value, so any set value (even
+    "0") enables it at the engine level. There is currently no way to
+    disable it once set; this only pins NeMo-RL's own os.environ handling.
+    """
     monkeypatch.setenv("MC_ENABLE_DEST_DEVICE_AFFINITY", "0")
     stub_client(_mooncake_cfg())
     assert os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "0"
