@@ -416,9 +416,11 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # the NemoGym actor's Ray max_concurrency, since each in-flight prompt is
     # one run_rollouts call on that actor — see
     # nemo_rl.environments.nemo_gym.resolve_nemo_gym_max_concurrency.
-    max_inflight_prompts: int = 32
+    # Bounded because both back an asyncio.Semaphore in the rollout pump, where 0
+    # is not a small value but a pump that never dispatches.
+    max_inflight_prompts: PositiveInt = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
-    max_buffered_rollouts: int = 64
+    max_buffered_rollouts: PositiveInt = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
 
@@ -684,19 +686,25 @@ def validate_gym_actor_concurrency(master_config: MasterConfig) -> None:
 
     The rollout pump dispatches one ``run_rollouts`` call per in-flight prompt
     onto a single NemoGym actor, so ``env.nemo_gym.max_concurrency`` — when set
-    explicitly — has to be at least ``async_rl.max_inflight_prompts``. Checked
-    here so the pair fails at config load instead of stalling a run that has
-    already claimed its allocation.
+    explicitly — has to cover ``async_rl.max_inflight_prompts`` plus the actor's
+    control-plane headroom. Checked here so the pair fails at config load
+    instead of stalling a run that has already claimed its allocation.
 
-    A config assembled through model_construct can lack ``env`` entirely (see
-    the note in validate_single_controller_config), and one without a Gym
-    section is not on this path at all; both skip.
+    Three configs skip: one assembled through model_construct can lack ``env``
+    entirely (see the note in validate_single_controller_config), one not taking
+    the Gym rollout path never builds the actor, and one without a Gym section is
+    not on this path at all.
 
     Args:
         master_config: The SingleController master config being validated.
     """
     env_config = getattr(master_config, "env", None)
     if env_config is None:
+        return
+    # Mirrors the rollout_failure check in validate_single_controller_config:
+    # should_use_nemo_gym decides which settings are inert, and an inert knob is
+    # not worth failing a run over.
+    if not env_config.get("should_use_nemo_gym"):
         return
     nemo_gym_config = env_config.get("nemo_gym")
     if nemo_gym_config is None:

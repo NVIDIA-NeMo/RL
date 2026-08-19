@@ -85,10 +85,7 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import (
-    RAY_DEFAULT_ASYNC_ACTOR_MAX_CONCURRENCY,
-    spinup_nemo_gym_actor,
-)
+from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
@@ -758,11 +755,14 @@ def setup(
             # This path fans in per prompt *batch* (one run_rollouts call per
             # in-flight AsyncTrajectoryCollector batch worker, or one per step
             # on the synchronous path), not per prompt, so its true fan-in is
-            # single digits and has never approached Ray's default. Passing
-            # that default keeps the v1 actor byte-for-byte as it was
-            # configured before max_concurrency became explicit; the fan-in
-            # that needed sizing is the SingleController one.
-            rollout_fan_in=RAY_DEFAULT_ASYNC_ACTOR_MAX_CONCURRENCY,
+            # single digits and has never approached Ray's default -- there is
+            # no v1 config knob to derive one from. Declaring no fan-in leaves
+            # max_concurrency off the actor entirely, keeping it byte-for-byte
+            # as it was configured before this option became explicit, and holds
+            # an explicit env.nemo_gym.max_concurrency to no floor it could not
+            # have known about. The fan-in that needed sizing is the
+            # SingleController one.
+            rollout_fan_in=None,
         )
         return actor, time.perf_counter() - t0
 
