@@ -193,7 +193,11 @@ class _FakeSampler:
         max_prompt_groups: int,
     ) -> tuple[KVBatchMeta, int]:
         n = max_prompt_groups
-        sample_ids = [f"s{self._step}-{i}" for i in range(n)]
+        # Canonical rollout rows are named ``{group_id}_g{generation_index}``.
+        # This fixture models one physical row per prompt group, so give each
+        # synthetic group its generation-0 row rather than using the legacy
+        # suffix-free IDs that the train pump now correctly rejects.
+        sample_ids = [f"s{self._step}-{i}_g0" for i in range(n)]
         self._step += 1
         meta = KVBatchMeta(
             partition_id=_PARTITION_ID,
