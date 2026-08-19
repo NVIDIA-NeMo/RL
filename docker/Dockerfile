@@ -312,9 +312,6 @@ fi
 uv sync --link-mode symlink --frozen --extra mcore --no-install-project
 uv sync --link-mode symlink --frozen --extra automodel --no-install-project
 uv sync --link-mode symlink --frozen --extra modelopt --no-install-project
-# L0_Unit_Tests_Nemo_Gym.sh selects this extra at runtime. Warm its artifacts
-# into the image cache, then restore the upstream all-groups environment.
-uv sync --link-mode symlink --frozen --all-groups --extra nemo_gym --no-install-project
 uv sync --link-mode symlink --frozen --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
@@ -349,7 +346,8 @@ uv lock --check
 
 if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
     echo "SKIP_TRTLLM_BUILD is set; skipping the isolated TRT-LLM build"
-    chown -R "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo_rl_venv "${UV_CACHE_DIR}"
+    chown -R --from=0 "${RUNTIME_UID}:${RUNTIME_GID}" \
+        /opt/nemo_rl_venv "${UV_CACHE_DIR}"
     exit 0
 fi
 
@@ -393,13 +391,13 @@ du -sh "${UV_CACHE_DIR}" /opt/nemo_rl_cache/trtllm-wheels
 
 # Restore the upstream all-groups environment in the same layer so the
 # transient TRT-LLM installation does not add a large intermediate venv layer.
-# The preceding dependency layer already warmed the NeMo Gym artifacts.
 uv sync --link-mode symlink --locked --all-groups --no-install-project
 
 # The final sync can repopulate the shared uv cache, so repeat the security
 # cleanup performed in the preceding dependency layer.
 find "${UV_CACHE_DIR}" -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
-chown -R "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo_rl_venv "${UV_CACHE_DIR}"
+chown -R --from=0 "${RUNTIME_UID}:${RUNTIME_GID}" \
+    /opt/nemo_rl_venv "${UV_CACHE_DIR}"
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -488,7 +486,7 @@ EOF
 RUN if git -C /opt/nemo-rl rev-parse --is-shallow-repository | grep -q true; then \
         git -C /opt/nemo-rl -c fetch.recurseSubmodules=false fetch --unshallow || true; \
     fi; \
-    chown -R "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl/.git
+    chown -R --from=0 "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl/.git
 ARG BASE_IMAGE
 RUN --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/opt/nemo_rl_cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
 NEGATIVE_FILTERS=""
@@ -517,12 +515,12 @@ export TRTLLM_REQUIRE_CACHED_WHEEL=1
 rm -rf -- /opt/ray_venvs
 install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /opt/ray_venvs
 if [[ -n "$NEGATIVE_FILTERS" ]]; then
-    UV_LINK_MODE=symlink uv run --locked --extra nemo_gym nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
+    UV_LINK_MODE=symlink uv run --locked nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
 else
-    UV_LINK_MODE=symlink uv run --locked --extra nemo_gym nemo_rl/utils/prefetch_venvs.py
+    UV_LINK_MODE=symlink uv run --locked nemo_rl/utils/prefetch_venvs.py
 fi
 # Keep ownership changes in the layer that creates the prefetched venvs.
-chown -R "${RUNTIME_UID}:${RUNTIME_GID}" \
+chown -R --from=0 "${RUNTIME_UID}:${RUNTIME_GID}" \
     /opt/nemo_rl_venv /opt/ray_venvs "${UV_CACHE_DIR}"
 EOF
 
@@ -544,7 +542,7 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     UV_LINK_MODE=symlink uv run --locked --extra nemo_gym python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
-chown -R "${RUNTIME_UID}:${RUNTIME_GID}" \
+chown -R --from=0 "${RUNTIME_UID}:${RUNTIME_GID}" \
     /opt/nemo_rl_venv /opt/gym_venvs "${UV_CACHE_DIR}"
 EOF
 # Generate container fingerprint for frozen environment support
@@ -588,8 +586,6 @@ RUN export XDG_CACHE_HOME=/tmp/regent-cache/xdg \
     test -x /usr/local/bin/uvx && \
     test -x /opt/nemo_rl_venv/bin/python && \
     test -z "$(find /opt/nemo-rl -xdev -uid 0 -print -quit)" && \
-    UV_OFFLINE=1 UV_LINK_MODE=symlink \
-        uv run --frozen --extra nemo_gym python -c "import nemo_gym" && \
     UV_OFFLINE=1 UV_LINK_MODE=symlink \
         uv sync --frozen --all-groups && \
     mkdir -p "${XDG_CACHE_HOME}" "${UV_CACHE_DIR}" && \
