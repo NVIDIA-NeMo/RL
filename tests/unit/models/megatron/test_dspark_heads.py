@@ -29,6 +29,9 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 
+pytestmark = pytest.mark.mcore
+
+
 def _load_heads() -> tuple[type[nn.Module], type[nn.Module]]:
     module_path = (
         Path(__file__).resolve().parents[4] / "nemo_rl/models/megatron/draft/dspark.py"
