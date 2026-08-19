@@ -522,14 +522,17 @@ def _run_tp2_split_vocab_mapping_and_bounds(rank: int, world_size: int) -> None:
 def _run_dp2_global_normalization_gradient(rank: int, world_size: int) -> None:
     dp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
-    local_count = torch.tensor([2.0, 0.0] if rank == 0 else [0.0, 100.0], device=device)
+    local_count = torch.tensor(
+        [0.0, 0.0] if rank == 0 else [1.0, 1.0], device=device
+    )
     global_count = local_count.clone()
     torch.distributed.all_reduce(global_count, group=dp_group)
-    differentiable_numerator = torch.tensor(
-        [2.0, 0.0] if rank == 0 else [0.0, 90.0],
+    numerator_source = torch.tensor(
+        [1.0, 1.0],
         device=device,
         requires_grad=True,
     )
+    differentiable_numerator = numerator_source * local_count
     slot_weights = torch.tensor([1.0, 0.25], device=device, requires_grad=True)
     from nemo_rl.algorithms.loss.dspark import DSparkLossBins
 
@@ -537,11 +540,13 @@ def _run_dp2_global_normalization_gradient(rank: int, world_size: int) -> None:
     local_loss = bins.normalized(normalization_counts=global_count)
     global_loss = local_loss.detach().clone()
     torch.distributed.all_reduce(global_loss, group=dp_group)
-    torch.testing.assert_close(global_loss, torch.tensor(24.5 / 27.0, device=device))
+    torch.testing.assert_close(global_loss, torch.tensor(0.625, device=device))
     local_loss.backward()
     torch.testing.assert_close(
-        differentiable_numerator.grad,
-        torch.tensor([1.0, 0.25], device=device) / 27.0,
+        numerator_source.grad,
+        torch.zeros(2, device=device)
+        if rank == 0
+        else torch.tensor([0.5, 0.125], device=device),
     )
     assert slot_weights.grad is None
 
@@ -717,6 +722,41 @@ def _run_tp2_provider_preflight(rank: int, world_size: int, case: str) -> None:
         )
 
 
+def _run_tp2_provider_group_drift(rank: int, world_size: int) -> None:
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    device = torch.device("cuda")
+    vocab_size, hidden_size = 8, 3
+    provider = build_dspark_provider(
+        body=_CheckpointBody(tp_group=tp_group, device=device),
+        target_vocab_size=vocab_size,
+        draft_vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        markov_rank=2,
+        confidence_enabled=False,
+        confidence_with_markov=False,
+        tensor_parallel_group=None if rank == 0 else tp_group,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    with pytest.raises(ValueError, match="ranks must agree on DSpark provider inputs"):
+        provider.objective_stats(
+            draft_hidden=torch.ones(1, 2, hidden_size, device=device),
+            target_output_weight=torch.ones(
+                vocab_size,
+                hidden_size,
+                device=device,
+            ),
+            target_logits=torch.ones(1, 2, vocab_size, device=device),
+            previous_token_ids=torch.zeros(1, 2, dtype=torch.long, device=device),
+            valid_mask=torch.ones(1, 2, dtype=torch.bool, device=device),
+            slot_bins=torch.tensor([[0, 1]], device=device),
+            loss_weights=(1.0, 1.0, 0.0),
+            token_chunk_size=1,
+            tp_group=tp_group,
+        )
+
+
 def test_tp2_bf16_output_and_hidden_head_gradients(distributed_test_runner) -> None:
     distributed_test_runner(_run_tp2_provider_objective, world_size=2)
 
@@ -759,6 +799,12 @@ def test_tp2_provider_preflight_rejects_rank_local_live_head_mismatch(
     distributed_test_runner(
         partial(_run_tp2_provider_preflight, case=case), world_size=2
     )
+
+
+def test_tp2_provider_preflight_rejects_rank_local_group_mismatch(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(_run_tp2_provider_group_drift, world_size=2)
 
 
 @pytest.mark.mcore

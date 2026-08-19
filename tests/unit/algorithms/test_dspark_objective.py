@@ -673,27 +673,26 @@ def test_normalized_requires_externally_reduced_counts() -> None:
     torch.testing.assert_close(local_numerator.grad, torch.tensor([1.0 / 3.0]))
 
 
-def test_slot_weights_are_detached_and_scale_global_normalization() -> None:
-    """Per-slot schedules scale both numerators and globally reduced counts."""
-    local_numerators = torch.tensor([2.0, 90.0], requires_grad=True)
+def test_slot_weights_are_detached_and_keep_global_count_unweighted() -> None:
+    """Per-slot schedules scale numerators, not the global valid-token count."""
+    local_numerators = torch.tensor([1.0, 1.0], requires_grad=True)
     slot_weights = torch.tensor([1.0, 0.25], requires_grad=True)
     stats = DSparkLossBins(
         numerators=local_numerators,
-        counts=torch.tensor([2.0, 40.0]),
+        counts=torch.tensor([1.0, 1.0]),
         weights=slot_weights,
     )
-    global_counts = torch.tensor([2.0, 100.0])
+    global_counts = torch.tensor([1.0, 1.0])
 
     loss = stats.normalized(normalization_counts=global_counts)
-    expected_denominator = torch.tensor(2.0 + 0.25 * 100.0)
-    torch.testing.assert_close(loss, torch.tensor((2.0 + 0.25 * 90.0) / 27.0))
+    torch.testing.assert_close(loss, torch.tensor(0.625))
     loss.backward()
 
     assert not stats.weights.requires_grad
     assert slot_weights.grad is None
     torch.testing.assert_close(
         local_numerators.grad,
-        torch.tensor([1.0, 0.25]) / expected_denominator,
+        torch.tensor([0.5, 0.125]),
     )
 
 
