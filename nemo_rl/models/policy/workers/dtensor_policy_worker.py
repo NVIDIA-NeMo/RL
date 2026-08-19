@@ -1938,7 +1938,16 @@ class DTensorPolicyWorkerImpl(
             self.model = self.move_to_cpu(self.model)
 
     @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_lp_inference")
-    def prepare_for_lp_inference(self) -> None:
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put the model in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave the optimizer state on CUDA because a train
+                step is already open. This backend accumulates gradients in
+                ``param.grad`` and never offloads them, so unlike the Megatron
+                backend there is nothing here that could discard them; the flag
+                only suppresses the per-chunk optimizer round trip.
+        """
         # onload model to cuda
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
@@ -1949,7 +1958,11 @@ class DTensorPolicyWorkerImpl(
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
-        if self.optimizer is not None and self.offload_optimizer_for_logprob:
+        if (
+            not keep_train_buffers
+            and self.optimizer is not None
+            and self.offload_optimizer_for_logprob
+        ):
             self.move_optimizer_to_device("cpu")
 
         gc.collect()

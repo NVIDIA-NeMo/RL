@@ -170,6 +170,7 @@ policy: &POLICY_BASE
             # optimizer cpu offload
             optimizer_cpu_offload: false
             optimizer_offload_fraction: 0.0
+            overlap_cpu_optimizer_d2h_h2d: false
 
             clip_grad: ${policy.max_grad_norm}
 
