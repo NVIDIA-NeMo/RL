@@ -67,7 +67,7 @@ def _dense_loss(
         .squeeze(-1)
     )
     tv_rows = 0.5 * (target_probs - draft_probs).abs().sum(dim=-1)
-    acceptance_targets = torch.minimum(target_probs, draft_probs).sum(dim=-1)
+    acceptance_targets = torch.minimum(target_probs, draft_probs).sum(dim=-1).detach()
     confidence_logits = (
         F.linear(
             torch.cat((hidden, embeddings), dim=-1),
