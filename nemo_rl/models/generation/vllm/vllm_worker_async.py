@@ -1571,12 +1571,15 @@ class VllmAsyncGenerationWorkerImpl(
             else refit_cfg.get("mx_reshard", {})
         )
         server_url = (
-            getattr(mx_cfg, "server_url", None)
-            if not isinstance(mx_cfg, dict)
-            else mx_cfg.get("server_url")
-        ) or os.environ.get("MX_SERVER_URL") or os.environ.get(
-            "MODEL_EXPRESS_URL"
-        ) or os.environ.get("MX_SERVER_ADDRESS")
+            (
+                getattr(mx_cfg, "server_url", None)
+                if not isinstance(mx_cfg, dict)
+                else mx_cfg.get("server_url")
+            )
+            or os.environ.get("MX_SERVER_URL")
+            or os.environ.get("MODEL_EXPRESS_URL")
+            or os.environ.get("MX_SERVER_ADDRESS")
+        )
         if not server_url:
             raise ValueError(
                 "mx_reshard requires refit_cfg.mx_reshard.server_url, "
@@ -1587,9 +1590,7 @@ class VllmAsyncGenerationWorkerImpl(
             if not isinstance(mx_cfg, dict)
             else mx_cfg.get("timeout_s", 1200.0)
         )
-        receiver_listen_port_base = (
-            resolve_mx_reshard_receiver_listen_port_base(mx_cfg)
-        )
+        receiver_listen_port_base = resolve_mx_reshard_receiver_listen_port_base(mx_cfg)
         results = await self.llm.collective_rpc(
             "init_mx_reshard_receiver",
             args=(

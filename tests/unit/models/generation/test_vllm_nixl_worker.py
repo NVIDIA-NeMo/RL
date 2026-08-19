@@ -143,9 +143,7 @@ def test_preinit_nixl_from_vllm_config_uses_default_backend_for_mx(monkeypatch):
         "preinit_nixl_agent",
         lambda **kwargs: calls.append(kwargs) or agent,
     )
-    config = SimpleNamespace(
-        additional_config={"nemo_rl_mx_reshard_nixl": True}
-    )
+    config = SimpleNamespace(additional_config={"nemo_rl_mx_reshard_nixl": True})
 
     assert preinit_nixl_from_vllm_config(config) is agent
     assert calls == [{}]

@@ -41,9 +41,7 @@ class ColumnParallelLinear(torch.nn.Module):
 class SelfAttention(torch.nn.Module):
     def __init__(self, rows: int, q_heads: int, kv_heads: int, head_dim: int):
         super().__init__()
-        self.linear_qkv = ColumnParallelLinear(
-            rows, q_heads, kv_heads, head_dim
-        )
+        self.linear_qkv = ColumnParallelLinear(rows, q_heads, kv_heads, head_dim)
 
 
 class TransformerLayer(torch.nn.Module):
@@ -257,18 +255,24 @@ def test_collect_reads_per_layer_geometry_from_the_live_qkv_module():
 
     assert len(published) == 2
     extras_by_name = {name: extras for name, _, _, extras in published}
-    assert extras_by_name[
-        "layers.0.self_attention.linear_qkv.weight"
-    ]["num_kv_heads"] == "2"
-    assert extras_by_name[
-        "layers.1.self_attention.linear_qkv.weight"
-    ]["num_kv_heads"] == "8"
-    assert "num_kv_heads_local" not in extras_by_name[
-        "layers.0.self_attention.linear_qkv.weight"
-    ]
-    assert extras_by_name[
-        "layers.1.self_attention.linear_qkv.weight"
-    ]["num_kv_heads_local"] == "1"
+    assert (
+        extras_by_name["layers.0.self_attention.linear_qkv.weight"]["num_kv_heads"]
+        == "2"
+    )
+    assert (
+        extras_by_name["layers.1.self_attention.linear_qkv.weight"]["num_kv_heads"]
+        == "8"
+    )
+    assert (
+        "num_kv_heads_local"
+        not in extras_by_name["layers.0.self_attention.linear_qkv.weight"]
+    )
+    assert (
+        extras_by_name["layers.1.self_attention.linear_qkv.weight"][
+            "num_kv_heads_local"
+        ]
+        == "1"
+    )
 
 
 def test_malformed_qkv_geometry_fails_closed():

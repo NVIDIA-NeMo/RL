@@ -35,7 +35,11 @@ STAGES = [
 
 
 def load(path: Path, warmup: int) -> list[dict]:
-    rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip().startswith("{")]
+    rows = [
+        json.loads(l)
+        for l in path.read_text().splitlines()
+        if l.strip().startswith("{")
+    ]
     return [r for r in rows if r["step"] > warmup]
 
 
@@ -78,8 +82,8 @@ def main() -> int:
         crit_ranks.append(ranks)
         mode = max(set(ranks), key=ranks.count)
         print(
-            f"  {name:28s} median={med:7.3f}s  min={min(v for _,v,_ in fc):7.3f}  "
-            f"max={max(v for _,v,_ in fc):7.3f}  critical rank most often={mode} "
+            f"  {name:28s} median={med:7.3f}s  min={min(v for _, v, _ in fc):7.3f}  "
+            f"max={max(v for _, v, _ in fc):7.3f}  critical rank most often={mode} "
             f"({ranks.count(mode)}/{len(ranks)} steps)"
         )
     report["headline_medians"] = headline
@@ -94,8 +98,15 @@ def main() -> int:
     #    while the tail that actually sets the refit duration barely moves. Only the
     #    critical rank's time is on the critical path, so that is the cut that says
     #    what to optimise.
-    print("\n== stage medians of the fleet-critical rank (the one on the critical path) ==")
-    hdr = "  " + "stage".ljust(22) + "".join(n[:11].rjust(13) for n in names) + "   spread   share"
+    print(
+        "\n== stage medians of the fleet-critical rank (the one on the critical path) =="
+    )
+    hdr = (
+        "  "
+        + "stage".ljust(22)
+        + "".join(n[:11].rjust(13) for n in names)
+        + "   spread   share"
+    )
     print(hdr)
 
     crit_stage_vals: list[dict[str, list[float]]] = []
@@ -109,15 +120,22 @@ def main() -> int:
         crit_stage_vals.append(per_stage)
 
     stage_rows = {}
-    totals = [
-        sum(statistics.median(v[s]) for s in STAGES) for v in crit_stage_vals
-    ]
+    totals = [sum(statistics.median(v[s]) for s in STAGES) for v in crit_stage_vals]
     for s in STAGES:
         meds = [statistics.median(v[s]) for v in crit_stage_vals]
-        share = (statistics.median(meds) / statistics.median(totals) * 100) if any(totals) else 0.0
+        share = (
+            (statistics.median(meds) / statistics.median(totals) * 100)
+            if any(totals)
+            else 0.0
+        )
         active = all(m > 0 for m in meds)
         sp = spread(meds) if active else None
-        stage_rows[s] = {"medians": meds, "spread_x": sp, "share_pct": share, "active": active}
+        stage_rows[s] = {
+            "medians": meds,
+            "spread_x": sp,
+            "share_pct": share,
+            "active": active,
+        }
         sp_txt = f"{sp:6.2f}x" if active else "     --"
         print(
             "  "
@@ -127,7 +145,9 @@ def main() -> int:
         )
     report["stages_critical_rank"] = stage_rows
     if any(not d["active"] for d in stage_rows.values()):
-        print("  ('--' = stage is zero in the warm window; it only runs on the cold step)")
+        print(
+            "  ('--' = stage is zero in the warm window; it only runs on the cold step)"
+        )
 
     ranked = sorted(
         (kv for kv in stage_rows.items() if kv[1]["active"]),
@@ -136,7 +156,9 @@ def main() -> int:
     )
     print("\n  stages ranked by contribution to the spread (excess spread x share):")
     for s, d in ranked[:4]:
-        print(f"    {s:22s} spread {d['spread_x']:5.2f}x on {d['share_pct']:5.1f}% of the time")
+        print(
+            f"    {s:22s} spread {d['spread_x']:5.2f}x on {d['share_pct']:5.1f}% of the time"
+        )
 
     # 3. Is the straggler the same rank every run? Placement vs contention.
     print("\n== per-rank max accounted_s ==")
@@ -152,13 +174,17 @@ def main() -> int:
         print(
             f"  {name:28s} slowest=rank {worst} ({per_rank[worst]:.3f}s)  "
             f"fastest=rank {best} ({per_rank[best]:.3f}s)  "
-            f"ratio={per_rank[worst]/per_rank[best]:.2f}x"
+            f"ratio={per_rank[worst] / per_rank[best]:.2f}x"
         )
     report["slowest_rank_per_run"] = slowest
     if len(set(slowest)) == 1:
-        print(f"  -> the SAME rank ({slowest[0]}) is slowest in every run: placement, not contention.")
+        print(
+            f"  -> the SAME rank ({slowest[0]}) is slowest in every run: placement, not contention."
+        )
     else:
-        print(f"  -> the slowest rank MOVES ({slowest}): contention or scheduling, not a fixed rank.")
+        print(
+            f"  -> the slowest rank MOVES ({slowest}): contention or scheduling, not a fixed rank."
+        )
 
     if args.json_out:
         args.json_out.write_text(json.dumps(report, indent=2) + "\n")

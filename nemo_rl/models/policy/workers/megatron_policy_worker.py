@@ -2171,12 +2171,15 @@ class MegatronPolicyWorkerImpl(
             else refit_cfg.get("mx_reshard", {})
         )
         server_url = (
-            getattr(mx_cfg, "server_url", None)
-            if not isinstance(mx_cfg, dict)
-            else mx_cfg.get("server_url")
-        ) or os.environ.get("MX_SERVER_URL") or os.environ.get(
-            "MODEL_EXPRESS_URL"
-        ) or os.environ.get("MX_SERVER_ADDRESS")
+            (
+                getattr(mx_cfg, "server_url", None)
+                if not isinstance(mx_cfg, dict)
+                else mx_cfg.get("server_url")
+            )
+            or os.environ.get("MX_SERVER_URL")
+            or os.environ.get("MODEL_EXPRESS_URL")
+            or os.environ.get("MX_SERVER_ADDRESS")
+        )
         if not server_url:
             raise ValueError(
                 "mx_reshard requires refit_cfg.mx_reshard.server_url, "
@@ -2188,13 +2191,9 @@ class MegatronPolicyWorkerImpl(
         device_id = torch.cuda.current_device()
         model_config = get_model_config(self.model)
         tp_size = int(self.cfg["megatron_cfg"].get("tensor_model_parallel_size", 1))
-        pp_size = int(
-            self.cfg["megatron_cfg"].get("pipeline_model_parallel_size", 1)
-        )
+        pp_size = int(self.cfg["megatron_cfg"].get("pipeline_model_parallel_size", 1))
         ep_size = int(self.cfg["megatron_cfg"].get("expert_model_parallel_size", 1))
-        etp_size = int(
-            self.cfg["megatron_cfg"].get("expert_tensor_parallel_size", 1)
-        )
+        etp_size = int(self.cfg["megatron_cfg"].get("expert_tensor_parallel_size", 1))
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         ep_rank = parallel_state.get_expert_model_parallel_rank()

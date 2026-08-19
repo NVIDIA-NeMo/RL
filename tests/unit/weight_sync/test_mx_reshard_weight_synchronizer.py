@@ -117,9 +117,7 @@ def test_support_validation_accepts_kv_heads_below_tp() -> None:
 
 def test_support_validation_rejects_query_heads_that_do_not_form_groups() -> None:
     with pytest.raises(ValueError, match="divisible by num_query_groups"):
-        check_mx_reshard_refit_support(
-            _supported_gqa_master(heads=63, query_groups=2)
-        )
+        check_mx_reshard_refit_support(_supported_gqa_master(heads=63, query_groups=2))
 
 
 def test_result_validation_accepts_flattened_and_nested_ray_shapes() -> None:
@@ -155,9 +153,7 @@ def test_publish_quorum_completes_before_pull(mock_ray: MagicMock) -> None:
         raise AssertionError(refs)
 
     mock_ray.get.side_effect = get
-    sync = MxReshardWeightSynchronizer(
-        policy, generation, _cluster(2), _cluster(2)
-    )
+    sync = MxReshardWeightSynchronizer(policy, generation, _cluster(2), _cluster(2))
     sync.sync_weights()
 
     assert events == [
@@ -176,9 +172,7 @@ def test_publish_failure_prevents_pull(mock_ray: MagicMock) -> None:
     generation = _generation()
     policy.publish_mx_reshard_weights.return_value = ["publish-ref"]
     mock_ray.get.return_value = [True, False]
-    sync = MxReshardWeightSynchronizer(
-        policy, generation, _cluster(2), _cluster(2)
-    )
+    sync = MxReshardWeightSynchronizer(policy, generation, _cluster(2), _cluster(2))
 
     with pytest.raises(RuntimeError, match="publish failed"):
         sync.sync_weights()
@@ -194,9 +188,7 @@ def test_receiver_failure_does_not_commit_version(mock_ray: MagicMock) -> None:
     policy.publish_mx_reshard_weights.return_value = ["publish-ref"]
     generation.update_weights_from_mx_reshard.return_value = ["pull-ref"]
     mock_ray.get.side_effect = [[True], [False]]
-    sync = MxReshardWeightSynchronizer(
-        policy, generation, _cluster(1), _cluster(1)
-    )
+    sync = MxReshardWeightSynchronizer(policy, generation, _cluster(1), _cluster(1))
 
     with pytest.raises(RuntimeError, match="receive failed"):
         sync.sync_weights()
@@ -213,9 +205,7 @@ def test_init_uses_physical_train_world_size(mock_ray: MagicMock) -> None:
     policy.init_mx_reshard_publisher.return_value = ["trainer-init"]
     generation.init_mx_reshard_receiver.return_value = ["receiver-init"]
     mock_ray.get.side_effect = [[True] * 16, [True] * 8]
-    sync = MxReshardWeightSynchronizer(
-        policy, generation, _cluster(16), _cluster(8)
-    )
+    sync = MxReshardWeightSynchronizer(policy, generation, _cluster(16), _cluster(8))
 
     sync.init_communicator()
 
@@ -238,9 +228,7 @@ def test_init_rejects_overlapping_port_ranges_before_worker_rpcs(
             "receiver_listen_port_base": 19001,
         }
     }
-    sync = MxReshardWeightSynchronizer(
-        policy, generation, _cluster(2), _cluster(2)
-    )
+    sync = MxReshardWeightSynchronizer(policy, generation, _cluster(2), _cluster(2))
 
     with pytest.raises(ValueError, match="listen port ranges overlap"):
         sync.init_communicator()
@@ -262,9 +250,7 @@ def test_shutdown_invokes_both_cleanup_quorums(mock_ray: MagicMock) -> None:
         events.append("receiver-called") or ["receiver-shutdown"]
     )
     mock_ray.get.side_effect = [[True, True], [[True], True]]
-    sync = MxReshardWeightSynchronizer(
-        policy, generation, _cluster(2), _cluster(2)
-    )
+    sync = MxReshardWeightSynchronizer(policy, generation, _cluster(2), _cluster(2))
 
     sync.shutdown()
     sync.shutdown()
@@ -283,9 +269,7 @@ def test_shutdown_attempts_publisher_cleanup_after_receiver_failure(
     policy.shutdown_mx_reshard_publisher.return_value = ["trainer-shutdown"]
     generation.shutdown_mx_reshard_receiver.return_value = ["receiver-shutdown"]
     mock_ray.get.side_effect = [RuntimeError("receiver cleanup failed"), [True]]
-    sync = MxReshardWeightSynchronizer(
-        policy, generation, _cluster(1), _cluster(1)
-    )
+    sync = MxReshardWeightSynchronizer(policy, generation, _cluster(1), _cluster(1))
 
     with pytest.raises(RuntimeError, match="receiver cleanup failed"):
         sync.shutdown()

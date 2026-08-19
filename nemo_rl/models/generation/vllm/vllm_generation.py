@@ -1200,9 +1200,7 @@ class VllmGeneration(GenerationInterface):
             },
         )
 
-    def update_weights_from_mx_reshard(
-        self, *, version: int
-    ) -> list[ray.ObjectRef]:
+    def update_weights_from_mx_reshard(self, *, version: int) -> list[ray.ObjectRef]:
         """Pull a stamped MX version on all vLLM replicas."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")

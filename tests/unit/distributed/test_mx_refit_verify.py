@@ -101,7 +101,9 @@ def test_first_refit_should_change_nothing(capsys):
     model = _Model()
     before = mx_refit_verify.fingerprint_model(model)
 
-    record = mx_refit_verify.report(1, 0, before, mx_refit_verify.fingerprint_model(model))
+    record = mx_refit_verify.report(
+        1, 0, before, mx_refit_verify.fingerprint_model(model)
+    )
 
     assert record["first_refit"] is True
     assert record["params_changed"] == 0
@@ -119,7 +121,9 @@ def test_later_refits_are_flagged_as_a_different_question(capsys):
         model.a.mul_(2.0)
         model.b.mul_(3.0)
 
-    record = mx_refit_verify.report(2, 5, before, mx_refit_verify.fingerprint_model(model))
+    record = mx_refit_verify.report(
+        2, 5, before, mx_refit_verify.fingerprint_model(model)
+    )
 
     assert record["first_refit"] is False
     assert record["params_changed"] == 2

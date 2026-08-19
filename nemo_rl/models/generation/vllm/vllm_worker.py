@@ -1275,12 +1275,15 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             else refit_cfg.get("mx_reshard", {})
         )
         server_url = (
-            getattr(mx_cfg, "server_url", None)
-            if not isinstance(mx_cfg, dict)
-            else mx_cfg.get("server_url")
-        ) or os.environ.get("MX_SERVER_URL") or os.environ.get(
-            "MODEL_EXPRESS_URL"
-        ) or os.environ.get("MX_SERVER_ADDRESS")
+            (
+                getattr(mx_cfg, "server_url", None)
+                if not isinstance(mx_cfg, dict)
+                else mx_cfg.get("server_url")
+            )
+            or os.environ.get("MX_SERVER_URL")
+            or os.environ.get("MODEL_EXPRESS_URL")
+            or os.environ.get("MX_SERVER_ADDRESS")
+        )
         if not server_url:
             raise ValueError(
                 "mx_reshard requires refit_cfg.mx_reshard.server_url, "
@@ -1291,9 +1294,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             if not isinstance(mx_cfg, dict)
             else mx_cfg.get("timeout_s", 1200.0)
         )
-        receiver_listen_port_base = (
-            resolve_mx_reshard_receiver_listen_port_base(mx_cfg)
-        )
+        receiver_listen_port_base = resolve_mx_reshard_receiver_listen_port_base(mx_cfg)
         results = self.llm.collective_rpc(
             "init_mx_reshard_receiver",
             args=(
@@ -1317,9 +1318,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
     def shutdown_mx_reshard_receiver(self) -> bool:
         """Shut down ModelExpress receivers on every backend rank."""
-        results = self.llm.collective_rpc(
-            "shutdown_mx_reshard_receiver", args=tuple()
-        )
+        results = self.llm.collective_rpc("shutdown_mx_reshard_receiver", args=tuple())
         return bool(results) and all(result is True for result in results)
 
     def reset_prefix_cache(self):

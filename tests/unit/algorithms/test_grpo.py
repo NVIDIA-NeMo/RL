@@ -5170,8 +5170,6 @@ def test_needs_hf_refit_handshake(
     backend, nccl_reshard, mx_reshard, colocated, expected
 ):
     assert (
-        _needs_hf_refit_handshake(
-            backend, nccl_reshard, mx_reshard, colocated
-        )
+        _needs_hf_refit_handshake(backend, nccl_reshard, mx_reshard, colocated)
         is expected
     )

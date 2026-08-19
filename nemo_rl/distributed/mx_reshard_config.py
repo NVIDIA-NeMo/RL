@@ -42,9 +42,7 @@ def resolve_mx_reshard_listen_port_bases(config: Any) -> tuple[int, int]:
     receiver = _get(config, "receiver_listen_port_base")
 
     if publisher is None:
-        publisher = (
-            legacy if legacy is not None else DEFAULT_PUBLISHER_LISTEN_PORT_BASE
-        )
+        publisher = legacy if legacy is not None else DEFAULT_PUBLISHER_LISTEN_PORT_BASE
     if receiver is None:
         receiver = (
             int(legacy) + LEGACY_RECEIVER_PORT_OFFSET
@@ -73,7 +71,9 @@ def validate_mx_reshard_listen_port_ranges(
     """Require valid, disjoint physical-rank port ranges before actor startup."""
     publisher, receiver = resolve_mx_reshard_listen_port_bases(config)
     if train_world_size <= 0 or inference_world_size <= 0:
-        raise ValueError("ModelExpress train and inference world sizes must be positive")
+        raise ValueError(
+            "ModelExpress train and inference world sizes must be positive"
+        )
 
     publisher_range = (publisher, publisher + train_world_size - 1)
     receiver_range = (receiver, receiver + inference_world_size - 1)

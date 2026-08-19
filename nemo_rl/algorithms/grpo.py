@@ -1520,9 +1520,7 @@ def setup(
     nccl_reshard_refit_enabled = (
         generation_config.get("refit_transport") == "nccl_reshard"
     )
-    mx_reshard_refit_enabled = (
-        generation_config.get("refit_transport") == "mx_reshard"
-    )
+    mx_reshard_refit_enabled = generation_config.get("refit_transport") == "mx_reshard"
     if nccl_reshard_refit_enabled:
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             check_nccl_reshard_refit_support,

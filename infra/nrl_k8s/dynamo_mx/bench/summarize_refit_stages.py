@@ -111,7 +111,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    rows = [json.loads(line) for line in args.records.read_text().splitlines() if line.strip()]
+    rows = [
+        json.loads(line)
+        for line in args.records.read_text().splitlines()
+        if line.strip()
+    ]
     if not rows:
         print("no records", file=sys.stderr)
         return 1
@@ -129,7 +133,8 @@ def main() -> int:
         critical.append(max(per_step))
 
     per_rank_max = {
-        rank: max(r["accounted_s"] for r in measured if r["rank"] == rank) for rank in ranks
+        rank: max(r["accounted_s"] for r in measured if r["rank"] == rank)
+        for rank in ranks
     }
 
     unattributed = [
@@ -180,7 +185,8 @@ def main() -> int:
             "median": statistics.median(per_rank_gbps),
             "max": max(per_rank_gbps),
         },
-        "aggregate_wire_gbps_upper_bound": len(ranks) * statistics.median(per_rank_gbps),
+        "aggregate_wire_gbps_upper_bound": len(ranks)
+        * statistics.median(per_rank_gbps),
         # Internal consistency only. MX's per-step stages are defined to sum to
         # accounted_s, so a high number here is near-tautological: it proves the
         # stage fields were parsed, not that the refit's cost is understood. It is
