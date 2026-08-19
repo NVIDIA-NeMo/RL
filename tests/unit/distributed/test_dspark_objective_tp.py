@@ -67,7 +67,7 @@ def _dense_loss(
         .squeeze(-1)
     )
     tv_rows = 0.5 * (target_probs - draft_probs).abs().sum(dim=-1)
-    verifier_correct = corrected_logits.detach().argmax(dim=-1).eq(hard_labels).float()
+    acceptance_targets = torch.minimum(target_probs, draft_probs).sum(dim=-1)
     confidence_logits = (
         F.linear(
             torch.cat((hidden, embeddings), dim=-1),
@@ -79,7 +79,7 @@ def _dense_loss(
     )
     confidence_rows = F.binary_cross_entropy_with_logits(
         confidence_logits,
-        verifier_correct,
+        acceptance_targets,
         reduction="none",
     )
     num_bins = hidden.shape[1]

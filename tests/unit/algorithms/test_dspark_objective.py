@@ -247,10 +247,10 @@ def _dense_oracle(inputs: dict[str, object]) -> tuple[DSparkLossBins, ...]:
         .squeeze(-1)
     )
     tv_rows = 0.5 * (target_probs - draft_probs).abs().sum(dim=-1)
-    verifier_correct = corrected_logits.detach().argmax(dim=-1).eq(hard_labels).float()
+    acceptance_targets = torch.minimum(target_probs, draft_probs).sum(dim=-1)
     confidence_rows = F.binary_cross_entropy_with_logits(
         confidence_logits.float(),
-        verifier_correct,
+        acceptance_targets,
         reduction="none",
     )
 
@@ -281,7 +281,7 @@ def _dense_oracle(inputs: dict[str, object]) -> tuple[DSparkLossBins, ...]:
 def test_dspark_objective_matches_dense_component_oracles(
     loss_weights: tuple[float, float, float],
 ) -> None:
-    """Wrong CE, TV factor, verifier target, bins, or weights breaks literals."""
+    """Wrong CE, TV factor, acceptance target, bins, or weights breaks literals."""
     inputs = _inputs()
     expected_ce, expected_tv, expected_confidence = _dense_oracle(inputs)
 

@@ -254,36 +254,6 @@ def _local_label_logits(
     return selected
 
 
-def _global_argmax(
-    logits: torch.Tensor,
-    *,
-    vocab_start: int,
-    global_vocab_size: int,
-    tp_group: torch.distributed.ProcessGroup | None,
-) -> torch.Tensor:
-    local_max, local_index = logits.max(dim=-1)
-    if tp_group is None:
-        return local_index
-    global_max = local_max.clone()
-    torch.distributed.all_reduce(
-        global_max,
-        op=torch.distributed.ReduceOp.MAX,
-        group=tp_group,
-    )
-    global_index = local_index.add(vocab_start)
-    candidates = torch.where(
-        local_max.eq(global_max),
-        global_index,
-        torch.full_like(global_index, global_vocab_size),
-    )
-    torch.distributed.all_reduce(
-        candidates,
-        op=torch.distributed.ReduceOp.MIN,
-        group=tp_group,
-    )
-    return candidates
-
-
 class _TiledProjectedHardCEAndTV(torch.autograd.Function):
     @staticmethod
     def forward(  # pyrefly: ignore[bad-override]
@@ -315,17 +285,13 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
             num_bins, dtype=torch.float32, device=draft_hidden.device
         )
         tv_numerators = torch.zeros_like(ce_numerators)
-        verifier_correct = torch.zeros_like(valid_mask, dtype=torch.float32)
-        flat_correct = verifier_correct.reshape(-1)
+        acceptance_targets = torch.zeros_like(valid_mask, dtype=torch.float32)
+        flat_acceptance = acceptance_targets.reshape(-1)
         log_normalizers = torch.empty(
             (flat_hidden.shape[0], 2),
             dtype=torch.float32,
             device=draft_hidden.device,
         )
-        global_draft_vocab_size = local_vocab_size
-        if tp_group is not None:
-            global_draft_vocab_size *= torch.distributed.get_world_size(tp_group)
-
         for start in range(0, flat_hidden.shape[0], token_chunk_size):
             end = min(start + token_chunk_size, flat_hidden.shape[0])
             tile_valid = flat_valid[start:end]
@@ -366,22 +332,21 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
                 tp_group=tp_group,
             )
             ce_rows = tile_normalizers[:, 1] - label_logits
-            tv_rows = 0.5 * target_probs.sub(draft_probs).abs().sum(dim=-1)
+            distribution_rows = torch.stack(
+                (
+                    0.5 * target_probs.sub(draft_probs).abs().sum(dim=-1),
+                    torch.minimum(target_probs, draft_probs).sum(dim=-1),
+                ),
+                dim=-1,
+            )
             if tp_group is not None:
                 torch.distributed.all_reduce(
-                    tv_rows,
+                    distribution_rows,
                     op=torch.distributed.ReduceOp.SUM,
                     group=tp_group,
                 )
-            predicted_tokens = _global_argmax(
-                draft_logits.float(),
-                vocab_start=vocab_start,
-                global_vocab_size=global_draft_vocab_size,
-                tp_group=tp_group,
-            )
-            flat_correct[start:end].copy_(
-                predicted_tokens.eq(flat_labels[start:end]).float()
-            )
+            tv_rows = distribution_rows[:, 0]
+            flat_acceptance[start:end].copy_(distribution_rows[:, 1])
             ce_numerators.scatter_add_(
                 0,
                 flat_bins[start:end],
@@ -410,15 +375,15 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
         ctx.token_chunk_size = token_chunk_size
         ctx.vocab_start = vocab_start  # pyrefly: ignore[implicitly-defined-attribute]
         ctx.tp_group = tp_group  # pyrefly: ignore[implicitly-defined-attribute]
-        ctx.mark_non_differentiable(verifier_correct)
-        return ce_numerators, tv_numerators, verifier_correct
+        ctx.mark_non_differentiable(acceptance_targets)
+        return ce_numerators, tv_numerators, acceptance_targets
 
     @staticmethod
     def backward(  # pyrefly: ignore[bad-override]
         ctx: Any,
         grad_ce: torch.Tensor,
         grad_tv: torch.Tensor,
-        _grad_correct: torch.Tensor,
+        _grad_acceptance: torch.Tensor,
     ) -> tuple[
         torch.Tensor,
         None,
@@ -810,7 +775,7 @@ def dspark_tiled_objective(
     compact_hard_labels = _compact_retained_view(hard_labels)
     compact_valid_mask = _compact_retained_view(valid_mask)
     compact_slot_bins = _compact_retained_view(slot_bins)
-    ce_numerators, tv_numerators, verifier_correct = _TiledProjectedHardCEAndTV.apply(
+    ce_numerators, tv_numerators, acceptance_targets = _TiledProjectedHardCEAndTV.apply(
         compact_hidden,
         target_output_weight,
         compact_target,
@@ -845,7 +810,7 @@ def dspark_tiled_objective(
         )
         confidence_rows = F.binary_cross_entropy_with_logits(
             safe_confidence,
-            verifier_correct,
+            acceptance_targets,
             reduction="none",
         )
         confidence_numerators = torch.zeros_like(ce_numerators)
