@@ -230,18 +230,42 @@ class DataPlaneCheckpointBarrier:
         self._condition = asyncio.Condition()
         self._checkpoint_active = False
         self._active_mutations = 0
+        self._mutation_depth_by_task: dict[asyncio.Task[Any], int] = {}
+        self._mutation_cut_by_task: dict[
+            asyncio.Task[Any], DataPlaneMutationCut
+        ] = {}
 
     @asynccontextmanager
     async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
-        """Yield a live mutation capability after any active checkpoint exits."""
+        """Yield one task-local live cut after any active checkpoint exits."""
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("data-plane mutation must run inside an asyncio task")
+        depth = self._mutation_depth_by_task.get(task, 0)
+        if depth:
+            # Replay-buffer helpers may join a controller-owned mutation. Do not
+            # wait behind a checkpoint that is already waiting for this outer
+            # mutation, or the two tasks deadlock.
+            self._mutation_depth_by_task[task] = depth + 1
+            cut = self._mutation_cut_by_task[task]
+            cut.require_live()
+            try:
+                yield cut
+            finally:
+                self._mutation_depth_by_task[task] -= 1
+            return
         async with self._condition:
             await self._condition.wait_for(lambda: not self._checkpoint_active)
             self._active_mutations += 1
-        cut = DataPlaneMutationCut(self)
+            self._mutation_depth_by_task[task] = 1
+            cut = DataPlaneMutationCut(self)
+            self._mutation_cut_by_task[task] = cut
         try:
             yield cut
         finally:
             cut._invalidate()
+            del self._mutation_cut_by_task[task]
+            del self._mutation_depth_by_task[task]
             async with self._condition:
                 self._active_mutations -= 1
                 if self._active_mutations == 0:
