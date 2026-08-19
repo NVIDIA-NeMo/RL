@@ -968,6 +968,16 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
             model_cfg.moe_flex_dispatcher_num_sms = num_sms
         else:
             model_cfg.moe_hybridep_num_sms = num_sms
+    if "moe_hybridep_pad_uneven_dispatch_inputs" in config["megatron_cfg"]:
+        if not hasattr(model_cfg, "moe_hybridep_pad_uneven_dispatch_inputs"):
+            warnings.warn(
+                "Megatron-LM version does not support moe_hybridep_pad_uneven_dispatch_inputs. Setting to False."
+            )
+            config["megatron_cfg"]["moe_hybridep_pad_uneven_dispatch_inputs"] = False
+        else:
+            model_cfg.moe_hybridep_pad_uneven_dispatch_inputs = config["megatron_cfg"][
+                "moe_hybridep_pad_uneven_dispatch_inputs"
+            ]
 
     # HybridEP environment variables
     # These are required by DeepEP's hybrid-ep branch for NVLink domain configuration.
