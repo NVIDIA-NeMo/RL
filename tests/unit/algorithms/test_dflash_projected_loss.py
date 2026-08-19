@@ -14,10 +14,17 @@
 
 import torch
 
+import nemo_rl.algorithms.loss as loss_api
+from nemo_rl.algorithms.loss import loss_functions
 from nemo_rl.algorithms.loss.draft import (
     dflash_projected_vocab_parallel_soft_ce,
 )
 from nemo_rl.algorithms.loss.loss_functions import DFlashProjectedLossFn
+
+
+def test_projected_dflash_loss_is_not_exposed_as_generic_loss_function() -> None:
+    assert not hasattr(loss_api, "DFlashProjectedLossFn")
+    assert not hasattr(loss_functions, "DFlashProjectedLossFn")
 
 
 def _inputs() -> tuple[torch.Tensor, ...]:
