@@ -1560,13 +1560,11 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     attention_backend=flash (FA4 via TE), and the Transformer Engine generation
     layer spec so generation and scoring share the patched MoE unpermute path.
     Also applies TE cuBLAS workspace shrink and TP=1 log-softmax via patches.py,
-    MoE gather unpermute plus index_put routing maps (gather+droppad on CUDA-graphed
-    decode) via moe_zero_kl_patches.py, router replay, Mamba train/prefill/decode alignment
-    via mamba_zero_kl_patches.py, generation ``logprobs_mode=raw_logprobs`` so
-    gen uses ``F.log_softmax`` (not FlashInfer processed log-probs). When
-    generation CUDA graphs are enabled, also applies
-    ``apply_cuda_graph_inference_determinism_patches``. Router replay and
-    moe_grouped_gemm must be configured explicitly.
+    deterministic MoE fixed-order combine (train + generation) via moe_zero_kl_patches.py,
+    and Mamba train/prefill/decode alignment via mamba_zero_kl_patches.py.
+    Generation uses ``logprobs_mode=raw_logprobs`` so gen uses ``F.log_softmax``
+    (not FlashInfer processed log-probs). Router replay and moe_grouped_gemm must
+    be configured explicitly.
     """
     if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
@@ -1577,7 +1575,6 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
         policy_uses_mamba_layers,
     )
     from nemo_rl.models.policy.workers.moe_zero_kl_patches import (
-        apply_cuda_graph_inference_determinism_patches,
         apply_moe_determinism_patches,
     )
     from nemo_rl.models.policy.workers.patches import (
@@ -1593,8 +1590,6 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
         "use_mamba_mem_eff_path", False
     )  # Disable Mamba's memory-efficient path
     generation = config.get("generation")
-    mcore_gen = (generation or {}).get("mcore_generation_config") or {}
-    cuda_graphs_on = mcore_gen.get("cuda_graph_impl", "none") not in (None, "none")
     if generation is not None and "mcore_generation_config" in generation:
         generation["mcore_generation_config"]["transformer_impl"] = "transformer_engine"
         # Match the TP=1 train log-softmax patch: Megatron processed_logprobs
@@ -1604,8 +1599,6 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     apply_log_softmax_determinism_patch()
     apply_moe_determinism_patches()
     apply_mamba_alignment_patch(required=policy_uses_mamba_layers(config))
-    if cuda_graphs_on:
-        apply_cuda_graph_inference_determinism_patches()
     # Starve PyTorch's own cuBLAS workspace so non-TE aten::mm/addmm paths also
     # pick workspace-free (splitK=1, reduction=NONE) algorithms.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
