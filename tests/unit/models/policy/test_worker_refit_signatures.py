@@ -87,6 +87,25 @@ GEN_FANOUT = [
     ("nccl_reshard_refit", "vllm_worker_async.py", "nccl_reshard_refit_async"),
 ]
 
+# One level up again: CollectiveWeightSynchronizer holds a GenerationInterface and calls
+# update_weights_from_collective on it, so EVERY backend has to take what it sends --
+# not just the one the author happened to test. Missing this cost a red
+# L1_Functional_Tests_Dynamo: the Dynamo backend arrived from upstream while this branch
+# was adding refit_timeout_s to the call, and nothing connected the two until a GPU job
+# failed. SGLang and Megatron cannot reach that synchronizer today (SGLang is rejected
+# for non-colocated, Megatron routes to its own), but they implement the same interface
+# method and are listed so the contract stays uniform rather than "uniform where it
+# currently matters".
+GENERATION = REPO_ROOT / "nemo_rl" / "models" / "generation"
+GENERATION_BACKENDS = [
+    "interfaces.py",
+    "vllm/vllm_generation.py",
+    "dynamo/dynamo_generation.py",
+    "trtllm/trtllm_generation.py",
+    "megatron/megatron_generation.py",
+    "sglang/sglang_generation.py",
+]
+
 
 def _kwargs_of(path: Path, method: str) -> set[str]:
     """Keyword names accepted by the outermost definition of ``method`` in ``path``."""
@@ -179,6 +198,36 @@ def test_both_engine_branches_accept_what_generation_forwards(
         "Which branch a run takes is decided by vllm_cfg.async_engine, so this is a "
         "config-dependent hang: the generation actor raises TypeError, never joins the "
         "collective, and the training side blocks in ray.get with no error anywhere."
+    )
+
+
+def _forwarded_by_collective_synchronizer() -> set[str]:
+    """Keywords the synchronizer sends to ``generation.update_weights_from_collective``."""
+    path = REPO_ROOT / "nemo_rl" / "weight_sync" / "collective_weight_synchronizer.py"
+    tree = ast.parse(path.read_text())
+    for call in ast.walk(tree):
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "update_weights_from_collective"
+        ):
+            return {kw.arg for kw in call.keywords if kw.arg is not None}
+    raise AssertionError(
+        "CollectiveWeightSynchronizer no longer calls update_weights_from_collective"
+    )
+
+
+@pytest.mark.parametrize("backend", GENERATION_BACKENDS)
+def test_every_generation_backend_accepts_what_the_synchronizer_sends(backend):
+    forwarded = _forwarded_by_collective_synchronizer()
+    accepted = _kwargs_of(GENERATION / backend, "update_weights_from_collective")
+    missing = forwarded - accepted
+    assert not missing, (
+        f"CollectiveWeightSynchronizer sends {sorted(missing)} to "
+        f"generation.update_weights_from_collective(), but {backend} does not accept "
+        f"{'it' if len(missing) == 1 else 'them'}. The synchronizer holds a "
+        "GenerationInterface, so whichever backend is configured receives this call; "
+        "a backend missing the kwarg fails at the Ray boundary during the first refit."
     )
 
 
