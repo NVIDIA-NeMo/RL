@@ -24,7 +24,7 @@ from typing import Any, Callable, Optional, TypeVar, cast
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -91,6 +91,7 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
+    RewardPenaltyConfig,
     attach_initial_nemo_gym_image_payloads,
     backfill_missing_routed_experts,
     get_nemo_gym_thinking_tags,
@@ -98,6 +99,7 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
+    validate_reward_penalties_use_nemo_gym,
 )
 from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
@@ -129,6 +131,7 @@ from nemo_rl.utils.logger import (
     LoggerConfig,
     print_message_log_samples,
     should_log_nemo_gym_full_result_tables,
+    should_log_nemo_gym_responses,
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.multimodal_payload_metrics import (
@@ -196,46 +199,6 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: bool = False
-
-
-class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
-    """Optional token IDs for reward penalties."""
-
-    unwanted: list[int] | None = None
-    think_open: int | None = None
-    think_close: int | None = None
-
-
-class RewardPenaltyConfig(BaseModel, extra="allow"):
-    """Reward-zeroing penalties applied to NeMo-Gym rollout results."""
-
-    penalize_duplicated_reasoning: bool = False
-    penalize_empty_final_answer: bool = False
-    penalize_unwanted_tokens: bool = False
-    penalize_malformed_think_tag: bool = False
-    # Optional token IDs. token_ids.unwanted is required when
-    # penalize_unwanted_tokens is true;
-    # think-tag IDs are inferred from configured tag strings when possible.
-    token_ids: Optional[RewardPenaltyTokenIdsConfig] = None
-
-    @model_validator(mode="after")
-    def _require_unwanted_token_ids_when_penalized(self) -> "RewardPenaltyConfig":
-        if self.penalize_unwanted_tokens and (
-            self.token_ids is None or not self.token_ids.unwanted
-        ):
-            raise ValueError(
-                "reward_penalties.token_ids.unwanted must be set when "
-                "reward_penalties.penalize_unwanted_tokens is true"
-            )
-        return self
-
-
-_REWARD_PENALTY_FLAGS = (
-    "penalize_duplicated_reasoning",
-    "penalize_empty_final_answer",
-    "penalize_unwanted_tokens",
-    "penalize_malformed_think_tag",
-)
 
 
 class GRPOConfig(BaseModel, extra="allow"):
@@ -1969,18 +1932,9 @@ def _raise_if_reward_penalties_enabled_without_nemo_gym(
     enable_nemo_gym: bool,
 ) -> None:
     """Validate reward-zeroing penalties are only used with NeMo-Gym."""
-    if enable_nemo_gym:
-        return
-
-    if not any(
-        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
-    ):
-        return
-
-    raise ValueError(
-        "reward_penalties require the NeMo-Gym path "
-        "(env.should_use_nemo_gym=true); they are not supported with the native "
-        "generation path."
+    validate_reward_penalties_use_nemo_gym(
+        master_config.reward_penalties,
+        enable_nemo_gym=enable_nemo_gym,
     )
 
 
@@ -2168,23 +2122,6 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     loss_multiplier[mask_sample_bool] = 0
     repeated_batch["loss_multiplier"] = loss_multiplier
     return num_masked
-
-
-def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
-    """Whether NeMo Gym is responsible for full response logging.
-
-    When **True**, skip the expensive per-step ``train_data_step*.jsonl`` dump.
-    When **False** (the default if unset), write the local JSONL file.
-
-    W&B full-result Tables are controlled independently by
-    ``logger.wandb.log_nemo_gym_full_result_tables``.
-    """
-    env_config = master_config.env
-    should_log_nemo_gym_responses = bool(
-        env_config.get("should_log_nemo_gym_responses")
-    )
-
-    return should_log_nemo_gym_responses
 
 
 def _write_latest_checkpoint_status(
@@ -3629,7 +3566,7 @@ def grpo_train(
             # Logging
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
-            if not _should_log_nemo_gym_responses(master_config):
+            if not should_log_nemo_gym_responses(master_config.env):
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
@@ -5200,8 +5137,8 @@ def async_grpo_train(
             # Log training data (match sync GRPO logging payload for parity).
             # NeMo Gym responses can be very large and expensive to log; when
             # env.should_log_nemo_gym_responses is true, skip this jsonl (see
-            # _should_log_nemo_gym_responses).
-            if not _should_log_nemo_gym_responses(master_config):
+            # should_log_nemo_gym_responses).
+            if not should_log_nemo_gym_responses(master_config.env):
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]

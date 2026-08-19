@@ -63,7 +63,7 @@ Set `ppo.async_ppo.enabled: true` to overlap rollout generation with training. A
 
 Async PPO reuses the trajectory collector, replay buffer, and weight-versioning infrastructure described in the [Async GRPO guide](async-grpo.md); this section focuses on PPO-specific behavior and constraints.
 
-Async PPO requires non-colocated vLLM generation with `vllm_cfg.async_engine: true`, `loss_fn.use_importance_sampling_correction: true`, and `loss_fn.force_on_policy_ratio: false`. Dynamic sampling, reward scaling, reward shaping, multiple dataloaders, NeMo Gym, colocated generation, and FP8 KV-scale synchronization are not supported yet.
+Async PPO requires non-colocated vLLM generation with `vllm_cfg.async_engine: true`, `loss_fn.use_importance_sampling_correction: true`, and `loss_fn.force_on_policy_ratio: false`. Dynamic sampling, reward scaling, reward shaping, multiple dataloaders, colocated generation, and FP8 KV-scale synchronization are not supported yet. NeMo Gym rollouts are supported through [run_ppo_nemo_gym.py](../../examples/nemo_gym/run_ppo_nemo_gym.py).
 
 `max_trajectory_age_steps` is the normal policy-training age limit. The recommended value is `1`; larger values improve overlap but increase off-policy bias in GAE. When `policy_training_start_step > 0`, set `warmup_generation_lead_steps` to a larger value to bank additional rollout batches while the policy is frozen for critic warmup. The collector caps frozen-policy targets at `policy_training_start_step + max_trajectory_age_steps`, so their actual policy-update age remains within the normal limit. The buffer keeps these batches valid through that frontier and then restores the normal age limit. `null` uses `max_trajectory_age_steps` as the generation lead throughout.
 

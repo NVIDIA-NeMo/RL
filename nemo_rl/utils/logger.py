@@ -100,6 +100,11 @@ def should_log_nemo_gym_full_result_tables(
     return wandb_enabled and bool(wandb_config.get("log_nemo_gym_full_result_tables"))
 
 
+def should_log_nemo_gym_responses(env_config: Mapping[str, Any]) -> bool:
+    """Return whether NeMo Gym owns full response logging."""
+    return bool(env_config.get("should_log_nemo_gym_responses"))
+
+
 class LoggerInterface(ABC):
     """Abstract base class for logger backends."""
 

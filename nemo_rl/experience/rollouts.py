@@ -27,7 +27,7 @@ from typing import Any, Optional
 
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
@@ -351,6 +351,61 @@ class EffortLevelsConfig(BaseModel, extra="allow"):
     """Response-length upper bound (in tokens) used to normalise the term."""
     low_string: str = ""
     """Substring that must appear in the user prompt to trigger shaping."""
+
+
+class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
+    """Optional token IDs for NeMo-Gym reward penalties."""
+
+    unwanted: list[int] | None = None
+    think_open: int | None = None
+    think_close: int | None = None
+
+
+class RewardPenaltyConfig(BaseModel, extra="allow"):
+    """Reward-zeroing penalties applied to NeMo-Gym rollout results."""
+
+    penalize_duplicated_reasoning: bool = False
+    penalize_empty_final_answer: bool = False
+    penalize_unwanted_tokens: bool = False
+    penalize_malformed_think_tag: bool = False
+    token_ids: RewardPenaltyTokenIdsConfig | None = None
+
+    @model_validator(mode="after")
+    def _require_unwanted_token_ids_when_penalized(self) -> "RewardPenaltyConfig":
+        if self.penalize_unwanted_tokens and (
+            self.token_ids is None or not self.token_ids.unwanted
+        ):
+            raise ValueError(
+                "reward_penalties.token_ids.unwanted must be set when "
+                "reward_penalties.penalize_unwanted_tokens is true"
+            )
+        return self
+
+
+_REWARD_PENALTY_FLAGS = (
+    "penalize_duplicated_reasoning",
+    "penalize_empty_final_answer",
+    "penalize_unwanted_tokens",
+    "penalize_malformed_think_tag",
+)
+
+
+def validate_reward_penalties_use_nemo_gym(
+    reward_penalty_config: RewardPenaltyConfig,
+    *,
+    enable_nemo_gym: bool,
+) -> None:
+    """Reject enabled reward penalties outside the NeMo-Gym rollout path."""
+    if enable_nemo_gym or not any(
+        getattr(reward_penalty_config, flag) for flag in _REWARD_PENALTY_FLAGS
+    ):
+        return
+
+    raise ValueError(
+        "reward_penalties require the NeMo-Gym path "
+        "(env.should_use_nemo_gym=true); they are not supported with the native "
+        "generation path."
+    )
 
 
 @dataclass

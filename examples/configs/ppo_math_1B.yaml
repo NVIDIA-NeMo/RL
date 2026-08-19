@@ -62,6 +62,15 @@ ppo:
   # high-error sequences; null keeps metrics-only behavior.
   seq_logprob_error_threshold: null
 
+# Reward-zeroing penalties applied to NeMo-Gym rollout results.
+reward_penalties:
+  penalize_duplicated_reasoning: false
+  penalize_empty_final_answer: false
+  penalize_unwanted_tokens: false
+  penalize_malformed_think_tag: false
+  # Optional token IDs used by unwanted-token and think-tag checks.
+  token_ids: null
+
 loss_fn:
   disable_ppo_ratio: false
   reference_policy_kl_penalty: 0.0  # DAPO: no KL penalty

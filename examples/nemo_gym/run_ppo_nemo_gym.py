@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,12 +18,16 @@ import pprint
 
 from omegaconf import OmegaConf
 
+from examples.run_ppo import _validate_async_ppo_config
 from nemo_rl.algorithms.ppo import MasterConfig, async_ppo_train, ppo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.nemo_gym import (
+    setup_nemo_gym_config,
+    should_use_nemo_gym,
+)
 from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -33,87 +37,29 @@ from nemo_rl.utils.logger import get_next_experiment_dir
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Run PPO training with configuration")
-    parser.add_argument(
-        "--config", type=str, default=None, help="Path to YAML config file"
-    )
-
-    # Parse known args for the script
-    args, overrides = parser.parse_known_args()
-
-    return args, overrides
-
-
-def _validate_async_ppo_config(
-    config: MasterConfig, policy_generation: GenerationInterface | None
-) -> None:
-    """Validate Async PPO requirements and unsupported features."""
-    generation_config = config.policy["generation"]
-    backend = generation_config.get("backend") if generation_config else None
-    vllm_config = generation_config.get("vllm_cfg") if generation_config else None
-    async_engine = bool(vllm_config and vllm_config.get("async_engine"))
-    if backend != "vllm" or not async_engine:
-        raise ValueError(
-            "Async PPO requires policy.generation.backend=vllm and "
-            "policy.generation.vllm_cfg.async_engine=true"
-        )
-    if not config.loss_fn.use_importance_sampling_correction:
-        raise ValueError(
-            "Async PPO requires loss_fn.use_importance_sampling_correction=true"
-        )
-    if config.loss_fn.force_on_policy_ratio:
-        raise ValueError("Async PPO requires loss_fn.force_on_policy_ratio=false")
-    if generation_config["colocated"]["enabled"]:
-        raise ValueError("Async PPO requires non-colocated generation")
-    if config.ppo.max_num_epochs != -1:
-        raise NotImplementedError(
-            "Async PPO does not support an epoch limit; set "
-            "ppo.max_num_epochs=-1 and use ppo.max_num_steps to control "
-            "training length"
-        )
-
-    unsupported_features = {
-        "Dynamic sampling": config.ppo.use_dynamic_sampling,
-        "Reward scaling": config.ppo.reward_scaling.enabled,
-        "Reward shaping": config.ppo.reward_shaping.enabled,
-        "Multiple dataloaders": config.data["use_multiple_dataloader"],
-        "FP8 KV-scale synchronization": bool(
-            getattr(policy_generation, "requires_kv_scale_sync", False)
-        ),
-    }
-    for feature, enabled in unsupported_features.items():
-        if enabled:
-            raise NotImplementedError(f"{feature} is not supported with async PPO")
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Run PPO training with NeMo Gym")
+    parser.add_argument("--config", type=str, default=None)
+    return parser.parse_known_args()
 
 
 def main() -> None:
-    """Main entry point."""
-    # Parse arguments
+    """Run synchronous or asynchronous PPO with NeMo Gym rollouts."""
     register_omegaconf_resolvers()
     args, overrides = parse_args()
-
     if not args.config:
         args.config = os.path.join(
-            os.path.dirname(__file__), "configs", "ppo_math_1B.yaml"
+            os.path.dirname(__file__), "ppo_math_rlvr_nemo_gym.yaml"
         )
 
     config = load_config(args.config)
     print(f"Loaded configuration from: {args.config}")
-
     if overrides:
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
-
-    config = OmegaConf.to_container(config, resolve=True)
-    config = MasterConfig(**config)
+    config = MasterConfig(**OmegaConf.to_container(config, resolve=True))
     print("Applied CLI overrides")
 
-    # Print config
-    print("Final config:")
-    pprint.pprint(config)
-
-    # Get the next experiment directory with incremented ID
     config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
     print(f"📊 Using log directory: {config.logger['log_dir']}")
     if config.checkpointing["enabled"]:
@@ -121,9 +67,6 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
-    init_ray()
-
-    # setup tokenizer
     tokenizer = get_tokenizer(config.policy["tokenizer"])
     assert config.policy["generation"] is not None, (
         "A generation config is required for PPO"
@@ -131,21 +74,31 @@ def main() -> None:
     config.policy["generation"] = configure_generation_config(
         config.policy["generation"], tokenizer
     )
+    setup_nemo_gym_config(config, tokenizer)
+    assert should_use_nemo_gym(config)
 
-    # setup data
-    (
-        dataset,
-        val_dataset,
-        task_to_env,
-        val_task_to_env,
-    ) = setup_response_data(tokenizer, config.data, config.env)
+    print("\n▶ Setting up data...")
+    dataset, val_dataset = setup_response_data(tokenizer, config.data, env_configs=None)
+
+    if config.ppo.max_val_samples is not None:
+        raise ValueError(
+            "ppo.max_val_samples must be null for NeMo Gym; validation uses "
+            "the complete prepared validation dataset"
+        )
+    if val_dataset is not None:
+        config.ppo.max_val_samples = len(val_dataset)
+        config.ppo.val_batch_size = len(val_dataset)
+
+    print("Final config:")
+    pprint.pprint(config)
+    init_ray()
 
     (
         policy,
         policy_generation,
-        _nemo_gym,
+        nemo_gym,
         value_model,
-        cluster,
+        _cluster,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -155,15 +108,17 @@ def main() -> None:
         ppo_state,
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
+    assert nemo_gym is not None
 
-    async_config = config.ppo.async_ppo
-    async_ppo_enabled = async_config.enabled
+    task_to_env = {"nemo_gym": nemo_gym}
+    val_task_to_env = task_to_env
+    async_ppo_enabled = config.ppo.async_ppo.enabled
     if async_ppo_enabled:
         _validate_async_ppo_config(config, policy_generation)
 
     with checkpointer:
         if async_ppo_enabled:
-            print("🚀 Running asynchronous PPO training")
+            print("🚀 Running asynchronous PPO training with NeMo Gym")
             async_ppo_train(
                 policy,
                 policy_generation,
@@ -181,7 +136,7 @@ def main() -> None:
                 master_config,
             )
         else:
-            print("🚀 Running synchronous PPO training")
+            print("🚀 Running synchronous PPO training with NeMo Gym")
             ppo_train(
                 policy,
                 policy_generation,

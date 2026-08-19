@@ -1,0 +1,42 @@
+# PPO with NeMo Gym math RLVR rollouts.
+defaults: ../configs/ppo_math_1B.yaml
+
+policy:
+  generation:
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+
+ppo:
+  max_val_samples: null
+  val_batch_size: null
+  reward_scaling:
+    enabled: false
+  reward_shaping:
+    enabled: false
+
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: /path/to/train.jsonl
+  validation:
+    data_path: /path/to/validation.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
