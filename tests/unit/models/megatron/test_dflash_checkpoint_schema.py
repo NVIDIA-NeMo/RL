@@ -70,6 +70,24 @@ def test_qwen3_8b_defaults_are_pinned_and_frozen() -> None:
         config.hidden_size = 8  # type: ignore[misc]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("rope_theta", float("nan")),
+        ("rope_theta", float("inf")),
+        ("rms_norm_eps", float("nan")),
+        ("rms_norm_eps", float("inf")),
+        ("initializer_range", float("nan")),
+        ("initializer_range", float("inf")),
+    ],
+)
+def test_config_rejects_nonfinite_positive_float_fields(
+    field: str, value: float
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        DFlashBodyConfig(**{field: value})
+
+
 def test_exact_public_body_state_dict_schema_and_shapes() -> None:
     artifact_provenance = (
         f"{_PUBLIC_ARTIFACT_REPO}@{_PUBLIC_ARTIFACT_REVISION}; "
