@@ -81,6 +81,30 @@ os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
 
 
+def _warn_if_uv_cache_dir_set():
+    """Warn if UV_CACHE_DIR is set, since the default is almost always the right choice.
+
+    Pointing uv at a non-default cache bypasses the cache that holds NeMo RL's
+    prebuilt wheels (e.g. the one baked into the container), and a cache placed on
+    a persistent/shared filesystem has been observed to corrupt when several jobs
+    use it concurrently.
+    """
+    uv_cache_dir = os.environ.get("UV_CACHE_DIR")
+    if not uv_cache_dir:
+        return
+
+    logging.warning(
+        f"UV_CACHE_DIR is set to '{uv_cache_dir}'. This bypasses the default uv cache "
+        "holding NeMo RL's prebuilt wheels (causing slow reinstalls even with a prebuilt "
+        "container), and a cache on a persistent/shared filesystem can be corrupted by "
+        "concurrent jobs. Recommended: `unset UV_CACHE_DIR` and let uv use its default, "
+        "whether in a container or on baremetal."
+    )
+
+
+_warn_if_uv_cache_dir_set()
+
+
 def _is_build_isolation():
     """Detect if we're running in a uv build isolation environment.
 
