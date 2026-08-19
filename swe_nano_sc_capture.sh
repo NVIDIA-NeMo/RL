@@ -31,6 +31,9 @@ BASE_LOG_DIR="${WORKSPACE_DIR}/ray_logs/${EXP_NAME}"
 NRL_FORCE_REBUILD_VENVS_LIST="nemo_rl.environments.nemo_gym.NemoGym,nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
 NRL_DRIVER_PYTHONPATH="/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 NRL_DRIVER_PIP_INSTALL="orjson"
+# Ray is started from the container's prefetched environment. Keep the driver on
+# that exact Python/Ray pair; only class-specific worker venvs are rebuilt below.
+NRL_DRIVER_UV_RUN_FLAGS="--locked --no-sync"
 
 # --- Per-call latency breakdown (CALL_TIMING=0 to disable) --------------------
 if [ "${CALL_TIMING:-1}" = "1" ]; then

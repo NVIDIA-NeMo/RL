@@ -62,6 +62,7 @@ set -euo pipefail
 #   INTERACTIVE_WALLTIME=                  override WALLTIME for the interactive alloc
 #   HF_HOME=                               HuggingFace cache root (recommended)
 #   HF_TOKEN=                              HuggingFace API token
+#   NRL_DRIVER_UV_RUN_FLAGS=               Extra flags for the driver-only uv run
 #   WANDB_API_KEY=                         Weights & Biases API key
 #   WANDB_PROJ=nemotron-3-ultra            W&B project
 #   WANDB_ENTITY=                          W&B entity
@@ -705,7 +706,7 @@ NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 \
 NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ${NRL_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py} \
+uv run ${NRL_DRIVER_UV_RUN_FLAGS:-} ${NRL_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
