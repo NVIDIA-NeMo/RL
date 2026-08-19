@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
@@ -25,6 +26,7 @@ from nemo_rl.algorithms.loss.interfaces import (
 )
 from nemo_rl.algorithms.loss.utils import (
     DRAFT_LOSS_SEQ_CHUNK_SIZE,
+    block_draft_slot_mask,
     draft_pass_token_mask,
 )
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
@@ -196,6 +198,181 @@ class DraftCrossEntropyLossFn(LossFunction):
                 )
 
         loss = total / torch.clamp(denominator.float(), min=1.0)
+        return loss, metrics
+
+
+BLOCK_DRAFT_LOSS_WEIGHTING_SCHEMES = ("uniform", "exp")
+
+# DFlash paper (arXiv 2602.06036) gamma_d table for the "exp" scheme, keyed by
+# block size (anchor + gamma slots, NOT gamma). Non-tabulated sizes
+# interpolate/extrapolate linearly, clamped to >= 1.
+_DFLASH_GAMMA_D_BY_BLOCK_SIZE: tuple[tuple[int, float], ...] = (
+    (8, 4.0),
+    (10, 5.0),
+    (16, 7.0),
+)
+
+
+def _dflash_gamma_d(block_size: int) -> float:
+    points = _DFLASH_GAMMA_D_BY_BLOCK_SIZE
+    if block_size <= points[0][0]:
+        (b0, g0), (b1, g1) = points[0], points[1]
+    elif block_size >= points[-1][0]:
+        (b0, g0), (b1, g1) = points[-2], points[-1]
+    else:
+        for (b0, g0), (b1, g1) in zip(points, points[1:]):
+            if b0 <= block_size <= b1:
+                break
+    gamma_d = g0 + (g1 - g0) * (block_size - b0) / (b1 - b0)
+    return max(gamma_d, 1.0)
+
+
+def resolve_block_draft_slot_weights(scheme: Optional[str], gamma: int) -> list[float]:
+    """Resolve a named block-draft slot-weighting scheme to per-slot weights.
+
+    Args:
+        scheme: ``None``/``"uniform"`` for all-ones weights, or ``"exp"`` for
+            the DFlash paper's exponentially decaying weight
+            ``w_j = exp(-j / gamma_d)``, with ``gamma_d`` tabulated by block
+            size (b8 -> 4, b10 -> 5, b16 -> 7) and interpolated in between.
+        gamma: Number of draft slots (block size minus the anchor).
+
+    Returns:
+        Weights of length ``gamma``, suitable as ``BlockDraftLossFn``
+        ``slot_weights``.
+    """
+    if scheme is None or scheme == "uniform":
+        return [1.0] * gamma
+    if scheme != "exp":
+        raise ValueError(
+            f"Unknown draft loss_weighting scheme {scheme!r}; expected null or "
+            f"one of {BLOCK_DRAFT_LOSS_WEIGHTING_SCHEMES}."
+        )
+    gamma_d = _dflash_gamma_d(gamma + 1)
+    return [math.exp(-j / gamma_d) for j in range(gamma)]
+
+
+class BlockDraftLossDataDict(TypedDict):
+    draft_anchor_positions: Tensor
+    draft_anchor_valid: Tensor
+    token_mask: Tensor
+    sample_mask: Tensor
+
+
+class BlockDraftLossFn(LossFunction):
+    """Soft-target cross-entropy for DFlash block draft training.
+
+    Slot ``j`` of a block anchored at ``p`` predicts ``x_{p + 1 + j}``; its
+    soft target is the (detached) policy logits at position ``p + j``. Both
+    student ``[B, N, gamma, V_local]`` and the gathered teacher are flattened
+    to a ``[B, N * gamma, V_local]`` "sequence" for the same chunked,
+    vocab-parallel soft CE the TTT draft loss uses.
+
+    ``slot_weights[j]`` (e.g. DFlash's exponential position decay) weights
+    both the numerator and the ``global_draft_pass_counts``-based denominator
+    — the counts vector here is the per-slot analogue produced by
+    ``compute_block_draft_slot_valid_counts`` (shape ``[gamma]``). Metrics are
+    normalized by the GLOBAL per-slot counts so the driver's
+    sum-over-microbatches reconstructs global means (same contract as
+    ``DraftCrossEntropyLossFn``).
+    """
+
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.DRAFT
+
+    def __init__(
+        self,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        slot_weights: Optional[list[float]] = None,
+    ):
+        self.vocab_parallel_group = vocab_parallel_group
+        self.slot_weights = slot_weights
+
+    def __call__(
+        self,
+        teacher_logits: Tensor,
+        student_block_logits: Tensor,
+        data: BatchedDataDict[BlockDraftLossDataDict],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        global_draft_pass_counts: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        batch_size, num_anchors, gamma, _ = student_block_logits.shape
+        seq_len = teacher_logits.shape[1]
+        device = student_block_logits.device
+
+        if self.slot_weights is not None and len(self.slot_weights) != gamma:
+            raise ValueError(
+                f"slot_weights has {len(self.slot_weights)} entries but the "
+                f"draft produced gamma={gamma} slots."
+            )
+        if (
+            global_draft_pass_counts is not None
+            and global_draft_pass_counts.shape[0] != gamma
+        ):
+            raise ValueError(
+                f"global_draft_pass_counts has {global_draft_pass_counts.shape[0]} "
+                f"entries but the draft produced gamma={gamma} slots."
+            )
+
+        anchors = data["draft_anchor_positions"]
+        anchor_valid = data["draft_anchor_valid"]
+        token_mask = data["token_mask"]
+        sample_mask = data["sample_mask"]
+
+        # Teacher for slot j sits at position p + j (it predicts x_{p+1+j}).
+        teacher_pos = (
+            anchors.unsqueeze(-1) + torch.arange(gamma, device=device).view(1, 1, -1)
+        ).clamp(max=seq_len - 1)
+        gather_index = teacher_pos.reshape(batch_size, num_anchors * gamma, 1).expand(
+            -1, -1, teacher_logits.shape[-1]
+        )
+        teacher_block = torch.gather(teacher_logits.detach(), 1, gather_index)
+
+        student_flat = student_block_logits.reshape(batch_size, num_anchors * gamma, -1)
+        per_token_loss = ChunkedDistributedCrossEntropy.apply(
+            student_flat,
+            teacher_block,
+            DRAFT_LOSS_SEQ_CHUNK_SIZE,
+            self.vocab_parallel_group,
+            False,
+        ).reshape(batch_size, num_anchors, gamma)
+
+        slot_mask = block_draft_slot_mask(
+            token_mask, sample_mask, anchors, anchor_valid, gamma=gamma
+        ).float()
+        weights = (
+            torch.ones(gamma, device=device, dtype=torch.float32)
+            if self.slot_weights is None
+            else torch.tensor(self.slot_weights, device=device, dtype=torch.float32)
+        )
+
+        per_slot_sum = (per_token_loss.float() * slot_mask).sum(dim=(0, 1))
+        total = (per_slot_sum * weights).sum()
+
+        if global_draft_pass_counts is not None:
+            slot_counts = global_draft_pass_counts.float()
+            denominator = (weights * slot_counts).sum()
+        else:
+            slot_counts = None
+            denominator = global_valid_toks.float()
+
+        metrics: dict[str, Any] = {}
+        with torch.no_grad():
+            for slot in range(gamma):
+                metric_denominator = (
+                    slot_counts[slot]
+                    if slot_counts is not None
+                    else global_valid_toks.float()
+                )
+                metrics[f"draft_loss_slot_{slot}"] = float(
+                    (
+                        per_slot_sum[slot].detach()
+                        / torch.clamp(metric_denominator, min=1.0)
+                    ).item()
+                )
+
+        loss = total / torch.clamp(denominator, min=1.0)
         return loss, metrics
 
 

@@ -473,6 +473,31 @@ class DraftConfig(TypedDict):
     ttt_steps: NotRequired[int]
     # Per-pass loss weights alpha_d (len == ttt_steps); null = uniform 1.0.
     ttt_pass_weights: NotRequired[list[float] | None]
+    # Draft algorithm: "eagle3" (default), or the block drafter "dflash"
+    # (vLLM >= 0.25 serving; anchor + mask-token blocks, bidirectional
+    # in-block attention, trunk truncated at the anchor; additionally
+    # requires PP == 1).
+    method: NotRequired[str]
+    # ---- dflash only ----
+    # Speculated tokens per block (vLLM num_speculative_tokens).
+    gamma: NotRequired[int]
+    # Anchors sampled per sequence (static shape).
+    anchors_per_seq: NotRequired[int]
+    # Restrict anchors to generation segments (token_loss_mask == 1 labels).
+    anchor_from_generation_only: NotRequired[bool]
+    # Reserved, unused-in-data token id (required for dflash). Mask
+    # slots embed via the target's FROZEN embedding row at this id (official
+    # DFlash contract; never trained).
+    mask_token_id: NotRequired[int | None]
+    # Named slot-weighting scheme for the block-draft loss: null/"uniform",
+    # or "exp" = the DFlash paper's exponentially decaying weight
+    # w_j = exp(-j / gamma_d), gamma_d tabulated by block size (b8 -> 4,
+    # b10 -> 5, b16 -> 7; interpolated otherwise).
+    loss_weighting: NotRequired[str | None]
+    # Trunk-attention bucketing granularity in tokens (correctness-neutral).
+    trunk_chunk: NotRequired[int]
+    # Per-head q/k RMSNorm in the draft attention (Qwen3 style).
+    qk_layernorm: NotRequired[bool]
     # Draft-only optimizer param group (separate from the policy's
     # megatron_cfg.optimizer settings). All null = share the policy optimizer
     # settings and keep the stock param-group partition.

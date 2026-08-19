@@ -231,8 +231,11 @@ class DraftLossWrapper:
     """Combine policy loss with the draft soft cross-entropy loss.
 
     ``draft_method`` selects the draft loss: ``"eagle3"`` uses the (multi-pass
-    TTT) :class:`DraftCrossEntropyLossFn`. ``draft_loss_kwargs`` are the
-    selected LossFn's remaining ctor kwargs — ``pass_weights`` for eagle3.
+    TTT) :class:`DraftCrossEntropyLossFn`; ``"dflash"`` uses
+    :class:`BlockDraftLossFn` (soft CE) over the block logits the train loop
+    stashed in ``data_dict["draft_block_logits"]``. ``draft_loss_kwargs`` are
+    the selected LossFn's remaining ctor kwargs — ``slot_weights`` for block
+    drafts, ``pass_weights`` for eagle3.
     """
 
     def __init__(
@@ -259,12 +262,19 @@ class DraftLossWrapper:
         self.draft_method = draft_method
         draft_loss_kwargs = draft_loss_kwargs or {}
         # Per-method losses are imported in-branch: only the selected one loads.
-        if draft_method == "eagle3":
+        if draft_method == "dflash":
+            from nemo_rl.algorithms.loss.loss_functions import BlockDraftLossFn
+
+            self.draft_loss_fn: Any = BlockDraftLossFn(
+                vocab_parallel_group=vocab_parallel_group,
+                **draft_loss_kwargs,
+            )
+        elif draft_method == "eagle3":
             from nemo_rl.algorithms.loss.loss_functions import (
                 DraftCrossEntropyLossFn,
             )
 
-            self.draft_loss_fn: Any = DraftCrossEntropyLossFn(
+            self.draft_loss_fn = DraftCrossEntropyLossFn(
                 vocab_parallel_group=vocab_parallel_group,
                 **draft_loss_kwargs,
             )
@@ -289,14 +299,23 @@ class DraftLossWrapper:
             **kwargs,
         )
 
-        loss_input, data = self.prepare_fn(
-            logits=next_token_logits,
-            data=data,
-            loss_fn=self.draft_loss_fn,
-            vocab_parallel_rank=self.vocab_parallel_rank,
-            vocab_parallel_group=self.vocab_parallel_group,
-            context_parallel_group=self.context_parallel_group,
-        )
+        if self.draft_method == "dflash":
+            # The block loss needs no prepare step: the teacher is the raw
+            # (vocab-parallel) policy logits and the student block logits were
+            # stashed by the train loop.
+            loss_input = {
+                "teacher_logits": next_token_logits.detach(),
+                "student_block_logits": data["draft_block_logits"],
+            }
+        else:
+            loss_input, data = self.prepare_fn(
+                logits=next_token_logits,
+                data=data,
+                loss_fn=self.draft_loss_fn,
+                vocab_parallel_rank=self.vocab_parallel_rank,
+                vocab_parallel_group=self.vocab_parallel_group,
+                context_parallel_group=self.context_parallel_group,
+            )
         draft_loss, draft_metrics = self.draft_loss_fn(
             data=data,
             global_valid_seqs=global_valid_seqs,
