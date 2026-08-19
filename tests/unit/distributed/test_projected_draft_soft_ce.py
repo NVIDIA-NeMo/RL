@@ -292,6 +292,33 @@ def test_tp2_dflash_wrapper_rejects_coordinate_aliases_together(
     )
 
 
+def _run_tp2_dflash_position_decay_mismatch(rank: int, world_size: int) -> None:
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    device = torch.device("cuda")
+
+    with pytest.raises(ValueError, match="TP ranks disagree"):
+        dflash_projected_vocab_parallel_soft_ce(
+            draft_hidden=torch.ones(1, 2, 3, device=device),
+            output_weight=torch.ones(4, 3, device=device),
+            teacher_logits=torch.ones(1, 2, 4, device=device),
+            sample_rows=torch.tensor([0], device=device),
+            label_positions=torch.tensor([[-1, 1]], device=device),
+            loss_mask=torch.tensor([[False, True]], device=device),
+            position_decay=0.5 if rank == 0 else 0.0,
+            token_chunk_size=1,
+            tp_group=tp_group,
+        )
+
+
+def test_tp2_dflash_wrapper_rejects_position_decay_mismatch_together(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(
+        _run_tp2_dflash_position_decay_mismatch,
+        world_size=2,
+    )
+
+
 def _run_tp2_projected_soft_ce_metadata_mismatch(
     rank: int,
     world_size: int,
