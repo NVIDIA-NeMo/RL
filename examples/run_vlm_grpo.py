@@ -84,8 +84,7 @@ def main() -> None:
         )
 
     with rl_init_timer.time("ray_connect"):
-        # Must precede init_ray(): its env snapshot is the only point a
-        # backend engine knob becomes cluster-wide. See both docstrings.
+        # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
         maybe_configure_data_plane_env(config.data_plane)
         init_ray()
 

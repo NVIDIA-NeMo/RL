@@ -11,11 +11,9 @@ git config --global --add safe.directory $PROJECT_ROOT
 set -eou pipefail
 
 # mooncake_cpu is RDMA-only, so this needs an mlx5 device libibverbs can open
-# (either fabric). Skip rather than fail on hosts that have none. Mirrors
-# rdma_device() in nemo_rl/data_plane/adapters/transfer_queue.py.
-if [[ -z "${MC_MOONCAKE_DEVICE:-}" ]] &&
-   ! { compgen -G "/dev/infiniband/uverbs*" >/dev/null &&
-       compgen -G "/sys/class/infiniband/mlx5_*/ports/1/link_layer" >/dev/null; }; then
+# (either fabric). Skip rather than fail on hosts that have none.
+source "$SCRIPT_DIR/../scripts/detect_rdma.sh"
+if [[ -z "${MC_MOONCAKE_DEVICE:-}" ]] && ! rdma_device_available; then
     echo "[SKIP] no usable mlx5 RDMA device; mooncake_cpu requires RDMA." \
          "Set MC_MOONCAKE_DEVICE=<dev> to override."
     exit 0
