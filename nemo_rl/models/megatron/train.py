@@ -160,10 +160,12 @@ def forward_with_post_processing_fn(
     defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    global_draft_pass_counts: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
+    draft_ttt_steps: int = 1,
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
@@ -212,8 +214,25 @@ def forward_with_post_processing_fn(
             )
         set_router_replay_forward(model, routed_experts_cp_sharded)
 
-    # Insert hook to capture hidden states and embeddings for draft model training if draft_model is provided
-    capture_context, capture = get_capture_context(model, enable_hidden_capture)
+    # Insert hook to capture hidden states and embeddings for draft model
+    # training. Capture the aux layers the DRAFT was built for (checkpoint
+    # target_layer_ids / policy.draft.aux_layer_indices, resolved onto
+    # draft_model.config at build time): the serving-side drafter taps exactly
+    # these policy layers, so capturing the hard-coded defaults instead would
+    # silently train on different features (or break the fc width when the
+    # counts differ).
+    aux_layer_indices = None
+    if draft_model is not None:
+        configured_aux_layers = getattr(
+            getattr(draft_model, "config", None),
+            "eagle_aux_hidden_state_layer_ids",
+            None,
+        )
+        if configured_aux_layers:
+            aux_layer_indices = tuple(int(i) for i in configured_aux_layers)
+    capture_context, capture = get_capture_context(
+        model, enable_hidden_capture, aux_layer_indices=aux_layer_indices
+    )
     try:
         with capture_context:
             output_tensor = model_forward(
@@ -243,20 +262,38 @@ def forward_with_post_processing_fn(
             clear_router_replay(model)
 
     if capture is not None:
-        from megatron.core.transformer.multi_token_prediction import roll_tensor
+        if use_fused_linear_logprobs:
+            # The fused path never materializes the policy's full logits, so
+            # there is no soft-CE teacher for the draft; the DRAFT loss prep
+            # would silently treat fused logprobs as logits.
+            raise RuntimeError(
+                "Draft-model training requires the policy's full logits; "
+                "disable megatron_cfg.use_fused_linear_logprobs."
+            )
 
         captured_states = capture.get_captured_states()
+        from megatron.core.transformer.multi_token_prediction import roll_tensor
+
         shifted_input_embeds = roll_tensor(
             captured_states.inputs_embeds,
             shifts=-1,
             dims=0,
             cp_group=get_context_parallel_group(),
         )[0]
-        data_dict["student_logits"] = draft_model(
-            hidden_states=captured_states.hidden_states,
-            input_embeds=shifted_input_embeds,
-            attention_mask=attention_mask,
-        )
+        if draft_ttt_steps > 1:
+            data_dict["student_logits_by_pass"] = draft_model.forward_ttt(
+                hidden_states=captured_states.hidden_states,
+                input_embeds=shifted_input_embeds,
+            )
+        else:
+            data_dict["student_logits"] = draft_model(
+                hidden_states=captured_states.hidden_states,
+                input_embeds=shifted_input_embeds,
+                # The draft decoder is forced onto the fused causal path
+                # (see EagleModel); an explicit mask tensor would route TE
+                # back to the unfused O(seq^2) backend.
+                attention_mask=None,
+            )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
     # Loss computation should use unscaled logits.
@@ -276,6 +313,7 @@ def forward_with_post_processing_fn(
             packed_seq_params=packed_seq_params,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            global_draft_pass_counts=global_draft_pass_counts,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
@@ -307,10 +345,12 @@ def megatron_forward_backward(
     defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    global_draft_pass_counts: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
+    draft_ttt_steps: int = 1,
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
@@ -346,10 +386,12 @@ def megatron_forward_backward(
         defer_fp32_logits=defer_fp32_logits,
         global_valid_seqs=global_valid_seqs,
         global_valid_toks=global_valid_toks,
+        global_draft_pass_counts=global_draft_pass_counts,
         sampling_params=sampling_params,
         straggler_timer=straggler_timer,
         draft_model=draft_model,
         enable_hidden_capture=enable_hidden_capture,
+        draft_ttt_steps=draft_ttt_steps,
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         use_router_replay=use_router_replay,
         router_replay_train=router_replay_train,
@@ -406,8 +448,9 @@ class LossPostProcessor:
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
         self.prepare_fn = prepare_fn
-        if draft_model is not None and draft_model.eagle_module is not None:
-            self.d2t = getattr(draft_model.eagle_module, "d2t", None)
+        eagle_module = getattr(draft_model, "eagle_module", None)
+        if eagle_module is not None:
+            self.d2t = getattr(eagle_module, "d2t", None)
         else:
             self.d2t = None
 
@@ -417,6 +460,7 @@ class LossPostProcessor:
         packed_seq_params: Optional[PackedSeqParams] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
+        global_draft_pass_counts: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -447,7 +491,17 @@ class LossPostProcessor:
 
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
+        has_draft_logits = (
+            "student_logits" in data_dict or "student_logits_by_pass" in data_dict
+        )
         if pack_sequences and packed_seq_params is not None:
+            if has_draft_logits:
+                # Neither packing wrapper threads the draft hook, so the draft
+                # loss would silently never train; fail loudly instead.
+                raise NotImplementedError(
+                    "Draft-model training is not supported with sequence "
+                    "packing; disable policy.sequence_packing."
+                )
             fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
             if fuse_loss:
                 # The fused path prepares loss via prepare_packed_loss_input and
@@ -486,15 +540,25 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
-            if "student_logits" in data_dict:
+            if has_draft_logits:
+                draft_cfg = self.cfg["draft"]
+                draft_method = draft_cfg.get("method", "eagle3")
+                # Ctor kwargs for the method's draft LossFn (uniform shape;
+                # DraftLossWrapper splats them into the selected class).
+                draft_loss_kwargs: dict[str, Any] = {
+                    "pass_weights": draft_cfg.get("ttt_pass_weights")
+                }
                 loss_fn_wrapped = DraftLossWrapper(
                     loss_fn=loss_fn_wrapped,
                     prepare_fn=prepare_loss_input_wrapped,
                     data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    loss_weight=float(draft_cfg["loss_weight"]),
+                    draft_loss_kwargs=draft_loss_kwargs,
+                    global_draft_pass_counts=global_draft_pass_counts,
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=get_context_parallel_group(),
+                    draft_method=draft_method,
                 )
 
         loss_fn_wrapped = partial(

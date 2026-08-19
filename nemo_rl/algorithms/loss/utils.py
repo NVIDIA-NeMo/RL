@@ -34,6 +34,14 @@ from nemo_rl.distributed.model_utils import (
 )
 
 
+# Sequence-dim chunk size for the draft (TTT) loss internals: the per-pass
+# soft-CE (ChunkedDistributedCrossEntropy) and the d2t full-vocab TP gather
+# both tile along the sequence so their fp32 / full-vocab buffers stay
+# chunk-sized. Internal tiling constant, not user config — it trades a few
+# extra TP collectives for peak memory and does not affect results.
+DRAFT_LOSS_SEQ_CHUNK_SIZE = 4096
+
+
 def prepare_loss_input(
     logits: torch.Tensor,
     data: BatchedDataDict[Any],
@@ -168,17 +176,21 @@ def prepare_loss_input(
             "cp_group": cp_group,
         }
     elif loss_fn.input_type == LossInputType.DRAFT:
-        from megatron.core.transformer.multi_token_prediction import roll_tensor
-
-        teacher_logits = roll_tensor(
-            logits.detach(),
-            shifts=-1,
-            dims=1,
-            cp_group=context_parallel_group,
-        )[0]
-        token_mask = roll_tensor(
-            data["token_mask"], shifts=-1, dims=1, cp_group=context_parallel_group
-        )[0]
+        # TTT convention: pass-d student logits z^d_i predict x_{i+d+1}; the
+        # matching teacher is the policy's logits at position i+d. The teacher
+        # stays UNSHIFTED here — the loss fn slices per pass (pure views) and
+        # builds the shifted masks via draft_pass_token_mask. Slicing replaces
+        # the CP-aware roll, so this path requires CP == 1 (which draft
+        # training already mandates for hidden-state capture).
+        if (
+            context_parallel_group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(context_parallel_group) > 1
+        ):
+            raise NotImplementedError(
+                "Draft distillation loss requires context_parallel_size == 1."
+            )
+        teacher_logits = logits.detach()
         if d2t is not None:
             reverse_mapping = (
                 torch.arange(len(d2t), device=teacher_logits.device, dtype=d2t.dtype)
@@ -189,26 +201,91 @@ def prepare_loss_input(
                     gather_from_tensor_model_parallel_region,
                 )
 
-                teacher_logits = gather_from_tensor_model_parallel_region(
-                    teacher_logits, vocab_parallel_group
-                )
                 tp_size = torch.distributed.get_world_size(vocab_parallel_group)
                 local_draft_size = len(d2t) // tp_size
                 assert vocab_parallel_rank is not None
                 start_index = vocab_parallel_rank * local_draft_size
                 end_index = (vocab_parallel_rank + 1) * local_draft_size
                 reverse_mapping = reverse_mapping[start_index:end_index]
-            teacher_logits = teacher_logits[:, :, reverse_mapping]
+
+                # Gather + d2t-subset in sequence chunks: gathering the whole
+                # [B, S, V_full] teacher at once peaks at several GiB at long
+                # sequence lengths, while only the [B, S, draft_vocab/tp]
+                # subset survives.
+                batch_size, seq_size = teacher_logits.shape[:2]
+                subset_teacher = torch.empty(
+                    batch_size,
+                    seq_size,
+                    reverse_mapping.shape[0],
+                    dtype=teacher_logits.dtype,
+                    device=teacher_logits.device,
+                )
+                for chunk_start in range(0, seq_size, DRAFT_LOSS_SEQ_CHUNK_SIZE):
+                    chunk_end = min(seq_size, chunk_start + DRAFT_LOSS_SEQ_CHUNK_SIZE)
+                    gathered_chunk = gather_from_tensor_model_parallel_region(
+                        teacher_logits[:, chunk_start:chunk_end].contiguous(),
+                        vocab_parallel_group,
+                    )
+                    subset_teacher[:, chunk_start:chunk_end] = gathered_chunk[
+                        :, :, reverse_mapping
+                    ]
+                    del gathered_chunk
+                teacher_logits = subset_teacher
+            else:
+                teacher_logits = teacher_logits[:, :, reverse_mapping]
+        if "student_logits_by_pass" in data:
+            student_logits_by_pass = list(data["student_logits_by_pass"])
+        else:
+            student_logits_by_pass = [data["student_logits"]]
         loss_input = {
             "teacher_logits": teacher_logits,
-            "student_logits": data["student_logits"],
-            "token_mask": token_mask,
+            "student_logits_by_pass": student_logits_by_pass,
         }
 
     else:
         raise ValueError(f"Unknown loss function input type: {loss_fn.input_type}")
 
     return loss_input, data
+
+
+def draft_pass_token_mask(token_mask: torch.Tensor, ttt_pass: int) -> torch.Tensor:
+    """Per-pass draft loss mask (before the sample_mask factor).
+
+    Pass ``d`` position ``i`` predicts token ``x_{i+d+1}``, so its validity is
+    ``token_mask[i + d + 1]``: a left shift by ``d + 1`` that also drops the
+    out-of-bounds tail. Returned shape is ``[B, S - d - 1]``, aligned with the
+    ``student[:, :S-d-1]`` / ``teacher[:, d:S-1]`` slices used by
+    ``DraftCrossEntropyLossFn``.
+    """
+    return token_mask[:, ttt_pass + 1 :]
+
+
+def compute_draft_pass_valid_counts(
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    *,
+    ttt_steps: int,
+) -> torch.Tensor:
+    """Local per-pass valid-token counts for the draft TTT loss.
+
+    Returns a fp32 tensor of shape ``[ttt_steps]`` where entry ``d-1`` is this
+    rank's ``#valid pass-d targets``. The caller must all-reduce it over the
+    data-parallel group (and only DP: every CP/TP rank computes the loss over
+    the full sequence/vocab, so reducing over those groups would double-count).
+
+    The loss consumes the vector twice: the gradient denominator is
+    ``sum_d alpha_d * counts[d-1]``, and the per-pass diagnostic metrics divide
+    by ``counts[d-1]`` so that the driver's sum-over-microbatches aggregation
+    (grpo.py logs mb-metric lists with ``np.sum``) reconstructs the global
+    per-token mean instead of summing per-microbatch means.
+    """
+    counts = token_mask.new_zeros((ttt_steps,), dtype=torch.float32)
+    for ttt_pass in range(1, ttt_steps + 1):
+        pass_mask = draft_pass_token_mask(token_mask, ttt_pass) * sample_mask.unsqueeze(
+            -1
+        )
+        counts[ttt_pass - 1] = pass_mask.sum().float()
+    return counts
 
 
 def _pack_input_ids(
