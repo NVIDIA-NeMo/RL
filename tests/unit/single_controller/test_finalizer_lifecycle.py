@@ -77,6 +77,7 @@ def _request() -> ReassemblyRequest:
     return ReassemblyRequest(
         group_id="group",
         rollout_ids=("group_g0",),
+        canonical_sample_ids=("group_g0",),
         receipts=(
             {
                 "manifest": [
@@ -101,14 +102,20 @@ def _controller(actor: object) -> Any:
     ctrl._finalizer_waiters = 0
     ctrl._finalizer_unknown_outcomes = 0
     ctrl._finalizer_metrics_by_group = {}
+    ctrl._rollout_recovery_ledger = MagicMock()
+    ctrl._rollout_recovery_ledger.__contains__.return_value = False
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
-        token_capture=SimpleNamespace(staging_partition="staging")
+        token_capture=SimpleNamespace(staging_partition="staging"),
+        grpo=SimpleNamespace(num_prompts_per_step=1),
     )
+    ctrl._trainer_version = 3
+    ctrl._train_steps = 3
     return ctrl
 
 
