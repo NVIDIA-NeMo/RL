@@ -153,13 +153,16 @@ fi
 # stock Linux).  All service ports are pinned below 9000 to stay clear of even
 # the lowest observed ephemeral floor.
 #
-# Port layout (all below ephemeral floor at 9000):
+# Port layout (all below ephemeral floor at 9000). Python port-range bounds
+# are half-open: [low, high).
 #   1200-1201    Ray GCS + client server (head only)
 #   1301-1312    Ray management (node-mgr, obj-mgr, etc.; odd=worker, even=head)
+#   1313-1399    Dynamo etcd/NATS control plane (driver-local allocation)
 #   1400-1999    Master address / TCPStore (cluster.master_port_range_low/high)
 #   2000-2999    Ray worker gRPC (min/max-worker-port)
-#   3000-4999    NeMo RL generation HTTP servers + SGLang engine NCCL/dist_init
-#                (policy.generation.port_range_low/high)
+#   [3000, 4999) Shared NeMo RL generation range (policy.generation.port_range_low/high)
+#     [3000, 4000) Dynamo frontend/token-wrapper HTTP endpoints
+#     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
 #   5000-5999    NeMo Gym HTTP servers (Gym global config port_range_low/high)
 #   6000         Sandbox Nginx (NEMO_SKILLS_SANDBOX_PORT)
 #   6001-6999    Sandbox uWSGI workers (SANDBOX_BASE_PORT)

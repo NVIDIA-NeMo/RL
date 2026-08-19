@@ -476,7 +476,7 @@ and opens the URL in the default browser. Ctrl+C kills the forward.
 
 **Blank dashboard?** The Ray dashboard serves its frontend from
 `ray/dashboard/client/build/static/`. If those JS/CSS files are
-symlinks into the uv cache (`/root/.cache/uv/archive-v0/...`),
+symlinks into the uv cache (`/opt/nemo_rl_cache/uv/archive-v0/...`),
 aiohttp's `follow_symlinks=False` default 404s every request — the
 browser renders an empty page.
 

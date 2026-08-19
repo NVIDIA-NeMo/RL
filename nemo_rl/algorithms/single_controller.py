@@ -35,6 +35,7 @@ Data flow:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from functools import partial
@@ -74,6 +75,10 @@ from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
+
+# Named `log` rather than `logger` to keep it distinct from the experiment
+# Logger this module also uses as `self._logger`.
+log = logging.getLogger(__name__)
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -508,6 +513,7 @@ class SingleControllerActor:
             evicted_stale_prompt_groups = 0
             min_sample_version = None
             step_open = False
+            chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
 
             with self._timer.time("total_step_time"):
@@ -575,8 +581,15 @@ class SingleControllerActor:
                         or self._reference_logprobs_required
                     ):
                         with self._timer.time("logprob_inference_prep"):
+                            # Once the step is open, gradients are accumulating
+                            # in the trainer's grad buffers across chunks. The
+                            # Megatron buffer offload frees that storage outright
+                            # and its reload zeroes it, so offloading here would
+                            # discard every chunk but the last while the 1/N
+                            # normalizer still counts all of them.
                             await asyncio.to_thread(
-                                self._trainer.prepare_for_lp_inference
+                                self._trainer.prepare_for_lp_inference,
+                                keep_train_buffers=step_open,
                             )
                         with self._timer.time("policy_and_reference_logprobs"):
                             if self._policy_logprobs_required:
@@ -647,7 +660,33 @@ class SingleControllerActor:
                     )
 
                     groups_dispatched += num_groups
+                    chunks_dispatched += 1
+                    # How many chunks a step is split into decides how many times
+                    # gradients accumulate before the single reduce, so record it
+                    # rather than leaving it to be inferred from phase timings.
+                    #
+                    # These reach a run's output only because nemo_rl/__init__.py
+                    # sets the `nemo_rl` logger to NRL_LOG_LEVEL (INFO by
+                    # default); the bare basicConfig() there pins the root logger
+                    # at WARNING and no later basicConfig can raise it. Note that
+                    # the handler writes to stderr while the progress prints
+                    # around this write to stdout, so the two are not guaranteed
+                    # to interleave in order in a Ray driver log.
+                    log.info(
+                        "train_pump: step %d chunk %d: %d group(s), %d/%d dispatched",
+                        version_during_step,
+                        chunks_dispatched,
+                        num_groups,
+                        groups_dispatched,
+                        grpo_cfg.num_prompts_per_step,
+                    )
 
+                log.info(
+                    "train_pump: step %d closing on %d chunk(s), %d group(s)",
+                    version_during_step,
+                    chunks_dispatched,
+                    groups_dispatched,
+                )
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
 

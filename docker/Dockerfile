@@ -22,6 +22,8 @@
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
+# Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
+#   --build-arg BUILD_DYNAMO=1
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
@@ -423,6 +425,10 @@ FROM hermetic AS release
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
 ARG SKIP_TRTLLM_BUILD
+ARG BUILD_DYNAMO
+ARG DYNAMO_PYTHON_VERSION=3.12.11
+ARG ETCD_VERSION=v3.5.21
+ARG NATS_VERSION=v2.11.6
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
 # (empty default = skip). Consumed by the gym prefetch RUN below.
 ARG NEMO_GYM_PREFETCH_CONFIGS=
@@ -440,6 +446,7 @@ LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+ENV NEMO_RL_DYNAMO_VENV_DIR=/opt/dynamo_venv
 
 # AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
 # The host's aws-efa-installer places libnccl-net-ofi.so under
@@ -455,14 +462,32 @@ ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_P
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
 COPY --from=nemo-rl --chown=${RUNTIME_UID}:${RUNTIME_GID} --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
+
+# Root remains the default runtime identity, so register every shipped Git
+# worktree that COPY transferred to the runtime UID. Keep the entries exact:
+# trusting the parent checkout does not trust nested submodule repositories.
+RUN <<"EOF" bash -exu -o pipefail
+while IFS= read -r -d '' git_marker; do
+    repo_dir=$(dirname -- "${git_marker}")
+    git config --system --add safe.directory "${repo_dir}"
+done < <(find /opt/nemo-rl -xdev -name .git \( -type d -o -type f \) -print0)
+EOF
+
+# Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
+# Ray/vLLM environments. Default image builds do not create this environment.
+RUN <<"EOF" bash -exu -o pipefail
+if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
+    echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
+    exit 0
+fi
+bash docker/dynamo/install.sh
+EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
-RUN git config --system --add safe.directory /opt/nemo-rl && \
-    if git rev-parse --is-shallow-repository | grep -q true; then \
-        git -c fetch.recurseSubmodules=false fetch --unshallow; \
+RUN if git -C /opt/nemo-rl rev-parse --is-shallow-repository | grep -q true; then \
+        git -C /opt/nemo-rl -c fetch.recurseSubmodules=false fetch --unshallow; \
     fi && \
-    git config --system --unset-all safe.directory /opt/nemo-rl && \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl/.git
 ARG BASE_IMAGE
 RUN --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/opt/nemo_rl_cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
@@ -483,12 +508,8 @@ fi
 export TRTLLM_WHEEL_CACHE_DIR=/opt/nemo_rl_cache/trtllm-wheels
 export TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
-# The final checkouts are owned by the runtime UID while root remains the image's
-# default user. uv strips GIT_CONFIG_GLOBAL from its isolated build environment,
-# so retain exact protected system entries for build-time and runtime Git metadata
-# discovery in NeMo RL and Gym.
-git config --system --add safe.directory /opt/nemo-rl
-git config --system --add safe.directory /opt/nemo-rl/3rdparty/Gym-workspace/Gym
+# Exact protected system entries for the final checkout and every initialized
+# submodule were registered immediately after the source COPY above.
 # A normal upstream BASE_IMAGE can already contain prefetched Ray environments
 # whose uv symlinks resolve through /root. Recursive ownership changes cannot
 # repair those targets, so recreate the derived image's environments from the
@@ -595,7 +616,10 @@ import os
 import subprocess
 from pathlib import Path
 
-roots = (Path("/opt/ray_venvs"), Path("/opt/gym_venvs"))
+roots = [Path("/opt/ray_venvs"), Path("/opt/gym_venvs")]
+dynamo_root = Path(os.environ["NEMO_RL_DYNAMO_VENV_DIR"])
+if dynamo_root.is_dir():
+    roots.append(dynamo_root)
 interpreters = []
 root_link_count = 0
 root_link_examples = []
@@ -632,6 +656,25 @@ for interpreter in sorted(set(interpreters)):
         [str(interpreter), "-c", "import sys; assert sys.executable"],
         check=True,
     )
+
+if dynamo_root.is_dir():
+    subprocess.run(
+        [
+            str(dynamo_root / "bin/python"),
+            "-c",
+            (
+                "import importlib.metadata as m; "
+                'assert m.version("ai-dynamo") == "1.3.0.post1"; '
+                'assert m.version("vllm") == "0.23.0"'
+            ),
+        ],
+        check=True,
+    )
+    for executable in ("etcd", "nats-server"):
+        subprocess.run(
+            [str(dynamo_root / "bin" / executable), "--version"],
+            check=True,
+        )
 PY
 
 # Root remains the default runtime identity. Keep HOME absent from the image

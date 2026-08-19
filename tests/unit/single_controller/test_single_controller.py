@@ -317,14 +317,34 @@ class _EvictingSampler(_OneThenEmptySampler):
         return meta, 2 if num_groups else 0
 
 
+class _ChunkedSampler(_EmptySampler):
+    """Assembles one step out of several single-group chunks, then goes empty.
+
+    This is the shape the streaming path actually produces and the reason
+    ``keep_train_buffers`` exists: every chunk after the first runs against an
+    already-open train step.
+    """
+
+    def __init__(self, meta: KVBatchMeta, chunks: int) -> None:
+        self._meta = meta
+        self._remaining = chunks
+
+    async def select(self, **kwargs):
+        del kwargs
+        if self._remaining == 0:
+            return None, 0
+        self._remaining -= 1
+        return self._meta, 1
+
+
 class _EmptyBuffer:
     def __len__(self) -> int:
         return 0
 
 
 class _NoOpTrainer:
-    def prepare_for_lp_inference(self) -> None:
-        pass
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        del keep_train_buffers
 
     def prepare_for_training(self) -> None:
         pass
@@ -337,6 +357,19 @@ class _NoOpTrainer:
 
     def finish_train_step(self) -> dict:
         return {}
+
+
+class _LpRecordingTrainer(_NoOpTrainer):
+    """Records the ``keep_train_buffers`` flag the pump passes on each chunk."""
+
+    def __init__(self) -> None:
+        self.keep_train_buffers_calls: list[bool] = []
+
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        self.keep_train_buffers_calls.append(keep_train_buffers)
+
+    def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
+        del meta
 
 
 class _NoOpDataPlane:
@@ -435,3 +468,35 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["evicted_stale_prompt_groups"] == 2
     assert train_metrics["aborted_stale_inflight_groups"] == 1
+
+
+def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> None:
+    """The logprob detour between chunks must not offload the trainer's grad
+    buffers, because mcore's offload frees the gradients the earlier chunks of
+    this step accumulated rather than copying them out.
+
+    First chunk: no step open yet, nothing to preserve, so the offload is still
+    worth taking. Every later chunk: step open, buffers must stay resident.
+    """
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    # num_prompts_per_step is 2 in the harness, so two single-group chunks close
+    # the step.
+    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    ctrl._policy_logprobs_required = True
+    trainer = _LpRecordingTrainer()
+    ctrl._trainer = trainer
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._train_steps == 1
+    assert trainer.keep_train_buffers_calls == [False, True]
