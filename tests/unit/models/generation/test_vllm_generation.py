@@ -19,7 +19,7 @@ import sys
 import types
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -49,6 +49,34 @@ from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+def test_model_express_uses_engine_bundle_index_for_metadata_port() -> None:
+    worker = object.__new__(VllmGenerationWorkerImpl)
+    worker.llm = MagicMock()
+    worker._bundle_indices = [3]
+
+    worker.initialize_model_express(server_url="mx-server:8000")
+
+    worker.llm.collective_rpc.assert_called_once_with(
+        "initialize_model_express",
+        args=("mx-server:8000", 3),
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_model_express_uses_engine_bundle_index_for_metadata_port() -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.llm = MagicMock()
+    worker.llm.collective_rpc = AsyncMock()
+    worker._bundle_indices = [4]
+
+    await worker.initialize_model_express_async(server_url="mx-server:8000")
+
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "initialize_model_express",
+        args=("mx-server:8000", 4),
+    )
 
 
 @pytest.mark.parametrize("results", [[], [None], [True, None], [False]])
