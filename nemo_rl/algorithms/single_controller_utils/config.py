@@ -299,6 +299,25 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     num_finalizer_workers: PositiveInt = 2
 
 
+class RolloutCheckpointConfig(BaseModel, extra="allow"):
+    """Frequent TQ/lineage snapshots anchored to durable trainer state.
+
+    ``interval_s=None`` disables periodic snapshots. A snapshot taken before
+    the first trainer checkpoint is anchored to the initial model and a
+    rollout-semantic configuration fingerprint. Later snapshots are anchored
+    to the most recent durable trainer checkpoint.
+
+    ``restore_mode="latest"`` selects the newest compatible periodic snapshot.
+    ``trainer_checkpoint`` ignores newer periodic snapshots, while ``none``
+    resumes trainer state without restoring rollout, replay, lineage, or the
+    dataloader cursor.
+    """
+
+    interval_s: Optional[float] = Field(default=None, gt=0)
+    keep_latest_k: int = Field(default=2, ge=1)
+    restore_mode: Literal["latest", "trainer_checkpoint", "none"] = "latest"
+
+
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
@@ -311,6 +330,9 @@ class MasterConfig(BaseModel, extra="allow"):
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
+    rollout_checkpointing: RolloutCheckpointConfig = Field(
+        default_factory=RolloutCheckpointConfig
+    )
 
 
 def validate_sampler_buffer_capacity(
@@ -332,6 +354,13 @@ def validate_sampler_buffer_capacity(
         )
 
 
+def required_rollout_recovery_capacity(
+    *, num_prompts_per_step: int, min_groups_for_streaming_train: int
+) -> int:
+    """Capacity needed to fill a partially restored streaming batch."""
+    return num_prompts_per_step + min_groups_for_streaming_train - 1
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     async_config = master_config.async_rl
@@ -350,6 +379,38 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             f"({async_config.min_groups_for_streaming_train}); otherwise the rollout "
             "pump can fill every buffer slot while the trainer waits for more groups."
         )
+    if (
+        master_config.token_capture.enabled
+        and async_config.max_buffered_rollouts < num_prompts_per_step
+    ):
+        raise ValueError(
+            "token capture requires async_rl.max_buffered_rollouts "
+            f"({async_config.max_buffered_rollouts}) to be >= "
+            f"grpo.num_prompts_per_step ({num_prompts_per_step}) so one "
+            "dataloader batch can reserve capacity atomically"
+        )
+    if (
+        master_config.token_capture.enabled
+        and master_config.checkpointing["enabled"]
+        and master_config.rollout_checkpointing.restore_mode != "none"
+    ):
+        recovery_capacity = required_rollout_recovery_capacity(
+            num_prompts_per_step=num_prompts_per_step,
+            min_groups_for_streaming_train=(
+                async_config.min_groups_for_streaming_train
+            ),
+        )
+        if async_config.max_buffered_rollouts < recovery_capacity:
+            raise ValueError(
+                "token-capture rollout recovery requires "
+                "async_rl.max_buffered_rollouts "
+                f"({async_config.max_buffered_rollouts}) to be >= "
+                "grpo.num_prompts_per_step + "
+                "async_rl.min_groups_for_streaming_train - 1 "
+                f"({recovery_capacity}); otherwise restored groups can leave "
+                "the trainer below its streaming threshold while fresh batch "
+                "reservation waits for capacity"
+            )
 
     rl_step_samples = (
         num_prompts_per_step * master_config.grpo.num_generations_per_prompt

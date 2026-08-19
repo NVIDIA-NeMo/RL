@@ -202,6 +202,44 @@ def test_open_train_step_rolls_back_as_one_unit() -> None:
     )
 
 
+def test_periodic_snapshot_rolls_back_claimed_groups_without_mutating_live_ledger() -> (
+    None
+):
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    ledger.mark_group_dispatched(group.group_id)
+    _seal(ledger, group.group_id, 0)
+    _seal(ledger, group.group_id, 1)
+    meta = _finalize(ledger, group.group_id)
+    ledger.claim_groups_for_training(
+        [group.group_id],
+        train_step=4,
+        trainer_version=4,
+        expected_group_count=2,
+    )
+
+    replay_groups = ledger.training_owned_replay_groups()
+    snapshot_state = ledger.periodic_snapshot_state_dict()
+    restored = RolloutRecoveryLedger.from_state_dict(snapshot_state)
+
+    assert replay_groups == [
+        {
+            "meta": meta,
+            "start_weight": 7,
+            "end_weight": 8,
+            "target_step": 8,
+            "group_id": group.group_id,
+        }
+    ]
+    assert restored.open_train_step is None
+    assert restored.get_group(group.group_id).status == PromptGroupStatus.FINALIZED
+    assert ledger.open_train_step is not None
+    assert (
+        ledger.get_group(group.group_id).status
+        == PromptGroupStatus.CLAIMED_FOR_TRAINING
+    )
+
+
 def test_state_dict_round_trip_preserves_partial_and_claimed_lineage() -> None:
     ledger = RolloutRecoveryLedger()
     partial = _reserve(ledger, group_id="partial")
