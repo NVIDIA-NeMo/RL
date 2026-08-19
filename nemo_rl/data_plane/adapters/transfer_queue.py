@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import glob
 import ipaddress
+import logging
 import os
 import resource
 import socket
@@ -47,6 +48,8 @@ from nemo_rl.data_plane.interfaces import (
     backend_config,
 )
 from nemo_rl.data_plane.schema import PROMOTE_1D_FIELDS
+
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
@@ -125,7 +128,8 @@ def rdma_devices(dedupe_per_numa_domain: bool = True) -> str:
     if not glob.glob("/dev/infiniband/uverbs*"):
         return ""
     ib, roce = [], []
-    roce_domains: set[str] = set()
+    roce_domains: dict[str, str] = {}  # domain -> the rail kept for it
+    dropped: list[tuple[str, str]] = []  # (rail, domain) skipped as redundant
     for path in sorted(glob.glob("/sys/class/infiniband/mlx5_*/ports/1/link_layer")):
         name = Path(path).parents[2].name
         try:
@@ -157,9 +161,19 @@ def rdma_devices(dedupe_per_numa_domain: bool = True) -> str:
             numa = ""
         domain = numa if numa not in ("", "-1") else name
         if domain in roce_domains:
+            dropped.append((name, domain))
             continue
-        roce_domains.add(domain)
+        roce_domains[domain] = name
         roce.append(name)
+    if dropped:
+        logger.info(
+            "rdma_devices: kept one RoCE rail per NUMA domain %s, dropped "
+            "redundant same-domain rail(s) %s — set "
+            "data_plane.mooncake_cpu.dedupe_rails_per_numa_domain=false to "
+            "keep every rail instead.",
+            roce_domains,
+            dropped,
+        )
     # No space after the comma: mooncake splits on "," only.
     return ",".join(ib or roce)
 
