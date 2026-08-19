@@ -10,11 +10,11 @@ from torch import nn
 
 def _load_provider() -> ModuleType:
     repository_root = Path(__file__).parents[4]
-    provider_path = (
-        repository_root / "nemo_rl/models/megatron/draft/dspark_provider.py"
-    )
+    provider_path = repository_root / "nemo_rl/models/megatron/draft/dspark_provider.py"
     if not provider_path.is_file():
-        pytest.fail(f"missing private DSpark provider adapter: {provider_path}", pytrace=False)
+        pytest.fail(
+            f"missing private DSpark provider adapter: {provider_path}", pytrace=False
+        )
     package_names = (
         "nemo_rl",
         "nemo_rl.algorithms",

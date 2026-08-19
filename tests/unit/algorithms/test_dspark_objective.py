@@ -1,20 +1,43 @@
+import importlib.util
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
-OBJECTIVE_MODULE = (
-    Path(__file__).parents[3] / "nemo_rl/algorithms/loss/dspark.py"
-)
+OBJECTIVE_MODULE = Path(__file__).parents[3] / "nemo_rl/algorithms/loss/dspark.py"
 if not OBJECTIVE_MODULE.is_file():
     pytest.fail(f"missing DSpark objective API: {OBJECTIVE_MODULE}", pytrace=False)
 
 import torch
 import torch.nn.functional as F
 
-from nemo_rl.algorithms.loss.dspark import (
-    DSparkLossBins,
-    dspark_tiled_objective,
-)
+
+def _load_objective() -> ModuleType:
+    repository_root = Path(__file__).parents[3]
+    for package_name in ("nemo_rl", "nemo_rl.algorithms", "nemo_rl.algorithms.loss"):
+        package = ModuleType(package_name)
+        package.__path__ = []  # type: ignore[attr-defined]
+        sys.modules[package_name] = package
+    for module_name, module_path in (
+        (
+            "nemo_rl.algorithms.loss.draft",
+            repository_root / "nemo_rl/algorithms/loss/draft.py",
+        ),
+        ("nemo_rl.algorithms.loss.dspark", OBJECTIVE_MODULE),
+    ):
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:
+            pytest.fail(f"cannot load {module_path}", pytrace=False)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    return sys.modules["nemo_rl.algorithms.loss.dspark"]
+
+
+_OBJECTIVE = _load_objective()
+DSparkLossBins = _OBJECTIVE.DSparkLossBins
+dspark_tiled_objective = _OBJECTIVE.dspark_tiled_objective
 
 
 def _inputs() -> dict[str, object]:
@@ -60,17 +83,19 @@ def _dense_oracle(inputs: dict[str, object]) -> tuple[DSparkLossBins, ...]:
     assert isinstance(valid_mask, torch.Tensor)
     assert isinstance(slot_bins, torch.Tensor)
 
-    corrected_logits = base_logits + markov_bias
-    target_probs = torch.softmax(target_logits.detach(), dim=-1)
+    corrected_logits = (base_logits + markov_bias).float()
+    target_probs = torch.softmax(target_logits.detach().float(), dim=-1)
     draft_probs = torch.softmax(corrected_logits, dim=-1)
-    ce_rows = -torch.log_softmax(corrected_logits, dim=-1).gather(
-        -1, hard_labels.unsqueeze(-1)
-    ).squeeze(-1)
+    ce_rows = (
+        -torch.log_softmax(corrected_logits, dim=-1)
+        .gather(-1, hard_labels.unsqueeze(-1))
+        .squeeze(-1)
+    )
     tv_rows = 0.5 * (target_probs - draft_probs).abs().sum(dim=-1)
     verifier_correct = corrected_logits.detach().argmax(dim=-1).eq(hard_labels).float()
     confidence_rows = F.binary_cross_entropy_with_logits(
-        confidence_logits,
-        verifier_correct.to(dtype=confidence_logits.dtype),
+        confidence_logits.float(),
+        verifier_correct,
         reduction="none",
     )
 
@@ -79,7 +104,7 @@ def _dense_oracle(inputs: dict[str, object]) -> tuple[DSparkLossBins, ...]:
     counts.scatter_add_(0, slot_bins.reshape(-1), valid_mask.reshape(-1).float())
     components = []
     for rows in (ce_rows, tv_rows, confidence_rows):
-        numerators = torch.zeros(num_bins, dtype=torch.float64)
+        numerators = torch.zeros(num_bins, dtype=torch.float32)
         numerators.scatter_add_(
             0,
             slot_bins.reshape(-1),
@@ -168,7 +193,9 @@ def test_invalid_nonfinite_rows_are_excluded_before_probability_math() -> None:
     confidence = inputs["confidence_logits"]
     assert isinstance(confidence, torch.Tensor)
     confidence_data = confidence.detach().clone()
-    confidence_data[~valid_mask] = torch.tensor([torch.nan, torch.inf])
+    confidence_data[~valid_mask] = torch.tensor(
+        [torch.nan, torch.inf], dtype=confidence_data.dtype
+    )
     inputs["confidence_logits"] = confidence_data.requires_grad_()
 
     actual = dspark_tiled_objective(
@@ -184,7 +211,9 @@ def test_invalid_nonfinite_rows_are_excluded_before_probability_math() -> None:
         assert isinstance(tensor, torch.Tensor)
         assert tensor.grad is not None
         assert torch.isfinite(tensor.grad).all()
-        assert torch.equal(tensor.grad[~valid_mask], torch.zeros_like(tensor.grad[~valid_mask]))
+        assert torch.equal(
+            tensor.grad[~valid_mask], torch.zeros_like(tensor.grad[~valid_mask])
+        )
 
 
 @pytest.mark.parametrize("num_blocks", [0, 2])
@@ -266,8 +295,7 @@ def test_probability_core_uses_one_normalizer_pass_and_saves_no_probabilities(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """CE and TV share each tile and backward recomputes ephemeral probabilities."""
-    import nemo_rl.algorithms.loss.dspark as dspark
-
+    dspark = _OBJECTIVE
     inputs = _inputs()
     tile_sizes = []
     original = dspark._tile_log_normalizers
