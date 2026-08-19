@@ -1353,7 +1353,12 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
     checkpointing block setup now reads.
     """
     return MasterConfig.model_construct(
-        data_plane={"enabled": True, "impl": "transfer_queue"},
+        data_plane={
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+            "checkpointing_enabled": True,
+        },
         data={
             "use_multiple_dataloader": False,
             "shuffle": False,
