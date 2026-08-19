@@ -463,6 +463,66 @@ def _run_tp2_hard_label_boundaries(rank: int, world_size: int) -> None:
             )
 
 
+def _run_tp2_split_vocab_mapping_and_bounds(rank: int, world_size: int) -> None:
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    device = torch.device("cuda")
+    target_vocab_size, draft_vocab_size = 11, 8
+    local_draft_vocab_size = draft_vocab_size // world_size
+    draft_vocab_start = rank * local_draft_vocab_size
+    draft_vocab_end = draft_vocab_start + local_draft_vocab_size
+    d2t = torch.tensor([10, 2, 8, 0, 6, 1, 9, 4], device=device)
+    generator = torch.Generator(device=device).manual_seed(20260819)
+    full_target_weight = torch.randn(
+        target_vocab_size, 3, generator=generator, device=device
+    )
+    mapped_target_weight = full_target_weight.index_select(0, d2t)
+    full_target_logits = torch.randn(
+        1, 2, target_vocab_size, generator=generator, device=device
+    )
+    mapped_target_logits = full_target_logits.index_select(-1, d2t)
+    provider = build_dspark_provider(
+        body=_CheckpointBody(tp_group=tp_group, device=device),
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+        hidden_size=3,
+        markov_rank=2,
+        confidence_enabled=False,
+        confidence_with_markov=False,
+        draft_vocab_start_index=draft_vocab_start,
+        draft_vocab_end_index=draft_vocab_end,
+        tensor_parallel_group=tp_group,
+        device=device,
+        dtype=torch.float32,
+    )
+    common: dict[str, Any] = {
+        "draft_hidden": torch.randn(1, 2, 3, generator=generator, device=device),
+        "target_output_weight": mapped_target_weight[
+            draft_vocab_start:draft_vocab_end
+        ],
+        "target_logits": mapped_target_logits[
+            ..., draft_vocab_start:draft_vocab_end
+        ],
+        "previous_token_ids": torch.tensor([[10, 0]], device=device),
+        "hard_labels": torch.tensor([[7, 0]], device=device),
+        "valid_mask": torch.ones(1, 2, dtype=torch.bool, device=device),
+        "slot_bins": torch.tensor([[0, 1]], device=device),
+        "loss_weights": (1.0, 1.0, 0.0),
+        "token_chunk_size": 1,
+        "tp_group": tp_group,
+    }
+
+    stats = provider.objective_stats(**common)
+    assert torch.isfinite(stats.combined.numerators).all()
+    for field, bad_id in (
+        ("previous_token_ids", target_vocab_size),
+        ("hard_labels", draft_vocab_size),
+    ):
+        with pytest.raises(ValueError, match=field):
+            provider.objective_stats(
+                **{**common, field: torch.tensor([[bad_id, 0]], device=device)}
+            )
+
+
 def _run_dp2_global_normalization_gradient(rank: int, world_size: int) -> None:
     dp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
@@ -575,6 +635,10 @@ def test_tp2_tv_only_gradient_uses_global_softmax_jacobian_expectation(
 
 def test_tp2_rejects_global_hard_label_boundaries(distributed_test_runner) -> None:
     distributed_test_runner(_run_tp2_hard_label_boundaries, world_size=2)
+
+
+def test_tp2_split_vocab_mapping_and_bounds(distributed_test_runner) -> None:
+    distributed_test_runner(_run_tp2_split_vocab_mapping_and_bounds, world_size=2)
 
 
 def test_dp2_normalized_gradient_uses_global_counts(distributed_test_runner) -> None:

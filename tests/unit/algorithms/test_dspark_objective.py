@@ -566,6 +566,47 @@ def test_valid_hard_labels_must_be_inside_global_vocabulary(bad_label: int) -> N
         dspark_tiled_objective(**inputs, loss_weights=(1.0, 1.0, 1.0))
 
 
+def test_split_vocab_uses_mapped_draft_rows_and_independent_id_bounds() -> None:
+    """Teacher rows/labels use draft space while previous IDs use target space."""
+    generator = torch.Generator().manual_seed(20260819)
+    target_vocab_size, draft_vocab_size = 11, 8
+    d2t = torch.tensor([10, 2, 8, 0, 6, 1, 9, 4])
+    full_target_logits = torch.randn(1, 2, target_vocab_size, generator=generator)
+    full_target_weight = torch.randn(target_vocab_size, 3, generator=generator)
+    common = {
+        "target_logits": full_target_logits.index_select(-1, d2t),
+        "draft_hidden": torch.randn(
+            1, 2, 3, generator=generator, requires_grad=True
+        ),
+        "target_output_weight": full_target_weight.index_select(0, d2t),
+        "markov_w1": torch.randn(
+            target_vocab_size, 2, generator=generator, requires_grad=True
+        ),
+        "markov_w2": torch.randn(
+            draft_vocab_size, 2, generator=generator, requires_grad=True
+        ),
+        "previous_token_ids": torch.tensor([[10, 0]]),
+        "confidence_logits": None,
+        "hard_labels": torch.tensor([[7, 0]]),
+        "valid_mask": torch.ones(1, 2, dtype=torch.bool),
+        "slot_bins": torch.tensor([[0, 1]]),
+        "loss_weights": (1.0, 1.0, 0.0),
+        "token_chunk_size": 1,
+        "draft_vocab_start_index": 0,
+        "tp_group": None,
+    }
+
+    stats = dspark_tiled_objective(**common)
+    assert torch.isfinite(stats.combined.numerators).all()
+
+    with pytest.raises(ValueError, match="previous_token_ids"):
+        dspark_tiled_objective(
+            **{**common, "previous_token_ids": torch.tensor([[11, 0]])}
+        )
+    with pytest.raises(ValueError, match="hard_labels"):
+        dspark_tiled_objective(**{**common, "hard_labels": torch.tensor([[8, 0]])})
+
+
 def test_invalid_slots_may_carry_out_of_range_sentinel_labels_and_tokens() -> None:
     """Only valid slots participate in label and previous-token validation."""
     inputs = _inputs()

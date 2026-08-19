@@ -106,6 +106,25 @@ def _provider_inputs() -> dict[str, object]:
     }
 
 
+def test_factory_preserves_public_split_vocab_shapes() -> None:
+    """The public DSpark artifact keeps target W1 and draft W2 vocabularies split."""
+    provider = build_dspark_provider(
+        body=_CheckpointIdentity(),
+        target_vocab_size=151_936,
+        draft_vocab_size=32_000,
+        hidden_size=256,
+        markov_rank=256,
+        confidence_enabled=False,
+        confidence_with_markov=False,
+        device="meta",
+    )
+
+    assert provider.markov_head.target_vocab_size == 151_936
+    assert provider.markov_head.draft_vocab_size == 32_000
+    assert provider.markov_head.markov_w1.weight.shape == (151_936, 256)
+    assert provider.markov_head.markov_w2.weight.shape == (32_000, 256)
+
+
 def test_factory_returns_private_body_and_head_only_adapter() -> None:
     """Provider state cannot capture a caller-owned target embedding or LM head."""
     body = _CheckpointLinear(5, 5, bias=False).double()
