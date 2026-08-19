@@ -662,6 +662,7 @@ class MegatronPolicyWorkerImpl(
         self._held_gather_buffer = None
 
         self._init_inference_engine_state()
+        self._setup_colocated_cuda_graph_managers()
 
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
