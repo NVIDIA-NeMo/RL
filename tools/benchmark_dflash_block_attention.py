@@ -32,8 +32,8 @@ from torch import Tensor
 from nemo_rl.models.megatron.draft.block_attention import (
     _block_visibility,
     _grouped_masked_attention,
-    _trunk_visibility,
     dflash_block_attention,
+    dflash_block_only_attention,
 )
 from nemo_rl.models.megatron.draft.block_plan import (
     DFlashBatchPlan,
@@ -41,7 +41,10 @@ from nemo_rl.models.megatron.draft.block_plan import (
 )
 
 
-_DEFAULT_CASES = ((1024, 4, 3), (4096, 8, 9), (1024, 512, 9))
+_DEFAULT_CASES = ((1024, 4, 16), (4096, 8, 16), (1024, 512, 16))
+_NUM_QUERY_HEADS = 32
+_NUM_KV_HEADS = 8
+_HEAD_DIM = 128
 
 
 def _parse_case(value: str) -> tuple[int, int, int]:
@@ -119,12 +122,11 @@ def _make_inputs(
     )
     num_blocks = plan.batch_size * plan.anchors_per_sample
     shapes = (
-        (plan.batch_size, plan.sequence_length, 8, 64),
-        (plan.batch_size, plan.sequence_length, 2, 64),
-        (plan.batch_size, plan.sequence_length, 2, 64),
-        (num_blocks, plan.block_size, 8, 64),
-        (num_blocks, plan.block_size, 2, 64),
-        (num_blocks, plan.block_size, 2, 64),
+        (plan.batch_size, plan.sequence_length, _NUM_KV_HEADS, _HEAD_DIM),
+        (plan.batch_size, plan.sequence_length, _NUM_KV_HEADS, _HEAD_DIM),
+        (num_blocks, plan.block_size, _NUM_QUERY_HEADS, _HEAD_DIM),
+        (num_blocks, plan.block_size, _NUM_KV_HEADS, _HEAD_DIM),
+        (num_blocks, plan.block_size, _NUM_KV_HEADS, _HEAD_DIM),
     )
     return tuple(
         torch.randn(
@@ -138,6 +140,44 @@ def _make_inputs(
 
 
 def _train_step(plan: DFlashBatchPlan, inputs: tuple[Tensor, ...]) -> None:
+    for tensor in inputs:
+        tensor.grad = None
+    block_output = dflash_block_only_attention(
+        plan=plan,
+        trunk_k=inputs[0],
+        trunk_v=inputs[1],
+        block_q=inputs[2],
+        block_k=inputs[3],
+        block_v=inputs[4],
+    )
+    block_output.float().square().mean().backward()
+
+
+def _make_full_attention_inputs(
+    plan: DFlashBatchPlan,
+    *,
+    device: torch.device,
+) -> tuple[Tensor, ...]:
+    block_only_inputs = _make_inputs(plan, device=device)
+    generator = torch.Generator(device=device).manual_seed(plan.sequence_length + 2026)
+    trunk_q = torch.randn(
+        (
+            plan.batch_size,
+            plan.sequence_length,
+            _NUM_QUERY_HEADS,
+            _HEAD_DIM,
+        ),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ).requires_grad_(True)
+    return (trunk_q, *block_only_inputs)
+
+
+def _full_attention_train_step(
+    plan: DFlashBatchPlan,
+    inputs: tuple[Tensor, ...],
+) -> None:
     for tensor in inputs:
         tensor.grad = None
     trunk_output, block_output = dflash_block_attention(
@@ -170,6 +210,7 @@ def _benchmark_case(
     warmup: int,
     iterations: int,
     device: torch.device,
+    full_attention: bool = False,
 ) -> dict[str, Any]:
     torch.compiler.reset()
     plan = _build_plan(
@@ -179,30 +220,40 @@ def _benchmark_case(
         block_size=block_size,
         device=device,
     )
-    inputs = _make_inputs(plan, device=device)
+    if full_attention:
+        inputs = _make_full_attention_inputs(plan, device=device)
+        train_step = _full_attention_train_step
+        kind = "full_flex_synchronized_train_step"
+        attention_path = "dflash_block_attention"
+    else:
+        inputs = _make_inputs(plan, device=device)
+        train_step = _train_step
+        kind = "block_only_flex_synchronized_train_step"
+        attention_path = "dflash_block_only_attention"
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
-    first_train_step_ms = _time_call(device, lambda: _train_step(plan, inputs))
+    first_train_step_ms = _time_call(device, lambda: train_step(plan, inputs))
     first_train_step_peak_bytes = torch.cuda.max_memory_allocated(device)
 
     for _ in range(warmup):
-        _train_step(plan, inputs)
+        train_step(plan, inputs)
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
     durations_ms = [
-        _time_call(device, lambda: _train_step(plan, inputs)) for _ in range(iterations)
+        _time_call(device, lambda: train_step(plan, inputs)) for _ in range(iterations)
     ]
     return {
-        "kind": "flex_synchronized_train_step",
+        "kind": kind,
+        "attention_path": attention_path,
         "batch_size": batch_size,
         "sequence_length": sequence_length,
         "anchors_per_sample": anchors_per_sample,
         "block_size": block_size,
         "dtype": "bfloat16",
-        "num_query_heads": 8,
-        "num_kv_heads": 2,
-        "head_dim": 64,
+        "num_query_heads": _NUM_QUERY_HEADS,
+        "num_kv_heads": _NUM_KV_HEADS,
+        "head_dim": _HEAD_DIM,
         "first_synchronized_train_step_ms": first_train_step_ms,
         "steady_synchronized_train_step_p50_ms": _percentile(durations_ms, 0.50),
         "steady_synchronized_train_step_p95_ms": _percentile(durations_ms, 0.95),
@@ -221,71 +272,67 @@ def _correctness_comparison(
 ) -> dict[str, Any]:
     torch.compiler.reset()
     plan = _build_plan(
-        batch_size=2,
-        sequence_length=1024,
-        anchors_per_sample=4,
-        block_size=3,
+        batch_size=1,
+        sequence_length=32,
+        anchors_per_sample=1,
+        block_size=16,
         device=device,
     )
     inputs = tuple(tensor.detach() for tensor in _make_inputs(plan, device=device))
 
-    def flex_forward() -> tuple[Tensor, Tensor]:
-        return dflash_block_attention(
+    def flex_forward() -> Tensor:
+        return dflash_block_only_attention(
             plan=plan,
-            trunk_q=inputs[0],
-            trunk_k=inputs[1],
-            trunk_v=inputs[2],
-            block_q=inputs[3],
-            block_k=inputs[4],
-            block_v=inputs[5],
+            trunk_k=inputs[0],
+            trunk_v=inputs[1],
+            block_q=inputs[2],
+            block_k=inputs[3],
+            block_v=inputs[4],
         )
 
     global_key = torch.cat(
-        (inputs[1].reshape(1, -1, 2, 64), inputs[4].reshape(1, -1, 2, 64)),
+        (
+            inputs[0].reshape(1, -1, _NUM_KV_HEADS, _HEAD_DIM),
+            inputs[3].reshape(1, -1, _NUM_KV_HEADS, _HEAD_DIM),
+        ),
         dim=1,
     )
     global_value = torch.cat(
-        (inputs[2].reshape(1, -1, 2, 64), inputs[5].reshape(1, -1, 2, 64)),
+        (
+            inputs[1].reshape(1, -1, _NUM_KV_HEADS, _HEAD_DIM),
+            inputs[4].reshape(1, -1, _NUM_KV_HEADS, _HEAD_DIM),
+        ),
         dim=1,
     )
 
-    def dense_forward() -> tuple[Tensor, Tensor]:
-        return (
-            _grouped_masked_attention(
-                inputs[0],
-                inputs[1],
-                inputs[2],
-                _trunk_visibility(plan),
-                scale=0.125,
-            ),
-            _grouped_masked_attention(
-                inputs[3],
-                global_key,
-                global_value,
-                _block_visibility(plan),
-                scale=0.125,
-            ),
+    def dense_forward() -> Tensor:
+        return _grouped_masked_attention(
+            inputs[2],
+            global_key,
+            global_value,
+            _block_visibility(plan),
+            scale=_HEAD_DIM**-0.5,
         )
 
     flex_outputs = flex_forward()
     dense_outputs = dense_forward()
     flex_durations_ms = [_time_call(device, flex_forward) for _ in range(iterations)]
     dense_durations_ms = [_time_call(device, dense_forward) for _ in range(iterations)]
-    errors = [
-        (flex.float() - dense.float()).abs().max().item()
-        for flex, dense in zip(flex_outputs, dense_outputs, strict=True)
-    ]
+    max_abs_error = (flex_outputs.float() - dense_outputs.float()).abs().max().item()
     return {
-        "kind": "forward_correctness_comparison",
+        "kind": "block_only_forward_correctness_comparison",
+        "attention_path": "dflash_block_only_attention",
         "scope": "correctness; timings are same-shape forward-only observations",
-        "batch_size": 2,
-        "sequence_length": 1024,
-        "anchors_per_sample": 4,
-        "block_size": 3,
+        "batch_size": plan.batch_size,
+        "sequence_length": plan.sequence_length,
+        "anchors_per_sample": plan.anchors_per_sample,
+        "block_size": plan.block_size,
+        "num_query_heads": _NUM_QUERY_HEADS,
+        "num_kv_heads": _NUM_KV_HEADS,
+        "head_dim": _HEAD_DIM,
         "flex_forward_only_p50_ms": _percentile(flex_durations_ms, 0.50),
         "dense_forward_only_p50_ms": _percentile(dense_durations_ms, 0.50),
-        "trunk_max_abs_error": errors[0],
-        "block_max_abs_error": errors[1],
+        "block_max_abs_error": max_abs_error,
         "measurement_iterations": iterations,
     }
 
@@ -302,6 +349,11 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument(
+        "--benchmark-full-attention",
+        action="store_true",
+        help="also benchmark the explicitly requested trunk-and-block attention path",
+    )
     args = parser.parse_args()
     if args.batch_size < 1 or args.warmup < 0 or args.iterations < 1:
         parser.error("batch size and iterations must be positive; warmup must be >= 0")
@@ -342,6 +394,19 @@ def main() -> None:
         )
         records.append(record)
         print(json.dumps(record), flush=True)
+        if args.benchmark_full_attention:
+            full_attention_record = _benchmark_case(
+                batch_size=args.batch_size,
+                sequence_length=sequence_length,
+                anchors_per_sample=anchors_per_sample,
+                block_size=block_size,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                device=device,
+                full_attention=True,
+            )
+            records.append(full_attention_record)
+            print(json.dumps(full_attention_record), flush=True)
     correctness_record = _correctness_comparison(
         device=device,
         iterations=args.iterations,
