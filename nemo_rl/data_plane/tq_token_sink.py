@@ -22,19 +22,19 @@ is the only hot-path file that knows tokens live in TQ; Gym sees opaque
 staging keys.
 
 Each staged row carries three jagged columns (``token_ids_delta``,
-``token_mask_delta``, ``generation_logprobs_delta``) plus scalar ``prev_len``
-and ``weight_version`` columns so a fetched row round-trips to a complete
-``StagedCallSnapshot`` (parent pointers are lineage state and are rejoined
-from the receipt manifest by the finalizer). Masks/logprobs are float32 on
-the wire, matching ``compute_staging_digest``'s float32-bit-pattern scheme,
-so the finalizer's digest recomputation over fetched values is byte-exact.
+``token_mask_delta``, ``generation_logprobs_delta``), the complete receipt
+identity/lineage metadata, and all digest inputs so it round-trips to a
+complete ``StagedCallSnapshot``. Masks/logprobs are float32 on the wire,
+matching ``compute_staging_digest``'s float32-bit-pattern scheme, so the
+finalizer's digest recomputation over fetched values is byte-exact.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import ray
 import torch
@@ -46,16 +46,59 @@ from nemo_gym.token_id_capture.staging.records import (
     StageResult,
 )
 
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD, ROUTED_LEN_FIELD
+from nemo_rl.data_plane.schema import (
+    ROUTED_EXPERTS_ENCODING_FIELD,
+    ROUTED_EXPERTS_FIELD,
+    ROUTED_EXTRAS_METADATA_FIELD,
+    ROUTED_LEN_FIELD,
+)
 
 STAGING_FIELDS = [
     "token_ids_delta",
     "token_mask_delta",
     "generation_logprobs_delta",
+    "schema_version",
+    "digest_version",
+    "extras_digest_version",
+    "rollout_id_utf8",
+    "model_call_id_utf8",
+    "parent_call_id_utf8",
+    "parent_call_id_present",
+    "capture_mode",
     "prev_len",
+    "delta_len",
+    "cum_len",
     "weight_version",
+    "digest_bytes",
+    "extras_digest_bytes",
+    "chain_hash_bytes",
+    "chain_hash_present",
+    "cumulative_hash_bytes",
+    "cumulative_hash_present",
+    ROUTED_EXTRAS_METADATA_FIELD,
+    ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_LEN_FIELD,
 ]
+
+_ROUTE_ENCODING_NONE = 0
+_ROUTE_ENCODING_ENVELOPE = 1
+_ROUTE_ENCODING_LIST = 2
+_MODE_TO_CODE = {"text": 0, "token_in": 1}
+_CODE_TO_MODE = {code: mode for mode, code in _MODE_TO_CODE.items()}
+
+
+def _bytes_tensor(value: bytes) -> torch.Tensor:
+    """Encode non-empty bytes as one jagged TQ row."""
+    if not value:
+        raise ValueError("staging byte fields must be non-empty")
+    return torch.tensor([list(value)], dtype=torch.uint8)
+
+
+def _optional_digest_fields(value: str | None) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        _bytes_tensor(bytes.fromhex(value) if value is not None else bytes(32)),
+        torch.tensor([value is not None], dtype=torch.bool),
+    )
 
 
 @dataclass(frozen=True)
@@ -101,58 +144,111 @@ class TQTokenSink:
                     [record.token_mask_delta], dtype=torch.float32
                 ),
                 "generation_logprobs_delta": torch.tensor(
-                    [record.generation_logprobs_delta], dtype=torch.float32
+                    [record.generation_log_probs_delta], dtype=torch.float32
+                ),
+                "schema_version": torch.tensor(
+                    [record.schema_version], dtype=torch.int64
+                ),
+                "digest_version": torch.tensor(
+                    [record.digest_version], dtype=torch.int64
+                ),
+                "extras_digest_version": torch.tensor(
+                    [record.extras_digest_version], dtype=torch.int64
+                ),
+                "rollout_id_utf8": _bytes_tensor(record.rollout_id.encode("utf-8")),
+                "model_call_id_utf8": _bytes_tensor(
+                    record.model_call_id.encode("utf-8")
+                ),
+                "parent_call_id_utf8": _bytes_tensor(
+                    (record.parent_call_id or "\0").encode("utf-8")
+                ),
+                "parent_call_id_present": torch.tensor(
+                    [record.parent_call_id is not None], dtype=torch.bool
+                ),
+                "capture_mode": torch.tensor(
+                    [_MODE_TO_CODE[record.mode]], dtype=torch.int64
                 ),
                 "prev_len": torch.tensor([record.prev_len], dtype=torch.int64),
+                "delta_len": torch.tensor([record.delta_len], dtype=torch.int64),
+                "cum_len": torch.tensor([record.cum_len], dtype=torch.int64),
                 "weight_version": torch.tensor(
                     [record.weight_version], dtype=torch.int64
                 ),
+                "digest_bytes": _bytes_tensor(bytes.fromhex(record.digest)),
+                "extras_digest_bytes": _bytes_tensor(
+                    bytes.fromhex(record.extras_digest)
+                ),
             }
-            routed = (record.extras or {}).get("routed_experts")
+            chain_hash, chain_hash_present = _optional_digest_fields(record.chain_hash)
+            cumulative_hash, cumulative_hash_present = _optional_digest_fields(
+                record.cumulative_hash
+            )
+            field_dict.update(
+                {
+                    "chain_hash_bytes": chain_hash,
+                    "chain_hash_present": chain_hash_present,
+                    "cumulative_hash_bytes": cumulative_hash,
+                    "cumulative_hash_present": cumulative_hash_present,
+                }
+            )
+            extras_metadata = dict(record.extras) if record.extras is not None else None
+            routed = (
+                extras_metadata.pop("routed_experts", None)
+                if extras_metadata is not None
+                else None
+            )
+            field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(
+                json.dumps(
+                    extras_metadata,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            )
             routed_len = 0
+            routed_encoding = _ROUTE_ENCODING_NONE
             if routed is not None:
-                # Worker sends full prompt+generation coverage of this call's
-                # spliced sequence; the delta-aligned slice is [prev_len:].
-                # A length mismatch stages the delta WITHOUT extras (replay
-                # degrades to Megatron's own router for this call) rather
-                # than poisoning the rollout.
                 delta_len = len(record.token_ids_delta)
                 if isinstance(routed, str):
-                    # The worker ships routes as the nrlre1 base64 envelope
-                    # (#3292). int16 covers every practical expert count
-                    # (<32k) and the -1 sentinel.
                     from nemo_rl.utils.routed_experts_codec import (
                         decode_routed_experts,
                     )
 
-                    experts = decode_routed_experts(routed, torch.int16)
+                    dtype_name = routed.split(":", 3)[1]
+                    dtype = {
+                        "int8": torch.int8,
+                        "int16": torch.int16,
+                        "int32": torch.int32,
+                    }.get(dtype_name)
+                    if dtype is None:
+                        raise ValueError(
+                            f"unsupported routed_experts dtype {dtype_name!r}"
+                        )
+                    experts = decode_routed_experts(routed, dtype)
+                    routed_encoding = _ROUTE_ENCODING_ENVELOPE
                 else:
-                    # int16 covers every practical expert count (<32k) and
-                    # the -1 sentinel; halves staged bytes vs int32.
                     experts = torch.tensor(routed, dtype=torch.int16)
-                if experts.shape[0] == record.prev_len + delta_len:
-                    experts = experts[record.prev_len :]
-                if experts.shape[0] == delta_len:
-                    field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
-                    routed_len = int(experts.shape[0])
-                else:
-                    logging.getLogger(__name__).warning(
-                        "routed_experts length %d does not cover delta %d "
-                        "(prev_len %d) for %s — staging without extras",
-                        experts.shape[0],
-                        delta_len,
-                        record.prev_len,
-                        key,
+                    routed_encoding = _ROUTE_ENCODING_LIST
+                if experts.dim() != 3 or experts.shape[0] != delta_len:
+                    raise ValueError(
+                        "routed_experts must already be delta-aligned: "
+                        f"got shape {tuple(experts.shape)} for delta_len={delta_len}"
                     )
+                field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
+                routed_len = int(experts.shape[0])
+            field_dict[ROUTED_EXPERTS_ENCODING_FIELD] = torch.tensor(
+                [routed_encoding], dtype=torch.int64
+            )
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
             fields = TensorDict(field_dict, batch_size=[1])
             tags = [
                 {
                     "rollout_id": record.rollout_id,
-                    "call_id": record.call_id,
+                    "model_call_id": record.model_call_id,
                     "parent_call_id": record.parent_call_id,
                     "prev_len": record.prev_len,
-                    "new_len": record.new_len,
+                    "delta_len": record.delta_len,
+                    "cum_len": record.cum_len,
                     "weight_version": record.weight_version,
                     "digest": record.digest,
                     "schema_version": record.schema_version,
@@ -254,8 +350,12 @@ class TQTokenSource:
         # recomputation is the byte-exact backstop if that ever breaks.
         snapshots: list[StagedCallSnapshot] = []
         for index, key in enumerate(staging_keys):
-            _, _, call_id = key.rpartition("/")
-            snapshots.append(_row_to_snapshot(call_id, _select_row(rows, index)))
+            snapshot = _row_to_snapshot(_select_row(rows, index), include_routes=True)
+            if snapshot.staging_key != key:
+                raise KeyError(
+                    f"staged row identity mismatch: requested {key!r}, got {snapshot.staging_key!r}"
+                )
+            snapshots.append(snapshot)
         return snapshots
 
     def fetch_for_finalization(
@@ -287,14 +387,16 @@ class TQTokenSource:
             )
         fetched: list[FetchedStagedCall] = []
         for index, key in enumerate(staging_keys):
-            _, separator, call_id = key.rpartition("/")
-            if not separator or not call_id:
-                raise KeyError(f"invalid staging key without call id: {key!r}")
             row = _select_row(rows, index)
+            snapshot = _row_to_snapshot(row, include_routes=False)
+            if snapshot.staging_key != key:
+                raise KeyError(
+                    f"staged row identity mismatch: requested {key!r}, got {snapshot.staging_key!r}"
+                )
             fetched.append(
                 FetchedStagedCall(
                     staging_key=key,
-                    snapshot=_row_to_snapshot(call_id, row),
+                    snapshot=snapshot,
                     routed_len=_row_scalar_int(row, ROUTED_LEN_FIELD),
                 )
             )
@@ -315,33 +417,94 @@ def _select_row(rows: TensorDict, index: int) -> dict[str, torch.Tensor]:
     return row
 
 
-def _row_to_snapshot(call_id: str, row: Any) -> StagedCallSnapshot:
+def _row_to_snapshot(row: Any, *, include_routes: bool) -> StagedCallSnapshot:
     def _leaf(name: str) -> torch.Tensor:
         value = row[name]
         tensor = value[0] if value.dim() > 1 or value.numel() > 1 else value
         return tensor.reshape(-1)
 
-    prev_len = int(_leaf("prev_len")[0].item())
-    weight_version: Optional[int] = int(_leaf("weight_version")[0].item())
-    extras: Optional[dict[str, Any]] = None
+    def _text(name: str) -> str:
+        return bytes(int(value) for value in _leaf(name).tolist()).decode("utf-8")
+
+    def _digest(name: str) -> str:
+        value = bytes(int(item) for item in _leaf(name).tolist())
+        if len(value) != 32:
+            raise ValueError(f"{name} must contain exactly 32 bytes")
+        return value.hex()
+
+    def _optional_digest(name: str, present_name: str) -> str | None:
+        return _digest(name) if bool(_leaf(present_name)[0].item()) else None
+
+    parent_call_id = (
+        _text("parent_call_id_utf8")
+        if bool(_leaf("parent_call_id_present")[0].item())
+        else None
+    )
+    mode_code = int(_leaf("capture_mode")[0].item())
     try:
-        routed = row[ROUTED_EXPERTS_FIELD]
-    except KeyError:
-        routed = None
-    if routed is not None:
-        # [1, delta_len, ...] -> [delta_len, ...]; keep the nested list wire
-        # shape so the snapshot stays a plain-pydantic record.
-        experts = routed[0] if routed.dim() > 2 or routed.shape[0] == 1 else routed
-        extras = {"routed_experts": experts.tolist()}
-    return StagedCallSnapshot(
-        call_id=call_id,
-        prev_len=prev_len,
+        mode = _CODE_TO_MODE[mode_code]
+    except KeyError as error:
+        raise ValueError(f"unknown capture_mode code {mode_code}") from error
+    extras = json.loads(_text(ROUTED_EXTRAS_METADATA_FIELD))
+    routed_encoding = int(_leaf(ROUTED_EXPERTS_ENCODING_FIELD)[0].item())
+    if routed_encoding != _ROUTE_ENCODING_NONE and include_routes:
+        try:
+            routed = row[ROUTED_EXPERTS_FIELD]
+        except KeyError as error:
+            raise KeyError(
+                "staged row metadata names routed_experts but its field is absent"
+            ) from error
+        experts = routed[0] if routed.dim() > 3 or routed.shape[0] == 1 else routed
+        if extras is None:
+            extras = {}
+        if not isinstance(extras, dict):
+            raise TypeError("staged extras metadata must decode to an object or null")
+        if routed_encoding == _ROUTE_ENCODING_ENVELOPE:
+            from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+            extras[ROUTED_EXPERTS_FIELD] = encode_routed_experts(experts)
+        elif routed_encoding == _ROUTE_ENCODING_LIST:
+            extras[ROUTED_EXPERTS_FIELD] = experts.tolist()
+        else:
+            raise ValueError(f"unknown routed_experts_encoding {routed_encoding}")
+    elif routed_encoding not in (
+        _ROUTE_ENCODING_NONE,
+        _ROUTE_ENCODING_ENVELOPE,
+        _ROUTE_ENCODING_LIST,
+    ):
+        raise ValueError(f"unknown routed_experts_encoding {routed_encoding}")
+
+    values = dict(
+        schema_version=int(_leaf("schema_version")[0].item()),
+        digest_version=int(_leaf("digest_version")[0].item()),
+        extras_digest_version=int(_leaf("extras_digest_version")[0].item()),
+        rollout_id=_text("rollout_id_utf8"),
+        model_call_id=_text("model_call_id_utf8"),
+        parent_call_id=parent_call_id,
+        mode=mode,
+        prev_len=int(_leaf("prev_len")[0].item()),
+        delta_len=int(_leaf("delta_len")[0].item()),
+        cum_len=int(_leaf("cum_len")[0].item()),
+        weight_version=int(_leaf("weight_version")[0].item()),
+        digest=_digest("digest_bytes"),
         token_ids_delta=[int(t) for t in _leaf("token_ids_delta").tolist()],
         token_mask_delta=[float(m) for m in _leaf("token_mask_delta").tolist()],
-        logprobs_delta=[float(p) for p in _leaf("generation_logprobs_delta").tolist()],
-        weight_version=weight_version,
+        generation_log_probs_delta=[
+            float(p) for p in _leaf("generation_logprobs_delta").tolist()
+        ],
         extras=extras,
+        extras_digest=_digest("extras_digest_bytes"),
+        chain_hash=_optional_digest("chain_hash_bytes", "chain_hash_present"),
+        cumulative_hash=_optional_digest(
+            "cumulative_hash_bytes", "cumulative_hash_present"
+        ),
     )
+    if include_routes or routed_encoding == _ROUTE_ENCODING_NONE:
+        return StagedCallSnapshot(**values)
+    # Metadata-only deferred finalization deliberately leaves the heavy route
+    # fragment in TQ. The finalizer verifies its digest binding before
+    # publishing a route assembly plan.
+    return StagedCallSnapshot.model_construct(**values)
 
 
 def _row_scalar_int(row: Any, field_name: str) -> int:

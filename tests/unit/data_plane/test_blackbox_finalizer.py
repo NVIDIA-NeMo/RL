@@ -35,10 +35,12 @@ import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
-from nemo_gym.token_id_capture.staging.conformance.kit import (  # noqa: E402
-    build_fixture_artifacts,
-    f32,
-    load_fixture,
+from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
+    compute_extras_digest,
+    compute_staging_digest,
+)
+from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
+    StagedCallRecord,
 )
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
@@ -53,6 +55,10 @@ from nemo_rl.data_plane.schema import (  # noqa: E402
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
 from nemo_rl.experience.blackbox_finalizer import BlackboxFinalizer  # noqa: E402
 from nemo_rl.experience.route_plan import decode_route_plan  # noqa: E402
+from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
+    build_fixture_artifacts,
+    f32,
+)
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -103,11 +109,7 @@ def _finalizer(tq_client, **overrides) -> BlackboxFinalizer:
 def _stage_fixture(tq_client, name: str, *, rollout_id: str | None = None):
     """Stage one golden fixture's rows (optionally re-keyed to rollout_id)
     and return (receipt_dict, expected LinearizedRow)."""
-    fixture = load_fixture(name)
-    if rollout_id is not None:
-        fixture = dict(fixture)
-        fixture["rollout_id"] = rollout_id
-    records, _, receipt, row = build_fixture_artifacts(fixture)
+    records, receipt, row = build_fixture_artifacts(name, rollout_id=rollout_id)
     sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION)
     for record in records:
         assert sink.stage(record).ok
@@ -140,7 +142,7 @@ def test_finalize_rollout_rejections(tq_client, partitions):
         finalizer.finalize_rollout("rej_a", poisoned, reward=0.0).rejection_reason
         == "capture_poisoned"
     )
-    empty = dict(receipt, manifest=[], terminal_call_id=None)
+    empty = dict(receipt, manifest=[], terminal_model_call_id=None)
     assert (
         finalizer.finalize_rollout("rej_a", empty, reward=0.0).rejection_reason
         == "empty_manifest"
@@ -303,21 +305,67 @@ def _routes_for_delta(call_idx: int, n_tokens: int) -> list:
     ]
 
 
+def _record_with_routes(record: StagedCallRecord, routes: list) -> StagedCallRecord:
+    extras = {"routed_experts": routes}
+    extras_digest = compute_extras_digest(extras)
+    digest = compute_staging_digest(
+        schema_version=record.schema_version,
+        digest_version=record.digest_version,
+        extras_digest_version=record.extras_digest_version,
+        rollout_id=record.rollout_id,
+        model_call_id=record.model_call_id,
+        parent_call_id=record.parent_call_id,
+        mode=record.mode,
+        prev_len=record.prev_len,
+        delta_len=record.delta_len,
+        cum_len=record.cum_len,
+        weight_version=record.weight_version,
+        token_ids_delta=record.token_ids_delta,
+        token_mask_delta=record.token_mask_delta,
+        generation_log_probs_delta=record.generation_log_probs_delta,
+        extras_digest=extras_digest,
+        chain_hash=record.chain_hash,
+        cumulative_hash=record.cumulative_hash,
+    )
+    return StagedCallRecord.model_validate(
+        record.model_dump()
+        | {"extras": extras, "extras_digest": extras_digest, "digest": digest}
+    )
+
+
+def _receipt_with_staged_records(receipt, records):
+    manifest_by_id = {record.model_call_id: record for record in receipt.manifest}
+    return receipt.model_copy(
+        update={
+            "manifest": [
+                manifest_by_id[record.model_call_id].model_copy(
+                    update={
+                        "digest": record.digest,
+                        "extras_digest": record.extras_digest,
+                    }
+                )
+                for record in records
+            ]
+        }
+    )
+
+
 def _stage_fixture_with_routes(tq_client, name: str, *, rollout_id: str):
     """Stage the golden fixture with per-call routed_experts extras attached.
 
     Returns (receipt_dict, expected LinearizedRow, routes_by_call).
     """
-    fixture = dict(load_fixture(name))
-    fixture["rollout_id"] = rollout_id
-    records, _, receipt, row = build_fixture_artifacts(fixture)
+    records, receipt, row = build_fixture_artifacts(name, rollout_id=rollout_id)
     sink = TQTokenSink(tq_client, staging_partition=_R3_STAGING)
     routes_by_call = {}
+    staged_records = []
     for idx, record in enumerate(records):
         routes = _routes_for_delta(idx, len(record.token_ids_delta))
-        routes_by_call[record.call_id] = routes
-        staged = record.model_copy(update={"extras": {"routed_experts": routes}})
+        routes_by_call[record.model_call_id] = routes
+        staged = _record_with_routes(record, routes)
+        staged_records.append(staged)
         assert sink.stage(staged).ok
+    receipt = _receipt_with_staged_records(receipt, staged_records)
     return receipt.model_dump(), row, routes_by_call
 
 
@@ -389,9 +437,9 @@ def test_finalize_group_router_replay_without_routes_fails_loudly(
 ):
     group_id = "grpr3b"
     rollout_id = f"{group_id}_g0"
-    fixture = dict(load_fixture("worked_example"))
-    fixture["rollout_id"] = rollout_id
-    records, _, receipt, _ = build_fixture_artifacts(fixture)
+    records, receipt, _ = build_fixture_artifacts(
+        "worked_example", rollout_id=rollout_id
+    )
     sink = TQTokenSink(tq_client, staging_partition=_R3_STAGING)
     for record in records:
         assert sink.stage(record).ok  # no extras staged
@@ -453,16 +501,19 @@ def r3_deferred_partitions(tq_client):
 
 
 def _stage_deferred_fixture(tq_client, *, rollout_id: str):
-    fixture = dict(load_fixture("worked_example"))
-    fixture["rollout_id"] = rollout_id
-    records, _, receipt, row = build_fixture_artifacts(fixture)
+    records, receipt, row = build_fixture_artifacts(
+        "worked_example", rollout_id=rollout_id
+    )
     sink = TQTokenSink(tq_client, staging_partition=_R3_DEFERRED_STAGING)
     routes_by_call = {}
+    staged_records = []
     for idx, record in enumerate(records):
         routes = _routes_for_delta(idx, len(record.token_ids_delta))
-        routes_by_call[record.call_id] = routes
-        staged = record.model_copy(update={"extras": {"routed_experts": routes}})
+        routes_by_call[record.model_call_id] = routes
+        staged = _record_with_routes(record, routes)
+        staged_records.append(staged)
         assert sink.stage(staged).ok
+    receipt = _receipt_with_staged_records(receipt, staged_records)
     return receipt.model_dump(), row, routes_by_call
 
 

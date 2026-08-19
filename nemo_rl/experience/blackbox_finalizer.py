@@ -52,9 +52,11 @@ from nemo_rl.experience.route_plan import (
 )
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.row_dump import maybe_dump_train_rows
-from nemo_rl.models.generation.interfaces import (
-    ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL as _ROUTED_EXPERTS_SENTINEL,
-)
+
+# Keep the finalizer importable in its CPU-only actor without importing the
+# generation package (which eagerly loads backend dependencies). This value is
+# the shared router-replay missing-route wire sentinel.
+_ROUTED_EXPERTS_SENTINEL = -1
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,112 @@ class FinalizedGroup:
     # True when min_valid_fraction_per_group rejected the whole group; the
     # caller aborts the slot instead of committing it.
     dropped: bool = False
+
+
+def _linearize_metadata_only(receipt: Any, snapshots: list[Any]) -> Any:
+    """Linearize a verified chain while leaving digest-bound route bytes in TQ."""
+    from nemo_gym.token_id_capture.staging.rebuild import (
+        LinearizedRow,
+        RebuildError,
+        WeightVersionSpan,
+    )
+
+    records = {record.model_call_id: record for record in receipt.manifest}
+    staged = {snapshot.model_call_id: snapshot for snapshot in snapshots}
+    for model_call_id, record in records.items():
+        if record.parent_call_id is not None:
+            parent = records.get(record.parent_call_id)
+            if parent is None:
+                raise RebuildError(
+                    "missing_parent",
+                    f"call {model_call_id} names absent parent {record.parent_call_id}",
+                )
+            if parent.cum_len != record.prev_len:
+                raise RebuildError(
+                    "parent_length_mismatch",
+                    f"call {model_call_id} starts at {record.prev_len}, parent ends at {parent.cum_len}",
+                )
+        visited: set[str] = set()
+        cursor = record
+        while cursor is not None:
+            if cursor.model_call_id in visited:
+                raise RebuildError(
+                    "lineage_cycle", f"cycle reaches call {cursor.model_call_id}"
+                )
+            visited.add(cursor.model_call_id)
+            cursor = (
+                records.get(cursor.parent_call_id)
+                if cursor.parent_call_id is not None
+                else None
+            )
+
+    terminal_id = receipt.terminal_model_call_id
+    if terminal_id is None or terminal_id not in records:
+        raise RebuildError(
+            "missing_terminal", "successful receipt has no terminal call"
+        )
+    chain = []
+    cursor = records[terminal_id]
+    while cursor is not None:
+        chain.append(cursor)
+        cursor = (
+            records.get(cursor.parent_call_id)
+            if cursor.parent_call_id is not None
+            else None
+        )
+    chain.reverse()
+
+    token_ids: list[int] = []
+    token_mask: list[float] = []
+    logprobs: list[float] = []
+    model_call_ids: list[str] = []
+    weight_versions: list[int] = []
+    weight_version_spans = []
+    link_spans: list[tuple[str, int, int]] = []
+    prompt_len = 0
+    for index, record in enumerate(chain):
+        snapshot = staged[record.model_call_id]
+        boundary = 0
+        for mask in snapshot.token_mask_delta:
+            if mask != 0.0:
+                break
+            boundary += 1
+        if boundary == len(snapshot.token_mask_delta) or any(
+            mask != 1.0 for mask in snapshot.token_mask_delta[boundary:]
+        ):
+            raise RebuildError(
+                "invalid_mask_order",
+                f"call {record.model_call_id} mask is not carry-then-generation",
+            )
+        start = len(token_ids)
+        token_ids.extend(snapshot.token_ids_delta)
+        token_mask.extend(snapshot.token_mask_delta)
+        logprobs.extend(snapshot.generation_log_probs_delta)
+        end = len(token_ids)
+        if index == 0:
+            prompt_len = boundary
+        model_call_ids.append(record.model_call_id)
+        weight_versions.append(record.weight_version)
+        weight_version_spans.append(
+            WeightVersionSpan(
+                model_call_id=record.model_call_id,
+                start=start,
+                end=end,
+                weight_version=record.weight_version,
+            )
+        )
+        link_spans.append((record.model_call_id, boundary, record.delta_len - boundary))
+    return LinearizedRow(
+        rollout_id=receipt.rollout_id,
+        token_ids=token_ids,
+        token_mask=token_mask,
+        logprobs=logprobs,
+        model_call_ids=model_call_ids,
+        prompt_len=prompt_len,
+        weight_versions=weight_versions,
+        weight_version_spans=weight_version_spans,
+        link_spans=link_spans,
+    )
 
 
 class BlackboxFinalizer:
@@ -141,7 +249,11 @@ class BlackboxFinalizer:
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.digest import compute_staging_digest
-        from nemo_gym.token_id_capture.staging.rebuild import RebuildError, linearize
+        from nemo_gym.token_id_capture.staging.rebuild import (
+            ReceiptVerificationError,
+            RebuildError,
+            verify_and_linearize,
+        )
         from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
         def rejected(reason: str, staging_keys: list[str]) -> FinalizedRollout:
@@ -177,7 +289,7 @@ class BlackboxFinalizer:
                 "duplicate_staging_key",
                 list(dict.fromkeys(staging_keys)),
             )
-        records_by_call = {record.call_id: record for record in parsed.manifest}
+        records_by_call = {record.model_call_id: record for record in parsed.manifest}
         if len(records_by_call) != len(parsed.manifest):
             return rejected("duplicate_manifest_call_id", staging_keys)
 
@@ -201,11 +313,13 @@ class BlackboxFinalizer:
             for record, item in zip(parsed.manifest, fetched):
                 if item.staging_key != record.staging_key:
                     return rejected(
-                        f"staging_key_mismatch:{record.call_id}", staging_keys
+                        f"staging_key_mismatch:{record.model_call_id}", staging_keys
                     )
-                if item.snapshot.call_id != record.call_id:
-                    return rejected(f"call_id_mismatch:{record.call_id}", staging_keys)
-                fetched_by_call[record.call_id] = item
+                if item.snapshot.model_call_id != record.model_call_id:
+                    return rejected(
+                        f"call_id_mismatch:{record.model_call_id}", staging_keys
+                    )
+                fetched_by_call[record.model_call_id] = item
             if len(fetched_by_call) != len(fetched):
                 return rejected("duplicate_fetched_call_id", staging_keys)
 
@@ -213,47 +327,98 @@ class BlackboxFinalizer:
             if not (
                 len(snapshot.token_ids_delta)
                 == len(snapshot.token_mask_delta)
-                == len(snapshot.logprobs_delta)
+                == len(snapshot.generation_log_probs_delta)
             ):
-                return rejected(f"misaligned_delta:{record.call_id}", staging_keys)
+                return rejected(
+                    f"misaligned_delta:{record.model_call_id}", staging_keys
+                )
             if any(m not in (0.0, 1.0) for m in snapshot.token_mask_delta):
-                return rejected(f"invalid_token_mask:{record.call_id}", staging_keys)
-            if any(not math.isfinite(p) for p in snapshot.logprobs_delta):
-                return rejected(f"non_finite_logprob:{record.call_id}", staging_keys)
+                return rejected(
+                    f"invalid_token_mask:{record.model_call_id}", staging_keys
+                )
+            if any(not math.isfinite(p) for p in snapshot.generation_log_probs_delta):
+                return rejected(
+                    f"non_finite_logprob:{record.model_call_id}", staging_keys
+                )
             if record.delta_len != len(snapshot.token_ids_delta) or (
                 snapshot.prev_len + record.delta_len != record.cum_len
             ):
-                return rejected(f"length_mismatch:{record.call_id}", staging_keys)
-            if snapshot.weight_version != record.weight_version:
+                return rejected(f"length_mismatch:{record.model_call_id}", staging_keys)
+            compared_fields = (
+                "schema_version",
+                "digest_version",
+                "extras_digest_version",
+                "rollout_id",
+                "model_call_id",
+                "parent_call_id",
+                "mode",
+                "prev_len",
+                "delta_len",
+                "cum_len",
+                "weight_version",
+                "digest",
+                "extras_digest",
+                "chain_hash",
+                "cumulative_hash",
+            )
+            mismatch = next(
+                (
+                    field_name
+                    for field_name in compared_fields
+                    if getattr(snapshot, field_name)
+                    != (
+                        rollout_id
+                        if field_name == "rollout_id"
+                        else getattr(record, field_name)
+                    )
+                ),
+                None,
+            )
+            if mismatch is not None:
                 return rejected(
-                    f"weight_version_mismatch:{record.call_id}", staging_keys
+                    f"{mismatch}_mismatch:{record.model_call_id}", staging_keys
                 )
-            digest = compute_staging_digest(
-                rollout_id=rollout_id,
-                call_id=record.call_id,
-                prev_len=snapshot.prev_len,
-                token_ids_delta=snapshot.token_ids_delta,
-                token_mask_delta=snapshot.token_mask_delta,
-                logprobs_delta=snapshot.logprobs_delta,
-            )
+            try:
+                digest = compute_staging_digest(
+                    schema_version=snapshot.schema_version,
+                    digest_version=snapshot.digest_version,
+                    extras_digest_version=snapshot.extras_digest_version,
+                    rollout_id=rollout_id,
+                    model_call_id=record.model_call_id,
+                    parent_call_id=record.parent_call_id,
+                    mode=record.mode,
+                    prev_len=snapshot.prev_len,
+                    delta_len=snapshot.delta_len,
+                    cum_len=snapshot.cum_len,
+                    weight_version=snapshot.weight_version,
+                    token_ids_delta=snapshot.token_ids_delta,
+                    token_mask_delta=snapshot.token_mask_delta,
+                    generation_log_probs_delta=(snapshot.generation_log_probs_delta),
+                    extras_digest=snapshot.extras_digest,
+                    chain_hash=snapshot.chain_hash,
+                    cumulative_hash=snapshot.cumulative_hash,
+                )
+            except (TypeError, ValueError, OverflowError) as error:
+                return rejected(
+                    f"invalid_digest_input:{record.model_call_id}:{error}",
+                    staging_keys,
+                )
             if digest != record.digest:
-                return rejected(f"digest_mismatch:{record.call_id}", staging_keys)
+                return rejected(f"digest_mismatch:{record.model_call_id}", staging_keys)
 
-        # Parent pointers are lineage state, not storage state: rejoin from
-        # the manifest before rebuilding (the storage rows carry them too,
-        # but the receipt is authoritative).
-        rejoined = [
-            snapshot.model_copy(update={"parent_call_id": record.parent_call_id})
-            for snapshot, record in zip(snapshots, parsed.manifest)
-        ]
         try:
-            row = linearize(
-                rollout_id,
-                rejoined,
-                parsed.manifest,
-                terminal_hint=parsed.terminal_call_id,
+            row = (
+                _linearize_metadata_only(parsed, snapshots)
+                if self._defer_routed_experts_to_policy
+                else verify_and_linearize(parsed, snapshots)
             )
-        except (RebuildError, NotImplementedError) as error:
+        except (
+            KeyError,
+            ValueError,
+            ReceiptVerificationError,
+            RebuildError,
+            NotImplementedError,
+        ) as error:
             return rejected(f"rebuild_failed:{error}", staging_keys)
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
@@ -290,6 +455,8 @@ class BlackboxFinalizer:
                     carry_len=int(carry_len),
                     generation_len=int(generation_len),
                     staged_route_len=item.routed_len,
+                    extras_digest_version=record.extras_digest_version,
+                    extras_digest=record.extras_digest,
                 )
                 classify_route_span(span)
                 route_spans.append(span)

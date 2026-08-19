@@ -18,12 +18,15 @@ from __future__ import annotations
 from collections import Counter
 
 import torch
+from nemo_gym.token_id_capture.staging.digest import compute_extras_digest
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
+    ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
+    ROUTED_EXTRAS_METADATA_FIELD,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -33,11 +36,22 @@ from nemo_rl.experience.route_plan import (
     RouteSpan,
     encode_route_plan,
 )
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 
 class _Rows(dict):
     def __init__(self, routed: list[torch.Tensor]) -> None:
-        super().__init__({ROUTED_EXPERTS_FIELD: routed})
+        super().__init__(
+            {
+                ROUTED_EXPERTS_FIELD: routed,
+                ROUTED_EXPERTS_ENCODING_FIELD: [
+                    torch.tensor([1], dtype=torch.int64) for _ in routed
+                ],
+                ROUTED_EXTRAS_METADATA_FIELD: [
+                    torch.tensor(list(b"{}"), dtype=torch.uint8) for _ in routed
+                ],
+            }
+        )
         self.batch_size = (len(routed),)
 
 
@@ -48,7 +62,11 @@ class _RouteClient:
 
     def get_samples(self, *, sample_ids, partition_id, select_fields):
         assert partition_id == "staging"
-        assert select_fields == [ROUTED_EXPERTS_FIELD]
+        assert select_fields == [
+            ROUTED_EXPERTS_FIELD,
+            ROUTED_EXPERTS_ENCODING_FIELD,
+            ROUTED_EXTRAS_METADATA_FIELD,
+        ]
         self.calls.append(list(sample_ids))
         return _Rows([self.fragments[key] for key in sample_ids])
 
@@ -73,6 +91,27 @@ def _plan(
             cleanup_staging_keys=cleanup,
             expected_token_length=expected,
         )
+    )
+
+
+def _span(
+    client: _RouteClient,
+    staging_key: str,
+    carry_len: int,
+    generation_len: int,
+    staged_route_len: int,
+) -> RouteSpan:
+    routes = client.fragments[staging_key]
+    extras_digest = compute_extras_digest(
+        {ROUTED_EXPERTS_FIELD: encode_routed_experts(routes)}
+    )
+    return RouteSpan(
+        staging_key,
+        carry_len,
+        generation_len,
+        staged_route_len,
+        extras_digest_version=1,
+        extras_digest=extras_digest,
     )
 
 
@@ -105,8 +144,8 @@ def test_worker_coalesces_keys_and_replays_full_tail_and_placeholder() -> None:
     plans = [
         _plan(
             (
-                RouteSpan("r/c0", 0, 2, 2),
-                RouteSpan("r/c1", 1, 1, 1),
+                _span(client, "r/c0", 0, 2, 2),
+                _span(client, "r/c1", 1, 1, 1),
             ),
             expected=4,
             cleanup=("r/c0", "r/c1", "r/off_chain"),
@@ -136,7 +175,7 @@ def test_wrong_model_shape_falls_back_for_entire_rollout() -> None:
     client = _RouteClient({"r/c0": torch.tensor([[[10]], [[11]]], dtype=torch.int16)})
     worker = _Worker(client)
     plan = _plan(
-        (RouteSpan("r/c0", 0, 2, 2),),
+        (_span(client, "r/c0", 0, 2, 2),),
         expected=2,
         cleanup=("r/c0",),
     )
@@ -146,3 +185,21 @@ def test_wrong_model_shape_falls_back_for_entire_rollout() -> None:
 
     assert bool(routed.eq(-1).all())
     assert worker._route_fallback_counts == Counter({"fragment_model_shape": 1})
+
+
+def test_tampered_fragment_falls_back_for_entire_rollout() -> None:
+    client = _RouteClient(
+        {"r/c0": torch.tensor([[[10, 11]], [[12, 13]]], dtype=torch.int16)}
+    )
+    worker = _Worker(client)
+    span = _span(client, "r/c0", 0, 2, 2)
+    client.fragments["r/c0"][0, 0, 0] = 999
+    meta, data = _meta(
+        [_plan((span,), expected=2, cleanup=("r/c0",))],
+        [2],
+    )
+
+    routed = worker._maybe_assemble_routed_experts(meta, data)[ROUTED_EXPERTS_FIELD]
+
+    assert bool(routed.eq(-1).all())
+    assert worker._route_fallback_counts == Counter({"fragment_integrity": 1})

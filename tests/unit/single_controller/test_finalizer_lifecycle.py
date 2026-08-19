@@ -215,6 +215,8 @@ def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() 
                 carry_len=2,
                 generation_len=1,
                 staged_route_len=3,
+                extras_digest_version=1,
+                extras_digest="0" * 64,
             ),
         ),
         cleanup_staging_keys=("group_g0/call", "group_g0/fork"),

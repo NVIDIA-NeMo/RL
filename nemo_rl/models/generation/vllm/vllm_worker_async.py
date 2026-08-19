@@ -407,15 +407,59 @@ class VllmAsyncGenerationWorkerImpl(
         context = getattr(request, "ng_capture", None)
         if capture is None or not context:
             return
+        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
         call = capture.begin_call(
-            rollout_id=context["rollout_id"],
-            call_id=context["call_id"],
-            parent_call_id=context.get("parent_call_id"),
-            prev_len=int(context.get("prev_len") or 0),
-            mode=context.get("mode") or "text",
+            CaptureAdmission.model_validate(context),
             stream=bool(getattr(request, "stream", False)),
         )
         self._capture_calls[id(request)] = (call, list(prompt_token_ids))
+
+    @staticmethod
+    def _delta_align_routed_experts(
+        payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
+    ) -> None:
+        """Normalize optional vLLM routes to the exact staged token delta."""
+        choices = payload.get("choices") or []
+        if len(choices) != 1 or not isinstance(choices[0], dict):
+            return
+        choice = dict(choices[0])
+        message = dict(choice.get("message") or {})
+        routed = message.get("routed_experts")
+        if routed is None:
+            return
+        try:
+            from nemo_rl.utils.routed_experts_codec import (
+                decode_routed_experts,
+                encode_routed_experts,
+            )
+
+            if isinstance(routed, str):
+                dtype_name = routed.split(":", 3)[1]
+                dtype = {
+                    "int8": torch.int8,
+                    "int16": torch.int16,
+                    "int32": torch.int32,
+                }.get(dtype_name)
+                if dtype is None:
+                    raise ValueError(f"unsupported routed_experts dtype {dtype_name!r}")
+            else:
+                dtype = torch.int16
+            experts = decode_routed_experts(routed, dtype)
+            expected_full_len = prompt_len + generated_len
+            if experts.dim() != 3 or experts.shape[0] != expected_full_len:
+                raise ValueError(
+                    f"route length {experts.shape[0]} does not match engine sequence "
+                    f"length {expected_full_len}"
+                )
+            message["routed_experts"] = encode_routed_experts(experts[prev_len:])
+        except (IndexError, TypeError, ValueError) as error:
+            LOGGER.warning(
+                "dropping invalid routed_experts from staged capture: %s", error
+            )
+            message.pop("routed_experts", None)
+        choice["message"] = message
+        payload["choices"] = [choice]
 
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Stage the finished call and ride its coords on the response.
@@ -436,6 +480,18 @@ class VllmAsyncGenerationWorkerImpl(
         # preprocess-time engine prompt off the payload (see
         # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
         payload["prompt_token_ids"] = prompt_token_ids
+        adapter = self.token_capture.adapter
+        if adapter is not None:
+            try:
+                generated_token_ids, _ = adapter.extract_generation(payload)
+            except Exception:  # capture core will report the authoritative failure
+                generated_token_ids = []
+            self._delta_align_routed_experts(
+                payload,
+                prev_len=call.admission.prev_len,
+                prompt_len=len(prompt_token_ids),
+                generated_len=len(generated_token_ids),
+            )
         coords = self.token_capture.complete_call_from_response(call, payload)
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)

@@ -19,7 +19,9 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
-ROUTE_PLAN_SCHEMA_VERSION = 1
+ROUTE_PLAN_SCHEMA_VERSION = 2
+_EXTRAS_DIGEST_VERSION = 1
+_SHA256_HEX_LENGTH = 64
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,8 @@ class RouteSpan:
     carry_len: int
     generation_len: int
     staged_route_len: int
+    extras_digest_version: int
+    extras_digest: str
 
 
 @dataclass(frozen=True)
@@ -116,6 +120,25 @@ def _validate_plan(plan: RouteAssemblyPlan) -> None:
             span.staged_route_len,
             where=f"route_plan.spans[{index}].staged_route_len",
         )
+        if (
+            type(span.extras_digest_version) is not int
+            or span.extras_digest_version != _EXTRAS_DIGEST_VERSION
+        ):
+            raise ValueError(
+                f"route_plan.spans[{index}].extras_digest_version must be "
+                f"{_EXTRAS_DIGEST_VERSION}"
+            )
+        if (
+            not isinstance(span.extras_digest, str)
+            or len(span.extras_digest) != _SHA256_HEX_LENGTH
+            or any(
+                character not in "0123456789abcdef" for character in span.extras_digest
+            )
+        ):
+            raise ValueError(
+                f"route_plan.spans[{index}].extras_digest must be a lowercase "
+                "SHA-256 hex digest"
+            )
         if span.staging_key not in cleanup_keys:
             raise ValueError(
                 f"route_plan.spans[{index}] key {span.staging_key!r} is outside "
@@ -143,6 +166,8 @@ def encode_route_plan(plan: RouteAssemblyPlan) -> dict[str, Any]:
                 "carry_len": span.carry_len,
                 "generation_len": span.generation_len,
                 "staged_route_len": span.staged_route_len,
+                "extras_digest_version": span.extras_digest_version,
+                "extras_digest": span.extras_digest,
             }
             for span in plan.spans
         ],
@@ -175,7 +200,14 @@ def decode_route_plan(value: Any) -> RouteAssemblyPlan:
             raise TypeError(f"route_plan.spans[{index}] must be a dict")
         _require_exact_keys(
             span_value,
-            {"staging_key", "carry_len", "generation_len", "staged_route_len"},
+            {
+                "staging_key",
+                "carry_len",
+                "generation_len",
+                "staged_route_len",
+                "extras_digest_version",
+                "extras_digest",
+            },
             where=f"route_plan.spans[{index}]",
         )
         spans.append(
@@ -195,6 +227,14 @@ def decode_route_plan(value: Any) -> RouteAssemblyPlan:
                 staged_route_len=_require_nonnegative_int(
                     span_value["staged_route_len"],
                     where=f"route_plan.spans[{index}].staged_route_len",
+                ),
+                extras_digest_version=_require_int(
+                    span_value["extras_digest_version"],
+                    where=f"route_plan.spans[{index}].extras_digest_version",
+                ),
+                extras_digest=_require_string(
+                    span_value["extras_digest"],
+                    where=f"route_plan.spans[{index}].extras_digest",
                 ),
             )
         )

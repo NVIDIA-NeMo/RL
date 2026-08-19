@@ -26,12 +26,6 @@ import pytest
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
-from nemo_gym.token_id_capture.staging.conformance import (  # noqa: E402
-    build_fixture_artifacts,
-    fixture_names,
-    load_fixture,
-    run_sink_source_conformance,
-)
 from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
     StagingSink as TokenSinkProtocol,
 )
@@ -43,6 +37,10 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     STAGING_FIELDS,
     TQTokenSink,
     TQTokenSource,
+)
+from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
+    build_fixture_artifacts,
+    fixture_names,
 )
 
 STAGING_PARTITION = "rollout_staging_test"
@@ -76,7 +74,13 @@ def test_tq_sink_source_passes_conformance(tq_client, staging_partition, fixture
     assert fixture_name in fixture_names()
     sink = TQTokenSink(tq_client, staging_partition=staging_partition)
     source = TQTokenSource(tq_client, staging_partition=staging_partition)
-    run_sink_source_conformance(load_fixture(fixture_name), sink, source)
+    records, _, _ = build_fixture_artifacts(fixture_name)
+    for record in records:
+        assert sink.stage(record).ok
+    snapshots = source.fetch([record.staging_key for record in records])
+    assert [snapshot.model_dump() for snapshot in snapshots] == [
+        record.model_dump() for record in records
+    ]
 
 
 def test_fetch_missing_key_raises_keyerror(tq_client, staging_partition):
@@ -98,7 +102,7 @@ def test_fetch_for_finalization_is_small_typed_and_identity_preserving(
             return self.client.get_samples(**kwargs)
 
     sink = TQTokenSink(tq_client, staging_partition=staging_partition)
-    records, _, _, _ = build_fixture_artifacts(load_fixture("single_call"))
+    records, _, _ = build_fixture_artifacts("single_call")
     assert sink.stage(records[0]).ok
     recording_client = RecordingClient(tq_client)
     source = TQTokenSource(recording_client, staging_partition=staging_partition)
@@ -109,7 +113,7 @@ def test_fetch_for_finalization_is_small_typed_and_identity_preserving(
     assert "routed_experts" not in recording_client.select_fields
     assert len(fetched) == 1
     assert fetched[0].staging_key == records[0].staging_key
-    assert fetched[0].snapshot.call_id == records[0].call_id
+    assert fetched[0].snapshot.model_call_id == records[0].model_call_id
     assert fetched[0].routed_len == 0
 
 
@@ -127,7 +131,7 @@ def test_stage_failure_reports_not_raises(staging_partition):
             raise RuntimeError("controller down")
 
     sink = TQTokenSink(ExplodingClient(), staging_partition=staging_partition)
-    records, _, _, _ = build_fixture_artifacts(load_fixture("single_call"))
+    records, _, _ = build_fixture_artifacts("single_call")
     result = sink.stage(records[0])
     assert not result.ok
     assert result.staging_key == records[0].staging_key
@@ -137,7 +141,7 @@ def test_stage_failure_reports_not_raises(staging_partition):
 def test_sink_clear_drops_rows(tq_client, staging_partition):
     sink = TQTokenSink(tq_client, staging_partition=staging_partition)
     source = TQTokenSource(tq_client, staging_partition=staging_partition)
-    records, _, _, _ = build_fixture_artifacts(load_fixture("single_call"))
+    records, _, _ = build_fixture_artifacts("single_call")
     for record in records:
         assert sink.stage(record).ok
     keys = [record.staging_key for record in records]

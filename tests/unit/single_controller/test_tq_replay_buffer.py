@@ -505,7 +505,7 @@ class TestTQReplayBufferTokenCaptureMode:
             RouteAssemblyPlan(
                 schema_version=ROUTE_PLAN_SCHEMA_VERSION,
                 staging_partition="rollout_staging",
-                spans=(RouteSpan("r0/on_chain", 0, 2, 2),),
+                spans=(RouteSpan("r0/on_chain", 0, 2, 2, 1, "0" * 64),),
                 cleanup_staging_keys=("r0/on_chain", "r0/off_chain"),
                 expected_token_length=2,
             )

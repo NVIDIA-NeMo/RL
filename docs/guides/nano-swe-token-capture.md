@@ -45,12 +45,14 @@ The call flow for a single SWE rollout, end to end:
 1. **Dispatch.** The `SingleControllerActor`'s rollout pump pulls a prompt
    group from the dataset and hands it to the NemoGym environment actor,
    which POSTs `/run` to the `swe_agents_train` Gym server. The run body
-   carries a fresh `ng_rollout_id`; the gate **registers** the rollout
-   (control plane) before any model call happens.
+   carries a fresh `ng_rollout_id`; RL **registers** the rollout with the gate
+   (control plane) before dispatch and mounts the returned rollout-local data
+   capability into the agent sandbox without serializing the secret.
 2. **Sandbox + agent.** The SWE harness materializes the SWE-bench instance
    in a sandbox and starts the OpenHands agent. The rollout id is snapshotted
-   into the agent's config so every LLM request it makes can be attributed
-   back to this rollout (`metadata.ng_rollout_id` on the request body).
+   into the agent's config so every LLM request uses the rollout-prefixed
+   route and its data-capability header. The capability file is mode `0600`
+   and is removed when the request finishes.
 3. **Agent turn loop.** Each turn, OpenHands POSTs `/v1/chat/completions`
    with the *full rendered history* to the policy model server, which runs
    in **gate mode**:
@@ -59,11 +61,13 @@ The call flow for a single SWE rollout, end to end:
      one continues (its *parent*) in the lineage index;
    - on a match it attaches the parent's **exact cumulative token ids**
      (`required_prefix_token_ids`) plus a capture context
-     (`rollout_id`, `call_id`, `parent_call_id`, `prev_len`), and forwards
-     the request to a vLLM engine (rollout→engine affinity keeps a
-     rollout's calls on the engine holding its KV cache);
+     (`rollout_id`, `model_call_id`, `parent_call_id`, `prev_len`), and
+     forwards the request to a vLLM engine;
    - no match (a true root, or a rewritten/condensed history) starts a new
      chain — a fallback, never an error.
+   Gate state and lineage are file-backed under the shared capture directory,
+   so registration, consecutive calls, and sealing may land on different
+   serving workers without losing ancestry.
 4. **Generate + stage.** The vLLM worker splices the supplied prefix
    verbatim, renders only the new tail through the chat template, and
    generates. Before acknowledging the call it **stages the call's token
@@ -80,8 +84,8 @@ The call flow for a single SWE rollout, end to end:
 6. **Verify + seal.** When the agent finishes, the harness runs the
    SWE-bench verifier to score the patch (reward 0/1). The `/run` response
    returns the reward plus a **token-free `RolloutReceipt`**: the ordered
-   manifest of committed calls (call ids, staging keys, digests, weight
-   versions) and a `terminal_call_id` naming the chain that is the
+   manifest of committed calls (model-call ids, staging keys, digests, weight
+   versions) and a `terminal_model_call_id` naming the chain that is the
    training row.
 7. **Finalize.** The controller constructs a metadata-only
    `FinalizationRequest`, releases the rollout concurrency permit, and submits
@@ -104,7 +108,7 @@ The token path in that flow, compressed:
 
 ```
 agent (nv-OpenHands)                     gate (vllm_model, gate mode)
-  /run body carries ng_rollout_id  ───►  registers the rollout, admits calls,
+  prefixed path + data capability  ───►  admits registered calls,
                                          fingerprints incoming history →
                                          resolves the parent call → sends the
                                          parent's exact prefix token ids
@@ -117,7 +121,7 @@ vLLM worker: splices the prefix verbatim, renders only the new tail,
                                               │  coords (≈4 B/token)
                                               ▼
 gate ingests coords into its lineage index; when the rollout ends it
-returns a token-free RolloutReceipt (a manifest of call_ids and staging
+returns a token-free RolloutReceipt (a manifest of model_call_ids and staging
 keys) on the /run response
                                               ▼
 fixed CPU Ray finalizer pool: accepts metadata only, fetches staged deltas
@@ -132,7 +136,7 @@ The pieces, by repo:
 | Component | Where |
 |---|---|
 | Gate mode, prefix serving, lineage | Gym `responses_api_models/vllm_model/app.py` + `nemo_gym/token_id_capture/gate.py` |
-| Rollout attribution (`ng_rollout_id`) | Gym capture middleware + `swe_agents` harness forwarding |
+| Rollout attribution + capability custody | Gym capture middleware + `swe_agents` sandbox mount/header forwarding |
 | Wire schema (deltas, coords, receipts) | Gym `nemo_gym/token_id_capture/staging/records.py` |
 | Worker-side capture + prefix splice | `nemo_rl/models/generation/vllm/vllm_worker_async.py` |
 | Staging sink/source over TransferQueue | `nemo_rl/data_plane/tq_token_sink.py` |
@@ -174,6 +178,7 @@ CAPTURE_OVERRIDES=(
   token_capture.num_finalizer_workers=2
   token_capture.defer_routed_experts_to_policy=true
   token_capture.staging_partition=rollout_staging_my_capture_smoke
+  +env.nemo_gym.policy_model.responses_api_models.vllm_model.num_workers=2
   +policy.router_replay.enabled=true
   async_rl.sampler.name=windowed
   +async_rl.sampler.max_staleness_versions=1
@@ -194,7 +199,9 @@ DRY_RUN=0 SC_EXP_NAME=my-capture-smoke NG_TIC_FP_CANONICAL=1 \
 `train_global_batch_size`; this config has four generations per prompt, hence
 `2 × 4 = 8`. The finalizer pool is mandatory whenever capture is enabled,
 and `num_finalizer_workers` must be positive. There is no pool enable/disable
-or legacy-inline-finalizer flag.
+or legacy-inline-finalizer flag. The smoke deliberately runs two Gym policy
+model workers; their gate state and lineage are shared, so it does not rely on
+single-worker request affinity.
 
 The 1h49 allocation is suitable when the model and compilation caches are
 warm and automatically selects the `short` QOS in `ultra_launch.sh`. For a
@@ -255,14 +262,15 @@ Config echo is not evidence. Check, in order:
    look stalled:
 
    ```
-   gate_metrics={'registered': 128.0, 'token_in': 7042.0,
-                 'fallback_no_match': 0.0, 'capture_failed': 0.0, ...}
+   gate_metrics={'registered': 128.0, 'admitted': 7048.0,
+                 'token_in': 7042.0, 'text': 6.0,
+                 'capture_failed': 0.0, ...}
    ```
 
-   `token_in / (token_in + fallback_*)` should be ≥ 0.99. A rate near 0 with
-   large `fallback_no_match` means canonical fingerprints are off (see
-   above). `unattributed_calls` > 0 means the harness is not forwarding
-   `ng_rollout_id` (attribution fix missing from the Gym pin).
+   `token_in / admitted` should be ≥ 0.99 after the root calls. A rate near 0
+   with a large `text` count means canonical fingerprints are off (see above).
+   `capability_rejected` or `unattributed_calls` above zero means the harness
+   is not forwarding the rollout capability/path correctly.
 
 2. **Finalizer-pool health.** In `step_metrics`, require
    `finalize/invalid_row_rate=0` and, for the R3 command above,

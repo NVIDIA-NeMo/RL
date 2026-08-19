@@ -33,6 +33,7 @@ _FORBIDDEN_RPC_KEYS = frozenset(
         "token_mask_delta",
         "generation_logprobs",
         "generation_logprobs_delta",
+        "generation_log_probs_delta",
         "logprobs_delta",
         "routed_experts",
     }

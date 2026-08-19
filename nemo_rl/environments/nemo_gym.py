@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import hashlib
 import math
 import os
 import subprocess
@@ -141,6 +142,9 @@ class NemoGymConfig(TypedDict):
 # model call, so the TQ sample id IS the capture key end to end.
 _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
+_NG_CAPTURE_CAPABILITY_BODY_KEY = "_ng_capture_capability"
+_TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
+_TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -488,6 +492,7 @@ Depending on your data shape, you may want to change these values."""
         self._server_client = None
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
+        self._control_owner_id = f"nemo-rl-{os.getpid()}-{id(self):x}"
         if self._token_capture_enabled:
             if self.rollout_max_attempts_to_avoid_lp_nan != 1:
                 raise ValueError(
@@ -501,35 +506,29 @@ Depending on your data shape, you may want to change these values."""
                 .setdefault("vllm_model", {})
             )
             policy_overrides["return_token_id_information"] = False
-            policy_overrides["token_capture_gate"] = {
+            capture_dir = os.path.abspath(token_capture["capture_dir"])
+            initial_global_config_dict["token_id_capture"] = {
                 "enabled": True,
-                "registration_ttl_s": token_capture["registration_ttl_s"],
-                # Finding M: the LineageIndex holds each in-flight rollout's
-                # cumulative tokens; capacity is sized from the training
-                # config at setup, never left at the eval-sized defaults.
-                "lineage_max_rollouts": token_capture["lineage_max_rollouts"],
-                "lineage_max_tokens": token_capture["lineage_max_tokens"],
-                # Finding S: control routes are bearer-authed,
-                # default-required; the token is minted per run at setup.
-                "control_auth_token": token_capture["control_auth_token"],
+                "all_agents": True,
+                "rebuild_response": False,
+                "dir": capture_dir,
+                # Both stores are process-shared. Every uvicorn worker builds
+                # its own handle over these same paths, so token-in ancestry
+                # remains valid when consecutive calls land on different
+                # workers.
+                "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
+                "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
+                "gate": {
+                    "enabled": True,
+                    "state_store_path": os.path.join(capture_dir, "gate-state.json"),
+                    "registration_ttl_s": token_capture["registration_ttl_s"],
+                    "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
+                },
             }
-            # #2124-c1 workaround: the capture middleware mints model_call_id
-            # (and sets the capture context the gate keys on) only when the
-            # base token capture is active, which requires a capture dir.
-            # The base's own capture_tokens no-ops on the gate path (the
-            # worker strips token fields before responding), so the dir
-            # stays essentially empty.
-            initial_global_config_dict["token_id_capture_enabled"] = True
-            initial_global_config_dict["token_id_capture_dir"] = token_capture[
-                "capture_dir"
-            ]
-            # Agents apply the /ng-rollout/<id> correlation prefix for token
-            # capture only when they opt in (the global enabled switch alone
-            # gates the infrastructure, not the prefix). In an RL training
-            # run every agent must correlate, and the SC cannot enumerate
-            # agent servers configured via config_paths — so flip the
-            # run-wide opt-in the Gym branch adds for exactly this case.
-            initial_global_config_dict["token_id_capture_all_agents"] = True
+            # Gym resolves the credential inside each serving process. Keep
+            # only the variable name in serialized config and inherit the
+            # secret through the server process environment.
+            os.environ[_TOKEN_CAPTURE_CONTROL_ENV] = token_capture["control_auth_token"]
             self._control_headers = {
                 "Authorization": f"Bearer {token_capture['control_auth_token']}"
             }
@@ -594,10 +593,29 @@ Depending on your data shape, you may want to change these values."""
             )
         return await response.json()
 
-    async def register_rollouts(self, rollout_ids: list[str]) -> None:
-        """Create-only registration before dispatch (§ 3.1)."""
+    def _control_operation_id(self, operation: str, rollout_id: str) -> str:
+        payload = f"{self._control_owner_id}\0{operation}\0{rollout_id}".encode()
+        return f"{operation}-{hashlib.sha256(payload).hexdigest()}"
+
+    async def register_rollouts(self, rollout_ids: list[str]) -> dict[str, str]:
+        """Register each rollout and return its worker-facing data capability."""
+        capabilities: dict[str, str] = {}
         for rollout_id in rollout_ids:
-            await self._control("PUT", f"/ng-control/rollouts/{rollout_id}")
+            registration = await self._control(
+                "PUT",
+                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}",
+                json={
+                    "owner_id": self._control_owner_id,
+                    "operation_id": self._control_operation_id("register", rollout_id),
+                },
+            )
+            capability = registration.get("data_capability")
+            if not isinstance(capability, str) or not capability:
+                raise RuntimeError(
+                    f"gate registration for {rollout_id} returned no data capability"
+                )
+            capabilities[rollout_id] = capability
+        return capabilities
 
     async def fail_rollouts(self, rollout_ids: list[str], *, reason: str) -> None:
         """Best-effort gate cleanup for a cancelled/failed dispatch (§ 7)."""
@@ -605,8 +623,12 @@ Depending on your data shape, you may want to change these values."""
             try:
                 await self._control(
                     "POST",
-                    f"/ng-control/rollouts/{rollout_id}/fail",
-                    json={"reason": reason},
+                    f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/fail",
+                    json={
+                        "owner_id": self._control_owner_id,
+                        "operation_id": self._control_operation_id("fail", rollout_id),
+                        "reason": reason,
+                    },
                 )
             except (RuntimeError, OSError) as error:
                 # The registration TTL is the backstop when the gate is
@@ -614,7 +636,7 @@ Depending on your data shape, you may want to change these values."""
                 print(f"fail_rollout({rollout_id}) failed: {error}", flush=True)
 
     async def gate_metrics(self) -> dict:
-        return await self._control("GET", "/ng-control/metrics")
+        return await self._control("GET", f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/metrics")
 
     async def run_rollouts(
         self,
@@ -645,7 +667,9 @@ Depending on your data shape, you may want to change these values."""
             rollout_ids = [
                 example[_NG_ROLLOUT_ID_BODY_KEY] for example in nemo_gym_examples
             ]
-            await self.register_rollouts(rollout_ids)
+            capabilities = await self.register_rollouts(rollout_ids)
+            for example, rollout_id in zip(nemo_gym_examples, rollout_ids):
+                example[_NG_CAPTURE_CAPABILITY_BODY_KEY] = capabilities[rollout_id]
 
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
@@ -737,11 +761,30 @@ Depending on your data shape, you may want to change these values."""
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
         rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
+        terminal_logical_request_id = nemo_gym_result.get("terminal_logical_request_id")
+        if not isinstance(terminal_logical_request_id, str) or not (
+            terminal_logical_request_id
+        ):
+            await self.fail_rollouts(
+                [rollout_id], reason="missing_terminal_logical_request_id"
+            )
+            return {
+                "message_log": [],
+                "input_message_log": [],
+                "full_result": nemo_gym_result,
+                "rollout_id": rollout_id,
+                "receipt": None,
+            }
         try:
             receipt = await self._control(
                 "POST",
-                f"/ng-control/rollouts/{rollout_id}/seal",
-                json={"reward": float(nemo_gym_result.get("reward") or 0.0)},
+                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/seal",
+                json={
+                    "owner_id": self._control_owner_id,
+                    "operation_id": self._control_operation_id("seal", rollout_id),
+                    "terminal_logical_request_id": terminal_logical_request_id,
+                    "reward": float(nemo_gym_result.get("reward") or 0.0),
+                },
             )
         except (RuntimeError, OSError) as error:
             # An unsealable rollout finalizes as a placeholder; the gate's

@@ -34,6 +34,7 @@ from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
     RolloutTokenCapture,
 )
 from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
+    CaptureAdmission,
     StagedCallRecord,
     StageResult,
 )
@@ -125,9 +126,13 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     )
 
     asyncio.run(VllmAsyncGenerationWorkerImpl.set_rollout_weight_version(worker, 4))
-    first = worker.token_capture.begin_call(rollout_id="r", call_id="c1", mode="text")
+    first = worker.token_capture.begin_call(
+        CaptureAdmission(rollout_id="r", model_call_id="c1", mode="text")
+    )
     asyncio.run(VllmAsyncGenerationWorkerImpl.set_rollout_weight_version(worker, 5))
-    second = worker.token_capture.begin_call(rollout_id="r", call_id="c2", mode="text")
+    second = worker.token_capture.begin_call(
+        CaptureAdmission(rollout_id="r", model_call_id="c2", mode="text")
+    )
 
     assert (first.weight_version, second.weight_version) == (4, 5)
 
@@ -148,6 +153,10 @@ def _generation_with_mock_group(*, async_engine: bool = True) -> VllmGeneration:
 
 def test_generation_setup_token_capture_fans_out(monkeypatch):
     gen = _generation_with_mock_group()
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
+        lambda futures: futures,
+    )
     gen.setup_token_capture({"backend": "simple"}, "rollout_staging")
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
         "setup_token_capture",
@@ -163,8 +172,12 @@ def test_generation_setup_token_capture_requires_async_engine():
         gen.setup_token_capture({}, "rollout_staging")
 
 
-def test_generation_set_rollout_weight_version_fans_out():
+def test_generation_set_rollout_weight_version_fans_out(monkeypatch):
     gen = _generation_with_mock_group()
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
+        lambda futures: futures,
+    )
     gen.set_rollout_weight_version(7)
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
         "set_rollout_weight_version",
@@ -187,6 +200,9 @@ def _worker_with_capture(sink: _MemorySink):
 
     worker = _fake_worker()
     worker._capture_calls = {}
+    worker._delta_align_routed_experts = (
+        VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
+    )
     worker.token_capture = RolloutTokenCapture(
         sink=sink,
         weight_version_fn=lambda: worker._rollout_weight_version,
@@ -218,7 +234,7 @@ def test_request_capture_round_trip_stages_and_rides_coords():
     request = _FakeRequest(
         ng_capture={
             "rollout_id": "r0",
-            "call_id": "c1",
+            "model_call_id": "c1",
             "parent_call_id": None,
             "prev_len": 0,
             "mode": "text",
@@ -250,10 +266,11 @@ def test_request_capture_token_in_prev_len_chains():
     request = _FakeRequest(
         ng_capture={
             "rollout_id": "r0",
-            "call_id": "c2",
+            "model_call_id": "c2",
             "parent_call_id": "c1",
             "prev_len": 3,
             "mode": "token_in",
+            "required_prefix_token_ids": [10, 11, 12],
         },
         stream=False,
     )
@@ -292,7 +309,7 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
     request = _FakeRequest(
         ng_capture={
             "rollout_id": "r0",
-            "call_id": "c1",
+            "model_call_id": "c1",
             "parent_call_id": None,
             "prev_len": 0,
             "mode": "text",

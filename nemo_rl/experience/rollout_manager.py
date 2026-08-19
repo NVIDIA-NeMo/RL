@@ -801,7 +801,8 @@ class RolloutManager:
 
         Returns:
             Cumulative gate counters (token_in, fallback_*, capture_failed,
-            registered/sealed/failed/expired) from ``/ng-control/metrics``,
+            registered/sealed/failed/expired) from Gym's token-capture control
+            metrics route,
             or None when no NemoGym env handle is wired.
         """
         env = self._env_handles.get("nemo_gym") if self._env_handles else None

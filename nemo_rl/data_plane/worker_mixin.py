@@ -27,9 +27,11 @@ TP=CP=PP=1) and inherit ``train`` / ``get_logprobs`` /
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections import Counter
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import torch
@@ -44,7 +46,9 @@ from nemo_rl.data_plane.schema import (
     MICRO_BATCH_LENGTHS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
+    ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
+    ROUTED_EXTRAS_METADATA_FIELD,
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
@@ -54,6 +58,13 @@ from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 if TYPE_CHECKING:
     from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
     from nemo_rl.data_plane.interfaces import DataPlaneClient
+
+
+@dataclass(frozen=True)
+class _DeferredRouteFragment:
+    routes: torch.Tensor
+    encoding: int
+    extras_metadata_json: torch.Tensor
 
 
 def _broadcast_batched_data_dict(
@@ -317,25 +328,77 @@ class TQWorkerMixin:
         *,
         keys: list[str],
         partition_id: str,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, _DeferredRouteFragment]:
         """Fetch a unique key set in one request and preserve request identity."""
         if not keys:
             return {}
         rows = self._require_dp_client().get_samples(
             sample_ids=keys,
             partition_id=partition_id,
-            select_fields=[ROUTED_EXPERTS_FIELD],
+            select_fields=[
+                ROUTED_EXPERTS_FIELD,
+                ROUTED_EXPERTS_ENCODING_FIELD,
+                ROUTED_EXTRAS_METADATA_FIELD,
+            ],
         )
         n_rows = int(rows.batch_size[0]) if len(rows.batch_size) else 0
         if n_rows != len(keys):
             raise KeyError(f"requested {len(keys)} route rows, got {n_rows}")
-        column = rows.get(ROUTED_EXPERTS_FIELD)
-        return {key: column[index] for index, key in enumerate(keys)}
+        route_column = rows.get(ROUTED_EXPERTS_FIELD)
+        encoding_column = rows.get(ROUTED_EXPERTS_ENCODING_FIELD)
+        metadata_column = rows.get(ROUTED_EXTRAS_METADATA_FIELD)
+        if route_column is None or encoding_column is None or metadata_column is None:
+            raise KeyError("deferred route row is missing integrity metadata")
+        return {
+            key: _DeferredRouteFragment(
+                routes=route_column[index],
+                encoding=int(encoding_column[index].reshape(-1)[0].item()),
+                extras_metadata_json=metadata_column[index].reshape(-1),
+            )
+            for index, key in enumerate(keys)
+        }
+
+    @staticmethod
+    def _verify_route_fragment_integrity(
+        fragment: _DeferredRouteFragment,
+        *,
+        extras_digest_version: int,
+        expected_extras_digest: str,
+    ) -> bool:
+        """Rebuild deferred extras and verify the receipt-bound Gym digest."""
+        from nemo_gym.token_id_capture.staging.digest import (
+            EXTRAS_DIGEST_VERSION,
+            compute_extras_digest,
+        )
+        from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+        if extras_digest_version != EXTRAS_DIGEST_VERSION:
+            return False
+        try:
+            raw_metadata = bytes(
+                int(value) for value in fragment.extras_metadata_json.tolist()
+            )
+            decoded = json.loads(raw_metadata.decode("utf-8"))
+            if decoded is None:
+                extras: dict[str, Any] = {}
+            elif isinstance(decoded, dict):
+                extras = decoded
+            else:
+                return False
+            if fragment.encoding == 1:
+                extras[ROUTED_EXPERTS_FIELD] = encode_routed_experts(fragment.routes)
+            elif fragment.encoding == 2:
+                extras[ROUTED_EXPERTS_FIELD] = fragment.routes.tolist()
+            else:
+                return False
+            return compute_extras_digest(extras) == expected_extras_digest
+        except (TypeError, ValueError):
+            return False
 
     def _route_fragments_by_row(
         self,
         plans: list[Any],
-    ) -> tuple[list[dict[str, torch.Tensor]], int, float]:
+    ) -> tuple[list[dict[str, _DeferredRouteFragment]], int, float]:
         """Use one normal-path batch read; isolate error retries per rollout."""
         from nemo_rl.experience.route_plan import decode_route_plan
 
@@ -365,7 +428,7 @@ class TQWorkerMixin:
                 "deferred route batch fetch failed; isolating by rollout: %s",
                 batch_error,
             )
-            per_row: list[dict[str, torch.Tensor]] = []
+            per_row: list[dict[str, _DeferredRouteFragment]] = []
             for plan in decoded:
                 row_keys = list(
                     dict.fromkeys(
@@ -456,23 +519,31 @@ class TQWorkerMixin:
                         if fragment is None:
                             reason = "missing_fragment"
                             break
-                        if fragment.dim() != 3:
+                        if not self._verify_route_fragment_integrity(
+                            fragment,
+                            extras_digest_version=span.extras_digest_version,
+                            expected_extras_digest=span.extras_digest,
+                        ):
+                            reason = "fragment_integrity"
+                            break
+                        routes = fragment.routes
+                        if routes.dim() != 3:
                             reason = "fragment_rank"
                             break
-                        if int(fragment.shape[0]) != span.staged_route_len:
+                        if int(routes.shape[0]) != span.staged_route_len:
                             reason = "fragment_length"
                             break
-                        if tuple(fragment.shape[1:]) != (num_moe_layers, top_k):
+                        if tuple(routes.shape[1:]) != (num_moe_layers, top_k):
                             reason = "fragment_model_shape"
                             break
                         if mode == "full":
                             routed[row_index, position : position + contribution] = (
-                                fragment.to(torch.int16)
+                                routes.to(torch.int16)
                             )
                         else:
                             tail_start = position + span.carry_len
                             routed[row_index, tail_start : position + contribution] = (
-                                fragment[-span.generation_len :].to(torch.int16)
+                                routes[-span.generation_len :].to(torch.int16)
                             )
                     position += contribution
             if reason is None and plan.spans and position != canonical_len:

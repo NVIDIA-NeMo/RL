@@ -26,16 +26,34 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
 )
 
+_DIGEST = "0" * 64
+
+
+def _span(
+    staging_key: str,
+    carry_len: int,
+    generation_len: int,
+    staged_route_len: int,
+) -> RouteSpan:
+    return RouteSpan(
+        staging_key,
+        carry_len,
+        generation_len,
+        staged_route_len,
+        extras_digest_version=1,
+        extras_digest=_DIGEST,
+    )
+
 
 def _plan() -> RouteAssemblyPlan:
     return RouteAssemblyPlan(
         schema_version=ROUTE_PLAN_SCHEMA_VERSION,
         staging_partition="staging",
         spans=(
-            RouteSpan("r/c0", carry_len=2, generation_len=2, staged_route_len=4),
-            RouteSpan("r/c1", carry_len=3, generation_len=1, staged_route_len=1),
-            RouteSpan("r/c2", carry_len=0, generation_len=0, staged_route_len=0),
-            RouteSpan("r/c3", carry_len=1, generation_len=1, staged_route_len=0),
+            _span("r/c0", carry_len=2, generation_len=2, staged_route_len=4),
+            _span("r/c1", carry_len=3, generation_len=1, staged_route_len=1),
+            _span("r/c2", carry_len=0, generation_len=0, staged_route_len=0),
+            _span("r/c3", carry_len=1, generation_len=1, staged_route_len=0),
         ),
         cleanup_staging_keys=("r/c0", "r/c1", "r/c2", "r/c3", "r/off_chain"),
         expected_token_length=10,

@@ -80,15 +80,7 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Gate-side cleanup backstops.
     registration_ttl_s: float = 3600.0
     staging_ttl_s: float = 3600.0
-    # Gym LineageIndex capacity (finding M: it holds each in-flight rollout's
-    # full cumulative token sequence, and eviction of a live rollout silently
-    # degrades token-in to fallbacks). None = derived at setup from the
-    # training config: rollouts ≈ 2 × max in-flight; tokens ≈ rollouts × max
-    # sequence length. Set explicitly for agentic workloads whose per-rollout
-    # call trees hold more than one context of tokens.
-    lineage_max_rollouts: Optional[int] = None
-    lineage_max_tokens: Optional[int] = None
-    # Bearer token for the gate's /ng-control/* routes (finding S). None =
+    # Bearer token for Gym's token-capture control routes. None =
     # minted per run at setup; set explicitly only for multi-controller
     # setups that must share one gate.
     control_auth_token: Optional[str] = None

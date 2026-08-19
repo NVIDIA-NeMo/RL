@@ -974,12 +974,10 @@ class SingleControllerActor:
             return
         if not counters:
             return
-        calls = counters["token_in"] + sum(
-            v for k, v in counters.items() if k.startswith("fallback_")
-        )
+        calls = counters.get("admitted", 0)
         gate_metrics: dict[str, float] = {k: float(v) for k, v in counters.items()}
         if calls:
-            gate_metrics["token_in_rate"] = counters["token_in"] / calls
+            gate_metrics["token_in_rate"] = counters.get("token_in", 0) / calls
         self._logger.log_metrics(gate_metrics, step=self._train_steps, prefix="gate")
         print(f"gate_metrics={gate_metrics}", flush=True)
 
