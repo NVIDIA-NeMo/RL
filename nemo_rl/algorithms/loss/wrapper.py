@@ -19,7 +19,6 @@ import torch
 import torch.distributed
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -229,7 +228,12 @@ class SequencePackingFusionLossWrapper:
 
 
 class DraftLossWrapper:
-    """Combine policy loss with draft soft cross-entropy loss."""
+    """Combine policy loss with the draft soft cross-entropy loss.
+
+    ``draft_method`` selects the draft loss: ``"eagle3"`` uses the (multi-pass
+    TTT) :class:`DraftCrossEntropyLossFn`. ``draft_loss_kwargs`` are the
+    selected LossFn's remaining ctor kwargs — ``pass_weights`` for eagle3.
+    """
 
     def __init__(
         self,
@@ -237,20 +241,35 @@ class DraftLossWrapper:
         prepare_fn: Callable[Any, Any],
         data_dict: BatchedDataDict[Any],
         loss_weight: float = 1.0,
+        draft_loss_kwargs: Optional[dict[str, Any]] = None,
+        global_draft_pass_counts: Optional[torch.Tensor] = None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        draft_method: str = "eagle3",
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
         self.data_dict = data_dict
         self.loss_weight = loss_weight
+        self.global_draft_pass_counts = global_draft_pass_counts
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
-        self.draft_loss_fn = DraftCrossEntropyLossFn(
-            vocab_parallel_group=vocab_parallel_group,
-        )
+        self.draft_method = draft_method
+        draft_loss_kwargs = draft_loss_kwargs or {}
+        # Per-method losses are imported in-branch: only the selected one loads.
+        if draft_method == "eagle3":
+            from nemo_rl.algorithms.loss.loss_functions import (
+                DraftCrossEntropyLossFn,
+            )
+
+            self.draft_loss_fn: Any = DraftCrossEntropyLossFn(
+                vocab_parallel_group=vocab_parallel_group,
+                **draft_loss_kwargs,
+            )
+        else:
+            raise ValueError(f"Unknown draft_method '{draft_method}'.")
 
     def __call__(
         self,
@@ -278,14 +297,16 @@ class DraftLossWrapper:
             vocab_parallel_group=self.vocab_parallel_group,
             context_parallel_group=self.context_parallel_group,
         )
-        draft_loss = self.draft_loss_fn(
+        draft_loss, draft_metrics = self.draft_loss_fn(
             data=data,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            global_draft_pass_counts=self.global_draft_pass_counts,
             **loss_input,
         )
         combined_loss = policy_loss + self.loss_weight * draft_loss
         metrics["draft_loss"] = float(draft_loss.detach().item())
+        metrics.update(draft_metrics)
         return combined_loss, metrics
 
 

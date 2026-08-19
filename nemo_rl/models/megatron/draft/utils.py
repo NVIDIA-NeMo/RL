@@ -18,11 +18,17 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Optional
 
 import torch
 import torch.distributed as dist
+from megatron.bridge.training.config import (
+    OptimizerConfigOverrideProvider,
+    OptimizerConfigOverrideProviderContext,
+)
 from megatron.core import parallel_state
+from megatron.core.optimizer import ParamKey
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.utils import unwrap_model
@@ -1225,6 +1231,139 @@ def register_draft_grad_norm_group() -> None:
         )
 
 
+# Keys appended to mcore's ``param_group_identifier_keys`` so checkpoint
+# resume can tell the draft param group apart from the policy group (see
+# extend_param_group_identifier_keys_for_resume).
+_PARAM_GROUP_IDENTIFIER_EXTRA_KEYS = ("max_lr", "min_lr")
+
+
+def extend_param_group_identifier_keys_for_resume() -> None:
+    """Include per-group LR in mcore's param-group identity used at resume.
+
+    mcore matches checkpointed optimizer param groups to runtime param groups
+    by the identity tuple ``param_group_identifier_keys = ('wd_mult',
+    'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')``. That tuple keys a
+    plain dict in both load paths (``MegatronOptimizer.
+    _filter_and_reorder_param_groups`` in megatron/core/optimizer/optimizer.py
+    and the inline ``make_needed_groups``/``param_groups_map`` in
+    ``DistributedOptimizer.load_state_dict`` in distrib_optimizer.py). The
+    draft group built by :class:`DraftOptimizerConfigOverrideProvider` differs
+    from the policy group only in ``max_lr``/``min_lr``/``start_wd``/``end_wd``
+    — none of which are identity keys — so both groups hash to the same key,
+    the last group wins the dict insert, and a resumed run silently trains the
+    policy at the draft hyperparameters (observed: policy at 50x LR after
+    resume, validation-accuracy collapse).
+
+    Appending ``max_lr``/``min_lr`` makes the identity unique whenever the
+    draft LR differs from the policy LR. Only these two are safe to append:
+    every group built by ``_get_param_groups`` carries them, while
+    ``start_wd``/``end_wd`` exist only on override groups and would raise in
+    ``make_needed_groups``. Checkpoints written before this patch carry the
+    same fields with the same values, so they remain loadable. Changing the
+    draft LR between save and resume now fails loudly at checkpoint load
+    (key-not-found) instead of silently keeping the checkpointed LR.
+    """
+    # Deferred import: keep the mcore optimizer modules a load-time dependency
+    # of this patch only, not of every draft.utils import.
+    from megatron.core import optimizer as mcore_optimizer_pkg
+    from megatron.core.optimizer import distrib_optimizer as mcore_distrib_optimizer
+    from megatron.core.optimizer import optimizer as mcore_optimizer
+
+    # distrib_optimizer binds the tuple into its own namespace via
+    # ``from ... import``, so each consuming module is patched; the package
+    # module only re-exports the name but is kept in sync for readers.
+    for module in (mcore_optimizer, mcore_distrib_optimizer, mcore_optimizer_pkg):
+        keys = module.param_group_identifier_keys
+        missing = tuple(
+            key for key in _PARAM_GROUP_IDENTIFIER_EXTRA_KEYS if key not in keys
+        )
+        if missing:
+            module.param_group_identifier_keys = (*keys, *missing)
+
+
+@dataclass
+class DraftOptimizerConfigOverrideProvider(OptimizerConfigOverrideProvider):
+    """Give ``draft_model.*`` params their own optimizer param group.
+
+    Extends the standard megatron-bridge overrides with a draft-only group so
+    the draft model trains at its own learning rate / weight decay while the
+    policy keeps the ``megatron_cfg.optimizer`` settings (FastGRPO trains the
+    draft at ~50x the policy LR during online draft learning). The schedule
+    *shape* (warmup iters, decay style) stays shared; only the per-group
+    max/min LR and weight-decay endpoints differ.
+
+    The draft (max_lr, min_lr) pair must differ from the policy's: it is what
+    identifies the draft group when a resumed run maps checkpointed param
+    groups back onto runtime groups (see
+    :func:`extend_param_group_identifier_keys_for_resume`). A draft override
+    that matches the policy pair exactly is rejected here rather than risking
+    the groups being conflated at the next resume.
+    """
+
+    draft_lr: Optional[float]
+    draft_min_lr: Optional[float]
+    draft_weight_decay: Optional[float]
+
+    def build_config_overrides(
+        self, context: OptimizerConfigOverrideProviderContext
+    ) -> dict[ParamKey, ParamGroupOverride] | None:
+        overrides = super().build_config_overrides(context) or {}
+        draft_override = ParamGroupOverride()
+        if self.draft_lr is not None:
+            draft_override["max_lr"] = float(self.draft_lr)
+            # A draft head generally wants to keep a high LR even when the
+            # policy LR decays, so min_lr follows the draft LR unless set.
+            draft_override["min_lr"] = float(
+                self.draft_min_lr if self.draft_min_lr is not None else self.draft_lr
+            )
+        elif self.draft_min_lr is not None:
+            draft_override["min_lr"] = float(self.draft_min_lr)
+        if self.draft_weight_decay is not None:
+            draft_override["start_wd"] = float(self.draft_weight_decay)
+            draft_override["end_wd"] = float(self.draft_weight_decay)
+
+        base_config = context.optimizer_config
+        effective_max_lr = draft_override.get("max_lr", base_config.lr)
+        effective_min_lr = draft_override.get("min_lr", base_config.min_lr)
+        if (effective_max_lr, effective_min_lr) == (base_config.lr, base_config.min_lr):
+            raise ValueError(
+                "[draft] policy.draft optimizer overrides must give the draft "
+                "group a (lr, min_lr) pair distinct from the policy's "
+                f"({base_config.lr}, {base_config.min_lr}); otherwise checkpoint "
+                "resume cannot tell the two param groups apart and would apply "
+                "the wrong hyperparameters to the policy. Set policy.draft.lr "
+                "(and/or min_lr) to a different value, or leave all "
+                "policy.draft optimizer keys null to share the policy settings."
+            )
+
+        overrides[ParamKey(name="*draft_model.*")] = draft_override
+        return overrides
+
+
+def build_draft_optimizer_override_provider(
+    draft_config: Mapping[str, Any],
+) -> Optional[DraftOptimizerConfigOverrideProvider]:
+    """Build the draft optimizer override provider from ``policy.draft`` config.
+
+    Returns None when the config requests no draft-specific optimizer settings,
+    so the caller falls back to megatron-bridge's default provider and the
+    optimizer param-group partition is byte-identical to a no-override run.
+    """
+    draft_lr = draft_config.get("lr")
+    draft_min_lr = draft_config.get("min_lr")
+    draft_weight_decay = draft_config.get("weight_decay")
+    if draft_lr is None and draft_min_lr is None and draft_weight_decay is None:
+        return None
+    # A draft param group exists from the first step, so the resume-matching
+    # patch must be in place before the optimizer state is ever saved/loaded.
+    extend_param_group_identifier_keys_for_resume()
+    return DraftOptimizerConfigOverrideProvider(
+        draft_lr=draft_lr,
+        draft_min_lr=draft_min_lr,
+        draft_weight_decay=draft_weight_decay,
+    )
+
+
 def build_draft_model(
     model_provider,
     draft_config: dict[str, Any],
@@ -1296,11 +1435,14 @@ def build_draft_model(
     )
     config.rotary_percent = model_provider.rotary_percent
     config.rotary_base = hf_config.get("rope_theta", model_provider.rotary_base)
+    # Official z-lab configs carry an explicit "rope_scaling": null — a
+    # present-but-null key must read as "no scaling", not crash on None.get.
+    hf_rope_scaling = (hf_config.get("rope_scaling") or {}) if hf_config else None
     config.rope_scaling = (
-        "rope_scaling" in hf_config if hf_config else model_provider.rope_scaling
+        bool(hf_rope_scaling) if hf_config else model_provider.rope_scaling
     )
     config.rope_scaling_factor = (
-        hf_config.get("rope_scaling", {}).get("factor")
+        hf_rope_scaling.get("factor", model_provider.rope_scaling_factor)
         if hf_config
         else model_provider.rope_scaling_factor
     )
@@ -1330,7 +1472,23 @@ def build_draft_model(
     config.use_mtp_layernorm = config.parallel_draft_heads_num_layers = None
     config.has_lm_head = True
 
-    draft_model = EagleModel(config=config)
+    ttt_steps = int(draft_config.get("ttt_steps", 1) or 1)
+    if ttt_steps > 1:
+        # The TTT attention/loss path slices sequences locally and stashes
+        # per-pass KV; both require every rank to see the full sequence.
+        if int(getattr(model_provider, "context_parallel_size", 1) or 1) != 1:
+            raise ValueError(
+                "policy.draft.ttt_steps > 1 requires context_parallel_size == 1."
+            )
+        if bool(model_provider.sequence_parallel):
+            raise ValueError(
+                "policy.draft.ttt_steps > 1 requires sequence_parallel == false."
+            )
+
+    draft_model = EagleModel(
+        config=config,
+        ttt_steps=ttt_steps,
+    )
     tp_group = getattr(pg_collection, "tp", None)
     if tp_group is not None:
         for module in draft_model.modules():
@@ -1377,3 +1535,4 @@ def build_draft_model(
         param.grad_norm_group = DRAFT_GRAD_NORM_GROUP
 
     return draft_model
+

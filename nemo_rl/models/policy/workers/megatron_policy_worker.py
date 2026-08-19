@@ -50,6 +50,9 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.utils import (
+    compute_draft_pass_valid_counts,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -771,6 +774,30 @@ class MegatronPolicyWorkerImpl(
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
+                # Draft (TTT) loss normalization: the draft's valid-token
+                # counts differ from the policy's (per-pass masks shift by
+                # d+1), so it gets its own global per-pass counts, all-reduced
+                # over DP only. The loss derives its gradient denominator
+                # (sum_d alpha_d * count_d) and the per-pass metric
+                # denominators from this vector.
+                draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+                draft_ttt_steps = (
+                    int(self.cfg["draft"].get("ttt_steps", 1) or 1)
+                    if draft_enabled
+                    else 1
+                )
+                global_draft_pass_counts = None
+                if draft_enabled and "token_mask" in batch and "sample_mask" in batch:
+                    global_draft_pass_counts = compute_draft_pass_valid_counts(
+                        batch["token_mask"],
+                        batch["sample_mask"],
+                        ttt_steps=draft_ttt_steps,
+                    ).to(device=global_valid_toks.device)
+                    torch.distributed.all_reduce(
+                        global_draft_pass_counts,
+                        group=parallel_state.get_data_parallel_group(),
+                    )
+
                 # Pre-compute the MTP loss mask, only when MTP is enabled, so
                 # process_microbatch can pack it.
                 model_config = self._get_model_config()
@@ -836,7 +863,6 @@ class MegatronPolicyWorkerImpl(
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
-                    draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
                     use_router_replay = _should_use_router_replay(
                         enabled=self._router_replay_enabled,
                         data=batch,
@@ -855,10 +881,12 @@ class MegatronPolicyWorkerImpl(
                             defer_fp32_logits=self.defer_fp32_logits,
                             global_valid_seqs=global_valid_seqs,
                             global_valid_toks=global_valid_toks,
+                            global_draft_pass_counts=global_draft_pass_counts,
                             sampling_params=self.sampling_params,
                             straggler_timer=self.mcore_state.straggler_timer,
                             draft_model=self.draft_model,
                             enable_hidden_capture=draft_enabled,
+                            draft_ttt_steps=draft_ttt_steps,
                             use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
                                 "use_fused_linear_logprobs", False
                             ),
@@ -1322,6 +1350,12 @@ class MegatronPolicyWorkerImpl(
         placeholder_n = torch.tensor(1.0, device="cuda")
 
         draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+        # With TTT enabled the draft's core attention is the multi-pass module,
+        # so the forward MUST run through forward_ttt even here (the plain
+        # single-pass forward would trip its begin_pass guard).
+        draft_ttt_steps = (
+            int(self.cfg["draft"].get("ttt_steps", 1) or 1) if draft_enabled else 1
+        )
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
             data=data,
@@ -1352,6 +1386,7 @@ class MegatronPolicyWorkerImpl(
                     straggler_timer=self.mcore_state.straggler_timer,
                     draft_model=self.draft_model,
                     enable_hidden_capture=draft_enabled,
+                    draft_ttt_steps=draft_ttt_steps,
                     use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
                         "use_fused_linear_logprobs", False
                     ),

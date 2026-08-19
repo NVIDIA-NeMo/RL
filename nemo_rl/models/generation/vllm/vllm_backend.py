@@ -427,6 +427,50 @@ class VllmInternalWorkerExtension:
         draft_owner = getattr(self.model_runner, "drafter", None)
         return getattr(draft_owner, "model", None) if draft_owner else None
 
+    def _unshare_draft_lm_head(self, draft_model: torch.nn.Module) -> None:
+        """Give the drafter a private lm_head before loading a trained head.
+
+        vLLM's spec-decode proposer aliases the drafter's ``lm_head`` MODULE to
+        the target's when their weights are identical at engine init — and
+        unconditionally for drafters without a ``has_own_lm_head`` flag
+        (``SpecDecodeBaseProposer._maybe_share_lm_head``, vLLM 0.26). For a
+        draft that TRAINS its own head (Eagle), the refit stream would then
+        write the diverged draft head through the alias, silently overwriting
+        the serving target's head (generation no longer matches the trained
+        policy — broken importance ratios / KL). Deep-copy the head into
+        drafter-private storage before such a load; later refits see distinct
+        storage and no-op.
+
+        Only called when the incoming draft weights actually contain an
+        lm_head update: head-less drafts WANT the sharing to persist — their
+        draft logits must track the target's live head. Embedding sharing is
+        likewise left intact.
+        """
+        target_model = getattr(self.model_runner, "model", None)
+        if target_model is not None and hasattr(target_model, "get_language_model"):
+            target_model = target_model.get_language_model()
+        draft_lm_head = getattr(draft_model, "lm_head", None)
+        target_lm_head = getattr(target_model, "lm_head", None)
+        draft_weight = getattr(draft_lm_head, "weight", None)
+        target_weight = getattr(target_lm_head, "weight", None)
+        if not isinstance(draft_weight, torch.Tensor) or not isinstance(
+            target_weight, torch.Tensor
+        ):
+            return
+        if (
+            draft_weight.untyped_storage().data_ptr()
+            != target_weight.untyped_storage().data_ptr()
+        ):
+            return
+        import copy
+
+        draft_model.lm_head = copy.deepcopy(target_lm_head)
+        print(
+            "[draft] Drafter lm_head was aliased to the target's (vLLM "
+            "share-on-identical-weights); un-shared it into private storage "
+            "before applying draft refit weights."
+        )
+
     def _load_draft_weights(
         self, draft_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
@@ -435,10 +479,19 @@ class VllmInternalWorkerExtension:
 
         draft_model = self._get_drafter_model()
         if draft_model is None:
-            logger.warning(
-                "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
+            # The trainer only streams draft.* weights when a draft model is
+            # co-training, so an unreachable drafter here means the weights
+            # would be silently dropped and serving would keep stale draft
+            # weights forever (observed: acceptance rate pinned at exactly 0
+            # while draft_loss fell). Fail loudly instead.
+            raise RuntimeError(
+                "[draft] Received draft weights but no vLLM drafter was found "
+                "on the model runner; the draft refit would be silently "
+                "dropped. Check the speculative_config and the vLLM "
+                "model-runner version compatibility."
             )
-            return
+        if any("lm_head" in name for name, _ in draft_weights):
+            self._unshare_draft_lm_head(draft_model)
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
 
