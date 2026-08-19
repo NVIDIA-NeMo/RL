@@ -79,6 +79,15 @@ def _run_tp2_projected_soft_ce(
     expected_loss = (expected_numerators * weights).sum() / (
         (expected_counts * weights).sum() + 1e-8
     )
+    row_scale = (
+        weights.index_select(0, bin_ids)
+        * mask
+        / ((expected_counts * weights).sum() + 1e-8)
+    )
+    expected_hidden_gradient = (
+        (student_log_probs.exp() - teacher_probs).mul(row_scale.unsqueeze(-1))
+        @ full_output_weight.float()
+    ).to(student_hidden.dtype)
     expected_loss.backward()
 
     local_output_weight = (
@@ -105,7 +114,7 @@ def _run_tp2_projected_soft_ce(
     torch.testing.assert_close(stats.numerators, expected_numerators)
     torch.testing.assert_close(stats.counts, expected_counts)
     torch.testing.assert_close(loss, expected_loss)
-    torch.testing.assert_close(local_hidden.grad, reference_hidden.grad)
+    torch.testing.assert_close(local_hidden.grad, expected_hidden_gradient)
     assert stats.counts[2] == 0
     assert local_teacher_logits.grad is None
     assert local_output_weight.grad is None

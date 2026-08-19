@@ -761,3 +761,85 @@ def projected_streaming_vocab_parallel_soft_ce(
         counts=counts.detach(),
         weights=weights.to(device=mask.device, dtype=torch.float32).detach(),
     )
+
+
+def dflash_projected_vocab_parallel_soft_ce(
+    *,
+    draft_hidden: torch.Tensor,
+    output_weight: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    sample_rows: torch.Tensor,
+    label_positions: torch.Tensor,
+    loss_mask: torch.Tensor,
+    position_decay: float,
+    token_chunk_size: int,
+    tp_group: torch.distributed.ProcessGroup | None,
+) -> DraftLossStats:
+    """Map DFlash block slots to the live target head and indexed teacher rows."""
+    if draft_hidden.ndim != 3 or draft_hidden.shape[1] < 2:
+        raise ValueError(
+            "draft_hidden must have shape [blocks, gamma + 1, hidden] with "
+            f"gamma positive, got {draft_hidden.shape}."
+        )
+    if teacher_logits.ndim != 3:
+        raise ValueError(
+            "teacher_logits must have shape [batch, sequence, local_vocab], "
+            f"got {teacher_logits.shape}."
+        )
+    block_shape = draft_hidden.shape[:-1]
+    num_blocks, block_size = block_shape
+    if sample_rows.shape != (num_blocks,):
+        raise ValueError(
+            f"sample_rows must have shape {(num_blocks,)}, got {sample_rows.shape}."
+        )
+    if label_positions.shape != block_shape:
+        raise ValueError(
+            "label_positions must match DFlash block slots, "
+            f"got {label_positions.shape} and {block_shape}."
+        )
+    if loss_mask.shape != block_shape:
+        raise ValueError(
+            "loss_mask must match DFlash block slots, "
+            f"got {loss_mask.shape} and {block_shape}."
+        )
+    if sample_rows.dtype != torch.long or label_positions.dtype != torch.long:
+        raise TypeError("sample_rows and label_positions must use torch.long.")
+    if loss_mask.dtype != torch.bool:
+        raise TypeError(f"loss_mask must be boolean, got {loss_mask.dtype}.")
+    if loss_mask[:, 0].any():
+        raise ValueError("loss_mask must exclude the DFlash anchor slot.")
+    if not (
+        draft_hidden.device
+        == teacher_logits.device
+        == sample_rows.device
+        == label_positions.device
+        == loss_mask.device
+    ):
+        raise ValueError(
+            "draft_hidden, teacher_logits, sample_rows, label_positions, and "
+            "loss_mask must share a device."
+        )
+    if not 0.0 < position_decay <= 1.0:
+        raise ValueError(f"position_decay must be in (0, 1], got {position_decay}.")
+
+    sequence_length = teacher_logits.shape[1]
+    teacher_row_indices = sample_rows[:, None] * sequence_length + label_positions
+    teacher_row_indices[:, 0] = 0
+    gamma = block_size - 1
+    slot_offsets = torch.arange(block_size, device=draft_hidden.device)
+    bin_ids = slot_offsets.sub(1).clamp_min_(0).expand(block_shape)
+    weights = torch.pow(
+        torch.tensor(position_decay, dtype=torch.float32, device=draft_hidden.device),
+        torch.arange(gamma, dtype=torch.float32, device=draft_hidden.device),
+    )
+    return projected_streaming_vocab_parallel_soft_ce(
+        student_hidden=draft_hidden,
+        output_weight=output_weight,
+        teacher_logits=teacher_logits,
+        teacher_row_indices=teacher_row_indices,
+        mask=loss_mask,
+        bin_ids=bin_ids,
+        weights=weights,
+        token_chunk_size=token_chunk_size,
+        tp_group=tp_group,
+    )

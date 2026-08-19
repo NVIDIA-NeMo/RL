@@ -17,7 +17,10 @@ from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 import torch
 from pydantic import BaseModel
 
-from nemo_rl.algorithms.loss.draft import streaming_vocab_parallel_soft_ce
+from nemo_rl.algorithms.loss.draft import (
+    dflash_projected_vocab_parallel_soft_ce,
+    streaming_vocab_parallel_soft_ce,
+)
 from nemo_rl.algorithms.loss.interfaces import (
     LossFunction,
     LossInputType,
@@ -96,6 +99,50 @@ class DraftCrossEntropyLossFn(LossFunction):
         )
         return stats.normalized(
             normalization_counts=global_valid_toks.reshape(1),
+        )
+
+
+class DFlashProjectedLossFn:
+    """Normalize DFlash hidden-to-live-head soft CE with global slot counts."""
+
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.DRAFT
+
+    def __init__(
+        self,
+        *,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup],
+        token_chunk_size: int,
+        position_decay: float,
+    ) -> None:
+        self.vocab_parallel_group = vocab_parallel_group
+        self.token_chunk_size = token_chunk_size
+        self.position_decay = position_decay
+
+    def __call__(
+        self,
+        *,
+        draft_hidden: torch.Tensor,
+        output_weight: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        sample_rows: torch.Tensor,
+        label_positions: torch.Tensor,
+        loss_mask: torch.Tensor,
+        global_normalization_counts: torch.Tensor,
+    ) -> torch.Tensor:
+        stats = dflash_projected_vocab_parallel_soft_ce(
+            draft_hidden=draft_hidden,
+            output_weight=output_weight,
+            teacher_logits=teacher_logits,
+            sample_rows=sample_rows,
+            label_positions=label_positions,
+            loss_mask=loss_mask,
+            position_decay=self.position_decay,
+            token_chunk_size=self.token_chunk_size,
+            tp_group=self.vocab_parallel_group,
+        )
+        return stats.normalized(
+            normalization_counts=global_normalization_counts,
         )
 
 
