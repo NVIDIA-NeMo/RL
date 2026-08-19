@@ -165,6 +165,39 @@ def _validate_tp_metadata_agreement(
         raise ValueError("tensor-parallel ranks must agree on DSpark token metadata")
 
 
+def _validate_tp_slot_weight_agreement(
+    slot_weights: torch.Tensor | None,
+    *,
+    device: torch.device,
+    tp_group: torch.distributed.ProcessGroup | None,
+) -> None:
+    if slot_weights is None:
+        return
+    _raise_if_tp_any(
+        not bool(torch.isfinite(slot_weights).all()) or bool(slot_weights.lt(0).any()),
+        message="slot_weights must be finite and nonnegative",
+        device=device,
+        tp_group=tp_group,
+    )
+    if tp_group is None:
+        return
+    weights = slot_weights.detach().float()
+    minimum = weights.clone()
+    maximum = weights.clone()
+    torch.distributed.all_reduce(
+        minimum,
+        op=torch.distributed.ReduceOp.MIN,
+        group=tp_group,
+    )
+    torch.distributed.all_reduce(
+        maximum,
+        op=torch.distributed.ReduceOp.MAX,
+        group=tp_group,
+    )
+    if not torch.equal(minimum, maximum):
+        raise ValueError("tensor-parallel ranks must agree on DSpark slot_weights")
+
+
 def _compact_retained_view(tensor: torch.Tensor) -> torch.Tensor:
     compact_nbytes = tensor.numel() * tensor.element_size()
     if tensor.untyped_storage().nbytes() > compact_nbytes:
@@ -178,14 +211,25 @@ class DSparkLossBins:
 
     numerators: torch.Tensor
     counts: torch.Tensor
+    weights: torch.Tensor
 
     def __post_init__(self) -> None:
-        if self.numerators.ndim != 1 or self.counts.ndim != 1:
-            raise ValueError("DSpark loss numerators and counts must be vectors")
-        if self.numerators.shape != self.counts.shape:
+        if any(
+            tensor.ndim != 1 for tensor in (self.numerators, self.counts, self.weights)
+        ):
             raise ValueError(
-                "DSpark loss numerators and counts must have the same shape"
+                "DSpark loss numerators, counts, and weights must be vectors"
             )
+        if not (self.numerators.shape == self.counts.shape == self.weights.shape):
+            raise ValueError(
+                "DSpark loss numerators, counts, and weights must have the same shape"
+            )
+        if not self.weights.is_floating_point():
+            raise TypeError("DSpark loss weights must use a floating dtype")
+        if not (self.numerators.device == self.counts.device == self.weights.device):
+            raise ValueError("DSpark loss bins must share a device")
+        if self.weights.requires_grad or self.weights.dtype != torch.float32:
+            object.__setattr__(self, "weights", self.weights.detach().float())
 
     def normalized(
         self,
@@ -195,21 +239,32 @@ class DSparkLossBins:
         """Normalize a local differentiable numerator by externally reduced counts."""
         if normalization_counts.shape != self.counts.shape:
             raise ValueError("normalization_counts must match the local count bins")
-        denominator = (
-            normalization_counts.detach()
-            .to(device=self.numerators.device, dtype=torch.float32)
-            .sum()
+        weights = self.weights.to(
+            device=self.numerators.device,
+            dtype=self.numerators.dtype,
         )
-        return self.numerators.sum() / (denominator + 1e-8)
+        denominator = (
+            normalization_counts.detach().to(
+                device=self.weights.device,
+                dtype=torch.float32,
+            )
+            * self.weights
+        ).sum()
+        return (self.numerators * weights).sum() / (denominator + 1e-8)
 
     def __add__(self, other: object) -> DSparkLossBins:
         if not isinstance(other, DSparkLossBins):
             return NotImplemented
         if self.numerators.shape != other.numerators.shape:
             raise ValueError("DSpark loss bins must have matching shapes")
+        if self.weights is not other.weights and not torch.equal(
+            self.weights, other.weights
+        ):
+            raise ValueError("DSpark loss bins must have matching weights")
         return DSparkLossBins(
             numerators=self.numerators + other.numerators,
             counts=self.counts + other.counts,
+            weights=self.weights,
         )
 
 
@@ -579,6 +634,7 @@ def _validate_inputs(
     hard_labels: torch.Tensor,
     valid_mask: torch.Tensor,
     slot_bins: torch.Tensor,
+    slot_weights: torch.Tensor | None,
     loss_weights: tuple[float, float, float],
     token_chunk_size: int,
     draft_vocab_start_index: int,
@@ -596,6 +652,7 @@ def _validate_inputs(
             hard_labels,
             valid_mask,
             slot_bins,
+            slot_weights,
         ),
         loss_weights=loss_weights,
         token_chunk_size=token_chunk_size,
@@ -647,6 +704,8 @@ def _validate_inputs(
             raise ValueError(f"{name} must match DSpark slots")
     if confidence_logits is not None and confidence_logits.shape != slot_shape:
         raise ValueError("confidence logits must match DSpark slots")
+    if slot_weights is not None and slot_weights.shape != (slot_shape[1],):
+        raise ValueError("slot_weights must have one value per DSpark slot bin")
     if previous_token_ids.dtype != torch.long:
         raise TypeError("previous_token_ids must use torch.long")
     if hard_labels.dtype != torch.long:
@@ -655,6 +714,8 @@ def _validate_inputs(
         raise TypeError("slot_bins must use torch.long")
     if valid_mask.dtype != torch.bool:
         raise TypeError("valid_mask must be boolean")
+    if slot_weights is not None and not slot_weights.is_floating_point():
+        raise TypeError("slot_weights must use a floating dtype")
     floating_inputs = (
         target_logits,
         draft_hidden,
@@ -686,6 +747,8 @@ def _validate_inputs(
     )
     if confidence_logits is not None:
         devices.add(confidence_logits.device)
+    if slot_weights is not None:
+        devices.add(slot_weights.device)
     _raise_if_tp_any(
         len(devices) != 1,
         message="all DSpark objective inputs must share a device",
@@ -700,6 +763,11 @@ def _validate_inputs(
         raise ValueError("loss_weights must contain three finite nonnegative values")
     if confidence_logits is None and loss_weights[2] != 0:
         raise ValueError("confidence weight must be zero when confidence is disabled")
+    _validate_tp_slot_weight_agreement(
+        slot_weights,
+        device=target_logits.device,
+        tp_group=tp_group,
+    )
     _validate_tp_metadata_agreement(
         previous_token_ids=previous_token_ids,
         hard_labels=hard_labels,
@@ -746,6 +814,7 @@ def dspark_tiled_objective(
     hard_labels: torch.Tensor,
     valid_mask: torch.Tensor,
     slot_bins: torch.Tensor,
+    slot_weights: torch.Tensor | None = None,
     loss_weights: tuple[float, float, float],
     token_chunk_size: int,
     draft_vocab_start_index: int,
@@ -763,12 +832,18 @@ def dspark_tiled_objective(
         hard_labels=hard_labels,
         valid_mask=valid_mask,
         slot_bins=slot_bins,
+        slot_weights=slot_weights,
         loss_weights=loss_weights,
         token_chunk_size=token_chunk_size,
         draft_vocab_start_index=draft_vocab_start_index,
         tp_group=tp_group,
     )
     num_bins = target_logits.shape[1]
+    resolved_slot_weights = (
+        torch.ones(num_bins, dtype=torch.float32, device=target_logits.device)
+        if slot_weights is None
+        else slot_weights.detach().float()
+    )
     compact_hidden = _compact_retained_view(draft_hidden)
     compact_target = _compact_retained_view(target_logits.detach())
     compact_previous_token_ids = _compact_retained_view(previous_token_ids)
@@ -820,18 +895,31 @@ def dspark_tiled_objective(
             confidence_rows.reshape(-1) * valid_mask.reshape(-1).float(),
         )
 
-    ce = DSparkLossBins(numerators=ce_numerators, counts=counts)
-    tv = DSparkLossBins(numerators=tv_numerators, counts=counts)
+    ce = DSparkLossBins(
+        numerators=ce_numerators,
+        counts=counts,
+        weights=resolved_slot_weights,
+    )
+    tv = DSparkLossBins(
+        numerators=tv_numerators,
+        counts=counts,
+        weights=resolved_slot_weights,
+    )
     confidence = DSparkLossBins(
         numerators=confidence_numerators,
         counts=confidence_counts,
+        weights=resolved_slot_weights,
     )
     combined_numerators = (
         loss_weights[0] * ce_numerators
         + loss_weights[1] * tv_numerators
         + loss_weights[2] * confidence_numerators
     )
-    combined = DSparkLossBins(numerators=combined_numerators, counts=counts)
+    combined = DSparkLossBins(
+        numerators=combined_numerators,
+        counts=counts,
+        weights=resolved_slot_weights,
+    )
     return DSparkObjectiveStats(
         ce=ce,
         tv=tv,

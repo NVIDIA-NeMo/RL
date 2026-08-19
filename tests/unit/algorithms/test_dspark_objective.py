@@ -265,7 +265,13 @@ def _dense_oracle(inputs: dict[str, object]) -> tuple[DSparkLossBins, ...]:
             slot_bins.reshape(-1),
             rows.reshape(-1) * valid_mask.reshape(-1),
         )
-        components.append(DSparkLossBins(numerators=numerators, counts=counts))
+        components.append(
+            DSparkLossBins(
+                numerators=numerators,
+                counts=counts,
+                weights=torch.ones_like(counts),
+            )
+        )
     return tuple(components)
 
 
@@ -615,6 +621,7 @@ def test_normalized_requires_externally_reduced_counts() -> None:
     stats = DSparkLossBins(
         numerators=local_numerator,
         counts=torch.tensor([2.0]),
+        weights=torch.ones(1),
     )
 
     with pytest.raises(TypeError, match="normalization_counts"):
