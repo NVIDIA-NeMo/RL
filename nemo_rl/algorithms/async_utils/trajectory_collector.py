@@ -30,6 +30,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_multiple
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import (
@@ -38,10 +39,16 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.rollouts import (
     RolloutGroupResult,
+    attach_initial_nemo_gym_image_payloads,
     run_async_multi_turn_rollout_groups,
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
+from nemo_rl.utils.multimodal_payload_metrics import (
+    collect_multimodal_payload_metrics,
+    drain_multimodal_payload_metrics,
+    print_multimodal_payload_metrics,
+)
 from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -66,6 +73,7 @@ class AsyncTrajectoryCollector:
         alias_to_group_alias: Optional[dict[str, str]] = None,
         on_policy_distillation_cfg: Optional[dict[str, Any]] = None,
         next_nemo_gym_task_index: int = 0,
+        processor: Any = None,
     ):
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
@@ -75,6 +83,7 @@ class AsyncTrajectoryCollector:
         self.teacher_worker_groups = teacher_worker_groups or {}
         self.alias_to_group_alias = alias_to_group_alias or {}
         self.on_policy_distillation_cfg = on_policy_distillation_cfg or {}
+        self.processor = processor
         self._has_distillation_teachers = bool(self.teacher_worker_groups)
         self._teacher_seq_pad_multiple = teacher_seq_pad_multiple(
             self.teacher_worker_groups,
@@ -125,6 +134,15 @@ class AsyncTrajectoryCollector:
 
         # Timer for efficiency metrics
         self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
+
+        # Failure tracking for rollout batch workers. _failure_lock guards both
+        # _failure_count and _fatal_error_message.
+        self._failure_lock: _threading.Lock = _threading.Lock()
+        self._failure_count: int = 0
+        self._fatal_error_message: str | None = None
+        self._max_generation_failures = (
+            self.master_config.grpo.async_grpo.max_generation_failures
+        )
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -291,6 +309,8 @@ class AsyncTrajectoryCollector:
 
                 # Check if generation limits require pausing collection
                 if self._should_pause_for_generation_limits() and self.running:
+                    self._generation_limit_cleared.clear()
+
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
                         max_trajectory_age = (
@@ -306,8 +326,6 @@ class AsyncTrajectoryCollector:
                             f"already exist in buffer. Waiting for weight update..."
                         )
                         self._last_limit_warning_version = self.current_weight_version
-
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
 
                     # Efficiently wait for generation limits to be cleared (no polling!)
                     with self._efficiency_timer.time("idle/generation_limit_pause"):
@@ -428,7 +446,23 @@ class AsyncTrajectoryCollector:
             rollout_batch = batch.slice(0, num_prompts_to_generate)
             if use_nemo_gym:
                 self._stamp_nemo_gym_task_indices(rollout_batch)
-            repeated_batch = rollout_batch.repeat_interleave(num_generations)
+                if self.master_config.grpo.deduplicate_multimodal_data:
+                    attach_initial_nemo_gym_image_payloads(
+                        rollout_batch, self.processor
+                    )
+            repeated_batch = rollout_batch.repeat_interleave(
+                num_generations,
+                share_immutable_media=(
+                    self.master_config.grpo.deduplicate_multimodal_data
+                ),
+            )
+            print_multimodal_payload_metrics(
+                collect_multimodal_payload_metrics(
+                    repeated_batch,
+                    "prompt_repeat_async",
+                    enabled=self.master_config.grpo.debug_payload_metrics,
+                )
+            )
 
             def _run_rollout_batch() -> None:
                 asyncio.run(
@@ -472,6 +506,21 @@ class AsyncTrajectoryCollector:
     def get_weight_version(self) -> int:
         return self.current_weight_version
 
+    def check_health(self) -> None:
+        """Raise the stored fatal worker error, if any.
+
+        Called by the trainer between sampling iterations. When a generation
+        worker has recorded a fatal failure (consecutive count exceeded
+        max_generation_failures), this raises it so the training job dies
+        instead of stalling on an empty replay buffer. Safe to call
+        repeatedly: returns silently when no fatal error is set, and raises
+        every time once one is.
+        """
+        with self._failure_lock:
+            error_message = self._fatal_error_message
+        if error_message is not None:
+            raise RuntimeError(error_message)
+
     def pause(self) -> None:
         """Pause trajectory collection."""
         self._manual_pause_cleared.clear()  # Signal collection to pause
@@ -506,15 +555,21 @@ class AsyncTrajectoryCollector:
                 "async_engine", False
             )
         elif backend == "megatron":
-            is_async_engine = generation_cfg.get("mcore_generation_config", {}).get(
-                "async_engine", False
-            )
+            is_async_engine = True
         elif backend == "trtllm":
             assert generation_cfg.get("trtllm_cfg", {}).get("async_engine", False), (
                 "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
                 "synchronous engine path (async_engine=false) is no longer supported."
             )
             is_async_engine = True
+        elif backend == "dynamo":
+            # Dynamo's native layerwise reload temporarily materializes model
+            # parameters while the NCCL update is in progress.  It is not safe
+            # to execute an already-issued vLLM request concurrently with that
+            # reload (in particular for NemotronH/Mamba parameters), even when
+            # the update route accepts allow_unpaused=True.  Stop new trajectory
+            # starts above and drain every active trajectory before refitting.
+            is_async_engine = False
         else:
             is_async_engine = False
         async_grpo_config = self.master_config.grpo.async_grpo
@@ -564,8 +619,17 @@ class AsyncTrajectoryCollector:
                     )
             except Exception as e:
                 print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
-
-        self._refit_pause_cleared.set()
+                if (
+                    "generation" in self.master_config.policy
+                    and self.master_config.policy["generation"]["backend"] == "dynamo"
+                ):
+                    raise RuntimeError(
+                        "Managed Dynamo KV cache invalidation failed after refit"
+                    ) from e
+            finally:
+                self._refit_pause_cleared.set()
+        else:
+            self._refit_pause_cleared.set()
 
     def wait_for_pending_generations(self) -> None:
         """Wait for all in-flight generation threads to complete."""
@@ -605,6 +669,15 @@ class AsyncTrajectoryCollector:
             self._efficiency_timer.get_timing_metrics(reduction_op="sum"),
         )
 
+    async def drain_payload_metrics(self) -> dict[str, int | float]:
+        """Close one drain-to-drain collector/Gym telemetry interval.
+
+        Rollout collection is concurrent with training, so the interval is not
+        claimed to own the sampled training batch. Call-normalized metrics make
+        intervals comparable even when their background transfer counts differ.
+        """
+        return drain_multimodal_payload_metrics()
+
     def get_rollouts_state(self) -> dict[str, int]:
         """Get collector-side rollout state for checkpointing."""
         return {NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index}
@@ -629,6 +702,7 @@ class AsyncTrajectoryCollector:
         input_ids: torch.Tensor,
         agent_refs: list[dict[str, Any]],
         input_lengths: Optional[torch.Tensor] = None,
+        multimodal_data: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, float]:
         """Compute teacher logprobs for non-colocated teachers.
 
@@ -638,6 +712,8 @@ class AsyncTrajectoryCollector:
             input_ids: [B, S] tokenized input tensor
             agent_refs: list of B agent reference dicts
             input_lengths: [B] per-sample lengths (required for sequence packing)
+            multimodal_data: batch-level multimodal inputs, row-aligned with
+                ``input_ids`` and sliced per teacher
 
         Returns:
             ([B, S] teacher logprobs tensor, total_time_seconds)
@@ -677,6 +753,7 @@ class AsyncTrajectoryCollector:
             twg = self.teacher_worker_groups[group_key]
             sub_input_ids = input_ids[indices]
             sub_lengths = input_lengths[indices] if input_lengths is not None else None
+            row_indices = list(indices)
 
             # Pad batch to multiple of dp_size (required for DP sharding)
             dp_size = twg.sharding_annotations.get_axis_size("data_parallel")
@@ -692,10 +769,26 @@ class AsyncTrajectoryCollector:
                     sub_lengths = torch.cat(
                         [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
                     )
+                row_indices.extend([row_indices[-1]] * pad_count)
 
             sub_data = BatchedDataDict({"input_ids": sub_input_ids})
             if sub_lengths is not None:
                 sub_data["input_lengths"] = sub_lengths
+            if multimodal_data:
+                selected_multimodal = BatchedDataDict(multimodal_data).select_indices(
+                    row_indices
+                )
+                sub_data.update(
+                    {
+                        key: value
+                        for key, value in selected_multimodal.items()
+                        if value is not None
+                        and not (
+                            isinstance(value, PackedTensor)
+                            and not any(value.logical_segment_counts_by_row())
+                        )
+                    }
+                )
 
             # Serialize calls per teacher to prevent NCCL collective desync
             t_lock_start = time.time()
@@ -777,6 +870,10 @@ class AsyncTrajectoryCollector:
                 mask_env_flagged_samples=should_mask_flagged_samples(
                     self.master_config.env
                 ),
+                deduplicate_multimodal_data=(
+                    self.master_config.grpo.deduplicate_multimodal_data
+                ),
+                debug_payload_metrics=self.master_config.grpo.debug_payload_metrics,
             ):
                 task_index = rollout_result.task_index
                 if task_index is None:
@@ -801,6 +898,9 @@ class AsyncTrajectoryCollector:
             num_generations=num_generations,
             max_rollout_turns=self.master_config.grpo.max_rollout_turns,
             greedy=False,
+            deduplicate_multimodal_data=(
+                self.master_config.grpo.deduplicate_multimodal_data
+            ),
         ):
             yield rollout_result
 
@@ -814,6 +914,7 @@ class AsyncTrajectoryCollector:
     ) -> None:
         """Own one target reservation while collecting its rollout batch."""
         worker_start = time.perf_counter()
+        wake_generation_limits_after_cleanup = False
         try:
             await self._collect_rollout_batch(
                 repeated_batch=repeated_batch,
@@ -822,22 +923,56 @@ class AsyncTrajectoryCollector:
                 num_generations=num_generations,
                 use_nemo_gym=use_nemo_gym,
             )
+            with self._failure_lock:
+                if self._fatal_error_message is None:
+                    self._failure_count = 0
         except Exception as error:
+            if not self.running:
+                return
+
             self._efficiency_timer.record(
                 "wasted/failed_trajectory", time.perf_counter() - worker_start
             )
             backend = "NeMo-Gym" if use_nemo_gym else "native"
-            print(
-                f"❌ Error in {backend} batch worker "
-                f"(target_weight={target_weight_version}): {error}"
-            )
             import traceback
 
-            traceback.print_exc()
+            failure_traceback = traceback.format_exc()
+            with self._failure_lock:
+                self._failure_count += 1
+                failure_count = self._failure_count
+                failure_limit = self._max_generation_failures
+                is_fatal = failure_count > failure_limit
+                if is_fatal and self._fatal_error_message is None:
+                    self._fatal_error_message = (
+                        "AsyncTrajectoryCollector aborting: "
+                        f"{failure_count} batch-worker failure(s) exceeded "
+                        f"max_generation_failures={failure_limit}. "
+                        f"Last failure in {backend} batch worker for "
+                        f"generation_weight={generation_weight_version}, "
+                        f"target_weight={target_weight_version}: {error!r}\n"
+                        f"Worker traceback:\n{failure_traceback}"
+                    )
+            wake_generation_limits_after_cleanup = True
+            print(
+                f"[AsyncTrajectoryCollector] {backend} batch worker FAILED "
+                f"(failure {failure_count}, tolerating {failure_limit}) "
+                f"generation_weight={generation_weight_version} "
+                f"target_weight={target_weight_version}\n{failure_traceback}",
+                flush=True,
+            )
+            if is_fatal:
+                print(
+                    f"[AsyncTrajectoryCollector] FATAL: failure count "
+                    f"{failure_count} exceeds threshold {failure_limit}; trainer "
+                    "will be notified on the next check_health() call.",
+                    flush=True,
+                )
         finally:
             self._release_target(target_weight_version)
             with self._threads_lock:
                 self._inflight_threads.discard(_threading.current_thread())
+            if wake_generation_limits_after_cleanup:
+                self._generation_limit_cleared.set()
 
     @staticmethod
     def _build_task_index_map(
@@ -904,6 +1039,9 @@ class AsyncTrajectoryCollector:
                     flat_for_teacher["token_ids"],
                     agent_refs,
                     input_lengths=teacher_input_lengths,
+                    multimodal_data=flat_for_teacher.get_multimodal_dict(
+                        as_tensors=False
+                    ),
                 )
                 # Keep the tensor inside the batch so replay-buffer collation can
                 # pad variable-length prompt groups correctly.
@@ -922,11 +1060,22 @@ class AsyncTrajectoryCollector:
         }
         if rollout_result.task_index is not None:
             trajectory_group[NEMO_GYM_TASK_INDEX_KEY] = rollout_result.task_index
-
         backoff_delay = 0.01
         backoff_started_at: float | None = None
         try:
             while self.running:
+                # Every retry is a distinct Ray submission of the full payload.
+                print_multimodal_payload_metrics(
+                    collect_multimodal_payload_metrics(
+                        (
+                            trajectory_group,
+                            generation_weight_version,
+                            target_weight_version,
+                        ),
+                        "replay_push",
+                        enabled=self.master_config.grpo.debug_payload_metrics,
+                    )
+                )
                 status = await self.replay_buffer.add.remote(
                     trajectory_group,
                     generation_weight_version,

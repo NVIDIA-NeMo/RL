@@ -25,11 +25,35 @@ nemo_rl.models.megatron.setup, focusing on:
 """
 
 import os
+from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+
+
+@dataclass
+class _NestedModelConfig:
+    enabled: bool = False
+    mode: str = "default"
+
+
+@dataclass
+class _SerializableModelConfig:
+    masked_softmax_fusion: bool = True
+    nested_config: _NestedModelConfig = field(default_factory=_NestedModelConfig)
+    mapping_config: dict[str, Any] = field(
+        default_factory=lambda: {"preserved": 1, "nested": {"old": 2}}
+    )
+    finalized: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        pass
+
+    def finalize(self) -> None:
+        self.finalized = True
 
 
 @pytest.mark.mcore
@@ -514,6 +538,80 @@ class TestValidateModelPaths:
 
 
 @pytest.mark.mcore
+class TestApplyModelOverrides:
+    """Tests for generic Megatron Bridge model-provider overrides."""
+
+    def test_constructs_provider_with_nested_and_mapping_overrides(self):
+        """Overrides construct a new provider and preserve the original config."""
+        from nemo_rl.models.megatron.setup import _merge_model_overrides
+
+        model_cfg = _SerializableModelConfig()
+        merged_model_cfg = _merge_model_overrides(
+            model_cfg,
+            {
+                "masked_softmax_fusion": False,
+                "nested_config": {"enabled": True},
+                "mapping_config": {"nested": {"new": 3}},
+            },
+        )
+
+        assert merged_model_cfg is not model_cfg
+        assert merged_model_cfg.masked_softmax_fusion is False
+        assert merged_model_cfg.nested_config is not model_cfg.nested_config
+        assert merged_model_cfg.nested_config.enabled is True
+        assert merged_model_cfg.nested_config.mode == "default"
+        assert merged_model_cfg.mapping_config == {
+            "preserved": 1,
+            "nested": {"old": 2, "new": 3},
+        }
+        assert model_cfg.masked_softmax_fusion is True
+        assert model_cfg.nested_config.enabled is False
+        assert model_cfg.mapping_config == {
+            "preserved": 1,
+            "nested": {"old": 2},
+        }
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected_path"),
+        [
+            ({"typo": True}, "policy.megatron_cfg.model_overrides.typo"),
+            (
+                {"nested_config": {"typo": True}},
+                "policy.megatron_cfg.model_overrides.nested_config.typo",
+            ),
+        ],
+    )
+    def test_unknown_object_attribute_raises_with_full_path(
+        self, overrides, expected_path
+    ):
+        """Misspelled provider fields fail early with an actionable path."""
+        from nemo_rl.models.megatron.setup import _merge_model_overrides
+
+        model_cfg = _SerializableModelConfig()
+
+        with pytest.raises(AttributeError, match=expected_path):
+            _merge_model_overrides(model_cfg, overrides)
+
+    def test_rejects_first_class_megatron_config_conflict(self):
+        """A first-class field cannot also be supplied through model_overrides."""
+        from nemo_rl.models.megatron.setup import (
+            _validate_model_override_conflicts,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "policy.megatron_cfg.model_overrides.tensor_model_parallel_size "
+                "conflicts with policy.megatron_cfg.tensor_model_parallel_size"
+            ),
+        ):
+            _validate_model_override_conflicts(
+                {"model_overrides": {"tensor_model_parallel_size": 2}},
+                {"tensor_model_parallel_size": 2},
+            )
+
+
+@pytest.mark.mcore
 class TestApplyParallelismConfig:
     """Tests for _apply_parallelism_config function."""
 
@@ -923,6 +1021,61 @@ class TestApplyPerformanceConfig:
             megatron_cfg["attention_backend"] = attention_backend
         return {"megatron_cfg": megatron_cfg}
 
+    def test_cuda_graph_training_values_are_forwarded(self):
+        """Explicit training CUDA Graph settings are normalized on assignment."""
+        from megatron.core.transformer.enums import CudaGraphModule
+
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            cuda_graph_modules=["attn"],
+            cuda_graph_warmup_steps=1,
+        )
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
+                "cuda_graph_modules": ["attn", "mlp"],
+                "cuda_graph_warmup_steps": 3,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.cuda_graph_modules == [
+            CudaGraphModule.attn,
+            CudaGraphModule.mlp,
+        ]
+        assert model_cfg.cuda_graph_warmup_steps == 3
+
+    def test_omitted_cuda_graph_training_values_preserve_model_config(self):
+        """Omitted training CUDA Graph settings retain Megatron-Core values."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            cuda_graph_modules=["attn"],
+            cuda_graph_warmup_steps=1,
+        )
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.cuda_graph_modules == ["attn"]
+        assert model_cfg.cuda_graph_warmup_steps == 1
+
     def test_basic_performance_config(self):
         """Test applying basic performance configuration."""
         from nemo_rl.models.megatron.setup import _apply_performance_config
@@ -1105,6 +1258,161 @@ class TestApplyPerformanceConfig:
         assert model_cfg.fp8_recipe == "default"
         assert model_cfg.fp8_param is False
 
+    def test_fine_grained_activation_offloading_enabled(self):
+        """Test happy path: enabled with non-empty offload_modules list."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock()
+        model_cfg.gated_linear_unit = True
+        model_cfg.num_moe_experts = 8
+        offload_modules = ["mlp_norm", "moe_act"]
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
+                "fine_grained_activation_offloading": True,
+                "offload_modules": offload_modules,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.fine_grained_activation_offloading is True
+        assert model_cfg.offload_modules == offload_modules
+
+    def test_absent_offloading_flag_leaves_attrs_unset(self):
+        """When the key is absent and the provider has no offload attrs, none are added."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True)
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert not hasattr(model_cfg, "fine_grained_activation_offloading")
+        assert not hasattr(model_cfg, "offload_modules")
+
+    def test_missing_offloading_flag_preserves_provider_values(self):
+        """An omitted setting does not overwrite the provider's offload configuration."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        offload_modules = ["core_attn"]
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+        )
+
+        _apply_performance_config(model_cfg, self._config())
+
+        assert model_cfg.fine_grained_activation_offloading is True
+        assert model_cfg.offload_modules == offload_modules
+
+    def test_explicitly_disabled_offloading_clears_provider_values(self):
+        """An explicit false overrides enabled provider values from a checkpoint."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        config = self._config()
+        config["megatron_cfg"].update(
+            {
+                "fine_grained_activation_offloading": False,
+                "offload_modules": None,
+            }
+        )
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            fine_grained_activation_offloading=True,
+            offload_modules=["core_attn"],
+        )
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.fine_grained_activation_offloading is False
+        assert model_cfg.offload_modules == []
+
+    @pytest.mark.parametrize(
+        "offload_modules",
+        [[], None, "moe_act", 42],
+        ids=["empty_list", "none", "string", "int"],
+    )
+    def test_fine_grained_activation_offloading_invalid_modules_raises(
+        self, offload_modules
+    ):
+        """offload_modules must be a non-empty list when feature is enabled."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock()
+        model_cfg.gated_linear_unit = True
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
+                "fine_grained_activation_offloading": True,
+                "offload_modules": offload_modules,
+            }
+        }
+
+        with pytest.raises(
+            ValueError, match="offload_modules must be a non-empty list"
+        ):
+            _apply_performance_config(model_cfg, config)
+
+    def test_fine_grained_activation_offloading_missing_modules_raises(self):
+        """When enabled but offload_modules key is absent, defaults to None → raises."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock()
+        model_cfg.gated_linear_unit = True
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
+                "fine_grained_activation_offloading": True,
+            }
+        }
+
+        with pytest.raises(
+            ValueError, match="offload_modules must be a non-empty list"
+        ):
+            _apply_performance_config(model_cfg, config)
+
+    @pytest.mark.parametrize(
+        "offload_module",
+        ["expert_fc1", "moe_act", "fused_group_mlp"],
+    )
+    def test_moe_only_offload_module_rejected_for_dense_model(self, offload_module):
+        """MoE-only offload modules cannot silently no-op for dense models."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        config = self._config()
+        config["megatron_cfg"].update(
+            {
+                "fine_grained_activation_offloading": True,
+                "offload_modules": [offload_module],
+            }
+        )
+        model_cfg = SimpleNamespace(gated_linear_unit=True, num_moe_experts=None)
+
+        with pytest.raises(ValueError, match="requires a MoE model"):
+            _apply_performance_config(model_cfg, config)
+
     def test_recompute_granularity_full_explicit(self):
         """granularity='full' sets uniform method with 1 layer."""
         from nemo_rl.models.megatron.setup import _apply_performance_config
@@ -1201,23 +1509,42 @@ class TestApplyPerformanceConfig:
 class TestValidateOptimizerConfig:
     """Tests for _validate_optimizer_config function."""
 
-    def test_cpu_offload_requires_full_fraction(self):
-        """Test that CPU offload requires offload_fraction=1.0."""
+    @pytest.mark.parametrize("optimizer", ["adam", "sgd"])
+    def test_cpu_offload_accepts_fractional_offload(self, optimizer):
+        """Supported optimizers delegate fractional offload to MCore."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "optimizer": optimizer,
+                    "use_distributed_optimizer": True,
+                    "optimizer_cpu_offload": True,
+                    "optimizer_offload_fraction": 0.5,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
+                }
+            }
+        }
+
+        _validate_optimizer_config(config)
+
+    @pytest.mark.parametrize("fraction", [-0.1, 0.0, 1.1])
+    def test_cpu_offload_rejects_invalid_fraction(self, fraction):
+        """Enabled CPU offload requires a fraction in the interval (0, 1]."""
         from nemo_rl.models.megatron.setup import _validate_optimizer_config
 
         config = {
             "megatron_cfg": {
                 "optimizer": {
                     "optimizer_cpu_offload": True,
-                    "optimizer_offload_fraction": 0.5,
+                    "optimizer_offload_fraction": fraction,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
                 }
             }
         }
 
-        with pytest.raises(AssertionError) as exc_info:
+        with pytest.raises(ValueError, match=r"0 < optimizer_offload_fraction <= 1"):
             _validate_optimizer_config(config)
-
-        assert "optimizer_offload_fraction=1.0" in str(exc_info.value)
 
     def test_cpu_offload_with_full_fraction(self):
         """Test that CPU offload works with full fraction."""
@@ -1226,14 +1553,63 @@ class TestValidateOptimizerConfig:
         config = {
             "megatron_cfg": {
                 "optimizer": {
+                    "optimizer": "adam",
+                    "use_distributed_optimizer": True,
                     "optimizer_cpu_offload": True,
                     "optimizer_offload_fraction": 1.0,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
                 }
             }
         }
 
         # Should not raise
         _validate_optimizer_config(config)
+
+    def test_cpu_offload_requires_distributed_optimizer(self):
+        """CPU offload is unsupported by the non-distributed BF16 wrapper."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "use_distributed_optimizer": False,
+                    "optimizer_cpu_offload": True,
+                    "optimizer_offload_fraction": 0.5,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
+                }
+            }
+        }
+
+        with pytest.raises(
+            ValueError,
+            match="optimizer_cpu_offload=True requires use_distributed_optimizer=True",
+        ):
+            _validate_optimizer_config(config)
+
+    @pytest.mark.parametrize("optimizer", ["lion", "muon"])
+    def test_cpu_offload_rejects_optimizers_without_hybrid_device_support(
+        self, optimizer
+    ):
+        """Pinned MCore only constructs HybridDeviceOptimizer for Adam and SGD."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "optimizer": optimizer,
+                    "use_distributed_optimizer": True,
+                    "optimizer_cpu_offload": True,
+                    "optimizer_offload_fraction": 0.5,
+                    "overlap_cpu_optimizer_d2h_h2d": False,
+                }
+            }
+        }
+
+        with pytest.raises(
+            ValueError,
+            match="optimizer_cpu_offload=True requires optimizer to be adam or sgd",
+        ):
+            _validate_optimizer_config(config)
 
     def test_no_cpu_offload(self):
         """Test configuration without CPU offload."""
@@ -1244,12 +1620,49 @@ class TestValidateOptimizerConfig:
                 "optimizer": {
                     "optimizer_cpu_offload": False,
                     "optimizer_offload_fraction": 0.5,  # Should be ignored
+                    "overlap_cpu_optimizer_d2h_h2d": False,
                 }
             }
         }
 
         # Should not raise
         _validate_optimizer_config(config)
+
+    def test_missing_transfer_overlap_uses_disabled_default(self):
+        """Older configs may omit the newly exposed transfer-overlap setting."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "use_distributed_optimizer": True,
+                    "optimizer_cpu_offload": False,
+                    "optimizer_offload_fraction": 0.0,
+                }
+            }
+        }
+
+        _validate_optimizer_config(config)
+
+    def test_transfer_overlap_requires_cpu_offload(self):
+        """Transfer overlap is invalid when CPU offload is disabled."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "optimizer_cpu_offload": False,
+                    "optimizer_offload_fraction": 0.0,
+                    "overlap_cpu_optimizer_d2h_h2d": True,
+                }
+            }
+        }
+
+        with pytest.raises(
+            ValueError,
+            match="overlap_cpu_optimizer_d2h_h2d=True requires optimizer_cpu_offload=True",
+        ):
+            _validate_optimizer_config(config)
 
 
 @pytest.mark.mcore
@@ -1767,6 +2180,66 @@ class TestCreateMegatronConfigGlooProcessGroups:
 
 
 @pytest.mark.mcore
+class TestCreateMegatronConfigOptimizerOffload:
+    """Tests for optimizer CPU-offload plumbing into Megatron Core."""
+
+    @pytest.mark.parametrize("transfer_overlap", [True, False, None])
+    def test_fraction_and_transfer_overlap_are_forwarded(self, transfer_overlap):
+        """Explicit values are forwarded; omission defers to the Bridge default."""
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        optimizer_config = {
+            "use_distributed_optimizer": True,
+            "optimizer_cpu_offload": True,
+            "optimizer_offload_fraction": 0.5,
+        }
+        if transfer_overlap is not None:
+            optimizer_config["overlap_cpu_optimizer_d2h_h2d"] = transfer_overlap
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": optimizer_config,
+                "scheduler": {},
+                "distributed_data_parallel_config": {
+                    "overlap_param_gather": False,
+                    "grad_reduce_in_fp32": False,
+                    "overlap_grad_reduce": False,
+                    "data_parallel_sharding_strategy": "optim_grads_params",
+                },
+                "train_iters": 10,
+            },
+            "train_global_batch_size": 8,
+        }
+
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer"),
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch(
+                "nemo_rl.models.megatron.setup.OptimizerConfig"
+            ) as mock_optimizer_config,
+            patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig"),
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+            )
+
+        optimizer_kwargs = mock_optimizer_config.call_args.kwargs
+        assert optimizer_kwargs["optimizer_cpu_offload"] is True
+        assert optimizer_kwargs["optimizer_offload_fraction"] == 0.5
+        if transfer_overlap is None:
+            assert "overlap_cpu_optimizer_d2h_h2d" not in optimizer_kwargs
+        else:
+            assert optimizer_kwargs["overlap_cpu_optimizer_d2h_h2d"] is transfer_overlap
+
+
+@pytest.mark.mcore
 class TestValidateAndSetConfig:
     """Tests for validate_and_set_config function."""
 
@@ -1842,6 +2315,7 @@ class TestValidateAndSetConfig:
                 )
 
                 assert runtime_config.is_generation_colocated is True
+                assert runtime_config.offload_optimizer_for_refit is True
 
 
 @pytest.mark.mcore
@@ -1858,6 +2332,7 @@ class TestRuntimeConfigNamedTuple:
             dtype=torch.bfloat16,
             optimizer_cpu_offload=False,
             offload_optimizer_for_logprob=True,
+            offload_optimizer_for_refit=False,
             is_generation_colocated=True,
             sampling_params=None,
             final_padded_vocab_size=32000,
@@ -1867,6 +2342,7 @@ class TestRuntimeConfigNamedTuple:
         assert runtime_config.optimizer_cpu_offload is False
         assert runtime_config.offload_optimizer_for_logprob is True
         assert runtime_config.is_generation_colocated is True
+        assert runtime_config.offload_optimizer_for_refit is False
         assert runtime_config.sampling_params is None
         assert runtime_config.final_padded_vocab_size == 32000
 
@@ -1991,7 +2467,7 @@ class TestMakePolicyLikeConfig:
 
 @pytest.mark.mcore
 class TestSetupModelConfig:
-    """Tests for setup_model_config — hf_config_overrides handling."""
+    """Tests for setup_model_config override handling."""
 
     _HELPER_PATCHES = [
         "nemo_rl.models.megatron.setup._create_megatron_config",
@@ -2059,6 +2535,57 @@ class TestSetupModelConfig:
             trust_remote_code=True,
             rope_scaling={"rope_type": "yarn", "factor": 4.0},
         )
+
+    def test_model_overrides_are_finalized_and_serialized(self, tmp_path, request):
+        """The reconstructed provider is the finalized, serializable config."""
+        from megatron.bridge.training.config import ConfigContainer
+
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        mocks = self._apply_patches(request)
+
+        iteration_dir = tmp_path / "iter_0000000"
+        iteration_dir.mkdir()
+        (iteration_dir / "run_config.yaml").touch()
+        model_cfg = _SerializableModelConfig()
+        config = {
+            "pretrained_checkpoint": None,
+            "megatron_cfg": {
+                "model_overrides": {
+                    "masked_softmax_fusion": False,
+                    "nested_config": {"enabled": True},
+                    "mapping_config": {"nested": {"new": 3}},
+                }
+            },
+        }
+
+        with patch(
+            "nemo_rl.models.megatron.setup.load_model_config",
+            return_value=(model_cfg, None),
+        ):
+            _, merged_model_cfg = setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path=str(tmp_path),
+            )
+
+        container_model_cfg = mocks["_create_megatron_config"].call_args.args[0]
+        serialized_model_cfg = ConfigContainer._convert_value_to_dict(
+            container_model_cfg
+        )
+
+        assert merged_model_cfg is container_model_cfg
+        assert merged_model_cfg is not model_cfg
+        assert merged_model_cfg.finalized is True
+        assert serialized_model_cfg["masked_softmax_fusion"] is False
+        assert serialized_model_cfg["nested_config"]["enabled"] is True
+        assert serialized_model_cfg["mapping_config"] == {
+            "preserved": 1,
+            "nested": {"old": 2, "new": 3},
+        }
+        assert model_cfg.masked_softmax_fusion is True
 
     def test_megatron_lm_no_overrides_calls_autoconfig_without_extra_kwargs(
         self, request

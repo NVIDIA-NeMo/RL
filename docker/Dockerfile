@@ -22,6 +22,8 @@
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
+# Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
+#   --build-arg BUILD_DYNAMO=1
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
@@ -334,6 +336,10 @@ FROM hermetic AS release
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
 ARG SKIP_TRTLLM_BUILD
+ARG BUILD_DYNAMO
+ARG DYNAMO_PYTHON_VERSION=3.12.11
+ARG ETCD_VERSION=v3.5.21
+ARG NATS_VERSION=v2.11.6
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
 # (empty default = skip). Consumed by the gym prefetch RUN below.
 ARG NEMO_GYM_PREFETCH_CONFIGS=
@@ -349,6 +355,7 @@ LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+ENV NEMO_RL_DYNAMO_VENV_DIR=/opt/dynamo_venv
 
 # AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
 # The host's aws-efa-installer places libnccl-net-ofi.so under
@@ -364,6 +371,16 @@ ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_P
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
 COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
+
+# Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
+# Ray/vLLM environments. Default image builds do not create this environment.
+RUN <<"EOF" bash -exu -o pipefail
+if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
+    echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
+    exit 0
+fi
+bash docker/dynamo/install.sh
+EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
@@ -397,16 +414,15 @@ EOF
 # Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
 # into the image. Gated on NEMO_GYM_PREFETCH_CONFIGS (no-op by default). Runs after the
 # source COPY above so examples/nemo_gym/prefetch_venvs.py is present.
-# Gym pins vllm==0.20.0; override it to vLLM's prebuilt cu-wheel (PyPI default is cu12) so Gym's
-# venvs share RL's torch/nvidia stack. 0.20.0's default GitHub wheel is the cu130 build (the
-# same wheel the policy pins in pyproject.toml); UV_TORCH_BACKEND keeps torch on the same CUDA.
+# Gym pins vllm==0.24.0; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
+# RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
 ARG NEMO_GYM_CUDA=cu130
-ARG NEMO_GYM_VLLM_VERSION=0.20.0
+ARG NEMO_GYM_VLLM_VERSION=0.24.0
 RUN <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
     GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
-    printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_35_%s.whl\n' \
+    printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_28_%s.whl\n' \
         "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
     UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
     UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \

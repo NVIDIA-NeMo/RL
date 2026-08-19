@@ -298,6 +298,21 @@ class TestBindSocketInRange:
             port = _bind_socket_in_range(s, 12010, 12011)
             assert port == 12010
 
+    def test_exhaustive_selection_skips_excluded_ports(self, monkeypatch):
+        mock_sock = MagicMock()
+        monkeypatch.setattr("random.shuffle", lambda candidates: None)
+
+        port = _bind_socket_in_range(
+            mock_sock,
+            12020,
+            12023,
+            max_retries=None,
+            excluded_ports={12020, 12021},
+        )
+
+        assert port == 12022
+        mock_sock.bind.assert_called_once_with(("", 12022))
+
 
 class TestGetFreePortLocal:
     """Tests for _get_free_port_local()."""

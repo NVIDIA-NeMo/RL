@@ -29,6 +29,9 @@ ULTRA_CONFIG_PATHS = [
     "examples/nemo_gym/nemotron-3-ultra/swe_teacher.yaml",
     "examples/nemo_gym/nemotron-3-ultra/mopd.yaml",
 ]
+NEMO_GYM_CONFIG_PATHS = ULTRA_CONFIG_PATHS + [
+    "examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml",
+]
 
 
 @pytest.fixture
@@ -232,16 +235,16 @@ def test_add_resolver():
     assert config.value == 5
 
 
-@pytest.mark.parametrize("config_path", ULTRA_CONFIG_PATHS)
-def test_ultra_configs_satisfy_current_grpo_contract(config_path):
-    """Ensure Ultra configs compose with all fields required by current GRPO."""
+@pytest.mark.parametrize("config_path", NEMO_GYM_CONFIG_PATHS)
+def test_nemo_gym_configs_satisfy_current_grpo_contract(config_path):
+    """Ensure production NeMo Gym configs satisfy the current GRPO contract."""
     from nemo_rl.algorithms.grpo import MasterConfig
     from nemo_rl.utils.checkpoint import CheckpointManager
 
     register_omegaconf_resolvers()
     config = load_config(REPO_ROOT / config_path)
 
-    # These values are intentionally supplied by ultra_launch.sh at runtime.
+    # These values are intentionally supplied by recipe launchers at runtime.
     config.policy.model_name = "test-model"
     for split in ("train", "validation"):
         datasets = config.data.get(split)
@@ -259,6 +262,10 @@ def test_ultra_configs_satisfy_current_grpo_contract(config_path):
         config["_teachers"]["general"] = "/tmp/test-teacher"
 
     resolved = OmegaConf.to_container(config, resolve=True)
+
+    if config_path == "examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml":
+        assert resolved["grpo"]["val_num_generations_per_prompt"] == 2
+        assert resolved["checkpointing"]["metric_name"] is None
 
     # The real contract checks: the config validates against GRPO's MasterConfig
     # schema and the checkpointing block is accepted by CheckpointManager.

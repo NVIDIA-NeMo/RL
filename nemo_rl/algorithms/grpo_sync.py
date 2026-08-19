@@ -52,6 +52,7 @@ from nemo_rl.algorithms.grpo import (
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
+    _policy_dtype,
     _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
@@ -68,7 +69,7 @@ from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
-    log_generation_metrics_to_wandb,
+    log_generation_metrics,
     print_performance_metrics,
 )
 from nemo_rl.data.interfaces import DatumSpec
@@ -624,7 +625,10 @@ def grpo_train_sync(
                                 }
                             )
                             calibration_data.update(
-                                calib_flat.get_multimodal_dict(as_tensors=False)
+                                calib_flat.get_multimodal_dict(
+                                    as_tensors=False,
+                                    pixel_dtype=_policy_dtype(master_config.policy),
+                                )
                             )
                             calibration_data.to("cpu")
                             kv_scales_cache = policy.calibrate_qkv_fp8_scales(
@@ -1275,10 +1279,12 @@ def grpo_train_sync(
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
                 )
-            if master_config.policy["generation"].get("vllm_cfg", {}).get(
-                "enable_vllm_metrics_logger", False
-            ) and master_config.logger.get("wandb_enabled", False):
-                log_generation_metrics_to_wandb(
+            if (
+                master_config.policy["generation"]
+                .get("vllm_cfg", {})
+                .get("enable_vllm_metrics_logger", False)
+            ):
+                log_generation_metrics(
                     generation_logger_metrics,
                     total_steps + 1,
                     master_config.policy["generation"]["vllm_cfg"][

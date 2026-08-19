@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import shutil
+import subprocess
+import sys
 import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -175,6 +179,49 @@ class TestTensorboardLogger:
         assert mock_writer.add_scalar.call_count == 2
         mock_writer.add_scalar.assert_any_call("loss", 0.5, 10)
         mock_writer.add_scalar.assert_any_call("accuracy", 0.8, 10)
+
+    def test_json_dump_requires_tag_prefix_across_plugin_categories(self, tmp_path):
+        """The functional gate accepts image tags and rejects missing prefixes."""
+        from torch.utils.tensorboard import SummaryWriter
+
+        log_dir = tmp_path / "tensorboard"
+        writer = SummaryWriter(log_dir=str(log_dir))
+        writer.add_image(
+            "generation_metrics/per_worker_requests",
+            torch.zeros((3, 1, 1)),
+            global_step=1,
+        )
+        writer.add_scalar("train/loss", 1.0, global_step=1)
+        writer.close()
+
+        script = Path(__file__).parents[2] / "json_dump_tb_logs.py"
+        metrics_path = tmp_path / "metrics.json"
+        command = [
+            sys.executable,
+            str(script),
+            str(log_dir),
+            "--output_path",
+            str(metrics_path),
+            "--require-tag-prefix",
+        ]
+
+        found = subprocess.run(
+            [*command, "generation_metrics/"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert found.returncode == 0, found.stderr
+        assert json.loads(metrics_path.read_text()) == {"train/loss": {"1": 1.0}}
+
+        missing = subprocess.run(
+            [*command, "missing/"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert missing.returncode == 1
+        assert "No TensorBoard tag starts with 'missing/'" in missing.stderr
 
     @patch("nemo_rl.utils.logger.SummaryWriter")
     def test_log_metrics_with_prefix(self, mock_summary_writer, temp_dir):

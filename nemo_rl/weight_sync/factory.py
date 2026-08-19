@@ -16,12 +16,14 @@
 
 Selects the appropriate weight synchronizer based on the deployment
 topology (colocated vs. non-colocated) and the generation backend
-(vLLM uses IPC/ZMQ, SGLang uses HTTP, non-colocated uses NCCL).
+(vLLM uses IPC/ZMQ, SGLang uses HTTP, and non-colocated vLLM or Dynamo uses
+NCCL).
 """
 
 from typing import Any, Optional
 
 from nemo_rl.models.generation.constants import (
+    DYNAMO_BACKEND,
     MEGATRON_BACKEND,
     SGLANG_BACKEND,
     VLLM_BACKEND,
@@ -46,7 +48,8 @@ def create_weight_synchronizer(
     Args:
         policy: Policy object (ColocatablePolicyInterface).
         generation: Generation object (GenerationInterface).
-        generation_backend: Name of the generation backend ("vllm", "sglang", "megatron").
+        generation_backend: Name of the generation backend ("vllm", "sglang",
+            "megatron", or "dynamo").
         colocated: Whether policy and generation share the same GPUs.
         train_cluster: RayVirtualCluster for training workers (required for non-colocated).
         inference_cluster: RayVirtualCluster for inference workers (required for non-colocated).
@@ -59,7 +62,12 @@ def create_weight_synchronizer(
         NotImplementedError: If the requested configuration is not supported.
         ValueError: If required arguments are missing.
     """
-    _SUPPORTED_BACKENDS = {VLLM_BACKEND, SGLANG_BACKEND, MEGATRON_BACKEND}
+    _SUPPORTED_BACKENDS = {
+        VLLM_BACKEND,
+        SGLANG_BACKEND,
+        MEGATRON_BACKEND,
+        DYNAMO_BACKEND,
+    }
     if generation_backend not in _SUPPORTED_BACKENDS:
         raise ValueError(
             f"Unknown generation backend {generation_backend!r}. "
@@ -92,6 +100,21 @@ def create_weight_synchronizer(
 
     if refit_buffer_size_gb is not None and refit_buffer_size_gb <= 0:
         raise ValueError("refit_buffer_size_gb must be > 0")
+
+    if generation_backend == MEGATRON_BACKEND:
+        from nemo_rl.weight_sync.megatron_weight_synchronizer import (
+            MegatronWeightSynchronizer,
+        )
+
+        # One synchronizer serves both colocation modes; colocated is the
+        # degenerate path (no cross-group collective to wire).
+        return MegatronWeightSynchronizer(
+            policy=policy,
+            generation=generation,
+            colocated=colocated,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+        )
 
     if not colocated:
         if generation_backend == SGLANG_BACKEND:

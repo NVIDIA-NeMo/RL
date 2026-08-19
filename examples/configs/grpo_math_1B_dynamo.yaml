@@ -1,0 +1,99 @@
+# Two-step, two-GPU smoke for the Ray-managed Dynamo vLLM backend.
+defaults: grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  max_num_steps: 2
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: true
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2.0
+
+checkpointing:
+  enabled: false
+
+policy:
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 512
+  sequence_packing:
+    enabled: false
+  dtensor_cfg:
+    _v2: false
+    enabled: true
+    cpu_offload: false
+    activation_checkpointing: false
+  megatron_cfg:
+    enabled: false
+  generation:
+    backend: dynamo
+    max_new_tokens: 128
+    temperature: 0.7
+    top_p: 0.95
+    top_k: 50
+    dynamo_cfg:
+      engine: vllm
+      startup_timeout_s: 600
+      request_timeout_s: 900
+      control_timeout_s: 600
+      metrics_include_prefixes: null
+      metrics_exclude_prefixes: null
+      worker_args:
+        tool_call_parser: null
+        reasoning_parser: null
+        exclude_tools_when_tool_choice_none: true
+        enable_structural_tag: false
+        structural_tag_scope: auto
+        structural_tag_schema: auto
+        custom_jinja_template: null
+        endpoint_types: [chat, completions]
+        extra_cli_args: []
+      frontend_args:
+        tokenizer: default
+        tokenizer_cache: false
+        tokenizer_cache_bytes: 52428800
+        router_mode: kv
+        router_reset_states: true
+        extra_cli_args: []
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      precision: bfloat16
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      kv_cache_dtype: auto
+      enforce_eager: true
+      expose_http_server: false
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 1.0
+      env_vars:
+        NCCL_MNNVL_ENABLE: "0"
+    vllm_kwargs:
+      max_num_seqs: 16
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 1
+
+logger:
+  log_dir: results/grpo-math-1b-dynamo
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: false
+
+cluster:
+  gpus_per_node: 2
+  num_nodes: 1
