@@ -45,6 +45,7 @@ class FinalizationRequest:
 
     group_id: str
     rollout_ids: tuple[str, ...]
+    canonical_sample_ids: tuple[str, ...]
     receipts: tuple[Optional[dict[str, Any]], ...]
     rewards: tuple[float, ...]
     fallback_weight_version: int
@@ -122,10 +123,14 @@ class FinalizerActor:  # pragma: no cover
         """Finalize one request without allowing tensor payloads across Ray RPC."""
         assert_metadata_only(request)
         if not (
-            len(request.rollout_ids) == len(request.receipts) == len(request.rewards)
+            len(request.rollout_ids)
+            == len(request.canonical_sample_ids)
+            == len(request.receipts)
+            == len(request.rewards)
         ):
             raise ValueError(
-                "finalizer request rollout_ids, receipts, and rewards must be parallel"
+                "finalizer request rollout_ids, canonical_sample_ids, receipts, "
+                "and rewards must be parallel"
             )
         result = self._finalizer.finalize_group(
             request.group_id,
@@ -133,6 +138,7 @@ class FinalizerActor:  # pragma: no cover
             list(request.receipts),
             list(request.rewards),
             fallback_weight_version=request.fallback_weight_version,
+            canonical_sample_ids=list(request.canonical_sample_ids),
         )
         assert_metadata_only(result)
         return result

@@ -143,6 +143,7 @@ class SingleControllerActor:
         self._loss_fn = actor_args.loss_fn
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
+        self._rollout_recovery_ledger = self._rollout_manager.recovery_ledger
         # Direct access, deliberately. A getattr default here reads as defensive but
         # buys a silent failure mode: rename or drop the field and
         # watchdog.gym_subprocess_check: true degrades to a health check that iterates
@@ -154,6 +155,10 @@ class SingleControllerActor:
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
         self._finalizer_actors = list(actor_args.finalizer_actors)
+        if self._finalizer_actors and self._rollout_recovery_ledger is None:
+            raise RuntimeError(
+                "token-capture finalizer actors require a rollout recovery ledger"
+            )
         self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
         for actor in self._finalizer_actors:
             self._available_finalizers.put_nowait(actor)
@@ -576,14 +581,15 @@ class SingleControllerActor:
         try:
             await self._call_dp(
                 "clear_samples",
-                sample_ids=list(request.rollout_ids),
+                sample_ids=list(request.canonical_sample_ids),
                 partition_id=self._partition_id,
             )
         except Exception as error:
             errors.append(
                 RuntimeError(
                     "pre-publication canonical cleanup failed for "
-                    f"group={request.group_id!r}, ids={request.rollout_ids!r}"
+                    f"group={request.group_id!r}, "
+                    f"ids={request.canonical_sample_ids!r}"
                 )
             )
             errors[-1].__cause__ = error
@@ -609,6 +615,11 @@ class SingleControllerActor:
                 errors,
             )
         self._buffer.abort(request.group_id)
+        if (
+            self._rollout_recovery_ledger is not None
+            and request.group_id in self._rollout_recovery_ledger
+        ):
+            self._rollout_recovery_ledger.discard_group(request.group_id)
 
     async def _finalize_with_actor(self, request: "FinalizationRequest") -> None:
         """Submit one metadata request to the bounded fixed actor pool."""
@@ -630,6 +641,8 @@ class SingleControllerActor:
         # that remote write and the matching local replay-index transition in
         # one mutation section so a native TQ checkpoint cannot split them.
         async with self._data_plane_checkpoint_barrier.mutation():
+            assert self._rollout_recovery_ledger is not None
+            self._rollout_recovery_ledger.mark_finalization_started(request.group_id)
             self._active_finalizers += 1
             active_actor_count = self._active_finalizers
             finalize_start = time.perf_counter()
@@ -637,6 +650,9 @@ class SingleControllerActor:
                 finalized = await actor.finalize.remote(request)
             except BaseException:
                 self._finalizer_unknown_outcomes += 1
+                self._rollout_recovery_ledger.mark_finalization_unknown(
+                    request.group_id
+                )
                 print(
                     "FATAL: finalizer actor RPC failed after submission; canonical "
                     f"publication outcome is unknown for group {request.group_id}. "
@@ -692,6 +708,12 @@ class SingleControllerActor:
                         [commit_error, cleanup_error],
                     )
                 raise
+            self._rollout_recovery_ledger.mark_group_finalized(
+                request.group_id,
+                meta=finalized.meta,
+                group_min_weight_version=finalized.group_min_wv,
+                group_max_weight_version=finalized.group_max_wv,
+            )
             finalized.metrics.update(
                 {
                     "finalize/queue_wait_ms": queue_wait_ms,
@@ -700,9 +722,7 @@ class SingleControllerActor:
                     "finalize/active_actor_count": float(active_actor_count),
                 }
             )
-            self._finalizer_metrics_by_group[request.group_id] = dict(
-                finalized.metrics
-            )
+            self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
 
     async def _cleanup_consumed_metas(self, metas: list[KVBatchMeta]) -> None:
         """Clear canonical rows and full-manifest staging keys after train success."""
@@ -754,6 +774,83 @@ class SingleControllerActor:
                 errors.append(cleanup_error)
         if errors:
             raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
+
+    @staticmethod
+    def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
+        """Return stable prompt-group IDs in their canonical sample order."""
+        group_ids: list[str] = []
+        for sample_id in meta.sample_ids:
+            if "_g" not in sample_id:
+                raise ValueError(
+                    f"canonical rollout sample ID has no generation suffix: "
+                    f"{sample_id!r}"
+                )
+            group_id, generation_index = sample_id.rsplit("_g", 1)
+            if not group_id or not generation_index.isdigit():
+                raise ValueError(f"invalid canonical rollout sample ID: {sample_id!r}")
+            if not group_ids or group_ids[-1] != group_id:
+                group_ids.append(group_id)
+        return group_ids
+
+    def _claim_train_meta(self, meta: KVBatchMeta, *, num_groups: int) -> list[str]:
+        """Bind a sampler selection to the ledger's current optimizer step."""
+        ledger = self._rollout_recovery_ledger
+        if ledger is None:
+            return self._group_ids_from_meta(meta)
+        group_ids = self._group_ids_from_meta(meta)
+        if len(group_ids) != num_groups:
+            raise ValueError(
+                f"sampler selected {num_groups} groups but canonical metadata "
+                f"contains {len(group_ids)} group IDs"
+            )
+
+        # Existing TQ-only checkpoints predate the lineage sidecar. Adopt their
+        # finalized rows lazily so completed-rollout recovery keeps working while
+        # the next stacked change adds persisted ledger restoration.
+        for group_id in group_ids:
+            if group_id in ledger:
+                continue
+            indices = [
+                index
+                for index, sample_id in enumerate(meta.sample_ids)
+                if sample_id.rsplit("_g", 1)[0] == group_id
+            ]
+            group_meta = KVBatchMeta(
+                partition_id=meta.partition_id,
+                task_name=meta.task_name,
+                sample_ids=[meta.sample_ids[index] for index in indices],
+                fields=list(meta.fields) if meta.fields is not None else None,
+                sequence_lengths=(
+                    [meta.sequence_lengths[index] for index in indices]
+                    if meta.sequence_lengths is not None
+                    else None
+                ),
+                extra_info=dict(meta.extra_info),
+                tags=(
+                    [dict(meta.tags[index]) for index in indices]
+                    if meta.tags is not None
+                    else None
+                ),
+            )
+            weights = [
+                int(tag["weight_version"])
+                for tag in group_meta.tags or []
+                if "weight_version" in tag
+            ]
+            fallback_weight = self._trainer_version
+            ledger.adopt_finalized_group(
+                group_id=group_id,
+                meta=group_meta,
+                start_weight_version=min(weights, default=fallback_weight),
+                end_weight_version=max(weights, default=fallback_weight),
+            )
+        ledger.claim_groups_for_training(
+            group_ids,
+            train_step=self._train_steps,
+            trainer_version=self._trainer_version,
+            expected_group_count=self._master_config.grpo.num_prompts_per_step,
+        )
+        return group_ids
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
@@ -936,9 +1033,24 @@ class SingleControllerActor:
                         await asyncio.sleep(0)
 
                         # Evict stale groups
-                        evicted = await self._sampler.evict(
-                            current_train_weight=self._trainer_version,
-                        )
+                        if self._rollout_recovery_ledger is None:
+                            evicted = await self._sampler.evict(
+                                current_train_weight=self._trainer_version,
+                            )
+                        else:
+                            async with self._data_plane_checkpoint_barrier.mutation():
+                                group_ids_before_evict = set(self._buffer.group_ids)
+                                evicted = await self._sampler.evict(
+                                    current_train_weight=self._trainer_version,
+                                )
+                                evicted_group_ids = group_ids_before_evict - set(
+                                    self._buffer.group_ids
+                                )
+                                for group_id in evicted_group_ids:
+                                    if group_id in self._rollout_recovery_ledger:
+                                        self._rollout_recovery_ledger.discard_group(
+                                            group_id
+                                        )
                         evicted_stale_prompt_groups += evicted
                         if evicted:
                             print(
@@ -956,11 +1068,26 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
-                        train_meta, num_groups = await self._sampler.select(
-                            current_train_weight=self._trainer_version,
-                            min_prompt_groups=min_prompt_groups,
-                            max_prompt_groups=max_prompt_groups,
-                        )
+                        if self._rollout_recovery_ledger is None:
+                            train_meta, num_groups = await self._sampler.select(
+                                current_train_weight=self._trainer_version,
+                                min_prompt_groups=min_prompt_groups,
+                                max_prompt_groups=max_prompt_groups,
+                            )
+                        else:
+                            # Selection removes local replay ownership. Keep that
+                            # removal and the matching ledger claim in one mutation
+                            # boundary so a later periodic checkpoint cannot split them.
+                            async with self._data_plane_checkpoint_barrier.mutation():
+                                train_meta, num_groups = await self._sampler.select(
+                                    current_train_weight=self._trainer_version,
+                                    min_prompt_groups=min_prompt_groups,
+                                    max_prompt_groups=max_prompt_groups,
+                                )
+                                if train_meta is not None:
+                                    self._claim_train_meta(
+                                        train_meta, num_groups=num_groups
+                                    )
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
@@ -986,10 +1113,7 @@ class SingleControllerActor:
 
                         consumed_metas.append(train_meta)
                         consumed_group_count += num_groups
-                        selected_group_ids = {
-                            sample_id.rsplit("_g", 1)[0]
-                            for sample_id in train_meta.sample_ids
-                        }
+                        selected_group_ids = self._group_ids_from_meta(train_meta)
                         for group_id in selected_group_ids:
                             for name, value in self._finalizer_metrics_by_group.pop(
                                 group_id, {}
@@ -1073,7 +1197,16 @@ class SingleControllerActor:
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
 
-                await self._cleanup_consumed_metas(consumed_metas)
+                if self._rollout_recovery_ledger is not None:
+                    self._rollout_recovery_ledger.mark_train_step_applied(
+                        self._train_steps
+                    )
+                async with self._data_plane_checkpoint_barrier.mutation():
+                    await self._cleanup_consumed_metas(consumed_metas)
+                    if self._rollout_recovery_ledger is not None:
+                        self._rollout_recovery_ledger.release_applied_train_step(
+                            self._train_steps
+                        )
                 for _ in range(consumed_group_count):
                     self._buffer_capacity.release()
 

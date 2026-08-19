@@ -901,6 +901,7 @@ def setup_single_controller(
         ),
     )
     finalizer_actors: list[Any] = []
+    recovery_ledger = None
     if token_capture_cfg.enabled:
         from nemo_rl.experience.finalizer_actor import (
             FinalizerActorConfig,
@@ -920,6 +921,9 @@ def setup_single_controller(
             ),
             num_workers=token_capture_cfg.num_finalizer_workers,
         )
+        from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+
+        recovery_ledger = RolloutRecoveryLedger()
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -937,6 +941,7 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
+        recovery_ledger=recovery_ledger,
     )
 
     # Print setup timing metrics
