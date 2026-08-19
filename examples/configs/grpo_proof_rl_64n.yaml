@@ -1,0 +1,429 @@
+# =============================================================================
+# Nemotron 3 Ultra — proof-generation and proof-verification GRPO
+# =============================================================================
+# Proof-only config for the NeMo Gym proof judge, generation-selection, and
+# verification environments. The launch scripts override the model, data,
+# cluster shape, sequence length, and selected parallelism for each stage.
+#
+# Defaults to the proof RL large-batch recipe. Override at launch time with
+# NRL_MAX_STEPS for shorter smoke tests (e.g. NRL_MAX_STEPS=4).
+#
+#   - gpus_per_node: 4
+#   - TP: 8
+#   - EP: 64
+#   - CP: 32
+#   - PP: 1
+#   - trainer nodes: 64
+#   - inference nodes: 64
+#   - vLLM TP: 8
+# =============================================================================
+
+# =============================================================================
+# Cluster — overridden by launch script
+# =============================================================================
+cluster:
+  gpus_per_node: 4
+  num_nodes: 128  # 64 trainer nodes + 64 inference nodes
+  segment_size: 16
+
+# =============================================================================
+# Checkpointing
+# =============================================================================
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/nemotron-3-ultra-imo"
+  metric_name: null
+  higher_is_better: true
+  keep_top_k: 2
+  force_keep_steps: 2
+  save_period: 1
+  ft_keep_latest_k: 1
+  ft_save_period: 1
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+# =============================================================================
+# GRPO Algorithm
+# =============================================================================
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  num_val_generations_per_prompt: 2
+  max_rollout_turns: 1
+  max_num_epochs: 100000
+  max_num_steps: 2000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  advantage_clip_low: null
+  advantage_clip_high: null
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  max_val_samples: null
+  val_batch_size: 256
+  seed: 42
+
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 4
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+    simplified_sampling: true
+    simp_samp_dynamic_sampling: true
+    simp_samp_max_parallel_trajectories: 160
+
+  seq_logprob_error_threshold: 2
+
+# =============================================================================
+# Loss Function
+# =============================================================================
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: 0
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  min_p_mask_threshold: 0.001
+  min_p_mask_type: "ada-pos"
+  target_entropy: 0.4
+  token_level_loss: false
+  force_on_policy_ratio: true
+  use_kl_in_reward: false
+
+# =============================================================================
+# Policy
+# =============================================================================
+policy:
+  # Always overridden by NRL_MODEL_PATH in launch_ultra_proofs.sh.
+  model_name: "/path/to/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+
+  train_global_batch_size: 2048  # num_prompts × num_generations = 128 × 16
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 131072
+  precision: "bfloat16"
+  logprob_chunk_size: 256
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 64
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 32
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+
+    # MoE
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "flex"
+    moe_flex_dispatcher_backend: "hybridep"
+    moe_hybridep_num_sms: 32
+    moe_aux_loss_coeff: 0.0
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+
+    # Compute
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+
+    # Logging
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+
+    # MTP — disabled
+    mtp_loss_scaling_factor: 0.3
+    mtp_use_repeated_layer: true
+    mtp_num_layers: 5
+    mtp_detach_heads: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 3.0e-6
+      min_lr: 3.0e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      adam_beta1: 0.9
+      adam_beta2: 0.90
+      adam_eps: 1e-8
+
+      sgd_momentum: 0.9
+
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 5
+      lr_warmup_init: 1e-7
+      override_opt_param_scheduler: true
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: true
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    # FP8 — overridden by precision recipe in launch script
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "mxfp8"
+      fp8_param: false
+
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+      fully_parallel_save_process_group: "ep_dp"
+      fully_parallel_load_process_group: "ep_dp"
+      fully_parallel_load_exchange_algo: "broadcast"
+
+    env_vars: null
+
+  # ---------------------------------------------------------------------------
+  # Sequence Packing
+  # ---------------------------------------------------------------------------
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+    fuse_loss: true
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
+
+  # ---------------------------------------------------------------------------
+  # Generation (vLLM) — Non-colocated, async
+  # ---------------------------------------------------------------------------
+  generation:
+    port_range_low: 3000
+    port_range_high: 4999
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        reasoning_parser: nano_v3
+        reasoning_parser_plugin: nemo_rl/utils/nano_v3_reasoning_parser.py
+
+    vllm_kwargs:
+      attention_backend: FLASH_ATTN
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        cudagraph_capture_sizes: [1,2,4,8,16,32,64]
+        pass_config:
+          # Disable FlashInfer TRTLLM AllReduce fusion.  It requires
+          # SymmDeviceMemory (MNNVL IPC) to initialise successfully on every TP
+          # rank.  When TP spans multiple nodes some ranks succeed while others
+          # fail (CUDA_ERROR_INVALID_DEVICE), causing a split-brain: half the TP
+          # group uses the MNNVL-based TRTLLM allreduce path while the other half
+          # falls back to standard NCCL.  They never rendezvous → permanent hang.
+          fuse_allreduce_rms: false
+
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 64
+
+# =============================================================================
+# Data
+# =============================================================================
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}   # NOTE: no-op for NemoGymDataset (processor ignores max_seq_length)
+  shuffle: false
+  num_workers: 1
+  train:
+    data_path: null   # Set by launch script
+  validation:
+    data_path: null   # Set by launch script
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+# =============================================================================
+# Environment — NeMo Gym Proof RL
+# =============================================================================
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    nemo_gym_log_dir: "logs/nemo_gym"
+    skip_venv_if_present: true
+    num_gpu_nodes: 0
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/proof_judge/configs/proof_judge.yaml
+      - resources_servers/proof_genselect/configs/proof_genselect.yaml
+      - resources_servers/proof_verification/configs/proof_verification.yaml
+
+    # The proof policy reasons once per response. Keep thinking enabled in the
+    # shared policy-model adapter without registering the unused reasoning-off
+    # variant from the source Gym checkout.
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+
+    proof_judge:
+      resources_servers:
+        proof_judge:
+          judge_model_server:
+            type: responses_api_models
+            name: policy_model
+          max_tokens: 65536 # prompt length + max_tokens must be lower than max_length, otherwise the response returns 400
+
+    proof_verification:
+      resources_servers:
+        proof_verification:
+          judge_model_server:
+            type: responses_api_models
+            name: policy_model
+          max_tokens: 65536 # prompt length + max_tokens must be lower than max_length, otherwise the response returns 400
+
+# =============================================================================
+# Logger
+# =============================================================================
+logger:
+  log_dir: "logs"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: "nemotron-3-ultra-imo"
+    name: "nemotron-3-ultra-imo-proof"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "nemotron-3-ultra-imo"
+    run_name: "nemotron-3-ultra-imo-proof"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+# =============================================================================
+# Effort Levels
+# =============================================================================
+effort_levels:
+  low_string: "{reasoning effort: low}"
+  low_weight: 0.2
+  low_penalty: 1
+  low_ub: 3000

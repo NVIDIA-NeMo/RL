@@ -10,6 +10,8 @@
 </div>
 
 ## 📣 News
+* [08/18/2026] [Nemotron 3 Ultra proof RL for IMO 2026](docs/guides/nemotron-3-ultra-imo.md)
+    * We are open-sourcing our proof-generation and proof-verification recipes as part of the effort toward winning a Gold Medal at IMO 2026.
 * [02/04/2026] LoRA Support
     * LoRA SFT is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1556) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1629) backends.
     * DTensor [GRPO](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [DPO](https://github.com/NVIDIA-NeMo/RL/pull/1826) both support LoRA; (Megatron Core coming soon).

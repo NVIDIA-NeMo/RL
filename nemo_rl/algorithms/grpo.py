@@ -140,6 +140,13 @@ class AsyncGRPOConfig(TypedDict):
     in_flight_weight_updates: NotRequired[bool]
     # Recomputes the KV cache after the in-flight weight updates.
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    # Continuously generate trajectories and train on the oldest valid groups,
+    # without reserving rollouts for a particular future trainer step.
+    simplified_sampling: NotRequired[bool]
+    # Drop prompt groups whose rewards have zero standard deviation.
+    simp_samp_dynamic_sampling: NotRequired[bool]
+    # Maximum number of per-prompt generation workers in simplified mode.
+    simp_samp_max_parallel_trajectories: NotRequired[int]
     # Optional override for the in-flight prompt-group semaphore cap used by
     # AsyncTrajectoryCollector. When unset (default), the cap is
     # `num_prompts_per_step * max_trajectory_age_steps`.
@@ -209,6 +216,8 @@ class GRPOSaveState(TypedDict):
     current_epoch: int
     total_steps: int
     total_valid_tokens: int  # Track total number of non-padding tokens during training
+    last_entropy: NotRequired[float]
+    cur_min_p_mask_threshold: NotRequired[float]
     val_reward: NotRequired[
         float
     ]  # Optional field - may not be present during training
@@ -223,6 +232,61 @@ def _default_grpo_save_state() -> GRPOSaveState:
         "total_valid_tokens": 0,
         "val_reward": -99999999.0,
     }
+
+
+def _restore_adaptive_loss_state(
+    loss_fn: ClippedPGLossFn,
+    grpo_save_state: GRPOSaveState,
+) -> None:
+    if loss_fn.has_adaptive_loss_state():
+        loss_fn.load_adaptive_loss_state_dict(grpo_save_state)
+
+
+def _update_adaptive_loss_state(
+    loss_fn: LossFunction,
+    metrics: dict[str, Any],
+) -> None:
+    if not isinstance(loss_fn, ClippedPGLossFn):
+        return
+    if not loss_fn.has_adaptive_loss_state() or "approx_entropy" not in metrics:
+        return
+
+    loss_fn.update_adaptive_loss_state(float(metrics["approx_entropy"]))
+    metrics.update(
+        {
+            key: value
+            for key, value in loss_fn.adaptive_loss_state_dict().items()
+            if value is not None
+        }
+    )
+
+
+def _save_adaptive_loss_state(
+    grpo_save_state: GRPOSaveState,
+    loss_fn: LossFunction,
+) -> None:
+    if not isinstance(loss_fn, ClippedPGLossFn):
+        return
+    if not loss_fn.has_adaptive_loss_state():
+        return
+
+    mutable_save_state = cast(dict[str, Any], grpo_save_state)
+    for key, value in loss_fn.adaptive_loss_state_dict().items():
+        if value is None:
+            mutable_save_state.pop(key, None)
+        else:
+            mutable_save_state[key] = value
+
+
+def _apply_configured_reward_shaping(
+    batch: BatchedDataDict[DatumSpec],
+    grpo_config: GRPOConfig,
+) -> BatchedDataDict[DatumSpec]:
+    """Apply the configured shaping policy to an async trajectory batch."""
+    reward_shaping_config = grpo_config["reward_shaping"]
+    if reward_shaping_config["enabled"]:
+        return apply_reward_shaping(batch, reward_shaping_config)
+    return batch
 
 
 class GRPOLoggerConfig(LoggerConfig):
@@ -363,6 +427,7 @@ def setup(
     #        Loss Function
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
+    _restore_adaptive_loss_state(loss_fn, grpo_save_state)
 
     # Validate force_on_policy_ratio
     if loss_config.get("force_on_policy_ratio", False):
@@ -2443,6 +2508,7 @@ def grpo_train(
                 metrics["min_seq_mult_prob_error_after_mask"] = min_seq_mult_prob_error_after_mask
                 metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
                 metrics["masked_correct_pct"] = masked_correct_pct
+                _update_adaptive_loss_state(loss_fn, metrics)
 
                 ## Checkpointing
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
@@ -2474,6 +2540,7 @@ def grpo_train(
                     elif "val_reward" in grpo_save_state:
                         del grpo_save_state["val_reward"]
                     grpo_save_state["consumed_samples"] = consumed_samples
+                    _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
                     full_metric_name = master_config["checkpointing"]["metric_name"]
                     if full_metric_name is not None:
@@ -3018,8 +3085,11 @@ def async_grpo_train(
         num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
     )
 
+    async_cfg = master_config["grpo"]["async_grpo"]
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
-        max_size=optimal_buffer_size
+        max_size=optimal_buffer_size,
+        simplified_sampling=async_cfg.get("simplified_sampling", False),
+        simp_samp_dynamic_sampling=async_cfg.get("simp_samp_dynamic_sampling", False),
     )
 
     # Restore replay buffer and rollout checkpoint state from checkpoint if available
@@ -3234,6 +3304,7 @@ def async_grpo_train(
     # Main training loop
     try:
         while step < master_config["grpo"]["max_num_steps"]:
+            replay_buffer_metrics: dict[str, Any] = {}
             print(
                 f"\n{'=' * 25} Step {step + 1}/{master_config['grpo']['max_num_steps']} {'=' * 25}"
             )
@@ -3327,6 +3398,7 @@ def async_grpo_train(
                     # Extract trajectories and metadata from sample result
                     trajectories = sample_result["trajectories"]
                     avg_trajectory_age = sample_result["avg_trajectory_age"]
+                    replay_buffer_metrics = sample_result.get("extra_metrics", {})
 
                     print(
                         f"✅ Sampled {len(trajectories)} trajectory groups from buffer (avg age: {avg_trajectory_age:.2f} steps)"
@@ -3398,6 +3470,10 @@ def async_grpo_train(
                     )
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
+
+                repeated_batch = _apply_configured_reward_shaping(
+                    repeated_batch, master_config["grpo"]
+                )
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
@@ -3820,6 +3896,7 @@ def async_grpo_train(
                 metrics["min_seq_mult_prob_error_after_mask"] = min_seq_mult_prob_error_after_mask
                 metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
                 metrics["masked_correct_pct"] = masked_correct_pct
+                _update_adaptive_loss_state(loss_fn, metrics)
 
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
@@ -3845,6 +3922,7 @@ def async_grpo_train(
                     elif "val_reward" in grpo_save_state:
                         del grpo_save_state["val_reward"]
                     grpo_save_state["consumed_samples"] = consumed_samples
+                    _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
                     full_metric_name = master_config["checkpointing"]["metric_name"]
                     if full_metric_name is not None:
@@ -3977,6 +4055,7 @@ def async_grpo_train(
             buffer_size_current = ray.get(replay_buffer.size.remote())
             metrics["buffer_size"] = buffer_size_current
             metrics["avg_trajectory_age"] = avg_trajectory_age
+            metrics.update(replay_buffer_metrics)
 
             if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
                 "enable_vllm_metrics_logger", False

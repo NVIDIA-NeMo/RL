@@ -47,6 +47,8 @@ class CheckpointingConfig(TypedDict):
         the metric should be taken from the validation or training metrics.
     higher_is_better (bool): Whether higher values of the metric indicate better performance.
     keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
+    force_keep_steps (Optional[int]): Always retain checkpoints whose step is a
+        multiple of this interval.
     ft_keep_latest_k (Optional[int]): Number of most recent checkpoints to keep for crash recovery.
     ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
         When set, a checkpoint is saved every ft_save_period steps for crash recovery.
@@ -64,6 +66,7 @@ class CheckpointingConfig(TypedDict):
     higher_is_better: bool
     save_period: int
     keep_top_k: NotRequired[int]
+    force_keep_steps: NotRequired[int | None]
     ft_keep_latest_k: NotRequired[int | None]
     ft_save_period: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
@@ -107,6 +110,9 @@ class CheckpointManager:
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
+        self.force_keep_steps: int | None = config.get("force_keep_steps")
+        if self.force_keep_steps is not None and self.force_keep_steps <= 0:
+            raise ValueError("force_keep_steps must be positive when set")
         self.save_period: int = config["save_period"]
         self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
 
@@ -270,7 +276,7 @@ class CheckpointManager:
     def remove_old_checkpoints(self, exclude_latest: bool = True) -> None:
         """Remove checkpoints that exceed the configured retention limits.
 
-        Three independent retention rules are applied as a union — a checkpoint
+        Four independent retention rules are applied as a union — a checkpoint
         survives if any rule retains it.
 
         Periodic retention: save_period-aligned checkpoints (step % save_period == 0)
@@ -283,6 +289,9 @@ class CheckpointManager:
           When multiple checkpoints share the same metric value, more recent
           checkpoints (higher step numbers) are preferred.
         - If no metric is provided: recency. The most recent k are kept.
+
+        force_keep_steps: retains checkpoints at multiples of the configured
+        interval regardless of the top-k result.
 
         ft_keep_latest_k: retains the most recent k checkpoints for crash recovery.
         Applied to all checkpoints regardless of save_period alignment.
@@ -327,6 +336,13 @@ class CheckpointManager:
         else:
             # Without keep_top_k, all periodic checkpoints are retained
             protected_steps.update(s for s, _, _ in periodic_history)
+
+        if self.force_keep_steps is not None:
+            protected_steps.update(
+                step
+                for step, _, _ in checkpoint_history
+                if step % self.force_keep_steps == 0
+            )
 
         # ft_keep_latest_k: retain the most recent k checkpoints for crash recovery
         if self.ft_keep_latest_k is not None:

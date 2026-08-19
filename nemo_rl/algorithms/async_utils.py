@@ -43,6 +43,25 @@ _NG_TASK_INDEX_KEY = "_ng_task_index"
 _NEXT_NG_TASK_INDEX_KEY = "next_ng_task_index"
 
 
+def _get_simplified_sampling_max_inflight(master_config: MasterConfig) -> int:
+    """Resolve the per-prompt generation cap for simplified sampling."""
+    async_cfg = master_config["grpo"]["async_grpo"]
+    configured = async_cfg.get("simp_samp_max_parallel_trajectories")
+    if configured is None:
+        return max(
+            1,
+            int(master_config["grpo"]["num_prompts_per_step"])
+            * int(async_cfg["max_trajectory_age_steps"]),
+        )
+
+    max_inflight = int(configured)
+    if max_inflight <= 0:
+        raise ValueError(
+            f"simp_samp_max_parallel_trajectories must be positive, got {configured}"
+        )
+    return max_inflight
+
+
 @ray.remote  # pragma: no cover
 class ReplayBuffer:
     """Replay buffer storing per-prompt groups.
@@ -51,10 +70,21 @@ class ReplayBuffer:
     grpo.num_generations_per_prompt (required to compute per-prompt advantages).
     """
 
-    def __init__(self, max_size: int):
+    def __init__(
+        self,
+        max_size: int,
+        simplified_sampling: bool = False,
+        simp_samp_dynamic_sampling: bool = False,
+    ):
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
+        if simp_samp_dynamic_sampling and not simplified_sampling:
+            raise ValueError(
+                "simp_samp_dynamic_sampling requires simplified_sampling=True"
+            )
         self.max_size = max_size
+        self.simplified_sampling = simplified_sampling
+        self.simp_samp_dynamic_sampling = simp_samp_dynamic_sampling
         self.trajectories = []  # List[dict[str, Any]]
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
@@ -62,6 +92,8 @@ class ReplayBuffer:
 
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
+        self._removed_old_count = 0
+        self._removed_zero_std_count = 0
 
     @staticmethod
     def _rollout_metrics_turn_count_for_diagnostics(rm: dict[str, Any]) -> Optional[float]:
@@ -241,6 +273,27 @@ class ReplayBuffer:
                 self.trajectories = [self.trajectories[i] for i in indices_to_keep]
                 self.trajectory_versions = [self.trajectory_versions[i] for i in indices_to_keep]
                 self.target_weight_versions = [self.target_weight_versions[i] for i in indices_to_keep]
+                if self.simplified_sampling:
+                    self._removed_old_count += len(old_indices)
+                    total_trajectories = len(self.trajectories)
+
+            if self.simp_samp_dynamic_sampling:
+                zero_std_indices = [
+                    i
+                    for i, trajectory in enumerate(self.trajectories)
+                    if not self._has_nonzero_reward_std(trajectory)
+                ]
+                if zero_std_indices:
+                    print(
+                        f"   🔍 Dynamic sampling: filtering out {len(zero_std_indices)} "
+                        "trajectories with zero reward std"
+                    )
+                    self._removed_zero_std_count += len(zero_std_indices)
+                    for idx in reversed(zero_std_indices):
+                        self.trajectory_versions.pop(idx)
+                        self.target_weight_versions.pop(idx)
+                        self.trajectories.pop(idx)
+                    total_trajectories = len(self.trajectories)
 
             # Filter for valid trajectories without modifying the buffer
             valid_indices = [
@@ -262,33 +315,33 @@ class ReplayBuffer:
                 )
                 return None
 
-            # Only select trajectories intended for the current training step
-            # This ensures no trajectory loses its "last chance" to be used for its intended step
-            intended_indices = [
-                i
-                for i in valid_indices
-                if self.target_weight_versions[i] == current_weight_version
-            ]
-
-            # print(
-            #     f"   🎯 Found {len(intended_indices)} trajectories intended for current step {current_weight_version}"
-            # )
-
-            # Stall training if we don't have enough trajectories intended for this step
-            if len(intended_indices) < num_prompt_groups:
+            if self.simplified_sampling:
+                # Consume the oldest still-valid trajectories first, independent
+                # of the target version assigned by the legacy reservation path.
+                selected = sorted(
+                    valid_indices, key=lambda i: self.trajectory_versions[i]
+                )[:num_prompt_groups]
                 print(
-                    f"   ⏸️ STALLING: Need {num_prompt_groups} trajectories for step {current_weight_version}, but only {len(intended_indices)} are ready"
+                    f"   ✅ Simplified sampling selected {len(selected)} oldest valid trajectories"
                 )
-                # print(
-                #     f"   ⏸️ Training will wait for remaining {num_prompt_groups - len(intended_indices)} trajectories to be generated"
-                # )
-                return None
+            else:
+                # Only select trajectories intended for the current training step.
+                intended_indices = [
+                    i
+                    for i in valid_indices
+                    if self.target_weight_versions[i] == current_weight_version
+                ]
+                if len(intended_indices) < num_prompt_groups:
+                    print(
+                        f"   ⏸️ STALLING: Need {num_prompt_groups} trajectories for step "
+                        f"{current_weight_version}, but only {len(intended_indices)} are ready"
+                    )
+                    return None
 
-            # Select exactly the trajectories intended for this step (FIFO within same target)
-            selected: list[int] = intended_indices[:num_prompt_groups]
-            print(
-                f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
-            )
+                selected = intended_indices[:num_prompt_groups]
+                print(
+                    f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
+                )
 
             sampled_weights = [self.trajectory_versions[i] for i in selected]
             avg_trajectory_age = current_weight_version - sum(sampled_weights) / len(
@@ -298,9 +351,10 @@ class ReplayBuffer:
                 f"✅ Selected counts by generation weight-version: {Counter(sampled_weights)}"
             )
             print(f"📊 Average trajectory age: {avg_trajectory_age:.2f} steps")
-            print(
-                f"🎯 All selected trajectories target step {current_weight_version} (100% target match)"
-            )
+            if not self.simplified_sampling:
+                print(
+                    f"🎯 All selected trajectories target step {current_weight_version} (100% target match)"
+                )
 
             sampled_items = [self.trajectories[i] for i in selected]
 
@@ -326,10 +380,18 @@ class ReplayBuffer:
                 f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )
 
-            return {
+            result = {
                 "trajectories": sampled_items,
                 "avg_trajectory_age": avg_trajectory_age,
             }
+            if self.simplified_sampling:
+                result["extra_metrics"] = {
+                    "removed_old_trajectories": self._removed_old_count,
+                    "removed_zero_std_trajectories": self._removed_zero_std_count,
+                }
+                self._removed_old_count = 0
+                self._removed_zero_std_count = 0
+            return result
 
     def size(self) -> int:
         """Return current buffer size."""
@@ -342,6 +404,11 @@ class ReplayBuffer:
             self.trajectories.clear()
             self.trajectory_versions.clear()
             self.target_weight_versions.clear()
+
+    @staticmethod
+    def _has_nonzero_reward_std(trajectory: dict[str, Any]) -> bool:
+        rewards = trajectory["batch"]["total_reward"]
+        return rewards.std().item() > 0
 
     def state_dict(self) -> dict:
         """Get serializable state for checkpointing.
@@ -418,8 +485,12 @@ class ReplayBuffer:
                 self.trajectory_versions = self.trajectory_versions[: self.max_size]
                 self.target_weight_versions = self.target_weight_versions[: self.max_size]
 
-            # Prepare buffer for resume at current_training_step
-            if (
+            # Target-version cleanup is specific to the reservation sampler.
+            # Simplified sampling retains all restored groups and lets sample()
+            # discard stale or zero-variance entries against the live step.
+            if self.simplified_sampling:
+                print("   ℹ️ Simplified sampling: preserving restored trajectories")
+            elif (
                 current_training_step is not None
                 and num_prompts_per_step is not None
                 and len(self.trajectories) > 0
@@ -521,6 +592,8 @@ class ReplayBuffer:
             True if target_step has >= num_prompts_per_step trajectories
         """
         with self._lock:
+            if self.simplified_sampling:
+                return len(self.trajectories) >= num_prompts_per_step
             current_count = sum(
                 1 for t in self.target_weight_versions if t == target_step
             )
@@ -653,6 +726,12 @@ class AsyncTrajectoryCollector:
         self._threads_lock: _threading.Lock = _threading.Lock()
 
         async_cfg = self.master_config.get("grpo", {}).get("async_grpo", {})
+        self._simplified_sampling = async_cfg.get("simplified_sampling", False)
+        self._inflight_sema: _threading.BoundedSemaphore | None = None
+        if self._simplified_sampling:
+            max_inflight = _get_simplified_sampling_max_inflight(self.master_config)
+            self._inflight_sema = _threading.BoundedSemaphore(max_inflight)
+            print(f"🔧 Simplified sampling parallel trajectory limit: {max_inflight}")
         max_trajectory_age = async_cfg["max_trajectory_age_steps"]
         self.num_groups_nemo_rl = max_trajectory_age + 1
         self.num_batches_so_far = 0
@@ -790,11 +869,17 @@ class AsyncTrajectoryCollector:
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits.
 
+        Simplified sampling continuously generates and relies on buffer age
+        filtering instead of target-version reservations.
+
         Pauses when all targets in the valid range either:
         - Have already been consumed by training (target <= last_target_weight_already_generated)
         - Are already being generated (in _generating_targets)
         - Don't need more trajectories (get_trajectories_needed returns 0)
         """
+        if self._simplified_sampling:
+            return False
+
         try:
             num_prompts = int(self.master_config["grpo"]["num_prompts_per_step"])
             max_trajectory_age = int(
@@ -962,45 +1047,48 @@ class AsyncTrajectoryCollector:
             num_prompts_in_batch = batch.size
             num_prompts_per_step = int(self.master_config["grpo"]["num_prompts_per_step"])
 
-            # Get the next target weight that needs generation
-            target_weight = self._get_next_target_for_generation(
-                generation_weight_version
-            )
-
-            if target_weight is None:
+            if self._simplified_sampling:
+                target_weight = generation_weight_version
+                num_prompts_to_generate = num_prompts_in_batch
                 print(
-                    f"🔄 No targets need generation for weight {generation_weight_version}"
-                )
-                return
-
-            # Check how many trajectories are actually needed for this target
-            trajectories_needed = ray.get(
-                self.replay_buffer.get_trajectories_needed.remote(
-                    target_weight, num_prompts_per_step
-                )
-            )
-
-            # Limit generation to what's needed (for gap-filling scenarios)
-            num_prompts_to_generate = min(num_prompts_in_batch, trajectories_needed)
-
-            if num_prompts_to_generate == 0:
-                print(
-                    f"🔄 Target {target_weight} already has enough trajectories, skipping"
-                )
-                with self._generation_check_lock:
-                    self._generating_targets.discard(target_weight)
-                return
-
-            if num_prompts_to_generate < num_prompts_in_batch:
-                print(
-                    f"🎯 Gap-filling for target weight {target_weight}: "
-                    f"generating {num_prompts_to_generate}/{num_prompts_in_batch} prompts "
-                    f"(need {trajectories_needed} more trajectories)"
+                    "🎯 Simplified sampling: generating with weight version "
+                    f"{generation_weight_version}"
                 )
             else:
-                print(
-                    f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
+                target_weight = self._get_next_target_for_generation(
+                    generation_weight_version
                 )
+                if target_weight is None:
+                    print(
+                        f"🔄 No targets need generation for weight {generation_weight_version}"
+                    )
+                    return
+
+                trajectories_needed = ray.get(
+                    self.replay_buffer.get_trajectories_needed.remote(
+                        target_weight, num_prompts_per_step
+                    )
+                )
+                num_prompts_to_generate = min(num_prompts_in_batch, trajectories_needed)
+                if num_prompts_to_generate == 0:
+                    print(
+                        f"🔄 Target {target_weight} already has enough trajectories, skipping"
+                    )
+                    with self._generation_check_lock:
+                        self._generating_targets.discard(target_weight)
+                    return
+
+                if num_prompts_to_generate < num_prompts_in_batch:
+                    print(
+                        f"🎯 Gap-filling for target weight {target_weight}: "
+                        f"generating {num_prompts_to_generate}/{num_prompts_in_batch} prompts "
+                        f"(need {trajectories_needed} more trajectories)"
+                    )
+                else:
+                    print(
+                        f"🎯 Generating for target weight {target_weight} from "
+                        f"generation_weight_version {generation_weight_version}"
+                    )
 
             # Generate for needed prompts in this batch for the target weight
             # Wait for refit to complete if in progress
@@ -1018,6 +1106,8 @@ class AsyncTrajectoryCollector:
 
                 # After refit finishes if weight version has updated, reflect that in the new trajectories
                 generation_weight_version = self.current_weight_version
+                if self._simplified_sampling:
+                    target_weight = generation_weight_version
 
             batch = batch.slice(0, num_prompts_to_generate)
             stamped_extra_env_info = []
@@ -1031,41 +1121,80 @@ class AsyncTrajectoryCollector:
                 stamped_extra_env_info.append(stamped_row)
             batch["extra_env_info"] = stamped_extra_env_info
             self._next_ng_task_index += num_prompts_to_generate
-            repeated_batch = batch.repeat_interleave(num_generations)
-            prompt_idx = 0
 
-            group_num = self.num_batches_so_far % self.num_groups_nemo_rl
-            self.num_batches_so_far += 1
+            def _start_generation_worker(
+                repeated_batch: BatchedDataDict[DatumSpec],
+                prompt_idx: int,
+                group_num: int,
+                use_inflight_limit: bool,
+            ) -> None:
+                if use_inflight_limit:
+                    self._acquire_inflight_slot()
 
-            def _target():
-                asyncio_run(
-                    self._run_prompt_group_worker(
+                def _target() -> None:
+                    try:
+                        asyncio_run(
+                            self._run_prompt_group_worker(
+                                repeated_batch,
+                                generation_weight_version,
+                                target_weight,
+                                prompt_idx,
+                                num_generations,
+                                group_num,
+                            )
+                        )
+                    finally:
+                        if use_inflight_limit:
+                            self._release_inflight_slot()
+
+                worker = _threading.Thread(target=_target, daemon=True)
+                try:
+                    with self._threads_lock:
+                        self._inflight_threads.add(worker)
+                    worker.start()
+                except Exception:
+                    with self._threads_lock:
+                        self._inflight_threads.discard(worker)
+                    if use_inflight_limit:
+                        self._release_inflight_slot()
+                    raise
+
+            if self._simplified_sampling:
+                for prompt_idx in range(num_prompts_to_generate):
+                    repeated_batch = batch.slice(
+                        prompt_idx, prompt_idx + 1
+                    ).repeat_interleave(num_generations)
+                    group_num = self.num_batches_so_far % self.num_groups_nemo_rl
+                    self.num_batches_so_far += 1
+                    _start_generation_worker(
                         repeated_batch,
-                        generation_weight_version,
-                        target_weight,
                         prompt_idx,
-                        num_generations,
                         group_num,
+                        use_inflight_limit=True,
                     )
+                    with self._counter_lock:
+                        self._spawned_per_target[target_weight] = (
+                            self._spawned_per_target.get(target_weight, 0) + 1
+                        )
+                    self._cleanup_finished_threads()
+            else:
+                repeated_batch = batch.repeat_interleave(num_generations)
+                group_num = self.num_batches_so_far % self.num_groups_nemo_rl
+                self.num_batches_so_far += 1
+                _start_generation_worker(
+                    repeated_batch,
+                    prompt_idx=0,
+                    group_num=group_num,
+                    use_inflight_limit=False,
                 )
-
-            worker = _threading.Thread(
-                target=_target,
-                daemon=True,
-            )
-            with self._threads_lock:
-                self._inflight_threads.add(worker)
-            worker.start()
-
-            # Debug: track spawned workers per target weight
-            with self._counter_lock:
-                self._spawned_per_target[target_weight] = (
-                    self._spawned_per_target.get(target_weight, 0) + num_prompts_to_generate
-                )
-                if prompt_idx == num_prompts_to_generate - 1:  # Last prompt being generated
-                    print(
-                        f"📊 DEBUG: Spawned {self._spawned_per_target.get(target_weight, 0)} workers for target_weight={target_weight}"
+                with self._counter_lock:
+                    self._spawned_per_target[target_weight] = (
+                        self._spawned_per_target.get(target_weight, 0) + num_prompts_to_generate
                     )
+                    if prompt_idx == num_prompts_to_generate - 1:
+                        print(
+                            f"📊 DEBUG: Spawned {self._spawned_per_target.get(target_weight, 0)} workers for target_weight={target_weight}"
+                        )
 
             self._cleanup_finished_threads()
 
@@ -1200,6 +1329,14 @@ class AsyncTrajectoryCollector:
         Called by the driver process each step to merge collector-side metrics.
         """
         return self._efficiency_timer.get_timing_metrics(reduction_op="sum")
+
+    def _acquire_inflight_slot(self) -> None:
+        assert self._inflight_sema is not None
+        self._inflight_sema.acquire()
+
+    def _release_inflight_slot(self) -> None:
+        assert self._inflight_sema is not None
+        self._inflight_sema.release()
 
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
@@ -1474,11 +1611,14 @@ class AsyncTrajectoryCollector:
                 )
                 await asyncio_sleep(retry_delay)
 
-                # Remove from thread tracking before recursive call
-                with self._threads_lock:
-                    current = _threading.current_thread()
-                    if current in self._inflight_threads:
-                        self._inflight_threads.remove(current)
+                # The simplified sampler's semaphore slot remains owned by this
+                # same recursive retry, so keep its thread tracked until the
+                # final attempt completes. Preserve legacy tracking otherwise.
+                if not self._simplified_sampling:
+                    with self._threads_lock:
+                        current = _threading.current_thread()
+                        if current in self._inflight_threads:
+                            self._inflight_threads.remove(current)
 
                 _retry_spawned = True  # Skip finally cleanup - retry worker handles it
                 return await self._run_prompt_group_worker(

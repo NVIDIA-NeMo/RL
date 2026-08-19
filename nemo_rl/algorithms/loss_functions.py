@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar
+from typing import Any, Literal, Mapping, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
 import torch.distributed
@@ -53,6 +53,12 @@ class ClippedPGLossConfig(TypedDict):
     truncated_importance_sampling_type: NotRequired[str | None]
     # Lower bound for ICE-POP / seq-mask-tis filtering
     truncated_importance_sampling_ratio_min: NotRequired[float | None]
+    # Adaptive positive min-p masking. Tokens whose current-policy probability
+    # is below the current threshold are masked only when their advantage is
+    # positive. The threshold is adjusted toward this configured maximum.
+    min_p_mask_threshold: NotRequired[float | None]
+    min_p_mask_type: NotRequired[Literal["ada-pos"] | None]
+    target_entropy: NotRequired[float]
     token_level_loss: bool
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
@@ -150,6 +156,28 @@ class ClippedPGLossFn(LossFunction):
         self.truncated_importance_sampling_ratio_min = cfg.get(
             "truncated_importance_sampling_ratio_min"
         )
+        self.min_p_mask_threshold = cfg.get("min_p_mask_threshold")
+        if self.min_p_mask_threshold is not None:
+            assert 0.0 <= self.min_p_mask_threshold <= 1.0, (
+                "min_p_mask_threshold must be a probability in [0, 1]"
+            )
+        self.min_p_mask_type = cfg.get(
+            "min_p_mask_type",
+            "ada-pos" if self.min_p_mask_threshold is not None else None,
+        )
+        assert self.min_p_mask_type in (None, "ada-pos"), (
+            "min_p_mask_type must be 'ada-pos' when set"
+        )
+        if self.min_p_mask_type == "ada-pos":
+            assert self.min_p_mask_threshold is not None, (
+                "min_p_mask_threshold must be set when min_p_mask_type is 'ada-pos'"
+            )
+        self.cur_min_p_mask_threshold = (
+            0.0 if self.min_p_mask_type == "ada-pos" else None
+        )
+        self.target_entropy = cfg.get("target_entropy", 0.3)
+        assert self.target_entropy >= 0.0, "target_entropy must be non-negative"
+        self.last_entropy: float | None = None
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.get(
             "sequence_level_importance_ratios",
@@ -196,6 +224,59 @@ class ClippedPGLossFn(LossFunction):
                     f"Set truncated_importance_sampling_ratio to enable truncated importance sampling.",
                     flush=True,
                 )
+
+    def is_adaptive_min_p_mask_enabled(self) -> bool:
+        return (
+            self.min_p_mask_type == "ada-pos" and self.min_p_mask_threshold is not None
+        )
+
+    def has_adaptive_loss_state(self) -> bool:
+        return self.is_adaptive_min_p_mask_enabled()
+
+    def adaptive_loss_state_dict(self) -> dict[str, float | None]:
+        if not self.has_adaptive_loss_state():
+            return {}
+        return {
+            "last_entropy": self.last_entropy,
+            "cur_min_p_mask_threshold": self.cur_min_p_mask_threshold,
+        }
+
+    def load_adaptive_loss_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        if not self.has_adaptive_loss_state():
+            return
+
+        last_entropy = state_dict.get("last_entropy")
+        self.last_entropy = float(last_entropy) if last_entropy is not None else None
+
+        cur_threshold = state_dict.get("cur_min_p_mask_threshold")
+        if cur_threshold is not None:
+            max_threshold = self.min_p_mask_threshold
+            assert max_threshold is not None
+            self.cur_min_p_mask_threshold = min(
+                max_threshold,
+                max(0.0, float(cur_threshold)),
+            )
+
+    def update_adaptive_loss_state(self, entropy: float) -> None:
+        if not self.has_adaptive_loss_state():
+            return
+
+        self.last_entropy = float(entropy)
+        max_threshold = self.min_p_mask_threshold
+        cur_threshold = self.cur_min_p_mask_threshold
+        assert max_threshold is not None
+        assert cur_threshold is not None
+
+        step_size = max_threshold / 10.0
+        if entropy > self.target_entropy:
+            cur_threshold += step_size
+        elif entropy < self.target_entropy:
+            cur_threshold -= step_size
+
+        self.cur_min_p_mask_threshold = min(
+            max_threshold,
+            max(0.0, cur_threshold),
+        )
 
     def __call__(
         self,
@@ -523,6 +604,27 @@ class ClippedPGLossFn(LossFunction):
         else:
             importance_weights_to_use = torch.ones_like(prev_logprobs)
 
+        _min_p_mask_metrics = {}
+        min_p_mask_threshold = self.cur_min_p_mask_threshold
+        if min_p_mask_threshold is not None and min_p_mask_threshold > 0.0:
+            # ada-pos only masks low-probability tokens with positive advantages.
+            min_p_kept_mask = (torch.exp(curr_logprobs) >= min_p_mask_threshold) | (
+                advantages <= 0
+            )
+            _min_p_mask_metrics = {
+                "min_p_masked_ratio": 1.0
+                - masked_mean(
+                    min_p_kept_mask.float(),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item(),
+            }
+            importance_weights_to_use = torch.where(
+                min_p_kept_mask,
+                importance_weights_to_use,
+                torch.zeros_like(importance_weights_to_use),
+            )
+
         if self.loss_type == LossType.TOKEN_LEVEL:
             actor_loss = masked_mean(
                 importance_weights_to_use * clip_loss,
@@ -616,6 +718,7 @@ class ClippedPGLossFn(LossFunction):
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
+                **_min_p_mask_metrics,
             },
         )
 
