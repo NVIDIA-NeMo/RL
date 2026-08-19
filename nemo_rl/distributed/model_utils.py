@@ -267,6 +267,138 @@ class DistributedCrossEntropy(torch.autograd.Function):
         return grad_student, None, None, None
 
 
+class ChunkedDistributedCrossEntropy(torch.autograd.Function):
+    """Soft-target cross entropy across TP-sharded vocab, chunked along sequence.
+
+    Same math as :class:`DistributedCrossEntropy`, but the fp32 softmax /
+    log-softmax buffers only ever exist for one sequence chunk:
+
+    - forward computes the per-token CE chunk-by-chunk and saves only the
+      (typically bf16) logits references — DistributedCrossEntropy instead
+      saves two full-size fp32 probability tensors for backward, which is the
+      dominant memory cost when several draft TTT passes stack up before the
+      shared backward;
+    - backward recomputes the chunk softmaxes and writes the gradient into a
+      single input-dtype buffer (mirrors :class:`ChunkedDistributedLogprob`).
+
+    ``group=None`` runs the same chunked math without collectives (single
+    process / no vocab parallelism).
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        student_logits: torch.Tensor,
+        target_logits: torch.Tensor,
+        chunk_size: int,
+        group: Optional[torch.distributed.ProcessGroup],
+        inference_only: bool = False,
+    ) -> torch.Tensor:
+        if student_logits.shape != target_logits.shape:
+            raise ValueError(
+                "student_logits and target_logits must have the same shape, "
+                f"got {student_logits.shape} and {target_logits.shape}."
+            )
+
+        seq_size = int(student_logits.shape[1])
+        num_chunks = (seq_size + chunk_size - 1) // chunk_size
+        ce_chunks = []
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
+
+            student_fp32 = student_logits[:, chunk_start:chunk_end, :].to(
+                dtype=torch.float32
+            )
+            target_fp32 = target_logits[:, chunk_start:chunk_end, :].to(
+                dtype=torch.float32
+            )
+
+            if group is None:
+                target_probs = torch.softmax(target_fp32, dim=-1)
+                student_log_probs = torch.log_softmax(student_fp32, dim=-1)
+                ce_chunk = (
+                    torch.einsum("...v,...v->...", target_probs, student_log_probs)
+                    .neg_()
+                    .contiguous()
+                )
+            else:
+                target_probs = _compute_distributed_softmax(target_fp32, group=group)
+                student_log_probs = _compute_distributed_log_softmax(
+                    student_fp32, group=group
+                )
+                ce_chunk = torch.einsum(
+                    "...v,...v->...", target_probs, student_log_probs
+                ).neg_()
+                torch.distributed.all_reduce(
+                    ce_chunk,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=group,
+                )
+
+            ce_chunks.append(ce_chunk)
+            del student_fp32, target_fp32, target_probs, student_log_probs
+
+        cross_entropy = torch.cat(ce_chunks, dim=1)
+
+        if not inference_only:
+            # Only references are saved; no fp32 full-size buffers survive.
+            ctx.save_for_backward(student_logits, target_logits)
+            ctx.chunk_size = chunk_size
+            ctx.group = group
+
+        return cross_entropy
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        *grad_outputs: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        grad_output = grad_outputs[0]
+        student_logits, target_logits = ctx.saved_tensors
+        chunk_size = ctx.chunk_size
+        group = ctx.group
+
+        seq_size = int(student_logits.shape[1])
+        num_chunks = (seq_size + chunk_size - 1) // chunk_size
+
+        # Every chunk row is written below, so no zero-init is needed.
+        grad_student = torch.empty_like(student_logits)
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
+
+            student_fp32 = student_logits[:, chunk_start:chunk_end, :].to(
+                dtype=torch.float32
+            )
+            target_fp32 = target_logits[:, chunk_start:chunk_end, :].to(
+                dtype=torch.float32
+            )
+
+            if group is None:
+                target_probs = torch.softmax(target_fp32, dim=-1)
+                student_probs = torch.softmax(student_fp32, dim=-1)
+            else:
+                target_probs = _compute_distributed_softmax(target_fp32, group=group)
+                student_probs = _compute_distributed_log_softmax(
+                    student_fp32, group=group
+                ).exp_()
+
+            # d(H(p, q))/d(z_v) = q_v - p_v
+            chunk_grad_fp32 = student_probs.sub_(target_probs)
+            chunk_grad_fp32.mul_(
+                grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1)
+            )
+            grad_student[:, chunk_start:chunk_end, :].copy_(chunk_grad_fp32)
+
+            del student_fp32, target_fp32, target_probs, student_probs
+            del chunk_grad_fp32
+
+        return grad_student, None, None, None, None
+
+
 class ChunkedDistributedLogprob(torch.autograd.Function):
     """Custom autograd function for computing log probabilities in a distributed setting.
 

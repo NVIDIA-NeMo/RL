@@ -502,6 +502,27 @@ class DraftConfig(TypedDict):
     loss_weight: NotRequired[float]
     num_layers: NotRequired[int | None]
     aux_layer_indices: NotRequired[list[int] | None]
+    # Multi-pass TTT draft training. ttt_steps=1 (default) keeps the stock
+    # single-pass path; >1 runs that many sequential draft passes with the
+    # trunk+branch two-part attention (requires CP=1, no sequence parallel,
+    # no sequence packing, no fused linear logprobs). Pass-d RoPE positions
+    # are offset by d-1 (inference-aligned, matching modelopt's reference
+    # TTT) — not configurable.
+    ttt_steps: NotRequired[int]
+    # Per-pass loss weights alpha_d (len == ttt_steps); null = uniform 1.0.
+    ttt_pass_weights: NotRequired[list[float] | None]
+    # Sequence-dim chunk size for the multi-pass draft loss internals (the
+    # fp32 soft-CE buffers and the d2t full-vocab TP gather). Trades a few
+    # extra TP collectives for peak memory; does not affect results. Only
+    # used when ttt_steps > 1 (the single-pass loss keeps the stock unchunked
+    # path). null = 4096.
+    loss_seq_chunk_size: NotRequired[int | None]
+    # Draft-only optimizer param group (separate from the policy's
+    # megatron_cfg.optimizer settings). All null = share the policy optimizer
+    # settings and keep the stock param-group partition.
+    lr: NotRequired[float | None]
+    min_lr: NotRequired[float | None]
+    weight_decay: NotRequired[float | None]
 
 
 class TokenizerConfig(TypedDict):

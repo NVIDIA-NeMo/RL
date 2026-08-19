@@ -19,7 +19,6 @@ import torch
 import torch.distributed
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -243,6 +242,12 @@ class DraftLossWrapper:
       vocabulary, and the token mask is packed with the same per-sequence
       shift; ``student_logits`` must be passed explicitly (it is kept out of
       the data dict so the packing loss wrappers never slice it).
+
+    ``draft_method`` selects the draft loss family; ``ttt_steps > 1`` selects
+    its multi-pass variant, which returns per-pass metrics alongside the loss
+    and needs ``global_draft_pass_counts``. ``draft_loss_kwargs`` are the
+    selected LossFn's remaining ctor kwargs — ``pass_weights`` for multi-pass
+    eagle3.
     """
 
     def __init__(
@@ -251,6 +256,8 @@ class DraftLossWrapper:
         prepare_fn: Optional[Callable[Any, Any]],
         data_dict: BatchedDataDict[Any],
         loss_weight: float = 1.0,
+        draft_loss_kwargs: Optional[dict[str, Any]] = None,
+        global_draft_pass_counts: Optional[torch.Tensor] = None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -258,11 +265,14 @@ class DraftLossWrapper:
         cu_seqlens_q_padded: Optional[torch.Tensor] = None,
         d2t: Optional[torch.Tensor] = None,
         student_logits: Optional[torch.Tensor] = None,
+        draft_method: str = "eagle3",
+        ttt_steps: int = 1,
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
         self.data_dict = data_dict
         self.loss_weight = loss_weight
+        self.global_draft_pass_counts = global_draft_pass_counts
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
@@ -276,9 +286,37 @@ class DraftLossWrapper:
             raise ValueError("student_logits must be passed explicitly in packed mode.")
         if cu_seqlens_q is None and prepare_fn is None:
             raise ValueError("prepare_fn is required in unpacked mode.")
-        self.draft_loss_fn = DraftCrossEntropyLossFn(
-            vocab_parallel_group=vocab_parallel_group,
-        )
+        self.draft_method = draft_method
+        self.multi_pass = ttt_steps > 1
+        if cu_seqlens_q is not None and self.multi_pass:
+            raise ValueError(
+                "Multi-pass draft training (policy.draft.ttt_steps > 1) does not "
+                "support sequence packing; the per-pass slicing convention needs "
+                "the unpacked [B, S] layout."
+            )
+        draft_loss_kwargs = draft_loss_kwargs or {}
+        # Per-method losses are imported in-branch: only the selected one loads.
+        if draft_method == "eagle3":
+            if self.multi_pass:
+                from nemo_rl.algorithms.loss.loss_functions import (
+                    DraftTTTCrossEntropyLossFn,
+                )
+
+                self.draft_loss_fn: Any = DraftTTTCrossEntropyLossFn(
+                    vocab_parallel_group=vocab_parallel_group,
+                    **draft_loss_kwargs,
+                )
+            else:
+                from nemo_rl.algorithms.loss.loss_functions import (
+                    DraftCrossEntropyLossFn,
+                )
+
+                self.draft_loss_fn = DraftCrossEntropyLossFn(
+                    vocab_parallel_group=vocab_parallel_group,
+                    **draft_loss_kwargs,
+                )
+        else:
+            raise ValueError(f"Unknown draft_method '{draft_method}'.")
 
     def _packed_draft_loss(
         self,
@@ -339,6 +377,7 @@ class DraftLossWrapper:
             **kwargs,
         )
 
+        draft_metrics: dict[str, Any] = {}
         if self.cu_seqlens_q is not None:
             draft_loss = self._packed_draft_loss(
                 next_token_logits, data, global_valid_seqs, global_valid_toks
@@ -352,14 +391,24 @@ class DraftLossWrapper:
                 vocab_parallel_group=self.vocab_parallel_group,
                 context_parallel_group=self.context_parallel_group,
             )
-            draft_loss = self.draft_loss_fn(
-                data=data,
-                global_valid_seqs=global_valid_seqs,
-                global_valid_toks=global_valid_toks,
-                **loss_input,
-            )
+            if self.multi_pass:
+                draft_loss, draft_metrics = self.draft_loss_fn(
+                    data=data,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    global_draft_pass_counts=self.global_draft_pass_counts,
+                    **loss_input,
+                )
+            else:
+                draft_loss = self.draft_loss_fn(
+                    data=data,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    **loss_input,
+                )
         combined_loss = policy_loss + self.loss_weight * draft_loss
         metrics["draft_loss"] = float(draft_loss.detach().item())
+        metrics.update(draft_metrics)
         return combined_loss, metrics
 
 
