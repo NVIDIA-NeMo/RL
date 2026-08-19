@@ -68,6 +68,15 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     is_ppo_run,
     validate_single_controller_config,
 )
+from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+    BOOTSTRAP_DIRNAME,
+    ROLLOUT_SNAPSHOTS_DIRNAME,
+    bootstrap_fingerprint,
+    ensure_bootstrap_anchor,
+    reset_bootstrap_anchor,
+    resolve_latest_snapshot,
+    validate_bootstrap_anchor,
+)
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
@@ -149,6 +158,7 @@ class SingleControllerActorArgs:
     last_checkpoint_path: Optional[str]
     finalizer_actors: list[Any]
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
+    bootstrap_fingerprint: Optional[str] = None
     # None when async_rl.generation_fleet_health is disabled.
     fleet_monitor: Optional[GenerationFleetHealth] = None
     # None unless async_rl.generation_router is enabled.
@@ -896,10 +906,11 @@ def setup_single_controller(
             "SingleController path is built on the TransferQueue data plane."
         )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
+    rollout_checkpoint_cfg = master_config.rollout_checkpointing
     if (
         master_config.checkpointing.get("save_data_plane")
-        and not data_plane_checkpointing_supported
-    ):
+        or rollout_checkpoint_cfg.interval_s is not None
+    ) and not data_plane_checkpointing_supported:
         raise NotImplementedError(
             "SingleController data-plane checkpointing is not supported for "
             f"data_plane.backend={dp_config['backend']!r}."
@@ -908,8 +919,10 @@ def setup_single_controller(
         sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
             master_config.async_rl.sampler
         )
-        if sampler_supports_replay_recovery and not master_config.checkpointing.get(
-            "save_data_plane"
+        if (
+            sampler_supports_replay_recovery
+            and rollout_checkpoint_cfg.restore_mode != "none"
+            and not master_config.checkpointing.get("save_data_plane")
         ):
             error_message = (
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -924,7 +937,10 @@ def setup_single_controller(
                     "checkpointing.enabled=false."
                 )
             raise ValueError(error_message)
-        if not sampler_supports_replay_recovery:
+        if (
+            rollout_checkpoint_cfg.restore_mode != "none"
+            and not sampler_supports_replay_recovery
+        ):
             warnings.warn(
                 f"Sampler {master_config.async_rl.sampler.name!r} cannot recover "
                 "completed buffered rollouts. On resume, the dataloader cursor "
@@ -956,6 +972,24 @@ def setup_single_controller(
     # give capture-enabled vLLM workers a venv that carries nemo_gym (the
     # worker hosts Gym's capture core + adapter in-process).
     token_capture_cfg = master_config.token_capture
+    if rollout_checkpoint_cfg.interval_s is not None:
+        if not master_config.checkpointing["enabled"]:
+            raise ValueError(
+                "rollout checkpointing requires checkpointing.enabled=true"
+            )
+        if not master_config.checkpointing.get("save_data_plane"):
+            raise ValueError(
+                "rollout checkpointing requires checkpointing.save_data_plane=true"
+            )
+        if not token_capture_cfg.enabled:
+            raise ValueError(
+                "rollout checkpointing currently requires token_capture.enabled=true"
+            )
+        if not sampler_supports_buffer_checkpoint(master_config.async_rl.sampler):
+            raise ValueError(
+                "rollout checkpointing requires a sampler that supports "
+                "replay-buffer recovery"
+            )
     if token_capture_cfg.enabled:
         if not should_use_nemo_gym(master_config):
             raise ValueError(
@@ -1006,22 +1040,106 @@ def setup_single_controller(
     # Checkpointing
     # ==========================
     checkpointer = CheckpointManager(master_config.checkpointing)
-    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    trainer_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = cast(
-        Optional[dict[str, Any]], checkpointer.load_training_info(last_checkpoint_path)
+        Optional[dict[str, Any]],
+        checkpointer.load_training_info(trainer_checkpoint_path),
     )
     save_state = _get_grpo_save_state(loaded_state)
-    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    weights_path, optimizer_path = checkpointer.get_resume_paths(
+        trainer_checkpoint_path
+    )
     if is_ppo_run(master_config):
         # Only a fresh run reads this; a resume ignores it and restores the critic
         # from its own checkpoint, so the key can stay in the config.
         warm_start = master_config.ppo.warm_start_value_checkpoint
-        if last_checkpoint_path is None and warm_start is not None:
+        if trainer_checkpoint_path is None and warm_start is not None:
             validate_warm_start_checkpoint(warm_start)
             print(f"🔥 Warm-starting the value model from {warm_start}")
         value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
-            last_checkpoint_path or warm_start,
+            trainer_checkpoint_path or warm_start,
             model_component="value",
+        )
+
+    restore_mode = rollout_checkpoint_cfg.restore_mode
+    recovery_checkpoint_path = (
+        trainer_checkpoint_path if restore_mode != "none" else None
+    )
+    bootstrap_anchor = checkpointer.checkpoint_dir / BOOTSTRAP_DIRNAME
+    needs_bootstrap_identity = trainer_checkpoint_path is None and (
+        rollout_checkpoint_cfg.interval_s is not None
+        or (restore_mode == "latest" and bootstrap_anchor.is_dir())
+    )
+    bootstrap_digest = (
+        bootstrap_fingerprint(master_config) if needs_bootstrap_identity else None
+    )
+    resolved_snapshot = None
+    restored_trainer_version = (
+        save_state.trainer_version
+        if save_state.trainer_version is not None
+        else save_state.current_step
+    )
+    if trainer_checkpoint_path is not None and restore_mode == "latest":
+        resolved_snapshot = resolve_latest_snapshot(
+            Path(trainer_checkpoint_path),
+            expected_train_step=save_state.current_step,
+            expected_trainer_version=restored_trainer_version,
+            expected_bootstrap_fingerprint=None,
+        )
+    elif trainer_checkpoint_path is None:
+        if rollout_checkpoint_cfg.interval_s is not None:
+            assert bootstrap_digest is not None
+            if restore_mode == "latest":
+                bootstrap_anchor = ensure_bootstrap_anchor(
+                    checkpointer.checkpoint_dir,
+                    fingerprint=bootstrap_digest,
+                )
+            else:
+                had_bootstrap_snapshots = (
+                    bootstrap_anchor / ROLLOUT_SNAPSHOTS_DIRNAME
+                ).is_dir()
+                bootstrap_anchor = reset_bootstrap_anchor(
+                    checkpointer.checkpoint_dir,
+                    fingerprint=bootstrap_digest,
+                )
+                if had_bootstrap_snapshots:
+                    print(
+                        "📦 Ignored existing bootstrap rollout snapshots and "
+                        "started a new bootstrap lineage because "
+                        f"rollout_checkpointing.restore_mode={restore_mode!r}.",
+                        flush=True,
+                    )
+        elif restore_mode == "latest" and bootstrap_anchor.is_dir():
+            assert bootstrap_digest is not None
+            validate_bootstrap_anchor(
+                bootstrap_anchor,
+                fingerprint=bootstrap_digest,
+            )
+        if restore_mode == "latest" and bootstrap_anchor.is_dir():
+            resolved_snapshot = resolve_latest_snapshot(
+                bootstrap_anchor,
+                expected_train_step=0,
+                expected_trainer_version=0,
+                expected_bootstrap_fingerprint=bootstrap_digest,
+            )
+    if resolved_snapshot is not None:
+        recovery_checkpoint_path = str(resolved_snapshot.path)
+        save_state.current_epoch = resolved_snapshot.manifest.current_epoch
+        print(
+            f"📦 Selected rollout recovery snapshot: {recovery_checkpoint_path}",
+            flush=True,
+        )
+    elif restore_mode == "trainer_checkpoint" and trainer_checkpoint_path:
+        print(
+            "📦 Restoring rollout state from the durable trainer checkpoint "
+            f"without considering newer periodic snapshots: {trainer_checkpoint_path}",
+            flush=True,
+        )
+    elif restore_mode == "none" and trainer_checkpoint_path:
+        print(
+            "📦 Resuming trainer state without rollout, replay, lineage, or "
+            "dataloader recovery.",
+            flush=True,
         )
 
     # ==========================
@@ -1055,9 +1173,12 @@ def setup_single_controller(
         drop_last=True,
         num_workers=data_config["num_workers"],
     )
-    if last_checkpoint_path is not None:
-        print(f"📦 Restoring dataloader state from checkpoint: {last_checkpoint_path}")
-        load_dataloader_state(dataloader, last_checkpoint_path, data_config)
+    if recovery_checkpoint_path is not None:
+        print(
+            "📦 Restoring dataloader state from checkpoint: "
+            f"{recovery_checkpoint_path}"
+        )
+        load_dataloader_state(dataloader, recovery_checkpoint_path, data_config)
 
     _clamp_max_num_steps(master_config, dataloader)
     _maybe_inject_megatron_train_iters(master_config)
@@ -1252,7 +1373,7 @@ def setup_single_controller(
     # operation starts.
     data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
         trainer,
-        last_checkpoint_path=last_checkpoint_path,
+        last_checkpoint_path=recovery_checkpoint_path,
         save_state=save_state,
         partition_id=partition_id,
         sampler_name=master_config.async_rl.sampler.name,
@@ -1468,8 +1589,9 @@ def setup_single_controller(
         tq_buffer=tq_buffer,
         partition_id=partition_id,
         save_state=save_state,
-        last_checkpoint_path=last_checkpoint_path,
+        last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
+        bootstrap_fingerprint=bootstrap_digest,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,
