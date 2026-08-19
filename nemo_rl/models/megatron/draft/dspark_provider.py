@@ -86,7 +86,7 @@ def _preflight_provider_inputs(
     agreement_group = (
         requested_tp_group if requested_tp_group is not None else configured_tp_group
     )
-    if agreement_group is None:
+    if agreement_group is None or not torch.distributed.is_initialized():
         return
     descriptor = [int(configured_tp_group is requested_tp_group)]
     for tensor in (
