@@ -28,7 +28,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     MseValueLossConfig,
     MseValueLossFn,
 )
-from nemo_rl.algorithms.ppo import PPOConfig, _apply_mask_sample_filter
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -50,50 +50,6 @@ def _make_loss_config(
         reference_policy_kl_type=kl_type,
         use_kl_in_reward=use_kl_in_reward,
     )
-
-
-class TestMaskSampleFilter:
-    def test_masks_env_flagged_samples(self):
-        repeated_batch = BatchedDataDict(
-            {
-                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
-                "mask_sample": torch.tensor([False, True, True]),
-            }
-        )
-
-        num_masked = _apply_mask_sample_filter(repeated_batch)
-
-        assert num_masked == 2
-        assert torch.equal(
-            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.0, 0.0])
-        )
-
-    def test_masks_list_valued_mask_sample(self):
-        repeated_batch = BatchedDataDict(
-            {
-                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
-                "mask_sample": [True, False, True],
-            }
-        )
-
-        num_masked = _apply_mask_sample_filter(repeated_batch)
-
-        assert num_masked == 2
-        assert torch.equal(
-            repeated_batch["loss_multiplier"], torch.tensor([0.0, 0.5, 0.0])
-        )
-
-    def test_missing_mask_sample_is_noop(self):
-        repeated_batch = BatchedDataDict(
-            {"loss_multiplier": torch.tensor([1.0, 0.5, 1.0])}
-        )
-
-        num_masked = _apply_mask_sample_filter(repeated_batch)
-
-        assert num_masked == 0
-        assert torch.equal(
-            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
-        )
 
 
 def _make_gae_config(

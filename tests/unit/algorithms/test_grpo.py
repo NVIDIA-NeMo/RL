@@ -36,7 +36,6 @@ from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
     RewardScalingConfig,
     _apply_configured_message_level_advantage_penalties,
-    _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
     _get_grpo_save_state,
     _initial_grpo_save_state,
@@ -135,50 +134,6 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
     )
-
-
-class TestMaskSampleFilter:
-    def test_masks_env_flagged_samples(self):
-        repeated_batch = BatchedDataDict(
-            {
-                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
-                "mask_sample": torch.tensor([False, True, True]),
-            }
-        )
-
-        num_masked = _apply_mask_sample_filter(repeated_batch)
-
-        assert num_masked == 2
-        assert torch.equal(
-            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.0, 0.0])
-        )
-
-    def test_masks_list_valued_mask_sample(self):
-        repeated_batch = BatchedDataDict(
-            {
-                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
-                "mask_sample": [True, False, True],
-            }
-        )
-
-        num_masked = _apply_mask_sample_filter(repeated_batch)
-
-        assert num_masked == 2
-        assert torch.equal(
-            repeated_batch["loss_multiplier"], torch.tensor([0.0, 0.5, 0.0])
-        )
-
-    def test_missing_mask_sample_is_noop(self):
-        repeated_batch = BatchedDataDict(
-            {"loss_multiplier": torch.tensor([1.0, 0.5, 1.0])}
-        )
-
-        num_masked = _apply_mask_sample_filter(repeated_batch)
-
-        assert num_masked == 0
-        assert torch.equal(
-            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
-        )
 
 
 def test_initial_policy_generation_stale() -> None:

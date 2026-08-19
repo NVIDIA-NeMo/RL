@@ -57,6 +57,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
+    apply_mask_sample_filter,
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
@@ -2106,24 +2107,6 @@ def _build_async_grpo_train_data(
     return train_data
 
 
-def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
-    """Zero loss_multiplier where mask_sample is True and return the count."""
-    if "mask_sample" not in repeated_batch:
-        return 0
-
-    loss_multiplier = repeated_batch["loss_multiplier"].clone()
-    mask_sample = repeated_batch["mask_sample"]
-
-    if isinstance(mask_sample, list):
-        mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
-    mask_sample_bool = mask_sample.bool()
-
-    num_masked = int(mask_sample_bool.sum().item())
-    loss_multiplier[mask_sample_bool] = 0
-    repeated_batch["loss_multiplier"] = loss_multiplier
-    return num_masked
-
-
 def _write_latest_checkpoint_status(
     checkpointer: CheckpointManager, last_checkpoint_step: int
 ) -> None:
@@ -3081,7 +3064,7 @@ def grpo_train(
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
 
-                    num_mask_sample_filtered = _apply_mask_sample_filter(repeated_batch)
+                    num_mask_sample_filtered = apply_mask_sample_filter(repeated_batch)
                     metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
 
                     add_grpo_token_loss_masks_and_generation_logprobs(
@@ -4656,7 +4639,7 @@ def async_grpo_train(
                             repeated_batch["loss_multiplier"] = loss_multiplier
 
                     with timer.time("mask_sample_filter"):
-                        num_mask_sample_filtered = _apply_mask_sample_filter(
+                        num_mask_sample_filtered = apply_mask_sample_filter(
                             repeated_batch
                         )
 
