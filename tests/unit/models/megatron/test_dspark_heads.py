@@ -46,6 +46,19 @@ def _load_heads() -> tuple[type[nn.Module], type[nn.Module]]:
 
 DSparkMarkovHead, DSparkConfidenceHead = _load_heads()
 
+_PUBLIC_DSPARK_REVISION = "737765aa0ff9f5dbda65839a6e010f03b66bc506"
+_PUBLIC_DSPARK_CONFIG = {
+    "vocab_size": 151936,
+    "draft_vocab_size": 32000,
+    "markov_rank": 256,
+}
+_PUBLIC_DSPARK_HEAD_SHAPES = {
+    "markov_head.markov_w1.weight": (151936, 256),
+    "markov_head.markov_w2.weight": (32000, 256),
+    "confidence_head.proj.weight": (1, 4352),
+    "confidence_head.proj.bias": (1,),
+}
+
 
 def _run_tp_markov_gradient(
     rank: int,
@@ -397,12 +410,14 @@ def test_markov_head_has_explicit_tp_local_vocab_contract() -> None:
         )
 
 
-def test_markov_head_checkpoint_names_and_tp1_shapes_match_public_dspark() -> None:
+def test_markov_head_loads_pinned_public_dspark_checkpoint_schema() -> None:
+    assert _PUBLIC_DSPARK_REVISION == "737765aa0ff9f5dbda65839a6e010f03b66bc506"
     heads = nn.ModuleDict(
         {
             "markov_head": DSparkMarkovHead(
-                vocab_size=151936,
-                markov_rank=256,
+                target_vocab_size=_PUBLIC_DSPARK_CONFIG["vocab_size"],
+                draft_vocab_size=_PUBLIC_DSPARK_CONFIG["draft_vocab_size"],
+                markov_rank=_PUBLIC_DSPARK_CONFIG["markov_rank"],
                 device="meta",
             ),
             "confidence_head": DSparkConfidenceHead(
@@ -415,16 +430,17 @@ def test_markov_head_checkpoint_names_and_tp1_shapes_match_public_dspark() -> No
     )
     state = heads.state_dict()
 
-    assert set(state) == {
-        "markov_head.markov_w1.weight",
-        "markov_head.markov_w2.weight",
-        "confidence_head.proj.weight",
-        "confidence_head.proj.bias",
+    assert set(state) == set(_PUBLIC_DSPARK_HEAD_SHAPES)
+    assert {
+        name: tuple(tensor.shape) for name, tensor in state.items()
+    } == _PUBLIC_DSPARK_HEAD_SHAPES
+    pinned_checkpoint = {
+        name: torch.empty(shape, dtype=torch.bfloat16, device="meta")
+        for name, shape in _PUBLIC_DSPARK_HEAD_SHAPES.items()
     }
-    assert state["markov_head.markov_w1.weight"].shape == (151936, 256)
-    assert state["markov_head.markov_w2.weight"].shape == (151936, 256)
-    assert state["confidence_head.proj.weight"].shape == (1, 4352)
-    assert state["confidence_head.proj.bias"].shape == (1,)
+    incompatible = heads.load_state_dict(pinned_checkpoint, strict=True, assign=True)
+    assert not incompatible.missing_keys
+    assert not incompatible.unexpected_keys
     assert not any(
         forbidden in name
         for name, _ in heads.named_parameters()
