@@ -463,6 +463,55 @@ def _run_tp2_hard_label_boundaries(rank: int, world_size: int) -> None:
             )
 
 
+def _run_tp2_global_acceptance_overlap(rank: int, world_size: int) -> None:
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    device = torch.device("cuda")
+    target_probabilities = torch.tensor([0.4, 0.1, 0.1, 0.4], device=device)
+    draft_probabilities = torch.tensor([0.1, 0.4, 0.4, 0.1], device=device)
+    local_vocab_size = target_probabilities.numel() // world_size
+    vocab_start = rank * local_vocab_size
+    vocab_end = vocab_start + local_vocab_size
+    draft_hidden = draft_probabilities.log().reshape(1, 1, -1).requires_grad_()
+    confidence_logits = torch.tensor([[1.0]], device=device, requires_grad=True)
+    output_weight = torch.eye(target_probabilities.numel(), device=device)[
+        vocab_start:vocab_end
+    ]
+
+    stats = dspark_tiled_objective(
+        target_logits=target_probabilities.log()[vocab_start:vocab_end].reshape(
+            1, 1, -1
+        ),
+        draft_hidden=draft_hidden,
+        target_output_weight=output_weight,
+        markov_w1=torch.zeros(4, 1, device=device, requires_grad=True),
+        markov_w2=torch.zeros(local_vocab_size, 1, device=device, requires_grad=True),
+        previous_token_ids=torch.zeros(1, 1, dtype=torch.long, device=device),
+        confidence_logits=confidence_logits,
+        hard_labels=torch.zeros(1, 1, dtype=torch.long, device=device),
+        valid_mask=torch.ones(1, 1, dtype=torch.bool, device=device),
+        slot_bins=torch.zeros(1, 1, dtype=torch.long, device=device),
+        loss_weights=(0.0, 0.0, 1.0),
+        token_chunk_size=1,
+        vocab_start_index=vocab_start,
+        tp_group=tp_group,
+    )
+    global_acceptance = torch.minimum(target_probabilities, draft_probabilities).sum()
+    assert global_acceptance.item() == pytest.approx(0.4)
+    expected = F.binary_cross_entropy_with_logits(
+        confidence_logits,
+        global_acceptance.reshape(1, 1),
+        reduction="none",
+    ).reshape(-1)
+    torch.testing.assert_close(stats.confidence.numerators, expected)
+
+    stats.confidence.normalized(normalization_counts=stats.confidence.counts).backward()
+    assert draft_hidden.grad is None
+    torch.testing.assert_close(
+        confidence_logits.grad,
+        confidence_logits.detach().sigmoid() - global_acceptance,
+    )
+
+
 def _run_tp2_split_vocab_mapping_and_bounds(rank: int, world_size: int) -> None:
     tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
@@ -496,12 +545,8 @@ def _run_tp2_split_vocab_mapping_and_bounds(rank: int, world_size: int) -> None:
     )
     common: dict[str, Any] = {
         "draft_hidden": torch.randn(1, 2, 3, generator=generator, device=device),
-        "target_output_weight": mapped_target_weight[
-            draft_vocab_start:draft_vocab_end
-        ],
-        "target_logits": mapped_target_logits[
-            ..., draft_vocab_start:draft_vocab_end
-        ],
+        "target_output_weight": mapped_target_weight[draft_vocab_start:draft_vocab_end],
+        "target_logits": mapped_target_logits[..., draft_vocab_start:draft_vocab_end],
         "previous_token_ids": torch.tensor([[10, 0]], device=device),
         "hard_labels": torch.tensor([[7, 0]], device=device),
         "valid_mask": torch.ones(1, 2, dtype=torch.bool, device=device),
@@ -635,6 +680,12 @@ def test_tp2_tv_only_gradient_uses_global_softmax_jacobian_expectation(
 
 def test_tp2_rejects_global_hard_label_boundaries(distributed_test_runner) -> None:
     distributed_test_runner(_run_tp2_hard_label_boundaries, world_size=2)
+
+
+def test_tp2_confidence_uses_global_acceptance_overlap(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(_run_tp2_global_acceptance_overlap, world_size=2)
 
 
 def test_tp2_split_vocab_mapping_and_bounds(distributed_test_runner) -> None:

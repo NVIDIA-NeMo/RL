@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -50,6 +51,8 @@ def _load_objective_without_poisoning_packages() -> ModuleType:
 _OBJECTIVE = _load_objective_without_poisoning_packages()
 DSparkLossBins = _OBJECTIVE.DSparkLossBins
 dspark_tiled_objective = _OBJECTIVE.dspark_tiled_objective
+
+_SPECULATORS_DSPARK_METRICS_REVISION = "ba4cc76e4e75102660d0bb954e299725f3092d58"
 
 
 def _distributed_inputs(
@@ -515,6 +518,69 @@ def test_confidence_can_be_disabled_without_changing_ce_or_tv() -> None:
     torch.testing.assert_close(disabled.confidence.counts, torch.zeros(3))
 
 
+def test_confidence_uses_detached_selected_vocab_acceptance_overlap() -> None:
+    """Match the pinned Speculators selected-logit, renormalized overlap target."""
+    full_target_logits = torch.tensor(
+        [[[math.log(0.4), math.log(0.6), 20.0, 21.0]]],
+        requires_grad=True,
+    )
+    d2t = torch.tensor([0, 1])
+    selected_target_logits = full_target_logits.index_select(-1, d2t)
+    draft_probabilities = torch.tensor([0.6, 0.4])
+    markov_w1 = torch.zeros(2, 2, requires_grad=True)
+    with torch.no_grad():
+        markov_w1[1].copy_(draft_probabilities.log())
+    draft_hidden = torch.zeros(1, 1, 1, requires_grad=True)
+    confidence_logits = torch.tensor([[1.25]], requires_grad=True)
+    hard_labels = torch.tensor([[1]])
+
+    stats = dspark_tiled_objective(
+        target_logits=selected_target_logits,
+        draft_hidden=draft_hidden,
+        target_output_weight=torch.zeros(2, 1),
+        markov_w1=markov_w1,
+        markov_w2=torch.eye(2, requires_grad=True),
+        previous_token_ids=torch.tensor([[1]]),
+        confidence_logits=confidence_logits,
+        hard_labels=hard_labels,
+        valid_mask=torch.ones(1, 1, dtype=torch.bool),
+        slot_bins=torch.zeros(1, 1, dtype=torch.long),
+        loss_weights=(0.0, 0.0, 1.0),
+        token_chunk_size=1,
+        vocab_start_index=0,
+        tp_group=None,
+    )
+
+    target_probabilities = torch.softmax(selected_target_logits.detach(), dim=-1)
+    acceptance_target = torch.minimum(
+        target_probabilities,
+        draft_probabilities.reshape(1, 1, -1),
+    ).sum(dim=-1)
+    assert acceptance_target.item() == pytest.approx(0.8)
+    assert draft_probabilities.argmax().item() != hard_labels.item()
+    assert torch.softmax(full_target_logits.detach(), dim=-1)[..., d2t].sum() < 1e-8
+    expected = F.binary_cross_entropy_with_logits(
+        confidence_logits,
+        acceptance_target,
+        reduction="none",
+    ).reshape(-1)
+    torch.testing.assert_close(
+        stats.confidence.numerators,
+        expected,
+        msg=lambda message: (
+            f"Speculators@{_SPECULATORS_DSPARK_METRICS_REVISION}: {message}"
+        ),
+    )
+
+    stats.confidence.normalized(normalization_counts=stats.confidence.counts).backward()
+    assert full_target_logits.grad is None
+    assert draft_hidden.grad is None
+    torch.testing.assert_close(
+        confidence_logits.grad,
+        confidence_logits.detach().sigmoid() - acceptance_target,
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
@@ -575,9 +641,7 @@ def test_split_vocab_uses_mapped_draft_rows_and_independent_id_bounds() -> None:
     full_target_weight = torch.randn(target_vocab_size, 3, generator=generator)
     common = {
         "target_logits": full_target_logits.index_select(-1, d2t),
-        "draft_hidden": torch.randn(
-            1, 2, 3, generator=generator, requires_grad=True
-        ),
+        "draft_hidden": torch.randn(1, 2, 3, generator=generator, requires_grad=True),
         "target_output_weight": full_target_weight.index_select(0, d2t),
         "markov_w1": torch.randn(
             target_vocab_size, 2, generator=generator, requires_grad=True
