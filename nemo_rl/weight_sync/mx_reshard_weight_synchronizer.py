@@ -32,9 +32,7 @@ def check_mx_reshard_refit_support(master_config: Any) -> None:
     if dtensor.get("enabled", False):
         violations.append("policy.dtensor_cfg.enabled must be False.")
     if megatron.get("expert_tensor_parallel_size", 1) not in (None, 1):
-        violations.append(
-            "policy.megatron_cfg.expert_tensor_parallel_size must be 1."
-        )
+        violations.append("policy.megatron_cfg.expert_tensor_parallel_size must be 1.")
     if str(vllm.get("kv_cache_dtype", "auto")).startswith("fp8"):
         violations.append("mx_reshard does not support FP8 KV-cache scale sync.")
 
@@ -49,9 +47,7 @@ def check_mx_reshard_refit_support(master_config: Any) -> None:
             "Megatron num_attention_heads must be divisible by tensor parallel size."
         )
     if query_groups is not None and int(query_groups) < 1:
-        violations.append(
-            "Megatron num_query_groups must be positive."
-        )
+        violations.append("Megatron num_query_groups must be positive.")
     if (
         heads is not None
         and query_groups is not None
@@ -114,12 +110,19 @@ class MxReshardWeightSynchronizer(WeightSynchronizer):
         if kv_scales is not None:
             raise ValueError("mx_reshard does not support FP8 KV-scale synchronization")
 
+        # `_version` is the last *committed* version, so a failed refit leaves it
+        # alone and the next attempt reuses this stamp. That is safe only because
+        # a failure here aborts the run: publishers stamp the shard table with
+        # this number, so a retry inside one process would advertise different
+        # bytes under a version a receiver may already have seen. Anything that
+        # adds a retry has to advance the counter per attempt instead.
         version = self._version + 1
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
             else nullcontext()
         )
+
         def phase(name: str):
             """Split the refit into its two serialized halves.
 
@@ -180,9 +183,7 @@ class MxReshardWeightSynchronizer(WeightSynchronizer):
             inference_world_size=inference_world_size,
         )
         published = ray.get(
-            self._policy.init_mx_reshard_publisher(
-                train_world_size=train_world_size
-            )
+            self._policy.init_mx_reshard_publisher(train_world_size=train_world_size)
         )
         self._require_all(published, "publisher initialization")
         receivers = ray.get(
@@ -202,9 +203,7 @@ class MxReshardWeightSynchronizer(WeightSynchronizer):
             # Receivers load publisher metadata and own the remote connection.
             # They must disconnect before the publisher destroys its local UCX
             # worker; reversing this order can abort in ucp_worker_destroy.
-            receiver_results = ray.get(
-                self._generation.shutdown_mx_reshard_receiver()
-            )
+            receiver_results = ray.get(self._generation.shutdown_mx_reshard_receiver())
             self._require_all(receiver_results, "receiver shutdown")
         except Exception as error:
             errors.append(error)

@@ -52,6 +52,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 if TYPE_CHECKING:
@@ -193,7 +194,8 @@ _DEFAULT_VOCAB_NAME_PATTERNS = (
 )
 
 
-def _bridge_module_type_registry() -> dict[str, set[str]] | None:
+@lru_cache(maxsize=1)
+def _bridge_module_type_registry() -> dict[str, frozenset[str]] | None:
     """Return Bridge's authoritative module classifier registry, or None.
 
     Bridge ships a curated dict of
@@ -202,13 +204,22 @@ def _bridge_module_type_registry() -> dict[str, set[str]] | None:
     dependency: when Bridge is not in the import path (e.g. in unit tests on
     a CPU-only env), the caller falls back to substring matching against
     the base class names, which is correct for mainline Megatron-Core.
+
+    Cached because this is consulted once per parameter while classifying a
+    publish set, and re-running the import machinery and copying the registry
+    thousands of times per refit buys nothing: the installed Bridge cannot
+    change mid-process. Frozen sets keep the cached value from being mutated by
+    a caller.
     """
     try:
         from megatron.bridge.models.conversion.param_mapping import (
             AutoMapping as _AM,
         )
 
-        return dict(_AM._MODULE_TYPE_REGISTRY)
+        return {
+            kind: frozenset(classes)
+            for kind, classes in _AM._MODULE_TYPE_REGISTRY.items()
+        }
     except Exception:
         return None
 
@@ -564,11 +575,7 @@ def detect_megatron_role(
                 )
                 # Preserve compatibility with old MX clients only when local
                 # head counts are meaningful. Never publish a zero KV count.
-                if (
-                    tp_size > 0
-                    and q_heads % tp_size == 0
-                    and kv_heads % tp_size == 0
-                ):
+                if tp_size > 0 and q_heads % tp_size == 0 and kv_heads % tp_size == 0:
                     extras["num_heads_local"] = str(q_heads // tp_size)
                     extras["num_kv_heads_local"] = str(kv_heads // tp_size)
             return MegatronRoleSpec(role=ROLE_QKV_COLUMN, descriptor_extras=extras)

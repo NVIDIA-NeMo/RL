@@ -21,7 +21,9 @@ local-head counts, and ``gated_mlp_order``), so no renaming happens here.
 
 from __future__ import annotations
 
+import json
 import re
+import time
 from inspect import signature
 from typing import Any, Callable, Iterable, Iterator
 
@@ -65,7 +67,7 @@ class UnmappedMegatronTensor(KeyError):
 
 
 class MxMegatronPublisher:
-    """Own one #635 NIXL registration, publication heartbeat, and MX client."""
+    """Own one rank's NIXL registration, publication heartbeat, and MX client."""
 
     def __init__(
         self,
@@ -84,6 +86,7 @@ class MxMegatronPublisher:
 
         worker_id = f"nemo-rl-trainer-{rank}"
         self._items = items
+        self._rank = rank
         self._metadata_endpoint = metadata_endpoint
         self._manager = NixlTransferManager(
             agent_name=worker_id,
@@ -112,13 +115,43 @@ class MxMegatronPublisher:
     def publish(self, version: int) -> None:
         if self._closed:
             raise RuntimeError("ModelExpress publisher is closed")
-        publish_megatron_hf_aliases(
+        started = time.perf_counter()
+        _source_id, published = publish_megatron_hf_aliases(
             manager=self._manager,
             rendezvous=self._rendezvous,
             items=self._items,
             metadata_endpoint=self._metadata_endpoint,
             publisher_step=version,
         )
+        self._report_publish(version, time.perf_counter() - started, published)
+
+    def _report_publish(self, version: int, elapsed_s: float, published: list) -> None:
+        """Emit the publish-side counterpart of the receiver's phase record.
+
+        The weight synchronizer already times this half, but elapsed time alone
+        does not distinguish a publish that described more shards from one that
+        described the same shards more slowly. Never raises: telemetry must not
+        be able to fail the operation it measures.
+        """
+        try:
+            shards = sum(len(tensor.shards) for tensor in published)
+            print(
+                "MX_PUBLISH_PHASE "
+                + json.dumps(
+                    {
+                        "schema": "mx-publish-phase-v1",
+                        "step": version,
+                        "rank": self._rank,
+                        "publish_s": round(elapsed_s, 6),
+                        "tensors": len(published),
+                        "shards": shards,
+                        "bytes": published_byte_count(published),
+                    }
+                ),
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001 - never worth a failed publish
+            pass
 
     def shutdown(self) -> None:
         if self._closed:
@@ -133,7 +166,9 @@ class MxMegatronPublisher:
                 self._client.close()
 
 
-def build_bridge_name_map(conversion_tasks: Iterable[Any]) -> dict[str, tuple[str, ...]]:
+def build_bridge_name_map(
+    conversion_tasks: Iterable[Any],
+) -> dict[str, tuple[str, ...]]:
     """Map this PP rank's unwrapped local Megatron names to ordered HF names.
 
     ``WeightConversionTask.param_name`` is the local name emitted by this
@@ -239,7 +274,9 @@ def _nearest_keys(name: str, resolved: dict[str, tuple[str, ...]], limit: int = 
 _GATED_ROLES = frozenset({"gated_mlp_column", "expert_column"})
 
 
-def _gated_mlp_extras(name: str, role: str, hf_names: tuple[str, ...]) -> dict[str, str]:
+def _gated_mlp_extras(
+    name: str, role: str, hf_names: tuple[str, ...]
+) -> dict[str, str]:
     """The ``gated_mlp_order`` stamp MX requires for a fused gate/up parameter.
 
     MX refuses to infer this, correctly: it assigns the first half of the fused
@@ -298,6 +335,10 @@ def build_megatron_alias_inputs(
     for name, tensor, spec, extras in publish_set:
         hf_names = resolve_hf_names(name, extras)
         if not hf_names:
+            # Only reachable through a deliberately non-strict resolver. The
+            # strict one -- what the worker builds -- raises
+            # UnmappedMegatronTensor instead, because silently dropping a
+            # parameter surfaces far from its cause.
             continue
 
         alias_extras = dict(extras)
@@ -360,10 +401,10 @@ def publish_megatron_hf_aliases(
     """
     if not items:
         raise ValueError("no alias inputs to publish")
-
-    published = build_hf_aliases(items, agent_name=str(manager.agent_name))
     if publisher_step < 0:
         raise ValueError("publisher_step must be non-negative")
+
+    published = build_hf_aliases(items, agent_name=str(manager.agent_name))
 
     # ModelExpress main's rendezvous payload owns the version stamp, while the
     # current convenience publisher does not expose it. Use MX's encoder rather

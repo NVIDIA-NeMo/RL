@@ -36,8 +36,11 @@ _ENV_FLAG = "MX_REFIT_VERIFY"
 
 
 def enabled() -> bool:
-    """Off unless asked for. The reductions are cheap but not free, and this runs
-    on the refit critical path."""
+    """Whether parameter-equality verification is enabled.
+
+    Off unless asked for: the reductions are cheap but not free, and this runs on
+    the refit critical path.
+    """
     return os.environ.get(_ENV_FLAG, "0") not in ("", "0", "false", "False")
 
 
@@ -78,10 +81,19 @@ def fingerprint_model(model) -> dict[str, tuple[int, int, int]]:
 
     Never raises: this is verification, and a verification failure must not be
     able to fail the refit it is verifying.
+
+    Returning ``{}`` disables the check for this refit, so say so rather than
+    going quiet. A verification tool that silently switches itself off reports
+    the same thing as one that is passing.
     """
     try:
         return {name: fingerprint(p) for name, p in model.named_parameters()}
-    except Exception:  # noqa: BLE001 - see above
+    except Exception as error:  # noqa: BLE001 - see above
+        print(
+            "MX_REFIT_VERIFY skipped: could not fingerprint parameters "
+            f"({type(error).__name__}: {error})",
+            flush=True,
+        )
         return {}
 
 

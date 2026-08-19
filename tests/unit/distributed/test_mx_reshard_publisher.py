@@ -11,6 +11,7 @@ one expert's weights under another's.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -181,9 +182,7 @@ def test_mx_reshard_preinitializes_nixl_only_for_selected_transport(monkeypatch)
 
     assert maybe_preinit_mx_reshard_nixl({}) is None
     assert (
-        maybe_preinit_mx_reshard_nixl(
-            {"generation": {"refit_transport": "mx_reshard"}}
-        )
+        maybe_preinit_mx_reshard_nixl({"generation": {"refit_transport": "mx_reshard"}})
         is agent
     )
     assert calls == [{}]
@@ -201,7 +200,7 @@ def test_overlapping_explicit_port_ranges_are_rejected():
         )
 
 
-def test_trainer_publisher_uses_exact_mx_635_constructor_arguments():
+def test_publisher_is_constructed_with_the_expected_mx_arguments():
     item = SimpleNamespace(name="weight", tensor=torch.zeros(1))
     manager = MagicMock()
     client = MagicMock()
@@ -293,12 +292,20 @@ def test_dp_replica_ranks_receive_unique_worker_ids():
 
 
 def test_replicated_tensor_publishes_its_whole_shape():
-    entry = _entry("decoder.layers.0.input_layernorm.weight", torch.zeros(16), ROLE_REPLICATED)
+    entry = _entry(
+        "decoder.layers.0.input_layernorm.weight", torch.zeros(16), ROLE_REPLICATED
+    )
     resolver = make_bridge_resolver(
-        {"decoder.layers.0.input_layernorm.weight": ["model.layers.0.input_layernorm.weight"]}
+        {
+            "decoder.layers.0.input_layernorm.weight": [
+                "model.layers.0.input_layernorm.weight"
+            ]
+        }
     )
 
-    (item,) = build_megatron_alias_inputs([entry], resolve_hf_names=resolver, tp_size=1, tp_rank=0)
+    (item,) = build_megatron_alias_inputs(
+        [entry], resolve_hf_names=resolver, tp_size=1, tp_rank=0
+    )
 
     assert item.placement_kind == PLACEMENT_REPLICATE
     assert item.global_shape == (16,)
@@ -309,12 +316,20 @@ def test_replicated_tensor_publishes_its_whole_shape():
 
 def test_tp_sharded_column_carries_its_global_shape_and_range():
     """TP2 rank 1 of a column-parallel weight owns the second row band."""
-    entry = _entry("decoder.layers.0.mlp.linear_fc2.weight", torch.zeros(8, 32), ROLE_ROW)
+    entry = _entry(
+        "decoder.layers.0.mlp.linear_fc2.weight", torch.zeros(8, 32), ROLE_ROW
+    )
     resolver = make_bridge_resolver(
-        {"decoder.layers.0.mlp.linear_fc2.weight": ["model.layers.0.mlp.down_proj.weight"]}
+        {
+            "decoder.layers.0.mlp.linear_fc2.weight": [
+                "model.layers.0.mlp.down_proj.weight"
+            ]
+        }
     )
 
-    (item,) = build_megatron_alias_inputs([entry], resolve_hf_names=resolver, tp_size=2, tp_rank=1)
+    (item,) = build_megatron_alias_inputs(
+        [entry], resolve_hf_names=resolver, tp_size=2, tp_rank=1
+    )
 
     # ROLE_ROW shards axis 1.
     assert item.placement_kind == PLACEMENT_SHARD
@@ -332,7 +347,9 @@ def test_tp1_leaves_every_tensor_whole():
     resolver = make_bridge_resolver({"a.weight": ["hf.a"], "b.weight": ["hf.b"]})
 
     items = list(
-        build_megatron_alias_inputs(entries, resolve_hf_names=resolver, tp_size=1, tp_rank=0)
+        build_megatron_alias_inputs(
+            entries, resolve_hf_names=resolver, tp_size=1, tp_rank=0
+        )
     )
 
     assert [item.placement_kind for item in items] == [PLACEMENT_REPLICATE] * 2
@@ -349,7 +366,11 @@ def test_expert_tp_geometry_is_taken_from_the_expert_mesh():
         is_expert=True,
     )
     resolver = make_bridge_resolver(
-        {"decoder.layers.0.mlp.experts.linear_fc2.weight0": ["model.layers.0.mlp.experts.0.down_proj.weight"]}
+        {
+            "decoder.layers.0.mlp.experts.linear_fc2.weight0": [
+                "model.layers.0.mlp.experts.0.down_proj.weight"
+            ]
+        }
     )
 
     (item,) = build_megatron_alias_inputs(
@@ -378,7 +399,11 @@ def test_global_expert_id_is_substituted_into_the_hf_name():
     those names unchanged would have every EP rank overwrite rank 0's experts.
     """
     resolver = make_bridge_resolver(
-        {"decoder.layers.0.mlp.experts.linear_fc1.weight0": ["model.layers.0.mlp.experts.0.gate_proj.weight"]}
+        {
+            "decoder.layers.0.mlp.experts.linear_fc1.weight0": [
+                "model.layers.0.mlp.experts.0.gate_proj.weight"
+            ]
+        }
     )
 
     names = resolver(
@@ -446,7 +471,9 @@ def test_non_strict_resolver_reports_no_names_and_the_tensor_is_dropped():
     resolver = make_bridge_resolver({"known.weight": ["hf.known"]}, strict=False)
 
     items = list(
-        build_megatron_alias_inputs([entry], resolve_hf_names=resolver, tp_size=1, tp_rank=0)
+        build_megatron_alias_inputs(
+            [entry], resolve_hf_names=resolver, tp_size=1, tp_rank=0
+        )
     )
 
     assert items == []
@@ -520,7 +547,9 @@ def test_gated_order_extra_survives_translation():
         }
     )
 
-    (item,) = build_megatron_alias_inputs([entry], resolve_hf_names=resolver, tp_size=1, tp_rank=0)
+    (item,) = build_megatron_alias_inputs(
+        [entry], resolve_hf_names=resolver, tp_size=1, tp_rank=0
+    )
 
     assert item.extras["gated_mlp_order"] == "gate_then_up"
 
@@ -548,12 +577,17 @@ def test_translated_items_are_accepted_by_build_hf_aliases():
     resolver = make_bridge_resolver(
         {
             "norm.weight": ["model.norm.weight"],
-            "mlp.linear_fc1.weight": ["model.mlp.gate_proj.weight", "model.mlp.up_proj.weight"],
+            "mlp.linear_fc1.weight": [
+                "model.mlp.gate_proj.weight",
+                "model.mlp.up_proj.weight",
+            ],
         }
     )
 
     items = list(
-        build_megatron_alias_inputs(entries, resolve_hf_names=resolver, tp_size=1, tp_rank=0)
+        build_megatron_alias_inputs(
+            entries, resolve_hf_names=resolver, tp_size=1, tp_rank=0
+        )
     )
     published = build_hf_aliases(items, agent_name="trainer-r0")
 
@@ -569,13 +603,78 @@ def test_translated_items_are_accepted_by_build_hf_aliases():
             assert shard.agent_name == "trainer-r0"
 
 
+def test_publish_reports_its_shard_and_byte_counts(capsys):
+    """The synchronizer times the publish half but not what it described, so a
+    publish that slowed down cannot be told from one that grew without this."""
+    item = SimpleNamespace(name="weight", tensor=torch.zeros(1))
+    published = [SimpleNamespace(shards=[SimpleNamespace(shape=(8,))], elsize=2)]
+    with (
+        patch("modelexpress.nixl_transfer.NixlTransferManager"),
+        patch("modelexpress.client.MxClient"),
+        patch("modelexpress.refit.reshard.rendezvous.MxReshardRendezvous"),
+    ):
+        publisher = MxMegatronPublisher(
+            items=[item],
+            model_name="model",
+            server_url="mx:8001",
+            rank=11,
+            device_id=0,
+            listen_port=19011,
+            metadata_endpoint="host:19011",
+        )
+    with patch(
+        "nemo_rl.distributed.mx_reshard_publisher.publish_megatron_hf_aliases",
+        return_value=("source-1", published),
+    ):
+        publisher.publish(7)
+
+    record = json.loads(capsys.readouterr().out.split("MX_PUBLISH_PHASE ", 1)[1])
+    assert record["step"] == 7
+    assert record["rank"] == 11
+    assert record["tensors"] == 1
+    assert record["shards"] == 1
+    assert record["bytes"] == 8 * 2
+    publisher.shutdown()
+
+
+def test_publish_telemetry_cannot_fail_a_successful_publish():
+    """Reporting is never worth a failed publish: the bytes are already out."""
+    item = SimpleNamespace(name="weight", tensor=torch.zeros(1))
+    with (
+        patch("modelexpress.nixl_transfer.NixlTransferManager"),
+        patch("modelexpress.client.MxClient"),
+        patch("modelexpress.refit.reshard.rendezvous.MxReshardRendezvous"),
+    ):
+        publisher = MxMegatronPublisher(
+            items=[item],
+            model_name="model",
+            server_url="mx:8001",
+            rank=0,
+            device_id=0,
+            listen_port=19000,
+            metadata_endpoint="host:19000",
+        )
+    # A payload whose shards cannot be counted at all.
+    with patch(
+        "nemo_rl.distributed.mx_reshard_publisher.publish_megatron_hf_aliases",
+        return_value=("source-1", [SimpleNamespace()]),
+    ):
+        publisher.publish(3)
+
+    publisher.shutdown()
+
+
 def test_published_byte_count_sums_shard_boxes():
     from modelexpress.refit.reshard.megatron_aliases import build_hf_aliases
 
-    entry = _entry("norm.weight", torch.zeros(16, dtype=torch.bfloat16), ROLE_REPLICATED)
+    entry = _entry(
+        "norm.weight", torch.zeros(16, dtype=torch.bfloat16), ROLE_REPLICATED
+    )
     resolver = make_bridge_resolver({"norm.weight": ["model.norm.weight"]})
     items = list(
-        build_megatron_alias_inputs([entry], resolve_hf_names=resolver, tp_size=1, tp_rank=0)
+        build_megatron_alias_inputs(
+            [entry], resolve_hf_names=resolver, tp_size=1, tp_rank=0
+        )
     )
 
     published = build_hf_aliases(items, agent_name="trainer-r0")
@@ -597,7 +696,9 @@ QWEN3_30B_A3B = {
 }
 
 
-def _expected_hf_names(layers: int, experts: int, tie_word_embeddings: bool) -> set[str]:
+def _expected_hf_names(
+    layers: int, experts: int, tie_word_embeddings: bool
+) -> set[str]:
     """The tensor names the HF checkpoint actually contains."""
     names = {"model.embed_tokens.weight", "model.norm.weight"}
     if not tie_word_embeddings:
@@ -661,7 +762,9 @@ def _bridge_map_for_rank(layers: int, local_experts: int) -> dict[str, list[str]
         name_map[f"{megatron}.self_attention.k_layernorm.weight"] = [
             f"{hf}.self_attn.k_norm.weight"
         ]
-        name_map[f"{megatron}.input_layernorm.weight"] = [f"{hf}.input_layernorm.weight"]
+        name_map[f"{megatron}.input_layernorm.weight"] = [
+            f"{hf}.input_layernorm.weight"
+        ]
         name_map[f"{megatron}.pre_mlp_layernorm.weight"] = [
             f"{hf}.post_attention_layernorm.weight"
         ]
@@ -763,8 +866,10 @@ def test_fused_expert_gate_up_is_stamped_gate_then_up():
     extras = _gated_mlp_extras(
         "decoder.layers.0.mlp.experts.linear_fc1.weight0",
         "expert_column",
-        ("model.layers.0.mlp.experts.0.gate_proj.weight",
-         "model.layers.0.mlp.experts.0.up_proj.weight"),
+        (
+            "model.layers.0.mlp.experts.0.gate_proj.weight",
+            "model.layers.0.mlp.experts.0.up_proj.weight",
+        ),
     )
     assert extras == {"gated_mlp_order": "gate_then_up"}
 
@@ -783,21 +888,29 @@ def test_reversed_hf_name_order_is_refused_not_guessed():
         _gated_mlp_extras(
             "decoder.layers.0.mlp.experts.linear_fc1.weight0",
             "expert_column",
-            ("model.layers.0.mlp.experts.0.up_proj.weight",
-             "model.layers.0.mlp.experts.0.gate_proj.weight"),
+            (
+                "model.layers.0.mlp.experts.0.up_proj.weight",
+                "model.layers.0.mlp.experts.0.gate_proj.weight",
+            ),
         )
 
 
 def test_unfused_roles_are_not_stamped():
     # linear_fc2 maps to one HF name, so there is nothing to order; stamping it
     # anyway would assert a layout claim about a tensor that has no halves.
-    assert _gated_mlp_extras(
-        "decoder.layers.0.mlp.experts.linear_fc2.weight0",
-        "expert_row",
-        ("model.layers.0.mlp.experts.0.down_proj.weight",),
-    ) == {}
-    assert _gated_mlp_extras(
-        "decoder.layers.0.self_attention.linear_qkv.weight",
-        "qkv_column",
-        ("q.weight", "k.weight", "v.weight"),
-    ) == {}
+    assert (
+        _gated_mlp_extras(
+            "decoder.layers.0.mlp.experts.linear_fc2.weight0",
+            "expert_row",
+            ("model.layers.0.mlp.experts.0.down_proj.weight",),
+        )
+        == {}
+    )
+    assert (
+        _gated_mlp_extras(
+            "decoder.layers.0.self_attention.linear_qkv.weight",
+            "qkv_column",
+            ("q.weight", "k.weight", "v.weight"),
+        )
+        == {}
+    )
