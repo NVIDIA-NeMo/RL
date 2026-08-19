@@ -232,6 +232,7 @@ def _run_tp_markov_checkpoint(
         assert markov_w2.global_offset == (vocab_start, 0)
         assert markov_w2.axis_fragmentations == (world_size, 1)
 
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
         dist_checkpointing.save({"model": sharded_state}, checkpoint_dir)
         restored = DSparkMarkovHead(
             vocab_size=vocab_size,
