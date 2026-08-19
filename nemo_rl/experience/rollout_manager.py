@@ -16,6 +16,7 @@ import asyncio
 import copy
 import enum
 import json
+import math
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -27,6 +28,7 @@ from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     TQReplayBuffer,
 )
@@ -1277,6 +1279,12 @@ class RolloutManager:
         self._recovery_ledger = recovery_ledger
         self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self._weight_version: int = 0
+        # Process-local benchmark counters. Restored work is counted only when
+        # it is republished in this process, so interval rates remain coherent.
+        self._canonical_groups_finalized = 0
+        self._canonical_output_tokens = 0
+        self._recovery_siblings_reused = 0
+        self._recovery_siblings_redispatched = 0
         # Run-wide, shared across concurrent generate_and_push calls. Safe as a plain
         # int: every caller runs on the SingleController's single event loop.
         self._skipped_prompts: int = 0
@@ -1298,13 +1306,15 @@ class RolloutManager:
         self._data_plane_checkpoint_barrier = barrier
 
     @asynccontextmanager
-    async def _recovery_mutation(self) -> AsyncIterator[None]:
+    async def _recovery_mutation(
+        self, kind: CheckpointMutationKind = "recovery_retries"
+    ) -> AsyncIterator[None]:
         """Serialize short lineage transitions with native TQ snapshots."""
         barrier = self._data_plane_checkpoint_barrier
         if barrier is None:
             yield
             return
-        async with barrier.mutation():
+        async with barrier.mutation(kind):
             yield
 
     def set_weight_version(self, version: int) -> None:
@@ -1314,6 +1324,37 @@ class RolloutManager:
             version: Trainer weight version to stamp on future rollout tags.
         """
         self._weight_version = int(version)
+
+    def telemetry_snapshot(self) -> dict[str, int]:
+        """Return cumulative canonical-publication and recovery counters."""
+        return {
+            "canonical_groups_finalized": getattr(
+                self, "_canonical_groups_finalized", 0
+            ),
+            "canonical_output_tokens": getattr(self, "_canonical_output_tokens", 0),
+            "recovery_siblings_reused": getattr(self, "_recovery_siblings_reused", 0),
+            "recovery_siblings_redispatched": (
+                getattr(self, "_recovery_siblings_redispatched", 0)
+            ),
+        }
+
+    def record_canonical_publication(self, output_tokens: int) -> None:
+        """Count one prompt group after its canonical TQ commit succeeds."""
+        self._canonical_groups_finalized = (
+            getattr(self, "_canonical_groups_finalized", 0) + 1
+        )
+        self._canonical_output_tokens = getattr(
+            self, "_canonical_output_tokens", 0
+        ) + max(0, int(output_tokens))
+
+    def record_recovery_siblings(self, *, reused: int, redispatched: int) -> None:
+        """Count the sibling work avoided and repeated during recovery."""
+        self._recovery_siblings_reused = getattr(
+            self, "_recovery_siblings_reused", 0
+        ) + max(0, int(reused))
+        self._recovery_siblings_redispatched = getattr(
+            self, "_recovery_siblings_redispatched", 0
+        ) + max(0, int(redispatched))
 
     def reserve_prompt_group(
         self, input_sample: DatumSpec, *, target_step: Optional[int] = None
@@ -1499,6 +1540,16 @@ class RolloutManager:
                 raise
 
             self._stats.committed += 1
+            rollout_metrics = getattr(record, "rollout_metrics", {})
+            mean_output_tokens = rollout_metrics.get("mean_gen_tokens_per_sample", 0)
+            output_tokens = 0
+            if isinstance(mean_output_tokens, (int, float)):
+                total_output_tokens = float(mean_output_tokens) * len(
+                    getattr(record, "completions", ())
+                )
+                if math.isfinite(total_output_tokens):
+                    output_tokens = max(0, round(total_output_tokens))
+            self.record_canonical_publication(output_tokens)
             return RolloutOutcome.COMMITTED
 
         # The infrastructure budget ran out. The same failure followed the prompt across
@@ -1544,7 +1595,7 @@ class RolloutManager:
                 "generate_for_finalization requires a rollout recovery ledger"
             )
         if recovery_group_id is None:
-            async with self._recovery_mutation():
+            async with self._recovery_mutation("prompt_reservations"):
                 recovery_group_id = self.reserve_prompt_group(
                     input_sample, target_step=target_step
                 )
@@ -1685,7 +1736,7 @@ class RolloutManager:
 
         assert self._tq_buffer is not None
         assert self._recovery_ledger is not None
-        async with self._recovery_mutation():
+        async with self._recovery_mutation("recovery_retries"):
             recovery_group = self._recovery_ledger.get_group(recovery_group_id)
             if recovery_group.status == PromptGroupStatus.GENERATING:
                 recovery_group = self._recovery_ledger.prepare_incomplete_retry(
@@ -1734,7 +1785,7 @@ class RolloutManager:
                     reward=completion.reward,
                 )
             else:
-                async with barrier.mutation():
+                async with barrier.mutation("sibling_seals"):
                     self._recovery_ledger.mark_sibling_sealed(
                         group_id,
                         generation_index=generation_index,
@@ -1755,7 +1806,7 @@ class RolloutManager:
                             f"recovery group {group_id!r} needs a prompt for "
                             "unfinished sibling generation"
                         )
-                    async with self._recovery_mutation():
+                    async with self._recovery_mutation("recovery_retries"):
                         self._recovery_ledger.mark_group_dispatched(
                             group_id, generation_indices=pending_indices
                         )
@@ -1768,7 +1819,7 @@ class RolloutManager:
             finally:
                 if inflight_registry is not None:
                     inflight_registry.pop(group_id, None)
-            async with self._recovery_mutation():
+            async with self._recovery_mutation("recovery_retries"):
                 (
                     physical_rollout_ids,
                     canonical_sample_ids,
@@ -1789,7 +1840,7 @@ class RolloutManager:
             return request
         except BaseException:
             self._tq_buffer.abort(group_id)
-            async with self._recovery_mutation():
+            async with self._recovery_mutation("recovery_retries"):
                 self._recovery_ledger.abandon_unsealed(group_id)
             # A failure after the last sibling sealed leaves the group ready to
             # finalize; an earlier failure leaves it generating. The outer retry
@@ -1809,6 +1860,6 @@ class RolloutManager:
             for sibling in group.siblings
             for key in sibling.current_attempt.staging_keys
         ]
-        async with self._recovery_mutation():
+        async with self._recovery_mutation("group_removals"):
             await self._tq_buffer.clear_staging_keys(staging_keys)
             self._recovery_ledger.discard_group(group_id)
