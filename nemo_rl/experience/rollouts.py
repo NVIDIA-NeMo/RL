@@ -2249,7 +2249,8 @@ async def run_async_nemo_gym_rollout(
         policy_generation: Generation interface whose configuration supplies the
             model's maximum sequence length.
         input_batch: Batch whose ``extra_env_info`` field contains NeMo-Gym rows.
-        tokenizer: Tokenizer used by the NeMo-Gym actor and local postprocessing.
+        tokenizer: Tokenizer for local postprocessing. The actor holds its own,
+            installed once at spinup -- see NemoGym.set_tokenizer.
         task_to_env: Environment mapping containing the ``"nemo_gym"`` actor.
         generation_config: Sampling parameters forwarded to every NeMo-Gym row.
         num_generations: Number of contiguous rows belonging to each prompt group.
@@ -2363,7 +2364,6 @@ async def run_async_nemo_gym_rollout(
         with timer.time(run_rollouts_timer_label):
             ray_arguments = (
                 nemo_gym_rows,
-                tokenizer,
                 timer_prefix,
                 deduplicate_multimodal_data,
             )
@@ -2482,7 +2482,8 @@ def run_nemo_gym_rollout_sync(
         policy_generation: Generation interface whose configuration supplies the
             model's maximum sequence length.
         input_batch: Batch whose ``extra_env_info`` field contains NeMo-Gym rows.
-        tokenizer: Tokenizer used by the NeMo-Gym actor and local postprocessing.
+        tokenizer: Tokenizer for local postprocessing. The actor holds its own,
+            installed once at spinup -- see NemoGym.set_tokenizer.
         task_to_env: Environment mapping containing the ``"nemo_gym"`` actor.
         generation_config: Sampling parameters forwarded to every NeMo-Gym row.
         log_full_result_tables: Whether to include complete per-agent result
