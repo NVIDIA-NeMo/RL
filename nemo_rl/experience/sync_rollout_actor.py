@@ -43,6 +43,9 @@ import numpy as np
 import ray
 import torch
 
+from nemo_rl.data.multimodal_utils import (
+    encode_multimodal_for_wire,
+)
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
@@ -212,6 +215,7 @@ class SyncRolloutActor:
         """
         # Lazy imports — avoid pulling grpo into this module at load.
         from nemo_rl.algorithms.grpo import (
+            _policy_dtype,
             _should_use_async_rollouts,
             _should_use_nemo_gym,
         )
@@ -317,9 +321,17 @@ class SyncRolloutActor:
         )
         if ROUTED_EXPERTS_FIELD in flat:
             bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
-        for k, v in flat.get_multimodal_dict(as_tensors=False).items():
-            if isinstance(v, torch.Tensor):
-                bulk_batch[k] = v
+        # ``pixel_dtype`` mirrors the legacy analogs (``grpo._build_async_grpo_train_data``
+        # and the sync train-data builders): cast pixels to the policy precision
+        # once here, at the same point they'd be cast in-memory. No worker
+        # re-applies it, so without this the largest column crosses the wire in
+        # fp32 where legacy shipped bf16. ``PackedTensor.to_dtype`` leaves
+        # integer segments (grid_thw / imgs_sizes / num_frames) untouched.
+        for k, v in flat.get_multimodal_dict(
+            as_tensors=False, pixel_dtype=_policy_dtype(cfg.policy)
+        ).items():
+            for wk, wv in encode_multimodal_for_wire(k, v):
+                bulk_batch[wk] = wv
         # ``content`` (raw assistant text per sample) — rides TQ as a
         # NonTensorStack so the driver can fetch it back at jsonl time
         # (kv_first_write wraps it via NonTensorStack).

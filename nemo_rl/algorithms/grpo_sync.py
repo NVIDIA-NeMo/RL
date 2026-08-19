@@ -37,6 +37,8 @@ import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
+    from transformers import AutoProcessor
+
     from nemo_rl.models.policy.tq_policy import TQPolicy
 
 import numpy as np
@@ -50,6 +52,7 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     _clip_grpo_advantages,
     _create_advantage_estimator,
+    _initial_policy_generation_stale,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
@@ -391,6 +394,13 @@ def grpo_train_sync(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    # Unused here, and present only so the shared VLM launcher can pass one
+    # fixed kwarg set to whichever trainer ``_select_trainer`` returns.
+    # ``grpo_train``'s sole use of it is
+    # ``attach_initial_nemo_gym_image_payloads``, gated on
+    # ``grpo.deduplicate_multimodal_data`` — which ``setup()`` already rejects
+    # for ``data_plane.enabled=true`` via ``_validate_multimodal_dedup_capability``.
+    processor: Optional["AutoProcessor"] = None,
 ) -> None:
     """Run GRPO training algorithm — TransferQueue-mediated.
 
@@ -423,7 +433,13 @@ def grpo_train_sync(
     if policy_generation is None:
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
-    POLICY_GENERATION_STALE = True
+    # Skip a redundant iter-1 refit when setup() already synced weights
+    # (synchronizer not stale, fresh run). The redundant refit resets
+    # vLLM CUDA-graph / KV-cache state and yields a step-1
+    # token_mult_prob_error spike that converges by step 3.
+    POLICY_GENERATION_STALE = _initial_policy_generation_stale(
+        policy_generation, grpo_save_state.total_steps
+    )
     assert policy_generation is not None
 
     if master_config.grpo.skip_reference_policy_logprobs_calculation:
@@ -960,9 +976,20 @@ def grpo_train_sync(
                         # (logprobs/advantages/masks) and wire-only message
                         # log bulk fields are skipped by virtue of not being
                         # in DP_CALIB_INPUT_FIELDS.
+                        # ``DP_CALIB_INPUT_FIELDS`` names a ``multi_modal_inputs``
+                        # column that is never actually written — the rollout
+                        # writes pixel_values / image_grid_thw / … individually
+                        # — so on a VLM run this filter would otherwise yield
+                        # only the text fields and calibrate image-blind.
+                        # Local import: ``tq_policy`` is TYPE_CHECKING-only at
+                        # module scope here (see the import block at the top).
+                        from nemo_rl.models.policy.tq_policy import (
+                            _present_multimodal_fields,
+                        )
+
                         _calib_fields = [
                             f for f in (meta.fields or []) if f in DP_CALIB_INPUT_FIELDS
-                        ]
+                        ] + _present_multimodal_fields(meta)
                         calibration_data = policy.read_from_dataplane(
                             meta,
                             select_fields=_calib_fields,
