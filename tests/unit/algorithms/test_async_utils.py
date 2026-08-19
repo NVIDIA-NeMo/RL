@@ -51,6 +51,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.experience.rollouts import RewardPenaltyConfig
 
 
 @ray.remote(num_cpus=0)
@@ -1400,6 +1401,7 @@ class TestAsyncTrajectoryCollector:
 
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
+        reward_penalties = SimpleNamespace()
         return MasterConfig.model_construct(
             grpo=GRPOConfig.model_construct(
                 num_prompts_per_step=2,
@@ -1419,6 +1421,7 @@ class TestAsyncTrajectoryCollector:
                 "wandb_enabled": False,
                 "wandb": {"log_nemo_gym_full_result_tables": False},
             },
+            reward_penalties=reward_penalties,
         )
 
     def test_collector_selects_ppo_config(self):
@@ -1435,6 +1438,7 @@ class TestAsyncTrajectoryCollector:
             max_trajectory_age_steps=3,
             warmup_generation_lead_steps=5,
         )
+        reward_penalties = RewardPenaltyConfig(penalize_empty_final_answer=True)
         master_config = PPOMasterConfig.model_construct(
             policy={"make_sequence_length_divisible_by": 1},
             ppo=PPOConfig.model_construct(
@@ -1443,6 +1447,7 @@ class TestAsyncTrajectoryCollector:
                 max_rollout_turns=1,
                 async_ppo=async_config,
             ),
+            reward_penalties=reward_penalties,
         )
         collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
         collector = collector_cls(
@@ -1456,6 +1461,7 @@ class TestAsyncTrajectoryCollector:
         assert collector.algorithm_config is master_config.ppo
         assert collector.async_config is async_config
         assert collector.async_config.max_trajectory_age_steps == 3
+        assert collector._reward_penalty_config is reward_penalties
 
         collector.set_generation_window(
             weight_version=2,
@@ -1466,6 +1472,14 @@ class TestAsyncTrajectoryCollector:
         assert collector._generation_lead_steps == 3
         assert collector._max_trajectory_age_steps == 5
         assert collector._calculate_target_weights(2) == [3, 4, 5]
+
+    def test_collector_preserves_grpo_reward_penalty_config(self):
+        """The shared collector keeps Async GRPO's Gym penalty behavior."""
+        collector = self.create_local_collector()
+
+        assert collector._reward_penalty_config is (
+            collector.master_config.reward_penalties
+        )
 
     def test_collector_grpo_window_remains_fixed(self):
         collector = self.create_local_collector()
