@@ -83,7 +83,10 @@ def _preflight_provider_inputs(
     configured_tp_group: torch.distributed.ProcessGroup | None,
     requested_tp_group: torch.distributed.ProcessGroup | None,
 ) -> None:
-    if configured_tp_group is None:
+    agreement_group = (
+        requested_tp_group if requested_tp_group is not None else configured_tp_group
+    )
+    if agreement_group is None:
         return
     descriptor = [int(configured_tp_group is requested_tp_group)]
     for tensor in (
@@ -107,12 +110,12 @@ def _preflight_provider_inputs(
     torch.distributed.all_reduce(
         minimum,
         op=torch.distributed.ReduceOp.MIN,
-        group=configured_tp_group,
+        group=agreement_group,
     )
     torch.distributed.all_reduce(
         maximum,
         op=torch.distributed.ReduceOp.MAX,
-        group=configured_tp_group,
+        group=agreement_group,
     )
     if not torch.equal(minimum, maximum):
         raise ValueError("tensor-parallel ranks must agree on DSpark provider inputs")
