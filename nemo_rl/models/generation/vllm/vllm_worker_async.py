@@ -99,7 +99,6 @@ def _complete_token_injection_eligibility(
     request: Any,
     messages: list[Any],
     *,
-    has_multimodal_config: bool,
     prompt_embeds_enabled: bool,
     renderer_supported: bool,
     vllm_version_supported: bool,
@@ -119,8 +118,6 @@ def _complete_token_injection_eligibility(
         return None, "add_special_tokens request"
     if request.return_prompt_text:
         return None, "return_prompt_text request"
-    if has_multimodal_config:
-        return None, "multimodal model"
     if prompt_embeds_enabled:
         return None, "prompt embeddings enabled"
     if not renderer_supported:
@@ -808,9 +805,6 @@ class VllmAsyncGenerationWorkerImpl(
                         _complete_token_injection_eligibility(
                             request,
                             messages,
-                            has_multimodal_config=(
-                                self.model_config.multimodal_config is not None
-                            ),
                             prompt_embeds_enabled=self.model_config.enable_prompt_embeds,
                             renderer_supported=isinstance(self.renderer, HfRenderer),
                             vllm_version_supported=vllm_version_supported,

@@ -188,7 +188,6 @@ def test_complete_token_injection_eligibility_returns_latest_assistant() -> None
     ordinal, reason = _complete_token_injection_eligibility(
         _complete_token_request(),
         _tokenized_assistant_messages(),
-        has_multimodal_config=False,
         prompt_embeds_enabled=False,
         renderer_supported=True,
         vllm_version_supported=True,
@@ -205,7 +204,6 @@ def test_complete_token_injection_eligibility_accepts_supported_roles(role) -> N
     _, reason = _complete_token_injection_eligibility(
         _complete_token_request(),
         messages,
-        has_multimodal_config=False,
         prompt_embeds_enabled=False,
         renderer_supported=True,
         vllm_version_supported=True,
@@ -252,7 +250,6 @@ def test_complete_token_injection_eligibility_rejects_request_options(
     ordinal, reason = _complete_token_injection_eligibility(
         _complete_token_request(**{field: value}),
         _tokenized_assistant_messages(),
-        has_multimodal_config=False,
         prompt_embeds_enabled=False,
         renderer_supported=True,
         vllm_version_supported=True,
@@ -265,11 +262,6 @@ def test_complete_token_injection_eligibility_rejects_request_options(
 @pytest.mark.parametrize(
     ("helper_updates", "expected_reason"),
     [
-        pytest.param(
-            {"has_multimodal_config": True},
-            "multimodal model",
-            id="multimodal",
-        ),
         pytest.param(
             {"prompt_embeds_enabled": True},
             "prompt embeddings enabled",
@@ -291,7 +283,6 @@ def test_complete_token_injection_eligibility_rejects_model_options(
     helper_updates, expected_reason
 ) -> None:
     helper_args = {
-        "has_multimodal_config": False,
         "prompt_embeds_enabled": False,
         "renderer_supported": True,
         "vllm_version_supported": True,
@@ -346,7 +337,6 @@ def test_complete_token_injection_eligibility_rejects_messages(
     ordinal, reason = _complete_token_injection_eligibility(
         _complete_token_request(),
         messages,
-        has_multimodal_config=False,
         prompt_embeds_enabled=False,
         renderer_supported=True,
         vllm_version_supported=True,
@@ -379,7 +369,6 @@ def test_complete_token_injection_eligibility_rejects_mismatched_prefix(
     ordinal, reason = _complete_token_injection_eligibility(
         _complete_token_request(required_prefix_token_ids=required_prefix_token_ids),
         messages,
-        has_multimodal_config=False,
         prompt_embeds_enabled=False,
         renderer_supported=True,
         vllm_version_supported=True,
@@ -393,7 +382,6 @@ def test_complete_token_injection_eligibility_rejects_slot_swapped_prefix() -> N
     ordinal, reason = _complete_token_injection_eligibility(
         _complete_token_request(required_prefix_token_ids=[12, 13, 14, 10, 11]),
         _tokenized_assistant_messages(),
-        has_multimodal_config=False,
         prompt_embeds_enabled=False,
         renderer_supported=True,
         vllm_version_supported=True,
@@ -598,9 +586,6 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     make_module(
         "vllm.entrypoints.chat_utils",
         load_chat_template=MagicMock(return_value=None),
-    )
-    make_module(
-        "vllm.entrypoints.chat_utils",
         parse_chat_messages_async=AsyncMock(),
     )
     make_module(
@@ -708,7 +693,8 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplo
         served_model_name="served-model",
         model="model-path",
         max_model_len=128,
-        multimodal_config=None,
+        # A VLM-capable model can use injection when this request has no media.
+        multimodal_config=object(),
         enable_prompt_embeds=False,
     )
     worker.llm = MagicMock(model_config=model_config, renderer=hf_renderer())
@@ -857,6 +843,44 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplo
         request.max_tokens = None
         return request
 
+    def make_renderer_request(**updates):
+        request = make_request(**updates)
+        request.build_tok_params = MagicMock(return_value={})
+        request.build_chat_params = MagicMock(return_value=chat_params)
+        request.mm_processor_kwargs = None
+        request.cache_salt = None
+        request.tool_choice = "none"
+        request.tools = []
+        return request
+
+    parse_chat_messages = sys.modules[
+        "vllm.entrypoints.chat_utils"
+    ].parse_chat_messages_async
+    for mm_data, mm_uuids in (
+        ({"image": [object()]}, None),
+        (None, {"image": ["image-uuid"]}),
+    ):
+        parse_chat_messages.return_value = (
+            _tokenized_assistant_messages(),
+            mm_data,
+            mm_uuids,
+        )
+        multimodal_result = asyncio.run(
+            renderer.preprocess_chat(
+                request=make_renderer_request(),
+                messages=_tokenized_assistant_messages(),
+                default_template=None,
+                default_template_content_format="auto",
+                default_template_kwargs={},
+            )
+        )
+        assert multimodal_result[1][0]["prompt_token_ids"] == [7]
+    parse_chat_messages.return_value = (
+        _tokenized_assistant_messages(),
+        None,
+        None,
+    )
+
     request = make_request()
     renderer._preprocess_chat_with_complete_token_ids = AsyncMock(
         return_value=(
@@ -877,6 +901,32 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplo
 
     assert result[1][0]["prompt_token_ids"] == [3, 4, 5]
     assert request.max_completion_tokens == 10
+    renderer._preprocess_chat_with_complete_token_ids.assert_awaited_once()
+
+    media_messages = [
+        *_tokenized_assistant_messages(),
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/image.png"},
+                }
+            ],
+        },
+    ]
+    media_request = make_request()
+    media_result = asyncio.run(
+        renderer.preprocess_chat(
+            request=media_request,
+            messages=media_messages,
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={},
+        )
+    )
+    assert media_result[1][0]["prompt_token_ids"] == [7]
+    assert media_request.max_completion_tokens == 10
     renderer._preprocess_chat_with_complete_token_ids.assert_awaited_once()
 
     error_request = make_request(
@@ -958,9 +1008,11 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, caplo
     )
 
     assert worker._get_complete_token_injection_stats() == {
-        "attempts": 5,
+        "attempts": 8,
         "successes": 1,
         "fallbacks": {
+            "Multimodal chat data requires native preprocessing.": 2,
+            "non-text message content": 1,
             "streaming request": 1,
             "test fallback": 2,
             "test injection error": 1,
