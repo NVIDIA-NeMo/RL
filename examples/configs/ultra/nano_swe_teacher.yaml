@@ -1,0 +1,42 @@
+# =============================================================================
+# Nemotron 3 NANO v3 (30B-A3B) — SWE teacher smoke test — GB200
+# =============================================================================
+# Inherits, in order:
+#   1. swe_teacher.yaml           — the Ultra stage
+#   2. _nano_smoke_gb200.yaml.inc — Nano+GB200 mesh & smoke sizing (shared)
+#
+# SWE has NO GPU-served Gym judges (env.nemo_gym.num_gpu_nodes = 0). Rewards come
+# from apptainer sandboxes, so there is no judge parallelism to shrink here. The
+# launcher must still set SIF_DIR (sif_dir=${SIF_DIR}) — the SWE agents resolve
+# `${sif_dir}/<subdir>/{instance_id}.sif`.
+#
+# Everything smoke-relevant (mesh, batch, context, MTP off, alltoall) comes from
+# _nano_smoke_gb200.yaml.inc, so this file only wires the inheritance.
+# =============================================================================
+
+defaults:
+  - swe_teacher.yaml
+  - _nano_smoke_gb200.yaml.inc
+
+env:
+  nemo_gym:
+    # Reuse the container's baked gym venvs (swe_teacher.yaml sets this false,
+    # which forces a concurrent nemo-gym rebuild -> uv cache lock timeout).
+    skip_venv_if_present: true
+
+policy:
+  # Bumped up from the 49152 smoke default to test long-context memory
+  # pressure (user request). 196608 = swe_teacher.yaml's own base Ultra-stage
+  # context length (the .inc's 16384 default would reject prompts this long,
+  # which is why this override exists at all). Untested at this length on
+  # Nano-30B/TP2 -- the model is much smaller than the 550B Ultra stage this
+  # value was tuned for, so there should be more KV-cache headroom under the
+  # same gpu_memory_utilization: 0.8 / max_num_seqs: 256 (both from
+  # swe_teacher.yaml), but that's a real-run question, not something derived
+  # from config alone -- watch the next run for OOM / KV-cache alloc failures.
+  max_total_sequence_length: 196608
+  generation:
+    vllm_cfg:
+      max_model_len: 196608
+
+sif_dir: /lustre/fsw/portfolios/llmservice/users/sdevare/images
