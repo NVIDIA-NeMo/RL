@@ -516,6 +516,7 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
         flat_mask = mask.reshape(-1).float()
         flat_bin_ids = bin_ids.reshape(-1)
         flat_hidden_gradient = torch.empty_like(flat_hidden, dtype=torch.float32)
+        output_weight_fp32 = output_weight.detach().float()
 
         for start in range(0, flat_hidden.shape[0], ctx.token_chunk_size):
             end = min(start + ctx.token_chunk_size, flat_hidden.shape[0])
@@ -532,9 +533,7 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
             )
             logits_gradient = student_probs.sub_(teacher_probs)
             logits_gradient.mul_(row_scale.unsqueeze(-1))
-            flat_hidden_gradient[start:end].copy_(
-                logits_gradient @ output_weight.float()
-            )
+            flat_hidden_gradient[start:end].copy_(logits_gradient @ output_weight_fp32)
 
         if ctx.tp_group is not None:
             torch.distributed.all_reduce(
@@ -864,12 +863,16 @@ def dflash_projected_vocab_parallel_soft_ce(
     if not 0.0 < position_decay <= 1.0:
         raise ValueError(f"position_decay must be in (0, 1], got {position_decay}.")
 
+    effective_loss_mask = loss_mask.clone()
+    effective_loss_mask[:, 0] = False
     sequence_length = teacher_logits.shape[1]
     teacher_positions = label_positions - 1
     teacher_row_indices = sample_rows[:, None] * sequence_length + teacher_positions
-    teacher_row_indices[:, 0] = 0
-    effective_loss_mask = loss_mask.clone()
-    effective_loss_mask[:, 0] = False
+    teacher_row_indices = torch.where(
+        effective_loss_mask,
+        teacher_row_indices,
+        torch.zeros((), dtype=torch.long, device=draft_hidden.device),
+    )
     gamma = block_size - 1
     slot_offsets = torch.arange(block_size, device=draft_hidden.device)
     bin_ids = slot_offsets.sub(1).clamp_min_(0).expand(block_shape)
