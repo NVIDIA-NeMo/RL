@@ -694,6 +694,7 @@ def setup(
             base_urls=base_urls,
             model_name=model_name,
             enable_router_replay=enable_router_replay,
+            log_dir=logger_config["log_dir"],
             routed_experts_dtype=routed_experts_dtype,
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         )
@@ -5383,7 +5384,9 @@ def async_grpo_train(
             for task_name, env in env_dict.items():
                 print(f"🛑 Shutting down environment {task_name}...")
                 try:
-                    ray.get(env.shutdown.remote(), timeout=10)
+                    # Monitored NeMo Gym environments may retain their Router
+                    # and backends briefly for a final Prometheus scrape.
+                    ray.get(env.shutdown.remote(), timeout=30)
                 except Exception:
                     try:
                         ray.kill(env)

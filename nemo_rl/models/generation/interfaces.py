@@ -13,7 +13,7 @@
 # limitations under the License.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from typing import Any, AsyncGenerator, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
@@ -360,6 +360,12 @@ class GenerationInterface(ABC):
         self, data: BatchedDataDict["GenerationDatumSpec"], greedy: bool
     ) -> BatchedDataDict["GenerationOutputSpec"]:
         pass
+
+    def generate_async(
+        self, data: BatchedDataDict["GenerationDatumSpec"], greedy: bool = False
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict["GenerationOutputSpec"]], None]:
+        """Generate one sample asynchronously."""
+        raise NotImplementedError
 
     @abstractmethod
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:

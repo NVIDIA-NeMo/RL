@@ -14,10 +14,99 @@
 import os
 import subprocess
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
-from nemo_rl.utils.venvs import create_local_venv
+import nemo_rl.utils.venvs as venvs
+from nemo_rl.utils.venvs import (
+    create_local_venv,
+    create_local_venv_on_each_node,
+    make_python_runtime_env,
+)
 from tests.unit.conftest import TEST_ASSETS_DIR
+
+
+def test_make_python_runtime_env_activates_configured_venv_without_mutating_input(
+    tmp_path,
+):
+    venv = tmp_path / "configured-venv"
+    python = venv / "bin" / "python"
+    base_env = {
+        "PATH": f"/opt/nemo_rl_venv/bin{os.pathsep}/usr/bin",
+        "PYTHONPATH": "/explicit/source/tree",
+        "VIRTUAL_ENV": "/opt/nemo_rl_venv",
+        "UV_PROJECT_ENVIRONMENT": "/opt/nemo_rl_venv",
+    }
+    original_base_env = base_env.copy()
+
+    runtime_env = make_python_runtime_env(str(python), base_env=base_env)
+
+    assert runtime_env["py_executable"] == str(python)
+    assert runtime_env["env_vars"] == {
+        "PATH": (
+            f"{venv / 'bin'}{os.pathsep}/opt/nemo_rl_venv/bin{os.pathsep}/usr/bin"
+        ),
+        "PYTHONPATH": "/explicit/source/tree",
+        "VIRTUAL_ENV": str(venv),
+        "UV_PROJECT_ENVIRONMENT": str(venv),
+    }
+    assert base_env == original_base_env
+
+
+def test_make_python_runtime_env_preserves_venv_python_symlink(tmp_path):
+    interpreter = tmp_path / "python3.13"
+    interpreter.touch()
+    venv = tmp_path / "configured-venv"
+    (venv / "bin").mkdir(parents=True)
+    python = venv / "bin" / "python"
+    python.symlink_to(interpreter)
+
+    runtime_env = make_python_runtime_env(str(python), base_env={})
+
+    assert runtime_env["py_executable"] == str(python)
+    assert runtime_env["py_executable"] != str(python.resolve())
+    assert runtime_env["env_vars"]["VIRTUAL_ENV"] == str(venv)
+
+
+def test_create_local_venv_on_each_node_propagates_configured_root(
+    tmp_path, monkeypatch
+):
+    venv_root = tmp_path / "shared-venvs"
+    venv_name = "example.Worker"
+    python = venv_root / venv_name / "bin" / "python"
+    monkeypatch.setenv("NEMO_RL_VENV_DIR", str(venv_root))
+
+    placement = MagicMock()
+    placement.ready.return_value = "placement-ready"
+    builder = MagicMock()
+    builder.options.return_value.remote.return_value = "builder-result"
+
+    with (
+        patch.object(
+            venvs.ray,
+            "nodes",
+            return_value=[{"Alive": True, "Resources": {"CPU": 1}}],
+        ),
+        patch.object(venvs, "placement_group", return_value=placement),
+        patch.object(
+            venvs.ray,
+            "get",
+            side_effect=[None, [str(python)]],
+        ) as ray_get,
+        patch.object(venvs, "_env_builder", builder),
+        patch.object(venvs.ray.util, "remove_placement_group") as remove_pg,
+    ):
+        result = create_local_venv_on_each_node("uv run --locked", venv_name)
+
+    assert result == str(python)
+    builder.options.assert_called_once_with(
+        placement_group=placement,
+        runtime_env={"env_vars": {"NEMO_RL_VENV_DIR": str(venv_root)}},
+    )
+    builder.options.return_value.remote.assert_called_once_with(
+        "uv run --locked", venv_name, 0, False
+    )
+    assert ray_get.call_args_list == [call("placement-ready"), call(["builder-result"])]
+    remove_pg.assert_called_once_with(placement)
 
 
 def test_create_local_venv():

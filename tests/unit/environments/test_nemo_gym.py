@@ -15,6 +15,7 @@ import json
 import time
 from copy import deepcopy
 from pathlib import Path
+from typing import Literal
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -40,11 +41,18 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    NemoGymSpinupResult,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
     spinup_nemo_gym_actor,
     validate_reward_components_match_scalar,
+)
+from nemo_rl.environments.prometheus import (
+    NemoGymPrometheusConfig,
+    PrometheusRegistrationResult,
+    PrometheusTargetStatus,
+    target_from_base_url,
 )
 from nemo_rl.environments.vllm_router import VllmRouterConfig
 from nemo_rl.experience.rollouts import _reattach_original_multimodal_payloads
@@ -182,6 +190,7 @@ def test_spinup_nemo_gym_actor_extracts_vllm_router_config():
             base_urls=["http://worker-0:8000/v1"],
             model_name="test-model",
             enable_router_replay=False,
+            log_dir="/tmp/test-nemo-gym-logs",
             routed_experts_dtype="int32",
             use_fastokens=False,
         )
@@ -196,16 +205,127 @@ def test_spinup_nemo_gym_actor_extracts_vllm_router_config():
     assert result is actor
 
 
-def test_nemo_gym_spinup_routes_policy_requests_through_vllm_router():
+def test_spinup_nemo_gym_actor_registers_and_archives_prometheus_targets(
+    tmp_path: Path,
+):
+    actor = MagicMock()
+    spinup_ref = object()
+    actor._spinup.remote.return_value = spinup_ref
+    target = target_from_base_url(
+        "http://worker-0:8000/v1",
+        labels={
+            "component": "vllm_backend",
+            "model": "test-model",
+            "replica": "0",
+            "routing_policy": "direct",
+            "run_id": "run-7",
+        },
+    )
+    spinup_result = NemoGymSpinupResult(
+        prometheus_target_statuses=(
+            PrometheusTargetStatus(target=target, ready=True, error=None),
+        ),
+        router_log_paths=(),
+        backend_log_paths=(("0", str(tmp_path / "backend-0.log")),),
+        model_call_capture_dir=str(tmp_path / "model-call-capture"),
+    )
+    registration = PrometheusRegistrationResult(
+        status="registered",
+        server_url="http://monitor:18080",
+        response={"status": "ok", "prometheus_reloaded": True},
+        error=None,
+    )
+
+    with (
+        patch("nemo_rl.environments.nemo_gym.NemoGym") as nemo_gym_actor,
+        patch(
+            "nemo_rl.environments.nemo_gym.get_actor_python_env",
+            return_value="/tmp/nemo-gym-python",
+        ),
+        patch(
+            "nemo_rl.environments.nemo_gym.ray.get_runtime_context",
+            return_value=MagicMock(get_job_id=lambda: "ray-job"),
+        ),
+        patch(
+            "nemo_rl.environments.nemo_gym.ray.get",
+            return_value=spinup_result,
+        ) as ray_get,
+        patch(
+            "nemo_rl.environments.nemo_gym.register_prometheus_targets",
+            return_value=registration,
+        ) as register_targets,
+        patch(
+            "nemo_rl.environments.nemo_gym.write_prometheus_manifest"
+        ) as write_manifest,
+    ):
+        nemo_gym_actor.options.return_value.remote.return_value = actor
+
+        result = spinup_nemo_gym_actor(
+            env_configs={
+                "nemo_gym": {
+                    "prometheus": {
+                        "enabled": True,
+                        "required": True,
+                        "server_url": "http://monitor:18080",
+                        "run_id": "run-7",
+                        "scrape_interval_s": 0.001,
+                        "initial_scrape_wait_s": 0.001,
+                        "target_lifecycle": "dedicated",
+                    },
+                    "config_paths": ["responses_api_models/vllm_model/config.yaml"],
+                }
+            },
+            base_urls=["http://worker-0:8000/v1"],
+            model_name="test-model",
+            enable_router_replay=False,
+            log_dir=str(tmp_path),
+            routed_experts_dtype="int32",
+            use_fastokens=False,
+        )
+
+    actor_cfg = nemo_gym_actor.options.return_value.remote.call_args.args[0]
+    assert actor_cfg["prometheus"].run_id == "run-7"
+    assert "prometheus" not in actor_cfg["initial_global_config_dict"]
+    register_targets.assert_called_once_with(
+        actor_cfg["prometheus"],
+        list(spinup_result.prometheus_target_statuses),
+    )
+    assert write_manifest.call_args.args[0] == (
+        Path(actor_cfg["monitoring_artifact_dir"]) / "prometheus-targets.json"
+    )
+    assert write_manifest.call_args.kwargs["backend_log_paths"] == {
+        "0": str(tmp_path / "backend-0.log")
+    }
+    ray_get.assert_called_once_with(spinup_ref)
+    assert result is actor
+
+
+@pytest.mark.parametrize(
+    ("policy", "cache_metrics_mode", "forward_session_id_in_body"),
+    [
+        ("cache_aware", "debug_log_compat", True),
+        ("consistent_hash", "native", False),
+    ],
+)
+def test_nemo_gym_spinup_routes_policy_requests_through_vllm_router(
+    policy: Literal["cache_aware", "consistent_hash"],
+    cache_metrics_mode: Literal["debug_log_compat", "native"],
+    forward_session_id_in_body: bool,
+) -> None:
     events = []
     router = MagicMock()
     router.openai_base_url = "http://10.0.0.5:1325/v1"
+    router.log_paths = ["/tmp/router.stdout.log", "/tmp/router.stderr.log"]
     router.start.side_effect = lambda: events.append("router.start")
     router.wait_until_ready.side_effect = lambda: events.append("router.ready")
 
     run_helper = MagicMock()
     run_helper.start.side_effect = lambda **_: events.append("gym.start")
-    router_config = VllmRouterConfig(enabled=True, policy="consistent_hash")
+    router_config = VllmRouterConfig(
+        enabled=True,
+        policy=policy,
+        cache_metrics_mode=cache_metrics_mode,
+    )
     gym = MagicMock()
     gym.cfg = NemoGymConfig(
         model_name="test-model",
@@ -213,6 +333,8 @@ def test_nemo_gym_spinup_routes_policy_requests_through_vllm_router():
             "http://worker-0:8000/v1",
             "http://worker-1:8001/v1",
         ],
+        monitoring_artifact_dir="/tmp/test-nemo-gym-logs",
+        prometheus=NemoGymPrometheusConfig(),
         initial_global_config_dict={
             "policy_model": {
                 "responses_api_models": {
@@ -230,15 +352,21 @@ def test_nemo_gym_spinup_routes_policy_requests_through_vllm_router():
         ),
         patch(
             "nemo_rl.environments.nemo_gym._get_free_port_local",
-            side_effect=[5500, 1325, 1365],
+            side_effect=[5500, 1325],
         ) as get_free_port,
+        patch(
+            "nemo_rl.environments.nemo_gym._get_free_consecutive_ports_local",
+            return_value=1365,
+        ) as get_free_consecutive_ports,
         patch(
             "nemo_rl.environments.nemo_gym.VllmRouterProcess",
             return_value=router,
             create=True,
         ) as router_process,
-        patch("nemo_gym.cli.RunHelper", return_value=run_helper),
-        patch("nemo_gym.cli.GlobalConfigDictParserConfig") as parser_config,
+        patch("nemo_gym.cli.RunHelper", return_value=run_helper, create=True),
+        patch(
+            "nemo_gym.cli.GlobalConfigDictParserConfig", create=True
+        ) as parser_config,
         patch("nemo_gym.rollout_collection.RolloutCollectionHelper"),
         patch("nemo_gym.server_utils.BaseServerConfig"),
         patch("nemo_rl.environments.nemo_gym.ray.is_initialized", return_value=True),
@@ -247,7 +375,7 @@ def test_nemo_gym_spinup_routes_policy_requests_through_vllm_router():
             return_value=MagicMock(gcs_address="10.0.0.5:1200"),
         ),
     ):
-        NemoGym.__ray_metadata__.modified_class._spinup(gym)
+        spinup_result = NemoGym.__ray_metadata__.modified_class._spinup(gym)
 
     assert get_free_port.call_args_list == [
         call(DEFAULT_GYM_PORT_RANGE_LOW, DEFAULT_GYM_PORT_RANGE_HIGH),
@@ -255,19 +383,28 @@ def test_nemo_gym_spinup_routes_policy_requests_through_vllm_router():
             DEFAULT_VLLM_ROUTER_PORT_RANGE_LOW,
             DEFAULT_VLLM_ROUTER_PORT_RANGE_HIGH,
         ),
-        call(
-            DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_LOW,
-            DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_HIGH,
-        ),
     ]
+    get_free_consecutive_ports.assert_called_once_with(
+        DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_LOW,
+        DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_HIGH,
+        consecutive=2,
+    )
     router_process.assert_called_once_with(
         worker_base_urls=gym.cfg["base_urls"],
         host="10.0.0.5",
         port=1325,
-        prometheus_port=1365,
+        prometheus_port=1366,
+        native_prometheus_port=1365,
         config=router_config,
+        log_dir=Path("/tmp/test-nemo-gym-logs") / "vllm_router",
     )
     assert events == ["router.start", "router.ready", "gym.start"]
+    assert spinup_result == NemoGymSpinupResult(
+        prometheus_target_statuses=(),
+        router_log_paths=("/tmp/router.stdout.log", "/tmp/router.stderr.log"),
+        backend_log_paths=(),
+        model_call_capture_dir=None,
+    )
 
     global_config = parser_config.call_args.kwargs["initial_global_config_dict"]
     assert global_config["policy_base_url"] == [router.openai_base_url]
@@ -275,7 +412,76 @@ def test_nemo_gym_spinup_routes_policy_requests_through_vllm_router():
         "vllm_model"
     ]
     assert vllm_model_config["session_affinity_header"] == "X-Session-ID"
+    assert vllm_model_config["forward_session_id_in_body"] is forward_session_id_in_body
     assert vllm_model_config["num_workers"] == 4
+
+
+def test_nemo_gym_discovers_router_and_backend_prometheus_targets(tmp_path: Path):
+    router = MagicMock()
+    router_target = target_from_base_url(
+        "http://10.0.0.5:1365",
+        labels={
+            "component": "vllm_router",
+            "model": "test-model",
+            "replica": "router",
+            "routing_policy": "cache_aware",
+            "run_id": "run-7",
+        },
+    )
+    router.prometheus_target.return_value = router_target
+    gym = MagicMock()
+    gym._vllm_router = router
+    gym.cfg = NemoGymConfig(
+        model_name="test-model",
+        base_urls=["http://worker-0:8000/v1", "http://worker-1:8001/v1"],
+        monitoring_artifact_dir=str(tmp_path),
+        prometheus=NemoGymPrometheusConfig(
+            enabled=True,
+            required=True,
+            run_id="run-7",
+            target_lifecycle="dedicated",
+        ),
+        initial_global_config_dict={},
+        vllm_router=VllmRouterConfig(enabled=True, policy="cache_aware"),
+    )
+
+    def ready(target, **_):
+        return PrometheusTargetStatus(target=target, ready=True, error=None)
+
+    with patch(
+        "nemo_rl.environments.nemo_gym.wait_for_prometheus_target",
+        side_effect=ready,
+    ) as wait_for_target:
+        discovery = (
+            NemoGym.__ray_metadata__.modified_class._discover_prometheus_targets(gym)
+        )
+
+    statuses = discovery.target_statuses
+    assert [status.target.address for status in statuses] == [
+        "10.0.0.5:1365",
+        "worker-0:8000",
+        "worker-1:8001",
+    ]
+    assert [status.target.labels["replica"] for status in statuses] == [
+        "router",
+        "0",
+        "1",
+    ]
+    assert all(
+        status.target.labels["routing_policy"] == "cache_aware" for status in statuses
+    )
+    router.wait_until_metrics_ready.assert_called_once_with(timeout=30.0)
+    assert wait_for_target.call_count == 2
+    assert dict(discovery.backend_log_paths) == {
+        "0": str(tmp_path / "backends" / "replica-0.log"),
+        "1": str(tmp_path / "backends" / "replica-1.log"),
+    }
+    backend_evidence = json.loads(
+        (tmp_path / "backends" / "replica-0.log").read_text(encoding="utf-8")
+    )
+    assert backend_evidence["event"] == "prometheus_metrics_readiness"
+    assert backend_evidence["ready"] is True
+    assert backend_evidence["metrics_url"] == "http://worker-0:8000/metrics"
 
 
 @pytest.mark.parametrize("failure_point", ["router.ready", "gym.start"])
@@ -293,6 +499,8 @@ def test_nemo_gym_spinup_stops_vllm_router_on_failure(failure_point):
     gym.cfg = NemoGymConfig(
         model_name="test-model",
         base_urls=["http://worker-0:8000/v1"],
+        monitoring_artifact_dir="/tmp/test-nemo-gym-logs",
+        prometheus=NemoGymPrometheusConfig(),
         initial_global_config_dict={},
         vllm_router=VllmRouterConfig(enabled=True),
     )
@@ -310,8 +518,8 @@ def test_nemo_gym_spinup_stops_vllm_router_on_failure(failure_point):
             "nemo_rl.environments.nemo_gym.VllmRouterProcess",
             return_value=router,
         ),
-        patch("nemo_gym.cli.RunHelper", return_value=run_helper),
-        patch("nemo_gym.cli.GlobalConfigDictParserConfig"),
+        patch("nemo_gym.cli.RunHelper", return_value=run_helper, create=True),
+        patch("nemo_gym.cli.GlobalConfigDictParserConfig", create=True),
         patch("nemo_gym.rollout_collection.RolloutCollectionHelper"),
         patch("nemo_gym.server_utils.BaseServerConfig"),
         patch("nemo_rl.environments.nemo_gym.ray.is_initialized", return_value=True),
@@ -369,7 +577,7 @@ def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
 
 
 @pytest.fixture(scope="function")
-def nemo_gym(nemo_gym_vllm_generation):
+def nemo_gym(nemo_gym_vllm_generation, tmp_path):
     """Create a NeMo-Gym actor for testing."""
 
     yaml_str = r"""example_multi_step_resources_server:
@@ -401,6 +609,8 @@ openai_model:
     config = NemoGymConfig(
         model_name=nemo_gym_vllm_generation.cfg["model_name"],
         base_urls=nemo_gym_vllm_generation.dp_openai_server_base_urls,
+        monitoring_artifact_dir=str(tmp_path / "nemo-gym-monitoring"),
+        prometheus=NemoGymPrometheusConfig(),
         initial_global_config_dict=safe_load(yaml_str),
     )
     env = NemoGym.options(

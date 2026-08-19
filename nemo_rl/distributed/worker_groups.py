@@ -32,7 +32,29 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
 from nemo_rl.utils.venvs import (
     create_local_venv_on_each_node,
+    make_python_runtime_env,
 )
+
+
+_RAY_MANAGED_ENV_VARS = frozenset(
+    {
+        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+        "RAY_CLIENT_MODE",
+        "RAY_JOB_ID",
+        "RAY_LD_PRELOAD",
+        "RAY_RAYLET_PID",
+        "RAY_USAGE_STATS_ENABLED",
+    }
+)
+
+
+def _without_ray_managed_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
+    """Copy an environment without values that each Ray worker must set."""
+    return {
+        key: value
+        for key, value in env_vars.items()
+        if key not in _RAY_MANAGED_ENV_VARS
+    }
 
 
 @dataclass
@@ -361,6 +383,10 @@ class RayWorkerGroup:
         self.name_prefix = name_prefix
         self.sharding_annotations = sharding_annotations
         self.dp_leader_worker_indices: list[int] = []
+        self.master_address: str
+        self.master_port: int
+        self.world_size = 0
+        self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
 
         # If explicit bundle indices are provided, use those
         if bundle_indices_list is None:
@@ -448,10 +474,11 @@ class RayWorkerGroup:
             self.cluster.get_master_address_and_port()
         )
 
-        # Update env_vars with the current environment variables
-        for k, v in os.environ.items():
-            if k not in env_vars:
-                env_vars[k] = v
+        # Copy the driver environment, then apply explicit worker overrides.
+        # Do not mutate the caller's mapping: it may be reused by another actor
+        # tier with a different Python environment.
+        base_env_vars = dict(os.environ)
+        base_env_vars.update(env_vars)
 
         # Get the python environment for the actor
         actor_python_env = get_actor_python_env(
@@ -493,13 +520,17 @@ class RayWorkerGroup:
         available_ports = [port for _, port in addr_port_results]
 
         # Pool one IsolatedWorkerInitializer per unique pg_idx instead of one
-        # per worker. All workers on a node share the same py_executable, so
-        # the initializer only needs that in its runtime_env — per-worker
-        # env_vars are passed through create_worker(). This reduces GCS actor
-        # registrations from N_workers to N_nodes.
+        # per worker. The initializer imports the target worker class, so it
+        # must receive the same Python environment as the workers. Explicitly
+        # pass the driver environment with the target virtualenv activated;
+        # otherwise container-level PYTHONPATH / virtualenv settings can leak
+        # into the custom py_executable before create_worker() is called.
         unique_pg_indices = sorted({pg_idx for pg_idx, _ in bundle_indices_list})
-        initializer_runtime_env = {"py_executable": py_executable}
-        self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
+        initializer_runtime_env = make_python_runtime_env(
+            py_executable,
+            base_env=_without_ray_managed_env_vars(base_env_vars),
+        )
+        self._initializer_pool = {}
         for pg_idx in unique_pg_indices:
             # num_cpus=0 so the initializer doesn't consume a CPU slot — it
             # sits idle after creating workers and only exists for GC lifetime.
@@ -526,7 +557,7 @@ class RayWorkerGroup:
 
             for local_rank, bundle_idx in enumerate(local_bundle_indices):
                 # Set up basic distributed environment variables
-                worker_env_vars = deepcopy(env_vars)
+                worker_env_vars = deepcopy(base_env_vars)
                 worker_env_vars.update(
                     {
                         "RANK": str(global_rank),
@@ -540,12 +571,7 @@ class RayWorkerGroup:
                     }
                 )
                 # Remove Ray-specific environment variables, let the worker itself set them.
-                worker_env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
-                worker_env_vars.pop("RAY_CLIENT_MODE", None)
-                worker_env_vars.pop("RAY_JOB_ID", None)
-                worker_env_vars.pop("RAY_LD_PRELOAD", None)
-                worker_env_vars.pop("RAY_RAYLET_PID", None)
-                worker_env_vars.pop("RAY_USAGE_STATS_ENABLED", None)
+                worker_env_vars = _without_ray_managed_env_vars(worker_env_vars)
 
                 # Only the first worker in each group gets bundle_indices
                 # This ensures only one worker per group is the model owner
@@ -569,15 +595,10 @@ class RayWorkerGroup:
                 )
 
                 # Build the worker's runtime_env with per-worker env_vars
-                runtime_env = {
-                    "env_vars": worker_env_vars,
-                    "py_executable": py_executable,
-                }
-                py_venv = os.path.dirname(
-                    os.path.dirname(py_executable)
-                )  # to remove the "bin/python" suffix
-                runtime_env["env_vars"]["VIRTUAL_ENV"] = py_venv
-                runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_venv
+                runtime_env = make_python_runtime_env(
+                    py_executable,
+                    base_env=worker_env_vars,
+                )
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 

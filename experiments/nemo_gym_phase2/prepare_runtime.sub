@@ -1,0 +1,21 @@
+#!/bin/bash
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --account=coreai_dlalgo_nemorl
+#SBATCH --partition=cpu_short
+#SBATCH --time=04:00:00
+#SBATCH --job-name=p2-runtime-build
+
+set -euo pipefail
+
+: "${PHASE2_REPO:?PHASE2_REPO must be set}"
+: "${PHASE2_CONTAINER:?PHASE2_CONTAINER must be set}"
+: "${PHASE2_MOUNTS:?PHASE2_MOUNTS must be set}"
+
+srun \
+  --no-container-mount-home \
+  --container-image="$PHASE2_CONTAINER" \
+  --container-mounts="$PHASE2_MOUNTS" \
+  --container-workdir="$PHASE2_REPO" \
+  "$PHASE2_REPO/experiments/nemo_gym_phase2/prepare_runtime.sh"

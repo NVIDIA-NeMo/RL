@@ -58,6 +58,16 @@ from nemo_rl.models.generation.openai_server_utils import (
 LOGGER = logging.getLogger(__name__)
 
 
+def _attach_vllm_observability_routes(app: FastAPI, engine_client: Any) -> None:
+    """Expose the same health and Prometheus routes as vLLM's API server."""
+    from vllm.entrypoints.serve.instrumentator.health import router as health_router
+    from vllm.entrypoints.serve.instrumentator.metrics import attach_router
+
+    app.state.engine_client = engine_client
+    app.include_router(health_router)
+    attach_router(app)
+
+
 class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
 ):
@@ -872,6 +882,7 @@ class VllmAsyncGenerationWorkerImpl(
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.setup_api_server(app)
+        _attach_vllm_observability_routes(app, self.llm)
 
         ########################################
         # Server spinup

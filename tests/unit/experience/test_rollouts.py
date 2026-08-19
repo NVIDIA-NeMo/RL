@@ -1591,6 +1591,27 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
             asyncio.run(_consume_rollout())
 
 
+def test_prepare_nemo_gym_rows_stamps_capture_correlation_ids():
+    rows = [
+        {"responses_create_params": {}},
+        {"responses_create_params": {}},
+        {"responses_create_params": {}, "_ng_task_index": 17},
+        {"responses_create_params": {}, "_ng_task_index": 17},
+    ]
+    sampling_params = type("_SamplingParams", (), {"temperature": 0.7, "top_p": 0.9})()
+
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        {"max_new_tokens": 32},
+        sampling_params,
+        num_generations=2,
+    )
+
+    assert [row["_ng_task_index"] for row in rows] == [0, 0, 17, 17]
+    assert [row["_ng_rollout_index"] for row in rows] == [0, 1, 0, 1]
+    assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
+
+
 def test_native_rollout_groups_match_whole_batch(monkeypatch):
     """One native batch can be split without changing data or metric semantics."""
 

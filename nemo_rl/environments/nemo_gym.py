@@ -11,13 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import logging
 import math
 import os
 import subprocess
 import sys
+import time
 from collections import Counter
 from collections.abc import AsyncGenerator
 from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict, cast
 
@@ -42,15 +47,30 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_VLLM_ROUTER_PORT_RANGE_LOW,
     DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_HIGH,
     DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_LOW,
+    _get_free_consecutive_ports_local,
     _get_free_port_local,
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.prometheus import (
+    PROMETHEUS_MANIFEST_FILENAME,
+    NemoGymPrometheusConfig,
+    PrometheusRegistrationError,
+    PrometheusTargetStatus,
+    failed_registration_result,
+    register_prometheus_targets,
+    resolve_run_id,
+    target_from_base_url,
+    wait_for_prometheus_target,
+    write_prometheus_manifest,
+)
 from nemo_rl.environments.vllm_router import VllmRouterConfig, VllmRouterProcess
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+
+logger = logging.getLogger(__name__)
 
 # Kept local (not imported from models.generation) so the gym actor stays free of
 # generation-module imports. Must cover every name resolve_routed_experts_dtype
@@ -107,6 +127,8 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    monitoring_artifact_dir: str
+    prometheus: NemoGymPrometheusConfig
     vllm_router: NotRequired[VllmRouterConfig]
     # Port range for Gym HTTP servers (head server + subprocess servers).
     # Defaults to DEFAULT_GYM_PORT_RANGE_LOW/HIGH (5000-5999) from
@@ -132,6 +154,24 @@ class NemoGymConfig(TypedDict):
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
     ]  # For processor reconstruction inside the actor
+
+
+@dataclass(frozen=True)
+class NemoGymSpinupResult:
+    """Driver-facing metadata produced while the NeMo Gym actor starts."""
+
+    prometheus_target_statuses: tuple[PrometheusTargetStatus, ...]
+    router_log_paths: tuple[str, ...]
+    backend_log_paths: tuple[tuple[str, str], ...]
+    model_call_capture_dir: str | None
+
+
+@dataclass(frozen=True)
+class PrometheusDiscoveryResult:
+    """Targets and per-backend discovery evidence produced by the actor."""
+
+    target_statuses: tuple[PrometheusTargetStatus, ...]
+    backend_log_paths: tuple[tuple[str, str], ...]
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -362,6 +402,7 @@ class NemoGym(EnvironmentInterface):
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
         self._vllm_router: VllmRouterProcess | None = None
+        self._model_call_capture_dirs: list[Path] = []
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
@@ -381,7 +422,7 @@ class NemoGym(EnvironmentInterface):
                 "_attach_multimodal_data_to_user_message before enabling."
             )
 
-    def _spinup(self) -> None:
+    def _spinup(self) -> NemoGymSpinupResult:
         """Start the NeMo-Gym head server and rollout collection helper.
 
         Deferred from __init__ so the actor can be created cheaply (and
@@ -394,22 +435,31 @@ class NemoGym(EnvironmentInterface):
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         policy_base_urls = self.cfg["base_urls"]
+        prometheus_config = self.cfg["prometheus"]
         vllm_router_config = self.cfg.get("vllm_router")
         if vllm_router_config is not None and vllm_router_config.enabled:
             router_port = _get_free_port_local(
                 DEFAULT_VLLM_ROUTER_PORT_RANGE_LOW,
                 DEFAULT_VLLM_ROUTER_PORT_RANGE_HIGH,
             )
-            prometheus_port = _get_free_port_local(
+            # Keep the native exporter on loopback and expose an owned adapter for
+            # every policy. Router 0.1.15 lazily creates several counters, so a
+            # stable proxy is required to distinguish audited zero observations
+            # from missing Prometheus series.
+            native_prometheus_port = _get_free_consecutive_ports_local(
                 DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_LOW,
                 DEFAULT_VLLM_ROUTER_PROMETHEUS_PORT_RANGE_HIGH,
+                consecutive=2,
             )
+            prometheus_port = native_prometheus_port + 1
             self._vllm_router = VllmRouterProcess(
                 worker_base_urls=self.cfg["base_urls"],
                 host=self.node_ip,
                 port=router_port,
                 prometheus_port=prometheus_port,
+                native_prometheus_port=native_prometheus_port,
                 config=vllm_router_config,
+                log_dir=Path(self.cfg["monitoring_artifact_dir"]) / "vllm_router",
             )
             policy_base_urls = [self._vllm_router.openai_base_url]
 
@@ -426,6 +476,25 @@ class NemoGym(EnvironmentInterface):
         initial_global_config_dict = DictConfig(
             self.cfg.get("initial_global_config_dict") or {}
         )
+        model_call_capture_dir: str | None = None
+        if prometheus_config.enabled:
+            configured_capture_dir = initial_global_config_dict.get(
+                "model_call_capture_dir"
+            )
+            capture_dir = (
+                Path(str(configured_capture_dir)).expanduser().resolve()
+                if configured_capture_dir is not None
+                else Path(self.cfg["monitoring_artifact_dir"]) / "model_call_capture"
+            )
+            model_call_capture_dir = str(capture_dir)
+            self._model_call_capture_dirs = [capture_dir]
+            # Reuse Gym's existing correlated model-call capture. Its records
+            # provide request/session timing, token, error, and cache evidence
+            # that Prometheus counters alone cannot reconstruct.
+            initial_global_config_dict["observability_enabled"] = True
+            initial_global_config_dict["model_call_capture_dir"] = (
+                model_call_capture_dir
+            )
         if self._vllm_router is not None:
             initial_global_config_dict = cast(
                 DictConfig,
@@ -435,7 +504,13 @@ class NemoGym(EnvironmentInterface):
                         "policy_model": {
                             "responses_api_models": {
                                 "vllm_model": {
-                                    "session_affinity_header": "X-Session-ID"
+                                    "session_affinity_header": "X-Session-ID",
+                                    # vllm-router 0.1.15 reads cache-aware
+                                    # Chat Completions keys from
+                                    # session_params.session_id, not headers.
+                                    "forward_session_id_in_body": (
+                                        vllm_router_config.policy == "cache_aware"
+                                    ),
                                 }
                             }
                         }
@@ -496,10 +571,16 @@ Depending on your data shape, you may want to change these values."""
         }
 
         self.rh = RunHelper()
+        prometheus_target_statuses: list[PrometheusTargetStatus] = []
+        backend_log_paths: tuple[tuple[str, str], ...] = ()
         try:
             if self._vllm_router is not None:
                 self._vllm_router.start()
                 self._vllm_router.wait_until_ready()
+            if prometheus_config.enabled:
+                discovery = self._discover_prometheus_targets()
+                prometheus_target_statuses = list(discovery.target_statuses)
+                backend_log_paths = discovery.backend_log_paths
             self.rh.start(
                 global_config_dict_parser_config=GlobalConfigDictParserConfig(
                     dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
@@ -521,6 +602,128 @@ Depending on your data shape, you may want to change these values."""
             port=self.head_server_port,
         )
         self.rch = RolloutCollectionHelper()
+        router_log_paths = (
+            tuple(self._vllm_router.log_paths) if self._vllm_router is not None else ()
+        )
+        return NemoGymSpinupResult(
+            prometheus_target_statuses=tuple(prometheus_target_statuses),
+            router_log_paths=router_log_paths,
+            backend_log_paths=backend_log_paths,
+            model_call_capture_dir=model_call_capture_dir,
+        )
+
+    def _discover_prometheus_targets(self) -> PrometheusDiscoveryResult:
+        """Discover and validate Router and per-backend metrics targets."""
+        prometheus_config = self.cfg["prometheus"]
+        run_id = prometheus_config.run_id
+        if run_id is None:
+            raise ValueError("prometheus.run_id must be resolved before actor spinup")
+
+        vllm_router_config = self.cfg.get("vllm_router")
+        routing_policy = (
+            vllm_router_config.policy
+            if vllm_router_config is not None and vllm_router_config.enabled
+            else "direct"
+        )
+        common_labels = {
+            **prometheus_config.labels,
+            "run_id": run_id,
+            "model": self.cfg["model_name"],
+            "routing_policy": routing_policy,
+        }
+        statuses: list[PrometheusTargetStatus] = []
+        backend_log_paths: dict[str, str] = {}
+
+        router = self._vllm_router
+        if router is not None:
+            router_target = router.prometheus_target(
+                labels={
+                    **common_labels,
+                    "component": "vllm_router",
+                    "replica": "router",
+                }
+            )
+            try:
+                router.wait_until_metrics_ready(
+                    timeout=float(prometheus_config.readiness_timeout_s)
+                )
+            except TimeoutError as exc:
+                router_status = PrometheusTargetStatus(
+                    target=router_target,
+                    ready=False,
+                    error=str(exc),
+                )
+            else:
+                router_status = PrometheusTargetStatus(
+                    target=router_target,
+                    ready=True,
+                    error=None,
+                )
+            statuses.append(router_status)
+
+        for replica, base_url in enumerate(self.cfg["base_urls"]):
+            replica_label = str(replica)
+            backend_target = target_from_base_url(
+                base_url,
+                labels={
+                    **common_labels,
+                    "component": "vllm_backend",
+                    "replica": replica_label,
+                },
+            )
+            backend_status = wait_for_prometheus_target(
+                backend_target,
+                timeout_s=float(prometheus_config.readiness_timeout_s),
+                poll_interval_s=1.0,
+            )
+            statuses.append(backend_status)
+            backend_log_path = (
+                Path(self.cfg["monitoring_artifact_dir"])
+                / "backends"
+                / f"replica-{replica_label}.log"
+            )
+            try:
+                backend_log_path.parent.mkdir(parents=True, exist_ok=True)
+                backend_log_path.write_text(
+                    json.dumps(
+                        {
+                            "event": "prometheus_metrics_readiness",
+                            "observed_at": datetime.now(timezone.utc).isoformat(),
+                            "replica": replica_label,
+                            "base_url": base_url,
+                            "metrics_url": backend_target.metrics_url,
+                            "ready": backend_status.ready,
+                            "error": backend_status.error,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                message = (
+                    "Failed to archive backend metrics discovery for replica "
+                    f"{replica_label}: {exc}"
+                )
+                if prometheus_config.required:
+                    raise RuntimeError(message) from exc
+                logger.warning(message)
+            else:
+                backend_log_paths[replica_label] = str(backend_log_path)
+
+        unavailable = [status for status in statuses if not status.ready]
+        if unavailable:
+            details = "; ".join(
+                f"{status.target.address}: {status.error}" for status in unavailable
+            )
+            message = f"Prometheus targets were not ready: {details}"
+            if prometheus_config.required:
+                raise RuntimeError(message)
+            logger.warning(message)
+        return PrometheusDiscoveryResult(
+            target_statuses=tuple(statuses),
+            backend_log_paths=tuple(sorted(backend_log_paths.items())),
+        )
 
     async def run_rollouts(
         self,
@@ -535,6 +738,17 @@ Depending on your data shape, you may want to change these values."""
 
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
+        from nemo_gym.base_responses_api_model import (
+            clear_model_call_captures_for_rollouts,
+            merge_model_call_capture_into_record,
+        )
+        from nemo_gym.global_config import (
+            ATTEMPT_INDEX_KEY_NAME,
+            ROLLOUT_INDEX_KEY_NAME,
+            TASK_INDEX_KEY_NAME,
+        )
+        from nemo_gym.rollout_collection import attach_trajectory_record
+
         maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
 
         timer = Timer()
@@ -544,6 +758,11 @@ Depending on your data shape, you may want to change these values."""
         # examples with base64 data URLs before shipping to vLLM. No-op when
         # examples carry no `input_image` items (text-only case).
         encode_images_in_examples(nemo_gym_examples)
+
+        if self._model_call_capture_dirs:
+            clear_model_call_captures_for_rollouts(
+                nemo_gym_examples, self._model_call_capture_dirs
+            )
 
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
@@ -563,6 +782,21 @@ Depending on your data shape, you may want to change these values."""
                             file=sys.stderr,
                         )
                     raise
+
+            if self._model_call_capture_dirs:
+                for key in (
+                    TASK_INDEX_KEY_NAME,
+                    ROLLOUT_INDEX_KEY_NAME,
+                    ATTEMPT_INDEX_KEY_NAME,
+                ):
+                    if key in nemo_gym_row:
+                        nemo_gym_result[key] = nemo_gym_row[key]
+                merge_model_call_capture_into_record(
+                    nemo_gym_result,
+                    self._model_call_capture_dirs,
+                    include_payloads=True,
+                )
+                attach_trajectory_record(nemo_gym_row, nemo_gym_result)
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
@@ -695,14 +929,31 @@ Depending on your data shape, you may want to change these values."""
             ):
                 continue
 
-            assert (
-                seen_token_ids
-                == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
-Seen token IDs: {seen_token_ids}
-Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
-output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
-"""
+            prompt_token_ids = output_item_dict["prompt_token_ids"]
+            prompt_prefix = prompt_token_ids[: len(seen_token_ids)]
+            if seen_token_ids != prompt_prefix:
+                if len(prompt_token_ids) < len(seen_token_ids):
+                    logger.warning(
+                        "NeMo Gym shortened prior message history; restarting the "
+                        "trainable token sequence from the current turn"
+                    )
+                    nemo_rl_message_log.clear()
+                    seen_token_ids.clear()
+                else:
+                    logger.warning(
+                        "NeMo Gym retokenized a prior message boundary; using the "
+                        "next-turn prompt as the authoritative tokenization"
+                    )
+                    token_offset = 0
+                    for message in nemo_rl_message_log:
+                        message_token_ids = message["token_ids"]
+                        token_count = len(message_token_ids)
+                        message["token_ids"] = torch.tensor(
+                            prompt_prefix[token_offset : token_offset + token_count],
+                            dtype=message_token_ids.dtype,
+                        )
+                        token_offset += token_count
+                    seen_token_ids = list(prompt_prefix)
 
             prompt_token_ids = output_item_dict.pop("prompt_token_ids")
             generation_token_ids = output_item_dict.pop("generation_token_ids")
@@ -867,7 +1118,19 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
         return result
 
-    def shutdown(self) -> None:
+    def shutdown(self, skip_final_scrape_wait: bool = False) -> None:
+        prometheus_config = self.cfg["prometheus"]
+        final_scrape_wait_s = float(prometheus_config.final_scrape_wait_s)
+        if (
+            prometheus_config.enabled
+            and not skip_final_scrape_wait
+            and final_scrape_wait_s > 0
+        ):
+            logger.info(
+                "Waiting %.1f seconds for the final Prometheus scrape",
+                final_scrape_wait_s,
+            )
+            time.sleep(final_scrape_wait_s)
         try:
             self.rh.shutdown()
         finally:
@@ -960,23 +1223,25 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 ########################################
 
 
-def setup_nemo_gym_config(config, tokenizer) -> None:
-    generation_config = config.policy["generation"]
+def setup_nemo_gym_generation_config(generation_config: dict[str, Any]) -> None:
+    """Configure a generation backend for NeMo Gym HTTP rollouts."""
+    backend = generation_config.get("backend")
+    if backend == "vllm":
+        backend_config = generation_config["vllm_cfg"]
+    elif backend == "megatron":
+        backend_config = generation_config["mcore_generation_config"]
+    else:
+        raise ValueError(
+            "NeMo Gym HTTP rollouts require backend=vllm or backend=megatron"
+        )
 
-    # Enable the http server. Requires both async engine and the expose_http_server flag
-    generation_config["vllm_cfg"]["async_engine"] = True
-    generation_config["vllm_cfg"]["expose_http_server"] = True
+    # Gym calls the rollout engine through its OpenAI-compatible HTTP server.
+    backend_config["async_engine"] = True
+    backend_config["expose_http_server"] = True
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
-
-    # For VLM runs, plumb the tokenizer config into the gym env config so the
-    # NemoGym actor can reconstruct the processor inside itself (needed for
-    # multi-turn multimodal postprocessing).
-    if config.policy.get("is_vlm"):
-        env_cfg = config.env.setdefault("nemo_gym", {})
-        env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))
 
 
 def spinup_nemo_gym_actor(
@@ -985,6 +1250,7 @@ def spinup_nemo_gym_actor(
     model_name: str,
     *,
     enable_router_replay: bool,
+    log_dir: str,
     routed_experts_dtype: str,
     use_fastokens: bool,
 ) -> Any:
@@ -1001,6 +1267,7 @@ def spinup_nemo_gym_actor(
         base_urls: Per-DP-rank OpenAI-compatible server base URLs from the generation backend.
         model_name: Served model name the Gym rollouts should target.
         enable_router_replay: Sets require_routed_experts on the NemoGymConfig.
+        log_dir: Driver log directory used for Router logs and monitoring manifests.
         routed_experts_dtype: Dtype name for R3 routed_experts tensors ("int8"/"int16"/"int32"),
             resolved by the caller from the model's expert count.
         use_fastokens: Forwarded from policy.tokenizer.use_fastokens so the rollout actor
@@ -1010,6 +1277,23 @@ def spinup_nemo_gym_actor(
         The spun-up NemoGym Ray actor handle (_spinup already awaited).
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
+    prometheus_dict = nemo_gym_dict.pop("prometheus", None)
+    prometheus_config = (
+        NemoGymPrometheusConfig.model_validate(prometheus_dict)
+        if prometheus_dict is not None
+        else NemoGymPrometheusConfig()
+    )
+    if prometheus_config.enabled:
+        ray_job_id = str(ray.get_runtime_context().get_job_id())
+        prometheus_config = prometheus_config.model_copy(
+            update={
+                "run_id": resolve_run_id(
+                    prometheus_config,
+                    ray_job_id=ray_job_id,
+                )
+            }
+        )
+
     vllm_router_dict = nemo_gym_dict.pop("vllm_router", None)
     vllm_router_config = (
         VllmRouterConfig.model_validate(vllm_router_dict)
@@ -1035,6 +1319,10 @@ def spinup_nemo_gym_actor(
     nemo_gym_cfg = NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
+        monitoring_artifact_dir=str(
+            (Path(log_dir).expanduser().resolve() / "nemo_gym_monitoring")
+        ),
+        prometheus=prometheus_config,
         vllm_router=vllm_router_config,
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
@@ -1067,5 +1355,74 @@ def spinup_nemo_gym_actor(
     }
 
     actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
-    ray.get(actor._spinup.remote())
+    spinup_result = ray.get(actor._spinup.remote())
+    if prometheus_config.enabled:
+        if not isinstance(spinup_result, NemoGymSpinupResult):
+            raise RuntimeError(
+                "NeMo Gym actor did not return Prometheus target metadata"
+            )
+        run_id = prometheus_config.run_id
+        assert run_id is not None
+        registration_error: PrometheusRegistrationError | None = None
+        try:
+            registration = register_prometheus_targets(
+                prometheus_config,
+                list(spinup_result.prometheus_target_statuses),
+            )
+        except PrometheusRegistrationError as exc:
+            registration_error = exc
+            registration = failed_registration_result(prometheus_config, exc)
+            logger.warning("Prometheus target registration failed: %s", exc)
+
+        manifest_path = (
+            Path(nemo_gym_cfg["monitoring_artifact_dir"]) / PROMETHEUS_MANIFEST_FILENAME
+        )
+        try:
+            write_prometheus_manifest(
+                manifest_path,
+                config=prometheus_config,
+                run_id=run_id,
+                target_statuses=list(spinup_result.prometheus_target_statuses),
+                registration=registration,
+                router_log_paths=list(spinup_result.router_log_paths),
+                backend_log_paths=dict(spinup_result.backend_log_paths),
+                model_call_capture_dir=spinup_result.model_call_capture_dir,
+            )
+        except OSError:
+            if prometheus_config.required:
+                _shutdown_actor_after_monitoring_failure(actor)
+                raise
+            logger.exception("Failed to write Prometheus manifest to %s", manifest_path)
+
+        if registration_error is not None and prometheus_config.required:
+            _shutdown_actor_after_monitoring_failure(actor)
+            raise registration_error
+        if registration.status == "registered":
+            initial_scrape_wait_s = float(prometheus_config.initial_scrape_wait_s)
+            if initial_scrape_wait_s > 0:
+                logger.info(
+                    "Waiting %.1f seconds for the initial Prometheus scrape",
+                    initial_scrape_wait_s,
+                )
+                time.sleep(initial_scrape_wait_s)
     return actor
+
+
+def _shutdown_actor_after_monitoring_failure(actor: Any) -> None:
+    """Best-effort cleanup when strict monitoring setup fails on the driver."""
+    try:
+        ray.get(actor.shutdown.remote(True))
+    except ray.exceptions.RayError as exc:
+        logger.warning("NeMo Gym cleanup after monitoring failure also failed: %s", exc)
+
+
+def setup_nemo_gym_config(config, tokenizer) -> None:
+    """Configure a training config for NeMo Gym rollouts."""
+    setup_nemo_gym_generation_config(config.policy["generation"])
+
+    # For VLM runs, plumb the tokenizer config into the gym env config so the
+    # NemoGym actor can reconstruct the processor inside itself (needed for
+    # multi-turn multimodal postprocessing).
+    if config.policy.get("is_vlm"):
+        env_cfg = config.env.setdefault("nemo_gym", {})
+        env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))

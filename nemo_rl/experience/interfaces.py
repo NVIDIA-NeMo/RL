@@ -18,6 +18,7 @@ from typing import Any, Optional
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
+NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 
 

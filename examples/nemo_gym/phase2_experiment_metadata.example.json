@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "engine": {
+    "fresh": true,
+    "launch_id": "replace-with-unique-slurm-job-and-launch-id"
+  },
+  "workload_replay": {
+    "faithful": true,
+    "workload_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "seed": "42",
+    "num_prompts": 64,
+    "num_generations_per_prompt": 4
+  },
+  "warmup": {
+    "completed": true,
+    "workload_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "requests": 32
+  },
+  "software": {
+    "nemo_rl_commit": "0000000000000000000000000000000000000000",
+    "container_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "model": {
+    "name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "revision": "replace-with-model-revision",
+    "tokenizer": "Qwen/Qwen2.5-1.5B-Instruct",
+    "tokenizer_revision": "replace-with-tokenizer-revision",
+    "chat_template_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "topology": {
+    "tensor_parallel_size": 1,
+    "data_parallel_size": 8,
+    "num_nodes": 1,
+    "gpus_per_node": 8
+  },
+  "generation": {
+    "sampling_parameters": {
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "top_k": null
+    },
+    "concurrency": 64,
+    "max_context_tokens": 8192,
+    "max_output_tokens": 256
+  },
+  "backend": {
+    "prefix_caching_enabled": true,
+    "scheduler_parameters": {
+      "scheduling_policy": "fcfs"
+    },
+    "batching_parameters": {
+      "max_num_seqs": 256,
+      "max_num_batched_tokens": 8192
+    }
+  },
+  "router": {
+    "enabled": true,
+    "policy": "cache_aware",
+    "session_affinity_header": "X-Session-ID",
+    "cache_metrics_mode": "debug_log_compat",
+    "cache_threshold": 0.3
+  }
+}

@@ -44,6 +44,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _attach_vllm_observability_routes,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -208,6 +209,26 @@ def test_resolve_enable_prefix_caching_uses_cuda_capability_for_auto(monkeypatch
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
 
     assert _resolve_enable_prefix_caching({}) is False
+
+
+def test_vllm_async_http_server_exposes_health_and_metrics():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    class HealthyEngineClient:
+        async def check_health(self):
+            return None
+
+    app = FastAPI()
+    _attach_vllm_observability_routes(app, HealthyEngineClient())
+
+    with TestClient(app) as client:
+        health = client.get("/health")
+        metrics = client.get("/metrics")
+
+    assert health.status_code == 200
+    assert metrics.status_code == 200
+    assert metrics.headers["content-type"].startswith("text/plain")
 
 
 basic_lora_test_config: LoRAConfig = {

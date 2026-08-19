@@ -309,6 +309,7 @@ def _spinup_gym(master_config: MasterConfig, base_urls: list[str]) -> tuple[Any,
         base_urls=base_urls,
         model_name=generation_config["model_name"],
         enable_router_replay=enable_router_replay,
+        log_dir=master_config.logger["log_dir"],
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
     )

@@ -17,8 +17,10 @@ import shlex
 import shutil
 import subprocess
 import time
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import ray
 from ray.util import placement_group
@@ -28,6 +30,50 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 DEFAULT_VENV_DIR = os.path.join(git_root, "venvs")
 
 logger = logging.getLogger(__name__)
+
+
+def make_python_runtime_env(
+    py_executable: str,
+    *,
+    base_env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build a coherent Ray runtime environment for a Python virtualenv.
+
+    ``py_executable`` is kept verbatim instead of resolving its interpreter
+    symlink. Ray needs the virtualenv entry point so Python discovers the
+    matching ``pyvenv.cfg`` and site-packages. The process environment is
+    copied before the virtualenv markers and ``PATH`` are corrected, so the
+    caller's mapping is never mutated and a container's active virtualenv
+    cannot leak into the actor.
+
+    Args:
+        py_executable: Python entry point to use for the Ray process.
+        base_env: Complete environment to copy. Defaults to ``os.environ``.
+
+    Returns:
+        A Ray ``runtime_env`` with an explicit Python executable and process
+        environment.
+    """
+    runtime_env_vars = dict(os.environ if base_env is None else base_env)
+    python_bin = os.path.dirname(py_executable)
+    python_environment = os.path.dirname(python_bin)
+
+    path_entries = [
+        entry
+        for entry in runtime_env_vars.get("PATH", "").split(os.pathsep)
+        if entry and entry != python_bin
+    ]
+    runtime_env_vars.update(
+        {
+            "PATH": os.pathsep.join([python_bin, *path_entries]),
+            "VIRTUAL_ENV": python_environment,
+            "UV_PROJECT_ENVIRONMENT": python_environment,
+        }
+    )
+    return {
+        "py_executable": py_executable,
+        "env_vars": runtime_env_vars,
+    }
 
 
 @lru_cache(maxsize=None)
@@ -166,6 +212,12 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
         if n.get("Alive", False) and n.get("Resources", {}).get("CPU", 0) > 0
     ]
     num_nodes = len(nodes)
+    venv_dir = os.path.normpath(os.environ.get("NEMO_RL_VENV_DIR", DEFAULT_VENV_DIR))
+    # Ray actors otherwise inherit the raylet's environment. In a container that
+    # can differ from the driver override and silently select an image-baked venv.
+    builder_runtime_env = {
+        "env_vars": {"NEMO_RL_VENV_DIR": venv_dir},
+    }
     # Reserve one CPU on each node using a STRICT_SPREAD placement group
     bundles = [{"CPU": 1} for _ in range(num_nodes)]
     pg = placement_group(bundles=bundles, strategy="STRICT_SPREAD")
@@ -174,9 +226,10 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     force_rebuild = os.environ.get("NRL_FORCE_REBUILD_VENVS", "false").lower() == "true"
     # Launch one actor per node
     actors = [
-        _env_builder.options(placement_group=pg).remote(
-            py_executable, venv_name, i, force_rebuild
-        )
+        _env_builder.options(
+            placement_group=pg,
+            runtime_env=builder_runtime_env,
+        ).remote(py_executable, venv_name, i, force_rebuild)
         for i, _ in enumerate(nodes)
     ]
     # ensure setup runs on each node
@@ -214,12 +267,4 @@ def make_actor_runtime_env(actor_class_fqn: str) -> dict:
     py_exec = get_actor_python_env(actor_class_fqn)
     if py_exec.startswith("uv"):
         py_exec = create_local_venv_on_each_node(py_exec, actor_class_fqn)
-    venv = os.path.dirname(os.path.dirname(py_exec))  # strip bin/python
-    return {
-        "py_executable": py_exec,
-        "env_vars": {
-            **os.environ,
-            "VIRTUAL_ENV": venv,
-            "UV_PROJECT_ENVIRONMENT": venv,
-        },
-    }
+    return make_python_runtime_env(py_exec)

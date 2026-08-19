@@ -132,6 +132,7 @@ policy:
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
     defer_fp32_logits: false
+    moe_per_layer_logging: false
     moe_permute_fusion: true
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
@@ -309,6 +310,27 @@ env:
     # RL (3000-4999) or vLLM (7000-8999). See ray.sub for the full port layout.
     port_range_low: 5000
     port_range_high: 5999
+    # Optional owned Router. Set enabled=true for cache_aware or consistent_hash
+    # Phase 2 arms; false is the direct-engine baseline.
+    vllm_router:
+      enabled: false
+      policy: consistent_hash
+      # vLLM Router 0.1.15 does not increment its declared cache counters.
+      # Use debug_log_compat only with policy=cache_aware when those counters
+      # are required; it adds DEBUG-log parsing overhead.
+      cache_metrics_mode: native
+      cache_threshold: 0.3
+    # Optional strict RL-Insight/Prometheus evidence collection. A formal run
+    # should set enabled=true, required=true, RL_INSIGHT_SERVER_URL, and a stable
+    # NEMO_RL_RUN_ID. See docs/design-docs/nemo-gym-integration.md.
+    prometheus:
+      enabled: false
+      required: false
+      scrape_interval_s: 10
+      initial_scrape_wait_s: 12
+      final_scrape_wait_s: 12
+      # Formal required runs must use a separate RL-Insight instance per run.
+      target_lifecycle: shared
     is_trajectory_collection: false  # Set this to true to enable trajectory collection (no training). You may also want to increase `policy.generation.vllm_cfg.gpu_memory_utilization`
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training

@@ -1,0 +1,20 @@
+server:
+  port: 18080
+  install_dir: ${oc.env:PHASE2_RL_INSIGHT_ROOT}/services
+  runtime_dir: ${oc.env:PHASE2_RL_INSIGHT_ROOT}/runtime
+  data_dir: ${oc.env:PHASE2_RL_INSIGHT_ROOT}/data
+  state_file: ${oc.env:PHASE2_RL_INSIGHT_ROOT}/run/services.json
+
+prometheus:
+  binary_path: ${oc.env:PHASE2_PROMETHEUS_BIN}
+  prometheus_port: 19090
+  retention_time: 1d
+  config_file: ${service_root}/prometheus.yml
+
+# Phase 2 needs the target API and Prometheus only. Disabling the other
+# services reduces moving parts in the per-run dedicated instance.
+tempo:
+  enable: false
+
+grafana:
+  enable: false

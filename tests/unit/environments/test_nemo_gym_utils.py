@@ -24,7 +24,48 @@ from nemo_rl.environments.nemo_gym import (
     _detect_invalid_tool_call_and_malformed_thinking,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    setup_nemo_gym_generation_config,
 )
+
+
+def test_setup_nemo_gym_generation_config_enables_http_rollouts() -> None:
+    generation_config = {
+        "backend": "vllm",
+        "stop_strings": ["stop"],
+        "stop_token_ids": [1],
+        "vllm_cfg": {"async_engine": False, "expose_http_server": False},
+    }
+
+    setup_nemo_gym_generation_config(generation_config)
+
+    assert generation_config["vllm_cfg"]["async_engine"] is True
+    assert generation_config["vllm_cfg"]["expose_http_server"] is True
+    assert generation_config["stop_strings"] is None
+    assert generation_config["stop_token_ids"] is None
+
+
+def test_setup_nemo_gym_generation_config_enables_megatron_http_rollouts() -> None:
+    generation_config = {
+        "backend": "megatron",
+        "stop_strings": ["stop"],
+        "stop_token_ids": [1],
+        "mcore_generation_config": {
+            "async_engine": False,
+            "expose_http_server": False,
+        },
+    }
+
+    setup_nemo_gym_generation_config(generation_config)
+
+    assert generation_config["mcore_generation_config"]["async_engine"] is True
+    assert generation_config["mcore_generation_config"]["expose_http_server"] is True
+    assert generation_config["stop_strings"] is None
+    assert generation_config["stop_token_ids"] is None
+
+
+def test_setup_nemo_gym_generation_config_rejects_unsupported_backend() -> None:
+    with pytest.raises(ValueError, match="backend=vllm or backend=megatron"):
+        setup_nemo_gym_generation_config({"backend": "sglang"})
 
 
 @pytest.mark.parametrize(

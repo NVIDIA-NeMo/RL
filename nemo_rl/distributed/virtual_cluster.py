@@ -70,7 +70,10 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and Megatron.
     MCORE = f"uv run --locked --extra mcore --directory {git_root}"
 
-    # Use NeMo-Gym dependencies
+    # Intentionally use one deterministic NeMo-Gym runtime that includes the
+    # pinned Router even when routing is disabled. This avoids conditional actor
+    # environments at the cost of resolving/installing Router dependencies for
+    # every NeMo-Gym user.
     NEMO_GYM = f"uv run --locked --extra nemo_gym --group nemo_gym_router --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and SGLang.
