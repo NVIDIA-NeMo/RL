@@ -63,6 +63,7 @@ project-includes = [
   "nemo_rl/algorithms/single_controller.py",
   "nemo_rl/algorithms/single_controller_utils/__init__.py",
   "nemo_rl/algorithms/single_controller_utils/config.py",
+  "nemo_rl/algorithms/single_controller_utils/rollout_checkpoint.py",
   "nemo_rl/algorithms/single_controller_utils/setup.py",
   "nemo_rl/algorithms/single_controller_utils/utils.py",
   "nemo_rl/algorithms/utils.py",

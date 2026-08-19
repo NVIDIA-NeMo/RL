@@ -1158,6 +1158,26 @@ class TestGenerateForFinalizationFlow:
         assert buf.commit_calls == []
         assert mgr._env_handles["nemo_gym"].failed == []
 
+    def test_dispatch_uses_pre_reserved_dataloader_lineage(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+        sample = {"prompt": "p", "idx": 0}
+        group_id = mgr.reserve_prompt_group(sample, target_step=5)
+
+        request = _run(
+            mgr.generate_for_finalization(
+                sample,
+                target_step=5,
+                recovery_group_id=group_id,
+            )
+        )
+
+        assert request is not None
+        assert request.group_id == group_id
+        assert mgr.recovery_ledger is not None
+        assert [group.group_id for group in mgr.recovery_ledger.groups()] == [group_id]
+        assert buf._slots == [group_id]
+
     def test_failed_dispatch_aborts_and_fails_gate_rollouts(self):
         buf = _FakeCaptureBuffer()
 

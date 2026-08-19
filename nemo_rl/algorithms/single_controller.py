@@ -37,15 +37,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import os
+import shutil
 import statistics
 import time
+import warnings
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import ray
 import torch
+import yaml
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
@@ -53,10 +58,12 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     DataPlaneCheckpointBarrier,
+    TQReplayGroupMetadata,
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     CheckpointDispatchSampler,
+    TwoPhaseAdmissionSampler,
     create_sampler,
 )
 from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
@@ -64,8 +71,18 @@ from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
+    required_rollout_recovery_capacity,
     validate_sampler_buffer_capacity,
     validate_single_controller_config,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+    ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
+    ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+    RolloutSnapshotManifest,
+    commit_snapshot,
+    ensure_bootstrap_anchor,
+    prepare_snapshot_paths,
+    prune_bootstrap_snapshots,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
@@ -101,6 +118,27 @@ if TYPE_CHECKING:
     from nemo_rl.experience.finalizer_actor import FinalizationRequest
 
 Generation = Union[VllmGeneration, SGLangGeneration]
+
+
+@dataclass(frozen=True)
+class _RolloutWorkItem:
+    """One capacity-owned prompt group awaiting generation."""
+
+    prompt: DatumSpec
+    target_step: Optional[int]
+    group_id: Optional[str]
+
+
+@dataclass(frozen=True)
+class _RolloutCheckpointCut:
+    """Controller sidecars captured with one native TQ snapshot."""
+
+    dataloader_state: dict[str, Any]
+    replay_metadata: Optional[TQReplayMetadataState]
+    rollout_recovery_payload: Optional[bytes]
+    rollout_recovery_group_count: Optional[int]
+    rolled_back_train_group_count: int
+    mutation_version: int
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -248,6 +286,17 @@ class SingleControllerActor:
         # this barrier, so native restore sees canonical rows and controller
         # metadata from the same mutation boundary.
         self._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        # Full trainer checkpoints and lightweight rollout snapshots share a
+        # filesystem namespace and must never publish concurrently.
+        self._checkpoint_save_lock = asyncio.Lock()
+        self._last_rollout_snapshot_mutation_version: Optional[int] = None
+        self._last_missing_rollout_snapshot_anchor: Optional[tuple[int, int]] = None
+        self._bootstrap_fingerprint = actor_args.bootstrap_fingerprint
+        self._rollout_checkpoint_stop_requested = asyncio.Event()
+        # Narrow unsafe window after optimizer apply and before SC publishes
+        # the matching trainer counters. Streaming accumulation itself remains
+        # snapshot-safe and is represented by the ledger's open train step.
+        self._optimizer_commit_in_progress = False
         if self._buffer is not None:
             self._buffer.set_data_plane_checkpoint_barrier(
                 self._data_plane_checkpoint_barrier
@@ -332,9 +381,16 @@ class SingleControllerActor:
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
         watchdog_task = asyncio.create_task(self._watchdog_pump())
+        rollout_checkpoint_task = (
+            asyncio.create_task(self._rollout_checkpoint_pump())
+            if self._master_config.rollout_checkpointing.interval_s is not None
+            else None
+        )
         tasks = {rollout_task, train_task, watchdog_task}
         if recovery_task is not None:
             tasks.add(recovery_task)
+        if rollout_checkpoint_task is not None:
+            tasks.add(rollout_checkpoint_task)
         try:
             pending = set(tasks)
             while pending:
@@ -353,6 +409,15 @@ class SingleControllerActor:
                         rollout_task.cancel()
                         await recovery_task
                     break
+                if (
+                    rollout_checkpoint_task is not None
+                    and rollout_checkpoint_task in done
+                ):
+                    if self._rollout_checkpoint_stop_requested.is_set():
+                        break
+                    raise RuntimeError(
+                        "rollout checkpoint pump exited without requesting stop"
+                    )
         finally:
             for task in tasks:
                 task.cancel()
@@ -640,6 +705,24 @@ class SingleControllerActor:
                 f"unfinished={len(unfinished)}, "
                 f"capacity={self._async_cfg.max_buffered_rollouts}"
             )
+        restored_group_count = restored_replay_groups + len(unfinished)
+        min_streaming_groups = self._async_cfg.min_groups_for_streaming_train
+        free_capacity = self._async_cfg.max_buffered_rollouts - restored_group_count
+        if (
+            0 < restored_group_count < min_streaming_groups
+            and free_capacity < self._master_config.grpo.num_prompts_per_step
+        ):
+            required_capacity = required_rollout_recovery_capacity(
+                num_prompts_per_step=(
+                    self._master_config.grpo.num_prompts_per_step
+                ),
+                min_groups_for_streaming_train=min_streaming_groups,
+            )
+            raise RuntimeError(
+                "restored rollout state cannot fill a streaming batch with the "
+                "configured capacity; increase async_rl.max_buffered_rollouts "
+                f"to at least {required_capacity}"
+            )
 
         # Reclaim all saved permits before fresh dataloader work can run. The
         # capacity check above makes these acquisitions immediate and prevents
@@ -680,6 +763,13 @@ class SingleControllerActor:
         buffer_permit_owned = True
         rollout_slot_owned = False
         counted_inflight = False
+        ledger = self._rollout_recovery_ledger
+        assert ledger is not None
+        recovery_record = ledger.get_group(group.group_id)
+        reused_siblings = len(recovery_record.sealed_generation_indices)
+        redispatched_siblings = (
+            recovery_record.expected_generations - reused_siblings
+        )
         try:
             await self._rollout_slots.acquire()
             rollout_slot_owned = True
@@ -702,6 +792,12 @@ class SingleControllerActor:
             if request is None:
                 return False
             await self._finalize_with_actor(request)
+            print(
+                "rollout recovery finalized group: "
+                f"group={group.group_id} reused={reused_siblings} "
+                f"redispatched={redispatched_siblings}",
+                flush=True,
+            )
             buffer_permit_owned = False
             return True
         finally:
@@ -891,6 +987,277 @@ class SingleControllerActor:
             f"{checkpoint_dir} ({time.monotonic() - started:.2f}s)",
             flush=True,
         )
+
+    async def _capture_rollout_checkpoint_cut(
+        self,
+        checkpoint_path: PathLike,
+        *,
+        periodic: bool,
+    ) -> _RolloutCheckpointCut:
+        """Save TQ and capture matching controller sidecars under the barrier.
+
+        For a periodic cut, groups already claimed by an open optimizer step
+        are added back to the persisted replay index and rolled back to
+        ``FINALIZED`` in the persisted lineage. The live ledger and trainer are
+        not modified; only restart semantics discard those uncommitted gradients.
+        """
+        dataloader_state = self._dataloader.state_dict()
+        replay_metadata: Optional[TQReplayMetadataState] = None
+        rollout_recovery_payload: Optional[bytes] = None
+        rollout_recovery_digest: Optional[str] = None
+        rollout_recovery_group_count: Optional[int] = None
+        rollout_recovery_state: Optional[dict[str, Any]] = None
+        ledger = self._rollout_recovery_ledger
+
+        additional_groups: list[TQReplayGroupMetadata] = []
+        if ledger is not None:
+            if periodic:
+                additional_groups = ledger.training_owned_replay_groups()
+                rollout_recovery_state = ledger.periodic_snapshot_state_dict()
+            else:
+                ledger.assert_full_step_checkpoint_safe()
+                rollout_recovery_state = ledger.state_dict()
+            payload_buffer = io.BytesIO()
+            torch.save(rollout_recovery_state, payload_buffer)
+            rollout_recovery_payload = payload_buffer.getvalue()
+            rollout_recovery_digest = hashlib.sha256(
+                rollout_recovery_payload
+            ).hexdigest()
+            rollout_recovery_group_count = len(rollout_recovery_state["groups"])
+
+        if self._sampler.supports_buffer_checkpoint:
+            replay_metadata = self._buffer.metadata_state_dict(
+                saved_capacity=self._async_cfg.max_buffered_rollouts,
+                additional_groups=additional_groups,
+            )
+        if replay_metadata is not None and rollout_recovery_state is not None:
+            replay_group_ids = {
+                group["group_id"] for group in replay_metadata["groups"]
+            }
+            finalized_group_ids = {
+                group["group_id"]
+                for group in rollout_recovery_state["groups"]
+                if group["status"] == PromptGroupStatus.FINALIZED.value
+            }
+            if replay_group_ids != finalized_group_ids:
+                raise RuntimeError(
+                    "rollout snapshot replay metadata does not match finalized "
+                    "lineage ownership: "
+                    f"replay_only={sorted(replay_group_ids - finalized_group_ids)!r}, "
+                    f"lineage_only={sorted(finalized_group_ids - replay_group_ids)!r}"
+                )
+        if replay_metadata is not None:
+            await self._validate_replay_inventory(replay_metadata)
+        if rollout_recovery_payload is not None:
+            await self._validate_rollout_recovery_inventory(
+                clear_unreferenced=False
+            )
+        await self._save_data_plane_checkpoint(
+            checkpoint_path,
+            replay_metadata=replay_metadata,
+            rollout_recovery_payload_sha256=rollout_recovery_digest,
+            rollout_recovery_group_count=rollout_recovery_group_count,
+        )
+        return _RolloutCheckpointCut(
+            dataloader_state=dataloader_state,
+            replay_metadata=replay_metadata,
+            rollout_recovery_payload=rollout_recovery_payload,
+            rollout_recovery_group_count=rollout_recovery_group_count,
+            rolled_back_train_group_count=len(additional_groups),
+            mutation_version=self._data_plane_checkpoint_barrier.mutation_version,
+        )
+
+    async def _write_rollout_checkpoint_sidecars(
+        self,
+        checkpoint_path: PathLike,
+        cut: _RolloutCheckpointCut,
+        *,
+        include_config: bool,
+    ) -> None:
+        """Write controller files that belong to a captured native TQ cut."""
+        checkpoint_path = Path(checkpoint_path)
+        await asyncio.to_thread(
+            torch.save,
+            cut.dataloader_state,
+            checkpoint_path / "train_dataloader.pt",
+        )
+        if cut.replay_metadata is not None:
+            await asyncio.to_thread(
+                torch.save,
+                cut.replay_metadata,
+                checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME,
+            )
+        if cut.rollout_recovery_payload is not None:
+            await asyncio.to_thread(
+                (checkpoint_path / ROLLOUT_RECOVERY_STATE_FILENAME).write_bytes,
+                cut.rollout_recovery_payload,
+            )
+        if include_config:
+            dumped_config = self._master_config.model_dump(mode="json")
+
+            def _write_config() -> None:
+                with (checkpoint_path / "config.yaml").open("w") as config_file:
+                    yaml.safe_dump(dumped_config, config_file)
+
+            await asyncio.to_thread(_write_config)
+
+    async def _save_rollout_checkpoint(self, *, force: bool = False) -> bool:
+        """Publish one lightweight snapshot anchored to durable trainer state."""
+        async with self._checkpoint_save_lock:
+            if self._optimizer_commit_in_progress:
+                return False
+            if (
+                not force
+                and self._last_rollout_snapshot_mutation_version
+                == self._data_plane_checkpoint_barrier.mutation_version
+            ):
+                return False
+
+            await asyncio.to_thread(self._checkpointer.finalize_pending)
+            if self._train_steps == 0:
+                if self._trainer_version != 0:
+                    raise RuntimeError(
+                        "bootstrap rollout snapshot requires trainer version zero"
+                    )
+                if self._bootstrap_fingerprint is None:
+                    raise RuntimeError(
+                        "rollout snapshotting requires a bootstrap fingerprint"
+                    )
+                anchor = await asyncio.to_thread(
+                    ensure_bootstrap_anchor,
+                    self._checkpointer.checkpoint_dir,
+                    fingerprint=self._bootstrap_fingerprint,
+                )
+                snapshot_fingerprint = self._bootstrap_fingerprint
+            else:
+                if self._trainer_version != self._train_steps:
+                    raise RuntimeError(
+                        "rollout snapshot trainer identity is ambiguous: "
+                        f"step={self._train_steps}, "
+                        f"trainer_version={self._trainer_version}"
+                    )
+                anchor = self._checkpointer.checkpoint_dir / f"step_{self._train_steps}"
+                if not anchor.is_dir():
+                    skip_key = (self._train_steps, self._trainer_version)
+                    if self._last_missing_rollout_snapshot_anchor != skip_key:
+                        print(
+                            "rollout checkpoint skipped: matching trainer "
+                            f"checkpoint is not durable yet: {anchor}",
+                            flush=True,
+                        )
+                        self._last_missing_rollout_snapshot_anchor = skip_key
+                    return False
+                try:
+                    await asyncio.to_thread(
+                        prune_bootstrap_snapshots,
+                        self._checkpointer.checkpoint_dir,
+                        durable_trainer_checkpoint=anchor,
+                    )
+                except OSError as error:
+                    warnings.warn(
+                        "Failed to prune obsolete bootstrap rollout snapshots: "
+                        f"{type(error).__name__}: {error}",
+                        stacklevel=2,
+                    )
+                snapshot_fingerprint = None
+
+            expected_train_step = self._train_steps
+            expected_trainer_version = self._trainer_version
+            tmp_path, final_path, _ = await asyncio.to_thread(
+                prepare_snapshot_paths, anchor
+            )
+            try:
+                async with self._data_plane_checkpoint_barrier.checkpoint():
+                    if (
+                        self._optimizer_commit_in_progress
+                        or self._train_steps != expected_train_step
+                        or self._trainer_version != expected_trainer_version
+                    ):
+                        await asyncio.to_thread(shutil.rmtree, tmp_path)
+                        return False
+                    snapshot_epoch = self._current_epoch
+                    cut = await self._capture_rollout_checkpoint_cut(
+                        tmp_path,
+                        periodic=True,
+                    )
+
+                await self._write_rollout_checkpoint_sidecars(
+                    tmp_path,
+                    cut,
+                    include_config=True,
+                )
+                manifest = RolloutSnapshotManifest(
+                    schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+                    base_train_step=expected_train_step,
+                    trainer_version=expected_trainer_version,
+                    current_epoch=snapshot_epoch,
+                    mutation_version=cut.mutation_version,
+                    rolled_back_train_group_count=(
+                        cut.rolled_back_train_group_count
+                    ),
+                    bootstrap_fingerprint=snapshot_fingerprint,
+                )
+                await asyncio.to_thread(
+                    (tmp_path / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text,
+                    json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n",
+                )
+                await asyncio.to_thread(
+                    commit_snapshot,
+                    tmp_path,
+                    final_path,
+                    keep_latest_k=(
+                        self._master_config.rollout_checkpointing.keep_latest_k
+                    ),
+                )
+            except BaseException:
+                if tmp_path.exists():
+                    await asyncio.to_thread(shutil.rmtree, tmp_path)
+                raise
+
+            self._last_rollout_snapshot_mutation_version = cut.mutation_version
+            self._last_missing_rollout_snapshot_anchor = None
+            print(
+                "rollout checkpoint save completed: "
+                f"{final_path} (step={expected_train_step}, "
+                f"trainer_version={expected_trainer_version}, "
+                f"ledger_groups={cut.rollout_recovery_group_count or 0})",
+                flush=True,
+            )
+            return True
+
+    async def _rollout_checkpoint_pump(self) -> None:
+        """Persist rollout state periodically, including during streamed train."""
+        interval_s = self._master_config.rollout_checkpointing.interval_s
+        if interval_s is None:
+            raise RuntimeError("rollout checkpoint pump started while disabled")
+        while True:
+            await asyncio.sleep(interval_s)
+            deadline_due = self._train_steps == 0 and self._timeout.would_save()
+            try:
+                saved = await self._save_rollout_checkpoint(force=deadline_due)
+            except Exception as error:
+                if deadline_due:
+                    raise RuntimeError(
+                        "failed to save the required pre-step rollout checkpoint"
+                    ) from error
+                warnings.warn(
+                    "Periodic rollout checkpoint failed; retaining the previous "
+                    f"committed snapshot: {type(error).__name__}: {error}",
+                    stacklevel=2,
+                )
+                continue
+            if deadline_due:
+                if not saved:
+                    continue
+                if not self._timeout.check_save():
+                    continue
+                print(
+                    "Checkpoint deadline reached before the first train step; "
+                    "stopping after a durable rollout snapshot",
+                    flush=True,
+                )
+                self._rollout_checkpoint_stop_requested.set()
+                return
 
     @staticmethod
     def _request_staging_keys(request: "FinalizationRequest") -> list[str]:
@@ -1188,6 +1555,7 @@ class SingleControllerActor:
         async def _dispatch_one_prompt(
             prompt: DatumSpec,
             target_step: Optional[int],
+            recovery_group_id: Optional[str],
             task_started_event: asyncio.Event,
             dispatch_admitted_event: asyncio.Event,
         ) -> None:
@@ -1205,10 +1573,15 @@ class SingleControllerActor:
                 self._inflight_rollouts += 1
                 counted_inflight = True
                 if self._finalizer_actors:
+                    finalization_kwargs: dict[str, Any] = {
+                        "target_step": target_step,
+                        "inflight_registry": self._inflight_by_group_id,
+                    }
+                    if recovery_group_id is not None:
+                        finalization_kwargs["recovery_group_id"] = recovery_group_id
                     request = await self._rollout_manager.generate_for_finalization(
                         prompt,
-                        target_step=target_step,
-                        inflight_registry=self._inflight_by_group_id,
+                        **finalization_kwargs,
                     )
                     if request is None:
                         outcome = RolloutOutcome.SKIPPED
@@ -1267,60 +1640,171 @@ class SingleControllerActor:
                 self._buffer_capacity.release()
                 dispatch_admitted_event.set()
 
+        def _release_capacity(permits: int) -> None:
+            for _ in range(permits):
+                self._buffer_capacity.release()
+
+        async def _acquire_capacity(permits: int) -> None:
+            acquired = 0
+            try:
+                for _ in range(permits):
+                    await self._buffer_capacity.acquire()
+                    acquired += 1
+            except BaseException:
+                _release_capacity(acquired)
+                raise
+
         max_epochs = self._master_config.grpo.max_num_epochs
+        token_capture_config = getattr(self._master_config, "token_capture", None)
+        token_capture_enabled = bool(
+            token_capture_config is not None and token_capture_config.enabled
+        )
+        if token_capture_enabled and not isinstance(
+            self._sampler, TwoPhaseAdmissionSampler
+        ):
+            raise RuntimeError(
+                f"token-capture sampler {type(self._sampler).__name__} must "
+                "support two-phase admission"
+            )
+
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
-                for prompt_batch in self._dataloader:
-                    target_step = await self._sampler.admit(
-                        trainer_version_fn=lambda: self._trainer_version
-                    )
-
-                    num_prompts = prompt_batch.size
-                    if target_step is not None:
-                        buffered = self._buffer.count_for_target_step(target_step)
-                        if buffered:
-                            num_prompts = max(0, prompt_batch.size - buffered)
-                            print(
-                                f"  target_step={target_step}: {buffered} group(s) "
-                                f"already buffered; dispatching {num_prompts} of "
-                                f"{prompt_batch.size} prompt(s), dropping the rest",
-                                flush=True,
-                            )
-
-                    for prompt_idx in range(num_prompts):
-                        prompt: DatumSpec = {  # type: ignore
-                            k: v[prompt_idx] for k, v in prompt_batch.items()
-                        }
-
-                        # check if buffer is full
-                        await self._buffer_capacity.acquire()
-
-                        task_started_event = asyncio.Event()
-                        dispatch_admitted_event = asyncio.Event()
-                        # dispatch rollout
-                        task = rollout_tasks.create_task(
-                            _dispatch_one_prompt(
-                                prompt,
-                                target_step,
-                                task_started_event,
-                                dispatch_admitted_event,
-                            )
+                dataloader_iterator = iter(self._dataloader)
+                while True:
+                    preacquired_capacity = 0
+                    if token_capture_enabled:
+                        await self._sampler.wait_until_admissible(
+                            trainer_version_fn=lambda: self._trainer_version
                         )
-                        self._dispatched_rollouts.add(task)
-                        task.add_done_callback(self._dispatched_rollouts.discard)
-                        task.add_done_callback(
-                            partial(
-                                _release_buffer_if_task_not_started,
-                                task_started_event=task_started_event,
-                                dispatch_admitted_event=dispatch_admitted_event,
-                            )
+                        configured_batch_size = (
+                            self._master_config.grpo.num_prompts_per_step
                         )
-                        # Keep dataloader production bounded by actual worker
-                        # admission instead of filling the buffer with tasks
-                        # queued behind recovery.
-                        await dispatch_admitted_event.wait()
+                        await _acquire_capacity(configured_batch_size)
+                        preacquired_capacity = configured_batch_size
+                        end_of_epoch = False
+                        try:
+                            # The cursor and all durable prompt reservations move
+                            # together. A snapshot therefore cannot skip a batch
+                            # whose lineage was not yet made recoverable.
+                            async with self._data_plane_checkpoint_barrier.mutation():
+                                try:
+                                    prompt_batch = next(dataloader_iterator)
+                                except StopIteration:
+                                    end_of_epoch = True
+                                if end_of_epoch:
+                                    # Keep the outer epoch counter in the same
+                                    # checkpoint cut as the exhausted loader
+                                    # cursor. Otherwise a snapshot can observe
+                                    # end-of-epoch data with the previous epoch
+                                    # number and replay the dataset on restart.
+                                    self._current_epoch += 1
+                                else:
+                                    if prompt_batch.size > preacquired_capacity:
+                                        raise RuntimeError(
+                                            "dataloader batch exceeds reserved "
+                                            "rollout capacity"
+                                        )
+                                    target_step = self._sampler.commit_admission(
+                                        trainer_version=self._trainer_version
+                                    )
+                                    num_prompts = prompt_batch.size
+                                    if target_step is not None:
+                                        buffered = self._buffer.count_for_target_step(
+                                            target_step
+                                        )
+                                        if buffered:
+                                            num_prompts = max(
+                                                0, prompt_batch.size - buffered
+                                            )
+                                    unused_capacity = (
+                                        preacquired_capacity - num_prompts
+                                    )
+                                    _release_capacity(unused_capacity)
+                                    preacquired_capacity = num_prompts
+                                    rollout_work_items = []
+                                    for prompt_idx in range(num_prompts):
+                                        prompt: DatumSpec = {  # type: ignore
+                                            key: value[prompt_idx]
+                                            for key, value in prompt_batch.items()
+                                        }
+                                        group_id = (
+                                            self._rollout_manager.reserve_prompt_group(
+                                                prompt,
+                                                target_step=target_step,
+                                            )
+                                        )
+                                        rollout_work_items.append(
+                                            _RolloutWorkItem(
+                                                prompt=prompt,
+                                                target_step=target_step,
+                                                group_id=group_id,
+                                            )
+                                        )
+                        except BaseException:
+                            _release_capacity(preacquired_capacity)
+                            raise
+                        if end_of_epoch:
+                            _release_capacity(preacquired_capacity)
+                            break
+                    else:
+                        try:
+                            prompt_batch = next(dataloader_iterator)
+                        except StopIteration:
+                            self._current_epoch += 1
+                            break
+                        target_step = await self._sampler.admit(
+                            trainer_version_fn=lambda: self._trainer_version
+                        )
+                        rollout_work_items = []
+                        for prompt_idx in range(prompt_batch.size):
+                            prompt = {  # type: ignore
+                                key: value[prompt_idx]
+                                for key, value in prompt_batch.items()
+                            }
+                            rollout_work_items.append(
+                                _RolloutWorkItem(prompt, target_step, None)
+                            )
 
-                self._current_epoch += 1
+                    pending_preacquired_capacity = preacquired_capacity
+                    try:
+                        for work_item in rollout_work_items:
+                            capacity_acquired_here = False
+                            if not token_capture_enabled:
+                                await self._buffer_capacity.acquire()
+                                capacity_acquired_here = True
+                            task_started_event = asyncio.Event()
+                            dispatch_admitted_event = asyncio.Event()
+                            try:
+                                task = rollout_tasks.create_task(
+                                    _dispatch_one_prompt(
+                                        work_item.prompt,
+                                        work_item.target_step,
+                                        work_item.group_id,
+                                        task_started_event,
+                                        dispatch_admitted_event,
+                                    )
+                                )
+                            except BaseException:
+                                if capacity_acquired_here:
+                                    self._buffer_capacity.release()
+                                elif token_capture_enabled:
+                                    pending_preacquired_capacity -= 1
+                                    self._buffer_capacity.release()
+                                raise
+                            if token_capture_enabled:
+                                pending_preacquired_capacity -= 1
+                            self._dispatched_rollouts.add(task)
+                            task.add_done_callback(self._dispatched_rollouts.discard)
+                            task.add_done_callback(
+                                partial(
+                                    _release_buffer_if_task_not_started,
+                                    task_started_event=task_started_event,
+                                    dispatch_admitted_event=dispatch_admitted_event,
+                                )
+                            )
+                            await dispatch_admitted_event.wait()
+                    finally:
+                        _release_capacity(pending_preacquired_capacity)
 
         # Drain in-flight so return implies "all rollouts in TQ".
         inflight = list(self._dispatched_rollouts)
@@ -1530,6 +2014,7 @@ class SingleControllerActor:
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
 
+                self._optimizer_commit_in_progress = True
                 async with self._data_plane_checkpoint_barrier.mutation():
                     if self._rollout_recovery_ledger is not None:
                         self._rollout_recovery_ledger.mark_train_step_applied(
@@ -1558,6 +2043,7 @@ class SingleControllerActor:
 
                 self._trainer_version += 1
                 self._train_steps += 1
+                self._optimizer_commit_in_progress = False
                 with self._timer.time("weight_sync"):
                     calibration_data = (
                         BatchedDataDict.from_batches(calibration_batches)
@@ -1798,6 +2284,11 @@ class SingleControllerActor:
         return len(stale_tasks)
 
     async def _save_checkpoint(self, step_metrics: dict[str, Any]) -> None:
+        """Serialize full and rollout-only checkpoint publication."""
+        async with self._checkpoint_save_lock:
+            await self._save_checkpoint_locked(step_metrics)
+
+    async def _save_checkpoint_locked(self, step_metrics: dict[str, Any]) -> None:
         """Write a full checkpoint for the just-finished train step.
 
         Everything except the (possibly async) policy weight write must be
@@ -1811,9 +2302,7 @@ class SingleControllerActor:
         save_state.consumed_samples = self._consumed_samples
         save_state.total_valid_tokens = self._total_valid_tokens
         save_state.sampler_name = self._async_cfg.sampler.name
-        # Snapshot before any await so it can't interleave with
-        # _rollout_pump iterating this same dataloader.
-        dataloader_state = self._dataloader.state_dict()
+        dataloader_state: Optional[dict[str, Any]] = None
         # SC has no validation loop yet; drop the default sentinel instead of
         # persisting a bogus val_reward.
         if hasattr(save_state, "val_reward"):
@@ -1833,28 +2322,7 @@ class SingleControllerActor:
         await asyncio.to_thread(self._checkpointer.finalize_pending)
 
         print(f"Saving checkpoint for step {self._train_steps}...")
-        checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
-            self._checkpointer.init_tmp_checkpoint,
-            self._train_steps,
-            vars(save_state),
-            self._master_config,
-        )
-        # With async_save this returns after D2H staging; disk writes finish
-        # in the background.
-        await asyncio.to_thread(
-            self._trainer.save_checkpoint,
-            weights_path=os.path.join(checkpoint_path, "policy", "weights"),
-            optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer")
-            if self._checkpointer.save_optimizer
-            else None,
-            tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
-            checkpointing_cfg=self._master_config.checkpointing,
-        )
-        await asyncio.to_thread(
-            torch.save,
-            dataloader_state,
-            os.path.join(checkpoint_path, "train_dataloader.pt"),
-        )
+        checkpoint_path: PathLike
         replay_metadata: Optional[TQReplayMetadataState] = None
         rollout_recovery_payload: Optional[bytes] = None
         rollout_recovery_digest: Optional[str] = None
@@ -1865,6 +2333,17 @@ class SingleControllerActor:
             # wait at commit, so TQ and the metadata sidecar describe exactly
             # the same set of training-ready groups.
             async with self._data_plane_checkpoint_barrier.checkpoint():
+                # Dataloader advancement and prompt-lineage reservation use the
+                # mutation side of this barrier, so this cursor belongs to the
+                # same exact cut as replay metadata, lineage, and native TQ.
+                save_state.current_epoch = self._current_epoch
+                checkpoint_path = await asyncio.to_thread(
+                    self._checkpointer.init_tmp_checkpoint,
+                    self._train_steps,
+                    vars(save_state),
+                    self._master_config,
+                )
+                dataloader_state = self._dataloader.state_dict()
                 if self._sampler.supports_buffer_checkpoint:
                     replay_metadata = self._buffer.metadata_state_dict(
                         saved_capacity=self._async_cfg.max_buffered_rollouts
@@ -1891,6 +2370,35 @@ class SingleControllerActor:
                     rollout_recovery_payload_sha256=rollout_recovery_digest,
                     rollout_recovery_group_count=rollout_recovery_group_count,
                 )
+                self._last_rollout_snapshot_mutation_version = (
+                    self._data_plane_checkpoint_barrier.mutation_version
+                )
+        else:
+            save_state.current_epoch = self._current_epoch
+            checkpoint_path = await asyncio.to_thread(
+                self._checkpointer.init_tmp_checkpoint,
+                self._train_steps,
+                vars(save_state),
+                self._master_config,
+            )
+            dataloader_state = self._dataloader.state_dict()
+        # With async_save this returns after D2H staging; disk writes finish
+        # in the background.
+        await asyncio.to_thread(
+            self._trainer.save_checkpoint,
+            weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+            optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer")
+            if self._checkpointer.save_optimizer
+            else None,
+            tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
+            checkpointing_cfg=self._master_config.checkpointing,
+        )
+        assert dataloader_state is not None
+        await asyncio.to_thread(
+            torch.save,
+            dataloader_state,
+            os.path.join(checkpoint_path, "train_dataloader.pt"),
+        )
         if replay_metadata is not None:
             await asyncio.to_thread(
                 torch.save,
