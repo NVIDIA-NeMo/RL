@@ -176,6 +176,7 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
     )
     ctrl._rollout_manager = _OutcomeRolloutManager()
+    ctrl._finalizer_actors = []
     ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
     ctrl._dataloader = [
         BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
@@ -273,6 +274,7 @@ def test_rollout_pump_tops_up_restored_target_step(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
     )
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
+    ctrl._finalizer_actors = []
     # lookahead=0 keeps the single batch on target_step 0.
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
     ctrl._dataloader = [
