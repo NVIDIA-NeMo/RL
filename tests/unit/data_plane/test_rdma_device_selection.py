@@ -127,6 +127,44 @@ def test_keeps_every_rail_when_numa_info_is_unavailable(fake_fabric):
     assert tq_adapter.rdma_devices() == "mlx5_0,mlx5_1,mlx5_2"
 
 
+def test_infiniband_is_never_deduped(fake_fabric):
+    """Dedup is a RoCE-only fallback, never applied to IB.
+
+    This PR's own intent is every IB rail in use (see the commit titled
+    "use all IB rails and reuse RDMA-registered buffers"), and the
+    cross-rail-ambiguity failure the dedup guards against has only been
+    measured on RoCE. Two same-domain IB rails must both survive even
+    though the equivalent RoCE layout in the test above collapses to one.
+    """
+    fake_fabric(
+        {"mlx5_0": "InfiniBand", "mlx5_1": "InfiniBand"},
+        numa={"mlx5_0": "0", "mlx5_1": "0"},
+    )
+    assert tq_adapter.rdma_devices() == "mlx5_0,mlx5_1"
+
+
+def test_dedupe_can_be_disabled(fake_fabric):
+    """MooncakeCpuConfig.dedupe_rails_per_numa_domain=False escape hatch."""
+    fake_fabric(
+        {"mlx5_0": "Ethernet", "mlx5_1": "Ethernet"},
+        numa={"mlx5_0": "0", "mlx5_1": "0"},
+    )
+    assert tq_adapter.rdma_devices(dedupe_per_numa_domain=False) == "mlx5_0,mlx5_1"
+
+
+def test_mc_mooncake_device_override_bypasses_dedupe(fake_fabric, monkeypatch):
+    """An explicit override is verbatim regardless of dedupe — same guarantee
+    as test_env_override_wins_verbatim, pinned separately because dedupe
+    logic runs after the override check and must never second-guess it.
+    """
+    fake_fabric(
+        {"mlx5_0": "Ethernet", "mlx5_1": "Ethernet"},
+        numa={"mlx5_0": "0", "mlx5_1": "0"},
+    )
+    monkeypatch.setenv("MC_MOONCAKE_DEVICE", "mlx5_0,mlx5_1")
+    assert tq_adapter.rdma_devices() == "mlx5_0,mlx5_1"
+
+
 def test_empty_without_verbs_node(fake_fabric):
     """Containers see /sys without /dev/infiniband; mooncake fails late there."""
     fake_fabric(_MIXED, uverbs=False)
