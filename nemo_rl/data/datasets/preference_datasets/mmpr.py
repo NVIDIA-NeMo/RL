@@ -28,7 +28,13 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.interfaces import TaskDataPreProcessFnCallable
 
 _IMAGE_PLACEHOLDER_RE = re.compile(r"<image(?:_\d+)?>")
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
+
+
+def _path_signature(path: Path) -> str:
+    """Return a cheap source signature suitable for cache invalidation."""
+    stat = path.stat()
+    return f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
 
 
 def format_mmpr_preference_dataset(example: dict[str, Any]) -> dict[str, Any]:
@@ -37,6 +43,13 @@ def format_mmpr_preference_dataset(example: dict[str, Any]) -> dict[str, Any]:
     if isinstance(images, str):
         images = [images]
     question = str(example["question"])
+    placeholder_count = len(_IMAGE_PLACEHOLDER_RE.findall(question))
+    if placeholder_count > 0 and placeholder_count != len(images):
+        raise ValueError(
+            "MMPR rows with image placeholders must contain exactly one "
+            "placeholder per image: "
+            f"found {placeholder_count} placeholder(s) and {len(images)} image(s)"
+        )
 
     segments = _IMAGE_PLACEHOLDER_RE.split(question)
     user_content: list[dict[str, Any]] = []
@@ -48,11 +61,10 @@ def format_mmpr_preference_dataset(example: dict[str, Any]) -> dict[str, Any]:
         if segment_index < len(segments) - 1 and image_index < len(images):
             user_content.append({"type": "image", "image": images[image_index]})
             image_index += 1
-    while image_index < len(images):
-        user_content.insert(
-            image_index, {"type": "image", "image": images[image_index]}
-        )
-        image_index += 1
+    # Legacy ``*_wo_image`` MMPR subsets carry image paths without inline
+    # placeholders. Preserve their contract by placing media before the text.
+    if placeholder_count == 0:
+        user_content[0:0] = [{"type": "image", "image": image} for image in images]
 
     chosen = str(example.get("chosen_response", example.get("chosen", "")))
     rejected = str(example.get("rejected_response", example.get("rejected", "")))
@@ -97,6 +109,9 @@ class MMPRPreferenceDataset(RawDataset):
             TaskDataPreProcessFnCallable, format_mmpr_preference_dataset
         )
         recipe_path = Path(data_path).expanduser().resolve()
+        with recipe_path.open(encoding="utf-8") as recipe_file:
+            recipe = json.load(recipe_file)
+        dataset_root = recipe_path.parent.parent
         hf_home = Path(
             os.environ.get(
                 "HF_HOME",
@@ -114,10 +129,20 @@ class MMPRPreferenceDataset(RawDataset):
             if cache_dir is not None
             else default_cache_root
         )
+        source_signatures = [_path_signature(recipe_path)]
+        for dataset_name, dataset_info in sorted(recipe.items()):
+            annotation_path = dataset_root / dataset_info["annotation"]
+            image_root = dataset_root / dataset_info["root"]
+            source_signatures.extend(
+                [
+                    dataset_name,
+                    _path_signature(annotation_path),
+                    _path_signature(image_root),
+                ]
+            )
         fingerprint = hashlib.sha256(
-            (
-                f"{recipe_path}|{recipe_path.stat().st_mtime_ns}|"
-                f"{max_samples}|{_CACHE_VERSION}"
+            "|".join(
+                [*source_signatures, str(max_samples), str(_CACHE_VERSION)]
             ).encode()
         ).hexdigest()[:16]
         prepared_cache = cache_root / f"mmpr_preference_{fingerprint}"
@@ -132,10 +157,6 @@ class MMPRPreferenceDataset(RawDataset):
                 )
 
         if dataset is None:
-            with recipe_path.open(encoding="utf-8") as recipe_file:
-                recipe = json.load(recipe_file)
-
-            dataset_root = recipe_path.parent.parent
             records: list[dict[str, Any]] = []
             for dataset_info in recipe.values():
                 image_root = dataset_root / dataset_info["root"]
@@ -153,16 +174,13 @@ class MMPRPreferenceDataset(RawDataset):
                             if "rejected_response" in record
                             else "rejected"
                         )
-                        if "<think>" not in str(record[chosen_key]):
-                            # Preserve the legacy MPO data contract used for the
-                            # parity baseline with the reasoning checkpoint.
-                            record[chosen_key] = "<think></think>\n\n" + str(
-                                record[chosen_key]
-                            )
-                            record[rejected_key] = "<think></think>\n\n" + str(
-                                record[rejected_key]
-                            )
-                            record["system"] = ""
+                        # Preserve the legacy MPO data contract used for the
+                        # parity baseline with the reasoning checkpoint.
+                        for response_key in (chosen_key, rejected_key):
+                            response = str(record[response_key])
+                            if "<think>" not in response:
+                                record[response_key] = "<think></think>\n\n" + response
+                        record.setdefault("system", "")
                         images = record["image"]
                         if isinstance(images, str):
                             images = [images]

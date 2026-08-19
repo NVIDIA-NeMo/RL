@@ -61,6 +61,26 @@ def _load_megatron_common_state_dict(iteration_dir: Path) -> dict[str, Any]:
     return load_common_state_dict(str(iteration_dir))
 
 
+def _load_megatron_sharded_metadata_keys(iteration_dir: Path) -> set[str]:
+    """Load the keys of tensors and objects stored in a torch_dist checkpoint."""
+    try:
+        from megatron.core.dist_checkpointing.serialization import (
+            load_sharded_metadata,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "Megatron-Core is required to inspect optimizer state in the distributed "
+            f"checkpoint at {iteration_dir}. Install NeMo-RL with the `mcore` extra."
+        ) from error
+
+    return {str(key) for key in load_sharded_metadata(str(iteration_dir))}
+
+
+def _is_megatron_optimizer_key(key: str) -> bool:
+    """Return whether a flattened Megatron checkpoint key belongs to the optimizer."""
+    return key == "optimizer" or key.startswith(("optimizer.", "optimizer/"))
+
+
 class PretrainedCheckpointConfig(TypedDict):
     """Configuration for restoring initial weights from a pre-existing Megatron checkpoint.
 
@@ -228,15 +248,13 @@ class CheckpointManager:
                     # state from the weights_path.
                     return weights_path, optimizer_path
 
-            # Modern Megatron torch_dist checkpoints store optimizer shards in the
-            # distributed checkpoint rather than common.pt. Their run_config is the
-            # authoritative manifest used by Megatron-Bridge during load.
-            run_config_path = weights_path / "iter_0000000" / "run_config.yaml"
-            if run_config_path.exists():
-                with open(run_config_path) as f:
-                    run_config = yaml.safe_load(f) or {}
-                if run_config.get("checkpoint", {}).get("save_optim") is True:
-                    return weights_path, optimizer_path
+                # Modern torch_dist checkpoints shard optimizer tensors separately
+                # from the common state. Inspect stored keys rather than trusting
+                # run_config.save_optim, which only records configuration intent.
+                if (iteration_dir / "metadata.json").exists():
+                    sharded_keys = _load_megatron_sharded_metadata_keys(iteration_dir)
+                    if any(_is_megatron_optimizer_key(key) for key in sharded_keys):
+                        return weights_path, optimizer_path
 
             warnings.warn(
                 f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "

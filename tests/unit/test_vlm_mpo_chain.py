@@ -1,0 +1,37 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import subprocess
+from pathlib import Path
+
+
+def test_vlm_mpo_chain_requires_targets_for_multiple_segments():
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env.update({"CHAIN_SEGMENTS": "2", "CHAIN_STEP_TARGETS": ""})
+
+    result = subprocess.run(
+        ["bash", str(repo_root / "scripts" / "vlm_mpo_chain.sh")],
+        capture_output=True,
+        check=False,
+        env=env,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert (
+        "CHAIN_STEP_TARGETS is required when CHAIN_SEGMENTS is greater than 1"
+        in result.stderr
+    )
