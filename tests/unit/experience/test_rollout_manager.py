@@ -42,6 +42,7 @@ from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.failures import GenerationUnavailable
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -1443,6 +1444,9 @@ class _FakeCaptureBuffer(_FakeBuffer):
             rollout_ids=rollout_ids,
         )
 
+    async def clear_staging_keys(self, staging_keys):
+        del staging_keys
+
 
 def _receipt_record(rollout_ids, receipts, instance_configs=None):
     instance_configs = instance_configs or [None] * len(rollout_ids)
@@ -1482,7 +1486,6 @@ def _make_capture_manager(
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
     mgr._tq_buffer = buf
-    mgr._env_handles = {}
     mgr._weight_version = 7
     mgr._retry_policy = (
         retry_policy
@@ -1492,20 +1495,46 @@ def _make_capture_manager(
     mgr._stats = RolloutStats()
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
+    mgr._recovery_ledger = RolloutRecoveryLedger()
 
     class _CaptureImpl:
         def __init__(self):
             self.seen_rollout_ids = None
 
-        async def run_rollout(self, _sample, *, rollout_ids=None):
+        async def run_rollout(
+            self,
+            _sample,
+            *,
+            rollout_ids=None,
+            generation_indices=None,
+            on_completion=None,
+        ):
             self.seen_rollout_ids = rollout_ids
             if on_run is not None:
                 await on_run(_sample)
-            return _receipt_record(
-                rollout_ids,
-                [{"rollout_id": rid} for rid in rollout_ids],
-                instance_configs=instance_configs,
+            indices = generation_indices or list(range(len(rollout_ids)))
+            selected_ids = [rollout_ids[index] for index in indices]
+            selected_configs = (
+                [instance_configs[index] for index in indices]
+                if instance_configs is not None
+                else None
             )
+            receipts = [
+                {
+                    "rollout_id": rollout_id,
+                    "manifest": [{"staging_key": f"{rollout_id}/call"}],
+                }
+                for rollout_id in selected_ids
+            ]
+            record = _receipt_record(
+                selected_ids,
+                receipts,
+                instance_configs=selected_configs,
+            )
+            if on_completion is not None:
+                for generation_index, completion in zip(indices, record.completions):
+                    await on_completion(generation_index, completion)
+            return record
 
     mgr._impl = _CaptureImpl()
     return mgr
@@ -1530,17 +1559,26 @@ class TestGenerateForFinalizationFlow:
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(buf)
 
-        request = _run(mgr.generate_for_finalization({"prompt": "p"}, target_step=5))
+        request = _run(
+            mgr.generate_for_finalization({"prompt": "p", "idx": 0}, target_step=5)
+        )
+        assert request is not None
 
         # Rollout ids were minted from the reserved group id and threaded
         # end to end: reserve -> impl -> metadata-only actor request.
         (group_id,) = buf._slots
-        expected_ids = [f"{group_id}_g0", f"{group_id}_g1"]
-        assert buf.reserve_rollout_ids == [expected_ids]
-        assert mgr._impl.seen_rollout_ids == expected_ids
+        canonical_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+        attempt_ids = buf.reserve_rollout_ids[0]
+        assert attempt_ids is not None
+        assert all(
+            attempt_id.startswith(f"{canonical_id}_a")
+            for attempt_id, canonical_id in zip(attempt_ids, canonical_ids)
+        )
+        assert mgr._impl.seen_rollout_ids == attempt_ids
         assert request.group_id == group_id
-        assert request.rollout_ids == tuple(expected_ids)
-        assert [r["rollout_id"] for r in request.receipts] == expected_ids
+        assert request.rollout_ids == tuple(attempt_ids)
+        assert request.canonical_sample_ids == tuple(canonical_ids)
+        assert [r["rollout_id"] for r in request.receipts] == attempt_ids
         assert request.rewards == (0.5, 0.5)
         assert request.mask_sample == (False, False)
         assert request.fallback_weight_version == 7
@@ -1556,7 +1594,91 @@ class TestGenerateForFinalizationFlow:
 
         mgr = _make_capture_manager(buf, on_run=_boom)
         with pytest.raises(RuntimeError, match="rollout exploded"):
-            _run(mgr.generate_for_finalization({"prompt": "p"}))
-        # The slot is released; abandoned staged rows are swept with the
-        # staging partition at run end (no per-rollout control-plane call).
+            _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
         assert len(buf.abort_calls) == 1
+
+    def test_retries_infrastructure_failure_with_stable_logical_ids(self):
+        buf = _FakeCaptureBuffer()
+        attempts = 0
+
+        async def _fail_once(_sample):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise GenerationUnavailable("worker disappeared")
+
+        mgr = _make_capture_manager(buf, on_run=_fail_once)
+        mgr._retry_policy = RolloutRetryPolicy.single_attempt(
+            max_infra_attempts=2,
+            backoff_base_s=0.0,
+        )
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 4}))
+
+        assert request is not None
+        assert attempts == 2
+        assert len(buf.reserve_rollout_ids) == 2
+        assert buf.reserve_rollout_ids[0] != buf.reserve_rollout_ids[1]
+        assert len(buf.abort_calls) == 1
+        assert buf.abort_calls[0] == request.group_id
+        assert request.canonical_sample_ids == (
+            f"{request.group_id}_g0",
+            f"{request.group_id}_g1",
+        )
+        assert mgr.stats.as_metrics()["rollout/redispatch_total"] == 1.0
+
+    def test_reuses_sealed_sibling_and_redispatches_only_incomplete_one(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+        mgr._retry_policy = RolloutRetryPolicy.single_attempt(
+            max_infra_attempts=2,
+            backoff_base_s=0.0,
+        )
+
+        class _PartialCaptureImpl:
+            def __init__(self):
+                self.generation_indices: list[list[int]] = []
+
+            async def run_rollout(
+                self,
+                _sample,
+                *,
+                rollout_ids=None,
+                generation_indices=None,
+                on_completion=None,
+            ):
+                indices = list(generation_indices)
+                self.generation_indices.append(indices)
+                completions = []
+                for generation_index in indices:
+                    rollout_id = rollout_ids[generation_index]
+                    receipt = {
+                        "rollout_id": rollout_id,
+                        "manifest": [{"staging_key": f"{rollout_id}/call"}],
+                    }
+                    completion = _receipt_record([rollout_id], [receipt]).completions[0]
+                    completions.append(completion)
+                    await on_completion(generation_index, completion)
+                    if len(self.generation_indices) == 1:
+                        raise GenerationUnavailable("worker disappeared")
+                return PromptGroupRecord(
+                    prompt_idx=0,
+                    prompt=[],
+                    extra_env_info={},
+                    metadata={"task_name": "nemo_gym"},
+                    completions=completions,
+                    rollout_metrics={},
+                )
+
+        impl = _PartialCaptureImpl()
+        mgr._impl = impl
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 9}))
+
+        assert request is not None
+        assert impl.generation_indices == [[0, 1], [1]]
+        first_ids, second_ids = buf.reserve_rollout_ids
+        assert first_ids is not None and second_ids is not None
+        assert second_ids[0] == first_ids[0]
+        assert second_ids[1] != first_ids[1]
+        assert request.rollout_ids == (second_ids[0], second_ids[1])
