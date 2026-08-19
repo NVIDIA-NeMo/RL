@@ -416,6 +416,10 @@ class NemoGym(EnvironmentInterface):
         self.head_server_config: Any = None
         self.node_ip: Optional[str] = None
         self.head_server_port: Optional[int] = None
+        # Installed by set_tokenizer at spinup, not passed per rollout call. Declared
+        # here rather than in _spinup so a second spinup cannot wipe an installed
+        # tokenizer and then report that set_tokenizer was never called.
+        self._tokenizer: Optional[PreTrainedTokenizerBase] = None
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -553,10 +557,33 @@ Depending on your data shape, you may want to change these values."""
         )
         self.rch = RolloutCollectionHelper()
 
+    def set_tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
+        """Install the tokenizer run_rollouts postprocesses with.
+
+        Called once per actor at spinup. It used to be a run_rollouts argument,
+        which meant Ray deserialized a tokenizer per prompt on this actor's
+        task-execution thread. That thread holds the GIL, so it blocked the
+        actor's event loop and no rollout could issue its first HTTP request
+        until its own copy finished loading.
+
+        The cost is not marginal. A tokenizer of this shape measured 7.45 MB on
+        the wire, 286 ms to serialize and 1052 ms to deserialize, so a
+        SingleController recipe admitting ~1000 prompts per step spends roughly
+        18 minutes deserializing a single admission burst, against a step that
+        should take minutes. Runs on that shape stalled without completing a
+        rollout.
+
+        Measured on one CPU node with 1024 concurrent calls against one actor:
+        153 of 1024 prompts finished in 300 s passing the tokenizer per call,
+        versus all 1024 in 16 s holding it here. Passing an ObjectRef instead
+        does not help -- Ray caches the object buffer, not the deserialized
+        value, so it still pays per task.
+        """
+        self._tokenizer = tokenizer
+
     async def run_rollouts(
         self,
         nemo_gym_examples: list[dict],
-        tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
     ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
@@ -564,6 +591,11 @@ Depending on your data shape, you may want to change these values."""
         self._require_spinup()
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
+        if self._tokenizer is None:
+            raise RuntimeError(
+                "NemoGym.set_tokenizer must be called before run_rollouts"
+            )
+        tokenizer = self._tokenizer
 
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
@@ -1024,6 +1056,7 @@ def spinup_nemo_gym_actor(
     base_urls: list[str],
     model_name: str,
     *,
+    tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     routed_experts_dtype: str,
     use_fastokens: bool,
@@ -1040,6 +1073,9 @@ def spinup_nemo_gym_actor(
             thinking_tags, num_gpu_nodes).
         base_urls: Per-DP-rank OpenAI-compatible server base URLs from the generation backend.
         model_name: Served model name the Gym rollouts should target.
+        tokenizer: Installed on the actor once, here, rather than passed per
+            rollout call. See NemoGym.set_tokenizer for why that distinction is
+            the difference between a working run and a stalled one.
         enable_router_replay: Sets require_routed_experts on the NemoGymConfig.
         routed_experts_dtype: Dtype name for R3 routed_experts tensors ("int8"/"int16"/"int32"),
             resolved by the caller from the model's expert count.
@@ -1110,4 +1146,5 @@ def spinup_nemo_gym_actor(
 
     actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
     ray.get(actor._spinup.remote())
+    ray.get(actor.set_tokenizer.remote(tokenizer))
     return actor

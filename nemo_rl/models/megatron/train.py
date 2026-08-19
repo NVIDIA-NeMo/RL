@@ -127,6 +127,7 @@ def model_forward(
     mtp_loss_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
+    media_token_validity_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -143,6 +144,9 @@ def model_forward(
         straggler_timer: Straggler detector for profiling the forward pass
         use_fused_linear_logprobs: Whether to compute logprobs with the fused
             chunked linear cross-entropy kernel (directly from hidden states)
+        media_token_validity_mask: Which media-token positions actually anchor a
+            projected feature, already in this model's token layout. Only passed
+            when the model accepts it; otherwise the model derives its own.
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -161,6 +165,11 @@ def model_forward(
     # Pass MTP loss mask to exclude prompt tokens from MTP loss
     if mtp_loss_mask is not None:
         additional_kwargs["loss_mask"] = mtp_loss_mask
+
+    # Only sent when the model advertises the parameter, so it never reaches a
+    # forward that would swallow it into **kwargs and quietly ignore it.
+    if media_token_validity_mask is not None:
+        additional_kwargs["media_token_validity_mask"] = media_token_validity_mask
 
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
@@ -259,6 +268,7 @@ def forward_with_post_processing_fn(
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
     mtp_loss_mask = processed_mb.mtp_loss_mask
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
+    media_token_validity_mask = processed_mb.media_token_validity_mask
 
     if use_router_replay:
         if routed_experts_cp_sharded is None:
@@ -282,6 +292,7 @@ def forward_with_post_processing_fn(
                 mtp_loss_mask=mtp_loss_mask,
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
+                media_token_validity_mask=media_token_validity_mask,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);

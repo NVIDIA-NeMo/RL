@@ -704,6 +704,7 @@ def setup(
             env_configs=env_configs,
             base_urls=base_urls,
             model_name=model_name,
+            tokenizer=tokenizer,
             enable_router_replay=enable_router_replay,
             routed_experts_dtype=routed_experts_dtype,
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),

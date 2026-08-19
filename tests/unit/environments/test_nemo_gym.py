@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import time
 from copy import deepcopy
@@ -166,7 +167,7 @@ def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
 
 
 @pytest.fixture(scope="function")
-def nemo_gym(nemo_gym_vllm_generation):
+def nemo_gym(nemo_gym_vllm_generation, nemo_gym_tokenizer):  # noqa: F811
     """Create a NeMo-Gym actor for testing."""
 
     yaml_str = r"""example_multi_step_resources_server:
@@ -210,6 +211,10 @@ openai_model:
 
     # Blocking wait for NeMo-Gym to spin up
     ray.get(env._spinup.remote())
+    # Install the tokenizer here, as spinup_nemo_gym_actor does, so the fixture
+    # yields an actor that can actually run rollouts. Tests reaching the actor
+    # through RolloutManager never see set_tokenizer themselves.
+    ray.get(env.set_tokenizer.remote(nemo_gym_tokenizer))
 
     yield env
     # Clean up the actor and wait for it to be killed
@@ -261,6 +266,26 @@ def _write_actual_test_data(original_input: list, actual_result: list):
         json.dump(data, f)
         f.write("\n")
     print(f"Wrote updated test data to {output_path}")
+
+
+def test_run_rollouts_requires_an_installed_tokenizer():
+    """run_rollouts reads the tokenizer off the actor, so reaching it without one fails.
+
+    Every call site installs it via spinup, so this is unreachable in practice -- but
+    silently postprocessing with no tokenizer is worse than a named error, and a future
+    spinup path that forgets the call should say so here rather than deeper in.
+    """
+    gym_cls = NemoGym.__ray_metadata__.modified_class
+    # Constructed through __init__ rather than object.__new__ so the None comes from
+    # the declaration itself: an attribute set only in _spinup would leave a second
+    # spinup free to wipe an installed tokenizer.
+    gym = gym_cls({})
+    assert gym._tokenizer is None
+    gym.rh = object()  # satisfies _require_spinup
+
+    stream = gym.run_rollouts([{"_rowidx": 0}], "")
+    with pytest.raises(RuntimeError, match="set_tokenizer must be called"):
+        asyncio.run(stream.__anext__())
 
 
 def test_nemo_gym_postprocess_uses_batch_decode():
@@ -669,7 +694,6 @@ def test_nemo_gym_sanity(
     nemo_gym,
     nemo_gym_sanity_test_data,
     nemo_gym_vllm_generation,
-    nemo_gym_tokenizer,  # noqa: F811
 ):
     """Test basic functionality of MathEnvironment step with simple messages."""
 
@@ -688,7 +712,7 @@ def test_nemo_gym_sanity(
 
     actual_result = [None] * len(nemo_gym_sanity_test_data["input"])
     for result_ref in nemo_gym.run_rollouts.options(num_returns="streaming").remote(
-        nemo_gym_sanity_test_data["input"], nemo_gym_tokenizer, ""
+        nemo_gym_sanity_test_data["input"], ""
     ):
         rowidx, result, _ = ray.get(result_ref)
         actual_result[rowidx] = result

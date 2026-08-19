@@ -241,5 +241,12 @@ class ColocatablePolicyInterface(PolicyInterface):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_for_lp_inference(self) -> None:
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put the policy in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave grad buffers and optimizer state on CUDA
+                because a train step is already open and its accumulated
+                gradients must survive this call.
+        """
         pass
