@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import torch
 
 from nemo_rl.algorithms.loss.draft import (
@@ -133,21 +132,34 @@ def test_dflash_loss_fn_normalizes_with_external_per_slot_counts() -> None:
     )
 
 
-def test_dflash_adapter_rejects_a_trained_anchor_slot() -> None:
-    """The anchor is context only and can never contribute to a loss bin."""
+def test_dflash_adapter_excludes_anchor_even_when_input_mask_includes_it() -> None:
+    """The anchor remains context only without a device-to-host validation sync."""
     inputs = list(_inputs())
+    expected = dflash_projected_vocab_parallel_soft_ce(
+        draft_hidden=inputs[0],
+        output_weight=inputs[1],
+        teacher_logits=inputs[2],
+        sample_rows=inputs[3],
+        label_positions=inputs[4],
+        loss_mask=inputs[5],
+        position_decay=0.5,
+        token_chunk_size=2,
+        tp_group=None,
+    )
     inputs[5] = inputs[5].clone()
     inputs[5][0, 0] = True
 
-    with pytest.raises(ValueError, match="anchor slot"):
-        dflash_projected_vocab_parallel_soft_ce(
-            draft_hidden=inputs[0],
-            output_weight=inputs[1],
-            teacher_logits=inputs[2],
-            sample_rows=inputs[3],
-            label_positions=inputs[4],
-            loss_mask=inputs[5],
-            position_decay=0.5,
-            token_chunk_size=2,
-            tp_group=None,
-        )
+    actual = dflash_projected_vocab_parallel_soft_ce(
+        draft_hidden=inputs[0],
+        output_weight=inputs[1],
+        teacher_logits=inputs[2],
+        sample_rows=inputs[3],
+        label_positions=inputs[4],
+        loss_mask=inputs[5],
+        position_decay=0.5,
+        token_chunk_size=2,
+        tp_group=None,
+    )
+
+    torch.testing.assert_close(actual.numerators, expected.numerators)
+    torch.testing.assert_close(actual.counts, expected.counts)

@@ -806,8 +806,6 @@ def dflash_projected_vocab_parallel_soft_ce(
         raise TypeError("sample_rows and label_positions must use torch.long.")
     if loss_mask.dtype != torch.bool:
         raise TypeError(f"loss_mask must be boolean, got {loss_mask.dtype}.")
-    if loss_mask[:, 0].any():
-        raise ValueError("loss_mask must exclude the DFlash anchor slot.")
     if not (
         draft_hidden.device
         == teacher_logits.device
@@ -825,6 +823,8 @@ def dflash_projected_vocab_parallel_soft_ce(
     sequence_length = teacher_logits.shape[1]
     teacher_row_indices = sample_rows[:, None] * sequence_length + label_positions
     teacher_row_indices[:, 0] = 0
+    effective_loss_mask = loss_mask.clone()
+    effective_loss_mask[:, 0] = False
     gamma = block_size - 1
     slot_offsets = torch.arange(block_size, device=draft_hidden.device)
     bin_ids = slot_offsets.sub(1).clamp_min_(0).expand(block_shape)
@@ -837,7 +837,7 @@ def dflash_projected_vocab_parallel_soft_ce(
         output_weight=output_weight,
         teacher_logits=teacher_logits,
         teacher_row_indices=teacher_row_indices,
-        mask=loss_mask,
+        mask=effective_loss_mask,
         bin_ids=bin_ids,
         weights=weights,
         token_chunk_size=token_chunk_size,
