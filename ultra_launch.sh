@@ -63,6 +63,8 @@ set -euo pipefail
 #   HF_HOME=                               HuggingFace cache root (recommended)
 #   HF_TOKEN=                              HuggingFace API token
 #   NRL_DRIVER_UV_RUN_FLAGS=               Extra flags for the driver-only uv run
+#   NEMO_RL_VENV_DIR=                      Worker venv root forwarded to the driver
+#   NEMO_GYM_VENV_DIR=                     Gym service venv root forwarded to the driver
 #   WANDB_API_KEY=                         Weights & Biases API key
 #   WANDB_PROJ=nemotron-3-ultra            W&B project
 #   WANDB_ENTITY=                          W&B entity
@@ -682,6 +684,8 @@ if [[ -n "${UV_CACHE_DIR:-}" ]]; then
 else
   TRAIN_UV_CACHE_DIR='/tmp/nemo-gym-uv-cache-${SLURM_JOB_ID:-default}'
 fi
+TRAIN_NEMO_RL_VENV_DIR="${NEMO_RL_VENV_DIR:-}"
+TRAIN_NEMO_GYM_VENV_DIR="${NEMO_GYM_VENV_DIR:-}"
 
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 ${NRL_DRIVER_PIP_INSTALL:+uv pip install --python /opt/nemo_rl_venv/bin/python ${NRL_DRIVER_PIP_INSTALL} ; }\
@@ -697,6 +701,8 @@ DG_JIT_CACHE_DIR=${NRL_VLLM_LOCAL_CACHE_DIR}/deep_gemm \
 TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
 TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
 UV_CACHE_DIR=${TRAIN_UV_CACHE_DIR} \
+${TRAIN_NEMO_RL_VENV_DIR:+NEMO_RL_VENV_DIR=${TRAIN_NEMO_RL_VENV_DIR} }\
+${TRAIN_NEMO_GYM_VENV_DIR:+NEMO_GYM_VENV_DIR=${TRAIN_NEMO_GYM_VENV_DIR} }\
 UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
