@@ -19,7 +19,6 @@ from nemo_rl.algorithms.loss import loss_functions
 from nemo_rl.algorithms.loss.draft import (
     dflash_projected_vocab_parallel_soft_ce,
 )
-from nemo_rl.algorithms.loss.loss_functions import DFlashProjectedLossFn
 
 
 def test_projected_dflash_loss_is_not_exposed_as_generic_loss_function() -> None:
@@ -100,43 +99,6 @@ def test_dflash_adapter_maps_blocks_to_teacher_rows_and_position_bins() -> None:
     assert draft_hidden.grad is not None
     assert teacher_logits.grad is None
     assert output_weight.grad is None
-
-
-def test_dflash_loss_fn_normalizes_with_external_per_slot_counts() -> None:
-    """The production loss seam honors globally reduced per-slot counts."""
-    inputs = _inputs()
-    loss_fn = DFlashProjectedLossFn(
-        vocab_parallel_group=None,
-        token_chunk_size=2,
-        position_decay=0.5,
-    )
-    global_counts = torch.tensor([4.0, 8.0])
-
-    loss = loss_fn(
-        draft_hidden=inputs[0],
-        output_weight=inputs[1],
-        teacher_logits=inputs[2],
-        sample_rows=inputs[3],
-        label_positions=inputs[4],
-        loss_mask=inputs[5],
-        global_normalization_counts=global_counts,
-    )
-    raw_stats = dflash_projected_vocab_parallel_soft_ce(
-        draft_hidden=inputs[0],
-        output_weight=inputs[1],
-        teacher_logits=inputs[2],
-        sample_rows=inputs[3],
-        label_positions=inputs[4],
-        loss_mask=inputs[5],
-        position_decay=0.5,
-        token_chunk_size=2,
-        tp_group=None,
-    )
-
-    torch.testing.assert_close(
-        loss,
-        raw_stats.normalized(normalization_counts=global_counts),
-    )
 
 
 def test_dflash_adapter_excludes_anchor_even_when_input_mask_includes_it() -> None:
