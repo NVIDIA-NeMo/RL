@@ -195,8 +195,11 @@ def maybe_configure_engine_env(cfg: DataPlaneConfig) -> None:
     on the network, so pinning one would break every rail at once where it is
     wrong, and its ``findBestGidIndex`` is per-device and cannot disagree.
 
-    ``setdefault`` so the launch environment can still override; running once on
-    the driver keeps an override uniform too.
+    ``setdefault`` so the launch environment can still set its own value
+    instead of being clobbered; running once on the driver keeps that value
+    uniform cluster-wide too. This is not the same as a way to *disable*
+    ``MC_ENABLE_DEST_DEVICE_AFFINITY`` — see the comment at its own
+    ``setdefault`` call below.
     """
     if cfg["backend"] != "mooncake_cpu":
         return
@@ -207,6 +210,12 @@ def maybe_configure_engine_env(cfg: DataPlaneConfig) -> None:
     # each rail is its own subnet a cross-rail pair has no route. Mooncake
     # recommends this for rail-optimized topologies and sets it as a pod-level
     # variable in its own deployment example, i.e. uniformly, for this reason.
+    # NOTE: verified against the pinned wheel, mooncake's own parsing is
+    # `if (std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY"))` — presence, not
+    # value, enables it. Setting this to "0" does NOT disable it at the
+    # engine level; there is currently no supported way to turn it off once
+    # any value is set. rdma_devices()'s per-domain dedup exists precisely
+    # because this knob cannot be relied on or turned off.
     os.environ.setdefault("MC_ENABLE_DEST_DEVICE_AFFINITY", "1")
 
 
