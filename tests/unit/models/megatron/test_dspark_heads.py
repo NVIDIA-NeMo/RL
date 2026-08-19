@@ -46,7 +46,9 @@ def _load_heads() -> tuple[type[nn.Module], type[nn.Module]]:
 
 DSparkMarkovHead, DSparkConfidenceHead = _load_heads()
 
-_PUBLIC_DSPARK_REVISION = "737765aa0ff9f5dbda65839a6e010f03b66bc506"
+_PUBLIC_DSPARK_ARTIFACT = (
+    "mgoin/Qwen3-8B-speculator.dspark@737765aa0ff9f5dbda65839a6e010f03b66bc506"
+)
 _PUBLIC_DSPARK_CONFIG = {
     "vocab_size": 151936,
     "draft_vocab_size": 32000,
@@ -434,7 +436,7 @@ def test_markov_head_has_explicit_tp_local_vocab_contract() -> None:
 
 
 def test_markov_head_loads_pinned_public_dspark_checkpoint_schema() -> None:
-    assert _PUBLIC_DSPARK_REVISION == "737765aa0ff9f5dbda65839a6e010f03b66bc506"
+    assert _PUBLIC_DSPARK_ARTIFACT.startswith("mgoin/Qwen3-8B-speculator.dspark@")
     heads = nn.ModuleDict(
         {
             "markov_head": DSparkMarkovHead(
