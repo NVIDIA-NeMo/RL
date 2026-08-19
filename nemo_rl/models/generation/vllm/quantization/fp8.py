@@ -1246,6 +1246,35 @@ def _shuffle_mxfp8_moe_per_expert(
     )
 
 
+def _shuffle_mxfp8_moe(
+    layer: RoutedExperts,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    is_gated: bool,
+    epilogue_tile_m: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if os.environ.get("NRL_MXFP8_BATCHED_SHUFFLE", "1") != "0":
+        return _shuffle_mxfp8_moe_batched(
+            layer,
+            w13_weight,
+            w2_weight,
+            w13_scale,
+            w2_scale,
+            is_gated,
+            epilogue_tile_m,
+        )
+    return _shuffle_mxfp8_moe_per_expert(
+        w13_weight,
+        w2_weight,
+        w13_scale,
+        w2_scale,
+        is_gated,
+        epilogue_tile_m,
+    )
+
+
 def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
     """Shuffle weights and scales into FlashInfer TRTLLM MXFP8 layout.
 
@@ -1338,7 +1367,7 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
         w2_weight_shuffled,
         w13_scale_shuffled,
         w2_scale_shuffled,
-    ) = _shuffle_mxfp8_moe_batched(
+    ) = _shuffle_mxfp8_moe(
         layer, w13_weight, w2_weight, w13_scale, w2_scale, is_gated, epilogue_tile_m
     )
 

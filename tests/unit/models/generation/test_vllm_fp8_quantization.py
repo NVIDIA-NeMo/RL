@@ -211,6 +211,51 @@ def test_batched_moe_shuffle_matches_per_expert(
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
+@pytest.mark.parametrize(
+    ("env_value", "expected_path"),
+    [(None, "batched"), ("1", "batched"), ("0", "per-expert")],
+)
+def test_mxfp8_moe_shuffle_ablation_selector(
+    fp8_module, monkeypatch, env_value, expected_path
+):
+    fp8 = fp8_module
+    calls = []
+    shuffled = tuple(torch.tensor(index) for index in range(4))
+
+    def batched(*args):
+        calls.append(("batched", args))
+        return shuffled
+
+    def per_expert(*args):
+        calls.append(("per-expert", args))
+        return shuffled
+
+    monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", batched)
+    monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_per_expert", per_expert)
+    if env_value is None:
+        monkeypatch.delenv("NRL_MXFP8_BATCHED_SHUFFLE", raising=False)
+    else:
+        monkeypatch.setenv("NRL_MXFP8_BATCHED_SHUFFLE", env_value)
+
+    args = (
+        object(),
+        torch.tensor(1),
+        torch.tensor(2),
+        torch.tensor(3),
+        torch.tensor(4),
+        True,
+        128,
+    )
+    assert fp8._shuffle_mxfp8_moe(*args) == shuffled
+    assert len(calls) == 1
+    selected_path, selected_args = calls[0]
+    assert selected_path == expected_path
+    if expected_path == "batched":
+        assert selected_args == args
+    else:
+        assert selected_args == args[1:]
+
+
 @pytest.mark.parametrize("is_gated", [True, False])
 def test_process_mxfp8_moe_refit_uses_batched_flashinfer_shuffle(
     fp8_module, monkeypatch, is_gated
