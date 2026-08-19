@@ -20,7 +20,10 @@ import time
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Optional, TypeVar, cast
+
+if TYPE_CHECKING:
+    from modelexpress_rl import ModelExpressTrainerClient
 
 log = logging.getLogger(__name__)
 
@@ -116,9 +119,6 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     HFToLocalParamMap,
     LocalParamSpec,
     RefitCtx,
-)
-from nemo_rl.weight_sync.model_express.trainer import (
-    ModelExpressTrainerIntegration,
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
@@ -312,7 +312,7 @@ class MegatronPolicyWorkerImpl(
     _train_step_state: Optional[dict[str, Any]] = None
     _remote_sparse_refit: Any = None
     _async_checkpoint_cuda_cache_active: bool = False
-    _model_express: ModelExpressTrainerIntegration | None = None
+    _model_express: Optional["ModelExpressTrainerClient"] = None
 
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
@@ -455,9 +455,28 @@ class MegatronPolicyWorkerImpl(
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
-        self._model_express = ModelExpressTrainerIntegration.from_config(
-            config=config, local_rank=local_rank
-        )
+        self._model_express = None
+        if config.get("generation", {}).get("refit_transport") == "model_express":
+            from modelexpress_rl import (
+                ModelExpressTrainerClient,
+                ModelExpressTrainerConfig,
+            )
+
+            refit_config = config["generation"].get("refit_cfg")
+            model_express_config = (
+                refit_config.model_express if refit_config is not None else None
+            )
+            self._model_express = ModelExpressTrainerClient.initialize(
+                ModelExpressTrainerConfig(
+                    model_name=config["model_name"],
+                    device_id=local_rank,
+                    server_url=(
+                        model_express_config.server_url
+                        if model_express_config is not None
+                        else None
+                    ),
+                )
+            )
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -2286,24 +2305,25 @@ class MegatronPolicyWorkerImpl(
             return None
         if self._model_express is None:
             raise RuntimeError("ModelExpress trainer integration was not configured")
-        return self._model_express.initialize(
-            model_name=self.cfg["model_name"],
+        from modelexpress_rl.train.engines.megatron import build_megatron_tensor_specs
+
+        specs = build_megatron_tensor_specs(
             conversion_tasks=self._build_refit_conversion_tasks(),
             transformer_config=self.megatron_bridge.transformer_config,
             tensor_parallel_size=parallel_state.get_tensor_model_parallel_world_size(),
             tensor_parallel_rank=parallel_state.get_tensor_model_parallel_rank(),
-            server_url=server_url,
         )
+        return self._model_express.bind_tensors(specs)
 
     def publish_model_express_version(self, *, version: Any) -> None:
         """Publish this rank's immutable shard for one MX version."""
         if self._model_express is not None:
-            self._model_express.publish(version)
+            self._model_express.publish_version(version=version)
 
     def release_model_express_version(self, *, version: Any) -> None:
         """Withdraw this rank's shard so training may mutate it again."""
         if self._model_express is not None:
-            self._model_express.release(version)
+            self._model_express.release_version(version=version)
 
     def shutdown(self) -> bool:
         """Release ModelExpress resources before normal policy cleanup."""

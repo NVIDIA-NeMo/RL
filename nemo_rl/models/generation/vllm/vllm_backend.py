@@ -17,10 +17,13 @@ import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import zmq
+
+if TYPE_CHECKING:
+    from modelexpress_rl import ModelExpressGeneratorClient, WeightVersionRef
 
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineMixin,
@@ -39,9 +42,6 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     LocalParamSpec,
     RefitCtx,
     _extract_layer_prefix,
-)
-from nemo_rl.weight_sync.model_express.generator import (
-    ModelExpressGeneratorIntegration,
 )
 
 logger = logging.getLogger(__name__)
@@ -187,7 +187,7 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
-    _model_express: ModelExpressGeneratorIntegration | None = None
+    _model_express: ModelExpressGeneratorClient | None = None
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -200,18 +200,33 @@ class VllmInternalWorkerExtension:
         """Initialize ModelExpress inside the vLLM rank that owns live weights."""
         if self._model_express is not None:
             return
-        self._model_express = ModelExpressGeneratorIntegration.initialize(
-            model=self.model_runner.model,
-            vllm_config=self.model_runner.vllm_config,
-            model_config=self.model_runner.model_config,
-            server_url=server_url,
+        from modelexpress_rl import (
+            ModelExpressGeneratorClient,
+            ModelExpressGeneratorConfig,
+            VllmGeneratorContext,
         )
 
-    def update_weights_from_model_express(self, version: Any) -> bool:
+        self._model_express = ModelExpressGeneratorClient.initialize(
+            ModelExpressGeneratorConfig(
+                engine_context=VllmGeneratorContext(
+                    model=self.model_runner.model,
+                    vllm_config=self.model_runner.vllm_config,
+                ),
+                model_name=self.model_runner.model_config.model,
+                server_url=server_url,
+            )
+        )
+
+    def update_weights_from_model_express(self, version: WeightVersionRef) -> bool:
         """Stage, verify, and install an exact MX version at a safe point."""
         if self._model_express is None:
             raise RuntimeError("ModelExpress generator client is not initialized")
-        return self._model_express.update(version)
+        staged = self._model_express.stage_weight(version=version)
+        try:
+            self._model_express.apply_weight(staged)
+        finally:
+            staged.release()
+        return True
 
     def _load_full_hf_weights(
         self, policy_weights: list[tuple[str, torch.Tensor]]
