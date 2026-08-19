@@ -50,58 +50,6 @@ def configure_vllm_for_router_replay(config: PolicyConfig) -> None:
     vllm_kwargs["enable_return_routed_experts"] = True
 
 
-def sync_model_config_for_router_replay(model: Any, config: PolicyConfig) -> None:
-    """Ensure the built mcore model config enables inference routing recording."""
-    if not router_replay_enabled(config):
-        return
-    model_config = _unwrap_model_config(model)
-    if model_config is None:
-        return
-    model_config.moe_enable_routing_replay = True
-    # Fused TE top-k bypasses RouterReplay.RECORD; force the replay-capable path.
-    model_config.moe_router_fusion = False
-
-
-def assert_megatron_inference_router_replay_ready(
-    model: Any, inference_context: Any, config: PolicyConfig
-) -> None:
-    """Fail fast when router replay is on but the inference engine cannot record routing."""
-    if not router_replay_enabled(config):
-        return
-
-    from megatron.core.transformer.moe.router_replay import RouterReplay
-
-    model_config = getattr(model, "config", None)
-    if model_config is None or not getattr(
-        model_config, "moe_enable_routing_replay", False
-    ):
-        raise RuntimeError(
-            "policy.router_replay.enabled=true requires model.config."
-            "moe_enable_routing_replay=True before Megatron inference starts."
-        )
-
-    if getattr(model_config, "num_moe_experts", None) in (None, 0):
-        raise RuntimeError(
-            "policy.router_replay.enabled=true requires a MoE model with "
-            "num_moe_experts > 0."
-        )
-
-    if not RouterReplay.global_router_replay_instances:
-        raise RuntimeError(
-            "policy.router_replay.enabled=true but no RouterReplay instances "
-            "were registered on the model. Ensure setup_model_config applied "
-            "moe_enable_routing_replay before the model was built."
-        )
-
-    if getattr(inference_context, "moe_routing_metadata", None) is None:
-        raise RuntimeError(
-            "policy.router_replay.enabled=true but the Megatron dynamic "
-            "inference context has no moe_routing_metadata. The inference "
-            "engine was likely initialized before moe_enable_routing_replay "
-            "was enabled; restart the job after enabling router replay."
-        )
-
-
 def validate_router_replay_config(config: PolicyConfig) -> None:
     if not router_replay_enabled(config):
         return
@@ -109,11 +57,8 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
     generation = config.get("generation") or {}
     megatron_cfg = config.get("megatron_cfg") or {}
 
-    generation_backend = generation.get("backend")
-    if generation_backend not in ("vllm", "megatron"):
-        raise ValueError(
-            "router_replay.enabled requires vLLM or Megatron generation."
-        )
+    if generation.get("backend") != "vllm":
+        raise ValueError("router_replay.enabled requires vLLM generation.")
     if not megatron_cfg.get("enabled", False):
         raise ValueError("router_replay.enabled requires the Megatron policy backend.")
 
@@ -620,9 +565,9 @@ def rebuild_global_router_replay_registry(model: Any) -> None:
     """Re-register policy RouterReplay instances after a temporary model build.
 
     Reference-model setup builds a throwaway Megatron model whose RouterReplay
-    objects register globally, then clears the global list. Megatron inference
-    recording uses that global list, so we must restore the live policy model's
-    instances before generation starts.
+    objects register globally, then clears the global list. Restore the live
+    policy model's instances so downstream Megatron MoE paths see the correct
+    registry even when router replay is disabled.
     """
     from megatron.core.transformer.moe.router_replay import RouterReplay
     from megatron.core.utils import unwrap_model
@@ -636,12 +581,3 @@ def rebuild_global_router_replay_registry(model: Any) -> None:
     RouterReplay.global_router_replay_instances.extend(
         replay_instance for replay_instance, _ in instances
     )
-
-
-def reset_moe_routing_metadata_buffer(inference_context: Any) -> None:
-    """Drop cached MoE routing CUDA-graph buffers so they resize to the live registry."""
-    metadata = getattr(inference_context, "moe_routing_metadata", None)
-    if metadata is None:
-        return
-    metadata.routing_indices_buffer = None
-    metadata.num_moe_layers = None

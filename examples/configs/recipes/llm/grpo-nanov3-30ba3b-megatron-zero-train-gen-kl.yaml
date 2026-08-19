@@ -8,8 +8,6 @@ grpo:
 
 
 policy:
-  router_replay:
-    enabled: true
   logprob_chunk_size: 2048
   megatron_cfg:
     zero_train_gen_mismatch: true

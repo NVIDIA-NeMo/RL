@@ -16,8 +16,6 @@ policy:
   train_global_batch_size: 256
   max_total_sequence_length: 10240
   logprob_chunk_size: 2048 # requires defer_fp32_logits
-  router_replay:
-    enabled: true
   megatron_cfg:
     zero_train_gen_mismatch: true
     activation_checkpointing: true
