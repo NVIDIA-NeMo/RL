@@ -158,16 +158,33 @@ class DataPlaneCheckpointBarrier:
         self._condition = asyncio.Condition()
         self._checkpoint_active = False
         self._active_mutations = 0
+        self._mutation_depth_by_task: dict[asyncio.Task[Any], int] = {}
 
     @asynccontextmanager
     async def mutation(self) -> AsyncIterator[None]:
         """Enter a commit/clear section, waiting only for an active checkpoint."""
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("data-plane mutation must run inside an asyncio task")
+        depth = self._mutation_depth_by_task.get(task, 0)
+        if depth:
+            # Replay-buffer helpers may join a controller-owned mutation. Do not
+            # wait behind a checkpoint that is already waiting for this outer
+            # mutation, or the two tasks deadlock.
+            self._mutation_depth_by_task[task] = depth + 1
+            try:
+                yield
+            finally:
+                self._mutation_depth_by_task[task] -= 1
+            return
         async with self._condition:
             await self._condition.wait_for(lambda: not self._checkpoint_active)
             self._active_mutations += 1
+            self._mutation_depth_by_task[task] = 1
         try:
             yield
         finally:
+            del self._mutation_depth_by_task[task]
             async with self._condition:
                 self._active_mutations -= 1
                 if self._active_mutations == 0:
