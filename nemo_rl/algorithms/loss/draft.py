@@ -332,7 +332,7 @@ class _SumTensorParallelHiddenGradient(torch.autograd.Function):
         return student_hidden
 
     @staticmethod
-    def backward(
+    def backward(  # pyrefly: ignore[bad-override]
         ctx: Any,
         hidden_gradient: torch.Tensor,
     ) -> tuple[torch.Tensor, None]:
