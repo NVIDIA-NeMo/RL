@@ -339,14 +339,15 @@ def _generation_max_seq_len(generation_config) -> int:
 def _clamp_max_num_steps(
     master_config: MasterConfig, dataloader: StatefulDataLoader
 ) -> None:
-    """Resolve the SingleController step limit against its finite data horizon."""
+    """Clamp grpo.max_num_steps to max_num_epochs * len(dataloader)."""
     grpo_config = master_config.grpo
     max_num_epochs = grpo_config.max_num_epochs
-    epoch_horizon = max_num_epochs * len(dataloader)
-    if grpo_config.max_num_steps == -1:
-        grpo_config.max_num_steps = epoch_horizon
-    else:
-        grpo_config.max_num_steps = min(grpo_config.max_num_steps, epoch_horizon)
+    if max_num_epochs is None:
+        return
+    grpo_config.max_num_steps = min(
+        grpo_config.max_num_steps,
+        max_num_epochs * len(dataloader),
+    )
 
 
 def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
@@ -355,8 +356,7 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     if not policy_config.get("megatron_cfg", {}).get("enabled", False):
         return
     grpo_config = master_config.grpo
-    megatron_config = cast(dict[str, Any], policy_config["megatron_cfg"])
-    megatron_config["train_iters"] = grpo_config.max_num_steps
+    policy_config["megatron_cfg"]["train_iters"] = grpo_config.max_num_steps
 
 
 def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
@@ -415,6 +415,7 @@ def setup_single_controller(
     assert generation_config is not None, (
         "single_controller_utils.setup requires policy.generation in master_config"
     )
+
     if data_config["use_multiple_dataloader"]:
         raise NotImplementedError(
             "single_controller_utils does not support "

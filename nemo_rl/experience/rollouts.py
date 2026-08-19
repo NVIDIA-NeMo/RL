@@ -2365,6 +2365,9 @@ async def run_async_nemo_gym_rollout(
         raise ValueError(
             "returns_entire_batch requires num_generations to equal the batch size"
         )
+    # Media is restored by row index: result[0] uses message_log[0], result[1]
+    # uses message_log[1], and so on. Reject mismatches instead of attaching a
+    # video's tensors to the wrong prompt.
     original_message_logs = input_batch.get("message_log")
     if original_message_logs is not None and len(original_message_logs) != len(
         nemo_gym_rows

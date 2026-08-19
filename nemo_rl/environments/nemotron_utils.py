@@ -97,6 +97,37 @@ def _nemotron_video_target_resolution(
     return patch_width * patch_size, patch_height * patch_size
 
 
+def _resize_and_normalize_nemotron_video_frame(
+    frame: Image.Image,
+    *,
+    target_height: int,
+    target_width: int,
+    norm_mean: torch.Tensor,
+    norm_std: torch.Tensor,
+) -> torch.Tensor:
+    """Resize one frame with the same numeric order as stock vLLM."""
+    frame_array = np.array(
+        frame.convert("RGB") if frame.mode != "RGB" else frame,
+        dtype=np.uint8,
+        copy=True,
+    )
+    frame_tensor = (
+        torch.from_numpy(np.expand_dims(frame_array, axis=0))
+        .permute(0, 3, 1, 2)
+        .to(dtype=torch.float32)
+    )
+    if frame_tensor.shape[-2:] != (target_height, target_width):
+        frame_tensor = F.interpolate(
+            frame_tensor,
+            size=(target_height, target_width),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+    normalized = (frame_tensor / 255.0 - norm_mean) / norm_std
+    return normalized.squeeze(0).contiguous()
+
+
 def _flatten_nemotron_video_frame_messages(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[Image.Image], list[int], float]:
@@ -287,23 +318,15 @@ def process_nemotron_video_frames(
             downsample_ratio=downsample_ratio,
             maintain_aspect_ratio=maintain_aspect_ratio,
         )
-        frame_array = np.array(
-            frame.convert("RGB") if frame.mode != "RGB" else frame,
-            dtype=np.uint8,
-            copy=True,
-        )
-        frame_tensor = torch.from_numpy(frame_array).permute(2, 0, 1).unsqueeze(0)
-        if frame_tensor.shape[-2:] != (target_height, target_width):
-            frame_tensor = F.interpolate(
-                frame_tensor,
-                size=(target_height, target_width),
-                mode="bicubic",
-                align_corners=False,
-                antialias=True,
+        pixel_values.append(
+            _resize_and_normalize_nemotron_video_frame(
+                frame,
+                target_height=target_height,
+                target_width=target_width,
+                norm_mean=norm_mean,
+                norm_std=norm_std,
             )
-        normalized = frame_tensor.squeeze(0) / 255.0
-        normalized = (normalized - norm_mean) / norm_std
-        pixel_values.append(normalized.contiguous())
+        )
         image_sizes.append([target_height, target_width])
         embeddings_per_frame.append(
             int((target_height // patch_size) * downsample_ratio)

@@ -41,14 +41,11 @@ from nemo_rl.algorithms.grpo import (
     _initial_policy_generation_stale,
     _needs_hf_refit_handshake,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
-    _resolve_megatron_train_iters,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
     _should_use_async_rollouts,
     _validate_multimodal_dedup_capability,
-    _step_limit_reached,
-    _step_progress_label,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
@@ -80,8 +77,6 @@ from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
     create_mock_batch,
 )
-
-_ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY = "async_rollout_epochs_completed"
 
 
 def _mock_policy_generation() -> MagicMock:
@@ -821,19 +816,11 @@ class StubReplayBuffer:
     Each method returns a MagicMock with a 'remote' attribute that can be called.
     """
 
-    def __init__(
-        self,
-        initial_size=10,
-        mock_batch=None,
-        mock_rollout_metrics=None,
-        samples_before_exhaustion=None,
-    ):
+    def __init__(self, initial_size=10, mock_batch=None, mock_rollout_metrics=None):
         self._size = initial_size
         self._trajectories = []
         self._mock_batch = mock_batch
         self._mock_rollout_metrics = mock_rollout_metrics or {}
-        self._samples_before_exhaustion = samples_before_exhaustion
-        self._sample_calls = 0
 
     @property
     def size(self):
@@ -847,13 +834,6 @@ class StubReplayBuffer:
         """Return a mock that returns sample result when .remote() is called"""
 
         def _sample(num_prompt_groups, current_weight_version, max_age_steps):
-            if (
-                self._samples_before_exhaustion is not None
-                and self._sample_calls >= self._samples_before_exhaustion
-            ):
-                self._size = 0
-                return None
-            self._sample_calls += 1
             # Return proper trajectory structure expected by async GRPO
             trajectories = [
                 {
@@ -862,11 +842,6 @@ class StubReplayBuffer:
                 }
                 for _ in range(num_prompt_groups)
             ]
-            if (
-                self._samples_before_exhaustion is not None
-                and self._sample_calls >= self._samples_before_exhaustion
-            ):
-                self._size = 0
             return {
                 "trajectories": trajectories,
                 "avg_trajectory_age": 0.5,
@@ -974,20 +949,11 @@ class StubAsyncTrajectoryCollector:
     Actor methods expose MagicMocks with a ``remote`` attribute.
     """
 
-    def __init__(self, status=None, health_side_effect=None, status_sequence=None):
-        self._status = status or {
-            "running": True,
-            "data_exhausted": False,
-            "errored": False,
-            "inflight_workers": 0,
-        }
-        self._status_sequence = list(status_sequence or [])
+    def __init__(self, health_side_effect=None):
         self.check_health = MagicMock()
         self.check_health.remote = MagicMock(
             return_value=None, side_effect=health_side_effect
         )
-        self._restore_rollouts_state = MagicMock()
-        self._restore_rollouts_state.remote = MagicMock(return_value=None)
 
     @property
     def start_collection(self):
@@ -1057,19 +1023,6 @@ class StubAsyncTrajectoryCollector:
         return mock
 
     @property
-    def get_status(self):
-        """Return collector lifecycle state for buffer-starvation checks."""
-        mock = MagicMock()
-
-        def next_status():
-            if self._status_sequence:
-                self._status = self._status_sequence.pop(0)
-            return dict(self._status)
-
-        mock.remote = MagicMock(side_effect=next_status)
-        return mock
-
-    @property
     def get_dataloader_state(self):
         """Return a remote-callable mock yielding a checkpointable dataloader state.
 
@@ -1079,32 +1032,6 @@ class StubAsyncTrajectoryCollector:
         mock = MagicMock()
         mock.remote = MagicMock(return_value={})
         return mock
-
-    @property
-    def get_checkpoint_state(self):
-        """Return one remote-callable collector checkpoint snapshot."""
-        mock = MagicMock()
-        mock.remote = MagicMock(
-            return_value=(
-                {},
-                {
-                    NEXT_NEMO_GYM_TASK_INDEX_KEY: 0,
-                    _ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: 0,
-                },
-                True,
-            )
-        )
-        return mock
-
-    @property
-    def finish_checkpoint_state(self):
-        mock = MagicMock()
-        mock.remote = MagicMock(return_value=None)
-        return mock
-
-    @property
-    def restore_rollouts_state(self):
-        return self._restore_rollouts_state
 
     @property
     def get_rollouts_state(self):
@@ -1119,8 +1046,6 @@ def mock_async_grpo_infrastructure(
     mock_rollout_metrics,
     seq_logprob_error_result=None,
     collector_health_side_effect=None,
-    stub_buffer=None,
-    stub_collector=None,
 ):
     """
     Context manager that mocks all async GRPO infrastructure (Ray actors, venv, etc).
@@ -1132,16 +1057,14 @@ def mock_async_grpo_infrastructure(
     stack = ExitStack()
 
     # Create stub instances with mock data
-    if stub_buffer is None:
-        stub_buffer = StubReplayBuffer(
-            initial_size=10,
-            mock_batch=mock_batch,
-            mock_rollout_metrics=mock_rollout_metrics,
-        )
-    if stub_collector is None:
-        stub_collector = StubAsyncTrajectoryCollector(
-            health_side_effect=collector_health_side_effect
-        )
+    stub_buffer = StubReplayBuffer(
+        initial_size=10,
+        mock_batch=mock_batch,
+        mock_rollout_metrics=mock_rollout_metrics,
+    )
+    stub_collector = StubAsyncTrajectoryCollector(
+        health_side_effect=collector_health_side_effect
+    )
 
     # Patch venv creation
     stack.enter_context(
@@ -1171,12 +1094,11 @@ def mock_async_grpo_infrastructure(
             mock_collector_cls,
         )
     )
-    stack.mock_collector_cls = mock_collector_cls
 
     # Patch ray.get to return values from our stubs (not remote refs)
     def mock_ray_get(ref):
         # If it's already a plain value (from our stubs), return it
-        if isinstance(ref, (int, str, dict, list, tuple)):
+        if isinstance(ref, (int, str, dict, list)):
             return ref
         # If it's a MagicMock, return a default response
         return None
@@ -2491,7 +2413,7 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
 
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_epochs = 1
-    master_config.grpo.max_num_steps = -1
+    master_config.grpo.max_num_steps = 100
     master_config.grpo.val_period = 0
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
@@ -2543,125 +2465,6 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
 
     checkpointer.begin_finalization.assert_called_once()
     checkpointer.shutdown.assert_called_once()
-
-
-def test_sync_grpo_positive_limit_rejects_early_dataset_exhaustion(
-    mock_grpo_components,
-):
-    master_config = mock_grpo_components["master_config"]
-    master_config.grpo.max_num_epochs = 1
-    master_config.grpo.max_num_steps = 100
-    master_config.grpo.val_period = 0
-    master_config.grpo.val_at_start = False
-    master_config.grpo.val_at_end = False
-    master_config.grpo.use_dynamic_sampling = False
-
-    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
-    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
-    with (
-        _patched_logprob_phase(mock_grpo_components["policy"]),
-        patch(
-            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
-            return_value=(mock_batch, mock_rollout_metrics),
-        ),
-        patch(
-            "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
-            return_value=(mock_batch, mock_rollout_metrics),
-        ),
-        patch(
-            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
-            return_value=_mock_seq_logprob_error_result(),
-        ),
-        pytest.raises(RuntimeError, match="before reaching grpo.max_num_steps=100"),
-    ):
-        grpo_train(
-            mock_grpo_components["policy"],
-            _mock_policy_generation(),
-            mock_grpo_components["train_dataloader"],
-            mock_grpo_components["val_dataloader"],
-            mock_grpo_components["tokenizer"],
-            mock_grpo_components["loss_fn"],
-            mock_grpo_components["task_to_env"],
-            mock_grpo_components["val_task_to_env"],
-            mock_grpo_components["logger"],
-            mock_grpo_components["checkpointer"],
-            _initial_grpo_save_state(),
-            master_config,
-        )
-
-
-@pytest.mark.parametrize(
-    ("completed_steps", "max_num_steps", "expected"),
-    [
-        (0, -1, False),
-        (1_000_000, -1, False),
-        (1, 2, False),
-        (2, 2, True),
-    ],
-)
-def test_step_limit_reached_supports_unlimited(
-    completed_steps, max_num_steps, expected
-):
-    assert _step_limit_reached(completed_steps, max_num_steps) is expected
-
-
-@pytest.mark.parametrize("max_num_steps", [0, -2])
-def test_grpo_config_rejects_invalid_step_limits(max_num_steps):
-    with pytest.raises(ValueError, match="max_num_steps must be -1 or a positive"):
-        GRPOConfig(max_num_steps=max_num_steps)
-
-
-@pytest.mark.parametrize("max_num_steps", [0, -2])
-def test_step_limit_helper_rejects_invalid_limits(max_num_steps):
-    with pytest.raises(ValueError, match="max_num_steps must be -1 or a positive"):
-        _step_limit_reached(0, max_num_steps)
-
-
-def test_unlimited_step_progress_labels_do_not_show_negative_denominator():
-    assert _step_progress_label(3, -1) == "3 (unlimited)"
-    assert _step_progress_label(3, -1, epoch_length=10) == "3/10"
-
-
-@pytest.mark.parametrize(
-    ("max_num_steps", "max_num_epochs", "train_steps_per_epoch", "expected"),
-    [
-        (-1, 2, 10, 20),
-        (3, 2, 10, 3),
-        (30, 2, 10, 20),
-    ],
-)
-def test_resolve_megatron_train_iters_uses_finite_dataset_horizon(
-    max_num_steps,
-    max_num_epochs,
-    train_steps_per_epoch,
-    expected,
-):
-    assert (
-        _resolve_megatron_train_iters(
-            max_num_steps, max_num_epochs, train_steps_per_epoch
-        )
-        == expected
-    )
-
-
-@pytest.mark.parametrize(
-    ("max_num_steps", "max_num_epochs", "train_steps_per_epoch"),
-    [
-        (0, 1, 10),
-        (-2, 1, 10),
-        (-1, 0, 10),
-        (-1, 1, 0),
-    ],
-)
-def test_resolve_megatron_train_iters_rejects_invalid_horizons(
-    max_num_steps,
-    max_num_epochs,
-    train_steps_per_epoch,
-):
-    with pytest.raises(ValueError):
-        _resolve_megatron_train_iters(
-            max_num_steps, max_num_epochs, train_steps_per_epoch
-        )
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
@@ -3523,10 +3326,10 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
 )  # Only test sync version for epochs (async uses steps)
 def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_epochs is reached"""
-    # Disable the step cap and rely only on finite epoch completion.
+    # Set max epochs to 2 and max steps to a large number
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_epochs = 2
-    master_config.grpo.max_num_steps = -1
+    master_config.grpo.max_num_steps = 100
 
     grpo_save_state = _initial_grpo_save_state()
 
@@ -3570,366 +3373,6 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
 
     # Verify we trained for exactly two epochs (20 batches)
     assert mock_grpo_components["policy"].train.call_count == 20
-
-
-@pytest.mark.parametrize("delayed_exhaustion", [False, True])
-def test_async_grpo_unlimited_stops_cleanly_on_data_exhaustion(
-    mock_grpo_components,
-    tmp_path,
-    delayed_exhaustion,
-):
-    """An uncapped async run validates and checkpoints its final finite step."""
-    master_config = mock_grpo_components["master_config"]
-    master_config.grpo.max_num_steps = -1
-    master_config.grpo.max_num_epochs = 1
-    master_config.grpo.val_period = 0
-    master_config.grpo.val_at_start = False
-    master_config.grpo.val_at_end = True
-    master_config.policy["generation"]["colocated"]["enabled"] = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 100
-    master_config.checkpointing["metric_name"] = None
-    checkpointer = mock_grpo_components["checkpointer"]
-    checkpointer.init_tmp_checkpoint.return_value = str(tmp_path / "checkpoint")
-    checkpointer.checkpoint_dir = tmp_path
-
-    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
-    rollout_metrics = {
-        "mean_gen_tokens_per_sample": 10.0,
-        "max_gen_tokens": 20,
-        "min_gen_tokens": 5,
-    }
-    stub_buffer = StubReplayBuffer(
-        initial_size=10,
-        mock_batch=mock_batch,
-        mock_rollout_metrics=rollout_metrics,
-        samples_before_exhaustion=1,
-    )
-    running_status = {
-        "running": True,
-        "data_exhausted": False,
-        "errored": False,
-        "inflight_workers": 0,
-    }
-    exhausted_status = {
-        "running": False,
-        "data_exhausted": True,
-        "errored": False,
-        "inflight_workers": 0,
-    }
-    stub_collector = StubAsyncTrajectoryCollector(
-        status=exhausted_status,
-        status_sequence=(
-            [running_status, running_status, exhausted_status]
-            if delayed_exhaustion
-            else None
-        ),
-    )
-
-    with (
-        mock_async_grpo_infrastructure(
-            mock_batch,
-            rollout_metrics,
-            stub_buffer=stub_buffer,
-            stub_collector=stub_collector,
-        ),
-        patch(
-            "nemo_rl.algorithms.grpo.validate",
-            return_value=({"accuracy": 0.75}, {}),
-        ) as mock_validate,
-        patch("nemo_rl.algorithms.grpo.torch.save"),
-    ):
-        async_grpo_train(
-            mock_grpo_components["policy"],
-            _mock_policy_generation(),
-            mock_grpo_components["train_dataloader"],
-            mock_grpo_components["val_dataloader"],
-            mock_grpo_components["tokenizer"],
-            mock_grpo_components["loss_fn"],
-            mock_grpo_components["task_to_env"],
-            mock_grpo_components["val_task_to_env"],
-            mock_grpo_components["logger"],
-            checkpointer,
-            _initial_grpo_save_state(),
-            master_config,
-        )
-
-    assert mock_grpo_components["policy"].train.call_count == 1
-    mock_validate.assert_called_once()
-    checkpointer.init_tmp_checkpoint.assert_called_once()
-    assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 1
-
-
-def test_async_grpo_resume_trains_final_restored_batch_without_lookahead(
-    mock_grpo_components,
-    tmp_path,
-):
-    class FinalStepReplayBuffer(StubReplayBuffer):
-        @property
-        def has_complete_batch(self):
-            mock = MagicMock()
-            mock.remote = MagicMock(
-                side_effect=lambda target_step, num_prompts_per_step, *_args: (
-                    target_step == 3 and self._size >= num_prompts_per_step
-                )
-            )
-            return mock
-
-    checkpoint_path = tmp_path / "step_3"
-    checkpoint_path.mkdir()
-    (checkpoint_path / "replay_buffer.pt").write_bytes(b"checkpoint")
-    torch.save(
-        {
-            NEXT_NEMO_GYM_TASK_INDEX_KEY: 8,
-            _ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: 0,
-        },
-        checkpoint_path / "rollouts.pt",
-    )
-    checkpointer = mock_grpo_components["checkpointer"]
-    checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
-    checkpointer.init_tmp_checkpoint.return_value = str(tmp_path / "save")
-    checkpointer.checkpoint_dir = tmp_path
-
-    master_config = mock_grpo_components["master_config"]
-    master_config.grpo.max_num_steps = -1
-    master_config.grpo.max_num_epochs = 1
-    master_config.grpo.val_period = 0
-    master_config.grpo.val_at_start = False
-    master_config.grpo.val_at_end = False
-    master_config.policy["generation"]["colocated"]["enabled"] = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 100
-    master_config.checkpointing["metric_name"] = None
-
-    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
-    rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
-    stub_buffer = FinalStepReplayBuffer(
-        initial_size=10,
-        mock_batch=mock_batch,
-        mock_rollout_metrics=rollout_metrics,
-        samples_before_exhaustion=1,
-    )
-    stub_collector = StubAsyncTrajectoryCollector(
-        status={
-            "running": False,
-            "data_exhausted": True,
-            "errored": False,
-            "inflight_workers": 0,
-        }
-    )
-    save_state = _initial_grpo_save_state()
-    save_state.current_step = 3
-
-    with (
-        mock_async_grpo_infrastructure(
-            mock_batch,
-            rollout_metrics,
-            stub_buffer=stub_buffer,
-            stub_collector=stub_collector,
-        ),
-        patch("nemo_rl.algorithms.grpo.torch.save"),
-    ):
-        async_grpo_train(
-            mock_grpo_components["policy"],
-            _mock_policy_generation(),
-            mock_grpo_components["train_dataloader"],
-            mock_grpo_components["val_dataloader"],
-            mock_grpo_components["tokenizer"],
-            mock_grpo_components["loss_fn"],
-            mock_grpo_components["task_to_env"],
-            mock_grpo_components["val_task_to_env"],
-            mock_grpo_components["logger"],
-            checkpointer,
-            save_state,
-            master_config,
-        )
-
-    assert mock_grpo_components["policy"].train.call_count == 1
-
-
-def test_async_grpo_completed_checkpoint_exits_without_collecting(
-    mock_grpo_components,
-    tmp_path,
-):
-    checkpoint_path = tmp_path / "step_3"
-    checkpoint_path.mkdir()
-    torch.save(
-        {
-            NEXT_NEMO_GYM_TASK_INDEX_KEY: 8,
-            _ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: 1,
-        },
-        checkpoint_path / "rollouts.pt",
-    )
-    checkpointer = mock_grpo_components["checkpointer"]
-    checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
-
-    master_config = mock_grpo_components["master_config"]
-    master_config.grpo.max_num_steps = -1
-    master_config.grpo.max_num_epochs = 1
-    master_config.policy["generation"]["colocated"]["enabled"] = False
-    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
-    rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
-    stub_buffer = StubReplayBuffer(
-        initial_size=0,
-        mock_batch=mock_batch,
-        mock_rollout_metrics=rollout_metrics,
-    )
-
-    with mock_async_grpo_infrastructure(
-        mock_batch,
-        rollout_metrics,
-        stub_buffer=stub_buffer,
-    ):
-        async_grpo_train(
-            mock_grpo_components["policy"],
-            _mock_policy_generation(),
-            mock_grpo_components["train_dataloader"],
-            mock_grpo_components["val_dataloader"],
-            mock_grpo_components["tokenizer"],
-            mock_grpo_components["loss_fn"],
-            mock_grpo_components["task_to_env"],
-            mock_grpo_components["val_task_to_env"],
-            mock_grpo_components["logger"],
-            checkpointer,
-            _initial_grpo_save_state(),
-            master_config,
-        )
-
-    mock_grpo_components["policy"].train.assert_not_called()
-    checkpointer.shutdown.assert_called_once()
-
-
-def test_async_grpo_restores_epoch_count_into_collector(
-    mock_grpo_components,
-    tmp_path,
-):
-    checkpoint_path = tmp_path / "step_0"
-    checkpoint_path.mkdir()
-    torch.save(
-        {
-            NEXT_NEMO_GYM_TASK_INDEX_KEY: 9,
-            _ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: 3,
-        },
-        checkpoint_path / "rollouts.pt",
-    )
-    checkpointer = mock_grpo_components["checkpointer"]
-    checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
-    checkpointer.init_tmp_checkpoint.return_value = str(tmp_path / "save")
-    checkpointer.checkpoint_dir = tmp_path
-
-    master_config = mock_grpo_components["master_config"]
-    master_config.grpo.max_num_steps = 1
-    master_config.grpo.max_num_epochs = 5
-    master_config.grpo.val_period = 0
-    master_config.grpo.val_at_start = False
-    master_config.grpo.val_at_end = False
-    master_config.policy["generation"]["colocated"]["enabled"] = False
-    master_config.checkpointing["metric_name"] = None
-    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
-    rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
-    infrastructure = mock_async_grpo_infrastructure(mock_batch, rollout_metrics)
-
-    with infrastructure, patch("nemo_rl.algorithms.grpo.torch.save"):
-        async_grpo_train(
-            mock_grpo_components["policy"],
-            _mock_policy_generation(),
-            mock_grpo_components["train_dataloader"],
-            mock_grpo_components["val_dataloader"],
-            mock_grpo_components["tokenizer"],
-            mock_grpo_components["loss_fn"],
-            mock_grpo_components["task_to_env"],
-            mock_grpo_components["val_task_to_env"],
-            mock_grpo_components["logger"],
-            checkpointer,
-            _initial_grpo_save_state(),
-            master_config,
-        )
-
-    collector_kwargs = (
-        infrastructure.mock_collector_cls.options.return_value.remote.call_args.kwargs
-    )
-    assert collector_kwargs["next_nemo_gym_task_index"] == 9
-    assert "epochs_completed" not in collector_kwargs
-    stub_collector = (
-        infrastructure.mock_collector_cls.options.return_value.remote.return_value
-    )
-    stub_collector.restore_rollouts_state.remote.assert_called_once_with(
-        {
-            NEXT_NEMO_GYM_TASK_INDEX_KEY: 9,
-            _ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: 3,
-        }
-    )
-
-
-def test_async_grpo_initial_refit_precedes_trajectory_collection(
-    mock_grpo_components,
-):
-    """The collector must not observe the dummy-loaded generation model."""
-    events = []
-
-    class RecordingTrajectoryCollector(StubAsyncTrajectoryCollector):
-        @property
-        def start_collection(self):
-            mock = MagicMock()
-
-            def record_start(*_args, **_kwargs):
-                events.append("start_collection")
-                return MagicMock()
-
-            mock.remote = MagicMock(side_effect=record_start)
-            return mock
-
-    master_config = mock_grpo_components["master_config"]
-    master_config.grpo.max_num_steps = 1
-    master_config.grpo.max_num_epochs = 1
-    master_config.grpo.val_period = 0
-    master_config.grpo.val_at_start = False
-    master_config.grpo.val_at_end = False
-    master_config.policy["generation"]["colocated"]["enabled"] = False
-
-    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
-    rollout_metrics = {
-        "mean_gen_tokens_per_sample": 10.0,
-        "max_gen_tokens": 20,
-        "min_gen_tokens": 5,
-    }
-    stub_buffer = StubReplayBuffer(
-        initial_size=10,
-        mock_batch=mock_batch,
-        mock_rollout_metrics=rollout_metrics,
-    )
-    stub_collector = RecordingTrajectoryCollector()
-
-    def record_refit(*_args, **_kwargs):
-        events.append("refit")
-        return {}
-
-    with mock_async_grpo_infrastructure(
-        mock_batch,
-        rollout_metrics,
-        stub_buffer=stub_buffer,
-        stub_collector=stub_collector,
-    ):
-        with patch(
-            "nemo_rl.algorithms.grpo.refit_policy_generation",
-            side_effect=record_refit,
-        ):
-            async_grpo_train(
-                mock_grpo_components["policy"],
-                _mock_policy_generation(),
-                mock_grpo_components["train_dataloader"],
-                mock_grpo_components["val_dataloader"],
-                mock_grpo_components["tokenizer"],
-                mock_grpo_components["loss_fn"],
-                mock_grpo_components["task_to_env"],
-                mock_grpo_components["val_task_to_env"],
-                mock_grpo_components["logger"],
-                mock_grpo_components["checkpointer"],
-                _initial_grpo_save_state(),
-                master_config,
-            )
-
-    assert events[:2] == ["refit", "start_collection"]
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])

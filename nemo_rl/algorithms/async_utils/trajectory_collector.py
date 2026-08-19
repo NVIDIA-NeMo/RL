@@ -51,14 +51,6 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 )
 from nemo_rl.utils.timer import ThreadSafeTimer
 
-_ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY = "async_rollout_epochs_completed"
-
-
-def get_rollout_epochs_completed(state: dict[str, int] | None) -> int:
-    """Read the collector-owned epoch counter from a checkpoint state."""
-    return int((state or {}).get(_ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY, 0))
-
-
 TokenizerType = PreTrainedTokenizerBase
 _MAX_NEMO_GYM_STREAM_RETRIES = 3
 _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
@@ -139,12 +131,6 @@ class AsyncTrajectoryCollector:
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
         self._next_nemo_gym_task_index = next_nemo_gym_task_index
-        self._epochs_completed = 0
-        # Keep the dataloader cursor and the collector counters that describe
-        # that cursor in one checkpoint-consistent state transition.
-        self._checkpoint_state_lock: _threading.RLock = _threading.RLock()
-        self._batch_dispatch_done = _threading.Event()
-        self._batch_dispatch_done.set()
 
         # Timer for efficiency metrics
         self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
@@ -299,22 +285,14 @@ class AsyncTrajectoryCollector:
 
     def _collection_loop(self):
         """Run the collection loop in background thread."""
+        dataloader_exhausted = False
         if self.dataloader is None:
             raise RuntimeError(
                 "start_collection must set a dataloader before collection"
             )
         dataloader = self.dataloader
-        completed_all_epochs = False
         try:
-            max_num_epochs = self.master_config.grpo.max_num_epochs
-            if max_num_epochs > 0 and self._epochs_completed >= max_num_epochs:
-                completed_all_epochs = True
-                print(
-                    "🏁 Trajectory collection checkpoint already completed all "
-                    f"{max_num_epochs} configured epochs"
-                )
-            data_iter = iter(dataloader) if not completed_all_epochs else None
-            while self.running and not completed_all_epochs:
+            for batch in dataloader:
                 if not self.running:
                     break
 
@@ -360,42 +338,10 @@ class AsyncTrajectoryCollector:
                 if not self.running:
                     break
 
-                batch = None
-                with self._checkpoint_state_lock:
-                    # A checkpoint may request a pause after the outer event
-                    # check but before this iterator boundary.
-                    if not self._manual_pause_cleared.is_set():
-                        continue
-                    assert data_iter is not None
-                    try:
-                        batch = next(data_iter)
-                    except StopIteration:
-                        self._epochs_completed += 1
-                        if (
-                            max_num_epochs > 0
-                            and self._epochs_completed >= max_num_epochs
-                        ):
-                            completed_all_epochs = True
-                            print(
-                                "🏁 Trajectory collection finished all "
-                                f"{max_num_epochs} configured epochs"
-                            )
-                            break
-                        next_epoch = self._epochs_completed + 1
-                        print(
-                            f"🔁 Dataset pass {self._epochs_completed} complete; "
-                            f"starting epoch {next_epoch}"
-                        )
-                        data_iter = iter(dataloader)
-                        continue
-
-                    if not self.running:
-                        break
-                    self._batch_dispatch_done.clear()
-                try:
-                    self._process_batch(batch)
-                finally:
-                    self._batch_dispatch_done.set()
+                self._process_batch(batch)
+            else:
+                # for-loop completed without break → dataloader iterator exhausted
+                dataloader_exhausted = True
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
@@ -404,22 +350,16 @@ class AsyncTrajectoryCollector:
             traceback.print_exc()
             self.collection_failed = True
         finally:
-            self._batch_dispatch_done.set()
-            # Keep ``running`` true while the final epoch's prompt-group workers
-            # drain. Their buffer enqueue loop uses this flag, so clearing it
-            # first silently drops the tail of the dataset.
-            if completed_all_epochs and self._inflight_threads:
-                print("⏳ Waiting for final in-flight trajectory groups to complete...")
-                self.wait_for_pending_generations()
-            if completed_all_epochs and not self.collection_failed:
+            self.running = False
+            if dataloader_exhausted:
                 self.data_exhausted = True
                 print(
-                    "🏁 Trajectory collection exhausted the configured dataset "
-                    f"after {self._epochs_completed} epochs"
+                    "❌ Trajectory collection stopped: dataloader exhausted "
+                    "(max_num_epochs reached). No more data available for generation. "
+                    "Increase max_num_epochs or use a larger dataset."
                 )
             else:
                 print("🛑 Trajectory collection stopped")
-            self.running = False
 
     def _stamp_nemo_gym_task_indices(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Assign one stable, monotonic task index to every prompt in a batch."""
@@ -698,10 +638,9 @@ class AsyncTrajectoryCollector:
 
     def get_dataloader_state(self) -> dict:
         """Get the current dataloader state for checkpointing."""
-        with self._checkpoint_state_lock:
-            if self.dataloader is not None:
-                return self.dataloader.state_dict()
-            return {}
+        if self.dataloader is not None:
+            return self.dataloader.state_dict()
+        return {}
 
     def get_efficiency_metrics(self) -> dict[str, float]:
         """Return accumulated efficiency metrics (sum of durations per category).
@@ -724,47 +663,7 @@ class AsyncTrajectoryCollector:
 
     def get_rollouts_state(self) -> dict[str, int]:
         """Get collector-side rollout state for checkpointing."""
-        with self._checkpoint_state_lock:
-            return {
-                NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index,
-                _ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: self._epochs_completed,
-            }
-
-    def restore_rollouts_state(self, state: dict[str, int]) -> None:
-        """Restore collector-owned rollout counters before collection starts."""
-        if self.running:
-            raise RuntimeError("Cannot restore rollout state after collection starts")
-        self._epochs_completed = int(state.get(_ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY, 0))
-
-    def get_checkpoint_state(self) -> tuple[dict, dict[str, int], bool]:
-        """Pause at a batch boundary and return one restart-consistent snapshot."""
-        resume_after_snapshot = self._manual_pause_cleared.is_set()
-        self._manual_pause_cleared.clear()
-        try:
-            # Cross the iterator lock first, then wait for any batch already
-            # fetched to finish dispatching and its rollout workers to drain.
-            with self._checkpoint_state_lock:
-                pass
-            self._batch_dispatch_done.wait()
-            self.wait_for_pending_generations()
-            with self._checkpoint_state_lock:
-                dataloader_state = (
-                    self.dataloader.state_dict() if self.dataloader is not None else {}
-                )
-                rollouts_state = {
-                    NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index,
-                    _ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: self._epochs_completed,
-                }
-                return dataloader_state, rollouts_state, resume_after_snapshot
-        except Exception:
-            if resume_after_snapshot:
-                self._manual_pause_cleared.set()
-            raise
-
-    def finish_checkpoint_state(self, resume_collection: bool) -> None:
-        """Release a checkpoint pause after all driver-side state is durable."""
-        if resume_collection:
-            self._manual_pause_cleared.set()
+        return {NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index}
 
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:

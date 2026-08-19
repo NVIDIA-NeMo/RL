@@ -49,14 +49,6 @@ pytestmark = pytest.mark.run_first
 register_omegaconf_resolvers()
 
 
-@pytest.fixture(autouse=True)
-def _required_video_recipe_paths(monkeypatch):
-    """Supply inert paths while resolving strict video recipes in config tests."""
-    monkeypatch.setenv("NEMO_RL_VIDEO_MEDIA_ROOT", "/tmp/nemo-rl-video-media")
-    monkeypatch.setenv("NEMO_RL_VIDEO_TRAIN_JSONL", "/tmp/train.jsonl")
-    monkeypatch.setenv("NEMO_RL_VIDEO_VAL_JSONL", "/tmp/validation.jsonl")
-
-
 def validate_config_section(
     section_config: Dict[str, Any],
     config_class: Type,

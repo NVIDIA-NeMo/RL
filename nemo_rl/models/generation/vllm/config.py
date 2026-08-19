@@ -30,6 +30,7 @@ VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_r
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
 
 
+# TODO(rohitrango): Move model-specific video fields behind ProcessorInterface.
 class VllmVideoConfig(BaseModel):
     """Video sampling contract shared by policy preprocessing and vLLM."""
 
@@ -211,6 +212,7 @@ def materialize_vllm_video_config(
     tokenizer_video_config = policy_config["tokenizer"].setdefault("video", {})
     tokenizer_video_config["num_frames"] = video_config.num_frames
 
+    # TODO(rohitrango): Let ProcessorInterface materialize model-specific data keys.
     data_defaults = data_config.setdefault("default", {})
     data_defaults.update(
         {

@@ -34,7 +34,7 @@ def test_video_grpo_recipes_preserve_unmasked_sync_and_async_contracts():
         materialize_vllm_video_config(policy, recipe["data"])
         vllm_cfg = policy["generation"]["vllm_cfg"]
 
-        assert grpo["max_num_steps"] == -1
+        assert grpo["max_num_steps"] == 1_000_000
         assert grpo["seq_logprob_error_threshold"] is None
         assert grpo["async_grpo"]["enabled"] is async_enabled
         assert policy["is_vlm"] is True

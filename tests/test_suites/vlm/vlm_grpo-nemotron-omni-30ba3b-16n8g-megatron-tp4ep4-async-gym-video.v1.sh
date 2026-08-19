@@ -64,14 +64,12 @@ uv run examples/nemo_gym/prepare_video_dataset.py convert \
     --input "$RAW_VALIDATION_PATH" \
     --output "$VALIDATION_PATH"
 
-export NEMO_RL_VIDEO_MEDIA_ROOT="$DATA_DIR"
-export NEMO_RL_VIDEO_TRAIN_JSONL="$TRAIN_PATH"
-export NEMO_RL_VIDEO_VAL_JSONL="$VALIDATION_PATH"
-
-# max_num_steps remains -1 from the recipe. The finite one-epoch fixture is the
-# only training terminator; no GRPO step cap or TMPE mask is introduced.
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config "$CONFIG_PATH" \
+    grpo.max_num_steps="$MAX_STEPS" \
+    policy.generation.vllm_kwargs.allowed_local_media_path="$DATA_DIR" \
+    data.train.data_path="$TRAIN_PATH" \
+    data.validation.data_path="$VALIDATION_PATH" \
     policy.generation.max_new_tokens=256 \
     logger.log_dir="$LOG_DIR" \
     logger.wandb_enabled=True \
@@ -90,7 +88,7 @@ RECORDED_STEP=$(jq -r \
     'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' \
     "$JSON_METRICS")
 if [[ "$RECORDED_STEP" -lt 1 ]]; then
-    echo "[ERROR] Expected at least one naturally completed training step"
+    echo "[ERROR] Expected at least one completed training step"
     exit 1
 fi
 

@@ -29,14 +29,10 @@ The two port patches ship their own suites. These cover the remaining two:
 """
 
 import ast
-import importlib.util
 import logging
 import os
-from pathlib import Path
 
-import numpy as np
 import pytest
-import torch
 
 from nemo_rl.models.generation.vllm import patches
 from tests.unit.models.generation.vllm_patch_source_utils import (
@@ -49,29 +45,6 @@ _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
 _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
-_VIDEO_SOURCE = "transformers_utils/processors/nano_nemotron_vl.py"
-_VIDEO_PATCH_FN = "_patch_vllm_nemotron_video_preprocessing"
-_VIDEO_MARKER = "# patched by nemo_rl: match policy-side video resize"
-
-
-class _Logger:
-    def __init__(self):
-        self.info_messages = []
-        self.warning_messages = []
-
-    def info(self, message, *args):
-        self.info_messages.append(message % args if args else message)
-
-    def warning(self, message, *args):
-        self.warning_messages.append(message % args if args else message)
-
-
-def _load_module(path: Path):
-    spec = importlib.util.spec_from_file_location("patched_nano_nemotron_vl", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 @pytest.fixture
@@ -89,20 +62,6 @@ def patched_radio_source(tmp_path, monkeypatch):
     copied = write_unpatched_copy(_RADIO_SOURCE, _RADIO_PATCH_FN, tmp_path / "radio.py")
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
     patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
-    return copied
-
-
-@pytest.fixture
-def patched_video_source(tmp_path, monkeypatch):
-    """The installed Nemotron video processor, unpatched then patched in tmp."""
-    copied = write_unpatched_copy(
-        _VIDEO_SOURCE, _VIDEO_PATCH_FN, tmp_path / "nano_nemotron_vl.py"
-    )
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
-    monkeypatch.setattr(patches, "version", lambda _package: "0.25.1")
-    patches._patch_vllm_nemotron_video_preprocessing(
-        logging.getLogger(__name__), required=True
-    )
     return copied
 
 
@@ -187,16 +146,6 @@ def test_radio_layerscale_patch_is_idempotent(patched_radio_source, monkeypatch)
     assert patched_radio_source.read_text() == before
 
 
-@pytest.mark.vllm
-def test_nemotron_video_patch_anchor_still_matches_installed_vllm(
-    patched_video_source,
-):
-    """Pin the stock vLLM 0.25.1 Nemotron video preprocessing source shape."""
-    content = patched_video_source.read_text()
-    assert _VIDEO_MARKER in content
-    ast.parse(content)
-
-
 def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, caplog):
     radio_source = tmp_path / "radio.py"
     radio_source.write_text("class RadioModel:\n    pass\n")
@@ -272,98 +221,3 @@ def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_pat
 
     assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
     assert ray_executor.read_text() == once
-
-
-def _stock_nemotron_video_preprocessing_source() -> str:
-    return """import numpy as np
-import torch
-
-def video_to_pixel_values(
-    video,
-    *,
-    size,
-    norm_mean=None,
-    norm_std=None,
-    dtype=torch.float32,
-):
-    tensor = torch.from_numpy(video)
-    return _bicubic_resize_and_normalize(tensor, size, norm_mean, norm_std, dtype)
-"""
-
-
-def test_nemotron_video_preprocessing_patch_matches_policy_resize(
-    tmp_path, monkeypatch
-):
-    processor = tmp_path / "nano_nemotron_vl.py"
-    processor.write_text(_stock_nemotron_video_preprocessing_source())
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _: str(processor))
-    monkeypatch.setattr(patches, "version", lambda _package: "0.25.1")
-    logger = _Logger()
-
-    patches._patch_vllm_nemotron_video_preprocessing(logger, required=True)
-    patched = processor.read_text()
-
-    assert "# patched by nemo_rl: match policy-side video resize" in patched
-    assert "np.ascontiguousarray(video)" in patched
-    assert not logger.warning_messages
-
-    module = _load_module(processor)
-    video = np.arange(2 * 3 * 5 * 3, dtype=np.uint8).reshape(2, 3, 5, 3)
-    norm_mean = torch.tensor([0.5, 0.4, 0.3]).view(3, 1, 1)
-    norm_std = torch.tensor([0.2, 0.3, 0.4]).view(3, 1, 1)
-    actual = module.video_to_pixel_values(
-        video,
-        size=(4, 6),
-        norm_mean=norm_mean,
-        norm_std=norm_std,
-        dtype=torch.float32,
-    )
-
-    expected = torch.from_numpy(video).permute(0, 3, 1, 2)
-    expected = torch.nn.functional.interpolate(
-        expected,
-        size=(4, 6),
-        mode="bicubic",
-        align_corners=False,
-        antialias=True,
-    )
-    expected = (expected / 255.0 - norm_mean) / norm_std
-    torch.testing.assert_close(actual, expected.contiguous(), rtol=0, atol=0)
-
-    patches._patch_vllm_nemotron_video_preprocessing(logger, required=True)
-    assert processor.read_text() == patched
-    assert logger.info_messages[-1] == (
-        "vLLM Nemotron video preprocessing patch already applied."
-    )
-
-
-def test_nemotron_video_preprocessing_patch_fails_loudly_when_required(
-    tmp_path, monkeypatch
-):
-    processor = tmp_path / "nano_nemotron_vl.py"
-    processor.write_text("# newer vLLM source\n")
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _: str(processor))
-    monkeypatch.setattr(patches, "version", lambda _package: "0.25.1")
-
-    with pytest.raises(RuntimeError, match="expected vLLM 0.25.1 source shape"):
-        patches._patch_vllm_nemotron_video_preprocessing(_Logger(), required=True)
-
-    assert processor.read_text() == "# newer vLLM source\n"
-
-
-def test_nemotron_video_preprocessing_patch_requires_exact_vllm_version(monkeypatch):
-    monkeypatch.setattr(patches, "version", lambda _package: "0.25.2")
-
-    with pytest.raises(RuntimeError, match="requires vLLM 0.25.1"):
-        patches._patch_vllm_nemotron_video_preprocessing(_Logger(), required=True)
-
-
-def test_nemotron_video_preprocessing_patch_warns_when_not_required(monkeypatch):
-    monkeypatch.setattr(patches, "version", lambda _package: "0.25.2")
-    logger = _Logger()
-
-    patches._patch_vllm_nemotron_video_preprocessing(logger, required=False)
-
-    assert logger.warning_messages == [
-        "The Nemotron video preprocessing patch requires vLLM 0.25.1; found 0.25.2."
-    ]

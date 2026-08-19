@@ -65,6 +65,7 @@ class RawDataset:
         self.data_config = data_config
         system_prompt_file = self.data_config.get("system_prompt_file", None)
         prompt_file = self.data_config.get("prompt_file", None)
+        # TODO(rohitrango): Source model-specific media keys from ProcessorInterface.
         self.task_spec = TaskDataSpec(
             task_name=self.task_name,
             prompt_file=prompt_file,

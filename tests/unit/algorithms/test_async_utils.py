@@ -52,9 +52,6 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
-from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
-
-_ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY = "async_rollout_epochs_completed"
 
 
 @ray.remote(num_cpus=0)
@@ -1159,7 +1156,6 @@ class TestAsyncTrajectoryCollector:
         self,
         replay_buffer=None,
         next_nemo_gym_task_index: int = 0,
-        epochs_completed: int = 0,
         max_generation_failures: int = 0,
     ):
         """Create a non-Ray collector instance for unit-testing local state."""
@@ -1172,7 +1168,7 @@ class TestAsyncTrajectoryCollector:
         if replay_buffer is None:
             replay_buffer = mock.MagicMock()
 
-        collector = collector_cls(
+        return collector_cls(
             policy_generation=mock_generation,
             tokenizer=mock_tokenizer,
             task_to_env=task_to_env,
@@ -1181,10 +1177,6 @@ class TestAsyncTrajectoryCollector:
             start_step=0,
             next_nemo_gym_task_index=next_nemo_gym_task_index,
         )
-        collector.restore_rollouts_state(
-            {_ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: epochs_completed}
-        )
-        return collector
 
     def _prime_collection_loop(self, collector):
         """Unblock every wait-event so _collection_loop() runs to completion."""
@@ -1216,37 +1208,6 @@ class TestAsyncTrajectoryCollector:
         assert status["data_exhausted"] is True
         assert status["errored"] is False
         assert status["running"] is False
-
-    def test_collection_loop_resumes_completed_epoch_count(self):
-        collector = self.create_local_collector(epochs_completed=1)
-        collector.master_config.grpo.max_num_epochs = 2
-        self._prime_collection_loop(collector)
-        processed = []
-        collector._process_batch = lambda batch: processed.append(batch)
-        collector.dataloader = [{"b": 0}]
-
-        collector._collection_loop()
-
-        assert processed == [{"b": 0}]
-        assert collector.data_exhausted is True
-        assert collector.get_rollouts_state() == {
-            NEXT_NEMO_GYM_TASK_INDEX_KEY: 0,
-            _ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: 2,
-        }
-
-    def test_collection_loop_does_not_repeat_already_completed_epochs(self):
-        collector = self.create_local_collector(epochs_completed=2)
-        collector.master_config.grpo.max_num_epochs = 2
-        self._prime_collection_loop(collector)
-        processed = []
-        collector._process_batch = lambda batch: processed.append(batch)
-        collector.dataloader = [{"b": 0}]
-
-        collector._collection_loop()
-
-        assert processed == []
-        assert collector.data_exhausted is True
-        assert collector.get_rollouts_state()[_ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY] == 2
 
     @pytest.mark.asyncio
     async def test_drain_payload_metrics_returns_collector_interval(self, monkeypatch):
@@ -1318,7 +1279,6 @@ class TestAsyncTrajectoryCollector:
             grpo=GRPOConfig.model_construct(
                 num_prompts_per_step=2,
                 num_generations_per_prompt=3,
-                max_num_epochs=1,
                 max_rollout_turns=1,
                 async_grpo=AsyncGRPOConfig.model_construct(
                     max_trajectory_age_steps=2,
@@ -1691,10 +1651,7 @@ class TestAsyncTrajectoryCollector:
             row["_ng_task_index"]
             for row in captured["repeated_batch"]["extra_env_info"]
         ] == [37, 37, 37, 38, 38, 38]
-        assert collector.get_rollouts_state() == {
-            NEXT_NEMO_GYM_TASK_INDEX_KEY: 39,
-            _ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: 0,
-        }
+        assert collector.get_rollouts_state() == {"next_ng_task_index": 39}
         assert target_weight not in collector._generating_targets
 
     def test_process_batch_non_gym_uses_one_batched_worker(self, monkeypatch):
@@ -1753,10 +1710,7 @@ class TestAsyncTrajectoryCollector:
             "_ng_task_index" not in row
             for row in captured["repeated_batch"]["extra_env_info"]
         )
-        assert collector.get_rollouts_state() == {
-            NEXT_NEMO_GYM_TASK_INDEX_KEY: 0,
-            _ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: 0,
-        }
+        assert collector.get_rollouts_state() == {"next_ng_task_index": 0}
         assert target_weight not in collector._generating_targets
 
     def test_native_batch_worker_enqueues_each_group(self, monkeypatch):
@@ -1994,33 +1948,9 @@ class TestAsyncTrajectoryCollector:
         assert target_weight not in collector._generating_targets
 
     def test_rollouts_state_retrieval(self):
-        collector = self.create_local_collector(
-            next_nemo_gym_task_index=123, epochs_completed=4
-        )
+        collector = self.create_local_collector(next_nemo_gym_task_index=123)
 
-        assert collector.get_rollouts_state() == {
-            NEXT_NEMO_GYM_TASK_INDEX_KEY: 123,
-            _ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: 4,
-        }
-
-    def test_checkpoint_state_snapshots_dataloader_and_rollout_counters_together(self):
-        collector = self.create_local_collector(
-            next_nemo_gym_task_index=123, epochs_completed=4
-        )
-        collector.dataloader = mock.MagicMock()
-        collector.dataloader.state_dict.return_value = {"samples_yielded": 8}
-
-        dataloader_state, rollouts_state, resume_collection = (
-            collector.get_checkpoint_state()
-        )
-
-        assert dataloader_state == {"samples_yielded": 8}
-        assert rollouts_state == {
-            NEXT_NEMO_GYM_TASK_INDEX_KEY: 123,
-            _ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: 4,
-        }
-        assert resume_collection is True
-        collector.finish_checkpoint_state(resume_collection)
+        assert collector.get_rollouts_state() == {"next_ng_task_index": 123}
 
     def test_dataloader_state_retrieval(self):
         """Test getting dataloader state for checkpointing."""

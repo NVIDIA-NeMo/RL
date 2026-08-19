@@ -786,8 +786,9 @@ def extract_multimodal_model_inputs(
 
     extracted: dict[str, PackedTensor | torch.Tensor] = {}
     multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    # Some remote-code processors omit these media inputs from their declared
-    # model_input_names even though their model forward requires them.
+    # TODO(rohitrango): Let ProcessorInterface declare model-specific media inputs.
+    # Some remote-code processors omit these inputs from model_input_names even
+    # though their model forward requires them.
     for key in (
         "imgs_sizes",
         "num_frames",

@@ -14,7 +14,6 @@
 
 import os
 from contextlib import contextmanager
-from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 
 
@@ -581,96 +580,12 @@ def ensure_vllm_source_compat() -> None:
     patch_logger = init_logger("vllm_patch")
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
-    _patch_vllm_nemotron_video_preprocessing(patch_logger, required=False)
-
-
-def _patch_vllm_nemotron_video_preprocessing(logger, *, required: bool) -> None:
-    """Match stock vLLM 0.25.1 video resizing to policy preprocessing.
-
-    The Nemotron policy path resizes uint8 frames before scaling them to
-    ``[0, 1]``. Stock vLLM converts frames to float32 first, which can
-    change bicubic rounding and create rollout/training logprob drift. Patch
-    the installed source so the same operation is used by every vLLM Ray
-    worker process without requiring a custom vLLM build.
-    """
-    try:
-        installed_version = version("vllm")
-    except PackageNotFoundError:
-        installed_version = None
-    if installed_version is None or installed_version.split("+", 1)[0] != "0.25.1":
-        message = (
-            "The Nemotron video preprocessing patch requires vLLM 0.25.1; "
-            f"found {installed_version or 'no vLLM installation'}."
-        )
-        if required:
-            raise RuntimeError(message)
-        logger.warning(message)
-        return
-
-    try:
-        file_to_patch = _get_vllm_file(
-            "transformers_utils/processors/nano_nemotron_vl.py"
-        )
-    except RuntimeError:
-        if required:
-            raise
-        logger.warning(
-            "Could not locate nano_nemotron_vl.py for video preprocessing patch."
-        )
-        return
-
-    marker = "# patched by nemo_rl: match policy-side video resize"
-    old_snippet = (
-        "    tensor = torch.from_numpy(video)\n"
-        "    return _bicubic_resize_and_normalize("
-        "tensor, size, norm_mean, norm_std, dtype)\n"
-    )
-    new_snippet = (
-        "    # patched by nemo_rl: match policy-side video resize\n"
-        "    tensor = torch.from_numpy(np.ascontiguousarray(video))"
-        ".permute(0, 3, 1, 2)\n"
-        "    if size is not None:\n"
-        "        tensor = torch.nn.functional.interpolate(\n"
-        "            tensor,\n"
-        "            size=size,\n"
-        '            mode="bicubic",\n'
-        "            align_corners=False,\n"
-        "            antialias=True,\n"
-        "        )\n"
-        "    tensor = tensor / 255.0\n"
-        "    if norm_mean is not None and norm_std is not None:\n"
-        "        tensor = (tensor - norm_mean) / norm_std\n"
-        "    return tensor.to(dtype=dtype).contiguous()\n"
-    )
-
-    with _locked_file_patch(file_to_patch) as (content, write_back):
-        if marker in content:
-            logger.info("vLLM Nemotron video preprocessing patch already applied.")
-            return
-
-        source_matches = (
-            content.count(old_snippet) == 1 and "import numpy as np" in content
-        )
-        if not source_matches:
-            message = (
-                "Could not apply vLLM Nemotron video preprocessing patch: "
-                f"expected vLLM 0.25.1 source shape was not found in {file_to_patch}."
-            )
-            if required:
-                raise RuntimeError(message)
-            logger.warning(message)
-            return
-
-        write_back(content.replace(old_snippet, new_snippet, 1))
-
-    logger.info("Successfully patched vLLM Nemotron video preprocessing.")
 
 
 def _apply_vllm_patches(
     py_executable: str,
     *,
     extra_env_vars: list[str] | None = None,
-    require_nemotron_video_patch: bool = False,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
     import vllm.envs as envs
@@ -719,6 +634,3 @@ def _apply_vllm_patches(
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
-    _patch_vllm_nemotron_video_preprocessing(
-        patch_logger, required=require_nemotron_video_patch
-    )

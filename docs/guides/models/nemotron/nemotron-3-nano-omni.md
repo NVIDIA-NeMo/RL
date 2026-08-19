@@ -192,12 +192,14 @@ to convert and validate source JSONL. Raw videos are decoded with TorchCodec;
 the runtime can also read externally prepared lossless frame manifests, but the
 converter currently emits raw-video rows only.
 
-Set the three recipe inputs before loading either config:
+The recipes contain explicit placeholder paths. Override them when launching:
 
 ```bash
-export NEMO_RL_VIDEO_MEDIA_ROOT=/absolute/path/to/video-data
-export NEMO_RL_VIDEO_TRAIN_JSONL=/absolute/path/to/train.jsonl
-export NEMO_RL_VIDEO_VAL_JSONL=/absolute/path/to/validation.jsonl
+uv run examples/nemo_gym/run_grpo_nemo_gym.py \
+  --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-2n8g-megatron-tp4ep4-gym-video.v1.yaml \
+  policy.generation.vllm_kwargs.allowed_local_media_path=/path/to/video-data \
+  data.train.data_path=/path/to/train.jsonl \
+  data.validation.data_path=/path/to/validation.jsonl
 ```
 
 Policy and rollout preprocessing must use the same sampling contract. The
@@ -220,14 +222,12 @@ The synchronous and asynchronous overlays are:
 - [16-node asynchronous recipe](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml)
 
 They require the corresponding Nemotron Omni support in Megatron Bridge and
-video request/token propagation in NeMo Gym. Rollout preprocessing is patched
-at runtime against stock vLLM 0.25.1; a custom vLLM fork is not required.
+video request/token propagation in NeMo Gym. Policy preprocessing numerically
+matches unmodified stock vLLM 0.25.1; a custom vLLM fork is not required.
 
-Both overlays set `grpo.max_num_steps: -1`, so training ends through the
-finite `grpo.max_num_epochs` dataset horizon rather than an artificial step cap.
-For Megatron this horizon also determines `train_iters`; non-constant learning
-rate schedules should therefore choose `max_num_epochs` deliberately. The
-recipes also leave
+Both overlays use a large positive `grpo.max_num_steps` value so it does not
+bind normal training. Training still follows the existing GRPO step-limit
+semantics. The recipes also leave
 `grpo.seq_logprob_error_threshold: null`: logged token multiplicative
 probability error (TMPE) is raw and no high-error sequence is masked. Interpret
 TMPE together with reward, loss, sequence length, and refit metrics; isolated

@@ -332,9 +332,6 @@ class BaseVllmGenerationWorker:
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
-            require_nemotron_video_patch=(
-                resolve_vllm_video_config(self.cfg) is not None
-            ),
         )
 
         # Skip model loading if we're not the model owner

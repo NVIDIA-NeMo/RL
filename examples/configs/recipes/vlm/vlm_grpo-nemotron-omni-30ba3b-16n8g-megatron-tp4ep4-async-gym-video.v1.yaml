@@ -2,7 +2,7 @@ defaults: ../../../nemo_gym/grpo_nanov3.yaml
 grpo:
   num_prompts_per_step: 4
   val_num_generations_per_prompt: 1
-  max_num_steps: -1
+  max_num_steps: 1000000
   val_period: 500
   val_batch_size: null
   seq_logprob_error_threshold: null
@@ -65,7 +65,7 @@ policy:
         chat_template_content_format: string
         reasoning_parser: nemotron_v3
     vllm_kwargs:
-      allowed_local_media_path: ${oc.env:NEMO_RL_VIDEO_MEDIA_ROOT}
+      allowed_local_media_path: /path/to/video-data
       mm_processor_cache_gb: 0
       max_num_seqs: 1
       limit_mm_per_prompt:
@@ -91,9 +91,9 @@ data:
     video_target_num_patches: 1024
     video_maintain_aspect_ratio: true
   train:
-    data_path: ${oc.env:NEMO_RL_VIDEO_TRAIN_JSONL}
+    data_path: /path/to/train.jsonl
   validation:
-    data_path: ${oc.env:NEMO_RL_VIDEO_VAL_JSONL}
+    data_path: /path/to/validation.jsonl
 env:
   should_log_nemo_gym_responses: false
   nemo_gym:

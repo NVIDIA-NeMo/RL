@@ -45,6 +45,14 @@ from nemo_rl.models.generation.vllm.video_utils import (
 
 
 _VideoConfigValue = TypeVar("_VideoConfigValue")
+_LOCAL_VIDEO_METADATA_KEYS = frozenset(
+    {
+        "_is_video_frame",
+        "_video_source",
+        "_video_frame_index",
+        "_video_fps",
+    }
+)
 
 
 def _require_video_config_value(
@@ -425,60 +433,6 @@ def _replace_cached_video_frames_with_native_video(
         raise ValueError("Failed to insert cached Gym video manifest.")
 
 
-def _ensure_vllm_video_placeholder_target(
-    nemo_gym_example: dict[str, Any],
-) -> None:
-    # Keep a token boundary after vLLM's literal replacement target. Some BPE
-    # tokenizers merge ``>\n`` into one token, so ``<video>\n`` does not contain
-    # the standalone token sequence vLLM searches for before its text fallback.
-    # A normal space keeps the target independently tokenized while preserving
-    # the same rendered prompt semantics.
-    video_target_prefix = "<video> "
-    input_items = nemo_gym_example.get("responses_create_params", {}).get("input", [])
-    if not isinstance(input_items, list):
-        return
-
-    for item in input_items:
-        if not isinstance(item, dict):
-            continue
-        content = item.get("content", "")
-        if isinstance(content, str) and "<video>" in content:
-            return
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, str) and "<video>" in part:
-                    return
-                if (
-                    isinstance(part, dict)
-                    and isinstance(part.get("text"), str)
-                    and "<video>" in part["text"]
-                ):
-                    return
-
-    for item in input_items:
-        if not isinstance(item, dict) or item.get("role") != "user":
-            continue
-        content = item.get("content", "")
-        if isinstance(content, str):
-            item["content"] = (
-                f"{video_target_prefix}{content}" if content else "<video>"
-            )
-            return
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if (
-                isinstance(part, dict)
-                and part.get("type") in ("input_text", "text")
-                and isinstance(part.get("text", ""), str)
-            ):
-                text = part.get("text", "")
-                part["text"] = f"{video_target_prefix}{text}" if text else "<video>"
-                return
-        content.append({"type": "input_text", "text": "<video>"})
-        return
-
-
 def _strip_local_media_metadata(nemo_gym_example: dict[str, Any]) -> None:
     input_items = nemo_gym_example.get("responses_create_params", {}).get("input", [])
     if not isinstance(input_items, list):
@@ -492,9 +446,8 @@ def _strip_local_media_metadata(nemo_gym_example: dict[str, Any]) -> None:
         for part in content:
             if not isinstance(part, dict):
                 continue
-            for key in list(part):
-                if key.startswith("_"):
-                    part.pop(key)
+            for key in _LOCAL_VIDEO_METADATA_KEYS:
+                part.pop(key, None)
 
 
 def _compute_dynamic_prompt_length(
@@ -727,7 +680,6 @@ def nemo_gym_example_to_video_datum_spec(
     if is_nemotron_video and video_path is None:
         _replace_cached_video_frames_with_native_video(extra_env_info)
     _strip_local_media_metadata(extra_env_info)
-    _ensure_vllm_video_placeholder_target(extra_env_info)
     # vLLM's native Nano-Nemotron processor consumes the video modality
     # directly and reads its temporal/dynamic-resolution settings from the
     # checkpoint config. Its constructor rejects the legacy ``video_as_images``

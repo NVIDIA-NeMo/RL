@@ -54,8 +54,6 @@ from nemo_rl.algorithms.grpo import (
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
     _resolve_logprob_skip_flags,
-    _step_limit_reached,
-    _step_progress_label,
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
     _validation_early_stop_message,
@@ -550,9 +548,7 @@ def grpo_train_sync(
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
 
-    while current_epoch < max_num_epochs and not _step_limit_reached(
-        total_steps, max_num_steps
-    ):
+    while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
         # 1-hop cross-iteration cache for dynamic_sampling: across
@@ -574,16 +570,12 @@ def grpo_train_sync(
 
             if master_config.data["use_multiple_dataloader"]:
                 print(
-                    f"\n{'=' * 25} Step "
-                    f"{_step_progress_label(current_step + 1, max_num_steps)} "
-                    f"{'=' * 25}",
+                    f"\n{'=' * 25} Step {current_step + 1}/{max_num_steps} {'=' * 25}",
                     flush=True,
                 )
             else:
                 print(
-                    f"\n{'=' * 25} Step "
-                    f"{_step_progress_label(current_step + 1, max_num_steps, epoch_length=len(wrapped_dataloader))} "
-                    f"{'=' * 25}",
+                    f"\n{'=' * 25} Step {current_step + 1}/{min(len(wrapped_dataloader), max_num_steps)} {'=' * 25}",
                     flush=True,
                 )
 
@@ -1005,7 +997,7 @@ def grpo_train_sync(
                 # ── Step-end TQ cleanup ────────────────────────────────
                 policy.finish_step(meta)
 
-                is_last_step = _step_limit_reached(total_steps + 1, max_num_steps)
+                is_last_step = total_steps + 1 >= max_num_steps
                 if not master_config.data["use_multiple_dataloader"]:
                     is_last_step = is_last_step or (
                         (current_epoch + 1 == max_num_epochs)
@@ -1390,7 +1382,7 @@ def grpo_train_sync(
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if _step_limit_reached(total_steps, max_num_steps):
+            if total_steps >= max_num_steps:
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(

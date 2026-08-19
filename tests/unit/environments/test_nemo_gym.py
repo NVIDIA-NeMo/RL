@@ -364,6 +364,7 @@ def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):
                         {
                             "type": "input_video",
                             "video_url": str(video_path),
+                            "_request_metadata": "keep",
                         },
                         {"type": "input_text", "text": "Describe the clip."},
                     ],
@@ -434,8 +435,9 @@ def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):
     assert user_message["num_frames"].as_tensor().tolist() == [4]
     assert user_message["imgs_sizes"].as_tensor().dtype == torch.int32
     extra_env_info = datum["extra_env_info"]
-    text = extra_env_info["responses_create_params"]["input"][0]["content"][1]["text"]
-    assert text.startswith("<video> ")
+    outbound_content = extra_env_info["responses_create_params"]["input"][0]["content"]
+    assert outbound_content[0]["_request_metadata"] == "keep"
+    assert outbound_content[1]["text"] == "Describe the clip."
     extra_body = json.loads(
         extra_env_info["responses_create_params"]["metadata"]["extra_body"]
     )
@@ -619,12 +621,18 @@ def test_video_datum_uses_cached_frames_without_decoding_video(monkeypatch, tmp_
     outbound_content = datum["extra_env_info"]["responses_create_params"]["input"][0][
         "content"
     ]
+    owned_metadata_keys = {
+        "_is_video_frame",
+        "_video_source",
+        "_video_frame_index",
+        "_video_fps",
+    }
     assert all(
-        not any(key.startswith("_") for key in part)
+        owned_metadata_keys.isdisjoint(part)
         for part in outbound_content
         if isinstance(part, dict)
     )
-    assert outbound_content[-1]["text"].startswith("<video> ")
+    assert outbound_content[-1]["text"] == "Describe the clip."
 
 
 def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path):
@@ -854,7 +862,7 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
             "type": "input_video",
             "video_url": {"url": "data:video/x-nemo-rl-cached-frames;base64,dGVzdA=="},
         },
-        {"type": "input_text", "text": "<video> Describe the clip."},
+        {"type": "input_text", "text": "Describe the clip."},
     ]
     extra_body = json.loads(outbound["metadata"]["extra_body"])
     assert extra_body == {"chat_template_kwargs": {"enable_thinking": True}}

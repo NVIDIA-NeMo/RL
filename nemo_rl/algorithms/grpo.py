@@ -86,7 +86,9 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
-from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
+from nemo_rl.experience.interfaces import (
+    NEXT_NEMO_GYM_TASK_INDEX_KEY,
+)
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
@@ -238,8 +240,6 @@ class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
     max_num_epochs: int = 1
-    # Positive values cap training steps. -1 disables the step cap so finite
-    # dataloaders stop naturally after max_num_epochs.
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
     normalize_rewards: bool = True
@@ -306,14 +306,6 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Emit exact-boundary and logical-vs-physical payload metrics.
     debug_payload_metrics: bool = False
 
-    @model_validator(mode="after")
-    def _validate_step_limit(self) -> "GRPOConfig":
-        if self.max_num_epochs <= 0:
-            raise ValueError("grpo.max_num_epochs must be a positive integer")
-        if self.max_num_steps != -1 and self.max_num_steps <= 0:
-            raise ValueError("grpo.max_num_steps must be -1 or a positive integer")
-        return self
-
 
 @dataclass
 class GRPOSaveState:
@@ -354,66 +346,6 @@ def _get_grpo_save_state(
         {key: value for key, value in loaded_state.items() if key in known_fields}
     )
     return GRPOSaveState(**state_values)
-
-
-def _step_limit_reached(completed_steps: int, max_num_steps: int) -> bool:
-    """Return whether a configured positive GRPO step limit was reached.
-
-    ``max_num_steps=-1`` means unlimited. Training then stops through its
-    natural lifecycle: epoch completion for synchronous GRPO and collector
-    exhaustion for asynchronous GRPO.
-    """
-    if max_num_steps == -1:
-        return False
-    if max_num_steps <= 0:
-        raise ValueError("grpo.max_num_steps must be -1 or a positive integer")
-    return completed_steps >= max_num_steps
-
-
-def _resolve_megatron_train_iters(
-    max_num_steps: int,
-    max_num_epochs: int,
-    train_steps_per_epoch: int,
-) -> int:
-    """Return a finite scheduler horizon for Megatron-backed GRPO.
-
-    ``max_num_steps=-1`` disables the GRPO loop's step cap, but Megatron still
-    requires a positive, finite ``train_iters`` value to construct its learning
-    rate scheduler. In that mode the finite dataset/epoch horizon is the
-    scheduler horizon.
-    """
-    dataset_train_iters = max_num_epochs * train_steps_per_epoch
-    if dataset_train_iters <= 0:
-        raise ValueError(
-            "GRPO requires at least one training iteration, got "
-            f"max_num_epochs={max_num_epochs} and "
-            f"train_steps_per_epoch={train_steps_per_epoch}."
-        )
-    if max_num_steps == -1:
-        return dataset_train_iters
-    if max_num_steps <= 0:
-        raise ValueError(
-            "grpo.max_num_steps must be -1 (unlimited) or a positive integer, "
-            f"got {max_num_steps}."
-        )
-    return min(max_num_steps, dataset_train_iters)
-
-
-def _step_progress_label(
-    current_step: int,
-    max_num_steps: int,
-    *,
-    epoch_length: Optional[int] = None,
-) -> str:
-    """Format a step label without presenting ``-1`` as a denominator."""
-    if max_num_steps > 0:
-        denominator = (
-            max_num_steps if epoch_length is None else min(epoch_length, max_num_steps)
-        )
-        return f"{current_step}/{denominator}"
-    if epoch_length is not None:
-        return f"{current_step}/{epoch_length}"
-    return f"{current_step} (unlimited)"
 
 
 class GRPOLoggerConfig(LoggerConfig):
@@ -1136,16 +1068,10 @@ def setup(
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = _resolve_megatron_train_iters(
+        total_train_iters = min(
             grpo_config.max_num_steps,
-            grpo_config.max_num_epochs,
-            train_sample_count,
+            grpo_config.max_num_epochs * train_sample_count,
         )
-        if grpo_config.max_num_steps == -1:
-            print(
-                "GRPO step cap is disabled; resolving Megatron scheduler "
-                f"train_iters to the finite dataset horizon ({total_train_iters})."
-            )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
         # When the user opts into recompute-after-refit on the megatron side,
@@ -2272,92 +2198,6 @@ def _write_latest_checkpoint_status(
         json.dump(status, f)
 
 
-def _save_async_grpo_checkpoint(
-    *,
-    step: int,
-    total_valid_tokens: Any,
-    consumed_samples: int,
-    train_metrics: dict[str, Any],
-    val_metrics: Optional[dict[str, Any]],
-    policy: ColocatablePolicyInterface,
-    trajectory_collector: Any,
-    replay_buffer: Any,
-    checkpointer: CheckpointManager,
-    grpo_save_state: GRPOSaveState,
-    master_config: MasterConfig,
-) -> None:
-    """Save all state required to resume async GRPO at a completed step."""
-    grpo_save_state.current_step = step
-    grpo_save_state.total_valid_tokens = total_valid_tokens
-    if val_metrics is not None:
-        grpo_save_state.val_reward = val_metrics["accuracy"]
-    elif hasattr(grpo_save_state, "val_reward"):
-        delattr(grpo_save_state, "val_reward")
-    grpo_save_state.consumed_samples = consumed_samples
-
-    full_metric_name = master_config.checkpointing["metric_name"]
-    if full_metric_name is not None:
-        assert full_metric_name.startswith("train:") or full_metric_name.startswith(
-            "val:"
-        ), (
-            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-            " If you are using an old config, update checkpointing.metric_name to the new format, "
-            "e.g. 'val_reward' -> 'val:accuracy'."
-        )
-        prefix, metric_name = full_metric_name.split(":", 1)
-        metrics_source = train_metrics if prefix == "train" else val_metrics
-        if not metrics_source:
-            warnings.warn(
-                f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
-                "This checkpoint will not be saved as top-k.",
-                stacklevel=2,
-            )
-            if hasattr(grpo_save_state, full_metric_name):
-                delattr(grpo_save_state, full_metric_name)
-        elif metric_name not in metrics_source:
-            raise ValueError(f"Metric {metric_name} not found in {prefix} metrics")
-        else:
-            setattr(
-                grpo_save_state,
-                full_metric_name,
-                metrics_source[metric_name],
-            )
-
-    checkpointer.finalize_pending()
-    print(f"Saving checkpoint for step {step}...")
-    checkpoint_path = str(
-        checkpointer.init_tmp_checkpoint(step, vars(grpo_save_state), master_config)
-    )
-    policy.save_checkpoint(
-        weights_path=os.path.join(checkpoint_path, "policy", "weights"),
-        optimizer_path=(
-            os.path.join(checkpoint_path, "policy", "optimizer")
-            if checkpointer.save_optimizer
-            else None
-        ),
-        tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
-        checkpointing_cfg=master_config.checkpointing,
-    )
-    actual_dataloader_state, rollouts_state, resume_collection = ray.get(
-        trajectory_collector.get_checkpoint_state.remote()
-    )
-    try:
-        torch.save(
-            actual_dataloader_state,
-            os.path.join(checkpoint_path, "train_dataloader.pt"),
-        )
-        _save_async_replay_buffer_checkpoint(replay_buffer, checkpoint_path)
-        torch.save(rollouts_state, os.path.join(checkpoint_path, "rollouts.pt"))
-    finally:
-        ray.get(trajectory_collector.finish_checkpoint_state.remote(resume_collection))
-    checkpointer.begin_finalization(
-        checkpoint_path,
-        wait_fn=policy.finalize_async_save,
-    )
-    _write_latest_checkpoint_status(checkpointer, last_checkpoint_step=step)
-
-
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
     """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
     if "nemo_gym" not in master_config.env:
@@ -2944,9 +2784,7 @@ def grpo_train(
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
 
-    while current_epoch < max_num_epochs and not _step_limit_reached(
-        total_steps, max_num_steps
-    ):
+    while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
         # batch cache is used for DAPO. We store prompts with non-zero standard deviation in this cache.
@@ -2963,16 +2801,12 @@ def grpo_train(
 
             if master_config.data["use_multiple_dataloader"]:
                 print(
-                    f"\n{'=' * 25} Step "
-                    f"{_step_progress_label(current_step + 1, max_num_steps)} "
-                    f"{'=' * 25}",
+                    f"\n{'=' * 25} Step {current_step + 1}/{max_num_steps} {'=' * 25}",
                     flush=True,
                 )
             else:
                 print(
-                    f"\n{'=' * 25} Step "
-                    f"{_step_progress_label(current_step + 1, max_num_steps, epoch_length=len(wrapped_dataloader))} "
-                    f"{'=' * 25}",
+                    f"\n{'=' * 25} Step {current_step + 1}/{min(len(wrapped_dataloader), max_num_steps)} {'=' * 25}",
                     flush=True,
                 )
 
@@ -3497,7 +3331,7 @@ def grpo_train(
                         # Set generation as stale to force refit with new scales
                         POLICY_GENERATION_STALE = True
 
-                is_last_step = _step_limit_reached(total_steps + 1, max_num_steps)
+                is_last_step = total_steps + 1 >= max_num_steps
                 if not master_config.data["use_multiple_dataloader"]:
                     is_last_step = is_last_step or (
                         (current_epoch + 1 == max_num_epochs)
@@ -3942,7 +3776,7 @@ def grpo_train(
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if _step_limit_reached(total_steps, max_num_steps):
+            if total_steps >= max_num_steps:
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
@@ -3960,13 +3794,6 @@ def grpo_train(
     # so without this the daemon finalization thread would be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
-    if max_num_steps != -1 and not _step_limit_reached(total_steps, max_num_steps):
-        raise RuntimeError(
-            "GRPO exhausted the configured dataset after "
-            f"{total_steps} steps before reaching grpo.max_num_steps="
-            f"{max_num_steps}. Increase grpo.max_num_epochs, use a larger "
-            "dataset, or set grpo.max_num_steps=-1 for natural exhaustion."
-        )
 
 
 def validate(
@@ -4294,9 +4121,6 @@ def async_grpo_train(
 
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
-    from nemo_rl.algorithms.async_utils.trajectory_collector import (
-        get_rollout_epochs_completed,
-    )
 
     timer = Timer(context={"worker": "driver"})
     training_wall_start = time.perf_counter()
@@ -4385,7 +4209,6 @@ def async_grpo_train(
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     replay_buffer_restore_metadata: dict[str, int] | None = None
-    restored_replay_buffer = False
     rollouts_state = None
     if last_checkpoint_path is not None:
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
@@ -4399,7 +4222,6 @@ def async_grpo_train(
                     max_age_steps=max_trajectory_age_steps,
                 )
             )
-            restored_replay_buffer = True
             print("✅ Replay buffer restored from checkpoint")
         else:
             print(
@@ -4418,43 +4240,6 @@ def async_grpo_train(
             (replay_buffer_restore_metadata or {}).get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0)
         ),
     )
-    async_rollout_epochs_completed = get_rollout_epochs_completed(rollouts_state)
-
-    configured_epochs_complete = (
-        master_config.grpo.max_num_epochs > 0
-        and async_rollout_epochs_completed >= master_config.grpo.max_num_epochs
-    )
-    restored_step_ready = ray.get(
-        replay_buffer.has_complete_batch.remote(
-            step, num_prompts_per_step, max_trajectory_age_steps
-        )
-    )
-    if _step_limit_reached(step, master_config.grpo.max_num_steps) or (
-        configured_epochs_complete and not restored_step_ready
-    ):
-        print(
-            "🏁 Restored async checkpoint already completed its configured "
-            "training horizon; no additional rollout collection is required."
-        )
-        checkpointer.shutdown()
-        ray.kill(replay_buffer)
-        for env_dict in (task_to_env, val_task_to_env):
-            if env_dict is None:
-                continue
-            for env in env_dict.values():
-                try:
-                    ray.get(env.shutdown.remote(), timeout=10)
-                except Exception:
-                    try:
-                        ray.kill(env)
-                    except Exception as error:
-                        print(f"Error shutting down environment: {error}")
-        try:
-            policy_generation.shutdown()
-        finally:
-            if policy is not policy_generation:
-                policy.shutdown()
-        return
 
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
@@ -4494,10 +4279,14 @@ def async_grpo_train(
         next_nemo_gym_task_index=next_nemo_gym_task_index,
         processor=processor,
     )
-    ray.get(trajectory_collector.restore_rollouts_state.remote(rollouts_state or {}))
+
+    # Start trajectory collection in background
+    collection_task = trajectory_collector.start_collection.remote(dataloader)
 
     # Ensure collector knows initial weight version
     trajectory_collector.set_weight_version.remote(weight_version)
+
+    print("📦 Started continuous background trajectory collection")
 
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, "
@@ -4505,9 +4294,6 @@ def async_grpo_train(
         f"max_generation_failures={max_generation_failures}"
     )
 
-    # The initial non-colocated refit must finish before rollout requests can
-    # reach the generation workers. Otherwise the collector can capture
-    # trajectories while the dummy-loaded vLLM model is only partially refit.
     print("⏳ Preparing policy generation for training...", flush=True)
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...", flush=True)
@@ -4524,7 +4310,7 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
-            raise
+            return
     else:
         print("🔄 Preparing policy generation for inference...")
         try:
@@ -4535,11 +4321,7 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
-            raise
-
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    print("📦 Started continuous background trajectory collection")
+            return
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -4621,7 +4403,6 @@ def async_grpo_train(
     )
     timer.start("init/total")
     wait_iterations = 0
-    max_num_steps = master_config.grpo.max_num_steps
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
         ray.get(trajectory_collector.check_health.remote())
@@ -4644,11 +4425,8 @@ def async_grpo_train(
             # the collector advances to targets starting at `step + 2`, leaving
             # `step + 1` permanently missing. Wait for the initial collector,
             # whose range includes both steps, to complete the lookahead first.
-            need_lookahead = (
-                restored_replay_buffer
-                and max_trajectory_age_steps > 0
-                and not _step_limit_reached(step + 1, max_num_steps)
-            )
+            max_num_steps = master_config.grpo.max_num_steps
+            need_lookahead = max_trajectory_age_steps > 0 and step + 1 < max_num_steps
             if need_lookahead:
                 next_step_ready = ray.get(
                     replay_buffer.has_complete_batch.remote(
@@ -4656,23 +4434,6 @@ def async_grpo_train(
                     )
                 )
                 if not next_step_ready:  # pragma: no cover
-                    collector_status = ray.get(trajectory_collector.get_status.remote())
-                    collector_stopped = (
-                        not collector_status["running"]
-                        and collector_status["inflight_workers"] == 0
-                    )
-                    if collector_status.get("errored", False) and collector_stopped:
-                        raise RuntimeError(
-                            "Trajectory collector failed while filling the async "
-                            f"resume lookahead. Collector status: {collector_status}."
-                        )
-                    if collector_status["data_exhausted"] and collector_stopped:
-                        print(
-                            f"  Pipeline barrier: collector exhausted after step "
-                            f"{step}; training the restored final batch without "
-                            f"lookahead step {step + 1}."
-                        )
-                        break
                     print(
                         f"  Pipeline barrier: step {step} ready but "
                         f"step {step + 1} not yet — waiting for lookahead fill "
@@ -4717,45 +4478,15 @@ def async_grpo_train(
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
-    natural_data_exhaustion = False
-    last_train_metrics: Optional[dict[str, Any]] = None
-    last_checkpoint_step: Optional[int] = None
-    last_validation_step: Optional[int] = None
-    last_val_metrics: Optional[dict[str, Any]] = None
-
-    def _collector_has_no_future_complete_batch(next_step: int) -> bool:
-        if max_num_steps != -1:
-            return False
-        collector_status = ray.get(trajectory_collector.get_status.remote())
-        collector_stopped = (
-            not collector_status["running"]
-            and collector_status["inflight_workers"] == 0
-        )
-        if collector_status.get("errored", False) and collector_stopped:
-            raise RuntimeError(
-                "Trajectory collector failed while determining the final async "
-                f"training step. Collector status: {collector_status}."
-            )
-        if not (collector_status["data_exhausted"] and collector_stopped):
-            return False
-        return not ray.get(
-            replay_buffer.has_complete_batch.remote(
-                next_step,
-                num_prompts_per_step,
-                max_trajectory_age_steps,
-            )
-        )
 
     # Main training loop
     try:
-        while not _step_limit_reached(step, max_num_steps):
+        while step < master_config.grpo.max_num_steps:
             ray.get(trajectory_collector.check_health.remote())
             refit_metrics: dict[str, float] = {}
             early_stop_message: Optional[str] = None
             print(
-                f"\n{'=' * 25} Step "
-                f"{_step_progress_label(step + 1, max_num_steps)} "
-                f"{'=' * 25}"
+                f"\n{'=' * 25} Step {step + 1}/{master_config.grpo.max_num_steps} {'=' * 25}"
             )
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
@@ -4841,31 +4572,20 @@ def async_grpo_train(
                         collector_status = ray.get(
                             trajectory_collector.get_status.remote()
                         )
-                        collector_stopped = (
-                            not collector_status["running"]
+                        if (
+                            (
+                                collector_status["data_exhausted"]
+                                or collector_status.get("errored", False)
+                            )
+                            and not collector_status["running"]
                             and collector_status["inflight_workers"] == 0
-                        )
-                        if collector_status.get("errored", False) and collector_stopped:
+                        ):
                             raise RuntimeError(
-                                "Trajectory collector failed at "
-                                f"training_step={step}. Collector status: "
-                                f"{collector_status}."
+                                f"Trajectory collector stopped: dataloader exhausted at training_step={step}. "
+                                f"The dataset ran out of data before training could complete. "
+                                f"Collector status: {collector_status}. "
+                                f"Increase data.train.max_num_epochs or use a larger dataset."
                             )
-                        if collector_status["data_exhausted"] and collector_stopped:
-                            if max_num_steps != -1:
-                                raise RuntimeError(
-                                    "Trajectory collector exhausted the configured "
-                                    f"dataset at training_step={step} before reaching "
-                                    f"grpo.max_num_steps={max_num_steps}. Increase "
-                                    "grpo.max_num_epochs or use a larger dataset."
-                                )
-                            print(
-                                "🏁 Trajectory collection exhausted all configured "
-                                f"epochs and cannot form another full batch; ending "
-                                f"training naturally after {step} steps."
-                            )
-                            natural_data_exhaustion = True
-                            break
 
                         with timer.time("idle/buffer_starvation"):
                             time.sleep(0.5)
@@ -5143,7 +4863,6 @@ def async_grpo_train(
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
-                is_last_step = _step_limit_reached(step + 1, max_num_steps)
                 if NEED_REFIT:
                     timer.start("idle/refit_bubble")
 
@@ -5151,8 +4870,6 @@ def async_grpo_train(
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
                         ray.get(trajectory_collector.prepare_for_refit.remote())
-                    if not is_last_step:
-                        is_last_step = _collector_has_no_future_complete_batch(step + 1)
 
                     # Collect generation logger metrics for performance reporting
                     # inflight batch sizes and num pending samples are collected from each worker
@@ -5174,13 +4891,9 @@ def async_grpo_train(
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
-                        if not is_last_step:
-                            trajectory_collector.resume_after_refit.remote()
+                        trajectory_collector.resume_after_refit.remote()
 
                     timer.stop("idle/refit_bubble")
-
-                if not is_last_step:
-                    is_last_step = _collector_has_no_future_complete_batch(step + 1)
 
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:
@@ -5188,6 +4901,7 @@ def async_grpo_train(
 
                 # Validation
                 val_metrics, validation_timings = None, None
+                is_last_step = step + 1 == master_config.grpo.max_num_steps
                 should_run_validation = (
                     val_period > 0
                     and (step + 1) >= val_start_at
@@ -5236,8 +4950,6 @@ def async_grpo_train(
                             validation_timings, step + 1, prefix="timing/validation"
                         )
                         logger.log_metrics(val_metrics, step + 1, prefix="validation")
-                        last_validation_step = step + 1
-                        last_val_metrics = val_metrics
                         if master_config.grpo.debug_payload_metrics:
                             validation_payload_metrics = (
                                 drain_multimodal_payload_metrics()
@@ -5261,9 +4973,8 @@ def async_grpo_train(
                         gc.collect()
                         torch.cuda.empty_cache()
 
-                        # Resume only when another optimizer step will consume
-                        # trajectories and validation did not trigger an early stop.
-                        if early_stop_message is None and not is_last_step:
+                        if early_stop_message is None:
+                            # Resume trajectory collection after validation
                             trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
@@ -5361,21 +5072,100 @@ def async_grpo_train(
                 if master_config.checkpointing["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
-                    with timer.time("checkpointing"):
-                        _save_async_grpo_checkpoint(
-                            step=step + 1,
-                            total_valid_tokens=total_valid_tokens,
-                            consumed_samples=consumed_samples,
-                            train_metrics=metrics,
-                            val_metrics=val_metrics,
-                            policy=policy,
-                            trajectory_collector=trajectory_collector,
-                            replay_buffer=replay_buffer,
-                            checkpointer=checkpointer,
-                            grpo_save_state=grpo_save_state,
-                            master_config=master_config,
+                    grpo_save_state.current_step = step + 1
+                    grpo_save_state.total_valid_tokens = total_valid_tokens
+                    if val_metrics is not None:
+                        grpo_save_state.val_reward = val_metrics["accuracy"]
+                    elif hasattr(grpo_save_state, "val_reward"):
+                        delattr(grpo_save_state, "val_reward")
+                    grpo_save_state.consumed_samples = consumed_samples
+
+                    full_metric_name = master_config.checkpointing["metric_name"]
+                    if full_metric_name is not None:
+                        assert full_metric_name.startswith(
+                            "train:"
+                        ) or full_metric_name.startswith("val:"), (
+                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
+                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
+                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
+                            f" e.g. 'val_reward --> 'val:accuracy'"
                         )
-                    last_checkpoint_step = step + 1
+                        prefix, metric_name = full_metric_name.split(":", 1)
+                        metrics_source = metrics if prefix == "train" else val_metrics
+                        if not metrics_source:
+                            warnings.warn(
+                                f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
+                                "This checkpoint will not be saved as top-k.",
+                                stacklevel=2,
+                            )
+                            if hasattr(grpo_save_state, full_metric_name):
+                                delattr(grpo_save_state, full_metric_name)
+                        elif metric_name not in metrics_source:
+                            raise ValueError(
+                                f"Metric {metric_name} not found in {prefix} metrics"
+                            )
+                        else:
+                            setattr(
+                                grpo_save_state,
+                                full_metric_name,
+                                metrics_source[metric_name],
+                            )
+
+                    with timer.time("checkpointing"):
+                        # Finalize the previous (possibly async) checkpoint before
+                        # starting a new one. No-op with sync save / nothing pending.
+                        checkpointer.finalize_pending()
+
+                        print(f"Saving checkpoint for step {step + 1}...")
+                        checkpoint_path = checkpointer.init_tmp_checkpoint(
+                            step + 1, vars(grpo_save_state), master_config
+                        )
+                        policy.save_checkpoint(
+                            weights_path=os.path.join(
+                                checkpoint_path, "policy", "weights"
+                            ),
+                            optimizer_path=os.path.join(
+                                checkpoint_path, "policy", "optimizer"
+                            )
+                            if checkpointer.save_optimizer
+                            else None,
+                            tokenizer_path=os.path.join(
+                                checkpoint_path, "policy", "tokenizer"
+                            ),
+                            checkpointing_cfg=master_config.checkpointing,
+                        )
+                        # Get dataloader state from trajectory collector
+                        actual_dataloader_state = ray.get(
+                            trajectory_collector.get_dataloader_state.remote()
+                        )
+                        torch.save(
+                            actual_dataloader_state,
+                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        )
+                        _save_async_replay_buffer_checkpoint(
+                            replay_buffer,
+                            checkpoint_path,
+                        )
+                        rollouts_state = ray.get(
+                            trajectory_collector.get_rollouts_state.remote()
+                        )
+                        torch.save(
+                            rollouts_state,
+                            os.path.join(checkpoint_path, "rollouts.pt"),
+                        )
+
+                        # Defer the directory rename until any async write
+                        # completes; flushed at the next save or on training exit.
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
+
+                        # Record last-successful-checkpoint time/step for external
+                        # monitoring (see _write_latest_checkpoint_status).
+                        _write_latest_checkpoint_status(
+                            checkpointer, last_checkpoint_step=step + 1
+                        )
 
             # Logging
             # Log training data (match sync GRPO logging payload for parity).
@@ -5521,7 +5311,6 @@ def async_grpo_train(
                 step_finished=True,
             )
 
-            last_train_metrics = metrics
             timer.reset()
             step += 1
             if early_stop_message is not None:
@@ -5531,71 +5320,13 @@ def async_grpo_train(
                 checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if _step_limit_reached(step, max_num_steps):
+            if step >= master_config.grpo.max_num_steps:
                 checkpointer.shutdown()
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
                 )
                 return
-
-        if natural_data_exhaustion:
-            if last_train_metrics is None:
-                raise RuntimeError(
-                    "Async trajectory collection ended without a completed training step."
-                )
-
-            final_val_metrics = (
-                last_val_metrics if last_validation_step == step else None
-            )
-            ran_final_validation = False
-            if val_at_end and last_validation_step != step:
-                print(
-                    f"🔍 Running final validation after async data exhaustion at step {step}"
-                )
-                if NEED_REFIT and POLICY_GENERATION_STALE:
-                    refit_policy_generation(
-                        policy,
-                        policy_generation,
-                        colocated_inference,
-                    )
-                    POLICY_GENERATION_STALE = False
-                else:
-                    policy_generation.prepare_for_generation()
-                final_val_metrics, validation_timings = validate(
-                    policy_generation,
-                    val_dataloader,
-                    tokenizer,
-                    val_task_to_env,
-                    step=step,
-                    master_config=master_config,
-                    logger=logger,
-                    processor=processor,
-                )
-                policy_generation.finish_generation()
-                logger.log_metrics(validation_timings, step, prefix="timing/validation")
-                logger.log_metrics(final_val_metrics, step, prefix="validation")
-                ran_final_validation = True
-                gc.collect()
-                torch.cuda.empty_cache()
-
-            if master_config.checkpointing["enabled"] and (
-                last_checkpoint_step != step or ran_final_validation
-            ):
-                with timer.time("checkpointing"):
-                    _save_async_grpo_checkpoint(
-                        step=step,
-                        total_valid_tokens=total_valid_tokens,
-                        consumed_samples=consumed_samples,
-                        train_metrics=last_train_metrics,
-                        val_metrics=final_val_metrics,
-                        policy=policy,
-                        trajectory_collector=trajectory_collector,
-                        replay_buffer=replay_buffer,
-                        checkpointer=checkpointer,
-                        grpo_save_state=grpo_save_state,
-                        master_config=master_config,
-                    )
 
     except Exception as e:
         print(f"❌ Error in async loop: {e}")

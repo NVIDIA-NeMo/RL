@@ -59,7 +59,7 @@ class TaskDataSpec:
     prompt_file: Optional[PathLike] = None
 
     system_prompt_file: Optional[PathLike] = None
-    # Optional image/video processing controls populated by multimodal recipes.
+    # TODO(rohitrango): Move model-specific media controls to ProcessorInterface.
     num_frames: Optional[int] = None
     video_sampling_style: Optional[str] = None
     video_target_num_patches: Optional[int] = None

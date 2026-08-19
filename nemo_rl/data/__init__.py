@@ -31,7 +31,7 @@ class ResponseDatasetConfig(TypedDict):
     split_validation_size: NotRequired[float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
-    # Multimodal media processing controls forwarded to TaskDataSpec.
+    # TODO(rohitrango): Move model-specific media controls to ProcessorInterface.
     num_frames: NotRequired[int]
     video_sampling_style: NotRequired[Literal["nemotron_vl"]]
     video_target_num_patches: NotRequired[int | None]
@@ -50,8 +50,7 @@ class PreferenceDatasetConfig(TypedDict):
     split: NotRequired[str]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
-    # Task-level multimodal controls are shared with response datasets because
-    # RawDataset constructs TaskDataSpec for both dataset families.
+    # TODO(rohitrango): Move model-specific media controls to ProcessorInterface.
     num_frames: NotRequired[int]
     video_sampling_style: NotRequired[Literal["nemotron_vl"]]
     video_target_num_patches: NotRequired[int | None]
