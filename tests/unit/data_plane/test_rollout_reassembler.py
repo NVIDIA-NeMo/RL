@@ -227,6 +227,7 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     assert finalized.metrics["finalize/terminal_selection_heuristic_fraction"] == 0.5
     assert finalized.metrics["finalize/terminal_selection_declared_count"] == 0.0
     assert finalized.metrics["finalize/terminal_witness_disagreement_count"] == 0.0
+    assert finalized.canonical_output_tokens == sum(expected.token_mask)
 
     rows = _fetch_rows(tq_client, rollout_ids)
     sample_mask = torch.as_tensor(rows["sample_mask"]).flatten()

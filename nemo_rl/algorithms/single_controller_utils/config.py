@@ -717,9 +717,14 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     ``val:<name>`` settings are rejected during setup. Unknown keys are
     forbidden because a misspelled interval, retention, or restore option can
     silently disable the durability behavior the operator intended.
+
+    ``telemetry_interval_s=None`` disables the independent wall-clock sampler
+    for rollout/checkpoint benchmark metrics. It does not enable checkpointing
+    and may be configured without ``snapshot_attempt_interval_s``.
     """
 
     snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    telemetry_interval_s: Annotated[Optional[float], Field(gt=0)] = None
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)

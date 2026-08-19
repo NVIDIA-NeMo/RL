@@ -102,6 +102,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutTimeouts,
 )
+from nemo_rl.experience.rollout_recovery import ROLLOUT_RECOVERY_STATE_FILENAME
 from nemo_rl.experience.rollouts import (
     get_nemo_gym_thinking_tags,
     resolve_reward_penalty_config,
@@ -163,6 +164,7 @@ class SingleControllerActorArgs:
     # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
+    rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -1223,6 +1225,16 @@ def setup_single_controller(
             f"without considering newer periodic snapshots: {trainer_checkpoint_path}",
             flush=True,
         )
+    recovery_path = (
+        Path(recovery_checkpoint_path) if recovery_checkpoint_path is not None else None
+    )
+    has_rollout_checkpoint_payload = recovery_path is not None and (
+        (recovery_path / REPLAY_BUFFER_METADATA_FILENAME).is_file()
+        or (recovery_path / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
+    )
+    rollout_checkpoint_load_metrics: Optional[dict[str, float]] = (
+        {} if has_rollout_checkpoint_payload else None
+    )
 
     # ==========================
     # Setup Dataset & Environments
@@ -1261,7 +1273,12 @@ def setup_single_controller(
         print(
             f"📦 Restoring dataloader state from checkpoint: {recovery_checkpoint_path}"
         )
+        dataloader_load_started = time.monotonic()
         load_dataloader_state(dataloader, recovery_checkpoint_path, data_config)
+        if rollout_checkpoint_load_metrics is not None:
+            rollout_checkpoint_load_metrics["dataloader_load_seconds"] = (
+                time.monotonic() - dataloader_load_started
+            )
 
     _clamp_max_num_steps(master_config, dataloader)
     _maybe_inject_megatron_train_iters(master_config)
@@ -1520,6 +1537,7 @@ def setup_single_controller(
     # Native TQ restore must run through the trainer's bootstrap client before
     # the normal SC data-plane client is created or any rollout/train data-plane
     # operation starts.
+    data_plane_load_started = time.monotonic()
     data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
         trainer,
         last_checkpoint_path=recovery_checkpoint_path,
@@ -1527,6 +1545,10 @@ def setup_single_controller(
         partition_id=partition_id,
         sampler_name=master_config.async_rl.sampler.name,
     )
+    if rollout_checkpoint_load_metrics is not None:
+        rollout_checkpoint_load_metrics["tq_load_seconds"] = (
+            time.monotonic() - data_plane_load_started
+        )
 
     if use_nemo_gym:
         # the two fields are only meaningful when use_nemo_gym enabled
@@ -1764,6 +1786,7 @@ def setup_single_controller(
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_identity=bootstrap_identity,
+        rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,
