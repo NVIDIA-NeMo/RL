@@ -69,6 +69,13 @@ def test_submitter_uses_a_pinned_ray_runtime() -> None:
     assert "export UV_PYTHON=${RAY_RUNTIME_VENV}/bin/python" in script
 
 
+def test_submitter_checks_top_level_and_submodule_revisions_separately() -> None:
+    script = SCRIPT.read_text()
+
+    assert "status --porcelain --untracked-files=no --ignore-submodules=all" in script
+    assert "submodule status --recursive | grep -q '^[+-U]'" in script
+
+
 def test_async_bf16_renders_nccl_reshard_with_same_logprob_work() -> None:
     result = render(MODE="async", MODEL="nano", ARM="bf16")
 
@@ -149,3 +156,5 @@ def test_ablation_driver_uses_same_python_as_ray_cluster() -> None:
     script = ABLATION_SCRIPT.read_text()
 
     assert "export UV_PYTHON=${RAY_RUNTIME_VENV}/bin/python" in script
+    assert "status --porcelain --untracked-files=no --ignore-submodules=all" in script
+    assert "submodule status --recursive | grep -q '^[+-U]'" in script

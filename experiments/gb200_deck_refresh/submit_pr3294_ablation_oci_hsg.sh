@@ -102,10 +102,10 @@ WANDB_NAME=${WANDB_NAME:-qwen30-sync-${STUDY}-${ARM}-${MAX_STEPS}step-${RUN_SUFF
 
 git -C "${CONTROLLER_REPO}" pull --ff-only origin sna/exp-gb200-deck-refresh-20260818
 test "$(git -C "${TARGET_REPO}" rev-parse HEAD)" = "${TARGET_COMMIT}"
-test -z "$(git -C "${TARGET_REPO}" status --porcelain --untracked-files=no)"
+test -z "$(git -C "${TARGET_REPO}" status --porcelain --untracked-files=no --ignore-submodules=all)"
 git -C "${TARGET_REPO}" submodule update --init --recursive
-if git -C "${TARGET_REPO}" submodule status --recursive | grep -q '^-'; then
-  echo "All pinned target submodules must be initialized" >&2
+if git -C "${TARGET_REPO}" submodule status --recursive | grep -q '^[+-U]'; then
+  echo "All target submodules must be initialized at their pinned revisions" >&2
   exit 2
 fi
 for path in "${TARGET_REPO}/${CONFIG}" "${CONTROLLER_REPO}/ray.sub" \

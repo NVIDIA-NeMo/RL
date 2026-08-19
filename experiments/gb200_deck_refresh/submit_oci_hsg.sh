@@ -156,9 +156,9 @@ test "${LOCAL_HEAD}" = "${REMOTE_HEAD}"
 if [[ -n "${EXPECTED_HEAD}" ]]; then
   test "${LOCAL_HEAD}" = "${EXPECTED_HEAD}"
 fi
-test -z "$(git -C "${REPO}" status --porcelain --untracked-files=no)"
-if git -C "${REPO}" submodule status --recursive | grep -q '^-'; then
-  echo "All pinned submodules must be initialized" >&2
+test -z "$(git -C "${REPO}" status --porcelain --untracked-files=no --ignore-submodules=all)"
+if git -C "${REPO}" submodule status --recursive | grep -q '^[+-U]'; then
+  echo "All submodules must be initialized at their pinned revisions" >&2
   exit 2
 fi
 for path in "${REPO}/${CONFIG}" "${REPO}/ray.sub" "${CONTAINER}" "${HF_HOME}" \
