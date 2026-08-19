@@ -10,6 +10,25 @@ the legacy packed-broadcast refit with NCCL Reshard for the same non-colocated
 Sync MXFP8 rollout used by the B200 result. Report means use completed steps
 3-20.
 
+## 2026-08-18 GB200 run matrix
+
+All runs below use 20 optimization steps. Final values must average completed
+steps 3-20 and report the included step count. Nano and Qwen3-235B use source
+commit `f8d3514b436cf79bf2e733b83a9ca902d88831c9`.
+
+| Study | Arm | SLURM job |
+| --- | --- | ---: |
+| Nano Sync | BF16 rollout | 6302542 |
+| Nano Sync | MXFP8 rollout | 6302578 |
+| Nano Async | BF16 rollout | 6302582 |
+| Nano Async | MXFP8 rollout | 6302584 |
+| Qwen3-235B Sync | MXFP8 legacy refit | 6302606 |
+| Qwen3-235B Sync | MXFP8 NCCL Reshard | 6302692 |
+| PR 3294 full ablation | all three disabled | 6302717 |
+| PR 3294 full ablation | all three enabled | 6302751 |
+| Batched shuffle only | parent `e45e29da` | 6302200 |
+| Batched shuffle only | PR 3478 `d5fb8d04` | 6302232 |
+
 The PR 3294 full ablation reproduces the prior GCP-NRT on/off controls on
 commit `313f41a9654cd67e44d783128543fe1638c778da`, which pins vLLM 0.25.1.
 It compares prequantization, batched MXFP8 shuffle, and cached loaders disabled
