@@ -177,3 +177,8 @@ checkpointing:
   # 4. The checkpoint time for this model is around 10 mins.
   checkpoint_must_save_by: "00:03:30:00"
   save_period: 1
+
+# Optional wall-clock benchmark sampling. This is independent of the rollout
+# checkpoint save interval and may be enabled for baseline runs as well.
+rollout_checkpointing:
+  telemetry_interval_s: null
