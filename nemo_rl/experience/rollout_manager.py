@@ -1042,14 +1042,17 @@ class AsyncNemoGymRolloutImpl:
         """Aggregate per-sample and per-agent metrics."""
         # Prepare lists of values for each metric.
         total_reward = [c.reward for c in completions]
-        receipt_mode = bool(completions) and "ng_receipt" in completions[0].env_extras
+        completion_extras = [completion.env_extras or {} for completion in completions]
+        receipt_mode = bool(completion_extras) and (
+            "ng_receipt" in completion_extras[0]
+        )
         if receipt_mode:
             # Token-free receipts: token accounting comes from the manifest
             # (cum_len of the deepest chain; delta sums as the generation
             # proxy) instead of a message_log walk.
             manifests = [
-                ((c.env_extras.get("ng_receipt") or {}).get("manifest") or [])
-                for c in completions
+                ((extras.get("ng_receipt") or {}).get("manifest") or [])
+                for extras in completion_extras
             ]
             turn_count = [len(m) for m in manifests]
             total_tokens = [
@@ -1116,8 +1119,8 @@ class AsyncNemoGymRolloutImpl:
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
         agent_extras = [
-            {k: v for k, v in c.env_extras.items() if k not in ("ng_receipt",)}
-            for c in completions
+            {k: v for k, v in extras.items() if k not in ("ng_receipt",)}
+            for extras in completion_extras
         ]
         for key in agent_extras[0].keys():
             values = [

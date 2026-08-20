@@ -950,10 +950,8 @@ class TestTQReplayBufferTokenCaptureMode:
             buf.commit_finalized(
                 group_id,
                 meta,
-                {"payload": "canonical"},
                 group_min_wv=3,
                 group_max_wv=5,
-                staging_keys=["r0/c1", "r0/c2", "r1/c1"],
             )
         )
         assert buf.ready_list == [True]
@@ -961,11 +959,10 @@ class TestTQReplayBufferTokenCaptureMode:
         assert buf.end_weight_list == [5]
         assert buf.meta_list[0] is meta
         assert buf._staging_keys_list == [None]
-        assert set(dp.rows_by_partition["rollout_data"]) == set(meta.sample_ids)
-        assert (
-            "rollout_staging",
-            ["r0/c1", "r0/c2", "r1/c1"],
-        ) in dp.clear_calls_by_partition
+        # The finalizer publishes canonical rows before this metadata-only
+        # buffer transition; commit_finalized must not perform data movement.
+        assert dp.rows_by_partition == {}
+        assert dp.clear_calls_by_partition == []
 
     def test_commit_finalized_waits_for_active_checkpoint(self):
         async def exercise() -> None:
@@ -993,7 +990,6 @@ class TestTQReplayBufferTokenCaptureMode:
                     buf.commit_finalized(
                         group_id,
                         meta,
-                        {"input_ids": torch.ones((1, 1), dtype=torch.long)},
                         group_min_wv=2,
                         group_max_wv=2,
                         staging_keys=["r0/c1"],
@@ -1004,7 +1000,7 @@ class TestTQReplayBufferTokenCaptureMode:
                 assert buf.ready_list == [False]
 
             await commit_task
-            assert set(dp.rows_by_partition["rollout_data"]) == set(meta.sample_ids)
+            assert dp.rows_by_partition == {}
             assert buf.ready_list == [True]
 
         asyncio.run(exercise())
@@ -1016,7 +1012,9 @@ class TestTQReplayBufferTokenCaptureMode:
         )
         with pytest.raises(ValueError, match="no live slot"):
             _run(
-                buf.commit_finalized("ghost", meta, {}, group_min_wv=0, group_max_wv=0)
+                buf.commit_finalized(
+                    "ghost", meta, group_min_wv=0, group_max_wv=0
+                )
             )
 
     def test_commit_finalized_verifies_full_plan_manifest_ownership(self):
@@ -1102,7 +1100,6 @@ class TestTQReplayBufferTokenCaptureMode:
             buf.commit_finalized(
                 group_id,
                 meta,
-                {},
                 group_min_wv=1,
                 group_max_wv=1,
                 staging_keys=["r0/c1", "r0/c2"],
@@ -1126,7 +1123,11 @@ class TestTQReplayBufferTokenCaptureMode:
             sample_ids=[f"{group_id}_g0"],
             fields=None,
         )
-        _run(buf.commit_finalized(group_id, meta, {}, group_min_wv=1, group_max_wv=1))
+        _run(
+            buf.commit_finalized(
+                group_id, meta, group_min_wv=1, group_max_wv=1
+            )
+        )
         _run(buf.remove([0], remove_in_dp=True))
         partitions_cleared = {p for p, _ in dp.clear_calls_by_partition}
         assert partitions_cleared == {"rollout_data"}

@@ -73,6 +73,24 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def test_rollout_metrics_accept_missing_environment_extras() -> None:
+    implementation = object.__new__(AsyncNemoGymRolloutImpl)
+    completion = Completion(
+        message_log=[
+            {"role": "user", "token_ids": torch.tensor([1])},
+            {"role": "assistant", "token_ids": torch.tensor([2])},
+        ],
+        env_extras=None,
+        truncated=False,
+        reward=1.0,
+    )
+
+    metrics = implementation._compute_rollout_metrics([completion], "agent")
+
+    assert metrics["total_reward/mean"] == 1.0
+    assert metrics["agent/full_result"].data == [["{}"]]
+
+
 class _FakeBuffer:
     """Minimal TQReplayBuffer stand-in that records reserve/commit calls."""
 
