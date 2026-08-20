@@ -530,7 +530,7 @@ class SingleControllerActor:
     async def _validate_rollout_recovery_inventory(
         self, *, clear_unreferenced: bool
     ) -> None:
-        """Require every sealed receipt to retain its staged TQ rows."""
+        """Require every unfinished receipt or deferred route to retain staging."""
         ledger = self._rollout_recovery_ledger
         if ledger is None:
             return
@@ -545,8 +545,8 @@ class SingleControllerActor:
         missing = sorted(expected_staging_keys - actual_staging_keys)
         if missing:
             raise RuntimeError(
-                "rollout-recovery receipts reference staging rows missing from "
-                f"the native TQ checkpoint: missing={missing[:10]!r} "
+                "rollout-recovery ownership references staging rows missing "
+                f"from live TQ state: missing={missing[:10]!r} "
                 f"(total={len(missing)})"
             )
         unreferenced = sorted(actual_staging_keys - expected_staging_keys)

@@ -1781,6 +1781,9 @@ class RolloutManager:
             async with self._recovery_mutation():
                 self._recovery_ledger.abandon_unsealed(group_id)
                 recovery_group = self._recovery_ledger.get_group(group_id)
+            # A failure after the last sibling sealed leaves the group ready to
+            # finalize; an earlier failure leaves it generating. The outer retry
+            # loop deliberately supports both entry states.
             unfinished_gate_ids = [
                 recovery_group.gate_rollout_id(sibling.generation_index)
                 for sibling in recovery_group.siblings

@@ -19,6 +19,12 @@ from copy import deepcopy
 import pytest
 
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.experience.route_plan import (
+    ROUTE_PLAN_SCHEMA_VERSION,
+    RouteAssemblyPlan,
+    encode_route_plan,
+)
 from nemo_rl.experience.rollout_recovery import (
     PromptRef,
     PromptGroupStatus,
@@ -318,6 +324,58 @@ def test_prepare_for_restart_preserves_sealed_and_abandons_inflight() -> None:
     assert restored.siblings[0].current_attempt.status == RolloutAttemptStatus.SEALED
     assert restored.siblings[1].current_attempt.status == RolloutAttemptStatus.ABANDONED
     assert ledger.expected_staging_keys() == {f"{restored.gate_rollout_ids[0]}/call"}
+
+
+def test_finalized_group_does_not_require_cleared_staging_rows() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    ledger.mark_group_dispatched(group.group_id)
+    _seal(ledger, group.group_id, 0)
+    _seal(ledger, group.group_id, 1)
+
+    _finalize(ledger, group.group_id)
+
+    assert ledger.expected_staging_keys() == set()
+
+
+def test_finalized_group_retains_deferred_router_staging_ownership() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(ledger)
+    ledger.mark_group_dispatched(group.group_id)
+    _seal(ledger, group.group_id, 0)
+    _seal(ledger, group.group_id, 1)
+    staging_keys = [f"{gate_id}/call" for gate_id in group.gate_rollout_ids]
+    meta = KVBatchMeta(
+        partition_id="rollout",
+        task_name="train",
+        sample_ids=group.logical_rollout_ids,
+        fields=["input_ids"],
+        sequence_lengths=[4, 5],
+        tags=[
+            {
+                "weight_version": 7,
+                ROUTE_PLAN_TAG: encode_route_plan(
+                    RouteAssemblyPlan(
+                        schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+                        staging_partition="rollout_staging",
+                        spans=(),
+                        cleanup_staging_keys=(staging_key,),
+                        expected_token_length=sequence_length,
+                    )
+                ),
+            }
+            for staging_key, sequence_length in zip(staging_keys, [4, 5])
+        ],
+    )
+    ledger.mark_finalization_started(group.group_id)
+    ledger.mark_group_finalized(
+        group.group_id,
+        meta=meta,
+        group_min_weight_version=7,
+        group_max_weight_version=8,
+    )
+
+    assert ledger.expected_staging_keys() == set(staging_keys)
 
 
 def test_full_step_checkpoint_rejects_open_train_step() -> None:
