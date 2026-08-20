@@ -5,6 +5,9 @@ grpo:
     enabled: true
     in_flight_weight_updates: true
 
+checkpointing:
+  checkpoint_dir: results/vlm_grpo_nemotron_omni_8n4g_megatron_async
+
 policy:
   generation:
     colocated:
