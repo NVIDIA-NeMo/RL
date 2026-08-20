@@ -288,8 +288,6 @@ def test_nightly_compute_stays_below_4115_hours(nightly_test_suite, tracker):
         f"Last line of output was not as expected: '{last_line}'"
     )
     total_gpu_hours = float(last_line.split(":")[-1].strip())
-    # Over the former 3928-hour limit: the two Qwen3.5 FP8 tests add 91
-    # GPU-hours and the managed Dynamo 3x8 H100 SWE1 test adds 96.
     assert total_gpu_hours <= 4115, (
         f"Total GPU hours exceeded 4115: {last_line}. We should revisit the test suites to reduce the total GPU hours."
     )
