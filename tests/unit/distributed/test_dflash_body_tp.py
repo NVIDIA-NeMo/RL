@@ -84,13 +84,28 @@ def _config() -> DFlashBodyConfig:
     )
 
 
+def _tp4_config() -> DFlashBodyConfig:
+    return DFlashBodyConfig(
+        hidden_size=32,
+        intermediate_size=48,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=8,
+        num_hidden_layers=1,
+        num_target_taps=2,
+        rope_theta=10_000.0,
+    )
+
+
 def _fp32_parallel_config(
     tensor_parallel_size: int,
     *,
+    context_parallel_size: int = 1,
     sequence_parallel: bool = False,
 ) -> ModelParallelConfig:
     return ModelParallelConfig(
         tensor_model_parallel_size=tensor_parallel_size,
+        context_parallel_size=context_parallel_size,
         use_cpu_initialization=True,
         params_dtype=torch.float32,
         sequence_parallel=sequence_parallel,
@@ -109,15 +124,19 @@ def _shard_axis(name: str) -> int | None:
     return None
 
 
-def _gather_global_state(body: DFlashBody) -> dict[str, Tensor]:
+def _gather_global_state(
+    body: DFlashBody,
+    *,
+    group: torch.distributed.ProcessGroup | None = None,
+) -> dict[str, Tensor]:
     local_state = {
         name: tensor.detach().cpu().clone()
         for name, tensor in body.state_dict().items()
     }
     gathered: list[dict[str, Tensor] | None] = [
         None
-    ] * torch.distributed.get_world_size()
-    torch.distributed.all_gather_object(gathered, local_state)
+    ] * torch.distributed.get_world_size(group)
+    torch.distributed.all_gather_object(gathered, local_state, group=group)
     states = [state for state in gathered if state is not None]
     global_state: dict[str, Tensor] = {}
     for name in local_state:
@@ -130,7 +149,11 @@ def _gather_global_state(body: DFlashBody) -> dict[str, Tensor]:
     return global_state
 
 
-def _gather_global_gradients(body: DFlashBody) -> dict[str, Tensor]:
+def _gather_global_gradients(
+    body: DFlashBody,
+    *,
+    group: torch.distributed.ProcessGroup | None = None,
+) -> dict[str, Tensor]:
     local_gradients = {
         name: parameter.grad.detach().cpu().clone()
         for name, parameter in body.named_parameters()
@@ -138,8 +161,8 @@ def _gather_global_gradients(body: DFlashBody) -> dict[str, Tensor]:
     }
     gathered: list[dict[str, Tensor] | None] = [
         None
-    ] * torch.distributed.get_world_size()
-    torch.distributed.all_gather_object(gathered, local_gradients)
+    ] * torch.distributed.get_world_size(group)
+    torch.distributed.all_gather_object(gathered, local_gradients, group=group)
     gradients = [gradient for gradient in gathered if gradient is not None]
     global_gradients: dict[str, Tensor] = {}
     for name in local_gradients:
@@ -166,6 +189,84 @@ def _inputs(device: torch.device) -> tuple[Any, Tensor, Tensor]:
     target_taps = torch.randn((1, 5, 2, 32), generator=generator, device=device)
     block_embeddings = torch.randn((1, 3, 32), generator=generator, device=device)
     return plan, target_taps, block_embeddings
+
+
+def _assert_forward_gradient_parity(
+    *,
+    body: DFlashBody,
+    reference: DFlashBody,
+    device: torch.device,
+    tp_group: torch.distributed.ProcessGroup,
+) -> None:
+    global_state = _gather_global_state(body, group=tp_group)
+    reference.load_state_dict(global_state, strict=True)
+    plan, target, blocks = _inputs(device)
+    target_actual = target.clone().requires_grad_()
+    blocks_actual = blocks.clone().requires_grad_()
+    target_reference = target.clone().requires_grad_()
+    blocks_reference = blocks.clone().requires_grad_()
+
+    actual = body(
+        target_taps=target_actual,
+        block_embeddings=blocks_actual,
+        plan=plan,
+    )
+    expected = reference(
+        target_taps=target_reference,
+        block_embeddings=blocks_reference,
+        plan=plan,
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+    weight = torch.linspace(
+        0.25,
+        1.25,
+        actual.numel(),
+        device=actual.device,
+    ).reshape_as(actual)
+    (expected * weight).sum().backward()
+    (actual * weight).sum().backward()
+    torch.testing.assert_close(target_actual.grad, target_reference.grad)
+    torch.testing.assert_close(blocks_actual.grad, blocks_reference.grad)
+
+    actual_gradients = _gather_global_gradients(body, group=tp_group)
+    for name, parameter in reference.named_parameters():
+        assert parameter.grad is not None
+        torch.testing.assert_close(
+            actual_gradients[name],
+            parameter.grad.detach().cpu(),
+        )
+
+
+def test_tp4_forward_and_gradient_parity(_pp2_world: None) -> None:
+    rank = torch.distributed.get_rank()
+    tp_group = torch.distributed.group.WORLD
+    singleton_groups = _singleton_groups(4)
+    device = (
+        torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+
+    torch.manual_seed(47)
+    body = DFlashBody(
+        _tp4_config(),
+        tp_group=tp_group,
+        parallel_config=_fp32_parallel_config(4),
+    ).to(device)
+    torch.manual_seed(47)
+    reference = DFlashBody(
+        _tp4_config(),
+        tp_group=singleton_groups[rank],
+        parallel_config=_fp32_parallel_config(1),
+    ).to(device)
+
+    _assert_forward_gradient_parity(
+        body=body,
+        reference=reference,
+        device=device,
+        tp_group=tp_group,
+    )
 
 
 def test_tp2_projection_forward_gradient_and_checkpoint_parity(
@@ -335,7 +436,9 @@ def test_tp2_rejects_sequence_parallel_config(_tp2_world: None) -> None:
     assert parallel_config.sequence_parallel is True
 
 
-def test_pp2_last_stage_uses_group_local_replica_ids(_pp2_world: None) -> None:
+def test_tp2_pp2_last_stage_forward_gradient_and_replica_ids(
+    _pp2_world: None,
+) -> None:
     rank = torch.distributed.get_rank()
     tp_groups = [
         torch.distributed.new_group([0, 1]),
@@ -344,10 +447,28 @@ def test_pp2_last_stage_uses_group_local_replica_ids(_pp2_world: None) -> None:
     singleton_groups = _singleton_groups(4)
     if rank >= 2:
         tp_group = tp_groups[1]
+        device = (
+            torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        torch.manual_seed(53)
         body = DFlashBody(
             _config(),
             tp_group=tp_group,
             parallel_config=_fp32_parallel_config(2),
+        ).to(device)
+        torch.manual_seed(53)
+        reference = DFlashBody(
+            _config(),
+            tp_group=singleton_groups[rank],
+            parallel_config=_fp32_parallel_config(1),
+        ).to(device)
+        _assert_forward_gradient_parity(
+            body=body,
+            reference=reference,
+            device=device,
+            tp_group=tp_group,
         )
         sharded = body.sharded_state_dict(
             prefix="draft.",
@@ -361,4 +482,27 @@ def test_pp2_last_stage_uses_group_local_replica_ids(_pp2_world: None) -> None:
         assert q_projection.axis_fragmentations == (2, 1)
         assert q_projection.global_offset == ((rank - 2) * 16, 0)
         assert q_projection.global_shape == (32, 32)
+    torch.distributed.barrier()
+
+
+def test_tp2_pp2_rejects_context_parallel_config(_pp2_world: None) -> None:
+    rank = torch.distributed.get_rank()
+    tp_groups = [
+        torch.distributed.new_group([0, 1]),
+        torch.distributed.new_group([2, 3]),
+    ]
+    if rank >= 2:
+        parallel_config = _fp32_parallel_config(
+            2,
+            context_parallel_size=2,
+        )
+        with pytest.raises(
+            ValueError,
+            match="DFlashBody does not support context_parallel_size > 1",
+        ):
+            DFlashBody(
+                _config(),
+                tp_group=tp_groups[1],
+                parallel_config=parallel_config,
+            )
     torch.distributed.barrier()

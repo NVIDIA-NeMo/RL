@@ -47,10 +47,12 @@ def _tiny_config(*, num_hidden_layers: int = 2) -> DFlashBodyConfig:
 def _fp32_parallel_config(
     *,
     tensor_parallel_size: int = 1,
+    context_parallel_size: int = 1,
     sequence_parallel: bool = False,
 ) -> ModelParallelConfig:
     return ModelParallelConfig(
         tensor_model_parallel_size=tensor_parallel_size,
+        context_parallel_size=context_parallel_size,
         use_cpu_initialization=True,
         params_dtype=torch.float32,
         sequence_parallel=sequence_parallel,
@@ -434,6 +436,24 @@ def test_constructor_rejects_sequence_parallel_config_without_mutating_it() -> N
         )
 
     assert parallel_config.sequence_parallel is True
+
+
+def test_constructor_rejects_context_parallel_config_without_mutating_it() -> None:
+    parallel_config = _fp32_parallel_config(
+        tensor_parallel_size=2,
+        context_parallel_size=2,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="DFlashBody does not support context_parallel_size > 1",
+    ):
+        DFlashBody(
+            _tiny_config(num_hidden_layers=1),
+            parallel_config=parallel_config,
+        )
+
+    assert parallel_config.context_parallel_size == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
