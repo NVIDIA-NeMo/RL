@@ -123,6 +123,22 @@ def test_qwen30_dapo_pair_keeps_workload_matched() -> None:
     assert "policy.generation.vllm_cfg.precision=fp8" in mxfp8.stdout
 
 
+def test_qwen30_topology_can_be_scaled_without_changing_the_workload() -> None:
+    result = render(
+        MODE="sync",
+        MODEL="qwen30",
+        ARM="bf16",
+        TOTAL_NODES_OVERRIDE="8",
+        GEN_NODES_OVERRIDE="8",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "cluster.num_nodes=8" in result.stdout
+    assert "policy.generation.colocated.resources.num_nodes=8" in result.stdout
+    assert "policy.train_global_batch_size=2048" in result.stdout
+    assert "policy.max_total_sequence_length=22528" in result.stdout
+
+
 def test_qwen235_legacy_arm_uses_current_mxfp8_recipe_without_reshard() -> None:
     result = render(MODE="sync", MODEL="qwen235", ARM="mxfp8_legacy")
 
