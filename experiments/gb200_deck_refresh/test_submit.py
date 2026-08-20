@@ -135,7 +135,7 @@ def test_qwen30_dapo_pair_keeps_workload_matched() -> None:
         assert "policy.train_global_batch_size=2048" in result.stdout
         assert "policy.max_total_sequence_length=22528" in result.stdout
         assert "policy.megatron_cfg.defer_fp32_logits=true" in result.stdout
-        assert "policy.logprob_chunk_size=2048" in result.stdout
+        assert "policy.logprob_chunk_size=512" in result.stdout
         assert "policy.generation.vllm_cfg.enforce_eager=false" in result.stdout
         assert "loss_fn.force_on_policy_ratio=false" in result.stdout
         assert "++grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout

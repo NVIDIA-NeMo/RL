@@ -174,7 +174,7 @@ if [[ "${MODEL}" == qwen30 ]]; then
     "grpo.num_generations_per_prompt=16"
     "policy.max_total_sequence_length=22528"
     "policy.megatron_cfg.defer_fp32_logits=true"
-    "policy.logprob_chunk_size=2048"
+    "policy.logprob_chunk_size=512"
     "loss_fn.reference_policy_kl_penalty=0.01"
   )
 fi
