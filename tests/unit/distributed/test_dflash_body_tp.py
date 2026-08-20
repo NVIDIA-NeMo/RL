@@ -271,9 +271,21 @@ def test_tp2_rank_local_malformed_input_fails_synchronously(
         tp_group=torch.distributed.group.WORLD,
         parallel_config=_fp32_parallel_config(2),
     ).to(device)
+    entered_fc = False
+
+    def record_fc_entry(_module: torch.nn.Module, _inputs: tuple[Tensor, ...]) -> None:
+        nonlocal entered_fc
+        entered_fc = True
+        print(f"rank={rank} entered self.fc", flush=True)
+
+    body.fc.register_forward_pre_hook(record_fc_entry)
     plan, target_taps, block_embeddings = _inputs(device)
     if rank == 1:
         block_embeddings = block_embeddings[:, :-1]
+    print(
+        f"rank={rank} block_embeddings_shape={tuple(block_embeddings.shape)}",
+        flush=True,
+    )
 
     with pytest.raises(ValueError) as error:
         body(
@@ -282,11 +294,14 @@ def test_tp2_rank_local_malformed_input_fails_synchronously(
             plan=plan,
         )
 
-    messages: list[str | None] = [None] * 2
-    torch.distributed.all_gather_object(messages, str(error.value))
-    assert messages == [
-        "block_embeddings shape does not match the DFlash plan",
-        "block_embeddings shape does not match the DFlash plan",
+    outcomes: list[tuple[str, bool] | None] = [None] * 2
+    torch.distributed.all_gather_object(
+        outcomes,
+        (str(error.value), entered_fc),
+    )
+    assert outcomes == [
+        ("block_embeddings shape does not match the DFlash plan", False),
+        ("block_embeddings shape does not match the DFlash plan", False),
     ]
 
 
