@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -45,6 +46,24 @@ def test_sync_mxfp8_renders_matched_two_logprob_cuda_graph_run() -> None:
     assert "loss_fn.force_on_policy_ratio=false" in result.stdout
     assert "loss_fn.use_importance_sampling_correction=true" in result.stdout
     assert "++grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout
+
+
+def test_nano_mxfp8_quantizes_only_routed_expert_projections() -> None:
+    sync_mxfp8 = render(MODE="sync", MODEL="nano", ARM="mxfp8")
+    async_mxfp8 = render(MODE="async", MODEL="nano", ARM="mxfp8")
+    bf16 = render(MODE="sync", MODEL="nano", ARM="bf16")
+    qwen_mxfp8 = render(MODE="sync", MODEL="qwen30", ARM="mxfp8")
+
+    expected = (
+        "++policy.generation.vllm_cfg.quantization_ignored_layer_kws="
+        "[q_proj,k_proj,v_proj,o_proj,in_proj,out_proj,shared_experts,gate,lm_head]"
+    )
+    assert sync_mxfp8.returncode == 0, sync_mxfp8.stderr
+    assert async_mxfp8.returncode == 0, async_mxfp8.stderr
+    assert expected in shlex.split(sync_mxfp8.stdout)
+    assert expected in shlex.split(async_mxfp8.stdout)
+    assert expected not in shlex.split(bf16.stdout)
+    assert expected not in shlex.split(qwen_mxfp8.stdout)
 
 
 def test_gpu_memory_utilization_can_be_overridden() -> None:

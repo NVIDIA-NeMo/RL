@@ -13,6 +13,7 @@ BRANCH=${BRANCH:-sna/exp-gb200-deck-refresh-repair}
 EXPECTED_HEAD=${EXPECTED_HEAD:-}
 MAX_NUM_SEQS=
 REFIT_WITH_RELOAD_API=false
+QUANTIZATION_IGNORED_LAYER_KWS=
 
 case "${MODEL}:${MODE}:${ARM}" in
   nano:sync:bf16|nano:sync:mxfp8)
@@ -114,6 +115,11 @@ case "${ARM}" in
     ;;
 esac
 
+if [[ "${MODEL}" == nano && "${IS_MX}" == true ]]; then
+  QUANTIZATION_SCOPE=routed_expert_projections_only
+  QUANTIZATION_IGNORED_LAYER_KWS='[q_proj,k_proj,v_proj,o_proj,in_proj,out_proj,shared_experts,gate,lm_head]'
+fi
+
 RUN_ARGS=(
   --config "${CONFIG}"
   "cluster.num_nodes=${TOTAL_NODES}"
@@ -152,6 +158,11 @@ RUN_ARGS=(
 )
 if [[ "${IS_MX}" == true ]]; then
   RUN_ARGS+=("++policy.generation.vllm_cfg.is_mx=true")
+fi
+if [[ -n "${QUANTIZATION_IGNORED_LAYER_KWS}" ]]; then
+  RUN_ARGS+=(
+    "++policy.generation.vllm_cfg.quantization_ignored_layer_kws=${QUANTIZATION_IGNORED_LAYER_KWS}"
+  )
 fi
 if [[ -n "${MAX_NUM_SEQS}" ]]; then
   RUN_ARGS+=("++policy.generation.vllm_kwargs.max_num_seqs=${MAX_NUM_SEQS}")
