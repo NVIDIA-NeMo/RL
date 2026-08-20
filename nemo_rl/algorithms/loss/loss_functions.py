@@ -208,11 +208,7 @@ def _clipped_pg_actor_objective(
     """Actor objective (ratio/clip terms + masked-mean reduction) in one region.
 
     Folding the elementwise clipped-PG terms and the reduction into a single
-    function lets ``torch.compile`` fuse the reduction with its producers. This
-    is the compute-heavy, launch-bound part of the loss; keeping it as one unit
-    is what makes compilation worthwhile (the elementwise-only helper is too
-    small to fuse). Returns the scalar actor loss plus ``ratios``/
-    ``ratios_clamped`` for the diagnostic metrics computed by the caller.
+    function lets ``torch.compile`` fuse them.
     """
     # Calculate clipped loss function if PPO ratio is enabled.
     if force_on_policy_ratio:
@@ -511,7 +507,7 @@ class ClippedPGLossFn(LossFunction):
 
             # token_mult_prob_error
             # See more details and other metrics in docs/guides/grpo.md#metrics
-            lp_error = torch.abs(generation_logprobs - prev_logprobs)
+            lp_error = torch.abs(generation_logprobs - prev_logprobs)  # noqa: F841  (precommit ignore for now)
             # average over all tokens in the microbatch
             mult_prob_error = masked_mean(
                 torch.exp(lp_error * mask),
