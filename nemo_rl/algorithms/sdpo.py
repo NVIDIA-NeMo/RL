@@ -39,7 +39,9 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
     GRPOLoggerConfig,
+    RewardPenaltyConfig,
     _should_use_async_rollouts,
     refit_policy_generation,
     validate,
@@ -771,10 +773,33 @@ def setup(
         "batch_multiplier": 1,
     }
 
-    # GRPO loss_fn stub (grpo.setup uses it only to build ClippedPGLossFn,
-    # which we discard; the values here don't affect anything else in setup).
+    # GRPO loss_fn stub. grpo.setup builds ClippedPGLossFn from it (which we
+    # discard) — but since the main merge it ALSO derives
+    # init_reference_model from this stub's reference_policy_kl_penalty
+    # (grpo.py: `init_reference_model = loss_config.reference_policy_kl_penalty
+    # > 0`). Hard-coding 0.0 meant the worker never snapshotted reference
+    # weights, and any SDPO run with its own KL anchor died at
+    # get_reference_policy_logprobs with reference_model_state_dict=None.
+    # Derive the effective penalty from the ACTUAL loss config so the worker
+    # loads the reference model iff some leg needs it.
+    if isinstance(loss_config, SDPOHybridLossConfig):
+        _ref_kl_penalty = max(
+            float(getattr(loss_config.sdpo, "reference_policy_kl_penalty", 0.0) or 0.0),
+            float(getattr(loss_config.grpo, "reference_policy_kl_penalty", 0.0) or 0.0),
+        )
+    else:
+        _ref_kl_penalty = float(
+            getattr(loss_config, "reference_policy_kl_penalty", 0.0) or 0.0
+        )
+    # grpo.setup asserts that skip_reference_policy_logprobs_calculation=True
+    # is only combined with penalty == 0, so keep the stub flag consistent.
+    # The flag only gates grpo's OWN train loop, which SDPO never runs —
+    # sdpo_train computes prev/reference logprobs itself.
+    grpo_config_stub["skip_reference_policy_logprobs_calculation"] = (
+        _ref_kl_penalty == 0.0
+    )
     grpo_loss_fn_stub = {
-        "reference_policy_kl_penalty": 0.0,
+        "reference_policy_kl_penalty": _ref_kl_penalty,
         "reference_policy_kl_type": "k3",
         "kl_input_clamp_value": 20.0,
         "kl_output_clamp_value": 10.0,
@@ -796,13 +821,27 @@ def setup(
     # .grpo, ...) and calls master_config.model_dump(), so it needs a Pydantic
     # model, not a dict. model_copy gives a MasterConfig carrying the original
     # policy/env/data/logger/cluster/checkpointing plus the injected GRPO blocks.
-    # The grpo block stays a plain dict (GRPOConfig is still a TypedDict, read via
-    # subscript), while loss_fn must be a ClippedPGLossConfig model because
-    # grpo.setup reads loss_config.force_on_policy_ratio / ClippedPGLossFn(cfg).
+    # The grpo block must be a GRPOConfig model: since the main merge, grpo.setup
+    # reads it by attribute too (e.g. grpo_config.val_num_generations_per_prompt,
+    # grpo_config.adv_estimator.name) — model_copy(update=...) does NOT validate
+    # or coerce, so passing the raw stub dict crashes there. Constructing
+    # GRPOConfig also coerces the nested async_grpo/reward_*/adv_estimator dicts
+    # into their models and fills new-required fields from defaults. loss_fn must
+    # be a ClippedPGLossConfig model because grpo.setup reads
+    # loss_config.force_on_policy_ratio / ClippedPGLossFn(cfg).
+    # grpo.setup's complete attribute surface on master_config (grep-verified:
+    # `master_config\.[a-z_]+` over grpo.py) is: policy, loss_fn, env, data,
+    # grpo, logger, cluster, checkpointing, reward_penalties, data_plane. The
+    # SDPO MasterConfig carries the first eight; the last two are grpo-only
+    # fields with defaults, injected here so attribute access doesn't die on
+    # the duck-typed copy. If a future main merge adds another
+    # `master_config.<field>` read to grpo.setup, extend this update dict.
     grpo_master_config = master_config.model_copy(
         update={
-            "grpo": grpo_config_stub,
+            "grpo": GRPOConfig(**grpo_config_stub),
             "loss_fn": ClippedPGLossConfig(**grpo_loss_fn_stub),
+            "reward_penalties": RewardPenaltyConfig(),
+            "data_plane": None,
         }
     )
 
@@ -818,6 +857,8 @@ def setup(
         checkpointer,
         grpo_save_state,
         _,
+        _teacher_worker_groups,  # discard: SDPO configures no distillation teachers
+        _alias_to_group_alias,  # discard: companion alias map for the above
     ) = grpo_setup(grpo_master_config, tokenizer, dataset, val_dataset)
 
     # Replace GRPO loss with SDPO loss (or the SDPO+GRPO hybrid when the
@@ -827,14 +868,17 @@ def setup(
     else:
         loss_fn = SDPOLossFn(loss_config)
 
-    # Convert grpo save state to sdpo save state (same fields)
+    # Convert grpo save state to sdpo save state (same fields). GRPOSaveState
+    # is a dataclass since the main merge (was a TypedDict), so read by
+    # attribute; getattr keeps the old .get() default for val_reward, which
+    # the class comment says may be absent when no validation metrics exist.
     sdpo_save_state: SDPOSaveState = {
-        "consumed_samples": grpo_save_state["consumed_samples"],
-        "current_step": grpo_save_state["current_step"],
-        "current_epoch": grpo_save_state["current_epoch"],
-        "total_steps": grpo_save_state["total_steps"],
-        "total_valid_tokens": grpo_save_state["total_valid_tokens"],
-        "val_reward": grpo_save_state.get("val_reward", -99999999.0),
+        "consumed_samples": grpo_save_state.consumed_samples,
+        "current_step": grpo_save_state.current_step,
+        "current_epoch": grpo_save_state.current_epoch,
+        "total_steps": grpo_save_state.total_steps,
+        "total_valid_tokens": grpo_save_state.total_valid_tokens,
+        "val_reward": getattr(grpo_save_state, "val_reward", -99999999.0),
     }
 
     return (
@@ -942,11 +986,15 @@ def sdpo_train(
         # grpo.validate() reads master_config.grpo for these keys; provide a shim.
         _validate_cfg = master_config.model_copy(
             update={
-                "grpo": {
-                    "max_val_samples": sdpo_cfg["max_val_samples"],
-                    "val_batch_size": sdpo_cfg["val_batch_size"],
-                    "max_rollout_turns": sdpo_cfg["max_rollout_turns"],
-                },
+                # Must be a GRPOConfig model, not a dict: validate() reads
+                # .grpo by attribute (val_period, max_val_samples,
+                # val_batch_size, val_num_generations_per_prompt,
+                # max_rollout_turns) — defaults cover the keys not set here.
+                "grpo": GRPOConfig(
+                    max_val_samples=sdpo_cfg["max_val_samples"],
+                    val_batch_size=sdpo_cfg["val_batch_size"],
+                    max_rollout_turns=sdpo_cfg["max_rollout_turns"],
+                ),
             }
         )
         val_metrics, _ = validate(
@@ -1144,7 +1192,10 @@ def sdpo_train(
                 # Two consumers need these:
                 #  • SDPO trust-region anchor to the frozen-init policy:
                 #    the SDPO term adds beta*KL(student||ref) when its
-                #    reference_policy_kl_penalty > 0.
+                #    reference_policy_kl_penalty > 0. Its student side comes
+                #    from the grad-carrying training forward (see
+                #    prepare_loss_input), so only reference logprobs are
+                #    needed here.
                 #  • GRPO policy-gradient term (hybrid): always needs
                 #    prev_logprobs; needs reference logprobs when GRPO's KL
                 #    penalty is on.
@@ -1155,7 +1206,7 @@ def sdpo_train(
                     sdpo_ref_penalty = getattr(loss_fn, "reference_policy_kl_penalty", 0.0)
                     grpo_ref_penalty = 0.0
 
-                need_prev_logprobs = is_hybrid or sdpo_ref_penalty > 0.0
+                need_prev_logprobs = is_hybrid
                 need_ref_logprobs = (sdpo_ref_penalty > 0.0) or (grpo_ref_penalty > 0.0)
 
                 if need_prev_logprobs or need_ref_logprobs:
@@ -1247,11 +1298,14 @@ def sdpo_train(
                     # grpo.validate() reads master_config.grpo for these keys; provide a shim.
                     _validate_cfg = master_config.model_copy(
                         update={
-                            "grpo": {
-                                "max_val_samples": sdpo_cfg["max_val_samples"],
-                                "val_batch_size": sdpo_cfg["val_batch_size"],
-                                "max_rollout_turns": sdpo_cfg["max_rollout_turns"],
-                            },
+                            # Must be a GRPOConfig model, not a dict: validate()
+                            # reads .grpo by attribute — defaults cover the
+                            # keys not set here.
+                            "grpo": GRPOConfig(
+                                max_val_samples=sdpo_cfg["max_val_samples"],
+                                val_batch_size=sdpo_cfg["val_batch_size"],
+                                max_rollout_turns=sdpo_cfg["max_rollout_turns"],
+                            ),
                         }
                     )
                     val_metrics, _ = validate(

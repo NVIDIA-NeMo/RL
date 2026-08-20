@@ -280,11 +280,14 @@ def test_sdpo_loss_js_is_symmetric():
 
 
 def test_sdpo_ref_kl_zero_when_student_equals_ref():
-    """Trust-region penalty is exactly 0 when prev_logprobs == reference."""
+    """Trust-region penalty is exactly 0 when current logprobs == reference."""
     s, t, H, data, gvt = _build_inputs()
-    student_lp_at_sampled = torch.randn(s.shape[0], s.shape[1] + 1)
-    data["prev_logprobs"] = student_lp_at_sampled
-    data["reference_policy_logprobs"] = student_lp_at_sampled.clone()
+    # next_token_logprobs is [B, S-1]; data tensors are [B, S] and the loss
+    # slices reference_policy_logprobs to [:, 1:] to align them.
+    curr_lp = torch.randn(s.shape[0], s.shape[1])
+    data["reference_policy_logprobs"] = torch.cat(
+        [torch.zeros(s.shape[0], 1), curr_lp], dim=1
+    )
 
     loss_fn = SDPOLossFn(
         {
@@ -296,7 +299,9 @@ def test_sdpo_ref_kl_zero_when_student_equals_ref():
             "reference_policy_kl_type": "k3",
         }
     )
-    _, metrics = loss_fn(s, t, H, data, torch.tensor(4.0), gvt)
+    _, metrics = loss_fn(
+        s, t, H, data, torch.tensor(4.0), gvt, next_token_logprobs=curr_lp
+    )
     assert metrics["sdpo/ref_kl"] == pytest.approx(0.0, abs=1e-7)
 
 
@@ -307,10 +312,11 @@ def test_sdpo_ref_kl_positive_when_drifted(kl_estimator):
     ratio so we check the per-token tensor instead of just sign."""
     s, t, H, data, gvt = _build_inputs()
     torch.manual_seed(123)
-    student_lp = torch.randn(s.shape[0], s.shape[1] + 1)
-    ref_lp = student_lp + torch.randn_like(student_lp) * 0.5  # drifted
-    data["prev_logprobs"] = student_lp
-    data["reference_policy_logprobs"] = ref_lp
+    curr_lp = torch.randn(s.shape[0], s.shape[1])
+    ref_lp = curr_lp + torch.randn_like(curr_lp) * 0.5  # drifted
+    data["reference_policy_logprobs"] = torch.cat(
+        [torch.zeros(s.shape[0], 1), ref_lp], dim=1
+    )
 
     cfg_base = {
         "kl_type": "js",
@@ -325,7 +331,7 @@ def test_sdpo_ref_kl_positive_when_drifted(kl_estimator):
     )(s, t, H, data, torch.tensor(4.0), gvt)
     loss_high, metrics_high = SDPOLossFn(
         {**cfg_base, "reference_policy_kl_penalty": 1.0}
-    )(s, t, H, data, torch.tensor(4.0), gvt)
+    )(s, t, H, data, torch.tensor(4.0), gvt, next_token_logprobs=curr_lp)
 
     # With drift the penalty changes the loss between beta=0 and beta=1.
     assert abs(loss_high.item() - loss_low.item()) > 1e-4
@@ -334,6 +340,56 @@ def test_sdpo_ref_kl_positive_when_drifted(kl_estimator):
     if kl_estimator in {"k2", "k3"}:
         # k2 and k3 are non-negative by construction.
         assert metrics_high["sdpo/ref_kl"] >= -1e-7
+
+
+@pytest.mark.parametrize("kl_estimator", ["k1", "k2", "k3"])
+def test_sdpo_ref_kl_carries_gradient(kl_estimator):
+    """Regression: the ref-KL anchor must contribute gradient through the
+    current-policy logprobs. An earlier version built it from two detached
+    data-dict tensors, making the penalty a training no-op."""
+    s, t, H, data, gvt = _build_inputs()
+    torch.manual_seed(321)
+    curr_lp = torch.randn(s.shape[0], s.shape[1], requires_grad=True)
+    ref_lp = curr_lp.detach() + torch.randn(s.shape[0], s.shape[1]) * 0.5
+    data["reference_policy_logprobs"] = torch.cat(
+        [torch.zeros(s.shape[0], 1), ref_lp], dim=1
+    )
+
+    loss_fn = SDPOLossFn(
+        {
+            "kl_type": "js",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+            "success_reward_threshold": 1.0,
+            "reference_policy_kl_penalty": 1.0,
+            "reference_policy_kl_type": kl_estimator,
+        }
+    )
+    # s/t/H carry no grad, so any gradient on curr_lp comes from the ref-KL.
+    loss, _ = loss_fn(
+        s, t, H, data, torch.tensor(4.0), gvt, next_token_logprobs=curr_lp
+    )
+    loss.backward()
+    assert curr_lp.grad is not None
+    assert curr_lp.grad.abs().sum().item() > 0.0
+
+
+def test_sdpo_ref_kl_requires_next_token_logprobs():
+    """With the penalty on, omitting the grad-carrying logprobs fails loudly."""
+    s, t, H, data, gvt = _build_inputs()
+    data["reference_policy_logprobs"] = torch.randn(s.shape[0], s.shape[1] + 1)
+
+    loss_fn = SDPOLossFn(
+        {
+            "kl_type": "js",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+            "success_reward_threshold": 1.0,
+            "reference_policy_kl_penalty": 1.0,
+        }
+    )
+    with pytest.raises(AssertionError, match="next_token_logprobs"):
+        loss_fn(s, t, H, data, torch.tensor(4.0), gvt)
 
 
 def test_sdpo_ref_kl_invalid_config_raises():

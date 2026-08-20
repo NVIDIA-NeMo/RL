@@ -1311,9 +1311,10 @@ class SDPOLossFn(LossFunction):
         student_topk_logprobs: torch.Tensor,
         teacher_topk_logprobs: torch.Tensor,
         H_all: Optional[torch.Tensor],
-        data: BatchedDataDict, # dummy comment
-        global_valid_seqs: torch.Tensor, # dummy comment
-        global_valid_toks: torch.Tensor, # dummy comment
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        next_token_logprobs: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the SDPO logit-level KL loss.
 
@@ -1324,6 +1325,10 @@ class SDPOLossFn(LossFunction):
             data: must contain keys defined in SDPOLossDataDict.
             global_valid_seqs: number of valid sequences in this microbatch.
             global_valid_toks: number of valid tokens in this microbatch.
+            next_token_logprobs: grad-carrying log π_θ at the sampled tokens from
+                this training forward, shape [B, S-1]. Required when
+                reference_policy_kl_penalty > 0 (student side of the ref-KL);
+                prepare_loss_input supplies it.
 
         Returns:
             (loss, metrics)
@@ -1370,23 +1375,40 @@ class SDPOLossFn(LossFunction):
                 tail = tail * (1.0 - self.mixed_kl_weight)
             per_token_kl = per_token_kl + tail
 
-        # Trust-region anchor to a frozen-init reference policy.
-        # We use prev_logprobs (snapshot at step start) as the student side; at
-        # LR=3e-7 the within-step drift is small. ref_kl is added regardless of
-        # sdpo_mask so that even samples without a teacher demonstration are
-        # still anchored to the init policy.
+        # Trust-region anchor to a frozen-init reference policy. The student
+        # side must be the grad-carrying logprobs from this training forward:
+        # building the KL from two detached data-dict tensors (as an earlier
+        # version did with prev_logprobs) changes the logged loss but
+        # contributes zero gradient. ref_kl is added regardless of sdpo_mask so
+        # that even samples without a teacher demonstration are still anchored
+        # to the init policy.
         ref_kl_per_token: Optional[torch.Tensor] = None
-        if self.reference_policy_kl_penalty > 0.0 and "prev_logprobs" in data and "reference_policy_logprobs" in data:
+        if self.reference_policy_kl_penalty > 0.0:
+            assert next_token_logprobs is not None, (
+                "SDPOLossFn: reference_policy_kl_penalty > 0 requires the "
+                "grad-carrying current logprobs (next_token_logprobs) from the "
+                "training forward; prepare_loss_input supplies them."
+            )
+            assert "reference_policy_logprobs" in data, (
+                "SDPOLossFn: reference_policy_kl_penalty > 0 requires "
+                "data['reference_policy_logprobs']."
+            )
             max_len = per_token_kl.shape[1]
-            student_lp = data["prev_logprobs"][:, 1:][:, :max_len]  # [B, S-1]
+            # Prefer unfiltered logprobs when top-k/top-p filtering is active,
+            # to be consistent with the unfiltered reference logprobs (mirrors
+            # ClippedPGLossFn's ref-KL path).
+            curr_lp = data.get("curr_logprobs_unfiltered", next_token_logprobs)[:, :max_len]  # [B, S-1]
             ref_lp = data["reference_policy_logprobs"][:, 1:][:, :max_len]
-            log_ratio = ref_lp - student_lp  # log(p_ref / p_student) at sampled tokens
-            if self.reference_policy_kl_type == "k1":
-                ref_kl_per_token = -log_ratio
-            elif self.reference_policy_kl_type == "k2":
-                ref_kl_per_token = 0.5 * log_ratio.pow(2)
-            else:  # "k3" — Schulman, unbiased, low-variance, always >= 0
-                ref_kl_per_token = torch.exp(log_ratio) - 1.0 - log_ratio
+            # exp(x - x.detach()) == 1 in the forward pass but adds the
+            # score-function term to the gradient: the KL samples come from the
+            # policy being optimized (see ClippedPGLossFn's ref-KL path).
+            kl_importance_weights = torch.exp(curr_lp - curr_lp.detach())
+            ref_kl_per_token = calculate_kl(
+                logprobs=curr_lp,
+                logprobs_reference=ref_lp,
+                kl_type=self.reference_policy_kl_type,
+                importance_sampling_weights=kl_importance_weights,
+            )
             per_token_kl = per_token_kl + self.reference_policy_kl_penalty * ref_kl_per_token
 
         # Effective mask: response token AND sample has demo AND sample is valid.
@@ -1648,6 +1670,7 @@ class SDPOHybridLossFn(LossFunction):
             data,
             global_valid_seqs,
             global_valid_toks,
+            next_token_logprobs=next_token_logprobs,
         )
         grpo_loss, grpo_metrics = self.grpo_loss(
             next_token_logprobs,
@@ -1976,37 +1999,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         / ``teacher_full_logits_by_idx`` are precomputed in ``prepare_loss_input``;
         the raw ``logits`` is kept for the CE term.
         """
-        if self.gold_loss:
-            kd_loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc = (
-                self._compute_gold(logits, data, teacher_full_logits)
-            )
-            ce_loss = self._compute_ce(logits, data, global_valid_toks)
-            # Combine the H-KL distillation loss with next-token CE, mirroring
-            # the P-KL path below
-            if self.dynamic_loss_scaling:
-                kd_detached = kd_loss.detach().abs()
-                ce_detached = ce_loss.detach().abs()
-                kl_scale = torch.where(
-                    kd_detached > 0,
-                    ce_detached / kd_detached,
-                    torch.ones_like(kd_detached),
-                )
-                loss = kl_scale * kd_loss + ce_loss
-            else:
-                kl_scale = torch.tensor(1.0, device=kd_loss.device, dtype=kd_loss.dtype)
-                loss = self.kl_loss_weight * kd_loss + self.ce_loss_scale * ce_loss
-            metrics = {
-                "loss": loss.item(),
-                "kl_common": kl_common.item(),
-                "l1_uncommon": l1_uncommon.item(),
-                "ce_loss": ce_loss.item(),
-                "kl_loss_scale": kl_scale.item(),
-                "accuracy": top1_acc.item(),
-                "num_valid_samples": data["input_ids"].shape[0],
-                "num_valid_chunks": int(num_valid_chunks.item()),
-            }
-            return loss, metrics
-
         ce_loss = self._compute_ce(logits, data, global_valid_toks)
 
         if self.kd_loss_mode == "sum":
