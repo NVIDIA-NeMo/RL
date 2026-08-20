@@ -28,7 +28,7 @@ set -a
 source "${HERE}/swe_nano.env"
 
 # --- SingleController + TransferQueue overrides ------------------------------
-EXP_NAME=nano-swe-sc-tq-zhiyul
+EXP_NAME="${SC_EXP_NAME:-nano-swe-sc-tq}"
 NRL_ENTRYPOINT="${CODE_DIR}/examples/run_grpo_single_controller.py"
 CONFIG_PATH="${CODE_DIR}/examples/configs/ultra/nano_swe_teacher_sc.yaml"
 RESULTS_DIR="${WORKSPACE_DIR}/results/${EXP_NAME}"
