@@ -33,6 +33,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerActorArgs,
     setup_single_controller,
 )
+from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 
 
 def _make_master_config(
@@ -280,11 +281,6 @@ class TestSetup:
             mc = _make_master_config(colocated=True, backend="sglang")
         else:  # pragma: no cover
             raise AssertionError(f"unknown test case {invalid_case}")
-        if use_gym:
-            patched_factories["setup_response_data"].return_value = (
-                list(range(8)),
-                None,
-            )
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=use_gym),
@@ -293,10 +289,7 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        # The megatron_* checks live in the config-overrides pass, which runs
-        # after dataset setup; everything else fails before it.
-        if not invalid_case.startswith("megatron_"):
-            patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["_build_generation"].assert_not_called()
         patched_factories["_build_trainer"].assert_not_called()
@@ -732,6 +725,11 @@ class TestSetup:
                 5555,
                 port_holder,
             )
+            # Wire the real check through the class mock so the
+            # served-vs-reserved legs below exercise the genuine logic.
+            mock_megatron.verify_served_address = (
+                MegatronGeneration.verify_served_address
+            )
             mock_megatron.return_value.dp_openai_server_base_urls = [served_url]
             if served_matches_reserved:
                 actor_args, metrics = setup_single_controller(mc, tokenizer)
@@ -780,3 +778,117 @@ class TestSetup:
             assert factory_kwargs["generation_backend"] == "megatron"
             assert factory_kwargs["colocated"] is False
             assert factory_kwargs["inference_cluster"] is inference_cluster
+
+    def test_megatron_gym_router_failure_reaps_port_holder(self, patched_factories):
+        """A router-startup failure after the reservation kills the port holder.
+
+        The holder is created before the executor try/finally that normally
+        reaps it; the guard around router startup is its only owner inside
+        that window, so a failure there must not leak the held socket.
+        """
+        mc = self._make_gym_megatron_config()
+        mc.async_rl.generation_router.enabled = True
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        port_holder = MagicMock(name="port_holder")
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "spinup_nemo_gym_actor") as mock_spinup,
+            patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+            patch.object(sc_setup_mod, "ray") as mock_ray,
+            patch.object(
+                sc_setup_mod,
+                "_maybe_start_generation_router",
+                side_effect=RuntimeError("router boom"),
+            ),
+            pytest.raises(RuntimeError, match="router boom"),
+        ):
+            mock_megatron.reserve_http_server_address.return_value = (
+                "http://10.0.0.1:5555/v1",
+                5555,
+                port_holder,
+            )
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        mock_megatron.reserve_http_server_address.assert_called_once()
+        mock_ray.kill.assert_called_once_with(port_holder)
+        mock_spinup.assert_not_called()
+        patched_factories["_build_trainer"].assert_not_called()
+
+    def test_megatron_non_gym_setup(self, patched_factories):
+        """Non-colocated Megatron generation with NeMo Gym off.
+
+        The native rollout path: expose_http_server=false and no Gym, so
+        nothing reserves a URL, no port holder is created, and the
+        served-address cross-check is skipped.
+        """
+        mc = _make_master_config(
+            colocated=False, backend="megatron", megatron_enabled=True
+        )
+        tokenizer = MagicMock(pad_token_id=0)
+
+        with (
+            patch.object(sc_setup_mod, "spinup_nemo_gym_actor") as mock_spinup,
+            patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+            patch.object(sc_setup_mod, "ray") as mock_ray,
+        ):
+            actor_args, metrics = setup_single_controller(mc, tokenizer)
+
+        inference_cluster = patched_factories["_build_clusters"].return_value[1]
+        # Gym off: no URL reservation, no port holder to kill, no gym actor.
+        mock_megatron.reserve_http_server_address.assert_not_called()
+        mock_ray.kill.assert_not_called()
+        mock_spinup.assert_not_called()
+        # Trainer first, then the dedicated engine with the weight load skipped
+        # and no pre-published port to adopt.
+        patched_factories["_build_generation"].assert_not_called()
+        patched_factories["_build_trainer"].assert_called_once()
+        mock_megatron.assert_called_once_with(
+            config=mc.policy,
+            tokenizer=tokenizer,
+            cluster=inference_cluster,
+            processor=None,
+            weights_path=None,
+            skip_weight_load=True,
+            reserved_http_server_port=None,
+        )
+        # model_name is copied over even off the Gym path (normally set inside
+        # _build_generation, which the megatron path skips).
+        assert mc.policy["generation"]["model_name"] == "test-model"
+        assert actor_args.gen_handle is mock_megatron.return_value
+        assert actor_args.trainer_handle is patched_factories["fake_policy"]
+        assert metrics.generation_init_time_s is not None
+        assert metrics.policy_init_time_s is not None
+        # Reserve/load split is populated on the gym-on path only.
+        assert metrics.generation_init_reserve_time_s is None
+        _, factory_kwargs = patched_factories["create_weight_synchronizer"].call_args
+        assert factory_kwargs["generation_backend"] == "megatron"
+        assert factory_kwargs["colocated"] is False
+        assert factory_kwargs["inference_cluster"] is inference_cluster
+
+    def test_megatron_fleet_health_rejected_with_clean_backend_error(self):
+        """megatron + generation_fleet_health fails naming the backend.
+
+        MegatronGeneration forwards ``worker_group`` to its policy, so
+        _maybe_attach_fleet_health survives its shard-count read and reaches
+        attach_fleet_health, whose base implementation rejects the backend by
+        name -- not an AttributeError on the monitor's constructor args.
+        """
+        mc = _make_master_config(
+            colocated=False, backend="megatron", megatron_enabled=True
+        )
+        mc.async_rl.generation_fleet_health.enabled = True
+        policy = MagicMock(name="policy")
+        policy.worker_group.dp_size = 2
+        generation = MegatronGeneration(
+            config=mc.policy,
+            tokenizer=MagicMock(),
+            policy=policy,
+        )
+        assert generation.worker_group is policy.worker_group
+
+        with pytest.raises(
+            NotImplementedError,
+            match="not supported for the MegatronGeneration generation backend",
+        ):
+            sc_setup_mod._maybe_attach_fleet_health(generation, mc)
