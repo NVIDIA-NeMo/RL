@@ -417,6 +417,11 @@ class VllmSparseRefitReceiver:
         return result
 
     def setup_api_server(self, app: Any) -> None:
+        # Deferred: fastapi is only needed when the refit HTTP server runs.
+        # These must stay unquoted at runtime -- FastAPI resolves handler
+        # annotations against the endpoint's globals, and a TYPE_CHECKING-only
+        # name leaves an unresolved ForwardRef, which silently demotes the
+        # parameter to a query param and 422s every request.
         from fastapi import Request
         from fastapi.responses import JSONResponse
 
@@ -532,6 +537,8 @@ class VllmSparseRefitReceiver:
         return self._zmq_refit_server[0].flush(transfer_id, expected_payloads)
 
     def _setup_vllm_refit_server(self) -> None:
+        # Deferred: fastapi and uvicorn are only needed when this worker
+        # actually serves refit over HTTP.
         import uvicorn
         from fastapi import FastAPI
 

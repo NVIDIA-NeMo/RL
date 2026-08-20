@@ -354,6 +354,11 @@ class VllmAsyncGenerationWorkerImpl(
         from logging import LogRecord
         from typing import List, Optional, Union
 
+        # Deferred: fastapi is only needed when this worker serves HTTP.
+        # These must stay unquoted at runtime -- FastAPI resolves handler
+        # annotations against the endpoint's globals, and a TYPE_CHECKING-only
+        # name leaves an unresolved ForwardRef, which silently demotes the
+        # parameter to a query param and 422s every request.
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
         from vllm.entrypoints.chat_utils import load_chat_template
@@ -905,6 +910,8 @@ class VllmAsyncGenerationWorkerImpl(
         from logging import Filter as LoggingFilter
         from logging import LogRecord, getLogger
 
+        # Deferred: fastapi and uvicorn are only needed when this worker
+        # actually serves the async engine over HTTP.
         import uvicorn
         from fastapi import FastAPI
 

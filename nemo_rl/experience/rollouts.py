@@ -2558,6 +2558,8 @@ def _postprocess_single_nemo_gym_group(
     mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
+    # Deferred: wandb is optional, and importing it at module scope would
+    # pull it in for every importer of nemo_rl.algorithms.grpo.
     from wandb import Table
 
     # Length-based reward shaping for low-effort prompts

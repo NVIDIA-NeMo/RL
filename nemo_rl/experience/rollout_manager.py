@@ -997,6 +997,8 @@ class AsyncNemoGymRolloutImpl:
         agent_name: str,
     ) -> dict[str, Any]:
         """Aggregate per-sample and per-agent metrics."""
+        # Deferred: wandb is optional, and importing it at module scope would
+        # pull it in for every importer of nemo_rl.algorithms.grpo.
         from wandb import Table
 
         # Prepare lists of values for each metric.
