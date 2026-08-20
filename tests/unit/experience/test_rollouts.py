@@ -850,6 +850,11 @@ def test_async_vlm_multiturn_drops_stale_native_content(
     assert [call["dedup"] for call in calls] == [deduplicate_multimodal_data] * 2
 
 
+class _DummyDynamoGeneration(_DummySGLangGeneration):
+    def __init__(self):
+        self.cfg = {"backend": "dynamo"}
+
+
 def test_generate_responses_async_requires_sglang_opt_in():
     generation_input_data = BatchedDataDict(
         {
@@ -883,6 +888,30 @@ def test_generate_responses_async_allows_sglang_opt_in():
     updated_batch, generated_ids, gen_metrics = asyncio.run(
         generate_responses_async(
             _DummySGLangGeneration(use_async_rollouts=True),
+            generation_input_data,
+            batch,
+            _DummyTokenizer(),
+            input_lengths=generation_input_data["input_lengths"],
+        )
+    )
+
+    assert updated_batch["message_log"][0][-1]["content"] == "ok"
+    assert generated_ids[0].tolist() == [2]
+    assert gen_metrics["total_generated_tokens"] == 1
+
+
+def test_generate_responses_async_allows_dynamo():
+    generation_input_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1]]),
+            "input_lengths": torch.tensor([1], dtype=torch.long),
+        }
+    )
+    batch = BatchedDataDict({"message_log": [[]]})
+
+    updated_batch, generated_ids, gen_metrics = asyncio.run(
+        generate_responses_async(
+            _DummyDynamoGeneration(),
             generation_input_data,
             batch,
             _DummyTokenizer(),
@@ -1810,11 +1839,10 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
         def remote(
             self,
             rows,
-            tokenizer,
             timer_prefix,
             deduplicate_multimodal_data,
         ):
-            del rows, tokenizer, timer_prefix
+            del rows, timer_prefix
             assert deduplicate_multimodal_data is True
             # Both groups complete out of order internally and group 1 completes first.
             completion_order = [3, 1, 2, 0]
@@ -1966,7 +1994,9 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     assert boundary == "nemo_gym_request"
     assert enabled is True
     assert ray_arguments[0] is rows
-    assert ray_arguments[3:] == (True,)
+    # (rows, timer_prefix, deduplicate_multimodal_data) -- the tokenizer is no longer
+    # among the arguments crossing to the actor, which is the point of set_tokenizer.
+    assert ray_arguments[2:] == (True,)
     for expected_rowidx, (payload, boundary, enabled) in zip(
         (3, 1, 2, 0), payload_calls[1:]
     ):
@@ -2162,8 +2192,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, tokenizer, timer_prefix):
-            del inputs, tokenizer, timer_prefix
+        def remote(self, inputs, timer_prefix):
+            del inputs, timer_prefix
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
@@ -2235,8 +2265,8 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, tokenizer, timer_prefix):
-            del inputs, tokenizer, timer_prefix
+        def remote(self, inputs, timer_prefix):
+            del inputs, timer_prefix
             return _DuplicateStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)

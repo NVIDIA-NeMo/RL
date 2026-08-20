@@ -556,6 +556,7 @@ async def generate_responses_async(
     # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``;
     # vLLM exposes ``cfg`` and gates on ``vllm_cfg.async_engine``;
     # TRT-LLM requires its flag; the Megatron backend is always async.
+    # Managed Dynamo always exposes its rollout frontend asynchronously.
     vllm_cfg = getattr(policy_generation, "cfg", None)
     sglang_cfg = getattr(policy_generation, "sglang_cfg", None)
     generation_config = vllm_cfg or sglang_cfg or {}
@@ -567,6 +568,8 @@ async def generate_responses_async(
         use_async_generation = bool(
             generation_config.get("vllm_cfg", {}).get("async_engine", False)
         )
+    elif backend == "dynamo":
+        use_async_generation = True
     elif backend == "trtllm":
         assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
             "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
@@ -2270,7 +2273,8 @@ async def run_async_nemo_gym_rollout(
         policy_generation: Generation interface whose configuration supplies the
             model's maximum sequence length.
         input_batch: Batch whose ``extra_env_info`` field contains NeMo-Gym rows.
-        tokenizer: Tokenizer used by the NeMo-Gym actor and local postprocessing.
+        tokenizer: Tokenizer for local postprocessing. The actor holds its own,
+            installed once at spinup -- see NemoGym.set_tokenizer.
         task_to_env: Environment mapping containing the ``"nemo_gym"`` actor.
         generation_config: Sampling parameters forwarded to every NeMo-Gym row.
         num_generations: Number of contiguous rows belonging to each prompt group.
@@ -2392,7 +2396,6 @@ async def run_async_nemo_gym_rollout(
         with timer.time(run_rollouts_timer_label):
             ray_arguments = (
                 nemo_gym_rows,
-                tokenizer,
                 timer_prefix,
                 deduplicate_multimodal_data,
             )
@@ -2511,7 +2514,8 @@ def run_nemo_gym_rollout_sync(
         policy_generation: Generation interface whose configuration supplies the
             model's maximum sequence length.
         input_batch: Batch whose ``extra_env_info`` field contains NeMo-Gym rows.
-        tokenizer: Tokenizer used by the NeMo-Gym actor and local postprocessing.
+        tokenizer: Tokenizer for local postprocessing. The actor holds its own,
+            installed once at spinup -- see NemoGym.set_tokenizer.
         task_to_env: Environment mapping containing the ``"nemo_gym"`` actor.
         generation_config: Sampling parameters forwarded to every NeMo-Gym row.
         log_full_result_tables: Whether to include complete per-agent result

@@ -255,6 +255,7 @@ def setup_configs(args, tokenizer):
                 # Optimizer CPU offload settings
                 "optimizer_cpu_offload": False,
                 "optimizer_offload_fraction": 0.0,
+                "overlap_cpu_optimizer_d2h_h2d": False,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
