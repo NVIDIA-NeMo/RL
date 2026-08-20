@@ -85,11 +85,7 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import (
-    get_pad_dynamic_image_shapes,
-    should_use_nemo_gym,
-    spinup_nemo_gym_actor,
-)
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
 from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
@@ -2848,9 +2844,7 @@ def grpo_train(
                         attach_initial_nemo_gym_image_payloads(
                             batch,
                             processor,
-                            pad_dynamic_image_shapes=get_pad_dynamic_image_shapes(
-                                master_config.env
-                            ),
+                            env_config=master_config.env,
                         )
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
@@ -3878,9 +3872,7 @@ def validate(
                     attach_initial_nemo_gym_image_payloads(
                         val_batch,
                         processor,
-                        pad_dynamic_image_shapes=get_pad_dynamic_image_shapes(
-                            master_config.env
-                        ),
+                        env_config=master_config.env,
                     )
                 generation_config = master_config.policy["generation"]
                 # Validation-only sampling (e.g. near-greedy validation);
