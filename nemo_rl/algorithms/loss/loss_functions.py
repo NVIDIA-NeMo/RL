@@ -17,7 +17,10 @@ from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 import torch
 from pydantic import BaseModel
 
-from nemo_rl.algorithms.loss.draft import streaming_vocab_parallel_soft_ce
+from nemo_rl.algorithms.loss.draft import (
+    DraftLossStats,
+    streaming_vocab_parallel_soft_ce,
+)
 from nemo_rl.algorithms.loss.interfaces import (
     LossFunction,
     LossInputType,
@@ -86,16 +89,31 @@ class DraftCrossEntropyLossFn(LossFunction):
         global_valid_toks: torch.Tensor,
     ) -> torch.Tensor:
         """Reduce the masked per-token draft loss to a scalar."""
+        stats = self.loss_stats(
+            teacher_logits=teacher_logits,
+            student_logits=student_logits,
+            token_mask=token_mask,
+            data=data,
+        )
+        return stats.normalized(
+            normalization_counts=global_valid_toks.reshape(1),
+        )
+
+    def loss_stats(
+        self,
+        teacher_logits: Tensor,
+        student_logits: Tensor,
+        token_mask: Tensor,
+        data: BatchedDataDict[DraftCrossEntropyLossDataDict],
+    ) -> DraftLossStats:
+        """Return raw one-bin EAGLE statistics for deferred normalization."""
         mask = token_mask * data["sample_mask"].unsqueeze(-1)
-        stats = streaming_vocab_parallel_soft_ce(
+        return streaming_vocab_parallel_soft_ce(
             student_logits=student_logits,
             teacher_logits=teacher_logits,
             mask=mask,
             token_chunk_size=self.token_chunk_size,
             tp_group=self.vocab_parallel_group,
-        )
-        return stats.normalized(
-            normalization_counts=global_valid_toks.reshape(1),
         )
 
 
