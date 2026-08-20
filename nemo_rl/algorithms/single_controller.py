@@ -110,6 +110,7 @@ from nemo_rl.experience.rollout_recovery import (
     PromptGroupStatus,
 )
 from nemo_rl.experience.route_plan import decode_route_plan
+from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -120,7 +121,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 if TYPE_CHECKING:
     from nemo_rl.experience.finalizer_actor import FinalizationRequest
 
-Generation = Union[VllmGeneration, SGLangGeneration]
+Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 
 _TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
 _TELEMETRY_PREFIXES = (
