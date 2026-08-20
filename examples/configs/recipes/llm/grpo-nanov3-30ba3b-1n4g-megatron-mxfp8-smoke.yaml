@@ -22,9 +22,8 @@ policy:
       expert_model_parallel_size: 2
       sequence_parallel: false
       inference_grouped_gemm_backend: torch
-      # Selects receiver-side refit quantization and dense MXFP8 GEMMs. MoE
-      # remains on torch scaled_grouped_mm for either compatible producer.
-      inference_mxfp8_backend: flashinfer
+      # Use fused Triton refit quantization for the PyTorch scaled GEMM paths.
+      inference_mxfp8_backend: triton
       # NVLS supports CUDA graphs for both prefill and decode in the
       # inference-optimized expert-parallel path.
       inference_moe_token_dispatcher_type: nvls

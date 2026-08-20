@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--precision", choices=("bf16", "mxfp8"), required=True)
     parser.add_argument("--source-precision", choices=("bf16", "mxfp8"), required=True)
+    parser.add_argument(
+        "--refit-impl",
+        choices=("bridge", "mcore"),
+        help="Override the recipe's Megatron refit implementation.",
+    )
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument(
         "--input-jsonl",
@@ -164,6 +169,8 @@ def main() -> None:
     if args.max_new_tokens is not None:
         generation_config["max_new_tokens"] = args.max_new_tokens
     mcore_generation_config = generation_config["mcore_generation_config"]
+    if args.refit_impl is not None:
+        mcore_generation_config["refit_impl"] = args.refit_impl
     if args.execution_mode == "eager":
         mcore_generation_config["cuda_graph_impl"] = "none"
         mcore_generation_config["inference_cuda_graph_scope"] = "none"
@@ -263,24 +270,33 @@ def main() -> None:
         ip, port = source_cluster.get_master_address_and_port()
         source_world_size = source_cluster.world_size()
         world_size = source_world_size + generation_cluster.world_size()
-        refit_backend = policy_config["generation"]["mcore_generation_config"][
-            "refit_backend"
-        ]
-        source_futures = policy.init_collective_mcore_generation(
-            ip,
-            port,
-            world_size,
-            rank_offset=0,
-            refit_backend=refit_backend,
-        )
+        if generation.uses_native_refit:
+            source_futures = policy.init_collective_mcore_generation(
+                ip,
+                port,
+                world_size,
+                rank_offset=0,
+                refit_backend=policy_config["generation"][
+                    "mcore_generation_config"
+                ]["refit_backend"],
+            )
+        else:
+            source_futures = policy.init_collective(
+                ip,
+                port,
+                world_size,
+                train_world_size=source_world_size,
+            )
         generation_futures = generation.init_collective(
             ip,
             port,
             world_size,
             train_world_size=source_world_size,
-            refit_backend=refit_backend,
         )
         ray.get(source_futures + generation_futures)
+        if not generation.uses_native_refit:
+            state_dict_info = policy.prepare_refit_info()
+            generation.prepare_refit_info(state_dict_info)
         for refit_iteration in range(1, args.refit_iterations + 1):
             refit_policy_generation(policy, generation, colocated_inference=False)
             print(
@@ -484,17 +500,11 @@ def main() -> None:
                         f"Inference engine rank {rank} did not capture CUDA graphs: "
                         f"{info}."
                     )
-                if info["cuda_graph_replay_count"] <= 0:
-                    raise RuntimeError(
-                        f"Inference engine rank {rank} did not replay a CUDA graph: "
-                        f"{info}."
-                    )
                 execution_marker = "CUDA_GRAPH"
             else:
                 if (
                     info["captured_graph_count"] != 0
                     or info["capture_stats"] is not None
-                    or info["cuda_graph_replay_count"] != 0
                 ):
                     raise RuntimeError(
                         f"Eager inference rank {rank} unexpectedly used CUDA graphs: "

@@ -26,7 +26,13 @@ class AbstractPolicyWorker:
     """Base class for policy workers with shared functionality."""
 
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        rank_offset: int = 0,
     ) -> None:
         """Initialize the collective communication.
 
@@ -35,11 +41,15 @@ class AbstractPolicyWorker:
             port: Port for the process group
             world_size: Total world size (train_world_size + inference_world_size)
             train_world_size: Number of training workers (used in inference cluster)
+            rank_offset: Offset added to this worker group's local rank.
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         self.model_update_group = StatelessProcessGroup(
-            master_address=ip, port=port, rank=self.rank, world_size=world_size
+            master_address=ip,
+            port=port,
+            rank=self.rank + rank_offset,
+            world_size=world_size,
         )
         device = torch.cuda.current_device()
         # Release unused cached allocator blocks before NCCL communicator

@@ -18,7 +18,9 @@ import os
 import threading
 import time
 import warnings
-from typing import AsyncGenerator, Optional
+from collections import Counter
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator, Optional
 
 import requests
 import torch
@@ -28,6 +30,7 @@ from megatron.core.inference.config import (
     PrefixCachingCoordinatorPolicy,
 )
 from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import toggle_cuda_graphs
@@ -44,9 +47,76 @@ from nemo_rl.models.generation.megatron.utils import (
     resolve_torch_dtype,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
 
 G_VERIFY_MXFP8_ENV = "NRL_VERIFY_MEGATRON_MXFP8"
+
+
+def _resolve_mxfp8_refit_backend(model_config: Any) -> tuple[str, str]:
+    """Resolve MXFP8 naming across supported Megatron Core revisions.
+
+    Newer MCore revisions derive the quantizer from the grouped-GEMM backend
+    and name the transform argument ``backend``. Earlier revisions expose an
+    independent ``inference_mxfp8_backend`` setting and call the argument
+    ``quantization_backend``.
+    """
+    try:
+        from megatron.core.inference.quantization.utils import (
+            resolve_mxfp8_backend,
+        )
+    except ImportError:
+        return (
+            getattr(model_config, "inference_mxfp8_backend", "flashinfer"),
+            "quantization_backend",
+        )
+    return (
+        resolve_mxfp8_backend(model_config.inference_grouped_gemm_backend),
+        "backend",
+    )
+
+
+class _RefittableMXFP8Tensor(MXFP8Tensor):
+    """MXFP8 storage with the logical tensor metadata Bridge needs for import."""
+
+    def __init__(
+        self,
+        tensor: MXFP8Tensor,
+        *,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        super().__init__(data=tensor.data, scale=tensor.scale, backend=tensor.backend)
+        self._logical_shape = shape
+        self._logical_dtype = dtype
+        self._logical_device = device
+
+    @property
+    def shape(self) -> torch.Size:
+        return self._logical_shape
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._logical_dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self._logical_device
+
+
+@dataclass
+class _MegatronRefitTask:
+    """A local Bridge import task and its persistent inference destination."""
+
+    param_name: str
+    mapping: Any
+    megatron_module: torch.nn.Module
+    destination: Any
+    dependencies: tuple[str, ...]
+    expected_shape: torch.Size
+    target_id: int
+    mxfp8_param_name: Optional[str] = None
 
 
 def _verify_mxfp8_inference_weights(
@@ -262,21 +332,13 @@ class MegatronGenerationMixin:
         print(f"[Rank {self.rank}] Initialized persistent inference engine")
 
     def get_inference_runtime_info(self) -> dict[str, object]:
-        """Return serializable state proving CUDA graphs were captured and selected.
-
-        This explicit diagnostics API avoids depending on MCore's INFO-level log
-        formatting. ``cuda_graph_replay_count`` is cumulative for the current
-        engine lifecycle and survives per-request context metadata resets.
-        ``using_cuda_graph_last_step`` is a point-in-time context diagnostic and
-        may be false after the most recent request batch has drained.
-        """
+        """Return serializable state for inference-engine functional tests."""
         if not self._inference_engine_initialized:
             return {
                 "initialized": False,
                 "captured_graph_count": 0,
                 "capture_stats": None,
                 "step_count": 0,
-                "cuda_graph_replay_count": 0,
                 "using_cuda_graph_last_step": False,
                 "padded_batch_dimensions": None,
             }
@@ -293,7 +355,6 @@ class MegatronGenerationMixin:
             ),
             "capture_stats": capture_stats,
             "step_count": context.step_count,
-            "cuda_graph_replay_count": engine.cuda_graph_replay_count,
             "using_cuda_graph_last_step": context.using_cuda_graph_this_step(),
             "padded_batch_dimensions": str(context.padded_batch_dimensions),
         }
@@ -508,8 +569,8 @@ class MegatronGenerationMixin:
 
         # tags=["weights"] means we are inside refit_policy_generation between
         # suspend_for_refit and the weight transfer — the engine was intentionally
-        # paused and waking it now would race NVSHMEM init / weight transfer against
-        # CUDA-graph replay, corrupting TE FP8 state. The subsequent
+        # paused and waking it now would race the weight transfer against CUDA-graph
+        # replay. The subsequent
         # prepare_for_generation(tags=["kv_cache"]) is what actually wakes it.
         if tags is None or "weights" not in tags:
             if not self._inference_engine_initialized:
@@ -766,8 +827,8 @@ class MegatronGenerationMixin:
         return results
 
 
-class MegatronGenerationRefitMixin:
-    """Refit collective, weight transfer, and engine suspend/resume around refits."""
+class MegatronNativeRefitMixin:
+    """Megatron Core's native cross-world reshard/refit implementation."""
 
     def init_collective_mcore_generation(
         self,
@@ -775,17 +836,11 @@ class MegatronGenerationRefitMixin:
         port: int,
         world_size: int,
         rank_offset: int,
-        refit_backend: str = "gloo",
+        refit_backend: str,
     ) -> None:
-        """Initialize the refit collective for non-colocated weight transfer.
-
-        Args:
-            ip: IP address for the process group rendezvous.
-            port: Port for the process group rendezvous.
-            world_size: Total world size (train + inference workers).
-            rank_offset: Offset for this side's ranks (`train_world_size` for inference).
-            refit_backend: Copy-service backend ("gloo", "nccl", or "nvshmem").
-        """
+        """Initialize the native MCore refit collective and reshard plan."""
+        # Native refit is optional; keep its private process-group machinery off
+        # the default Megatron Bridge path.
         from torch.distributed.distributed_c10d import (
             PrefixStore,
             ProcessGroup,
@@ -795,8 +850,6 @@ class MegatronGenerationRefitMixin:
 
         local_rank = torch.distributed.get_rank()
         global_rank = local_rank + rank_offset
-
-        # port+1 to avoid collision with the caller's rendezvous on `port`.
         store = torch.distributed.TCPStore(
             host_name=ip,
             port=port + 1,
@@ -806,12 +859,6 @@ class MegatronGenerationRefitMixin:
 
         group_name = "refit"
         pg_prefix_store = PrefixStore(f"{group_name}/", store)
-
-        # Training and inference workers run in separate torch.distributed worlds.
-        # The public APIs (new_group, init_process_group) assume all ranks belong to one world;
-        # new_group validates ranks against the default PG, and init_process_group can only
-        # be called once. We construct the PG manually using the same internal pattern as
-        # _new_process_group_helper, skipping the single-world assumptions.
         pg = ProcessGroup(pg_prefix_store, global_rank, world_size)
         gloo_store = PrefixStore("cpu/", pg_prefix_store)
         gloo_backend = ProcessGroupGloo(gloo_store, global_rank, world_size)
@@ -823,20 +870,16 @@ class MegatronGenerationRefitMixin:
         )
         pg._set_default_backend(ProcessGroup.BackendType.GLOO)
 
-        # The NCCL copy service moves the actual weight bytes with CUDA-tensor P2P
-        # (`torch.distributed.batch_isend_irecv`), which needs an NCCL backend
-        # registered for the cuda device on this cross-world PG. GLOO stays the
-        # default backend so the object collectives in `prepare_swap_model_weights`
-        # (all_gather_object / broadcast_object_list) keep using CPU tensors.
         if refit_backend == "nccl":
             from torch.distributed.distributed_c10d import ProcessGroupNCCL
 
-            # Ensure the NCCL communicator binds to this rank's own GPU.
             torch.cuda.set_device(torch.cuda.current_device())
             nccl_store = PrefixStore("cuda/", pg_prefix_store)
-            nccl_options = ProcessGroupNCCL.Options()
             nccl_backend = ProcessGroupNCCL(
-                nccl_store, global_rank, world_size, nccl_options
+                nccl_store,
+                global_rank,
+                world_size,
+                ProcessGroupNCCL.Options(),
             )
             nccl_backend._set_sequence_number_for_group()
             pg._register_backend(
@@ -846,12 +889,11 @@ class MegatronGenerationRefitMixin:
             )
 
         pg._set_group_name(group_name)
-
         self.refit_pg = pg
 
-        # Register in torch.distributed's global state so that high-level ops
-        # (all_gather_object, broadcast_object_list) work with this PG.
-        _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+        # High-level object collectives need this manually-created cross-world
+        # process group registered in torch.distributed's global state.
+        _world.pg_group_ranks[pg] = {rank: rank for rank in range(world_size)}
         _world.pg_map[pg] = ("gloo", pg_prefix_store)
         _world.pg_names[pg] = group_name
 
@@ -860,34 +902,32 @@ class MegatronGenerationRefitMixin:
                 NVSHMEMCopyService,
             )
 
-            self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
+            self.refit_copy_service = NVSHMEMCopyService(group=pg)
         elif refit_backend == "nccl":
             from megatron.core.resharding.copy_services.nccl_copy_service import (
                 NCCLCopyService,
             )
 
-            self.refit_copy_service = NCCLCopyService(group=self.refit_pg)
-        else:
+            self.refit_copy_service = NCCLCopyService(group=pg)
+        elif refit_backend == "gloo":
             from megatron.core.resharding.copy_services.gloo_copy_service import (
                 GlooCopyService,
             )
 
-            self.refit_copy_service = GlooCopyService(group=self.refit_pg)
+            self.refit_copy_service = GlooCopyService(group=pg)
+        else:
+            raise ValueError(f"Unsupported native MCore refit backend: {refit_backend!r}.")
 
         from megatron.core.resharding.refit import prepare_swap_model_weights
 
         is_source = rank_offset == 0
-        # Cache for later refit calls (swap_weights_via_reshard).
         self.refit_dst_rank_offset = (
             torch.distributed.get_world_size() if is_source else rank_offset
         )
-
-        # Build and cache the reshard plan (and any MXFP8 transforms) collectively.
-        # All participating ranks (training + generation) call this simultaneously.
         prepare_swap_model_weights(
             src_model=self.model if is_source else None,
             target_model=None if is_source else self.model,
-            group=self.refit_pg,
+            group=pg,
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
         )
@@ -897,9 +937,7 @@ class MegatronGenerationRefitMixin:
                 self.model if isinstance(self.model, (list, tuple)) else [self.model]
             )
             model_config = unwrap_model(model_chunks[0]).config
-            expected_backend = getattr(
-                model_config, "inference_mxfp8_backend", "flashinfer"
-            )
+            expected_backend, _ = _resolve_mxfp8_refit_backend(model_config)
             mxfp8_weight_count = _verify_mxfp8_inference_weights(
                 self.model, expected_backend=expected_backend
             )
@@ -910,43 +948,292 @@ class MegatronGenerationRefitMixin:
             )
 
     def preinit_nvshmem_collective(self) -> None:
-        """Initialize NVShmem collectively before any weight transfer.
-
-        Must be called on ALL participating ranks (training + inference) simultaneously,
-        outside CUDA graph capture. Skip-load inference initializes NVSHMEM before its
-        first engine capture; initialized engines call this after capture. In either
-        ordering, the lazy initialization never occurs inside graph recording/replay.
-        """
-        if not hasattr(self, "refit_copy_service"):
-            return
-        if not hasattr(self.refit_copy_service, "_ensure_initialized"):
-            return
-        self.refit_copy_service._ensure_initialized()
+        """Initialize an NVSHMEM copy service outside CUDA graph capture."""
+        copy_service = getattr(self, "refit_copy_service", None)
+        if copy_service is not None and hasattr(copy_service, "_ensure_initialized"):
+            copy_service._ensure_initialized()
 
     def swap_weights_via_reshard(self, is_source: bool) -> bool:
-        """Transfer weights using Megatron's `swap_model_weights` API.
-
-        Args:
-            is_source: True for training workers (senders), False for inference workers (receivers).
-
-        Returns:
-            True on success.
-        """
+        """Transfer weights through Megatron Core's native refit plan."""
         from megatron.core.resharding.refit import swap_model_weights
 
-        src_model = self.model if is_source else None
-        dst_model = None if is_source else self.model
-
         swap_model_weights(
-            src_model,
-            dst_model,
+            self.model if is_source else None,
+            None if is_source else self.model,
             refit_method=self.refit_copy_service,
             group=self.refit_pg,
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
         )
-
         return True
+
+
+class MegatronGenerationRefitMixin(MegatronNativeRefitMixin):
+    """Bridge/native refit implementations and inference-engine lifecycle."""
+
+    @staticmethod
+    def _hf_dependencies(mapping: Any) -> tuple[str, ...]:
+        hf_param = mapping.hf_param
+        names = (hf_param,) if isinstance(hf_param, str) else tuple(hf_param.values())
+        return tuple(dict.fromkeys(names))
+
+    def _prepare_mxfp8_refit(self, tasks: list[_MegatronRefitTask]) -> None:
+        """Replace inference FP8 parameters with persistent MCore MXFP8 storage."""
+        model_chunks = (
+            self.model if isinstance(self.model, (list, tuple)) else [self.model]
+        )
+        cores = [unwrap_model(model) for model in model_chunks]
+        needs_mxfp8 = any(
+            getattr(core.config, "transformer_impl", None) == "inference_optimized"
+            and getattr(core.config, "fp8_recipe", None) == "mxfp8"
+            for core in cores
+        )
+        if not needs_mxfp8:
+            return
+        if len(cores) != 1:
+            raise NotImplementedError(
+                "Packed Megatron MXFP8 refit does not yet support virtual pipeline stages."
+            )
+        core = cores[0]
+        if (
+            getattr(core.config, "share_embeddings_and_output_weights", False)
+            and getattr(core.config, "pipeline_model_parallel_size", 1) > 1
+        ):
+            raise NotImplementedError(
+                "Packed Megatron MXFP8 refit does not yet support tied embeddings "
+                "across pipeline stages."
+            )
+        if self._inference_engine_initialized:
+            raise RuntimeError(
+                "MXFP8 refit buffers must be prepared before inference-engine "
+                "initialization; construct MegatronGeneration with skip_weight_load=True."
+            )
+
+        from megatron.bridge.models.conversion.utils import (
+            get_module_and_param_from_name,
+        )
+        from megatron.core.inference.quantization.utils import (
+            collect_mxfp8_param_metadata,
+            quantize_params_to_mxfp8,
+        )
+        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+
+        decoder = core.decoder if hasattr(core, "decoder") else core
+        param_name_by_id = {
+            id(param): name for name, param in decoder.named_parameters()
+        }
+        logical_metadata = collect_mxfp8_param_metadata(decoder)
+        backend, transform_backend_arg = _resolve_mxfp8_refit_backend(core.config)
+        persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
+
+        # Bridge mappings query the destination's logical shape/dtype/device.
+        # MCore's MXFP8 wrapper intentionally exposes only physical data/scale,
+        # so use a thin subclass that shares those exact persistent allocations.
+        for name, tensor in tuple(persistent_buffers.items()):
+            shape, dtype, device = logical_metadata[name]
+            refittable = _RefittableMXFP8Tensor(
+                tensor, shape=shape, dtype=dtype, device=device
+            )
+            module, current = get_module_and_param_from_name(decoder, name)
+            if current is not tensor:
+                raise RuntimeError(
+                    f"MXFP8 destination changed while preparing {name!r}."
+                )
+            setattr(module, name.rsplit(".", 1)[-1], refittable)
+            persistent_buffers[name] = refittable
+
+        convertible_params = {f"decoder.{name}" for name in persistent_buffers}
+        transform_kwargs = {
+            transform_backend_arg: backend,
+        }
+        self._generation_refit_mxfp8_transform = MXFP8ReshardTransform(
+            convertible_params=convertible_params,
+            persistent_buffers=persistent_buffers,
+            buffer_key_prefix="decoder.",
+            **transform_kwargs,
+        )
+
+        for task in tasks:
+            decoder_name = param_name_by_id.get(task.target_id)
+            if decoder_name not in persistent_buffers:
+                continue
+            task.mxfp8_param_name = f"decoder.{decoder_name}"
+            task.destination = persistent_buffers[decoder_name]
+
+        if os.environ.get(G_VERIFY_MXFP8_ENV) == "1":
+            mxfp8_weight_count = _verify_mxfp8_inference_weights(
+                self.model, expected_backend=backend
+            )
+            print(
+                f"NRL_MXFP8_VERIFY: PASS rank={self.rank} "
+                f"weights={mxfp8_weight_count} backend={backend}",
+                flush=True,
+            )
+
+    @torch.no_grad()
+    def prepare_generation_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        """Build the local HF-to-Megatron receive plan before the first refit."""
+        if not state_dict_info:
+            raise ValueError(
+                "Megatron packed refit requires non-empty state_dict_info."
+            )
+
+        model_chunks = (
+            list(self.model) if isinstance(self.model, (list, tuple)) else [self.model]
+        )
+        conversion_tasks = self.megatron_bridge.get_conversion_tasks(model_chunks)
+        tasks: list[_MegatronRefitTask] = []
+        for conversion_task in conversion_tasks:
+            if conversion_task is None or conversion_task.megatron_module is None:
+                continue
+            destination = conversion_task.param_weight
+            if destination is None:
+                raise RuntimeError(
+                    f"Bridge task {conversion_task.param_name!r} has no destination."
+                )
+            tasks.append(
+                _MegatronRefitTask(
+                    param_name=conversion_task.param_name,
+                    mapping=conversion_task.mapping,
+                    megatron_module=conversion_task.megatron_module,
+                    destination=destination,
+                    dependencies=self._hf_dependencies(conversion_task.mapping),
+                    expected_shape=torch.Size(destination.shape),
+                    target_id=id(destination),
+                )
+            )
+
+        if not tasks:
+            raise RuntimeError("Megatron Bridge produced no local refit tasks.")
+
+        required_names = {name for task in tasks for name in task.dependencies}
+        missing_names = sorted(required_names.difference(state_dict_info))
+        if missing_names:
+            preview = ", ".join(missing_names[:20])
+            raise ValueError(
+                "Megatron refit metadata is missing Bridge inputs: "
+                f"{preview}{' ...' if len(missing_names) > 20 else ''}"
+            )
+
+        self._prepare_mxfp8_refit(tasks)
+        self._generation_refit_model_chunks = model_chunks
+        self._generation_refit_tasks = tasks
+        self._generation_refit_dependency_counts = Counter(
+            name for task in tasks for name in task.dependencies
+        )
+        self._generation_refit_state_dict_info = state_dict_info
+
+    def _write_generation_refit_weight(
+        self, task: _MegatronRefitTask, converted_weight: torch.Tensor
+    ) -> None:
+        if converted_weight.shape != task.expected_shape:
+            raise ValueError(
+                f"Shape mismatch for Megatron parameter {task.param_name!r}: "
+                f"expected {tuple(task.expected_shape)}, got {tuple(converted_weight.shape)}."
+            )
+
+        if task.mxfp8_param_name is not None:
+            converted_weight = converted_weight.to(torch.bfloat16).contiguous()
+            dst_slice = tuple(slice(None) for _ in task.expected_shape)
+            self._generation_refit_mxfp8_transform.finalize_recv(
+                task.mxfp8_param_name, dst_slice, [converted_weight]
+            )
+        else:
+            task.destination.copy_(converted_weight)
+
+    def _load_generation_refit_batch(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        batch_stream = (
+            torch.cuda.current_stream() if weights and weights[0][1].is_cuda else None
+        )
+        for name, tensor in weights:
+            if self._generation_refit_remaining_dependencies.get(name, 0) > 0:
+                self._generation_refit_pending_weights[name] = tensor
+                if batch_stream is not None:
+                    self._generation_refit_pending_streams[name] = batch_stream
+
+        tasks = self._generation_refit_tasks
+        while self._generation_refit_task_index < len(tasks):
+            task = tasks[self._generation_refit_task_index]
+            if any(
+                name not in self._generation_refit_pending_weights
+                for name in task.dependencies
+            ):
+                break
+
+            # packed_broadcast_consumer alternates CUDA streams. A compound Bridge
+            # mapping can retain one input across a batch boundary, so make the
+            # current batch wait for the stream that received each retained input.
+            current_stream = (
+                torch.cuda.current_stream() if batch_stream is not None else None
+            )
+            for name in task.dependencies:
+                source_stream = self._generation_refit_pending_streams.get(name)
+                if current_stream is not None and source_stream is not None:
+                    current_stream.wait_stream(source_stream)
+
+            hf_weights = (
+                self.megatron_bridge._model_bridge.maybe_modify_loaded_hf_weight(
+                    task.mapping.hf_param, self._generation_refit_pending_weights
+                )
+            )
+            converted_weight = task.mapping.hf_to_megatron(
+                hf_weights, task.megatron_module
+            )
+            if converted_weight is None:
+                raise RuntimeError(
+                    f"Bridge produced no local value for {task.param_name!r}."
+                )
+            self._write_generation_refit_weight(task, converted_weight)
+
+            for name in task.dependencies:
+                self._generation_refit_remaining_dependencies[name] -= 1
+                if self._generation_refit_remaining_dependencies[name] == 0:
+                    del self._generation_refit_pending_weights[name]
+                    self._generation_refit_pending_streams.pop(name, None)
+            self._generation_refit_task_index += 1
+
+    @torch.no_grad()
+    def update_generation_weights_from_collective(self) -> bool:
+        """Receive packed HF tensors and import them into the Megatron model."""
+        if not hasattr(self, "_generation_refit_state_dict_info"):
+            raise RuntimeError(
+                "Megatron refit metadata is not prepared. Call prepare_refit_info first."
+            )
+
+        self._generation_refit_task_index = 0
+        self._generation_refit_pending_weights: dict[str, torch.Tensor] = {}
+        self._generation_refit_pending_streams: dict[str, torch.cuda.Stream] = {}
+        self._generation_refit_remaining_dependencies = Counter(
+            self._generation_refit_dependency_counts
+        )
+        try:
+            packed_broadcast_consumer(
+                iterator=iter(self._generation_refit_state_dict_info.items()),
+                group=self.model_update_group,
+                src=0,
+                post_unpack_func=self._load_generation_refit_batch,
+            )
+            if self._generation_refit_task_index != len(self._generation_refit_tasks):
+                task = self._generation_refit_tasks[self._generation_refit_task_index]
+                missing = [
+                    name
+                    for name in task.dependencies
+                    if name not in self._generation_refit_pending_weights
+                ]
+                raise RuntimeError(
+                    f"Megatron refit ended before {task.param_name!r}; "
+                    f"missing inputs: {missing}."
+                )
+
+            self.megatron_bridge._model_bridge._broadcast_shared_embeddings(
+                self._generation_refit_model_chunks
+            )
+            return True
+        finally:
+            self._generation_refit_pending_weights.clear()
+            self._generation_refit_pending_streams.clear()
 
     def suspend_for_refit(self) -> None:
         """Pause+suspend the inference engine before a weight refit."""

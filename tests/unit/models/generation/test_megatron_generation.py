@@ -14,6 +14,7 @@
 
 import gc
 from copy import deepcopy
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -28,6 +29,49 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+@pytest.mark.parametrize("refit_impl", ["bridge", "mcore"])
+def test_megatron_generation_dispatches_refit_implementation(refit_impl):
+    generation = object.__new__(MegatronGeneration)
+    generation.refit_impl = refit_impl
+    generation.cfg = {
+        "mcore_generation_config": {
+            "refit_impl": refit_impl,
+            "refit_backend": "gloo",
+        }
+    }
+    generation._policy = MagicMock()
+
+    generation.init_collective(
+        "127.0.0.1", 1234, 4, train_world_size=2
+    )
+    generation.update_weights_from_collective()
+
+    if refit_impl == "mcore":
+        generation._policy.init_collective_mcore_generation.assert_called_once_with(
+            "127.0.0.1",
+            1234,
+            4,
+            rank_offset=2,
+            refit_backend="gloo",
+        )
+        generation._policy.swap_weights_via_reshard.assert_called_once_with(
+            is_source=False
+        )
+        generation._policy.init_collective.assert_not_called()
+    else:
+        generation._policy.init_collective.assert_called_once_with(
+            "127.0.0.1",
+            1234,
+            4,
+            train_world_size=2,
+            rank_offset=2,
+        )
+        generation._policy.worker_group.run_all_workers_single_data.assert_called_once_with(
+            "update_generation_weights_from_collective"
+        )
+        generation._policy.init_collective_mcore_generation.assert_not_called()
 
 basic_megatron_test_config: PolicyConfig = {
     "model_name": model_name,
@@ -137,6 +181,7 @@ basic_megatron_test_config: PolicyConfig = {
             "materialize_only_last_token_logits": True,
             "num_speculative_tokens": 0,
             "logprobs_mode": "processed_logprobs",
+            "refit_impl": "bridge",
             "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
             "parsers": [],
             "expose_http_server": False,
@@ -444,8 +489,13 @@ def test_megatron_generation_colocated(cluster, test_input_data, tokenizer):
 @pytest.mark.mcore
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("skip_weight_load", [False, True])
+@pytest.mark.parametrize("refit_impl", ["bridge", "mcore"])
 def test_megatron_generation_non_colocated_refit(
-    policy_cluster_separate, test_input_data, tokenizer, skip_weight_load
+    policy_cluster_separate,
+    test_input_data,
+    tokenizer,
+    skip_weight_load,
+    refit_impl,
 ):
     """Non-colocated Megatron generation.
 
@@ -467,6 +517,7 @@ def test_megatron_generation_non_colocated_refit(
         pytest.skip("Need at least two GPUs across separate clusters")
 
     config = deepcopy(basic_megatron_test_config)
+    config["generation"]["mcore_generation_config"]["refit_impl"] = refit_impl
 
     policy = None
     mg = None
@@ -496,18 +547,30 @@ def test_megatron_generation_non_colocated_refit(
         ip, port = policy_cluster_separate.get_master_address_and_port()
         train_world_size = policy_cluster_separate.world_size()
         world_size = train_world_size + generation_cluster.world_size()
-        refit_backend = config["generation"]["mcore_generation_config"]["refit_backend"]
-        futures_train = policy.init_collective_mcore_generation(
-            ip, port, world_size, rank_offset=0, refit_backend=refit_backend
-        )
+        if refit_impl == "mcore":
+            futures_train = policy.init_collective_mcore_generation(
+                ip,
+                port,
+                world_size,
+                rank_offset=0,
+                refit_backend=config["generation"]["mcore_generation_config"][
+                    "refit_backend"
+                ],
+            )
+        else:
+            futures_train = policy.init_collective(
+                ip, port, world_size, train_world_size=train_world_size
+            )
         futures_inference = mg.init_collective(
             ip,
             port,
             world_size,
             train_world_size=train_world_size,
-            refit_backend=refit_backend,
         )
         ray.get(futures_train + futures_inference)
+        if refit_impl == "bridge":
+            state_dict_info = policy.prepare_refit_info()
+            mg.prepare_refit_info(state_dict_info)
 
         # refit the inference engine from the training weights, then generate
         refit_policy_generation(policy, mg, False)

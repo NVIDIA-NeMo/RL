@@ -50,6 +50,10 @@ class MCoreGenerationSpecificArgs(TypedDict):
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
 
+    # "bridge" uses the shared packed-broadcast transport and Megatron Bridge
+    # import mappings. "mcore" uses Megatron Core's native reshard/refit API.
+    refit_impl: Literal["bridge", "mcore"]
+    # Copy-service backend used only when refit_impl="mcore".
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
     num_speculative_tokens: int
 

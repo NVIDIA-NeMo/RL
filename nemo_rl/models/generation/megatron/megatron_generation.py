@@ -122,6 +122,20 @@ class MegatronGeneration(GenerationInterface):
         # `self._policy_config` keeps a reference to the full PolicyConfig.
         self._policy_config = config
         self.cfg: MCoreGenerationConfig = config["generation"]
+        self.refit_impl = self.cfg["mcore_generation_config"]["refit_impl"]
+        if self.refit_impl not in ("bridge", "mcore"):
+            raise ValueError(
+                "policy.generation.mcore_generation_config.refit_impl must be "
+                f"'bridge' or 'mcore', got {self.refit_impl!r}."
+            )
+        if self.refit_impl == "mcore":
+            refit_backend = self.cfg["mcore_generation_config"]["refit_backend"]
+            if refit_backend not in ("gloo", "nccl", "nvshmem"):
+                raise ValueError(
+                    "policy.generation.mcore_generation_config.refit_backend "
+                    "must be 'gloo', 'nccl', or 'nvshmem' when "
+                    f"refit_impl='mcore', got {refit_backend!r}."
+                )
         # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
 
@@ -165,6 +179,11 @@ class MegatronGeneration(GenerationInterface):
         if not skip_weight_load:
             self.prepare_for_generation()
 
+    @property
+    def uses_native_refit(self) -> bool:
+        """Whether non-colocated refit uses Megatron Core's native mechanism."""
+        return self.refit_impl == "mcore"
+
     def init_collective(
         self,
         ip: str,
@@ -172,31 +191,41 @@ class MegatronGeneration(GenerationInterface):
         world_size: int,
         *,
         train_world_size: int,
-        refit_backend: str = "gloo",
     ) -> list[ray.ObjectRef]:
-        """Initialize the refit collective for weight synchronization.
+        """Join the configured refit collective after the training ranks.
 
         Args:
             ip: IP address for the process group rendezvous.
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             train_world_size: Number of training workers (used to offset ranks).
-            refit_backend: Copy service backend ("gloo", "nccl", or "nvshmem").
 
         Returns:
             List of Ray ObjectRefs for the collective init futures.
         """
-        return self._policy.init_collective_mcore_generation(
+        if self.uses_native_refit:
+            return self._policy.init_collective_mcore_generation(
+                ip,
+                port,
+                world_size,
+                rank_offset=train_world_size,
+                refit_backend=self.cfg["mcore_generation_config"]["refit_backend"],
+            )
+        return self._policy.init_collective(
             ip,
             port,
             world_size,
+            train_world_size=train_world_size,
             rank_offset=train_world_size,
-            refit_backend=refit_backend,
         )
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
-        """Receive updated weights from the training cluster via collective communication."""
-        return self._policy.swap_weights_via_reshard(is_source=False)
+        """Receive weights through the configured Megatron refit mechanism."""
+        if self.uses_native_refit:
+            return self._policy.swap_weights_via_reshard(is_source=False)
+        return self._policy.worker_group.run_all_workers_single_data(
+            "update_generation_weights_from_collective"
+        )
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -273,11 +302,11 @@ class MegatronGeneration(GenerationInterface):
         return ray.get(futures)
 
     def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
-        """Pre-initialize NVShmem collectively outside CUDA graph capture.
-
-        Must be called simultaneously on both training and inference workers. For
-        skip-load inference, this intentionally runs before the first engine capture.
-        """
+        """Initialize native NVSHMEM outside CUDA graph capture."""
+        if not self.uses_native_refit:
+            raise RuntimeError(
+                "NVSHMEM pre-initialization is only valid with refit_impl='mcore'."
+            )
         return self._policy.preinit_nvshmem()
 
     def suspend_for_refit(self) -> None:
@@ -293,8 +322,15 @@ class MegatronGeneration(GenerationInterface):
         )
 
     def prepare_refit_info(self, state_dict_info: Optional[dict[str, Any]]) -> None:
-        """Accept the cross-backend refit-prep contract; Megatron needs none of it."""
-        pass
+        """Prepare Bridge conversion tasks on every dedicated inference worker."""
+        if not self._owns_policy or self.uses_native_refit:
+            return
+        if state_dict_info is None:
+            raise ValueError("Megatron collective refit requires state_dict_info.")
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "prepare_generation_refit_info", state_dict_info=state_dict_info
+        )
+        ray.get(futures)
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling on the dedicated inference workers.

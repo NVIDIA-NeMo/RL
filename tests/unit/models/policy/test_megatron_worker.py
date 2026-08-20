@@ -15,6 +15,7 @@ import ast
 import os
 import tempfile
 import time
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -44,6 +45,143 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
 pytestmark = pytest.mark.mcore
+
+
+def test_megatron_refit_loader_waits_for_compound_weights_and_reuses_inputs():
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationRefitMixin,
+        _MegatronRefitTask,
+    )
+
+    class Mapping:
+        def __init__(self, hf_param, convert):
+            self.hf_param = hf_param
+            self._convert = convert
+
+        def hf_to_megatron(self, weights, _module):
+            return self._convert(weights)
+
+    class ModelBridge:
+        @staticmethod
+        def maybe_modify_loaded_hf_weight(hf_param, state):
+            if isinstance(hf_param, str):
+                return state[hf_param]
+            return {key: state[name] for key, name in hf_param.items()}
+
+    first_destination = torch.zeros(4, dtype=torch.bfloat16)
+    second_destination = torch.zeros(2, dtype=torch.bfloat16)
+    first_mapping = Mapping(
+        {"left": "a", "right": "b"},
+        lambda weights: torch.cat([weights["left"], weights["right"]]),
+    )
+    second_mapping = Mapping("b", lambda weight: weight * 2)
+    tasks = [
+        _MegatronRefitTask(
+            param_name="first.weight",
+            mapping=first_mapping,
+            megatron_module=MagicMock(),
+            destination=first_destination,
+            dependencies=("a", "b"),
+            expected_shape=first_destination.shape,
+            target_id=id(first_destination),
+        ),
+        _MegatronRefitTask(
+            param_name="second.weight",
+            mapping=second_mapping,
+            megatron_module=MagicMock(),
+            destination=second_destination,
+            dependencies=("b",),
+            expected_shape=second_destination.shape,
+            target_id=id(second_destination),
+        ),
+    ]
+
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    worker.megatron_bridge = SimpleNamespace(_model_bridge=ModelBridge())
+    worker._generation_refit_tasks = tasks
+    worker._generation_refit_task_index = 0
+    worker._generation_refit_pending_weights = {}
+    worker._generation_refit_pending_streams = {}
+    worker._generation_refit_remaining_dependencies = Counter({"a": 1, "b": 2})
+
+    worker._load_generation_refit_batch(
+        [("a", torch.tensor([1.0, 2.0], dtype=torch.bfloat16))]
+    )
+    assert worker._generation_refit_task_index == 0
+
+    worker._load_generation_refit_batch(
+        [("b", torch.tensor([3.0, 4.0], dtype=torch.bfloat16))]
+    )
+
+    assert worker._generation_refit_task_index == 2
+    assert torch.equal(
+        first_destination,
+        torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.bfloat16),
+    )
+    assert torch.equal(
+        second_destination, torch.tensor([6.0, 8.0], dtype=torch.bfloat16)
+    )
+    assert worker._generation_refit_pending_weights == {}
+
+
+def test_megatron_bridge_refit_uses_mxfp8_transform():
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationRefitMixin,
+        _MegatronRefitTask,
+    )
+
+    destination = torch.zeros(3, 2)
+    task = _MegatronRefitTask(
+        param_name="decoder.weight",
+        mapping=MagicMock(),
+        megatron_module=MagicMock(),
+        destination=destination,
+        dependencies=("weight",),
+        expected_shape=destination.shape,
+        target_id=id(destination),
+        mxfp8_param_name="weight",
+    )
+    transform = MagicMock()
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    worker._generation_refit_mxfp8_transform = transform
+    converted_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3).T
+
+    worker._write_generation_refit_weight(task, converted_weight)
+
+    transform.finalize_recv.assert_called_once()
+    param_name, dst_slice, received = transform.finalize_recv.call_args.args
+    assert param_name == "weight"
+    assert dst_slice == (slice(None), slice(None))
+    assert len(received) == 1
+    assert received[0].dtype == torch.bfloat16
+    assert received[0].is_contiguous()
+    assert torch.equal(received[0], converted_weight.to(torch.bfloat16))
+
+
+def test_policy_collective_applies_rank_offset(monkeypatch: pytest.MonkeyPatch):
+    from nemo_rl.distributed import stateless_process_group
+    from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+
+    communicator = MagicMock()
+    process_group = MagicMock(return_value=communicator)
+    monkeypatch.setattr(stateless_process_group, "StatelessProcessGroup", process_group)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    worker = SimpleNamespace(rank=2)
+
+    AbstractPolicyWorker.init_collective(
+        worker,
+        "127.0.0.1",
+        1234,
+        10,
+        train_world_size=4,
+        rank_offset=4,
+    )
+
+    process_group.assert_called_once_with(
+        master_address="127.0.0.1", port=1234, rank=6, world_size=10
+    )
+    communicator.init_nccl_communicator.assert_called_once_with(device=0)
 
 
 def test_model_owned_packing_capability_is_detected():
@@ -734,6 +872,7 @@ def create_megatron_test_config(
                 "kv_cache_management_mode": "persist",
                 "materialize_only_last_token_logits": True,
                 "num_speculative_tokens": 0,
+                "refit_impl": "bridge",
                 "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
                 "parsers": [],
                 "expose_http_server": False,

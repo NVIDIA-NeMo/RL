@@ -1417,6 +1417,10 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
+    native_megatron_refit = (
+        isinstance(policy_generation, MegatronGeneration)
+        and policy_generation.uses_native_refit
+    )
     nccl_reshard_refit_enabled = (
         generation_config.get("refit_transport") == "nccl_reshard"
     )
@@ -1451,8 +1455,8 @@ def setup(
         world_size = train_world_size + inference_world_size
 
         # init collective
-        if backend == "megatron":
-            refit_backend = policy_config["generation"]["mcore_generation_config"][
+        if native_megatron_refit:
+            refit_backend = generation_config["mcore_generation_config"][
                 "refit_backend"
             ]
             futures_train = policy.init_collective_mcore_generation(
@@ -1467,7 +1471,6 @@ def setup(
                 port,
                 world_size,
                 train_world_size=train_world_size,
-                refit_backend=refit_backend,
             )
             ray.get(futures_train + futures_inference)
         elif nccl_reshard_refit_enabled:
@@ -1530,7 +1533,9 @@ def setup(
             flush=True,
         )
     else:
-        if not (nccl_reshard_refit_enabled and not colocated_inference):
+        if not native_megatron_refit and not (
+            nccl_reshard_refit_enabled and not colocated_inference
+        ):
             state_dict_info = policy.prepare_refit_info()
             if policy_generation is not None:
                 policy_generation.prepare_refit_info(state_dict_info)
@@ -2324,6 +2329,7 @@ def refit_policy_generation(
     if (
         not colocated_inference
         and isinstance(policy_generation, MegatronGeneration)
+        and policy_generation.uses_native_refit
         and policy_generation.cfg["mcore_generation_config"]["refit_backend"]
         == "nvshmem"
     ):
@@ -2376,13 +2382,16 @@ def refit_policy_generation(
                 results = ray.get(futures_inference)
                 update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl (vLLM) or megatron reshard
+            # Update through native MCore refit or the shared packed collective.
             # SGLang haven't implemented non-colocated inference mode.
             if isinstance(policy_generation, SGLangGeneration):
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
-            if isinstance(policy_generation, MegatronGeneration):
+            if (
+                isinstance(policy_generation, MegatronGeneration)
+                and policy_generation.uses_native_refit
+            ):
                 futures_train = policy.swap_weights_via_reshard(is_source=True)
             else:
                 futures_train = policy.broadcast_weights_for_collective(
@@ -2396,7 +2405,15 @@ def refit_policy_generation(
 
         # check if update is successful
         if not update_success:
-            error_tag = "cuda-ipc" if colocated_inference else "nccl"
+            if colocated_inference:
+                error_tag = "cuda-ipc"
+            elif (
+                isinstance(policy_generation, MegatronGeneration)
+                and policy_generation.uses_native_refit
+            ):
+                error_tag = "Megatron Core refit"
+            else:
+                error_tag = "nccl"
             error_message = (
                 "❌ Error: Updating weights for the generation policy failed during refit.\n"
                 f"This often indicates an issue with {error_tag} or "

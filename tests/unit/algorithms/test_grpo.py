@@ -129,6 +129,38 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     )
 
 
+@pytest.mark.parametrize("refit_impl", ["bridge", "mcore"])
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_megatron_refit_uses_configured_transfer(
+    mock_ray: MagicMock, refit_impl: str
+) -> None:
+    mock_ray.get.return_value = [True]
+    policy = MagicMock()
+    generation = object.__new__(MegatronGeneration)
+    generation.refit_impl = refit_impl
+    generation.cfg = {
+        "mcore_generation_config": {
+            "refit_impl": refit_impl,
+            "refit_backend": "gloo",
+        }
+    }
+    generation.weight_synchronizer = None
+    generation.suspend_for_refit = MagicMock()
+    generation.prepare_for_generation = MagicMock()
+    generation.update_weights_from_collective = MagicMock(return_value=["recv"])
+    generation.resume_after_refit = MagicMock()
+
+    refit_policy_generation(policy, generation, colocated_inference=False)
+
+    if refit_impl == "mcore":
+        policy.swap_weights_via_reshard.assert_called_once_with(is_source=True)
+        policy.broadcast_weights_for_collective.assert_not_called()
+    else:
+        policy.broadcast_weights_for_collective.assert_called_once_with(kv_scales=None)
+        policy.swap_weights_via_reshard.assert_not_called()
+    generation.update_weights_from_collective.assert_called_once_with()
+
+
 class TestMaskSampleFilter:
     def test_masks_env_flagged_samples(self):
         repeated_batch = BatchedDataDict(
