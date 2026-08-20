@@ -80,6 +80,8 @@ def print_setup_timing_summary(
 
     if gen_init_time_key is not None:
         # grpo.py path; megatron+gym overlap also reserves the server address.
+        # Deliberately not including the load time here: grpo's weight-sync/collective phases run
+        # after the worker-init snapshot, so their wall-clock is already accounted for.
         assert metrics.generation_init_time_s is None
         gen_line = f"  Generation init: {getattr(metrics, gen_init_time_key):.1f}s"
         if metrics.generation_init_reserve_time_s:

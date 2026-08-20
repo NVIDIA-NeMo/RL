@@ -634,6 +634,12 @@ def _rank0_bundle_via_worker_group(sorted_bundle_indices, group_size):
     Mirrors lm_policy.py's tied_groups[0] for a unified PG and RayWorkerGroup's
     default first-worker tuple otherwise -- the two branches
     reserve_http_server_address must agree with.
+
+    Deliberately a hand-copy rather than a call into the code under test (or a
+    shared helper): sharing the implementation would make the assertion a
+    tautology. The cost is that this copy is frozen -- if the worker-group
+    placement rule ever changes, update it by hand; grpo.py's runtime
+    served-vs-reserved URL check is the net for that direction.
     """
     if sorted_bundle_indices is not None:
         # lm_policy.py: tied_groups = [(i // group_size, [b]) for i, b in ...]
