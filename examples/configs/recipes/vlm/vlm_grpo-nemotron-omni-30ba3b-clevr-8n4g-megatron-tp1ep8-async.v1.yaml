@@ -1,0 +1,25 @@
+defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-tp1ep8.v1.yaml
+
+grpo:
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+
+policy:
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 4
+    vllm_cfg:
+      gpu_memory_utilization: 0.8
+    vllm_kwargs:
+      max_num_seqs: 128
+
+logger:
+  wandb:
+    name: nemotron-omni-8n4g-async-1-off
+
+cluster:
+  segment_size: 4
