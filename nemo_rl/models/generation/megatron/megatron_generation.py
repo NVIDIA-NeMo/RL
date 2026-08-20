@@ -325,13 +325,6 @@ class MegatronGeneration(GenerationInterface):
         ray.get(futures)
         return True
 
-    def get_inference_runtime_info(self) -> list[dict[str, object]]:
-        """Return inference-engine diagnostics from every Megatron worker."""
-        futures = self._policy.worker_group.run_all_workers_single_data(
-            "get_inference_runtime_info"
-        )
-        return ray.get(futures)
-
     def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
         """Initialize native NVSHMEM outside CUDA graph capture."""
         if not self.uses_native_refit:

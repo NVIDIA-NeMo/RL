@@ -211,22 +211,6 @@ def test_ray_uses_same_cluster_for_permuted_cuda_devices():
         assert mock_ray_shutdown.call_count == 0
 
 
-def test_ray_local_cluster_respects_num_cpus():
-    """Test that an explicit CPU limit is used for a new local cluster."""
-    with (
-        patch("ray.init") as mock_ray_init,
-        patch("ray.shutdown"),
-        patch("ray.cluster_resources"),
-    ):
-        mock_ray_init.side_effect = [ConnectionError, None]
-        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True):
-            from nemo_rl.distributed.virtual_cluster import init_ray
-
-            init_ray(num_cpus=8)
-
-        assert mock_ray_init.call_args_list[1].kwargs["num_cpus"] == 8
-
-
 def test_mcore_py_executable():
     # The temporary directory is created within the project.
     # For some reason, creating a virtual environment outside of the project

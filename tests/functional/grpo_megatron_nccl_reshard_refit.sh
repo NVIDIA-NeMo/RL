@@ -38,7 +38,6 @@ case "$REFIT_PRECISION" in
         # Qwen3 is bias-free and is supported by Megatron Bridge.
         model_name=Qwen/Qwen3-0.6B
         max_token_mult_prob_error=1.10
-        export NRL_VERIFY_MEGATRON_MXFP8=1
         precision_args=(
             ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized
             ++policy.generation.mcore_generation_config.fp8_cfg.enabled=true
@@ -102,9 +101,6 @@ uv run coverage run -a \
 
 grep -q "nccl_reshard bulk comm group" "$RUN_LOG"
 grep -q "cuda graph warmup" "$RUN_LOG"
-if [[ "$REFIT_PRECISION" == "mxfp8" ]]; then
-    grep -q "NRL_MXFP8_VERIFY: PASS" "$RUN_LOG"
-fi
 if [[ "${REQUIRE_REAL_NCCL_M2N:-0}" == "1" ]]; then
     grep -q "reshard path: real nccl.m2n.reshard" "$RUN_LOG"
 else

@@ -235,7 +235,7 @@ def _get_free_consecutive_ports_local(
     )
 
 
-def init_ray(log_dir: Optional[str] = None, num_cpus: Optional[int] = None) -> None:
+def init_ray(log_dir: Optional[str] = None) -> None:
     """Initialise Ray.
 
     Try to attach to an existing local cluster.
@@ -244,8 +244,6 @@ def init_ray(log_dir: Optional[str] = None, num_cpus: Optional[int] = None) -> N
 
     Args:
         log_dir: Optional directory to store Ray logs and temp files.
-        num_cpus: Optional CPU limit when starting a new local Ray cluster. This
-            does not alter an existing cluster that is reused.
     """
     # Strip MPI/PMIx/SLURM launcher vars from the driver env before they get
     # captured into runtime_env (both by `dict(os.environ)` below and by
@@ -334,7 +332,6 @@ def init_ray(log_dir: Optional[str] = None, num_cpus: Optional[int] = None) -> N
         runtime_env=local_runtime_env,
         _temp_dir=os.path.abspath(log_dir) if log_dir else None,
         resources={cvd_tag: 1},
-        num_cpus=num_cpus,
     )
     logger.info(
         f"Started local cluster with tag '{cvd_tag}': {ray.cluster_resources()}"

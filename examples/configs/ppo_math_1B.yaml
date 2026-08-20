@@ -251,7 +251,6 @@ policy:
       enable_chunked_prefill: true
       unified_memory_level: 0
       max_tokens: 16384
-      logprobs_mode: processed_logprobs
       refit_impl: "bridge"
       refit_backend: "nvshmem"
     vllm_cfg:

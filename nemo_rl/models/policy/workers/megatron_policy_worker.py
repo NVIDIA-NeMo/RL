@@ -39,20 +39,9 @@ from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
-
-try:
-    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-        FullyShardedDataParallelV1,
-        FullyShardedDataParallelV2,
-    )
-
-    CUSTOM_FSDP_TYPES = (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
-except ImportError:
-    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-        FullyShardedDataParallel as custom_FSDP,
-    )
-
-    CUSTOM_FSDP_TYPES = (custom_FSDP,)
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel as custom_FSDP,
+)
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config
@@ -1984,26 +1973,6 @@ class MegatronPolicyWorkerImpl(
             return model.config
         return None
 
-    def get_runtime_precision_info(self) -> dict[str, Any]:
-        """Return serializable precision settings from the constructed model.
-
-        This reports the effective Megatron model configuration rather than the
-        input YAML, allowing launch-time validation to detect a precision
-        override that was accepted by configuration loading but not applied to
-        the runtime model.
-        """
-        config = self._get_model_config()
-        if config is None:
-            raise RuntimeError("The Megatron model has no runtime configuration.")
-        fp8 = getattr(config, "fp8", None)
-        fp8_recipe = getattr(config, "fp8_recipe", None)
-        return {
-            "fp8_enabled": bool(fp8),
-            "fp8": getattr(fp8, "value", fp8),
-            "fp8_recipe": getattr(fp8_recipe, "value", fp8_recipe),
-            "fp8_param": bool(getattr(config, "fp8_param", False)),
-        }
-
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/init_remote_sparse_delta_baseline")
     def init_remote_sparse_delta_baseline(
@@ -2934,7 +2903,7 @@ class MegatronPolicyWorkerImpl(
                         raise ValueError(
                             f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
                         )
-        elif isinstance(model, CUSTOM_FSDP_TYPES):
+        elif isinstance(model, custom_FSDP):
             if device == "cpu":
                 model.param_and_grad_buffer.offload_to_cpu(move_params, move_grads)
             elif device == "cuda":

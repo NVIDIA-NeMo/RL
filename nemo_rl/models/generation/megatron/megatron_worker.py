@@ -53,9 +53,6 @@ if TYPE_CHECKING:
     from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
 
 
-G_VERIFY_MXFP8_ENV = "NRL_VERIFY_MEGATRON_MXFP8"
-
-
 def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
     """Build the generic GPT layer spec backed by MCore inference linears."""
     from megatron.core.models.gpt.gpt_layer_specs import (
@@ -171,66 +168,6 @@ class _MegatronBulkRefitPiece:
     dtype: torch.dtype
     device: torch.device
     destination: torch.Tensor | None
-
-
-def _verify_mxfp8_inference_weights(
-    model: torch.nn.Module | list[torch.nn.Module] | tuple[torch.nn.Module, ...],
-    expected_backend: str | None = None,
-) -> int:
-    """Fail unless an inference model contains Megatron MXFP8 weight objects.
-
-    Inference-optimized MXFP8 weights are plain attributes rather than
-    ``nn.Parameter`` objects, so ``named_parameters()`` cannot observe them.
-    This check walks module attributes and nested containers, deduplicating
-    objects that are also referenced by concatenated expert buffers.
-
-    Args:
-        model: Wrapped Megatron model or list of model chunks.
-
-    Returns:
-        Number of distinct MXFP8 weight objects found.
-
-    Raises:
-        RuntimeError: If no MXFP8 weights are present.
-    """
-    # This type is only available with Megatron inference dependencies loaded.
-    from megatron.core.inference.quantization.mxfp8_tensor import (
-        MXFP8Tensor,
-        validate_mxfp8_tensor,
-    )
-
-    seen: dict[int, MXFP8Tensor] = {}
-
-    def visit(value: object) -> None:
-        if isinstance(value, MXFP8Tensor):
-            seen[id(value)] = value
-        elif isinstance(value, dict):
-            for child in value.values():
-                visit(child)
-        elif isinstance(value, (list, tuple)):
-            for child in value:
-                visit(child)
-
-    model_chunks = model if isinstance(model, (list, tuple)) else [model]
-    for model_chunk in model_chunks:
-        unwrapped_model = unwrap_model(model_chunk)
-        for module in unwrapped_model.modules():
-            for value in vars(module).values():
-                visit(value)
-
-    if not seen:
-        raise RuntimeError(
-            "Megatron MXFP8 verification failed: the inference model contains no "
-            "megatron.core.inference.quantization.MXFP8Tensor weights."
-        )
-    if expected_backend is not None:
-        for index, weight in enumerate(seen.values()):
-            validate_mxfp8_tensor(
-                weight,
-                expected_backend=expected_backend,
-                tensor_name=f"inference MXFP8 weight {index}",
-            )
-    return len(seen)
 
 
 class MegatronGenerationMixin:
@@ -358,7 +295,7 @@ class MegatronGenerationMixin:
             ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
-            logprobs_mode=mcore_generation_config["logprobs_mode"],
+            logprobs_mode="processed_logprobs",
             max_requests=max_requests,
         )
 
@@ -384,34 +321,6 @@ class MegatronGenerationMixin:
         self._inference_engine_initialized = True
         self._inference_engine_asleep = True
         print(f"[Rank {self.rank}] Initialized persistent inference engine")
-
-    def get_inference_runtime_info(self) -> dict[str, object]:
-        """Return serializable state for inference-engine functional tests."""
-        if not self._inference_engine_initialized:
-            return {
-                "initialized": False,
-                "captured_graph_count": 0,
-                "capture_stats": None,
-                "step_count": 0,
-                "using_cuda_graph_last_step": False,
-                "padded_batch_dimensions": None,
-            }
-
-        engine = self.dynamic_inference_engine
-        context = engine.context
-        capture_stats = engine.capture_stats
-        return {
-            "initialized": True,
-            "captured_graph_count": (
-                len(context.cuda_graph_batch_dimensions_list)
-                if capture_stats is not None
-                else 0
-            ),
-            "capture_stats": capture_stats,
-            "step_count": context.step_count,
-            "using_cuda_graph_last_step": context.using_cuda_graph_this_step(),
-            "padded_batch_dimensions": str(context.padded_batch_dimensions),
-        }
 
     async def _start_inference_coordinator(self):
         """Start the inference coordinator and engine loop."""
@@ -988,21 +897,6 @@ class MegatronNativeRefitMixin:
             dst_rank_offset=self.refit_dst_rank_offset,
         )
 
-        if not is_source and os.environ.get(G_VERIFY_MXFP8_ENV) == "1":
-            model_chunks = (
-                self.model if isinstance(self.model, (list, tuple)) else [self.model]
-            )
-            model_config = unwrap_model(model_chunks[0]).config
-            expected_backend = _resolve_mxfp8_refit_backend(model_config)
-            mxfp8_weight_count = _verify_mxfp8_inference_weights(
-                self.model, expected_backend=expected_backend
-            )
-            print(
-                f"NRL_MXFP8_VERIFY: PASS rank={self.rank} "
-                f"weights={mxfp8_weight_count} backend={expected_backend}",
-                flush=True,
-            )
-
     def preinit_nvshmem_collective(self) -> None:
         """Initialize an NVSHMEM copy service outside CUDA graph capture."""
         copy_service = getattr(self, "refit_copy_service", None)
@@ -1333,16 +1227,6 @@ class MegatronGenerationRefitMixin(MegatronNativeRefitMixin):
             task.is_mxfp8 = True
             task.destination = persistent_buffers[decoder_name]
 
-        if os.environ.get(G_VERIFY_MXFP8_ENV) == "1":
-            mxfp8_weight_count = _verify_mxfp8_inference_weights(
-                self.model, expected_backend=backend
-            )
-            print(
-                f"NRL_MXFP8_VERIFY: PASS rank={self.rank} "
-                f"weights={mxfp8_weight_count} backend={backend}",
-                flush=True,
-            )
-
     def _build_generation_refit_tasks(
         self,
     ) -> tuple[list[torch.nn.Module], list[_MegatronRefitTask]]:
@@ -1451,7 +1335,6 @@ class MegatronGenerationRefitMixin(MegatronNativeRefitMixin):
     @torch.no_grad()
     def nccl_reshard_generation_refit(self) -> bool:
         """Receive bulk FFN shards via M-to-N, then import packed misc weights."""
-        import os
         from collections import OrderedDict
 
         from nemo_rl.weight_sync.nccl_reshard_utils import RefitCtx

@@ -385,7 +385,6 @@ policy:
       kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
       materialize_only_last_token_logits: true  # Materialize logits only for the last token of each sequence during decode.
       num_speculative_tokens: 0
-      logprobs_mode: processed_logprobs  # Return log-probs after sampling processors. Use raw_logprobs for parity with policy recomputation.
       refit_impl: "bridge"  # Megatron refit implementation. Options: "bridge" (shared packed broadcast) or "mcore" (native reshard/refit).
       refit_backend: "nvshmem"  # Native MCore copy-service backend, used only when refit_impl="mcore". Options: "gloo", "nccl", or "nvshmem".
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
