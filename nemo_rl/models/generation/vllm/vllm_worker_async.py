@@ -910,6 +910,11 @@ class VllmAsyncGenerationWorkerImpl(
         # e.g. last-run middleware.
         app = FastAPI()
 
+        # vLLM Router uses GET /health while registering a dynamic backend.
+        @app.get("/health")
+        async def _health() -> dict[str, str]:
+            return {"status": "ok"}
+
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.setup_api_server(app)
