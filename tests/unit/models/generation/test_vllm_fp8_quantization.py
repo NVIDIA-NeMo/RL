@@ -639,9 +639,7 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     import torch
 
     fp8 = fp8_module
-    model = _grouped_expert_model(
-        fp8, monkeypatch, torch.bfloat16, wrap_language_model
-    )
+    model = _grouped_expert_model(fp8, monkeypatch, torch.bfloat16, wrap_language_model)
     loaded = []
     model.load_weights = lambda pairs: loaded.extend(pairs)
 
