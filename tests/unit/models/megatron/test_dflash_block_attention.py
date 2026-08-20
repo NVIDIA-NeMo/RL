@@ -566,10 +566,8 @@ def test_cuda_implementation_uses_only_public_flex_attention_apis() -> None:
     ) not in imported_symbols
     assert any(
         isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "BlockMask"
-        and node.func.attr == "from_kv_blocks"
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "BlockMask"
         for node in ast.walk(tree)
     )
 
