@@ -166,11 +166,10 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     )
     thinking_tags = thinking_tags or DEFAULT_THINKING_TAGS
 
-    is_output_message = (
-        "content" in output_item_dict
-        and len(output_item_dict["content"]) > 0
-        and "text" in output_item_dict["content"][0]
-    )
+    # A tool-call-only assistant item carries content: None — not a final
+    # content message.
+    _content = output_item_dict.get("content") or []
+    is_output_message = len(_content) > 0 and "text" in _content[0]
     # NeMo-Gym only attaches generation_token_ids to the last output item of a
     # model call (see vllm_model/app.py postprocess_chat_response). So this item
     # is guaranteed to be the final thing the model produced for this turn.
