@@ -2,9 +2,6 @@ defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml
 
 grpo:
   num_prompts_per_step: 64
-  val_period: 0
-  zero_variance_prompt_filtering: false
-  overlong_filtering: true
 
 loss_fn:
   use_importance_sampling_correction: true
@@ -39,7 +36,6 @@ policy:
       expert_parallel_size: 2
       enforce_eager: false
       load_format: auto
-      max_model_len: ${policy.max_total_sequence_length}
       reasoning_parser_plugin: ${oc.env:PWD}/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
@@ -50,17 +46,12 @@ policy:
           enable_thinking: true
           truncate_history_thinking: false
     vllm_kwargs:
-      limit_mm_per_prompt:
-        image: 3
       max_num_batched_tokens: 32768
       max_num_seqs: 64
       all2all_backend: flashinfer_nvlink_one_sided
       kernel_config:
         moe_backend: flashinfer_cutlass
         enable_flashinfer_autotune: true
-
-data:
-  shuffle: false
 
 logger:
   wandb_enabled: true
