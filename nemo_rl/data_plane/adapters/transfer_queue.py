@@ -23,6 +23,7 @@ business logic. Backend init is lifted from
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import socket
 import subprocess
@@ -157,6 +158,18 @@ def _patch_tq_actor_runtime_env() -> None:
     """
     global _TQ_RUNTIME_ENV_PATCHED
     if _TQ_RUNTIME_ENV_PATCHED:
+        return
+
+    # Skip the pin when the deployment declares the base env already ships
+    # TQ on every node (container-baked, or single-node test runs whose venv
+    # is shared): the per-actor pip env Ray would build does not inherit the
+    # parent site-packages and breaks on nodes without network egress.
+    if os.environ.get("NRL_TQ_SKIP_RUNTIME_ENV_PIN", "") == "1":
+        logging.getLogger(__name__).info(
+            "NRL_TQ_SKIP_RUNTIME_ENV_PIN=1: not injecting the TransferQueue "
+            "pip pin into TQ actor runtime_envs (base-env TQ assumed)."
+        )
+        _TQ_RUNTIME_ENV_PATCHED = True
         return
 
     runtime_env = {"pip": [_resolve_tq_pin()]}
