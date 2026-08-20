@@ -56,6 +56,8 @@ ppo:
     target_min: -1.0  # DAPO: scale rewards to [-1, 1]
     target_max: 1.0
   seq_logprob_error_threshold: null
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:

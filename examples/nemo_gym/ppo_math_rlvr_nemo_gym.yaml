@@ -40,3 +40,9 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    # Optional NeMo-RL-side length shaping for selected effort prompts.
+    # effort_levels:
+    #   low_weight: 0.0
+    #   low_penalty: 1.0
+    #   low_ub: 64000
+    #   low_string: ""

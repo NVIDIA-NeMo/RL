@@ -61,6 +61,9 @@ ppo:
   # Log train/generation probability mismatch. Set a threshold to mask
   # high-error sequences; null keeps metrics-only behavior.
   seq_logprob_error_threshold: null
+  # Optional NeMo-Gym assistant-message advantage overrides.
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:

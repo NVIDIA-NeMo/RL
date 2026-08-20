@@ -52,6 +52,7 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import (
     apply_mask_sample_filter,
+    apply_message_level_advantage_penalties,
     print_efficiency_summary,
     print_performance_metrics,
     set_seed,
@@ -79,6 +80,7 @@ from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_a
 from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollouts import (
     RewardPenaltyConfig,
+    get_nemo_gym_effort_config,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -221,6 +223,10 @@ class PPOConfig(BaseModel, extra="allow"):
     # Nullable sequence-level multiplicative probability-error threshold.
     # None logs metrics without masking; values above the threshold are excluded.
     seq_logprob_error_threshold: float | None = None
+    # Advantage assigned to invalid tool-call assistant-message tokens.
+    invalid_tool_call_advantage: float | None = None
+    # Advantage assigned to malformed-thinking assistant-message tokens.
+    malformed_thinking_advantage: float | None = None
     # Asynchronous PPO uses a replay buffer with non-colocated generation.
     async_ppo: AsyncPPOConfig = Field(default_factory=AsyncPPOConfig)
 
@@ -474,6 +480,15 @@ def setup(
         master_config.reward_penalties,
         enable_nemo_gym=enable_nemo_gym,
     )
+    if not enable_nemo_gym and (
+        ppo_config.invalid_tool_call_advantage is not None
+        or ppo_config.malformed_thinking_advantage is not None
+    ):
+        raise ValueError(
+            "ppo.invalid_tool_call_advantage and "
+            "ppo.malformed_thinking_advantage require the NeMo-Gym path "
+            "(env.should_use_nemo_gym=true)"
+        )
     if enable_nemo_gym and backend != "vllm":
         raise NotImplementedError(
             "PPO NeMo Gym currently requires the vLLM generation backend"
@@ -1559,6 +1574,7 @@ def ppo_train(
                             max_rollout_turns=None,
                             greedy=False,
                             reward_penalty_config=master_config.reward_penalties,
+                            effort_config=get_nemo_gym_effort_config(master_config.env),
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
                                 master_config.env
@@ -1765,6 +1781,18 @@ def ppo_train(
                     train_data["advantages"] = advantages
                     if returns is not None:
                         train_data["returns"] = returns
+                    metrics.update(
+                        apply_message_level_advantage_penalties(
+                            train_data=train_data,
+                            message_logs=repeated_batch["message_log"],
+                            invalid_tool_call_advantage=(
+                                master_config.ppo.invalid_tool_call_advantage
+                            ),
+                            malformed_thinking_advantage=(
+                                master_config.ppo.malformed_thinking_advantage
+                            ),
+                        )
+                    )
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
@@ -2792,6 +2820,18 @@ def async_ppo_train(
                     train_data["advantages"] = advantages
                     if returns is not None:
                         train_data["returns"] = returns
+                    metrics.update(
+                        apply_message_level_advantage_penalties(
+                            train_data=train_data,
+                            message_logs=repeated_batch["message_log"],
+                            invalid_tool_call_advantage=(
+                                master_config.ppo.invalid_tool_call_advantage
+                            ),
+                            malformed_thinking_advantage=(
+                                master_config.ppo.malformed_thinking_advantage
+                            ),
+                        )
+                    )
 
                 # ---- 7. ppo_epochs inner loop (critic, then actor) ----
                 # Each epoch: value on GPU -> train -> off. Then, once past critic
@@ -3303,6 +3343,7 @@ def validate(
                     max_rollout_turns=None,
                     greedy=False,
                     reward_penalty_config=master_config.reward_penalties,
+                    effort_config=get_nemo_gym_effort_config(master_config.env),
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                     mask_env_flagged_samples=should_mask_flagged_samples(
                         master_config.env
