@@ -47,6 +47,16 @@ if TYPE_CHECKING:
 
 
 _ShardedOffsets = tuple[tuple[int, int, int], ...]
+_INPUT_ERROR_MESSAGES = (
+    "target_taps shape does not match the DFlash plan",
+    "block_embeddings shape does not match the DFlash plan",
+    "DFlash plan and inputs must share a device",
+    "DFlash inputs must share a device",
+    "DFlash inputs must share a dtype",
+    "DFlash inputs must use a floating dtype",
+    "DFlash query positions must use torch.int64",
+)
+_INPUT_TYPE_ERROR_CODES = frozenset({4, 5, 6})
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,38 +498,56 @@ class DFlashBody(_ShardedModule):
             self.config.hidden_size,
         )
         if target_taps.shape != expected_target_shape:
-            raise ValueError(
-                "target_taps must have shape "
-                f"{expected_target_shape}, got {tuple(target_taps.shape)}"
+            error_code = 0
+        else:
+            num_blocks = plan.batch_size * plan.anchors_per_sample
+            expected_block_shape = (
+                num_blocks,
+                plan.block_size,
+                self.config.hidden_size,
             )
-        num_blocks = plan.batch_size * plan.anchors_per_sample
-        expected_block_shape = (
-            num_blocks,
-            plan.block_size,
-            self.config.hidden_size,
-        )
-        if block_embeddings.shape != expected_block_shape:
-            raise ValueError(
-                "block_embeddings must have shape "
-                f"{expected_block_shape}, got {tuple(block_embeddings.shape)}"
+            plan_tensors = (
+                plan.token_valid_mask,
+                plan.sample_rows,
+                plan.anchor_positions,
+                plan.query_positions,
+                plan.slot_valid,
             )
-        plan_tensors = (
-            plan.token_valid_mask,
-            plan.sample_rows,
-            plan.anchor_positions,
-            plan.query_positions,
-            plan.slot_valid,
-        )
-        if any(tensor.device != target_taps.device for tensor in plan_tensors):
-            raise ValueError("DFlash plan and inputs must share a device")
-        if block_embeddings.device != target_taps.device:
-            raise ValueError("DFlash inputs must share a device")
-        if block_embeddings.dtype != target_taps.dtype:
-            raise TypeError("DFlash inputs must share a dtype")
-        if not target_taps.dtype.is_floating_point:
-            raise TypeError("DFlash inputs must use a floating dtype")
-        if plan.query_positions.dtype != torch.int64:
-            raise TypeError("DFlash query positions must use torch.int64")
+            if block_embeddings.shape != expected_block_shape:
+                error_code = 1
+            elif any(tensor.device != target_taps.device for tensor in plan_tensors):
+                error_code = 2
+            elif block_embeddings.device != target_taps.device:
+                error_code = 3
+            elif block_embeddings.dtype != target_taps.dtype:
+                error_code = 4
+            elif not target_taps.dtype.is_floating_point:
+                error_code = 5
+            elif plan.query_positions.dtype != torch.int64:
+                error_code = 6
+            else:
+                error_code = len(_INPUT_ERROR_MESSAGES)
+
+        if self.tensor_parallel_size > 1:
+            if self.tp_group is None:
+                raise RuntimeError("DFlash tensor parallel group is unavailable")
+            synchronized_error = torch.tensor(
+                error_code,
+                dtype=torch.int64,
+                device=self.fc.weight.device,
+            )
+            torch.distributed.all_reduce(
+                synchronized_error,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            error_code = int(synchronized_error.item())
+
+        if error_code < len(_INPUT_ERROR_MESSAGES):
+            message = _INPUT_ERROR_MESSAGES[error_code]
+            if error_code in _INPUT_TYPE_ERROR_CODES:
+                raise TypeError(message)
+            raise ValueError(message)
 
     def forward(
         self,
