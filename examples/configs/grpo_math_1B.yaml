@@ -109,6 +109,10 @@ loss_fn:
   # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
   # 0.0 disables it. VAPO paper recommends 0.1.
   positive_example_nll_weight: 0.0
+  # Keep full diagnostics for historical monitoring; use "minimal" to skip
+  # diagnostic-only kernels. Compilation is opt-in pending backend parity.
+  metrics_level: "full"
+  enable_torch_compile: false
 
 checkpointing:
   enabled: true

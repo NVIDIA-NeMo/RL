@@ -543,6 +543,12 @@ Under tensor parallelism (TP), enabling top-p or top-k adds communication overhe
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
+`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described
+below. Set it to `minimal` when diagnostic-only kernels are not needed; the loss
+and objective bookkeeping remain unchanged. `loss_fn.enable_torch_compile` can
+be enabled separately to compile the tensor-only actor objective (it is opt-in
+because backend and distributed-layout support should be validated first).
+
 ### Multiplicative Token Probability Error
 This feature is controlled by the parameter `token_mult_prob_error`. It measures the error introduced when token probabilities are scaled multiplicatively, which can affect model calibration and output consistency. This is equal to the 'Logprob consistency metric' defined in [Adding New Models](../adding-new-models.md#importance-of-log-probability-consistency-in-training-and-inference):
 
