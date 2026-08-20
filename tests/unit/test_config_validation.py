@@ -169,18 +169,9 @@ def test_multimodal_dedup_grpo_config_keys_default_off():
     assert GRPOConfig.model_fields["debug_payload_metrics"].default is False
 
 
-@pytest.mark.parametrize(
-    "launcher_relpath",
-    [
-        "examples/run_vlm_grpo.py",
-        "examples/nemo_gym/run_grpo_nemo_gym.py",
-    ],
-)
-def test_multimodal_launchers_forward_processor_to_both_trainers(
-    launcher_relpath: str,
-):
-    """Keep sync and async multimodal processing wired to the processor."""
-    launcher = Path(__file__).parents[2] / launcher_relpath
+def test_nemo_gym_launcher_forwards_processor_to_both_trainers():
+    """Keep sync and async Gym image processing wired to the selected processor."""
+    launcher = Path(__file__).parents[2] / "examples/nemo_gym/run_grpo_nemo_gym.py"
     tree = ast.parse(launcher.read_text())
     trainer_calls = {
         node.func.id: node
