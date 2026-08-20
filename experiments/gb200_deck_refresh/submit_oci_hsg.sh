@@ -96,6 +96,9 @@ case "${MODEL}:${MODE}:${ARM}" in
     ;;
 esac
 
+TOTAL_NODES=${TOTAL_NODES_OVERRIDE:-${TOTAL_NODES}}
+GEN_NODES=${GEN_NODES_OVERRIDE:-${GEN_NODES}}
+SEGMENT_SIZE=${SEGMENT_SIZE_OVERRIDE:-${SEGMENT_SIZE}}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-${DEFAULT_VLLM_GPU_MEMORY_UTILIZATION}}
 
 case "${ARM}" in
@@ -159,6 +162,8 @@ if [[ "${MODEL}" == qwen30 ]]; then
     "grpo.num_prompts_per_step=128"
     "grpo.num_generations_per_prompt=16"
     "policy.max_total_sequence_length=22528"
+    "policy.megatron_cfg.defer_fp32_logits=true"
+    "policy.logprob_chunk_size=2048"
     "loss_fn.reference_policy_kl_penalty=0.01"
   )
 fi
