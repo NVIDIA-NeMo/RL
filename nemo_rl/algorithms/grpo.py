@@ -65,6 +65,9 @@ from nemo_rl.algorithms.utils import (
     print_performance_metrics,
     set_seed,
 )
+from nemo_rl.algorithms.utils import (
+    apply_message_level_advantage_penalties as _apply_message_level_advantage_penalties,
+)
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.dataloader import MultipleDataloaderWrapper
@@ -91,10 +94,10 @@ from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
 from nemo_rl.experience.rollouts import (
-    EffortLevelsConfig,
     RewardPenaltyConfig,
     attach_initial_nemo_gym_image_payloads,
     backfill_missing_routed_experts,
+    get_nemo_gym_effort_config,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -1939,120 +1942,12 @@ def _raise_if_reward_penalties_enabled_without_nemo_gym(
     )
 
 
-def _apply_message_level_advantage_penalties(
-    train_data: BatchedDataDict[ClippedPGLossDataDict],
-    message_logs: list[LLMMessageLogType | VLMMessageLogType],
-    invalid_tool_call_advantage: float | None,
-    malformed_thinking_advantage: float | None,
-    log_config: bool = False,
-) -> Optional[dict[str, float]]:
-    """Overwrite advantages for flagged assistant-message token spans.
-
-    For each assistant message flagged by the NeMo-Gym detector as an invalid
-    tool call or malformed thinking, overwrite that message's advantage span in
-    ``train_data["advantages"]`` with the configured negative value. No-op when
-    neither ``grpo.invalid_tool_call_advantage`` nor
-    ``grpo.malformed_thinking_advantage`` is set.
-
-    Args:
-        train_data: Training batch; ``advantages`` is modified in place.
-        message_logs: Batch of message logs with per-message flags.
-        invalid_tool_call_advantage: Advantage value assigned to invalid tool calls.
-        malformed_thinking_advantage: Advantage value assigned to malformed thinking.
-        log_config: If True, print the configured penalty values once.
-
-    Returns:
-        Dictionary of penalty metrics if penalties are applied, otherwise None.
-    """
-    penalty_metrics = {}
-    invalid_neg_adv = invalid_tool_call_advantage
-    malformed_neg_adv = malformed_thinking_advantage
-    if invalid_neg_adv is None and malformed_neg_adv is None:
-        return penalty_metrics
-
-    if log_config:
-        print(
-            f"Invalid tool call advantage: {invalid_neg_adv}",
-            flush=True,
-        )
-        print(
-            f"Malformed thinking advantage: {malformed_neg_adv}",
-            flush=True,
-        )
-
-    advantages = train_data["advantages"]
-    materialized_advantages = False
-    num_invalid_tool_calls = 0
-    num_malformed_thinking = 0
-    num_assistant_messages = 0
-
-    for i, message_log in enumerate(message_logs):
-        token_offset = 0
-        for j, message in enumerate(message_log):
-            token_ids = cast(torch.Tensor, message["token_ids"])
-            msg_len = len(token_ids)
-            is_assistant = (
-                message["role"] == "assistant" and "generation_logprobs" in message
-            )
-            if is_assistant:
-                num_assistant_messages += 1
-            is_invalid = (
-                is_assistant
-                and invalid_neg_adv is not None
-                and message.get("is_invalid_tool_call", False)
-            )
-            is_malformed_thinking = (
-                is_assistant
-                and malformed_neg_adv is not None
-                and message.get("has_malformed_thinking", False)
-            )
-            if (is_invalid or is_malformed_thinking) and not materialized_advantages:
-                # GRPO/GDPO may expand per-sample advantages into zero-stride views;
-                # clone before span writes so penalties only affect targeted tokens.
-                advantages = advantages.clone()
-                train_data["advantages"] = advantages
-                materialized_advantages = True
-
-            if is_invalid:
-                num_invalid_tool_calls += 1
-                print(
-                    f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}",
-                    flush=True,
-                )
-                advantages[i, token_offset : token_offset + msg_len] = invalid_neg_adv
-            elif is_malformed_thinking:
-                num_malformed_thinking += 1
-                print(
-                    f"Setting negative advantage ({malformed_neg_adv}) for malformed thinking in assistant message {i} {j}",
-                    flush=True,
-                )
-                advantages[i, token_offset : token_offset + msg_len] = malformed_neg_adv
-            token_offset += msg_len
-
-    invalid_tool_call_rate = num_invalid_tool_calls / max(num_assistant_messages, 1)
-    malformed_thinking_rate = num_malformed_thinking / max(num_assistant_messages, 1)
-    print(
-        f"Invalid tool call rate: {invalid_tool_call_rate:.4f} ({num_invalid_tool_calls}/{num_assistant_messages})",
-        flush=True,
-    )
-    print(
-        f"Malformed thinking rate: {malformed_thinking_rate:.4f} ({num_malformed_thinking}/{num_assistant_messages})",
-        flush=True,
-    )
-    penalty_metrics["invalid_tool_call_rate"] = invalid_tool_call_rate
-    penalty_metrics["malformed_thinking_rate"] = malformed_thinking_rate
-    penalty_metrics["num_invalid_tool_calls"] = num_invalid_tool_calls
-    penalty_metrics["num_malformed_thinking"] = num_malformed_thinking
-    penalty_metrics["num_assistant_messages"] = num_assistant_messages
-    return penalty_metrics
-
-
 def _apply_configured_message_level_advantage_penalties(
     train_data: BatchedDataDict[ClippedPGLossDataDict],
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
     master_config: MasterConfig,
     log_config: bool = False,
-) -> Optional[dict[str, float]]:
+) -> dict[str, float | int]:
     """Resolve config and apply message-level advantage penalties."""
     (
         invalid_tool_call_advantage,
@@ -2132,16 +2027,6 @@ def _write_latest_checkpoint_status(
     status["last_checkpoint_step"] = last_checkpoint_step
     with open(status_path, "w") as f:
         json.dump(status, f)
-
-
-def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
-    """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
-    if "nemo_gym" not in master_config.env:
-        return None
-    effort_dict = master_config.env["nemo_gym"].get("effort_levels")
-    if effort_dict is None:
-        return None
-    return EffortLevelsConfig.model_validate(effort_dict)
 
 
 def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch.Tensor:
@@ -2876,7 +2761,7 @@ def grpo_train(
                             ),
                             max_rollout_turns=None,
                             greedy=False,
-                            effort_config=_get_effort_config(master_config),
+                            effort_config=get_nemo_gym_effort_config(master_config.env),
                             reward_penalty_config=master_config.reward_penalties,
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
@@ -3809,7 +3694,7 @@ def validate(
                     ),
                     max_rollout_turns=None,
                     greedy=False,
-                    effort_config=_get_effort_config(master_config),
+                    effort_config=get_nemo_gym_effort_config(master_config.env),
                     reward_penalty_config=master_config.reward_penalties,
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                     mask_env_flagged_samples=should_mask_flagged_samples(

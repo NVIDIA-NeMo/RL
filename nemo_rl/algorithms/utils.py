@@ -15,6 +15,7 @@
 import math
 import random
 import warnings
+from collections.abc import Mapping, Sequence
 from functools import partial, wraps
 from typing import Any, Optional
 
@@ -226,6 +227,104 @@ def apply_mask_sample_filter(repeated_batch: BatchedDataDict[Any]) -> int:
     loss_multiplier[mask_sample_bool] = 0
     repeated_batch["loss_multiplier"] = loss_multiplier
     return num_masked
+
+
+def apply_message_level_advantage_penalties(
+    train_data: BatchedDataDict[Any],
+    message_logs: Sequence[Sequence[Mapping[str, Any]]],
+    invalid_tool_call_advantage: float | None,
+    malformed_thinking_advantage: float | None,
+    log_config: bool = False,
+) -> dict[str, float | int]:
+    """Overwrite actor advantages for Gym-flagged assistant-message token spans.
+
+    The value-model returns are intentionally unchanged.
+    """
+    penalty_metrics: dict[str, float | int] = {}
+    if invalid_tool_call_advantage is None and malformed_thinking_advantage is None:
+        return penalty_metrics
+
+    if log_config:
+        print(
+            f"Invalid tool call advantage: {invalid_tool_call_advantage}",
+            flush=True,
+        )
+        print(
+            f"Malformed thinking advantage: {malformed_thinking_advantage}",
+            flush=True,
+        )
+
+    advantages = train_data["advantages"]
+    materialized_advantages = False
+    num_invalid_tool_calls = 0
+    num_malformed_thinking = 0
+    num_assistant_messages = 0
+
+    for i, message_log in enumerate(message_logs):
+        token_offset = 0
+        for j, message in enumerate(message_log):
+            msg_len = len(message["token_ids"])
+            is_assistant = (
+                message["role"] == "assistant" and "generation_logprobs" in message
+            )
+            if is_assistant:
+                num_assistant_messages += 1
+            is_invalid = (
+                is_assistant
+                and invalid_tool_call_advantage is not None
+                and message.get("is_invalid_tool_call", False)
+            )
+            is_malformed_thinking = (
+                is_assistant
+                and malformed_thinking_advantage is not None
+                and message.get("has_malformed_thinking", False)
+            )
+            if (is_invalid or is_malformed_thinking) and not materialized_advantages:
+                # Some estimators expand per-sample advantages into zero-stride views.
+                advantages = advantages.clone()
+                train_data["advantages"] = advantages
+                materialized_advantages = True
+
+            if is_invalid:
+                num_invalid_tool_calls += 1
+                print(
+                    f"Setting negative advantage ({invalid_tool_call_advantage}) "
+                    f"for invalid tool call in assistant message {i} {j}",
+                    flush=True,
+                )
+                advantages[i, token_offset : token_offset + msg_len] = (
+                    invalid_tool_call_advantage
+                )
+            elif is_malformed_thinking:
+                num_malformed_thinking += 1
+                print(
+                    f"Setting negative advantage ({malformed_thinking_advantage}) "
+                    f"for malformed thinking in assistant message {i} {j}",
+                    flush=True,
+                )
+                advantages[i, token_offset : token_offset + msg_len] = (
+                    malformed_thinking_advantage
+                )
+            token_offset += msg_len
+
+    invalid_tool_call_rate = num_invalid_tool_calls / max(num_assistant_messages, 1)
+    malformed_thinking_rate = num_malformed_thinking / max(num_assistant_messages, 1)
+    print(
+        f"Invalid tool call rate: {invalid_tool_call_rate:.4f} "
+        f"({num_invalid_tool_calls}/{num_assistant_messages})",
+        flush=True,
+    )
+    print(
+        f"Malformed thinking rate: {malformed_thinking_rate:.4f} "
+        f"({num_malformed_thinking}/{num_assistant_messages})",
+        flush=True,
+    )
+    penalty_metrics["invalid_tool_call_rate"] = invalid_tool_call_rate
+    penalty_metrics["malformed_thinking_rate"] = malformed_thinking_rate
+    penalty_metrics["num_invalid_tool_calls"] = num_invalid_tool_calls
+    penalty_metrics["num_malformed_thinking"] = num_malformed_thinking
+    penalty_metrics["num_assistant_messages"] = num_assistant_messages
+    return penalty_metrics
 
 
 def masked_mean(

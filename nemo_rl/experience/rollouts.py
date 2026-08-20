@@ -353,6 +353,19 @@ class EffortLevelsConfig(BaseModel, extra="allow"):
     """Substring that must appear in the user prompt to trigger shaping."""
 
 
+def get_nemo_gym_effort_config(
+    env_config: dict[str, Any],
+) -> EffortLevelsConfig | None:
+    """Resolve ``env.nemo_gym.effort_levels`` when configured."""
+    nemo_gym_config = env_config.get("nemo_gym")
+    if not isinstance(nemo_gym_config, dict):
+        return None
+    effort_config = nemo_gym_config.get("effort_levels")
+    if effort_config is None:
+        return None
+    return EffortLevelsConfig.model_validate(effort_config)
+
+
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
     """Optional token IDs for NeMo-Gym reward penalties."""
 
