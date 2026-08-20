@@ -92,9 +92,30 @@ def test_async_bf16_renders_nccl_reshard_with_same_logprob_work() -> None:
     assert result.returncode == 0, result.stderr
     assert "policy.generation.colocated.enabled=false" in result.stdout
     assert "policy.generation.refit_transport=nccl_reshard" in result.stdout
+    assert "policy.generation.vllm_cfg.async_engine=true" in result.stdout
+    assert "policy.generation.vllm_cfg.refit_with_reload_api=true" in result.stdout
     assert "policy.generation.vllm_cfg.precision=bfloat16" in result.stdout
     assert "loss_fn.force_on_policy_ratio=false" in result.stdout
     assert "++grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout
+
+
+def test_qwen30_dapo_pair_keeps_workload_matched() -> None:
+    bf16 = render(MODE="sync", MODEL="qwen30", ARM="bf16")
+    mxfp8 = render(MODE="sync", MODEL="qwen30", ARM="mxfp8")
+
+    assert bf16.returncode == 0, bf16.stderr
+    assert mxfp8.returncode == 0, mxfp8.stderr
+    for result in (bf16, mxfp8):
+        assert "data.train.dataset_name=DAPOMath17K" in result.stdout
+        assert "grpo.num_prompts_per_step=128" in result.stdout
+        assert "grpo.num_generations_per_prompt=16" in result.stdout
+        assert "policy.train_global_batch_size=2048" in result.stdout
+        assert "policy.max_total_sequence_length=22528" in result.stdout
+        assert "policy.generation.vllm_cfg.enforce_eager=false" in result.stdout
+        assert "loss_fn.force_on_policy_ratio=false" in result.stdout
+        assert "++grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout
+    assert "policy.generation.vllm_cfg.precision=bfloat16" in bf16.stdout
+    assert "policy.generation.vllm_cfg.precision=fp8" in mxfp8.stdout
 
 
 def test_qwen235_legacy_arm_uses_current_mxfp8_recipe_without_reshard() -> None:

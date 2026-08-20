@@ -40,6 +40,30 @@ case "${MODEL}:${MODE}:${ARM}" in
     REFIT_WITH_RELOAD_API=true
     DEFAULT_VLLM_GPU_MEMORY_UTILIZATION=0.5
     ;;
+  qwen30:sync:bf16)
+    CONFIG=examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g.yaml
+    TOTAL_NODES=4
+    GEN_NODES=4
+    SEGMENT_SIZE=4
+    TRAIN_GLOBAL_BATCH_SIZE=2048
+    REFIT_TRANSPORT=null
+    COLOCATED=true
+    ASYNC_GRPO=false
+    VLLM_TP=1
+    DEFAULT_VLLM_GPU_MEMORY_UTILIZATION=0.5
+    ;;
+  qwen30:sync:mxfp8)
+    CONFIG=examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-mxfp8-rollout.yaml
+    TOTAL_NODES=4
+    GEN_NODES=4
+    SEGMENT_SIZE=4
+    TRAIN_GLOBAL_BATCH_SIZE=2048
+    REFIT_TRANSPORT=null
+    COLOCATED=true
+    ASYNC_GRPO=false
+    VLLM_TP=1
+    DEFAULT_VLLM_GPU_MEMORY_UTILIZATION=0.5
+    ;;
   qwen235:sync:mxfp8_legacy)
     CONFIG=examples/configs/recipes/llm/performance/grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml
     TOTAL_NODES=32
@@ -127,6 +151,15 @@ if [[ "${IS_MX}" == true ]]; then
 fi
 if [[ -n "${MAX_NUM_SEQS}" ]]; then
   RUN_ARGS+=("++policy.generation.vllm_kwargs.max_num_seqs=${MAX_NUM_SEQS}")
+fi
+if [[ "${MODEL}" == qwen30 ]]; then
+  RUN_ARGS+=(
+    "data.train.dataset_name=DAPOMath17K"
+    "grpo.num_prompts_per_step=128"
+    "grpo.num_generations_per_prompt=16"
+    "policy.max_total_sequence_length=22528"
+    "loss_fn.reference_policy_kl_penalty=0.01"
+  )
 fi
 
 printf -v RUN_COMMAND '%q ' uv run --frozen examples/run_grpo.py "${RUN_ARGS[@]}"
