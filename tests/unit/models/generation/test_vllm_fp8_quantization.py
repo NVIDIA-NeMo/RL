@@ -773,7 +773,7 @@ def test_load_weights_expands_grouped_experts_for_mxfp8(fp8_module, monkeypatch)
         value = weight.to(torch.float8_e4m3fn)
         scale = torch.full(
             (rows, cols // 32, 1),
-            len(quantized_inputs),
+            0,
             dtype=torch.uint8,
         )
         return value, scale
@@ -833,7 +833,7 @@ def test_load_weights_expands_grouped_experts_for_mxfp8(fp8_module, monkeypatch)
             assert torch.equal(value.float(), expected.float())
             assert scale.dtype == torch.uint8
             assert scale.shape == (*value.shape[:-1], value.shape[-1] // 32)
-            assert torch.all(scale == quantize_call)
+            assert torch.all(scale == 1)
             assert torch.equal(quantized_inputs[quantize_call - 1], source[expert_id])
 
     assert len(quantized_inputs) == 6
