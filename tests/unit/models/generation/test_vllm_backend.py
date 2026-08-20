@@ -142,6 +142,28 @@ def _make_unquantized_moe_model(
     return SimpleNamespace(modules=lambda: [module])
 
 
+@pytest.mark.vllm
+def test_process_hpc_modules_after_loading(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    class FakeHpcModule:
+        def __init__(self):
+            self.process_weights_after_loading = MagicMock()
+
+    hpc_module = FakeHpcModule()
+    other_module = object()
+    model = SimpleNamespace(
+        named_modules=lambda: [("", other_module), ("rope_norm", hpc_module)]
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.hpc.HpcModule", FakeHpcModule
+    )
+
+    vllm_backend._process_hpc_modules_after_loading(model)
+
+    hpc_module.process_weights_after_loading.assert_called_once_with(model)
+
+
 class _DeferredReloadLayer(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -206,6 +228,11 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
         ),
     )
     monkeypatch.setattr(
+        vllm_backend,
+        "_process_hpc_modules_after_loading",
+        lambda reload_model: call_order.append(("hpc", reload_model)),
+    )
+    monkeypatch.setattr(
         "vllm.model_executor.model_loader.utils.process_weights_after_loading",
         lambda *_args: pytest.fail(
             "unquantized refit must use vLLM's native layerwise reload lifecycle"
@@ -223,6 +250,7 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
         ("initialize", model),
         "load",
         ("finalize", model, model_config),
+        ("hpc", model),
         "mtp",
         "config_exit",
     ]
@@ -878,6 +906,8 @@ def test_load_mtp_weights_from_disk_uses_layerwise_reload_for_trtllm(
     tmp_path, monkeypatch
 ):
     """TRTLLM draft weights reload into their preserved runtime storage."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
     model_dir = tmp_path / "ckpt"
     _write_sharded_checkpoint(
         model_dir,
@@ -904,6 +934,11 @@ def test_load_mtp_weights_from_disk_uses_layerwise_reload_for_trtllm(
         lambda model, config: call_order.append(("finalize", model, config)),
     )
     monkeypatch.setattr(
+        vllm_backend,
+        "_process_hpc_modules_after_loading",
+        lambda model: call_order.append(("hpc", model)),
+    )
+    monkeypatch.setattr(
         "vllm.model_executor.model_loader.utils.process_weights_after_loading",
         lambda *_: pytest.fail("TRTLLM draft reload must use the layerwise path"),
     )
@@ -918,6 +953,7 @@ def test_load_mtp_weights_from_disk_uses_layerwise_reload_for_trtllm(
             draft_model,
             ext.model_runner.vllm_config.speculative_config.draft_model_config,
         ),
+        ("hpc", draft_model),
     ]
 
 
