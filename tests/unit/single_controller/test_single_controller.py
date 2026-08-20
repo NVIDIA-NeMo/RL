@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
+from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
@@ -31,6 +32,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
     MasterConfig,
+    validate_single_controller_config,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -98,6 +100,90 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
             actor_args=actor_args,
             setup_timing_metrics=SetupTimingMetrics(),
         )
+
+
+def test_rejects_message_level_penalties_without_nemo_gym() -> None:
+    master_config = MasterConfig.model_construct(
+        policy={"train_global_batch_size": 1},
+        grpo=GRPOConfig(
+            num_prompts_per_step=1,
+            num_generations_per_prompt=1,
+            invalid_tool_call_advantage=-5.0,
+        ),
+        loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
+        async_rl=AsyncRLConfig(min_groups_for_streaming_train=1),
+        checkpointing={"enabled": False, "metric_name": None},
+        env={},
+    )
+
+    with pytest.raises(ValueError, match="require the NeMo-Gym rollout path"):
+        validate_single_controller_config(master_config)
+
+
+def test_advantage_stage_applies_message_level_penalties_and_records_counts() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = MagicMock()
+    ctrl._advantage_estimator.compute_advantage.return_value = torch.zeros(1, 4)
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._message_level_advantage_penalties_enabled = True
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig(
+            invalid_tool_call_advantage=-5.0,
+            malformed_thinking_advantage=-7.0,
+        )
+    )
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "num_invalid_tool_calls": [],
+        "num_malformed_thinking": [],
+        "num_assistant_messages": [],
+    }
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.tensor([[10, 11]]),
+            "total_reward": torch.tensor([1.0]),
+            "token_mask": torch.ones(1, 4),
+            "sample_mask": torch.ones(1),
+            "invalid_tool_call_mask": torch.tensor([[False, True, False, False]]),
+            "malformed_thinking_mask": torch.tensor([[False, False, True, False]]),
+            "num_invalid_tool_calls": torch.tensor([1]),
+            "num_malformed_thinking": torch.tensor([1]),
+            "num_assistant_messages": torch.tensor([2]),
+        },
+        batch_size=[1],
+    )
+    ctrl._call_dp = AsyncMock(side_effect=[data, None])
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=list(data.keys()),
+        sequence_lengths=[4],
+    )
+
+    result = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert result.fields is not None
+    assert "advantages" in result.fields
+    first_call = ctrl._call_dp.await_args_list[0]
+    assert "invalid_tool_call_mask" in first_call.kwargs["select_fields"]
+    assert "num_assistant_messages" in first_call.kwargs["select_fields"]
+    written = ctrl._call_dp.await_args_list[1].kwargs["fields"]["advantages"]
+    if written.is_nested:
+        written = torch.nested.to_padded_tensor(written, padding=0)
+    torch.testing.assert_close(
+        written,
+        torch.tensor([[0.0, -5.0, -7.0, 0.0]]),
+    )
+    assert ctrl._step_log_dict["num_invalid_tool_calls"][0].tolist() == [1]
+    assert ctrl._step_log_dict["num_malformed_thinking"][0].tolist() == [1]
+    assert ctrl._step_log_dict["num_assistant_messages"][0].tolist() == [2]
+    ctrl._advantage_estimator.compute_advantage.assert_called_once()
 
 
 def test_logs_hyperparameters_and_concrete_weight_synchronizer(
@@ -422,6 +508,9 @@ def _train_pump_controller(*, sampler) -> object:
         "rewards": [],
         "masked_advantages": [],
         "sequence_lengths": [],
+        "num_invalid_tool_calls": [],
+        "num_malformed_thinking": [],
+        "num_assistant_messages": [],
     }
     return ctrl
 
