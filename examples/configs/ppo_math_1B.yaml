@@ -89,6 +89,9 @@ value_loss_fn:
 
 checkpointing:
   enabled: true
+  # set to false to start fresh in a checkpoint_dir that already has
+  # checkpoints; the existing ones are moved to checkpoint_dir/run_<n>/
+  resume_if_exists: true
   checkpoint_dir: "results/ppo_dapo"
   metric_name: "val:accuracy"
   higher_is_better: true
