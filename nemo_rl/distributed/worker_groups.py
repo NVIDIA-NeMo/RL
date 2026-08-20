@@ -1080,6 +1080,11 @@ class RayWorkerGroup:
         Returns:
             bool: True if all workers were successfully shut down
         """
+        # Skip if Ray is already gone (typically from __del__ during _Py_Finalize
+        # after Ray's atexit teardown). Any Ray API call would trigger a fatal
+        # core_worker_process.cc:88 CHECK. Actors die with Ray.
+        if not ray.is_initialized():
+            return True
         if not self._workers:
             return True
 
