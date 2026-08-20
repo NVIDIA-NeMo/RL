@@ -114,6 +114,7 @@ def test_qwen30_dapo_pair_keeps_workload_matched() -> None:
         assert "policy.generation.vllm_cfg.enforce_eager=false" in result.stdout
         assert "loss_fn.force_on_policy_ratio=false" in result.stdout
         assert "++grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout
+        assert "grpo.val_period=0" in result.stdout
     assert "policy.generation.vllm_cfg.precision=bfloat16" in bf16.stdout
     assert "policy.generation.vllm_cfg.precision=fp8" in mxfp8.stdout
 

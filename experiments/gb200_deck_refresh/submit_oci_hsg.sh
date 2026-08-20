@@ -142,6 +142,7 @@ RUN_ARGS=(
   "++grpo.skip_reference_policy_logprobs_calculation=false"
   "grpo.max_num_steps=${MAX_STEPS}"
   "grpo.seed=42"
+  "grpo.val_period=0"
   "grpo.val_at_start=false"
   "++grpo.val_at_end=false"
   "checkpointing.enabled=false"
