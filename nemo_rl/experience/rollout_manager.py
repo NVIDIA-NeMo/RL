@@ -16,7 +16,8 @@ import asyncio
 import copy
 import enum
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -25,7 +26,10 @@ import torch
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    TQReplayBuffer,
+)
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -1274,6 +1278,7 @@ class RolloutManager:
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
         self._recovery_ledger = recovery_ledger
+        self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         # The NeMo-Gym env handle doubles as the gate control-plane proxy
         # (gate_metrics / fail_rollouts) on the capture path.
         self._env_handles = task_to_env
@@ -1291,6 +1296,22 @@ class RolloutManager:
     def recovery_ledger(self) -> Optional[RolloutRecoveryLedger]:
         """Return the controller-owned token-capture lineage ledger."""
         return self._recovery_ledger
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        """Join streamed receipt transitions to the SC snapshot barrier."""
+        self._data_plane_checkpoint_barrier = barrier
+
+    @asynccontextmanager
+    async def _recovery_mutation(self) -> AsyncIterator[None]:
+        """Serialize short lineage transitions with native TQ snapshots."""
+        barrier = self._data_plane_checkpoint_barrier
+        if barrier is None:
+            yield
+            return
+        async with barrier.mutation():
+            yield
 
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
@@ -1517,18 +1538,65 @@ class RolloutManager:
             raise RuntimeError(
                 "generate_for_finalization requires a rollout recovery ledger"
             )
-        recovery_group = self._recovery_ledger.reserve_group(
-            prompt_id=str(input_sample["idx"]),
-            prompt_ref=PromptRef(
-                sample_id=str(input_sample["idx"]),
-                task_name=input_sample.get("task_name"),
-            ),
-            prompt_payload=input_sample,
-            expected_generations=self._num_generations_per_prompt,
-            target_step=target_step,
-            start_weight_version=self._weight_version,
-        )
+        async with self._recovery_mutation():
+            recovery_group = self._recovery_ledger.reserve_group(
+                prompt_id=str(input_sample["idx"]),
+                prompt_ref=PromptRef(
+                    sample_id=str(input_sample["idx"]),
+                    task_name=input_sample.get("task_name"),
+                ),
+                prompt_payload=input_sample,
+                expected_generations=self._num_generations_per_prompt,
+                target_step=target_step,
+                start_weight_version=self._weight_version,
+            )
         recovery_group_id = recovery_group.group_id
+        return await self._run_finalization_with_retries(
+            input_sample,
+            recovery_group_id=recovery_group_id,
+            inflight_registry=inflight_registry,
+        )
+
+    async def recover_for_finalization(
+        self,
+        group_id: str,
+        *,
+        inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
+    ) -> Optional["FinalizationRequest"]:
+        """Redispatch only missing siblings from one restored prompt group."""
+        if self._recovery_ledger is None:
+            raise RuntimeError("rollout recovery requires a lineage ledger")
+        group = self._recovery_ledger.get_group(group_id)
+        if group.status == PromptGroupStatus.READY_TO_FINALIZE:
+            input_sample = None
+        elif group.status == PromptGroupStatus.GENERATING:
+            input_sample = group.runtime_prompt_payload
+            if input_sample is None:
+                raise RuntimeError(
+                    f"recovery group {group_id!r} has no reconstructed prompt"
+                )
+        else:
+            raise ValueError(
+                f"cannot recover group {group_id!r} from {group.status.value!r}"
+            )
+        return await self._run_finalization_with_retries(
+            input_sample,
+            recovery_group_id=group_id,
+            inflight_registry=inflight_registry,
+        )
+
+    async def discard_recovery_group(self, group_id: str) -> None:
+        """Drop restored lineage that the active sampler can no longer consume."""
+        await self._discard_recovery_group(group_id)
+
+    async def _run_finalization_with_retries(
+        self,
+        input_sample: Optional[DatumSpec],
+        *,
+        recovery_group_id: str,
+        inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]],
+    ) -> Optional["FinalizationRequest"]:
+        """Apply the normal retry policy to new or restored capture groups."""
         policy = self._retry_policy
         infra_attempts = 0
         data_attempts = 0
@@ -1567,8 +1635,13 @@ class RolloutManager:
                         ) from error
                     self._skipped_prompts += 1
                     await self._discard_recovery_group(recovery_group_id)
+                    prompt_id = (
+                        input_sample["idx"]
+                        if input_sample is not None
+                        else recovery_group_id
+                    )
                     print(
-                        f"skipping prompt idx={input_sample['idx']} after "
+                        f"skipping prompt idx={prompt_id} after "
                         f"{data_attempts} deterministic failure(s) "
                         f"({reason}: {error})",
                         flush=True,
@@ -1578,8 +1651,11 @@ class RolloutManager:
                 self._stats.record_data_retry(reason)
 
         assert last_infra_error is not None
+        prompt_id = (
+            input_sample["idx"] if input_sample is not None else recovery_group_id
+        )
         raise RolloutRedispatchExhausted(
-            f"prompt idx={input_sample['idx']} exhausted its infrastructure retry "
+            f"prompt idx={prompt_id} exhausted its infrastructure retry "
             f"budget after {infra_attempts} attempt(s) "
             f"(max_infra_attempts_per_prompt={policy.max_infra_attempts}); "
             f"last failure was {type(last_infra_error).__name__}: "
@@ -1588,7 +1664,7 @@ class RolloutManager:
 
     async def _generate_for_finalization_attempt(
         self,
-        input_sample: DatumSpec,
+        input_sample: Optional[DatumSpec],
         *,
         recovery_group_id: str,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]],
@@ -1598,11 +1674,12 @@ class RolloutManager:
 
         assert self._tq_buffer is not None
         assert self._recovery_ledger is not None
-        recovery_group = self._recovery_ledger.get_group(recovery_group_id)
-        if recovery_group.status == PromptGroupStatus.GENERATING:
-            recovery_group = self._recovery_ledger.prepare_incomplete_retry(
-                recovery_group_id
-            )
+        async with self._recovery_mutation():
+            recovery_group = self._recovery_ledger.get_group(recovery_group_id)
+            if recovery_group.status == PromptGroupStatus.GENERATING:
+                recovery_group = self._recovery_ledger.prepare_incomplete_retry(
+                    recovery_group_id
+                )
         pending_indices = [
             sibling.generation_index
             for sibling in recovery_group.siblings
@@ -1636,13 +1713,24 @@ class RolloutManager:
                 raise ValueError(
                     "token-capture completion must contain its Gate rollout ID"
                 )
-            self._recovery_ledger.mark_sibling_sealed(
-                group_id,
-                generation_index=generation_index,
-                gate_rollout_id=gate_rollout_id,
-                receipt=receipt,
-                reward=completion.reward,
-            )
+            barrier = self._data_plane_checkpoint_barrier
+            if barrier is None:
+                self._recovery_ledger.mark_sibling_sealed(
+                    group_id,
+                    generation_index=generation_index,
+                    gate_rollout_id=gate_rollout_id,
+                    receipt=receipt,
+                    reward=completion.reward,
+                )
+            else:
+                async with barrier.mutation():
+                    self._recovery_ledger.mark_sibling_sealed(
+                        group_id,
+                        generation_index=generation_index,
+                        gate_rollout_id=gate_rollout_id,
+                        receipt=receipt,
+                        reward=completion.reward,
+                    )
 
         try:
             if inflight_registry is not None:
@@ -1651,9 +1739,15 @@ class RolloutManager:
                 inflight_registry[group_id] = (current_task, start_version)
             try:
                 if pending_indices:
-                    self._recovery_ledger.mark_group_dispatched(
-                        group_id, generation_indices=pending_indices
-                    )
+                    if input_sample is None:
+                        raise RuntimeError(
+                            f"recovery group {group_id!r} needs a prompt for "
+                            "unfinished sibling generation"
+                        )
+                    async with self._recovery_mutation():
+                        self._recovery_ledger.mark_group_dispatched(
+                            group_id, generation_indices=pending_indices
+                        )
                     await self.run_rollout(
                         input_sample,
                         rollout_ids=list(rollout_ids),
@@ -1663,12 +1757,13 @@ class RolloutManager:
             finally:
                 if inflight_registry is not None:
                     inflight_registry.pop(group_id, None)
-            (
-                physical_rollout_ids,
-                canonical_sample_ids,
-                receipts,
-                rewards,
-            ) = self._recovery_ledger.finalization_inputs(group_id)
+            async with self._recovery_mutation():
+                (
+                    physical_rollout_ids,
+                    canonical_sample_ids,
+                    receipts,
+                    rewards,
+                ) = self._recovery_ledger.finalization_inputs(group_id)
             request = FinalizationRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -1683,8 +1778,12 @@ class RolloutManager:
             return request
         except BaseException:
             self._tq_buffer.abort(group_id)
-            self._recovery_ledger.abandon_unsealed(group_id)
-            recovery_group = self._recovery_ledger.get_group(group_id)
+            async with self._recovery_mutation():
+                self._recovery_ledger.abandon_unsealed(group_id)
+                recovery_group = self._recovery_ledger.get_group(group_id)
+            # A failure after the last sibling sealed leaves the group ready to
+            # finalize; an earlier failure leaves it generating. The outer retry
+            # loop deliberately supports both entry states.
             unfinished_gate_ids = [
                 recovery_group.gate_rollout_id(sibling.generation_index)
                 for sibling in recovery_group.siblings
@@ -1714,11 +1813,19 @@ class RolloutManager:
             for sibling in group.siblings
             for key in sibling.current_attempt.staging_keys
         ]
-        await self._tq_buffer.clear_staging_keys(staging_keys)
+        async with self._recovery_mutation():
+            await self._tq_buffer.clear_staging_keys(staging_keys)
+            self._recovery_ledger.discard_group(group_id)
         nemo_gym_env = self._env_handles.get("nemo_gym")
         if nemo_gym_env is not None:
-            await nemo_gym_env.fail_rollouts.remote(
-                group.gate_rollout_ids,
-                reason="prompt_skipped",
-            )
-        self._recovery_ledger.discard_group(group_id)
+            try:
+                await nemo_gym_env.fail_rollouts.remote(
+                    group.gate_rollout_ids,
+                    reason="prompt_skipped",
+                )
+            except Exception as cleanup_error:
+                print(
+                    "  warn: gate cleanup failed for skipped capture group "
+                    f"group={group_id}: {cleanup_error!r}",
+                    flush=True,
+                )

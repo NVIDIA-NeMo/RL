@@ -138,6 +138,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         data_plane_checkpoint_metadata=None,
+        finalizer_actors=[],
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
@@ -196,6 +197,7 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         data_plane_checkpoint_metadata=None,
+        finalizer_actors=[],
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
@@ -358,6 +360,7 @@ def _train_pump_controller(*, sampler) -> object:
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
         checkpointing={"enabled": False, "save_period": 10},
+        token_capture=SimpleNamespace(enabled=False),
     )
     ctrl._async_cfg = SimpleNamespace(min_groups_for_streaming_train=1)
     ctrl._consumed_samples = 0
@@ -374,6 +377,8 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._rollout_exhausted.set()
+    ctrl._rollout_recovery_complete = asyncio.Event()
+    ctrl._rollout_recovery_complete.set()
     ctrl._trainer = _NoOpTrainer()
     ctrl._gen = SimpleNamespace(requires_kv_scale_sync=False)
     ctrl._loss_fn = None
@@ -383,6 +388,12 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._train_steps = 0
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._rollout_recovery_ledger = None
+    ctrl._finalizer_actors = []
+    ctrl._available_finalizers = asyncio.Queue()
+    ctrl._active_finalizers = 0
+    ctrl._finalizer_waiters = 0
+    ctrl._finalizer_unknown_outcomes = 0
+    ctrl._finalizer_metrics_by_group = {}
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -399,11 +410,26 @@ def test_train_pump_stops_after_rollout_exhaustion_and_buffer_drain() -> None:
     assert ctrl._train_steps == 0
 
 
+def test_train_pump_waits_for_recovery_after_dataloader_exhaustion() -> None:
+    async def _main() -> None:
+        ctrl = _train_pump_controller(sampler=_EmptySampler())
+        ctrl._rollout_recovery_complete.clear()
+
+        train_task = asyncio.create_task(ctrl._train_pump())
+        await asyncio.sleep(0.02)
+        assert not train_task.done()
+
+        ctrl._rollout_recovery_complete.set()
+        await asyncio.wait_for(train_task, timeout=1.0)
+
+    asyncio.run(_main())
+
+
 def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
-        sample_ids=["sample-0"],
+        sample_ids=["g0_g0"],
         fields=[],
         sequence_lengths=[1],
         tags=[{"weight_version": 0}],
@@ -424,7 +450,7 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
-        sample_ids=["sample-0", "sample-1"],
+        sample_ids=["g0_g0", "g1_g0"],
         fields=[],
         sequence_lengths=[1, 1],
         tags=[{"weight_version": 0}, {"weight_version": 0}],

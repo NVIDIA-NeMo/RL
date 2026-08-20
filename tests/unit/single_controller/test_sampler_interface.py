@@ -159,7 +159,7 @@ class TestFactory:
         [
             (WindowedSamplerConfig(), True),
             (WeightFifoSamplerConfig(), False),
-            (InOrderSamplerConfig(), False),
+            (InOrderSamplerConfig(), True),
             (
                 CustomSamplerConfig(target=f"{__name__}:EchoSampler"),
                 False,
@@ -389,6 +389,38 @@ class TestDispatchCursorRestore:
         )
         s.set_dispatch_index(6)
         assert _run(s.admit(trainer_version_fn=lambda: 6)) == 6
+
+    def test_in_order_restores_after_highest_complete_target(self):
+        s = InOrderSampler(FakeBuffer(), max_lookahead_versions=2)
+
+        s.restore_dispatch_state(
+            current_train_weight=4,
+            restored_target_steps=[4, 4, 5, 5],
+            groups_per_step=2,
+        )
+
+        assert _run(s.admit(trainer_version_fn=lambda: 4)) == 6
+
+    @pytest.mark.parametrize(
+        ("targets", "error_fragment"),
+        [
+            ([3, 3], "older than the trainer"),
+            ([4, 4, 6, 6], "not contiguous"),
+            ([4], "exactly grpo.num_prompts_per_step"),
+            ([4, 4, 7, 7], "configured lookahead"),
+        ],
+    )
+    def test_in_order_rejects_inconsistent_restored_targets(
+        self, targets, error_fragment
+    ):
+        s = InOrderSampler(FakeBuffer(), max_lookahead_versions=2)
+
+        with pytest.raises(ValueError, match=error_fragment):
+            s.restore_dispatch_state(
+                current_train_weight=4,
+                restored_target_steps=targets,
+                groups_per_step=2,
+            )
 
 
 class TestInflightAbortPolicy:
