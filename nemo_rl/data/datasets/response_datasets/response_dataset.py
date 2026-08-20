@@ -79,7 +79,9 @@ class ResponseDataset(RawDataset):
         return {
             "messages": [
                 {"role": "user", "content": data[self.input_key]},
-                {"role": "assistant", "content": data[self.output_key]},
+                # CSV/JSON loaders can infer all-numeric output columns as ints;
+                # cast so the messages column keeps a uniform str content schema.
+                {"role": "assistant", "content": str(data[self.output_key])},
             ],
             "task_name": self.task_name,
         }

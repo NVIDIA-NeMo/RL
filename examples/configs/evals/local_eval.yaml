@@ -10,10 +10,12 @@ generation:
 data:
   prompt_file: "examples/prompts/cot.txt"
   system_prompt_file: null
-  # You can also use custom datasets from a local dataset or HuggingFace.
-  # e.g., /path/to/local/dataset or hf_org/hf_dataset_name (HuggingFace)
-  dataset_name: "https://openaipublic.blob.core.windows.net/simple-evals/math_500_test.csv"
-  problem_key: "Question"
-  solution_key: "Answer"
+  # Custom local or Hugging Face datasets use the generic ResponseDataset
+  # registry entry and provide their source through data_path.
+  # Examples: /path/to/local/dataset.csv or hf_org/hf_dataset_name.
+  dataset_name: "ResponseDataset"
+  data_path: "https://openaipublic.blob.core.windows.net/simple-evals/math_500_test.csv"
+  input_key: "Question"
+  output_key: "Answer"
   split: "train"
-  file_format: "csv"
+  processor: "math_hf_data_processor"

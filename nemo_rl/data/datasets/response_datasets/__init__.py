@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
 from functools import partial
 
 from nemo_rl.data import ResponseDatasetConfig
@@ -30,12 +31,17 @@ from nemo_rl.data.datasets.response_datasets.general_conversations_dataset impor
     GeneralConversationsJsonlDataset,
 )
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
+from nemo_rl.data.datasets.response_datasets.gpqa import GPQADataset
 from nemo_rl.data.datasets.response_datasets.gsm8k import GSM8KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.datasets.response_datasets.intent import (
     IntentBenchDataset,
     IntentTrainDataset,
 )
+from nemo_rl.data.datasets.response_datasets.math import MathDataset
+from nemo_rl.data.datasets.response_datasets.mmau import MMAUDataset
+from nemo_rl.data.datasets.response_datasets.mmlu import MMLUDataset
+from nemo_rl.data.datasets.response_datasets.mmlu_pro import MMLUProDataset
 from nemo_rl.data.datasets.response_datasets.mmpr_tiny import MMPRTinyDataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
 from nemo_rl.data.datasets.response_datasets.nemotron_cascade2_sft import (
@@ -59,6 +65,22 @@ from nemo_rl.data.datasets.utils import (
     warn_on_unsupported_dataset_config_keys,
 )
 
+MULTIMODAL_DATASETS = {
+    "audiomcq",
+    "avqa",
+    "clevr-cogent",
+    "daily-omni",
+    "geometry3k",
+    "intent-bench",
+    "intent-train",
+    "mmau",
+    "TwinkStart/MMAU",
+    "mmpr-tiny",
+    "refcoco",
+}
+
+LEGACY_EVAL_DATA_KEYS = frozenset({"file_format", "problem_key", "solution_key"})
+
 DATASET_REGISTRY = {
     # built-in datasets
     "audiomcq": AudioMCQDataset,
@@ -75,7 +97,15 @@ DATASET_REGISTRY = {
     "DeepScaler": DeepScalerDataset,
     "GSM8K": GSM8KDataset,
     "geometry3k": Geometry3KDataset,
+    "gpqa": partial(GPQADataset, variant="main"),
+    "gpqa_diamond": partial(GPQADataset, variant="diamond"),
     "mmpr-tiny": MMPRTinyDataset,
+    "math": partial(MathDataset, variant="math_test"),
+    "math500": partial(MathDataset, variant="math_500_test"),
+    "mmau": MMAUDataset,
+    "TwinkStart/MMAU": MMAUDataset,
+    "mmlu": MMLUDataset,
+    "mmlu_pro": MMLUProDataset,
     "HelpSteer3": HelpSteer3Dataset,
     "intent-train": IntentTrainDataset,
     "intent-bench": IntentBenchDataset,
@@ -95,8 +125,39 @@ DATASET_REGISTRY = {
 }
 
 
+def _resolve_response_dataset_factory(dataset_name: str):
+    """Resolve a built-in or external response dataset factory."""
+    if dataset_name in DATASET_REGISTRY:
+        return DATASET_REGISTRY[dataset_name]
+    if "." in dataset_name:
+        return resolve_external_dataset_class(dataset_name)
+    raise ValueError(
+        f"Unsupported {dataset_name=}. Please set dataset_name to one of: "
+        "(1) a built-in dataset name, "
+        "(2) 'ResponseDataset' to load from a local JSONL file or HuggingFace, or "
+        "(3) an importable dotted path to a dataset class "
+        "(ensure it is installed and importable from PYTHONPATH)."
+    )
+
+
+def is_multimodal_response_dataset(dataset_name: str) -> bool:
+    """Return whether a built-in response dataset is multimodal."""
+    return dataset_name in MULTIMODAL_DATASETS
+
+
+def validate_eval_data_config(data_config: Mapping[str, object]) -> None:
+    """Reject the legacy local-eval keys with an actionable migration message."""
+    legacy_keys = sorted(LEGACY_EVAL_DATA_KEYS.intersection(data_config))
+    assert not legacy_keys, (
+        f"Legacy evaluation data keys are no longer supported: {legacy_keys}. "
+        "Use data.dataset_name=ResponseDataset together with data.data_path, "
+        "data.input_key, and data.output_key. See the migration guide in "
+        "https://github.com/NVIDIA-NeMo/RL/pull/3039."
+    )
+
+
 def load_response_dataset(data_config: ResponseDatasetConfig):
-    """Loads response dataset.
+    """Load a response dataset.
 
     Resolution order for ``data_config["dataset_name"]``:
 
@@ -108,21 +169,10 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
        without editing ``nemo_rl``.
     3. Otherwise, raise ``ValueError`` with a helpful message.
     """
+    validate_eval_data_config(data_config)
     dataset_name = data_config["dataset_name"]
 
-    # load dataset
-    if dataset_name in DATASET_REGISTRY:
-        dataset_class = DATASET_REGISTRY[dataset_name]
-    elif "." in dataset_name:
-        dataset_class = resolve_external_dataset_class(dataset_name)
-    else:
-        raise ValueError(
-            f"Unsupported {dataset_name=}. Please set dataset_name to one of: "
-            "(1) a built-in dataset name, "
-            "(2) 'ResponseDataset' to load from a local JSONL file or HuggingFace, or "
-            "(3) an importable dotted path to a dataset class "
-            "(ensure it is installed and importable from PYTHONPATH)."
-        )
+    dataset_class = _resolve_response_dataset_factory(dataset_name)
 
     # Every dataset class accepts **kwargs, so unsupported config keys are
     # otherwise swallowed silently (e.g. `split_validation_size` on a dataset
@@ -154,10 +204,16 @@ __all__ = [
     "GSM8KDataset",
     "DeepScalerDataset",
     "Geometry3KDataset",
+    "GPQADataset",
     "HelpSteer3Dataset",
     "IntentBenchDataset",
     "IntentTrainDataset",
+    "MathDataset",
+    "MULTIMODAL_DATASETS",
+    "MMAUDataset",
     "MMPRTinyDataset",
+    "MMLUDataset",
+    "MMLUProDataset",
     "NemoGymDataset",
     "NemotronCascade2SFTMathDataset",
     "OasstDataset",
@@ -169,5 +225,7 @@ __all__ = [
     "ResponseDataset",
     "SquadDataset",
     "Tulu3SftMixtureDataset",
+    "is_multimodal_response_dataset",
     "load_response_dataset",
+    "validate_eval_data_config",
 ]

@@ -7,3 +7,4 @@ generation:
 data:
   prompt_file: "examples/prompts/cot.txt"
   dataset_name: "math"
+  processor: "math_data_processor"

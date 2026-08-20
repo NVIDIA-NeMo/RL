@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import os
 import sys
 import tempfile
 from collections import defaultdict
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import soundfile as sf
 import torch
 from datasets import Dataset
 
@@ -25,17 +29,13 @@ abspath = os.path.abspath(__file__)
 sys.path.append("/".join(abspath.split("/")[:-4]))
 
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.datasets.eval_datasets import (
-    GPQADataset,
-    MathDataset,
-    MMLUDataset,
-)
+from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
 from nemo_rl.data.datasets.response_datasets import (
     AIMEDataset,
     DeepScalerDataset,
     OpenMathInstruct2Dataset,
 )
+from nemo_rl.data.datasets.response_datasets import mmau as mmau_module
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import (
     PROCESSOR_REGISTRY,
@@ -255,19 +255,28 @@ def system_prompt_file(request):
     ],
 )
 @pytest.mark.parametrize(
-    "dataset_cls",
+    "data_config",
     [
-        GPQADataset,
-        MathDataset,
-        MMLUDataset,
+        {
+            "dataset_name": "AIME2024",
+            "processor": "math_hf_data_processor",
+            "repeat": 1,
+        },
+        {"dataset_name": "gpqa", "processor": "multichoice_qa_processor"},
+        {"dataset_name": "math", "processor": "math_data_processor"},
+        {"dataset_name": "mmlu", "processor": "multichoice_qa_processor"},
     ],
 )
 @pytest.mark.parametrize(
     "system_prompt_file", [system_prompt_file, None], indirect=True
 )
-def test_eval_math_hf_data_processor(tokenizer_name, dataset_cls, system_prompt_file):
-    # Initialize dataset
-    data = dataset_cls()
+def test_eval_response_data_processor(tokenizer_name, data_config, system_prompt_file):
+    data_config = {
+        **data_config,
+        "prompt_file": f"{os.path.dirname(abspath)}/../../../examples/prompts/cot.txt",
+        "system_prompt_file": system_prompt_file,
+    }
+    data = load_response_dataset(data_config)
 
     # Setup tokenizer
     tokenizer = get_tokenizer(
@@ -277,17 +286,10 @@ def test_eval_math_hf_data_processor(tokenizer_name, dataset_cls, system_prompt_
         )
     )
 
-    # Configure task specification
-    math_task_spec = TaskDataSpec(
-        task_name="math",
-        prompt_file=f"{os.path.dirname(abspath)}/../../../examples/prompts/cot.txt",
-        system_prompt_file=system_prompt_file,
-    )
-
     dataset = AllTaskProcessedDataset(
-        dataset=data.rekeyed_ds,
+        dataset=data.dataset,
         tokenizer=tokenizer,
-        default_task_data_spec=math_task_spec,
+        default_task_data_spec=data.task_spec,
         task_data_processors=data.processor,
         max_seq_length=128,
     )
@@ -297,6 +299,63 @@ def test_eval_math_hf_data_processor(tokenizer_name, dataset_cls, system_prompt_
     assert first_item is not None
     assert "message_log" in first_item
     assert len(first_item["message_log"]) > 0
+
+
+def test_eval_multimodal_response_data_processor(monkeypatch):
+    audio_buffer = io.BytesIO()
+    sf.write(
+        audio_buffer,
+        np.zeros(160, dtype=np.float32),
+        16000,
+        format="WAV",
+    )
+    source = Dataset.from_list(
+        [
+            {
+                "audio": {"bytes": audio_buffer.getvalue(), "path": None},
+                "question": "Which option is correct?",
+                "choices": ["A", "B"],
+                "answer": "A",
+            }
+        ]
+    )
+    monkeypatch.setattr(mmau_module, "load_dataset", lambda *args, **kwargs: source)
+
+    data = load_response_dataset(
+        {
+            "dataset_name": "mmau",
+            "processor": "vlm_hf_data_processor",
+            "split": "v05.15.25",
+        }
+    )
+
+    class DummyVLMProcessor:
+        feature_extractor = SimpleNamespace(
+            model_input_names=[],
+            sampling_rate=16000,
+        )
+        model_input_names = ["input_ids"]
+        tokenizer = SimpleNamespace(model_input_names=["input_ids"], bos_token_id=None)
+
+        def apply_chat_template(self, messages, *, tokenize=False, **kwargs):
+            if tokenize:
+                return {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
+            return "user: Which option is correct?\nassistant:"
+
+    dataset = AllTaskProcessedDataset(
+        dataset=data.dataset,
+        tokenizer=DummyVLMProcessor(),
+        default_task_data_spec=data.task_spec,
+        task_data_processors=data.processor,
+        task_data_preprocessors=data.preprocessor,
+        max_seq_length=128,
+    )
+
+    first_item = dataset[0]
+    assert data.processor is PROCESSOR_REGISTRY["vlm_hf_data_processor"]
+    assert first_item["task_name"] == "mmau"
+    assert first_item["extra_env_info"]["ground_truth"] == "A"
+    assert len(first_item["vllm_audios"]) == 1
 
 
 def test_helpsteer3_data_processor():

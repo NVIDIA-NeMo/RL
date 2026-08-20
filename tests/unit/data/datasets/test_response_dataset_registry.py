@@ -39,6 +39,8 @@ from nemo_rl.data.datasets.response_datasets import (
     DATASET_REGISTRY as RESPONSE_REGISTRY,
 )
 from nemo_rl.data.datasets.response_datasets import (
+    MULTIMODAL_DATASETS,
+    is_multimodal_response_dataset,
     load_response_dataset,
 )
 from nemo_rl.data.datasets.utils import (
@@ -129,6 +131,39 @@ def test_resolve_external_rejects_non_class(stub_module):
 def test_load_response_dataset_builtin_registry_present():
     """Built-in registry must still expose the loadable formats."""
     assert "ResponseDataset" in RESPONSE_REGISTRY
+
+
+def test_eval_datasets_are_available_from_response_registry():
+    expected_names = {
+        "AIME2024",
+        "AIME2025",
+        "AIME2026",
+        "gpqa",
+        "gpqa_diamond",
+        "math",
+        "math500",
+        "mmlu",
+        "mmlu_pro",
+        "mmau",
+        "TwinkStart/MMAU",
+        "daily-omni",
+    }
+    assert expected_names <= RESPONSE_REGISTRY.keys()
+
+
+def test_multimodal_dataset_names_are_centralized():
+    assert MULTIMODAL_DATASETS <= RESPONSE_REGISTRY.keys()
+    for dataset_name in RESPONSE_REGISTRY:
+        assert is_multimodal_response_dataset(dataset_name) is (
+            dataset_name in MULTIMODAL_DATASETS
+        )
+
+
+@pytest.mark.parametrize("name", ["aime2024", "aime2025", "aime2026"])
+def test_legacy_lowercase_aime_names_are_removed(name):
+    assert name not in RESPONSE_REGISTRY
+    with pytest.raises(ValueError, match="Unsupported dataset_name"):
+        load_response_dataset({"dataset_name": name})
 
 
 def test_load_response_dataset_uses_external_class(stub_module):

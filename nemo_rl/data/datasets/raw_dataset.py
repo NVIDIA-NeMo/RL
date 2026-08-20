@@ -24,7 +24,6 @@ from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
 class RawDataset:
-    # change to ResponseDatasetConfig | PreferenceDatasetConfig once preference dataset is refactored
     data_config: ResponseDatasetConfig | PreferenceDatasetConfig
     dataset: Dataset
     # `val_dataset` is used only when current dataset is used for both training and validation
