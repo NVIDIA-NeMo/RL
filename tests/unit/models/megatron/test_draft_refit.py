@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -338,3 +340,264 @@ def _run_cp2_dtype_bucket_owner_preflight(rank: int, world_size: int) -> None:
 @pytest.mark.mcore
 def test_cp2_dtype_bucket_owner_preflight(distributed_test_runner) -> None:
     distributed_test_runner(_run_cp2_dtype_bucket_owner_preflight, world_size=4)
+
+
+class _EmptyBridge:
+    def export_hf_weights(self, *_args: object, **_kwargs: object):
+        return iter(())
+
+
+def _draft_refit_worker(*, draft_model: object | None) -> Any:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {"draft": {"enabled": True}}
+    worker.model = object()
+    worker.megatron_bridge = _EmptyBridge()
+    worker.refit_conversion_tasks = []
+    worker.draft_model = draft_model
+    return worker
+
+
+def _run_tp2_pp2_cp2_worker_draft_refit(rank: int, world_size: int) -> None:
+    from megatron.core import parallel_state
+
+    import nemo_rl.models.megatron.draft as draft_module
+
+    assert world_size == 8
+    parallel_state.destroy_model_parallel()
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        context_parallel_size=2,
+    )
+
+    pp_group = parallel_state.get_pipeline_model_parallel_group()
+    expected_owner_rank = parallel_state.get_pipeline_model_parallel_last_rank()
+    cp_rank = parallel_state.get_context_parallel_rank()
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    lane_value = cp_rank * 10 + tp_rank
+    draft_model = (
+        SimpleNamespace(lane_value=lane_value)
+        if parallel_state.is_pipeline_last_stage()
+        else None
+    )
+    worker = _draft_refit_worker(draft_model=draft_model)
+
+    payload_sources: list[int] = []
+    original_export = draft_module.export_eagle_weights_to_hf
+    original_broadcast = dist.broadcast
+    original_all_reduce = dist.all_reduce
+    original_all_gather_object = dist.all_gather_object
+    original_broadcast_object_list = dist.broadcast_object_list
+
+    def export_lane(model: Any) -> list[tuple[str, torch.Tensor]]:
+        return [
+            (
+                "model.layers.0.norm.weight",
+                torch.full(
+                    (2,),
+                    model.lane_value,
+                    dtype=torch.float32,
+                    device=torch.device("cuda", torch.cuda.current_device()),
+                ),
+            )
+        ]
+
+    def checked_broadcast(
+        tensor: torch.Tensor,
+        src: int,
+        group: dist.ProcessGroup | None = None,
+        **kwargs,
+    ):
+        assert group is pp_group
+        if tensor.dtype == torch.float32:
+            payload_sources.append(src)
+        return original_broadcast(tensor, src=src, group=group, **kwargs)
+
+    def checked_all_reduce(
+        tensor: torch.Tensor,
+        op=dist.ReduceOp.SUM,
+        group: dist.ProcessGroup | None = None,
+        **kwargs,
+    ):
+        assert group is pp_group
+        return original_all_reduce(tensor, op=op, group=group, **kwargs)
+
+    def reject_object_collective(*_args, **_kwargs):
+        raise AssertionError("worker draft refit must not use object collectives")
+
+    draft_module.export_eagle_weights_to_hf = export_lane
+    dist.broadcast = checked_broadcast
+    dist.all_reduce = checked_all_reduce
+    dist.all_gather_object = reject_object_collective
+    dist.broadcast_object_list = reject_object_collective
+    try:
+        metadata = list(
+            worker._iter_params_with_optional_kv_scales(draft_metadata_only=True)
+        )
+        assert [
+            (name, tuple(tensor.shape), tensor.dtype) for name, tensor in metadata
+        ] == [("draft.model.layers.0.norm.weight", (2,), torch.float32)]
+        assert metadata[0][1].device.type == "meta"
+        assert payload_sources == []
+
+        exported = list(worker._iter_params_with_optional_kv_scales())
+        assert [name for name, _ in exported] == ["draft.model.layers.0.norm.weight"]
+        torch.testing.assert_close(
+            exported[0][1],
+            torch.full_like(exported[0][1], lane_value),
+            rtol=0,
+            atol=0,
+        )
+        assert payload_sources == [expected_owner_rank]
+    finally:
+        draft_module.export_eagle_weights_to_hf = original_export
+        dist.broadcast = original_broadcast
+        dist.all_reduce = original_all_reduce
+        dist.all_gather_object = original_all_gather_object
+        dist.broadcast_object_list = original_broadcast_object_list
+        parallel_state.destroy_model_parallel()
+
+
+@pytest.mark.mcore
+def test_tp2_pp2_cp2_worker_uses_exact_mcore_draft_lane(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(_run_tp2_pp2_cp2_worker_draft_refit, world_size=8)
+
+
+def _run_cp_lane_manifest_mismatch(rank: int, world_size: int) -> None:
+    from megatron.core import parallel_state
+
+    import nemo_rl.models.megatron.draft as draft_module
+    from nemo_rl.weight_sync import nccl_reshard_utils
+
+    assert world_size == 8
+    parallel_state.destroy_model_parallel()
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        context_parallel_size=2,
+    )
+
+    cp_rank = parallel_state.get_context_parallel_rank()
+    pp_group = parallel_state.get_pipeline_model_parallel_group()
+    draft_model = object() if parallel_state.is_pipeline_last_stage() else None
+    worker = _draft_refit_worker(draft_model=draft_model)
+    worker._calculate_refit_param_info = lambda: []
+
+    class _MetadataBridge:
+        def export_hf_weights(self, *_args: object, **_kwargs: object):
+            return iter(
+                [
+                    (
+                        "model.layers.0.mlp.gate_proj.weight",
+                        torch.empty((2, 2), dtype=torch.bfloat16, device="meta"),
+                    )
+                ]
+            )
+
+    worker.megatron_bridge = _MetadataBridge()
+    payload_broadcasts = 0
+    build_calls = 0
+    descriptor_reductions = 0
+    original_export = draft_module.export_eagle_weights_to_hf
+    original_build = nccl_reshard_utils.build_nccl_reshard_refit_info
+    original_broadcast = dist.broadcast
+    original_all_reduce = dist.all_reduce
+    original_all_gather_object = dist.all_gather_object
+    original_broadcast_object_list = dist.broadcast_object_list
+
+    def export_lane(_model: object) -> list[tuple[str, torch.Tensor]]:
+        names = (
+            ("model.layers.0.a.weight", "model.layers.0.b.weight")
+            if cp_rank == 0
+            else ("model.layers.0.b.weight", "model.layers.0.a.weight")
+        )
+        direct_weight = torch.ones(
+            1,
+            dtype=torch.float32,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        return [
+            (names[0], direct_weight),
+            (names[1], torch.empty_like(direct_weight)),
+        ]
+
+    def unexpected_build(*_args, **_kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        raise AssertionError("refit builder ran before manifest agreement")
+
+    def checked_broadcast(*args, **kwargs):
+        nonlocal payload_broadcasts
+        tensor = args[0] if args else kwargs["tensor"]
+        if tensor.dtype == torch.float32:
+            payload_broadcasts += 1
+        return original_broadcast(*args, **kwargs)
+
+    def checked_all_reduce(
+        tensor: torch.Tensor,
+        op=dist.ReduceOp.SUM,
+        group: dist.ProcessGroup | None = None,
+        **kwargs,
+    ):
+        nonlocal descriptor_reductions
+        if group is dist.group.WORLD:
+            descriptor_reductions += 1
+            assert tensor.shape == (6,)
+            assert tensor.dtype == torch.int64
+        else:
+            assert group is pp_group
+        return original_all_reduce(tensor, op=op, group=group, **kwargs)
+
+    def reject_object_collective(*_args, **_kwargs):
+        raise AssertionError("manifest agreement must not use object collectives")
+
+    draft_module.export_eagle_weights_to_hf = export_lane
+    nccl_reshard_utils.build_nccl_reshard_refit_info = unexpected_build
+    dist.broadcast = checked_broadcast
+    dist.all_reduce = checked_all_reduce
+    dist.all_gather_object = reject_object_collective
+    dist.broadcast_object_list = reject_object_collective
+    try:
+        with pytest.raises(
+            ValueError, match="refit weight manifest differs across ranks"
+        ):
+            worker.prepare_nccl_reshard_refit_info(
+                train_parallelism={
+                    "tp_size": 2,
+                    "ep_size": 1,
+                    "cp_size": 2,
+                    "pp_size": 2,
+                },
+                gen_parallelism={
+                    "tp_size": 2,
+                    "ep_size": 1,
+                    "cp_size": 1,
+                    "pp_size": 1,
+                },
+                train_world_size=8,
+                gen_world_size=2,
+            )
+        assert build_calls == 0
+        assert payload_broadcasts == 0
+        assert descriptor_reductions == 2
+    finally:
+        draft_module.export_eagle_weights_to_hf = original_export
+        nccl_reshard_utils.build_nccl_reshard_refit_info = original_build
+        dist.broadcast = original_broadcast
+        dist.all_reduce = original_all_reduce
+        dist.all_gather_object = original_all_gather_object
+        dist.broadcast_object_list = original_broadcast_object_list
+        parallel_state.destroy_model_parallel()
+
+
+@pytest.mark.mcore
+def test_cp_lane_manifest_mismatch_fails_before_refit_builder(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(_run_cp_lane_manifest_mismatch, world_size=8)

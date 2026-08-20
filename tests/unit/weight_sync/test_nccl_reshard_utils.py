@@ -611,6 +611,32 @@ def test_build_refit_info_replicates_train_context_parallelism():
     assert info["gen_cp_size"] == 1
 
 
+def test_build_refit_info_tp2_pp2_cp2_stage_mesh_keeps_both_cp_replicas():
+    metadata = {
+        **_dense_metadata(),
+        "model.layers.1.mlp.gate_proj.weight": {
+            "shape": [64, 32],
+            "dtype": "torch.bfloat16",
+        },
+    }
+    info = build_nccl_reshard_refit_info(
+        metadata,
+        train_parallelism={"tp_size": 2, "ep_size": 1, "cp_size": 2, "pp_size": 2},
+        gen_parallelism={"tp_size": 2, "ep_size": 1, "cp_size": 1, "pp_size": 1},
+        train_world_size=8,
+        gen_world_size=2,
+        layer_to_pp_stage={"model.layers.0": 0, "model.layers.1": 1},
+    )
+
+    assert info["train_cp_size"] == 2
+    assert info["pp_size"] == 2
+    for layer_name in ("model.layers.0", "model.layers.1"):
+        parameter = info["per_layer_params"][layer_name][0]
+        assert tuple(parameter["src_mesh_info"].mesh.shape) == (2, 2)
+        assert parameter["src_mesh_info"].mesh.flatten().tolist() == [0, 1, 2, 3]
+        assert isinstance(parameter["src_placements"][0], Replicate)
+
+
 # --------------------------------------------------------------------------
 # make_nccl_reshard_refit_info_wire_safe / restore_refit_info_placements
 # --------------------------------------------------------------------------
