@@ -35,6 +35,7 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
+    _STR_TO_DTYPE,
     HFToLocalParamMap,
     LocalParamSpec,
     RefitCtx,
@@ -819,30 +820,133 @@ class VllmInternalWorkerExtension:
         """
 
         def _merged_param_spec(vllm_param, merged_slice):
-            def pre(_base):
+            def pre(_base: torch.Tensor) -> RefitCtx:
                 region = vllm_param.data[merged_slice]
                 return RefitCtx(buf=torch.empty_like(region), extra={"region": region})
 
-            def post(ctx):
+            def post(ctx: RefitCtx) -> None:
                 ctx.extra["region"].copy_(ctx.buf)
 
             return LocalParamSpec(base=vllm_param, pre=pre, post=post)
 
+        def _bf16_to_mxfp8_receiver_quant_spec(
+            value_param: torch.Tensor,
+            scale_param: torch.Tensor,
+            merged_slice: tuple[slice, ...] | None,
+        ) -> LocalParamSpec:
+            def pre(_base: torch.Tensor) -> RefitCtx:
+                value_region = (
+                    value_param.data
+                    if merged_slice is None
+                    else value_param.data[merged_slice]
+                )
+                scale_region = (
+                    scale_param.data
+                    if merged_slice is None
+                    else scale_param.data[merged_slice]
+                )
+                return RefitCtx(
+                    buf=torch.empty_like(value_region, dtype=torch.bfloat16),
+                    extra={"value_region": value_region, "scale_region": scale_region},
+                )
+
+            def post(ctx: RefitCtx) -> None:
+                from nemo_rl.models.generation.vllm.quantization.fp8 import (
+                    quantize_mxfp8_weight,
+                )
+
+                value, scale = quantize_mxfp8_weight(ctx.buf)
+                ctx.extra["value_region"].copy_(value)
+                ctx.extra["scale_region"].copy_(scale)
+
+            return LocalParamSpec(base=value_param.data, pre=pre, post=post)
+
         # Get dict of vllm_param and merged_slice for each hf_name
         vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
-        return HFToLocalParamMap(
-            specs={
-                hf_name: (
+        param_info_by_name = {
+            param_info["name"]: param_info
+            for layer_name in refit_info["layer_names"]
+            for param_info in refit_info["per_layer_params"][layer_name]
+        }
+        vllm_params = dict(self.model_runner.model.named_parameters())
+        vllm_names_by_id = {id(param): name for name, param in vllm_params.items()}
+        specs = {}
+        for hf_name, (vllm_param, merged_slice) in vllm_param_map_and_slices.items():
+            wire_dtype_value = param_info_by_name[hf_name].get("dtype")
+            wire_dtype = (
+                wire_dtype_value
+                if isinstance(wire_dtype_value, torch.dtype)
+                else _STR_TO_DTYPE.get(wire_dtype_value)
+            )
+            if wire_dtype is None:
+                raise ValueError(
+                    f"build_hf_to_local_param_map: unsupported wire dtype "
+                    f"{wire_dtype_value!r} for {hf_name!r}"
+                )
+            if wire_dtype == torch.bfloat16 and vllm_param.dtype == torch.float8_e4m3fn:
+                vllm_name = vllm_names_by_id.get(id(vllm_param))
+                if vllm_name is None:
+                    raise ValueError(
+                        f"build_hf_to_local_param_map: resolved vLLM target for "
+                        f"{hf_name!r} is not a registered model parameter"
+                    )
+                scale_names = (
+                    vllm_name + "_scale_from_checkpoint",
+                    vllm_name + "_scale",
+                )
+                scale_name = next(
+                    (name for name in scale_names if name in vllm_params), None
+                )
+                scale_param = (
+                    vllm_params.get(scale_name) if scale_name is not None else None
+                )
+                if scale_param is None:
+                    raise ValueError(
+                        f"build_hf_to_local_param_map: MXFP8 target {vllm_name!r} "
+                        f"for {hf_name!r} has no scale parameter among "
+                        f"{scale_names!r}"
+                    )
+                value_region = (
+                    vllm_param if merged_slice is None else vllm_param[merged_slice]
+                )
+                scale_region = (
+                    scale_param if merged_slice is None else scale_param[merged_slice]
+                )
+                if value_region.shape[-1] % 32 != 0:
+                    raise ValueError(
+                        f"build_hf_to_local_param_map: MXFP8 target for {hf_name!r} "
+                        f"must have K divisible by 32, got {tuple(value_region.shape)}"
+                    )
+                expected_scale_shape = (
+                    *value_region.shape[:-1],
+                    value_region.shape[-1] // 32,
+                )
+                if tuple(scale_region.shape) != expected_scale_shape:
+                    raise ValueError(
+                        f"build_hf_to_local_param_map: MXFP8 scale target "
+                        f"{scale_name!r} for {hf_name!r} has shape "
+                        f"{tuple(scale_region.shape)}, expected {expected_scale_shape}"
+                    )
+                if scale_param.dtype != torch.uint8:
+                    raise ValueError(
+                        f"build_hf_to_local_param_map: MXFP8 scale target "
+                        f"{scale_name!r} has dtype {scale_param.dtype}, expected torch.uint8"
+                    )
+                specs[hf_name] = _bf16_to_mxfp8_receiver_quant_spec(
+                    vllm_param, scale_param, merged_slice
+                )
+            elif wire_dtype != vllm_param.dtype:
+                raise ValueError(
+                    f"build_hf_to_local_param_map: wire dtype {wire_dtype} does not "
+                    f"match target dtype {vllm_param.dtype} for {hf_name!r}"
+                )
+            else:
+                specs[hf_name] = (
                     LocalParamSpec(base=vllm_param.data)
                     if merged_slice is None
                     else _merged_param_spec(vllm_param, merged_slice)
                 )
-                for hf_name, (
-                    vllm_param,
-                    merged_slice,
-                ) in vllm_param_map_and_slices.items()
-            }
-        )
+        return HFToLocalParamMap(specs=specs)
 
     def _build_hf_to_gen_backend_mapping(self, refit_info):
         """Map each FFN HF param name to its gen-backend param and slice.
@@ -1088,8 +1192,6 @@ class VllmInternalWorkerExtension:
 
     def _receive_and_load_misc_params(self) -> None:
         """Receive misc params via packed_broadcast and load via vLLM."""
-        from nemo_rl.weight_sync.nccl_reshard_utils import _STR_TO_DTYPE
-
         misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
         if not misc_meta:
             return

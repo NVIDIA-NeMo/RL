@@ -22,6 +22,17 @@ ppo:
   batch_multiplier: 1
   skip_reference_policy_logprobs_calculation: true  # No KL, so skip ref logprobs
 
+  # Async PPO requires non-colocated vLLM generation and importance correction.
+  async_ppo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    # Requires policy_training_start_step > 0. null uses max_trajectory_age_steps.
+    warmup_generation_lead_steps: null
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+    # true discards partial restored rows and fills from subsequent prompts.
+    drop_incomplete_targets_on_restore: false
+
   reward_shaping:
     enabled: true
     overlong_buffer_length: 2048
@@ -443,6 +454,7 @@ data:
   max_input_seq_length: 2048
   shuffle: true
   num_workers: 1
+  use_multiple_dataloader: false
   train:
     dataset_name: DAPOMath17K
   validation:
