@@ -686,10 +686,19 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     """Frequent rollout-state snapshots anchored to durable trainer state.
 
-    ``interval_s=None`` disables the periodic pump. ``latest`` restores the
-    newest compatible rollout snapshot, ``trainer_checkpoint`` ignores newer
-    rollout-only snapshots, and ``none`` restores trainer state without any
-    replay, lineage, or dataloader state.
+    ``interval_s=None`` disables periodic snapshots. A snapshot taken before
+    the first trainer checkpoint is anchored to the initial model and a
+    rollout-semantic configuration fingerprint. Later snapshots are anchored
+    to the most recent durable trainer checkpoint.
+
+    ``restore_mode="latest"`` selects the newest compatible periodic snapshot.
+    ``trainer_checkpoint`` ignores newer periodic snapshots, while ``none``
+    resumes trainer state without restoring rollout, replay, lineage, or the
+    dataloader cursor.
+
+    SingleController has no validation loop, so checkpoint selection must use
+    ``checkpointing.metric_name=None`` or a ``train:<name>`` metric. Inherited
+    ``val:<name>`` settings are rejected during setup.
     """
 
     interval_s: Optional[float] = Field(default=None, gt=0)
