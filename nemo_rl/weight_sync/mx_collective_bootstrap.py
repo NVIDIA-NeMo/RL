@@ -27,6 +27,9 @@ transports comparable: they cannot drift apart, because below the bootstrap
 they are the same code path.
 """
 
+import os
+from typing import Any
+
 import torch
 
 
@@ -38,11 +41,22 @@ class MxProcessGroup:
     would drag in the ``TCPStore`` this exists to replace.
     """
 
-    def __init__(self, *, unique_id: bytes, rank: int, world_size: int):
+    def __init__(
+        self,
+        *,
+        unique_id: bytes,
+        rank: int,
+        world_size: int,
+        root_unique_id: Any = None,
+    ):
         self.rank = rank
         self.world_size = world_size
         self.nccl_communicator = None
         self._unique_id = unique_id
+        # Rank zero keeps and consumes the exact object returned by
+        # ncclGetUniqueId, matching StatelessProcessGroup. Peers reconstruct
+        # it from the bytes MX brokered.
+        self._root_unique_id = root_unique_id
 
     def init_nccl_communicator(self, device):
         from nccl.core.communicator import Communicator
@@ -52,11 +66,28 @@ class MxProcessGroup:
         # transport buffers have device-memory headroom.
         torch.cuda.empty_cache()
         with torch.cuda.device(device):
+            unique_id = self._root_unique_id
+            if unique_id is None:
+                unique_id = UniqueId.from_bytes(self._unique_id)
             self.nccl_communicator = Communicator.init(
                 nranks=self.world_size,
                 rank=self.rank,
-                unique_id=UniqueId.from_bytes(self._unique_id),
+                unique_id=unique_id,
             )
+
+            # Match the native StatelessProcessGroup bootstrap protocol. This
+            # proves the newly-created communicator can execute one collective
+            # before it is handed to the refit path.
+            stream = torch.cuda.current_stream()
+            data = (
+                torch.ones(1, device=device)
+                if self.rank == 0
+                else torch.zeros(1, device=device)
+            )
+            self.broadcast(data, 0, stream=stream)
+            stream.synchronize()
+            if not torch.allclose(data, torch.ones(1, device=device)):
+                raise RuntimeError("MX NCCL communicator bootstrap broadcast failed")
 
     def broadcast(self, tensor, src, stream=None):
         if stream is None:
@@ -106,9 +137,16 @@ def mx_rendezvous(
     No communicator is created here. Creation is a separate phase per lane so
     the driver can barrier between them.
     """
+    if role not in ("TRAINER", "GENERATOR"):
+        raise ValueError(f"unsupported MX collective role {role!r}")
+    if os.environ.get("NCCL_COMM_ID"):
+        raise RuntimeError(
+            "NCCL_COMM_ID must be unset for the MX collective transport; "
+            "it overrides ncclGetUniqueId and bypasses MX's per-lane bootstrap"
+        )
+
     import grpc
     from modelexpress_rl.collective import CollectiveRendezvous, Role
-    from modelexpress_rl.collective.comm import new_unique_id
 
     role_enum = Role.TRAINER if role == "TRAINER" else Role.GENERATOR
     channel = grpc.insecure_channel(mx_server_url)
@@ -167,12 +205,15 @@ def _await_lane_id(state: MxBootstrapState, lane_id: int) -> bytes:
                 f"{group.epoch} while bootstrapping lane {lane_id}"
             )
         for lane in group.lanes:
-            if lane.lane_id == lane_id and len(lane.nccl_unique_id) == 128:
+            if (
+                lane.lane_id == lane_id
+                and lane.bootstrap_epoch == state.membership.epoch
+                and len(lane.nccl_unique_id) == 128
+            ):
                 return bytes(lane.nccl_unique_id)
         if time.monotonic() >= deadline:
             raise TimeoutError(
-                f"lane {lane_id} identifier not published within "
-                f"{state.timeout_s:.0f}s"
+                f"lane {lane_id} identifier not published within {state.timeout_s:.0f}s"
             )
         time.sleep(0.2)
 
@@ -188,24 +229,35 @@ def mx_init_lane(state: MxBootstrapState, lane_id: int) -> None:
     lane = next((l for l in state.membership.lanes if l.lane_id == lane_id), None)
     if lane is None:
         return
-    from modelexpress_rl.collective.comm import new_unique_id
-
+    root_unique_id = None
+    minted_uid = None
     if lane.rank_in_lane == 0:
         # Mint and publish in the same breath as the init below, so the
         # listening socket ncclGetUniqueId opens is still accepting when the
         # peers dial it.
+        from nccl.core.utils import get_unique_id
+
+        root_unique_id = get_unique_id()
+        minted_uid = bytes(root_unique_id.as_bytes)
         state.rz.publish_bootstrap(
             group_id=state.membership.group_id,
             epoch=state.membership.epoch,
             lane_id=lane.lane_id,
             worker_id=state.worker_id,
-            nccl_unique_id=new_unique_id(),
+            nccl_unique_id=minted_uid,
         )
     uid = _await_lane_id(state, lane.lane_id)
+    if minted_uid is not None and uid != minted_uid:
+        raise RuntimeError(
+            f"MX returned a different ncclUniqueId for lane {lane.lane_id} "
+            "than rank zero published"
+        )
+    state.ids[lane.lane_id] = uid
     pg = MxProcessGroup(
         unique_id=uid,
         rank=lane.rank_in_lane,
         world_size=lane.world_size,
+        root_unique_id=root_unique_id,
     )
     pg.init_nccl_communicator(device=state.device)
     if lane.kind == "BROADCAST":

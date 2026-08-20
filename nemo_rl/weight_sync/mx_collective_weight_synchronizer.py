@@ -97,9 +97,11 @@ class MxCollectiveWeightSynchronizer(WeightSynchronizer):
             from modelexpress_rl.collective import plan_digest
 
             digest = plan_digest(build_mx_plan(refit_info))
-        except Exception as error:  # noqa: BLE001 - digest is an agreement token
-            print(f"[mx] plan digest unavailable ({error!r}); using a constant", flush=True)
-            digest = "nccl-reshard-plan"
+        except Exception as error:  # noqa: BLE001 - normalize an optional integration boundary
+            raise RuntimeError(
+                "failed to derive the MX collective reshard-plan digest; "
+                "refusing to form an unfenced collective"
+            ) from error
 
         trainers = [f"train/{r}" for r in range(train_world_size)]
         generators = [f"gen/{r}" for r in range(gen_world_size)]
