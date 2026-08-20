@@ -20,6 +20,7 @@ import json
 import statistics
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import ray
@@ -34,6 +35,10 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.nccl_reshard_utils import (
+    check_nccl_reshard_refit_support,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -171,6 +176,8 @@ def main() -> None:
     mcore_generation_config = generation_config["mcore_generation_config"]
     if args.refit_impl is not None:
         mcore_generation_config["refit_impl"] = args.refit_impl
+        if args.refit_impl == "mcore":
+            generation_config["refit_transport"] = None
     if args.execution_mode == "eager":
         mcore_generation_config["cuda_graph_impl"] = "none"
         mcore_generation_config["inference_cuda_graph_scope"] = "none"
@@ -200,8 +207,14 @@ def main() -> None:
             "fp8_param": True,
         }
     else:
+        fp8_config["enabled"] = False
+        fp8_config["fp8_param"] = False
         assert not fp8_config["enabled"]
         assert not fp8_config["fp8_param"]
+
+    use_nccl_reshard = generation_config.get("refit_transport") == "nccl_reshard"
+    if use_nccl_reshard:
+        check_nccl_reshard_refit_support(SimpleNamespace(policy=policy_config))
 
     marker_prefix = f"NRL_NANOV3_MEGATRON_{args.precision.upper()}"
 
@@ -267,36 +280,47 @@ def main() -> None:
             name_prefix="nanov3_mxfp8_generation",
         )
 
-        ip, port = source_cluster.get_master_address_and_port()
-        source_world_size = source_cluster.world_size()
-        world_size = source_world_size + generation_cluster.world_size()
-        if generation.uses_native_refit:
-            source_futures = policy.init_collective_mcore_generation(
-                ip,
-                port,
-                world_size,
-                rank_offset=0,
-                refit_backend=policy_config["generation"][
-                    "mcore_generation_config"
-                ]["refit_backend"],
+        if use_nccl_reshard:
+            generation.weight_synchronizer = create_weight_synchronizer(
+                policy=policy,
+                generation=generation,
+                generation_backend="megatron",
+                colocated=False,
+                train_cluster=source_cluster,
+                inference_cluster=generation_cluster,
             )
+            generation.weight_synchronizer.init_communicator()
         else:
-            source_futures = policy.init_collective(
+            ip, port = source_cluster.get_master_address_and_port()
+            source_world_size = source_cluster.world_size()
+            world_size = source_world_size + generation_cluster.world_size()
+            if generation.uses_native_refit:
+                source_futures = policy.init_collective_mcore_generation(
+                    ip,
+                    port,
+                    world_size,
+                    rank_offset=0,
+                    refit_backend=policy_config["generation"][
+                        "mcore_generation_config"
+                    ]["refit_backend"],
+                )
+            else:
+                source_futures = policy.init_collective(
+                    ip,
+                    port,
+                    world_size,
+                    train_world_size=source_world_size,
+                )
+            generation_futures = generation.init_collective(
                 ip,
                 port,
                 world_size,
                 train_world_size=source_world_size,
             )
-        generation_futures = generation.init_collective(
-            ip,
-            port,
-            world_size,
-            train_world_size=source_world_size,
-        )
-        ray.get(source_futures + generation_futures)
-        if not generation.uses_native_refit:
-            state_dict_info = policy.prepare_refit_info()
-            generation.prepare_refit_info(state_dict_info)
+            ray.get(source_futures + generation_futures)
+            if not generation.uses_native_refit:
+                state_dict_info = policy.prepare_refit_info()
+                generation.prepare_refit_info(state_dict_info)
         for refit_iteration in range(1, args.refit_iterations + 1):
             refit_policy_generation(policy, generation, colocated_inference=False)
             print(
