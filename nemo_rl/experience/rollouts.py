@@ -77,6 +77,8 @@ TokenizerType = PreTrainedTokenizerBase
 def attach_initial_nemo_gym_image_payloads(
     batch: BatchedDataDict[DatumSpec],
     processor: Any,
+    *,
+    pad_dynamic_image_shapes: bool = False,
 ) -> None:
     """Attach initial Gym image tensors once, before prompt repeat.
 
@@ -114,6 +116,7 @@ def attach_initial_nemo_gym_image_payloads(
             user_message,
             images=images,
             processor=processor,
+            pad_dynamic_image_shapes=pad_dynamic_image_shapes,
         )
 
 

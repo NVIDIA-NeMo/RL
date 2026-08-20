@@ -520,7 +520,13 @@ class AsyncTrajectoryCollector:
                 self._stamp_nemo_gym_task_indices(rollout_batch)
                 if self._deduplicate_multimodal_data:
                     attach_initial_nemo_gym_image_payloads(
-                        rollout_batch, self.processor
+                        rollout_batch,
+                        self.processor,
+                        pad_dynamic_image_shapes=bool(
+                            self.master_config.env.get("nemo_gym", {}).get(
+                                "pad_dynamic_image_shapes", False
+                            )
+                        ),
                     )
             repeated_batch = rollout_batch.repeat_interleave(
                 num_generations,
