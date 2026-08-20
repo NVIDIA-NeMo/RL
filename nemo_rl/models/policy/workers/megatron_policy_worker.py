@@ -2721,7 +2721,7 @@ class MegatronPolicyWorkerImpl(
         # goes to the misc packed_broadcast + vLLM load_weights path.
         state_dict_metadata = {}
         misc_meta = OrderedDict()
-        _xfer_bytes = _bcast_bytes = 0  # full-tensor payload routed to each path
+        payload_bytes = [0, 0]  # bulk and packed-broadcast bytes, respectively
 
         # Iterates all the params to construct the state_dict_metadata (xferdtensor path)
         # state_dict_metadata[hf_name] -> [shape, dtype]
@@ -2744,7 +2744,7 @@ class MegatronPolicyWorkerImpl(
         ordered_manifest: list[tuple[str, str, tuple[int, ...], str]] = []
 
         def record_metadata(name: str, tensor: torch.Tensor) -> None:
-            nonlocal _xfer_bytes, _bcast_bytes, layer_prefix
+            nonlocal layer_prefix
             shape = tuple(tensor.shape)
             dtype = str(tensor.dtype)
             meta = {
@@ -2760,7 +2760,7 @@ class MegatronPolicyWorkerImpl(
             ):
                 route = "bulk"
                 state_dict_metadata[name] = meta
-                _xfer_bytes += num_bytes
+                payload_bytes[0] += num_bytes
                 if layer_prefix is not None:
                     assert layer_prefix == _extract_layer_prefix(name), (
                         f"layer_prefix mismatch: {layer_prefix} != {_extract_layer_prefix(name)}"
@@ -2770,7 +2770,7 @@ class MegatronPolicyWorkerImpl(
             else:
                 route = "misc"
                 misc_meta[name] = meta
-                _bcast_bytes += num_bytes
+                payload_bytes[1] += num_bytes
             ordered_manifest.append((route, name, shape, dtype))
 
         with _meta_tensor_alloc_context(
@@ -2783,9 +2783,13 @@ class MegatronPolicyWorkerImpl(
 
         assert_refit_weight_manifest_rank_agreement(
             ordered_manifest,
-            group=torch.distributed.group.WORLD,
+            group=cast(
+                torch.distributed.ProcessGroup,
+                torch.distributed.group.WORLD,
+            ),
         )
 
+        _xfer_bytes, _bcast_bytes = payload_bytes
         _gib = 1024**3
         _tot = _xfer_bytes + _bcast_bytes
         print(
