@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import atexit
 import glob
 import json
 import logging
@@ -45,6 +46,14 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
+
+# W&B owns one monotonically increasing internal history row counter per run.
+# Keep the NeMo-RL caller step as a custom axis so independently committed
+# telemetry rows cannot advance past, and thereby invalidate, trainer steps.
+# Metric axes are registered by exact name when a key is first logged. A
+# catch-all ``*`` definition is intentionally avoided because wandb-core does
+# not deterministically resolve overlapping glob definitions.
+_WANDB_CALLER_STEP_METRIC = "nemo_rl/step"
 
 
 class WandbConfig(TypedDict):
@@ -220,6 +229,19 @@ class WandbLogger(LoggerInterface):
         wandb_init_config = dict(cfg)
         wandb_init_config.pop("log_nemo_gym_full_result_tables", None)
         self.run = wandb.init(**wandb_init_config, dir=log_dir)
+        self._log_lock = threading.Lock()
+        self._metric_step_patterns: dict[str, Optional[str]] = {}
+        self._defined_metric_axes: dict[str, Optional[str]] = {
+            _WANDB_CALLER_STEP_METRIC: None
+        }
+        self._pending_step: Optional[int] = None
+        self._pending_metrics: dict[str, Any] = {}
+        self.run.define_metric(_WANDB_CALLER_STEP_METRIC, hidden=True)
+        # Most training entrypoints run W&B in the driver process and do not
+        # own an explicit logger teardown today. Register after wandb.init so
+        # our Python-side row buffer drains before W&B's own atexit handlers.
+        # finish() is idempotent for actors that already close explicitly.
+        atexit.register(self.finish)
 
         if os.environ.get("RAY_BACKEND_LOG_LEVEL", "").lower() == "debug":
             print(
@@ -347,13 +369,151 @@ class WandbLogger(LoggerInterface):
         name: str,
         step_metric: Optional[str] = None,
     ) -> None:
-        """Define a metric with custom step metric.
+        """Register the axis to apply lazily to matching exact metric names.
 
         Args:
             name: Name of the metric or pattern (e.g. 'ray/*')
             step_metric: Optional name of the step metric to use
         """
-        self.run.define_metric(name, step_metric=step_metric)
+        with self._log_lock:
+            existing_step_metric = self._metric_step_patterns.get(name)
+            if name in self._metric_step_patterns and (
+                existing_step_metric != step_metric
+            ):
+                raise ValueError(
+                    f"W&B metric pattern {name!r} is already registered with "
+                    f"step metric {existing_step_metric!r}, not {step_metric!r}"
+                )
+            self._metric_step_patterns[name] = step_metric
+            if step_metric is not None:
+                self._define_exact_metric_locked(
+                    step_metric,
+                    step_metric=None,
+                    hidden=True,
+                )
+            if "*" not in name and name != step_metric:
+                self._define_exact_metric_locked(name, step_metric=step_metric)
+
+    def _define_exact_metric_locked(
+        self,
+        name: str,
+        *,
+        step_metric: Optional[str],
+        hidden: bool = False,
+    ) -> None:
+        """Define one exact W&B key once and reject conflicting axes."""
+        if name in self._defined_metric_axes:
+            existing_step_metric = self._defined_metric_axes[name]
+            if existing_step_metric != step_metric:
+                raise ValueError(
+                    f"W&B metric {name!r} is already defined with step metric "
+                    f"{existing_step_metric!r}, not {step_metric!r}"
+                )
+            return
+
+        define_kwargs: dict[str, Any] = {}
+        if step_metric is not None:
+            define_kwargs["step_metric"] = step_metric
+        if hidden:
+            define_kwargs["hidden"] = True
+        self.run.define_metric(name, **define_kwargs)
+        self._defined_metric_axes[name] = step_metric
+
+    def _matching_step_metric(self, metric_name: str) -> Optional[str]:
+        """Resolve a locally registered pattern without sending globs to W&B."""
+        matches: list[tuple[int, Optional[str]]] = []
+        for pattern, step_metric in self._metric_step_patterns.items():
+            if pattern.endswith("*"):
+                matches_pattern = metric_name.startswith(pattern[:-1])
+            else:
+                matches_pattern = metric_name == pattern
+            if matches_pattern:
+                matches.append((len(pattern), step_metric))
+
+        if not matches:
+            return None
+        longest_match = max(length for length, _ in matches)
+        matching_axes = {
+            step_metric for length, step_metric in matches if length == longest_match
+        }
+        if len(matching_axes) != 1:
+            raise ValueError(
+                f"W&B metric {metric_name!r} matches conflicting step metrics: "
+                f"{matching_axes!r}"
+            )
+        return matching_axes.pop()
+
+    def _resolve_event_step_metric(
+        self,
+        metrics: Mapping[str, Any],
+        explicit_step_metric: Optional[str],
+    ) -> Optional[str]:
+        """Choose the single custom axis for an event, if it has one."""
+        if explicit_step_metric is not None:
+            return explicit_step_metric
+
+        matching_axes = {
+            step_metric
+            for metric_name in metrics
+            if (step_metric := self._matching_step_metric(metric_name)) is not None
+        }
+        if len(matching_axes) > 1:
+            raise ValueError(
+                "One W&B event cannot contain metrics with different custom "
+                f"step metrics: {matching_axes!r}"
+            )
+        return next(iter(matching_axes), None)
+
+    def _define_event_metrics_locked(
+        self,
+        metrics: Mapping[str, Any],
+        *,
+        step_metric: str,
+    ) -> None:
+        """Define the event axis and each data key by exact name."""
+        self._define_exact_metric_locked(
+            step_metric,
+            step_metric=None,
+            hidden=True,
+        )
+        for metric_name in metrics:
+            if metric_name != step_metric:
+                self._define_exact_metric_locked(
+                    metric_name,
+                    step_metric=step_metric,
+                )
+
+    def _flush_pending_metrics_locked(self) -> None:
+        """Commit the accumulated metrics for one trainer step."""
+        if self._pending_step is None:
+            return
+        event_metrics = dict(self._pending_metrics)
+        event_metrics[_WANDB_CALLER_STEP_METRIC] = self._pending_step
+        self.run.log(event_metrics)
+        self._pending_step = None
+        self._pending_metrics = {}
+
+    def _buffer_step_metrics_locked(
+        self,
+        metrics: Mapping[str, Any],
+        *,
+        step: int,
+        step_finished: bool,
+    ) -> None:
+        """Accumulate correlated trainer metrics into one W&B history row."""
+        if self._pending_step is not None and self._pending_step != step:
+            self._flush_pending_metrics_locked()
+        if self._pending_step is None:
+            self._pending_step = step
+
+        for metric_name in metrics:
+            self._define_exact_metric_locked(
+                metric_name,
+                step_metric=_WANDB_CALLER_STEP_METRIC,
+            )
+        self._pending_metrics.update(metrics)
+        if step_finished:
+            self._flush_pending_metrics_locked()
 
     def log_metrics(
         self,
@@ -378,16 +538,28 @@ class WandbLogger(LoggerInterface):
                 for k, v in metrics.items()
             }
 
-        # If step_metric is provided, use the corresponding value from metrics as step
-        if step_metric and step_metric in metrics:
-            # commit=False so the step does not get incremented
-            self.run.log(metrics, commit=False)
-        elif step_finished:
-            # Commit param defaults to None. By default if step is set, then commit defaults to False
-            # Here, we have an explicit fork for commit in case W&B ever decides to change their default logic.
-            self.run.log(metrics, step=step, commit=True)
-        else:
-            self.run.log(metrics, step=step)
+        with self._log_lock:
+            event_step_metric = self._resolve_event_step_metric(metrics, step_metric)
+            if event_step_metric is not None:
+                if event_step_metric not in metrics:
+                    raise ValueError(
+                        f"Custom W&B step metric {event_step_metric!r} is missing "
+                        "from the logged event"
+                    )
+                self._define_event_metrics_locked(
+                    metrics,
+                    step_metric=event_step_metric,
+                )
+                # Custom-axis streams (rollout telemetry, GPU monitoring) are
+                # independent events and must not carry nemo_rl/step.
+                self.run.log(dict(metrics))
+                return
+
+            self._buffer_step_metrics_locked(
+                metrics,
+                step=step,
+                step_finished=step_finished,
+            )
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to wandb.
@@ -395,7 +567,8 @@ class WandbLogger(LoggerInterface):
         Args:
             params: Dict of hyperparameters to log
         """
-        self.run.config.update(params, allow_val_change=True)
+        with self._log_lock:
+            self.run.config.update(params, allow_val_change=True)
 
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a plot to wandb.
@@ -404,7 +577,12 @@ class WandbLogger(LoggerInterface):
             figure: Matplotlib figure to log
             step: Global step value
         """
-        self.run.log({name: figure}, step=step)
+        with self._log_lock:
+            self._buffer_step_metrics_locked(
+                {name: figure},
+                step=step,
+                step_finished=False,
+            )
 
     def finish(self) -> None:
         """Flush queued metrics and close the wandb service.
@@ -412,9 +590,11 @@ class WandbLogger(LoggerInterface):
         Required when the run lives inside a Ray actor: Ray tears the worker
         down before wandb's atexit hook can drain the IPC queue to the service.
         """
-        if self.run is not None:
-            self.run.finish()
-            self.run = None
+        with self._log_lock:
+            if self.run is not None:
+                self._flush_pending_metrics_locked()
+                self.run.finish()
+                self.run = None
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to wandb.
@@ -425,11 +605,17 @@ class WandbLogger(LoggerInterface):
             name: Name of the metric
         """
         try:
-            self.run.log({name: wandb.Histogram(histogram)}, step=step)
+            value: Any = wandb.Histogram(histogram)
         except ValueError:
             # When all values are identical, numpy cannot create finite-sized bins.
             # Log the scalar value instead.
-            self.run.log({name: histogram[0] if len(histogram) > 0 else 0}, step=step)
+            value = histogram[0] if len(histogram) > 0 else 0
+        with self._log_lock:
+            self._buffer_step_metrics_locked(
+                {name: value},
+                step=step,
+                step_finished=False,
+            )
 
 
 class SwanlabLogger(LoggerInterface):
@@ -1051,6 +1237,21 @@ class Logger(LoggerInterface):
         """
         for logger in self.loggers:
             logger.log_metrics(metrics, step, prefix, step_metric, step_finished)
+
+    def define_metric(
+        self,
+        name: str,
+        *,
+        step_metric: Optional[str] = None,
+    ) -> None:
+        """Define a W&B metric series without affecting other backends.
+
+        TensorBoard and MLflow maintain independent steps per metric key, while
+        W&B needs an explicit custom step metric for event streams that advance
+        independently from the trainer step.
+        """
+        if self.wandb_logger is not None:
+            self.wandb_logger.define_metric(name, step_metric=step_metric)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to all enabled backends.

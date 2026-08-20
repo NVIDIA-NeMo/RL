@@ -27,6 +27,7 @@ import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     REPLAY_BUFFER_METADATA_STORAGE,
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     TQReplayBuffer,
     replay_manifest_digest,
@@ -336,6 +337,41 @@ class TestDataPlaneCheckpointBarrier:
                 "second-enter",
                 "second-exit",
             ]
+
+        asyncio.run(exercise())
+
+    def test_reports_mutations_blocked_by_checkpoint(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+
+            async def mutate(kind: CheckpointMutationKind) -> None:
+                async with barrier.mutation(kind):
+                    pass
+
+            async with barrier.checkpoint():
+                commit_task = asyncio.create_task(mutate("group_commits"))
+                seal_task = asyncio.create_task(mutate("sibling_seals"))
+                await asyncio.sleep(0)
+                active = await barrier.drain_telemetry()
+                assert active.checkpoint_active
+                assert active.waiting_mutations == 2
+                assert active.max_waiting_mutations == 2
+                assert sum(active.blocked_by_kind.values()) == 0
+
+            await asyncio.gather(commit_task, seal_task)
+            completed = await barrier.drain_telemetry()
+            assert not completed.checkpoint_active
+            assert completed.waiting_mutations == 0
+            assert completed.max_waiting_mutations == 2
+            assert completed.blocked_by_kind["group_commits"] == 1
+            assert completed.blocked_by_kind["sibling_seals"] == 1
+            assert len(completed.wait_durations_s) == 2
+            assert all(duration >= 0 for duration in completed.wait_durations_s)
+
+            drained = await barrier.drain_telemetry()
+            assert sum(drained.blocked_by_kind.values()) == 0
+            assert drained.wait_durations_s == ()
+            assert drained.max_waiting_mutations == 0
 
         asyncio.run(exercise())
 

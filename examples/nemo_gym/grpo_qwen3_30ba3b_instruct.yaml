@@ -53,6 +53,10 @@ policy:
   generation:
     vllm_cfg:
       tensor_parallel_size: 4
+      # Required for rollout-throughput checkpoint A/B telemetry. Keep this
+      # identical in baseline and checkpoint-enabled runs.
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
       # This is a very low GPU mem utilization. We GPU OOM in two places:
       # Refit after train, refit before validation.
       gpu_memory_utilization: 0.7
@@ -171,3 +175,8 @@ checkpointing:
   # 4. The checkpoint time for this model is around 10 mins.
   checkpoint_must_save_by: "00:03:30:00"
   save_period: 1
+
+# Optional wall-clock benchmark sampling. This is independent of the rollout
+# checkpoint save interval and may be enabled for baseline runs as well.
+rollout_checkpointing:
+  telemetry_interval_s: null
