@@ -35,6 +35,12 @@ done
 CONFIG_PATH="${CONFIG_PATH:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml}"
 ENTRYPOINT="${ENTRYPOINT:-examples/nemo_gym/run_grpo_nemo_gym.py}"
 SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:0:0}"
+# GPU-idle-reaper exemption: async GRPO idles train GPUs by design while the
+# trajectory buffer fills (~50 min at GBS 512); the reaper kills at 30 min idle
+# without this comment (killed omni jobs 6296577/6297585 on 2026-08-20).
+if [[ -z "${SLURM_COMMENT:-}" ]]; then
+    SLURM_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"async GRPO rollout buffer fill - train GPUs idle by design while generations finish"}}'
+fi
 # Read the cluster block from the *resolved* recipe. Scraping the raw file
 # with awk only sees keys written literally in it, which forced every recipe
 # to repeat cluster: even when it inherits one -- and silently produced an
@@ -141,7 +147,7 @@ export RAY_DEDUP_LOGS=1
 export LISTEN_PORT=6000
 export NGINX_PORT=6000
 export NEMO_SKILLS_SANDBOX_PORT=6000
-export SANDBOX_COMMAND="/start-with-nginx.sh"
+export SANDBOX_COMMAND="${SANDBOX_COMMAND:-/start-with-nginx.sh}"
 export SANDBOX_ENV_VARS="NEMO_SKILLS_SANDBOX_PORT=${NEMO_SKILLS_SANDBOX_PORT}"
 
 export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
@@ -235,7 +241,8 @@ SBATCH_ARGS=(
     --time="${SLURM_TIME_LIMIT}"
     --gres=gpu:"${SBATCH_GPUS_PER_NODE}"
     --exclusive
-    --dependency=singleton
+    --dependency=singleton${SLURM_EXTRA_DEPENDENCY:+,${SLURM_EXTRA_DEPENDENCY}}
+    --comment="${SLURM_COMMENT}"
     ray.sub
 )
 

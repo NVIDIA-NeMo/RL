@@ -1,0 +1,118 @@
+# Babyvision-reasoning MOPD on HSG GB200 — v2 "refmatch": match the settings of
+# amalasanjayd's SUCCESSFUL reference runs (nvidia/omni-mopd-test 1f8r629p /
+# 3gavqjgk, 82 steps, loss -0.026 -> -0.022) as closely as the hardware allows.
+# Derived from mopd-nemotron-super-omni-babyvision-20n4g-hsg.v1.yaml with:
+#   * batch: 8x8 GBS 64 -> 256x2 GBS 512   (reference shape)
+#   * max_new_tokens: 4096 -> 16384        (reference; = full seqlen)
+#   * lr: 3e-6 -> 2e-6 FLAT (min_lr = lr)  (reference)
+#   * token_level_loss: false -> true       (reference)
+#   * limit_mm_per_prompt.image: 3 -> 10    (reference)
+#   * gen fleet: 2n4g -> 8n4g = 32 GPUs     (matches reference GPU count; also
+#     required for 16k gens at GBS 512); cluster 20 -> 26 nodes
+# Kept DELIBERATELY UNMATCHED:
+#   * real string_match verification (reference used skip_verification,
+#     rewards forced 0 — MOPD ignores rewards either way, ours logs real ones)
+#   * mtp_num_layers 0 (matches the SUCCESSFUL reference; only their FAILED
+#     first attempt had frozen MTP heads)
+#   * save_period 10 + keep_top_k 1000 (preemption insurance; theirs 25/keep-all)
+#   * in_flight_weight_updates false, vLLM gpu_mem 0.5 + enforce_eager (our
+#     proven plumbing; theirs 0.8 + cuda graphs on B200)
+# Teacher is self-distillation by default; the submit script overrides it.
+defaults: vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+checkpointing:
+  checkpoint_dir: results/mopd-super-omni-babyvision-hsg
+  keep_top_k: 1000
+cluster:
+  num_nodes: 26
+  gpus_per_node: 4
+grpo:
+  num_prompts_per_step: 256
+  num_generations_per_prompt: 2
+  max_num_epochs: 5
+  max_num_steps: 200
+  async_grpo:
+    in_flight_weight_updates: false
+  adv_estimator:
+    name: opd
+loss_fn:
+  disable_ppo_ratio: true
+  token_level_loss: true
+  truncated_importance_sampling_type: icepop
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: 0.2
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+policy:
+  train_global_batch_size: 512
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  megatron_cfg:
+    # MTP per this branch's canonical super-omni MTP recipe: the checkpoint
+    # ships ONE physical MTP layer (mtp_hybrid_override_pattern "*E"), so
+    # num_layers=1 non-repeated maps directly onto it. detach_heads keeps the
+    # main objective unchanged. Loss scale 0.3 matches the text wbfix-001 MTP
+    # campaign (upstream's recipe uses 0.1). The bridge's mtp export mapping is
+    # FIXED on this branch (nemotron_omni_bridge reuses NemotronH mappings), so
+    # the NRL_REFIT_SKIP_MTP workaround from RL_omni_mopd_test_stacked is NOT
+    # needed -- refit ships mtp weights normally.
+    mtp_num_layers: 1
+    mtp_use_repeated_layer: false
+    mtp_detach_heads: true
+    mtp_loss_scaling_factor: 0.3
+    optimizer:
+      lr: 2.0e-06
+      min_lr: 2.0e-06
+  generation:
+    max_new_tokens: 16384
+    colocated:
+      resources:
+        num_nodes: 8
+        gpus_per_node: 4
+    vllm_cfg:
+      gpu_memory_utilization: 0.5
+      enforce_eager: true
+      reset_encoder_cache_after_weight_update: true
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 10
+data:
+  train:
+    data_path: /lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/adithyare/code/main_branch_unified_opd/vlm_run_resources/vlm_training_data/babyvision_reasoning_rep1_gym_random_shuf.local_images.jsonl
+  validation:
+    data_path: /lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/adithyare/code/main_branch_unified_opd/vlm_run_resources/vlm_training_data/babyvision_reasoning_rep1_gym_random_shuf.local_images.jsonl
+env:
+  nemo_gym:
+    uv_pip_set_python: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/string_match/configs/string_match.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          max_input_tokens: ${policy.max_total_sequence_length}
+on_policy_distillation:
+  enabled: true
+  teacher_model_by_agent_name:
+    string_match_simple_agent: ${policy.model_name}
+  strict_agent_name_match: true
+  deduplicate_shared_teacher_checkpoints: true
+  non_colocated_teachers:
+    enabled: true
+    default_teacher_cfg:
+      tensor_model_parallel_size: 8
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 8
+      context_parallel_size: 1
+      num_nodes: 2
+      gpus_per_node: 4
+      precision: bf16
+      micro_batch_size: 1
+      moe_shared_expert_overlap: false
+logger:
+  log_dir: logs/mopd-super-omni-babyvision-hsg
+  wandb:
+    project: unified_opd_tests_main_hsg
+    name: mopd-super-omni-babyvision-hsg-003-refmatch-mtp
+    log_nemo_gym_full_result_tables: false
