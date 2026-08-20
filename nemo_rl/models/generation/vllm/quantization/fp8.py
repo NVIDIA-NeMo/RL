@@ -271,7 +271,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
         os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
-    if not vllm_cfg["refit_with_reload_api"]:
+    needs_nemo_fp8_patches = (
+        not vllm_cfg["refit_with_reload_api"] or global_fp8_config.is_mx
+    )
+    if needs_nemo_fp8_patches:
         if vllm_cfg["async_engine"]:
             EngineCoreProc.run_engine_core = my_run_engine_core
             CoreEngineProcManager.__init__ = my_init

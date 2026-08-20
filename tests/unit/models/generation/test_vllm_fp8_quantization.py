@@ -98,11 +98,7 @@ def test_init_fp8_uses_mxfp8_quantization_config(
         "kv_cache_dtype": "auto",
         "hf_overrides": {"quantization_config": fp8.MXFP8_BLOCK_QUANT_KWARGS},
     }
-    if refit_with_reload_api:
-        assert applied_configs == []
-        assert fp8.EngineCoreProc.run_engine_core is original_run_engine_core
-        assert fp8.CoreEngineProcManager.__init__ is original_core_manager_init
-    elif async_engine:
+    if async_engine:
         assert applied_configs == []
         assert fp8.EngineCoreProc.run_engine_core is fp8.my_run_engine_core
         assert fp8.CoreEngineProcManager.__init__ is fp8.my_init
@@ -114,6 +110,42 @@ def test_init_fp8_uses_mxfp8_quantization_config(
     assert fp8.global_fp8_config.is_mx is True
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+def test_init_fp8_reload_api_keeps_blockwise_vllm_native(
+    fp8_module, monkeypatch, async_engine
+):
+    fp8 = fp8_module
+    original_run_engine_core = fp8.EngineCoreProc.run_engine_core
+    original_core_manager_init = fp8.CoreEngineProcManager.__init__
+    applied_configs = []
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(
+        fp8,
+        "monkey_patch_vllm_ray_executor",
+        lambda fp8_config: applied_configs.append(fp8_config),
+    )
+
+    fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": async_engine,
+            "is_mx": False,
+            "refit_with_reload_api": True,
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    assert applied_configs == []
+    assert fp8.EngineCoreProc.run_engine_core is original_run_engine_core
+    assert fp8.CoreEngineProcManager.__init__ is original_core_manager_init
 
 
 @pytest.mark.parametrize("precision", [None, "auto", "bf16", "bfloat16"])
