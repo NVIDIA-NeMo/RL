@@ -43,7 +43,6 @@ from nemo_rl.models.generation.vllm.video_utils import (
     load_video_frames_with_metadata,
 )
 
-
 _VideoConfigValue = TypeVar("_VideoConfigValue")
 _LOCAL_VIDEO_METADATA_KEYS = frozenset(
     {

@@ -2,7 +2,6 @@ defaults: ../../../nemo_gym/grpo_nanov3.yaml
 grpo:
   num_prompts_per_step: 4
   val_num_generations_per_prompt: 1
-  max_num_steps: 1000000
   val_period: 500
   val_batch_size: null
   seq_logprob_error_threshold: null
@@ -90,10 +89,6 @@ data:
   default:
     video_target_num_patches: 1024
     video_maintain_aspect_ratio: true
-  train:
-    data_path: /path/to/train.jsonl
-  validation:
-    data_path: /path/to/validation.jsonl
 env:
   should_log_nemo_gym_responses: false
   nemo_gym:

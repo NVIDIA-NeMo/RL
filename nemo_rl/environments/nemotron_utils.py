@@ -23,7 +23,6 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoConfig
 
-
 NEMOTRON_VIDEO_PROCESSOR_NAMES = frozenset(
     {
         "NemotronNanoVLV2Processor",

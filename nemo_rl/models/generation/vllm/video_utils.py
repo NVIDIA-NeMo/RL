@@ -24,7 +24,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-
 VideoSamplingStyle = Literal["nemotron_vl"]
 
 _TORCHCODEC_END_OF_STREAM_ERROR = (

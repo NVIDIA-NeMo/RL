@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-
 VERIFIER_TO_AGENT = {
     "mcqa": "mcqa_simple_agent",
     "multiple-choice": "mcqa_simple_agent",

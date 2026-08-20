@@ -45,10 +45,6 @@ from nemo_rl.environments.nemo_gym import (
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
 )
-from nemo_rl.experience.rollouts import (
-    _reattach_original_multimodal_payloads,
-    attach_static_multimodal_payload,
-)
 from nemo_rl.environments.nemo_gym_video import (
     _extract_static_video_messages,
     _inject_vllm_mm_processor_kwargs,
@@ -59,6 +55,10 @@ from nemo_rl.environments.nemo_gym_video import (
 from nemo_rl.environments.nemotron_utils import (
     _expand_nemotron_video_placeholders,
     _flatten_nemotron_video_frame_messages,
+)
+from nemo_rl.experience.rollouts import (
+    _reattach_original_multimodal_payloads,
+    attach_static_multimodal_payload,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
 
