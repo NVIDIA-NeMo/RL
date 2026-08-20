@@ -85,9 +85,13 @@ class PY_EXECUTABLES:
 # service port is pinned below 9000 to avoid TOCTOU collisions.  See ray.sub for
 # the full layout including Ray's own GCS / worker gRPC ports.
 #
+# Python port-range bounds below are half-open: [low, high).
+#
+#   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
-#   3000-4999    NeMo RL generation HTTP servers + SGLang engine NCCL/dist_init
-#                                                 (policy.generation.port_range_low/high)
+#   [3000, 4999) Shared NeMo RL generation range (policy.generation.port_range_low/high)
+#     [3000, 4000) Dynamo frontend/token-wrapper HTTP endpoints
+#     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
 #   6000-6099    SingleController gen. router    (async_rl.generation_router.port_range_low/high;
 #                                                 one fixed port per run — NeMo-Gym holds the
@@ -99,6 +103,12 @@ class PY_EXECUTABLES:
 #   8800-8999    SGLang Prometheus metrics       (DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_*, hard-coded)
 DEFAULT_GENERATION_PORT_RANGE_LOW = 3000
 DEFAULT_GENERATION_PORT_RANGE_HIGH = 4999
+DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW = 1313
+DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH = 1400
+DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW = 3000
+DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH = 4000
+DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW = 4000
+DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH = 4100
 DEFAULT_GYM_PORT_RANGE_LOW = 5000
 DEFAULT_GYM_PORT_RANGE_HIGH = 5999
 # vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports starting
@@ -172,33 +182,64 @@ def _bind_socket_in_range(
     sock: socket.socket,
     port_range_low: int,
     port_range_high: int,
-    max_retries: int = 50,
+    max_retries: int | None = 50,
+    excluded_ports: set[int] | None = None,
 ) -> int:
     """Try to bind *sock* to a random port in [port_range_low, port_range_high).
 
-    Raises ``RuntimeError`` after *max_retries* failed attempts.
+    When *max_retries* is ``None``, try every non-excluded port once. Otherwise,
+    preserve the existing bounded random-retry behavior.
     """
     import random
 
-    for _ in range(max_retries):
-        port = random.randint(port_range_low, port_range_high - 1)
-        try:
-            sock.bind(("", port))
-            return port
-        except OSError:
-            continue
+    excluded = excluded_ports or set()
+    if max_retries is None:
+        candidates = [
+            port
+            for port in range(port_range_low, port_range_high)
+            if port not in excluded
+        ]
+        random.shuffle(candidates)
+        for port in candidates:
+            try:
+                sock.bind(("", port))
+                return port
+            except OSError:
+                continue
+        retry_description = f"all {len(candidates)} available ports"
+    else:
+        for _ in range(max_retries):
+            port = random.randint(port_range_low, port_range_high - 1)
+            if port in excluded:
+                continue
+            try:
+                sock.bind(("", port))
+                return port
+            except OSError:
+                continue
+        retry_description = f"{max_retries} attempts"
+
     raise RuntimeError(
         f"Could not find a free port in range [{port_range_low}, {port_range_high}) "
-        f"after {max_retries} attempts."
+        f"after {retry_description}."
     )
 
 
 def _get_free_port_local(
     port_range_low: int = DEFAULT_MASTER_PORT_RANGE_LOW,
     port_range_high: int = DEFAULT_MASTER_PORT_RANGE_HIGH,
+    *,
+    max_retries: int | None = 50,
+    excluded_ports: set[int] | None = None,
 ) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        port = _bind_socket_in_range(s, port_range_low, port_range_high)
+        port = _bind_socket_in_range(
+            s,
+            port_range_low,
+            port_range_high,
+            max_retries=max_retries,
+            excluded_ports=excluded_ports,
+        )
         s.listen(1)
 
     return port

@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import math
+import warnings
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from pydantic import (
     BaseModel,
@@ -88,12 +90,24 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     Infrastructure failures re-dispatch the prompt onto a different generation shard;
     data failures are deterministic, so their budget is small and exhausting it is
     reported rather than absorbed. Nothing here ever discards a prompt silently.
+
+    Each class also has a budget for how many prompts may be given up on entirely, and
+    the two differ because the question they answer differs. Data exhaustion is a
+    property of the dataset, so ``max_skipped_prompts`` counts them for the run's
+    lifetime. Infra exhaustion is a property of the fleet at a moment in time, so
+    ``max_consecutive_dropped_prompts`` resets on every success: an outage that ends is
+    absorbed, one that does not stops the run.
+
+    Once a prompt has been given up on, ``on_dropped_prompt`` decides what happens to
+    the training step it was stamped for: train the step on fewer groups, or substitute
+    a fresh prompt so the step keeps its configured batch size.
     """
 
     # ── shared: consumed by generate_and_push, above the impl split ──
     # Attempts for infrastructure failures (timeout, dead shard, transport). Each retry
     # re-enters shard selection, so it lands elsewhere. Exhausting this means the fleet
-    # is broken rather than the prompt, and the run fails.
+    # is broken rather than the prompt; whether that ends the run is then decided by
+    # max_consecutive_dropped_prompts below.
     #
     # Named for the failure class it bounds, not "per prompt": this budget and the data
     # budget below are INDEPENDENT counters, not a total and a sub-total. Worst case for
@@ -113,6 +127,75 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     # never actually skip anything", which meant a validator existed purely to reject
     # that one combination. At 0 the name reads as its own documentation.
     max_skipped_prompts: NonNegativeInt = 0
+    # Consecutive prompts that may exhaust their infra budget and be dropped before the
+    # run fails. Any committed rollout resets the count, so this bounds an outage rather
+    # than the run's lifetime: a fleet losing the occasional shard keeps going, a fleet
+    # that has stopped answering stops the run instead of retrying into a stall.
+    #
+    # 0 (the default) fails on the first exhaustion, which is both the behaviour before
+    # this knob existed and the default the v1 stack ships for the same idea
+    # (``async_grpo.max_generation_failures``).
+    #
+    # Counted separately from max_skipped_prompts rather than sharing one budget: a
+    # shared counter would let a bad dataset consume the allowance that exists to ride
+    # out a shard outage, which is the one distinction the failure taxonomy draws.
+    max_consecutive_dropped_prompts: NonNegativeInt = 0
+    # Smallest batch a training step may close on, as a fraction of
+    # num_prompts_per_step. Below it the run fails instead of training the step.
+    #
+    # Neither drop budget bounds this on its own. Both are properties of the run:
+    # max_skipped_prompts is a lifetime total, and the consecutive counter is cleared by
+    # any commit at all, including commits belonging to other steps. So drops
+    # concentrated on one step, interleaved with unrelated successes, keep resetting the
+    # counter while that one step shrinks without limit -- and a step is what the
+    # gradient is actually computed from.
+    #
+    # A fraction rather than a count so it holds across batch sizes, and so small
+    # batches are protected more strictly: losing 1 group of 4 is a 25% batch reduction
+    # and should not be treated like losing 1 of 128. The floor is ceil(fraction * N),
+    # so at the default a batch of 8 or fewer tolerates no drops at all.
+    min_step_batch_fraction: Annotated[float, Field(gt=0.0, le=1.0)] = 0.9
+    # What becomes of the training step a given-up prompt was stamped for. Only stamped
+    # prompts are affected: with a sampler that does not stamp (WeightFifoSampler,
+    # whose admit returns None) a step fills from whatever is ready, so a drop costs
+    # throughput but strands nothing and there is nothing to substitute for.
+    #
+    # "shrink" (the default, and the behaviour before this knob existed) closes the step
+    # on fewer groups, bounded by min_step_batch_fraction above.
+    #
+    # "replace" dispatches a fresh prompt so the step trains on the batch size that was
+    # configured. This is what both the v1 stack and verl do -- v1 discards the whole
+    # batch and regenerates it, verl's async path evicts the failed group and refills.
+    # It is bounded by max_replacement_attempts and by the spare pool below, and falls
+    # back to shrinking when either runs out; without that fallback a step whose
+    # replacements keep failing would never close at all.
+    #
+    # Where the fresh prompt is *sent* is an optimization, not a knob. If a later step
+    # already has a finished group, that group is re-stamped into the step that was
+    # dropped from -- which therefore closes immediately rather than waiting out a
+    # rollout while the trainer idles -- and the fresh prompt repays the lender, which
+    # is not due for another training step and has the slack to receive it. When no such
+    # group exists the fresh prompt fills the dropped step directly. Both paths hold the
+    # batch size; asking for the slower one is not a choice worth exposing, so the
+    # counters (promoted_prompt_groups, replaced_prompt_groups) report which one ran
+    # instead of a mode selecting it.
+    on_dropped_prompt: Literal["shrink", "replace"] = "shrink"
+    # Fresh prompts to substitute for one lost group before giving up and shrinking the
+    # step. Read only when on_dropped_prompt="replace".
+    max_replacement_attempts: NonNegativeInt = 1
+    # Low-water mark for the pool of spare prompts that replacements are drawn from. A
+    # threshold rather than a size because the pool is refilled by diverting one whole
+    # dataloader batch, so a single refill yields a batch worth of spares.
+    #
+    # The pool exists because the refill has to happen on the pump loop: it is the sole
+    # consumer of the StatefulDataLoader, and pulling from that iterator inside a
+    # dispatch task -- which is where a drop is discovered, arbitrarily later -- would
+    # race the iteration order that checkpoint/resume accounting depends on. Diverting
+    # happens before admit(), so a diverted batch never burns a target step.
+    #
+    # Read only when on_dropped_prompt="replace". Borrowing draws on it too: a group is
+    # only ever taken from a later step when a spare is in hand to repay that step.
+    replacement_reserve_prompts: NonNegativeInt = 1
     # ── path-specific ──
     native: NativeRolloutFTConfig = Field(default_factory=NativeRolloutFTConfig)
     nemo_gym: NemoGymRolloutFTConfig = Field(default_factory=NemoGymRolloutFTConfig)
@@ -124,6 +207,25 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
                 f"async_rl.rollout_failure.max_backoff_s ({self.max_backoff_s}) must be "
                 f">= backoff_base_s ({self.backoff_base_s})"
             )
+        # Both of these would leave on_dropped_prompt="replace" configured but unable to
+        # ever produce a replacement, so it would quietly behave as "shrink". Rejected
+        # rather than tolerated: the whole point of asking for "replace" is the batch
+        # size guarantee, and losing it silently is the failure mode worth preventing.
+        if self.on_dropped_prompt == "replace":
+            if self.max_replacement_attempts < 1:
+                raise ValueError(
+                    "async_rl.rollout_failure.on_dropped_prompt='replace' requires "
+                    "max_replacement_attempts >= 1, got "
+                    f"{self.max_replacement_attempts}; at 0 no replacement is ever "
+                    "dispatched, which is on_dropped_prompt='shrink'"
+                )
+            if self.replacement_reserve_prompts < 1:
+                raise ValueError(
+                    "async_rl.rollout_failure.on_dropped_prompt='replace' requires "
+                    "replacement_reserve_prompts >= 1, got "
+                    f"{self.replacement_reserve_prompts}; at 0 the spare pool is never "
+                    "refilled, so every replacement falls back to shrinking"
+                )
         return self
 
     @model_validator(mode="after")
@@ -463,6 +565,116 @@ def validate_sampler_buffer_capacity(
         )
 
 
+def _validate_failure_settings(
+    async_config: AsyncRLConfig,
+    num_prompts_per_step: int,
+) -> None:
+    """Check rollout_failure settings that cannot do what they were set for.
+
+    ``RolloutFailureConfig._check_consistent`` rejects the two combinations that make
+    ``on_dropped_prompt="replace"`` unable to ever produce a replacement. These are the
+    combinations it cannot see, because each depends on a field outside that block.
+
+    Warnings rather than errors for most of them, deliberately: a strict "never train a
+    short batch" run, one base YAML whose sampler is overridden per experiment, a
+    deliberately deep spare pool are all coherent things to have typed, so rejecting
+    them would forbid configurations somebody wants. What is not acceptable is finding
+    out hours into a run, or not at all.
+
+    The exception, and the only hard error here, is a drop budget under a sampler that
+    stamps no target step. That one is not a knob cancelling itself out; it converts a
+    recoverable prompt failure into a stalled run, so there is no configuration it
+    could be the intent of.
+    """
+    failure_config = async_config.rollout_failure
+    drop_budget = (
+        failure_config.max_skipped_prompts
+        + failure_config.max_consecutive_dropped_prompts
+    )
+    floor = math.ceil(num_prompts_per_step * failure_config.min_step_batch_fraction)
+    # InOrderSampler is the only built-in that stamps a target step, and only a
+    # stamped step can be credited short, so for the others the floor is unreachable
+    # and the spare pool is never filled. A "custom" sampler may or may not stamp,
+    # which is why it is in neither set -- a warning nobody can act on is noise.
+    #
+    # Named by exclusion rather than by list so that a sampler added later is guarded
+    # by default instead of silently exempt: every built-in but InOrderSampler leaves
+    # _GatedSampler._stamp returning None, and ready_first (#3582) landed doing exactly
+    # that after this check was first written.
+    sampler_name = async_config.sampler.name
+    sampler_stamps = sampler_name == "in_order"
+    sampler_never_stamps = sampler_name not in ("in_order", "custom")
+
+    # A budget that permits drops is worse than inert under an unstamped sampler: the
+    # prompt is still given up on, but _credit_shortfall has no step to charge it to,
+    # so the step's target never falls and the train pump waits on a group nobody is
+    # generating. How that ends depends on the sampler. Under weight_fifo the wait never
+    # does: the same gate that stops the rollout pump running ahead also stops it
+    # reaching exhaustion, so the "rollout exhausted" error never fires and the run
+    # holds its GPUs until the wall clock kills it. Under windowed and ready_first the
+    # shortfall instead migrates from batch to batch until the last one, which has none
+    # left to borrow from, and the run dies there hours in. A zero budget is exempt: no
+    # drop is tolerated at all then, so nothing reaches the shortfall path and the
+    # warnings below are the right register.
+    if sampler_never_stamps and drop_budget:
+        raise ValueError(
+            f"async_rl.sampler.name={sampler_name!r} stamps no target step, so the drop "
+            f"budget (max_skipped_prompts={failure_config.max_skipped_prompts}, "
+            f"max_consecutive_dropped_prompts="
+            f"{failure_config.max_consecutive_dropped_prompts}) cannot be honoured: a "
+            "prompt that is given up on is never subtracted from the step waiting for "
+            "it, so that step waits on a group no one is generating -- ending the run "
+            "at its final step, or stalling it outright with no error at all. Set "
+            "async_rl.sampler.name='in_order' to get the tolerance these budgets "
+            "promise, or set both budgets to 0 to end the run on the first dropped "
+            "prompt instead."
+        )
+
+    if (
+        sampler_stamps
+        and drop_budget
+        and floor >= num_prompts_per_step
+        and failure_config.on_dropped_prompt == "shrink"
+    ):
+        warnings.warn(
+            f"async_rl.rollout_failure.min_step_batch_fraction="
+            f"{failure_config.min_step_batch_fraction} gives a floor of {floor} of "
+            f"grpo.num_prompts_per_step={num_prompts_per_step}, so no prompt may be "
+            f"dropped -- but max_skipped_prompts="
+            f"{failure_config.max_skipped_prompts} / max_consecutive_dropped_prompts="
+            f"{failure_config.max_consecutive_dropped_prompts} permit drops, and the "
+            "first one will fail the run mid-training rather than shrinking the step. "
+            "Lower min_step_batch_fraction to buy the tolerance the budgets promise, "
+            "or set on_dropped_prompt='replace' to hold the batch size instead.",
+            stacklevel=2,
+        )
+
+    if failure_config.on_dropped_prompt == "replace" and sampler_never_stamps:
+        warnings.warn(
+            f"async_rl.rollout_failure.on_dropped_prompt='replace' does nothing with "
+            f"the {sampler_name} sampler: it does not stamp a target step, so no step "
+            "is ever left short, the spare pool is never filled, and every drop "
+            "behaves as 'shrink'. replaced_prompt_groups will stay at 0 whether or "
+            "not anything failed.",
+            stacklevel=2,
+        )
+
+    if (
+        failure_config.on_dropped_prompt == "replace"
+        and failure_config.replacement_reserve_prompts > num_prompts_per_step
+    ):
+        warnings.warn(
+            f"async_rl.rollout_failure.replacement_reserve_prompts="
+            f"{failure_config.replacement_reserve_prompts} exceeds "
+            f"grpo.num_prompts_per_step={num_prompts_per_step}. The pool is refilled "
+            "by diverting one whole dataloader batch, so a mark above one batch "
+            "diverts several in a row before any is admitted -- and diverting happens "
+            "before admit(), outside the sampler gate and the buffer-capacity valve, "
+            "so nothing is dispatched while the pool fills.",
+            stacklevel=2,
+        )
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     async_config = master_config.async_rl
@@ -545,6 +757,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "grpo.skip_reference_policy_logprobs_calculation=false, or set "
             "loss_fn.reference_policy_kl_penalty=0."
         )
+
+    _validate_failure_settings(async_config, num_prompts_per_step)
 
     # Nesting says which knob applies to which path, but nothing stops an operator
     # filling in the block for the path this run is not taking -- and a populated

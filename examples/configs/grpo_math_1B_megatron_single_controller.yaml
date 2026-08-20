@@ -35,7 +35,7 @@ async_rl:
   # so the structure says which knob applies where. Filling in the block for the
   # path a run is not taking is rejected at setup rather than silently ignored.
   rollout_failure:
-    max_infra_attempts_per_prompt: 5  # infra budget; exhausting it fails the run
+    max_infra_attempts_per_prompt: 5  # infra budget; exhausting it drops the prompt
     max_data_attempts_per_prompt: 2   # data budget; 1 retry separates transient from deterministic
     backoff_base_s: 1.0
     max_backoff_s: 30.0
@@ -43,6 +43,30 @@ async_rl:
     # on the first one, propagating the original error. The two budgets above are
     # INDEPENDENT counters, so one prompt can consume up to their sum minus one.
     max_skipped_prompts: 0
+    # CONSECUTIVE prompts allowed to exhaust their infra budget and be dropped; any
+    # committed rollout resets the count. 0 fails the run on the first one. Raise it
+    # on a large fleet where losing the odd shard is expected and a whole run is
+    # expensive to restart -- a step short a few groups still trains, and the count
+    # only keeps climbing if nothing at all is coming back.
+    max_consecutive_dropped_prompts: 0
+    # Smallest batch a step may train on, as a fraction of num_prompts_per_step.
+    # The budgets above are run-scoped and cannot bound how short one step gets, so
+    # this is what guarantees the gradient is computed from most of a batch. The floor
+    # is ceil(fraction * num_prompts_per_step), so small batches tolerate no drops.
+    min_step_batch_fraction: 0.9
+    # What happens to the step a dropped prompt was stamped for (in_order sampler only;
+    # an unstamped sampler strands nothing). "shrink" trains the step on fewer groups,
+    # bounded by the floor above. "replace" substitutes a fresh prompt so the step keeps
+    # its configured batch size -- what the v1 stack does -- and still shrinks if the
+    # attempts or spares below run out. When a later step already has a finished group,
+    # replace borrows it to close the dropped step immediately and sends the fresh
+    # prompt to repay that step instead, so the trainer does not idle waiting on a new
+    # rollout; promoted_prompt_groups reports when that happened.
+    on_dropped_prompt: shrink         # shrink | replace
+    max_replacement_attempts: 1       # fresh prompts tried per lost group
+    # Low-water mark for the spare-prompt pool. Refilled by diverting one whole batch
+    # from the dataloader before it is admitted, so a refill yields a batch of spares.
+    replacement_reserve_prompts: 1
 
     # Deadlines. null disables, which is the default and reproduces the historical
     # behaviour of waiting forever. Set them in any run that matters: without one a

@@ -312,12 +312,18 @@ def _build_trainer(
     return trainer, time.perf_counter() - t0
 
 
-def _spinup_gym(master_config: MasterConfig, base_urls: list[str]) -> tuple[Any, float]:
+def _spinup_gym(
+    master_config: MasterConfig,
+    base_urls: list[str],
+    tokenizer: PreTrainedTokenizerBase,
+) -> tuple[Any, float]:
     """Spin up the NeMo-Gym actor against the reserved vLLM URLs.
 
     Args:
         master_config: SC MasterConfig.
         base_urls: Reserved vLLM OpenAI server URLs.
+        tokenizer: Installed on the actor at spinup rather than passed per rollout
+            call. See NemoGym.set_tokenizer.
 
     Returns:
         A tuple of (NeMo-Gym actor, wall time spent in this call).
@@ -335,6 +341,7 @@ def _spinup_gym(master_config: MasterConfig, base_urls: list[str]) -> tuple[Any,
         env_configs=master_config.env,
         base_urls=base_urls,
         model_name=generation_config["model_name"],
+        tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
@@ -491,6 +498,7 @@ def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
         backoff_base_s=failure_config.backoff_base_s,
         max_backoff_s=failure_config.max_backoff_s,
         max_skipped_prompts=failure_config.max_skipped_prompts,
+        max_consecutive_dropped_prompts=failure_config.max_consecutive_dropped_prompts,
         max_gym_row_attempts=failure_config.nemo_gym.max_row_attempts,
     )
 
@@ -690,6 +698,7 @@ def setup_single_controller(
                 if generation_router is not None
                 else generation.dp_openai_server_base_urls
             ),
+            tokenizer=tokenizer,
         )
 
     if colocated:
