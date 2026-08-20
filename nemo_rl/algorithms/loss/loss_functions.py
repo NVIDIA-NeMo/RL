@@ -842,11 +842,18 @@ class NLLLossFn(LossFunction):
 
 
 class PreferenceLossDataDict(TypedDict):
-    """Required keys for the preference loss function."""
+    """Keys for a preference loss.
+
+    ``pair_index`` and ``is_chosen`` make pair reconstruction robust to row
+    reordering by sequence packing. They remain optional for compatibility
+    with existing interleaved DPO batches.
+    """
 
     input_ids: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    pair_index: NotRequired[torch.Tensor]
+    is_chosen: NotRequired[torch.Tensor]
 
 
 class PreferenceLossFn(LossFunction):
@@ -873,9 +880,48 @@ class PreferenceLossFn(LossFunction):
     loss_type = LossType.SEQUENCE_LEVEL
     input_type = LossInputType.LOGIT
 
-    def split_output_tensor(self, tensor: Tensor) -> tuple[Tensor, Tensor]:
-        # tensor is of shape (2*micro_batch_size,)
-        return tensor[::2], tensor[1::2]
+    def split_output_tensor(
+        self,
+        tensor: Tensor,
+        data: Optional[PreferenceLossDataDict] = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Return pair-aligned chosen and rejected rows.
+
+        Sequence packing may reorder rows, so positional slicing is only safe
+        for legacy batches that do not carry pair metadata.
+        """
+        if data is None or "pair_index" not in data or "is_chosen" not in data:
+            return tensor[::2], tensor[1::2]
+
+        is_chosen = data["is_chosen"].to(device=tensor.device, dtype=torch.bool)
+        pair_index = data["pair_index"].to(device=tensor.device)
+        if (
+            is_chosen.numel() != tensor.shape[0]
+            or pair_index.numel() != tensor.shape[0]
+        ):
+            raise ValueError(
+                "pair_index and is_chosen must contain one entry per preference row."
+            )
+        chosen_rows = torch.nonzero(is_chosen, as_tuple=True)[0]
+        rejected_rows = torch.nonzero(~is_chosen, as_tuple=True)[0]
+        chosen_pairs = pair_index.index_select(0, chosen_rows)
+        rejected_pairs = pair_index.index_select(0, rejected_rows)
+        chosen_order = chosen_pairs.argsort(stable=True)
+        rejected_order = rejected_pairs.argsort(stable=True)
+        chosen_pairs = chosen_pairs.index_select(0, chosen_order)
+        rejected_pairs = rejected_pairs.index_select(0, rejected_order)
+        if (
+            not torch.equal(chosen_pairs, rejected_pairs)
+            or torch.unique(chosen_pairs).numel() != chosen_pairs.numel()
+        ):
+            raise ValueError(
+                "Preference batch must contain exactly one chosen and one rejected "
+                "row for every pair_index."
+            )
+        return (
+            tensor.index_select(0, chosen_rows.index_select(0, chosen_order)),
+            tensor.index_select(0, rejected_rows.index_select(0, rejected_order)),
+        )
 
     def _preference_loss(
         self,
@@ -883,34 +929,36 @@ class PreferenceLossFn(LossFunction):
         sample_mask: Tensor,
         global_valid_seqs: Tensor,
         beta: float = 1.0,
+        data: Optional[PreferenceLossDataDict] = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        rewards_chosen, rewards_rejected = self.split_output_tensor(rewards)
+        rewards_chosen, rewards_rejected = self.split_output_tensor(rewards, data)
+        mask_chosen, mask_rejected = self.split_output_tensor(sample_mask, data)
         rewards_delta = rewards_chosen - rewards_rejected
 
         per_sample_loss = (
-            -torch.nn.functional.logsigmoid(beta * rewards_delta) * sample_mask[::2]
+            -torch.nn.functional.logsigmoid(beta * rewards_delta) * mask_chosen
         )  ## zero out invalid samples
 
         ## divide by 2 because each preference example corresponds to 2 samples (chosen, rejected)
         return (
             masked_mean(
                 per_sample_loss,
-                sample_mask[::2],
+                mask_chosen,
                 global_normalization_factor=global_valid_seqs / 2,
             ),
             masked_mean(
                 rewards_chosen > rewards_rejected,
-                sample_mask[::2],
+                mask_chosen,
                 global_normalization_factor=global_valid_seqs / 2,
             ),
             masked_mean(
                 rewards_chosen,
-                sample_mask[::2],
+                mask_chosen,
                 global_normalization_factor=global_valid_seqs / 2,
             ),
             masked_mean(
                 rewards_rejected,
-                sample_mask[1::2],
+                mask_rejected,
                 global_normalization_factor=global_valid_seqs / 2,
             ),
         )
@@ -931,7 +979,7 @@ class PreferenceLossFn(LossFunction):
             accuracy,
             rewards_chosen_mean,
             rewards_rejected_mean,
-        ) = self._preference_loss(rewards, sample_mask, global_valid_seqs)
+        ) = self._preference_loss(rewards, sample_mask, global_valid_seqs, data=data)
 
         ## divide by 2 because we're summing over (chosen, rejected) pairs
         num_valid_samples = sample_mask.sum() / 2
@@ -960,6 +1008,8 @@ class DPOLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    pair_index: NotRequired[torch.Tensor]
+    is_chosen: NotRequired[torch.Tensor]
 
 
 class DPOLossFn(PreferenceLossFn):
@@ -1029,6 +1079,15 @@ class DPOLossFn(PreferenceLossFn):
         self.sft_average_log_probs = cfg.sft_average_log_probs
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
         self.sft_loss = NLLLossFn(use_fused_linear_logprobs=use_fused_linear_logprobs)
+        self.metric_normalizations = {
+            "loss": MetricNormalizer.SEQUENCES,
+            "sft_loss": MetricNormalizer.SEQUENCES,
+            "preference_loss": MetricNormalizer.SEQUENCES,
+            "accuracy": MetricNormalizer.SEQUENCES,
+            "rewards_chosen_mean": MetricNormalizer.SEQUENCES,
+            "rewards_rejected_mean": MetricNormalizer.SEQUENCES,
+            "num_valid_samples": MetricNormalizer.NONE,
+        }
 
     def _dpo_loss(
         self,
@@ -1048,7 +1107,11 @@ class DPOLossFn(PreferenceLossFn):
             rewards = rewards / token_mask.sum(-1).clamp(min=1)
 
         return self._preference_loss(
-            rewards, sample_mask, global_valid_seqs, self.reference_policy_kl_penalty
+            rewards,
+            sample_mask,
+            global_valid_seqs,
+            self.reference_policy_kl_penalty,
+            data=data,
         )
 
     # TODO a cleaner typing fix would be required (probably that DPOLossFn should not inherit from PreferenceLossFn)
@@ -1072,10 +1135,11 @@ class DPOLossFn(PreferenceLossFn):
                 dpo_loss=True,
                 dpo_average_log_probs=self.sft_average_log_probs,
             )
-            sft_loss_chosen, sft_loss_rejected = self.split_output_tensor(sft_loss)
+            sft_loss_chosen, _ = self.split_output_tensor(sft_loss, data)
+            sample_mask_chosen, _ = self.split_output_tensor(data["sample_mask"], data)
             sft_loss_chosen = masked_mean(
                 sft_loss_chosen,
-                data["sample_mask"][::2],
+                sample_mask_chosen,
                 global_normalization_factor=global_valid_seqs / 2,
             )
 
@@ -1102,6 +1166,224 @@ class DPOLossFn(PreferenceLossFn):
             "rewards_chosen_mean": rewards_chosen_mean.item(),
             "rewards_rejected_mean": rewards_rejected_mean.item(),
             "num_valid_samples": num_valid_samples.item(),
+        }
+
+
+class MPOLossConfig(BaseModel, extra="allow"):
+    """Mixed Preference Optimization loss configuration."""
+
+    reference_policy_kl_penalty: float = 0.05
+    preference_loss_weight: float = 1.0
+    sft_loss_weight: float = 0.0
+    bco_loss_weight: float = 1.0
+    preference_average_log_probs: bool = False
+    sft_average_log_probs: bool = False
+    quality_average_log_probs: bool = False
+    reward_shift_momentum: float = 0.99
+    reward_shift: float = 0.0
+
+
+class MPOLossFn(PreferenceLossFn):
+    """MPO loss with driver-owned BCO reward-shift state.
+
+    The loss combines a DPO preference term, a chosen-response SFT term, and
+    a BCO quality term. The BCO shift is intentionally not mutated here:
+    loss objects are serialized to distributed workers, so worker-local
+    mutation would be lost between optimizer steps and would diverge across
+    data-parallel ranks. Instead, the loss returns a raw reward sum/count;
+    the algorithm aggregates those values and updates ``reward_shift`` once
+    on the driver after each successful training step.
+    """
+
+    loss_type = LossType.SEQUENCE_LEVEL
+    input_type = LossInputType.LOGPROB
+
+    def __init__(
+        self, cfg: MPOLossConfig, use_fused_linear_logprobs: bool = False
+    ) -> None:
+        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.preference_loss_weight = cfg.preference_loss_weight
+        self.sft_loss_weight = cfg.sft_loss_weight
+        self.bco_loss_weight = cfg.bco_loss_weight
+        self.preference_average_log_probs = cfg.preference_average_log_probs
+        self.sft_average_log_probs = cfg.sft_average_log_probs
+        self.quality_average_log_probs = cfg.quality_average_log_probs
+        self.reward_shift_momentum = cfg.reward_shift_momentum
+        self.reward_shift = float(cfg.reward_shift)
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
+
+        if not 0.0 <= self.reward_shift_momentum < 1.0:
+            raise ValueError("reward_shift_momentum must be in [0, 1)")
+
+        self.metric_normalizations = {
+            "loss": MetricNormalizer.SEQUENCES,
+            "sft_loss": MetricNormalizer.SEQUENCES,
+            "preference_loss": MetricNormalizer.SEQUENCES,
+            "bco_loss": MetricNormalizer.SEQUENCES,
+            "accuracy": MetricNormalizer.SEQUENCES,
+            "rewards_chosen_mean": MetricNormalizer.SEQUENCES,
+            "rewards_rejected_mean": MetricNormalizer.SEQUENCES,
+            "bco_rewards_chosen_mean": MetricNormalizer.SEQUENCES,
+            "bco_rewards_rejected_mean": MetricNormalizer.SEQUENCES,
+            "num_valid_samples": MetricNormalizer.NONE,
+            # These are sufficient statistics, aggregated by summation before
+            # the single driver-side EMA update.
+            "bco_reward_sum": MetricNormalizer.NONE,
+            "bco_reward_count": MetricNormalizer.NONE,
+        }
+
+    def set_reward_shift(self, value: float) -> None:
+        self.reward_shift = float(value)
+
+    def update_reward_shift(self, reward_sum: float, reward_count: float) -> float:
+        """Apply one EMA update from globally aggregated BCO rewards."""
+        if reward_count <= 0:
+            return self.reward_shift
+        batch_mean = reward_sum / reward_count
+        self.reward_shift = (
+            self.reward_shift_momentum * self.reward_shift
+            + (1.0 - self.reward_shift_momentum) * batch_mean
+        )
+        return self.reward_shift
+
+    @staticmethod
+    def _sequence_logratios(
+        next_token_logprobs: Tensor,
+        data: BatchedDataDict[DPOLossDataDict],
+        *,
+        average: bool,
+    ) -> Tensor:
+        token_mask = data["token_mask"][:, 1:]
+        reference_logprobs = data["reference_policy_logprobs"][:, :-1]
+        logratios = ((next_token_logprobs - reference_logprobs) * token_mask).sum(
+            dim=-1
+        )
+        if average:
+            logratios = logratios / token_mask.sum(dim=-1).clamp(min=1)
+        return logratios
+
+    def _sft_loss(
+        self,
+        next_token_logprobs: Tensor,
+        data: BatchedDataDict[DPOLossDataDict],
+        global_valid_seqs: Tensor,
+    ) -> Tensor:
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        per_sequence_loss = -(next_token_logprobs * token_mask).sum(dim=-1)
+        if self.sft_average_log_probs:
+            per_sequence_loss = per_sequence_loss / token_mask.sum(dim=-1).clamp(min=1)
+        chosen_loss, _ = self.split_output_tensor(per_sequence_loss, data)
+        chosen_mask, _ = self.split_output_tensor(sample_mask, data)
+        return masked_mean(
+            chosen_loss,
+            chosen_mask,
+            global_normalization_factor=global_valid_seqs / 2,
+        )
+
+    def _bco_loss(
+        self,
+        rewards: Tensor,
+        data: BatchedDataDict[DPOLossDataDict],
+        global_valid_seqs: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        sample_mask = data["sample_mask"]
+        chosen_rewards, rejected_rewards = self.split_output_tensor(rewards, data)
+        chosen_mask, rejected_mask = self.split_output_tensor(sample_mask, data)
+        shift = torch.as_tensor(
+            self.reward_shift, dtype=rewards.dtype, device=rewards.device
+        )
+        chosen_loss = (
+            -torch.nn.functional.logsigmoid(chosen_rewards - shift) * chosen_mask
+        )
+        rejected_loss = (
+            -torch.nn.functional.logsigmoid(-(rejected_rewards - shift)) * rejected_mask
+        )
+        pair_count = global_valid_seqs / 2
+        loss = masked_mean(
+            chosen_loss,
+            chosen_mask,
+            global_normalization_factor=pair_count,
+        ) + masked_mean(
+            rejected_loss,
+            rejected_mask,
+            global_normalization_factor=pair_count,
+        )
+        chosen_mean = masked_mean(
+            chosen_rewards,
+            chosen_mask,
+            global_normalization_factor=pair_count,
+        )
+        rejected_mean = masked_mean(
+            rejected_rewards,
+            rejected_mask,
+            global_normalization_factor=pair_count,
+        )
+        return loss, chosen_mean, rejected_mean
+
+    def __call__(
+        self,
+        next_token_logprobs: Tensor,
+        data: BatchedDataDict[DPOLossDataDict],
+        global_valid_seqs: Tensor,
+        global_valid_toks: Tensor | None,
+    ) -> tuple[Tensor, dict[str, Any]]:
+        preference_logratios = self._sequence_logratios(
+            next_token_logprobs,
+            data,
+            average=self.preference_average_log_probs,
+        )
+        (
+            preference_loss,
+            accuracy,
+            rewards_chosen_mean,
+            rewards_rejected_mean,
+        ) = self._preference_loss(
+            preference_logratios,
+            data["sample_mask"],
+            global_valid_seqs,
+            beta=self.reference_policy_kl_penalty,
+            data=data,
+        )
+
+        quality_logratios = self._sequence_logratios(
+            next_token_logprobs,
+            data,
+            average=self.quality_average_log_probs,
+        )
+        quality_rewards = self.reference_policy_kl_penalty * quality_logratios
+        bco_loss, bco_chosen_mean, bco_rejected_mean = self._bco_loss(
+            quality_rewards, data, global_valid_seqs
+        )
+
+        sft_loss = torch.zeros(
+            (), dtype=next_token_logprobs.dtype, device=next_token_logprobs.device
+        )
+        if self.sft_loss_weight > 0:
+            sft_loss = self._sft_loss(next_token_logprobs, data, global_valid_seqs)
+
+        total_loss = (
+            self.preference_loss_weight * preference_loss
+            + self.sft_loss_weight * sft_loss
+            + self.bco_loss_weight * bco_loss
+        )
+        sample_mask = data["sample_mask"].to(dtype=quality_rewards.dtype)
+        bco_reward_sum = (quality_rewards.detach() * sample_mask).sum()
+        bco_reward_count = sample_mask.sum()
+
+        return total_loss, {
+            "loss": total_loss.item(),
+            "sft_loss": sft_loss.item(),
+            "preference_loss": preference_loss.item(),
+            "bco_loss": bco_loss.item(),
+            "accuracy": accuracy.item(),
+            "rewards_chosen_mean": rewards_chosen_mean.item(),
+            "rewards_rejected_mean": rewards_rejected_mean.item(),
+            "bco_rewards_chosen_mean": bco_chosen_mean.item(),
+            "bco_rewards_rejected_mean": bco_rejected_mean.item(),
+            "num_valid_samples": (data["sample_mask"].sum() / 2).item(),
+            "bco_reward_sum": bco_reward_sum.item(),
+            "bco_reward_count": bco_reward_count.item(),
         }
 
 

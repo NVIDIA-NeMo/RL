@@ -1,0 +1,18 @@
+# Packing A/B control for vlm_mpo-nemotron-omni-nopack-legacy-parity.yaml.
+# Keep every training, data, model, and parallelism setting identical; only
+# enable pair-atomic packing in NeMo-RL's Megatron data pipeline.
+defaults: vlm_mpo-nemotron-omni-nopack-legacy-parity.yaml
+
+policy:
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+    algorithm: modified_first_fit_decreasing
+    fuse_loss: true
+    pair_grouping_key: pair_index
+    max_sequences_per_bin: 1
+
+logger:
+  wandb:
+    name: nano-main-packed-legacy-parity-100step

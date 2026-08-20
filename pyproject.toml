@@ -683,6 +683,10 @@ select = ["D", "F"]
 # TODO: Remove D10 once we are about to release to get all the docstrings written
 ignore = ["D417", "D10", "F841"]
 
+[tool.ruff.lint.isort]
+# Keep W&B classified as third-party even when local runs create ./wandb/.
+known-third-party = ["wandb"]
+
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 

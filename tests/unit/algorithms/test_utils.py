@@ -14,6 +14,8 @@
 
 import math
 from datetime import datetime
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -32,6 +34,7 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy import TokenizerConfig
 
 
 @pytest.fixture
@@ -146,6 +149,42 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     assert formatted == expected
 
 
+def test_get_processor_forwards_fix_mistral_regex(monkeypatch):
+    tokenizer = SimpleNamespace(
+        pad_token="<pad>",
+        eos_token="<eos>",
+        bos_token="<bos>",
+        pad_token_id=0,
+        eos_token_id=1,
+        bos_token_id=2,
+        name_or_path="nemotron-omni",
+        chat_template=None,
+    )
+    processor = SimpleNamespace(tokenizer=tokenizer, chat_template=None)
+    captured: dict[str, object] = {}
+
+    def _from_pretrained(name: str, **kwargs):
+        captured["name"] = name
+        captured.update(kwargs)
+        return processor
+
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.utils.AutoProcessor.from_pretrained", _from_pretrained
+    )
+    config = cast(
+        TokenizerConfig,
+        {"name": "nemotron-omni", "fix_mistral_regex": True},
+    )
+
+    result = get_tokenizer(config, get_processor=True)
+
+    assert result is processor
+    assert captured["name"] == "nemotron-omni"
+    assert captured["trust_remote_code"] is True
+    assert captured["use_fast"] is True
+    assert captured["fix_mistral_regex"] is True
+
+
 def test_maybe_pad_last_batch():
     """Test maybe_pad_last_batch function for various scenarios"""
     # Test case 1: No padding needed
@@ -224,6 +263,25 @@ def test_maybe_pad_last_batch():
     assert result["sample_mask"].shape[0] == expected_size
     assert "token_mask" not in result
     assert "reference_policy_logprobs" not in result
+
+    # Preference padding must append complete, uniquely identified pairs.
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(18).reshape(6, 3),
+            "input_lengths": torch.full((6,), 3),
+            "sample_mask": torch.ones(6),
+            "pair_index": torch.tensor([0, 0, 1, 1, 2, 2]),
+            "is_chosen": torch.tensor([True, False, True, False, True, False]),
+        }
+    )
+    result = maybe_pad_last_batch(batch, dp_size=2, mbs=2)
+    assert result.size == 8
+    assert torch.equal(result["pair_index"], torch.tensor([0, 0, 1, 1, 2, 2, 3, 3]))
+    assert torch.equal(
+        result["is_chosen"],
+        torch.tensor([True, False, True, False, True, False, True, False]),
+    )
+    assert torch.equal(result["sample_mask"][-2:], torch.zeros(2))
 
 
 # Performance Metrics Tests

@@ -272,6 +272,19 @@ def process_microbatch(
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
     with ctx:
         input_ids = data_dict["input_ids"]
+        if (
+            not pack_sequences
+            and model_slices_context_parallel_inputs
+            and "pixel_values" in data_dict
+        ):
+            raise NotImplementedError(
+                "Nemotron Omni image batches without sequence packing are not "
+                "supported by the currently pinned Megatron-Bridge: its media "
+                "insertion path cannot consume NeMo-RL's 4D decoder attention "
+                "mask. Enable policy.sequence_packing.enabled=true, or land "
+                "NVIDIA-NeMo/Megatron-Bridge#5181 and bump the MBridge pin. "
+                "See NVIDIA-NeMo/RL#3525."
+            )
         attention_mask = None
         position_ids = None
         packed_seq_params = None
