@@ -62,6 +62,32 @@ class MxProcessGroup:
         self._root_unique_id = root_unique_id
         self._timeout_s = timeout_s
 
+    def _wait_for_async_success(self, bindings, *, operation: str) -> None:
+        """Drive a nonblocking NCCL host operation to completion.
+
+        A nonblocking communicator can return ``ncclInProgress`` not only
+        from communicator creation, but also while the first collective lazily
+        connects its transports.  Until that state becomes ``ncclSuccess`` the
+        collective may not have been posted to the CUDA stream yet.
+        """
+        deadline = time.monotonic() + self._timeout_s
+        while True:
+            status = self.nccl_communicator.get_async_error()
+            if int(status) == int(bindings.Result.Success):
+                return
+            if int(status) != int(bindings.Result.InProgress):
+                raise RuntimeError(
+                    f"MX NCCL {operation} failed with {status!r}: "
+                    f"{self.nccl_communicator.get_last_error()}"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"MX NCCL {operation} did not complete within "
+                    f"{self._timeout_s:.1f}s"
+                )
+            time.sleep(min(0.01, remaining))
+
     def init_nccl_communicator(self, device):
         from nccl.bindings import nccl as bindings
         from nccl.core import communicator
@@ -86,23 +112,9 @@ class MxProcessGroup:
                     unique_id=unique_id,
                     config=config_type(blocking=False),
                 )
-                deadline = time.monotonic() + self._timeout_s
-                while True:
-                    status = self.nccl_communicator.get_async_error()
-                    if int(status) == int(bindings.Result.Success):
-                        break
-                    if int(status) != int(bindings.Result.InProgress):
-                        raise RuntimeError(
-                            "MX NCCL communicator initialization failed with "
-                            f"{status!r}: {self.nccl_communicator.get_last_error()}"
-                        )
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError(
-                            "MX NCCL communicator initialization did not complete "
-                            f"within {self._timeout_s:.1f}s"
-                        )
-                    time.sleep(min(0.01, remaining))
+                self._wait_for_async_success(
+                    bindings, operation="communicator initialization"
+                )
             except BaseException:
                 try:
                     self.abort()
@@ -121,6 +133,14 @@ class MxProcessGroup:
                     else torch.zeros(1, device=device)
                 )
                 self.broadcast(data, 0, stream=stream)
+                # With a nonblocking communicator the first collective can
+                # still be establishing transport connections here. Polling
+                # is required before synchronizing the CUDA stream: otherwise
+                # the stream may have no NCCL work posted yet and peers can
+                # observe the untouched zero buffer, aborting a healthy lane.
+                self._wait_for_async_success(
+                    bindings, operation="communicator bootstrap broadcast"
+                )
                 stream.synchronize()
                 if not torch.allclose(data, torch.ones(1, device=device)):
                     raise RuntimeError(
