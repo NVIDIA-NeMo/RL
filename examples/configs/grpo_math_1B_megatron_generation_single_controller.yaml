@@ -1,8 +1,0 @@
-# SingleController with the Megatron generation backend (non-colocated).
-defaults: grpo_math_1B_megatron_single_controller.yaml
-
-policy:
-  generation:
-    backend: megatron
-    mcore_generation_config:
-      expose_http_server: false

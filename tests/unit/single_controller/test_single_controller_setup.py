@@ -55,6 +55,7 @@ from nemo_rl.experience.rollout_recovery import (
     PromptRef,
     RolloutRecoveryLedger,
 )
+from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 
 
 class _CheckpointingCustomSampler(WindowedSampler):
@@ -456,11 +457,6 @@ class TestSetup:
             mc = _make_master_config(colocated=True, backend="sglang")
         else:  # pragma: no cover
             raise AssertionError(f"unknown test case {invalid_case}")
-        if use_gym:
-            patched_factories["setup_response_data"].return_value = (
-                list(range(8)),
-                None,
-            )
 
         with (
             patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=use_gym),
@@ -469,10 +465,7 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        # The megatron_* checks live in the config-overrides pass, which runs
-        # after dataset setup; everything else fails before it.
-        if not invalid_case.startswith("megatron_"):
-            patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["_build_generation"].assert_not_called()
         patched_factories["_build_trainer"].assert_not_called()
@@ -913,6 +906,11 @@ class TestSetup:
                 5555,
                 port_holder,
             )
+            # Wire the real check through the class mock so the
+            # served-vs-reserved legs below exercise the genuine logic.
+            mock_megatron.verify_served_address = (
+                MegatronGeneration.verify_served_address
+            )
             mock_megatron.return_value.dp_openai_server_base_urls = [served_url]
             if served_matches_reserved:
                 actor_args, metrics = setup_single_controller(mc, tokenizer)
@@ -961,6 +959,46 @@ class TestSetup:
             assert factory_kwargs["generation_backend"] == "megatron"
             assert factory_kwargs["colocated"] is False
             assert factory_kwargs["inference_cluster"] is inference_cluster
+
+    def test_megatron_non_gym_setup(self, patched_factories):
+        """Non-colocated Megatron generation with NeMo Gym off."""
+        mc = _make_master_config(
+            colocated=False, backend="megatron", megatron_enabled=True
+        )
+        tokenizer = MagicMock(pad_token_id=0)
+
+        with (
+            patch.object(sc_setup_mod, "spinup_nemo_gym_actor") as mock_spinup,
+            patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+            patch.object(sc_setup_mod, "ray") as mock_ray,
+        ):
+            actor_args, metrics = setup_single_controller(mc, tokenizer)
+
+        inference_cluster = patched_factories["_build_clusters"].return_value[1]
+        mock_megatron.reserve_http_server_address.assert_not_called()
+        mock_ray.kill.assert_not_called()
+        mock_spinup.assert_not_called()
+        patched_factories["_build_generation"].assert_not_called()
+        patched_factories["_build_trainer"].assert_called_once()
+        mock_megatron.assert_called_once_with(
+            config=mc.policy,
+            tokenizer=tokenizer,
+            cluster=inference_cluster,
+            processor=None,
+            weights_path=None,
+            skip_weight_load=True,
+            reserved_http_server_port=None,
+        )
+        assert mc.policy["generation"]["model_name"] == "test-model"
+        assert actor_args.gen_handle is mock_megatron.return_value
+        assert actor_args.trainer_handle is patched_factories["fake_policy"]
+        assert metrics.generation_init_time_s is not None
+        assert metrics.policy_init_time_s is not None
+        assert metrics.generation_init_reserve_time_s is None
+        _, factory_kwargs = patched_factories["create_weight_synchronizer"].call_args
+        assert factory_kwargs["generation_backend"] == "megatron"
+        assert factory_kwargs["colocated"] is False
+        assert factory_kwargs["inference_cluster"] is inference_cluster
 
 
 class TestNativeTQRecoverySetup:
