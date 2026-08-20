@@ -33,7 +33,14 @@ def _make_collective_update_extension(backend):
     state_info = object()
     ext.state_dict_info = {"model.weight": state_info}
     ext.model_update_group = object()
-    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    ext.model_runner = SimpleNamespace(
+        model=object(),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=[]),
+            speculative_config=None,
+        ),
+        drafter=None,
+    )
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
@@ -120,16 +127,134 @@ def _make_mtp_refit_extension(
 
 
 @pytest.mark.vllm
-@pytest.mark.parametrize("with_mtp", [False, True])
-def test_update_weights_from_collective_processes_weights_after_loading(
-    monkeypatch, with_mtp
-):
+def test_update_weights_from_collective_uses_legacy_loader_by_default(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    call_order = []
+    ext, expected_state_info = _make_collective_update_extension(vllm_backend)
+
+    @contextlib.contextmanager
+    def lifecycle(transport):
+        assert transport == "collective"
+        call_order.append("lifecycle")
+        yield lambda: call_order.append("finalize")
+
+    def load_weights(weights):
+        call_order.append("load")
+        assert weights == [("model.weight", "weight-value")]
+
+    def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
+        call_order.append("broadcast")
+        assert list(iterator) == [("model.weight", expected_state_info)]
+        assert group is ext.model_update_group
+        assert src == 0
+        post_unpack_func([("model.weight", "weight-value")])
+
+    ext._weight_update_lifecycle = lifecycle
+    ext._load_weights = load_weights
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: call_order.append("gc"))
+    monkeypatch.setattr(
+        vllm_backend.torch.cuda,
+        "empty_cache",
+        lambda: call_order.append("empty_cache"),
+    )
+
+    assert ext.update_weights_from_collective(refit_with_reload_api=False) is True
+    assert call_order == [
+        "lifecycle",
+        "broadcast",
+        "load",
+        "finalize",
+        "gc",
+        "empty_cache",
+    ]
+
+
+@pytest.mark.vllm
+def test_update_weights_from_collective_uses_native_reload_when_enabled(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    call_order = []
+    ext, expected_state_info = _make_collective_update_extension(vllm_backend)
+
+    def packed_broadcast_consumer(
+        iterator, group, src, post_unpack_func, return_iterator=False
+    ):
+        call_order.append("broadcast")
+        assert list(iterator) == [("model.weight", expected_state_info)]
+        assert group is ext.model_update_group
+        assert src == 0
+        assert post_unpack_func is None
+        assert return_iterator is True
+        return iter([("model.weight", "weight-value")])
+
+    def reload_weights(*, weights_iterator):
+        call_order.append("reload")
+        assert list(weights_iterator) == [("model.weight", "weight-value")]
+
+    ext.model_runner.reload_weights = reload_weights
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: call_order.append("gc"))
+    monkeypatch.setattr(
+        vllm_backend.torch.cuda,
+        "empty_cache",
+        lambda: call_order.append("empty_cache"),
+    )
+
+    assert ext.update_weights_from_collective(refit_with_reload_api=True) is True
+    assert call_order == ["broadcast", "reload", "gc", "empty_cache"]
+
+
+@pytest.mark.vllm
+def test_update_weights_from_collective_rejects_reload_for_draft_weights():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, state_info = _make_collective_update_extension(vllm_backend)
+    ext.state_dict_info = {"draft.weight": state_info}
+    ext._weight_update_errors_are_fatal = lambda: True
+
+    with pytest.raises(RuntimeError, match="refit_with_reload_api=true"):
+        ext.update_weights_from_collective(refit_with_reload_api=True)
+
+
+@pytest.mark.vllm
+def test_collective_fp8_uses_native_reload_iterator(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext, _ = _make_collective_update_extension(vllm_backend)
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+    source_weights = iter([("model.weight", "weight-value")])
+    quantized_weights = iter(
+        [("model.weight", "quantized"), ("model.weight_scale", "scale")]
+    )
+
+    def get_quantized_weight_iterator(weights, model_runner):
+        assert weights is source_weights
+        assert model_runner is ext.model_runner
+        return quantized_weights
+
+    monkeypatch.setattr(
+        fp8, "get_quantized_weight_iterator", get_quantized_weight_iterator
+    )
+
+    assert ext._collective_requires_batched_loading() is False
+    assert ext._prepare_reload_weight_iterator(source_weights) is quantized_weights
+
+
+@pytest.mark.vllm
+def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     call_order = []
     process_calls = []
-    draft_model = object() if with_mtp else None
-    draft_model_config = object() if with_mtp else None
+    draft_model = object()
+    draft_model_config = object()
 
     def process_weights_after_loading(model, model_config, device):
         call_order.append("process_mtp" if model is draft_model else "process_main")
@@ -140,14 +265,13 @@ def test_update_weights_from_collective_processes_weights_after_loading(
         process_weights_after_loading,
     )
     ext, expected_state_info = _make_collective_update_extension(vllm_backend)
-    if with_mtp:
-        ext._mtp_drafter_from_disk = False
-        ext.model_runner.drafter = SimpleNamespace(model=draft_model)
-        ext.model_runner.vllm_config = SimpleNamespace(
-            speculative_config=SimpleNamespace(
-                method="mtp", draft_model_config=draft_model_config
-            )
+    ext._mtp_drafter_from_disk = False
+    ext.model_runner.drafter = SimpleNamespace(model=draft_model)
+    ext.model_runner.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="mtp", draft_model_config=draft_model_config
         )
+    )
 
     @contextlib.contextmanager
     def set_current_vllm_config(config):
@@ -183,7 +307,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(
         lambda: call_order.append("empty_cache"),
     )
 
-    assert ext.update_weights_from_collective() is True
+    assert ext.update_weights_from_collective(refit_with_reload_api=False) is True
 
     expected_process_calls = [(ext.model_runner.model, ext.model_config, ext.device)]
     expected_call_order = [
@@ -192,11 +316,14 @@ def test_update_weights_from_collective_processes_weights_after_loading(
         "config_enter",
         "process_main",
         "config_exit",
+        "config_enter",
+        "process_mtp",
+        "config_exit",
+        "kv",
+        "gc",
+        "empty_cache",
     ]
-    if with_mtp:
-        expected_process_calls.append((draft_model, draft_model_config, ext.device))
-        expected_call_order.extend(["config_enter", "process_mtp", "config_exit"])
-    expected_call_order.extend(["kv", "gc", "empty_cache"])
+    expected_process_calls.append((draft_model, draft_model_config, ext.device))
 
     assert process_calls == expected_process_calls
     assert call_order == expected_call_order
@@ -227,36 +354,50 @@ def test_checkpoint_engine_lifecycle_processes_weights_once(monkeypatch):
 
 @pytest.mark.vllm
 @pytest.mark.parametrize(
-    "method_name",
-    ["update_weights_via_ipc_zmq", "update_weights_from_collective"],
+    ("method_name", "expected_rpc_args"),
+    [
+        ("update_weights_via_ipc_zmq", tuple()),
+        ("update_weights_from_collective", (True,)),
+    ],
 )
 @pytest.mark.parametrize(
     "worker_results, expected", [([True, True], True), ([True, False], False)]
 )
 def test_sync_weight_updates_check_every_internal_worker(
-    method_name, worker_results, expected
+    method_name, expected_rpc_args, worker_results, expected
 ):
     """A failure on a later PP rank must not be hidden by rank zero success."""
     from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
 
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    worker.cfg = {"vllm_cfg": {"async_engine": False, "refit_with_reload_api": True}}
     worker.llm = SimpleNamespace(collective_rpc=MagicMock(return_value=worker_results))
 
     assert getattr(worker, method_name)() is expected
+    worker.llm.collective_rpc.assert_called_once_with(
+        method_name,
+        args=expected_rpc_args,
+    )
 
 
 @pytest.mark.vllm
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "method_name",
-    ["update_weights_via_ipc_zmq_async", "update_weights_from_collective_async"],
+    ("method_name", "expected_rpc_method", "expected_rpc_args"),
+    [
+        ("update_weights_via_ipc_zmq_async", "update_weights_via_ipc_zmq", tuple()),
+        (
+            "update_weights_from_collective_async",
+            "update_weights_from_collective",
+            (True,),
+        ),
+    ],
 )
 @pytest.mark.parametrize(
     "worker_results, expected", [([True, True], True), ([True, False], False)]
 )
 async def test_async_weight_updates_check_every_internal_worker(
-    method_name, worker_results, expected
+    method_name, expected_rpc_method, expected_rpc_args, worker_results, expected
 ):
     """Async refit also reports failures from every internal PP rank."""
     from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -267,6 +408,7 @@ async def test_async_weight_updates_check_every_internal_worker(
     worker.cfg = {
         "vllm_cfg": {
             "async_engine": True,
+            "refit_with_reload_api": True,
             "reset_encoder_cache_after_weight_update": True,
         }
     }
@@ -276,6 +418,10 @@ async def test_async_weight_updates_check_every_internal_worker(
     )
 
     assert await getattr(worker, method_name)() is expected
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        expected_rpc_method,
+        args=expected_rpc_args,
+    )
     if expected:
         worker.llm.reset_encoder_cache.assert_awaited_once_with()
     else:
@@ -291,7 +437,7 @@ async def test_async_weight_update_skips_encoder_cache_reset_when_disabled():
     )
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.cfg = {"vllm_cfg": {"async_engine": True, "refit_with_reload_api": False}}
     worker.llm = SimpleNamespace(
         collective_rpc=AsyncMock(return_value=[True]),
         reset_encoder_cache=AsyncMock(),
@@ -313,6 +459,7 @@ async def test_async_weight_update_fails_when_encoder_cache_reset_fails():
     worker.cfg = {
         "vllm_cfg": {
             "async_engine": True,
+            "refit_with_reload_api": False,
             "reset_encoder_cache_after_weight_update": True,
         }
     }
@@ -346,6 +493,59 @@ async def test_nccl_reshard_refit_resets_encoder_cache():
 
     assert await worker.nccl_reshard_refit_async() is True
     worker.llm.reset_encoder_cache.assert_awaited_once_with()
+
+
+@pytest.mark.vllm
+def test_vllm_worker_rejects_reload_refit_when_colocated():
+    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+
+    with pytest.raises(AssertionError, match="refit_with_reload_api=true.*colocated"):
+        worker._init_config(
+            {
+                "vllm_cfg": {"refit_with_reload_api": True},
+                "colocated": {"enabled": True},
+            },
+            bundle_indices=None,
+            fraction_of_gpus=1.0,
+            seed=None,
+            extra_env_vars=None,
+        )
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("async_engine", "expected_method"),
+    [(False, "prepare_refit_info"), (True, "prepare_refit_info_async")],
+)
+def test_generation_prepare_refit_info_keeps_reload_flag_out_of_rpc(
+    monkeypatch, async_engine, expected_method
+):
+    from nemo_rl.models.generation.vllm import vllm_generation
+
+    generation = vllm_generation.VllmGeneration.__new__(vllm_generation.VllmGeneration)
+    generation.cfg = {
+        "vllm_cfg": {
+            "async_engine": async_engine,
+            "refit_with_reload_api": True,
+        }
+    }
+    generation.worker_group = SimpleNamespace(
+        run_all_workers_single_data=MagicMock(return_value=["future"])
+    )
+    ray_get = MagicMock()
+    monkeypatch.setattr(vllm_generation.ray, "get", ray_get)
+    state_dict_info = {"model.weight": object()}
+
+    generation.prepare_refit_info(state_dict_info)
+
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        expected_method,
+        state_dict_info=state_dict_info,
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+    ray_get.assert_called_once_with(["future"])
 
 
 @pytest.mark.vllm

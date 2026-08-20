@@ -9,9 +9,10 @@ ARM=${ARM:-bf16}
 MAX_STEPS=${MAX_STEPS:-20}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-}
 RUN_SUFFIX=${RUN_SUFFIX:-$(date +%Y%m%d-%H%M%S)}
-BRANCH=${BRANCH:-sna/exp-gb200-deck-refresh-current}
+BRANCH=${BRANCH:-sna/exp-gb200-deck-refresh-repair}
 EXPECTED_HEAD=${EXPECTED_HEAD:-}
 MAX_NUM_SEQS=
+REFIT_WITH_RELOAD_API=false
 
 case "${MODEL}:${MODE}:${ARM}" in
   nano:sync:bf16|nano:sync:mxfp8)
@@ -36,6 +37,7 @@ case "${MODEL}:${MODE}:${ARM}" in
     COLOCATED=false
     ASYNC_GRPO=true
     VLLM_TP=1
+    REFIT_WITH_RELOAD_API=true
     DEFAULT_VLLM_GPU_MEMORY_UTILIZATION=0.5
     ;;
   qwen235:sync:mxfp8_legacy)
@@ -102,6 +104,7 @@ RUN_ARGS=(
   "policy.generation.vllm_cfg.pipeline_parallel_size=1"
   "policy.generation.vllm_cfg.expert_parallel_size=1"
   "policy.generation.vllm_cfg.async_engine=${ASYNC_GRPO}"
+  "policy.generation.vllm_cfg.refit_with_reload_api=${REFIT_WITH_RELOAD_API}"
   "policy.generation.vllm_cfg.enforce_eager=false"
   "policy.generation.vllm_cfg.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION}"
   "policy.generation.vllm_cfg.use_tqdm=false"
@@ -139,7 +142,7 @@ case "${ACTION}" in
 esac
 
 BASE=${BASE:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna}
-REPO=${REPO:-${BASE}/RL-gb200-deck-refresh-current}
+REPO=${REPO:-${BASE}/RL-gb200-deck-refresh-repair}
 CONTAINER=${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/mkar/containers/nemo-rl-nightly-ngc-20260815_212622.sqsh}
 HF_HOME=${HF_HOME:-${BASE}/hf_home}
 ACCOUNT=${SLURM_ACCOUNT:-nemotron_sw_post}
@@ -217,6 +220,7 @@ training_precision=bf16
 rollout_precision=${ROLLOUT_PRECISION}
 quantization_scope=${QUANTIZATION_SCOPE}
 refit_transport=${REFIT_TRANSPORT}
+refit_with_reload_api=${REFIT_WITH_RELOAD_API}
 colocated=${COLOCATED}
 cuda_graphs=enabled
 moe_backend=flashinfer_trtllm

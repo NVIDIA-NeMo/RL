@@ -70,6 +70,52 @@ def create_mock_state_dict_info(params):
     return {name: (tensor.shape, tensor.dtype) for name, tensor in params}
 
 
+def test_packed_broadcast_consumer_callback_is_eager(monkeypatch):
+    batches = [[("a", "a-value")], [("b", "b-value")]]
+    callbacks = []
+
+    monkeypatch.setattr(
+        "nemo_rl.utils.packed_tensor._packed_broadcast_consumer_batches",
+        lambda _iterator, _group, _src: iter(batches),
+    )
+
+    result = packed_broadcast_consumer(
+        iterator=iter(()),
+        group=object(),
+        src=0,
+        post_unpack_func=callbacks.append,
+    )
+
+    assert result is None
+    assert callbacks == batches
+
+
+def test_packed_broadcast_consumer_returns_lazy_flattened_iterator(monkeypatch):
+    batches_started = []
+
+    def batches(_iterator, _group, _src):
+        batches_started.append(True)
+        yield [("a", "a-value")]
+        yield [("b", "b-value")]
+
+    monkeypatch.setattr(
+        "nemo_rl.utils.packed_tensor._packed_broadcast_consumer_batches", batches
+    )
+
+    result = packed_broadcast_consumer(
+        iterator=iter(()),
+        group=object(),
+        src=0,
+        post_unpack_func=None,
+        return_iterator=True,
+    )
+
+    assert batches_started == []
+    assert result is not None
+    assert list(result) == [("a", "a-value"), ("b", "b-value")]
+    assert batches_started == [True]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_packed_broadcast_producer_consumer_roundtrip():
     """Test that producer and consumer work together correctly."""
