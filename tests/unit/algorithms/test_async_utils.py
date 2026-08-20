@@ -2122,6 +2122,17 @@ class TestAsyncTrajectoryCollector:
             "stop_token_ids": [1],
             "stop_strings": ["stop"],
         }
+        collector.master_config.env = {
+            "should_use_nemo_gym": True,
+            "nemo_gym": {
+                "effort_levels": {
+                    "low_weight": 0.25,
+                    "low_penalty": 2.0,
+                    "low_ub": 512,
+                    "low_string": "brief",
+                }
+            },
+        }
         target_weight = 15
         collector._generating_targets.add(target_weight)
         repeated_batch = BatchedDataDict(

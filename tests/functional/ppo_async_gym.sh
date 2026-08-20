@@ -40,20 +40,58 @@ jq -c '.responses_create_params.tools |= (.[0:1])' \
     data/workplace_assistant/validation.jsonl > "${VALIDATION_PATH}"
 
 cd "${PROJECT_ROOT}"
+# Keep shared backend, rollout, and Gym settings aligned with grpo_async_gym.sh.
 uv run coverage run -a \
     --data-file="${PROJECT_ROOT}/tests/.coverage" \
     --source="${PROJECT_ROOT}/nemo_rl" \
     "${PROJECT_ROOT}/examples/nemo_gym/run_ppo_nemo_gym.py" \
     --config "${PROJECT_ROOT}/examples/nemo_gym/ppo_math_rlvr_nemo_gym.yaml" \
     policy.model_name=Qwen/Qwen3-0.6B \
-    policy.dtensor_cfg.enabled=true \
-    policy.megatron_cfg.enabled=false \
+    policy.dtensor_cfg.enabled=false \
+    policy.megatron_cfg.enabled=true \
+    policy.megatron_cfg.converter_type=Qwen3ForCausalLM \
+    policy.megatron_cfg.tensor_model_parallel_size=1 \
+    policy.megatron_cfg.pipeline_model_parallel_size=1 \
+    policy.megatron_cfg.expert_model_parallel_size=1 \
+    policy.megatron_cfg.context_parallel_size=1 \
+    policy.megatron_cfg.sequence_parallel=false \
+    policy.megatron_cfg.activation_checkpointing=true \
+    policy.megatron_cfg.defer_fp32_logits=true \
+    policy.megatron_cfg.freeze_moe_router=false \
+    policy.megatron_cfg.moe_router_dtype=fp32 \
+    policy.megatron_cfg.moe_permute_fusion=true \
+    policy.megatron_cfg.moe_token_dispatcher_type=alltoall \
+    policy.megatron_cfg.moe_per_layer_logging=true \
+    policy.megatron_cfg.optimizer.lr=2.0e-6 \
+    policy.megatron_cfg.optimizer.min_lr=2.0e-6 \
+    policy.megatron_cfg.optimizer.weight_decay=0.01 \
+    policy.megatron_cfg.scheduler.lr_decay_iters=null \
+    policy.megatron_cfg.scheduler.lr_warmup_iters=0 \
+    policy.megatron_cfg.scheduler.lr_warmup_init=2.0e-6 \
+    ++policy.megatron_cfg.scheduler.override_opt_param_scheduler=true \
+    ++policy.megatron_cfg.checkpoint.async_save=true \
+    ++policy.megatron_cfg.train_iters=100000 \
+    policy.optimizer=null \
+    policy.scheduler=null \
     value.model_name=Qwen/Qwen3-0.6B \
-    value.dtensor_cfg.enabled=true \
-    value.megatron_cfg.enabled=false \
+    value.reward_model_cfg.enabled=false \
+    value.dtensor_cfg.enabled=false \
+    value.megatron_cfg.enabled=true \
+    value.megatron_cfg.tensor_model_parallel_size=1 \
+    value.megatron_cfg.pipeline_model_parallel_size=1 \
+    value.megatron_cfg.expert_model_parallel_size=1 \
+    value.megatron_cfg.context_parallel_size=1 \
+    value.megatron_cfg.sequence_parallel=false \
+    value.optimizer=null \
+    value.scheduler=null \
     policy.generation.vllm_cfg.tensor_parallel_size=1 \
+    policy.generation.vllm_cfg.async_engine=true \
+    policy.generation.vllm_cfg.expose_http_server=true \
+    policy.generation.vllm_cfg.gpu_memory_utilization=0.7 \
     ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.enable_auto_tools=true \
     ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.tool_parser=hermes \
+    ++policy.generation.vllm_kwargs.compilation_config.backend=eager \
+    ++policy.generation.vllm_kwargs.mamba_ssm_cache_dtype=float32 \
     policy.max_total_sequence_length=768 \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.num_nodes=1 \
@@ -80,6 +118,12 @@ uv run coverage run -a \
     checkpointing.save_period=5 \
     checkpointing.checkpoint_dir="${CHECKPOINT_DIR}" \
     'env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/workplace_assistant/configs/workplace_assistant.yaml]' \
+    ++env.nemo_gym.policy_model.responses_api_models.vllm_model.uses_reasoning_parser=false \
+    ++env.nemo_gym.policy_model.responses_api_models.vllm_model.extra_body.chat_template_kwargs.enable_thinking=false \
+    env.should_log_nemo_gym_responses=true \
+    ++env.should_mask_flagged_samples=true \
+    data.shuffle=true \
+    data.num_workers=0 \
     data.train.data_path="${TRAIN_PATH}" \
     data.validation.data_path="${VALIDATION_PATH}" \
     "$@" \

@@ -54,6 +54,9 @@ uv run coverage run -a \
     policy.generation.vllm_cfg.tensor_parallel_size=1 \
     ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.enable_auto_tools=true \
     ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.tool_parser=hermes \
+    policy.generation.vllm_cfg.gpu_memory_utilization=0.7 \
+    ++policy.generation.vllm_kwargs.compilation_config.backend=eager \
+    ++policy.generation.vllm_kwargs.mamba_ssm_cache_dtype=float32 \
     policy.max_total_sequence_length=768 \
     policy.generation.colocated.enabled=true \
     ppo.num_prompts_per_step=4 \
@@ -73,6 +76,12 @@ uv run coverage run -a \
     checkpointing.save_period=5 \
     checkpointing.checkpoint_dir="${CHECKPOINT_DIR}" \
     'env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/workplace_assistant/configs/workplace_assistant.yaml]' \
+    ++env.nemo_gym.policy_model.responses_api_models.vllm_model.uses_reasoning_parser=false \
+    ++env.nemo_gym.policy_model.responses_api_models.vllm_model.extra_body.chat_template_kwargs.enable_thinking=false \
+    env.should_log_nemo_gym_responses=true \
+    ++env.should_mask_flagged_samples=true \
+    data.shuffle=true \
+    data.num_workers=0 \
     data.train.data_path="${TRAIN_PATH}" \
     data.validation.data_path="${VALIDATION_PATH}" \
     "$@" \
