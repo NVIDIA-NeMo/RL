@@ -93,6 +93,9 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation.get_logger_metrics.return_value = {}
     policy_generation.blocks_training.return_value = False
     policy_generation.wake_carries_weight_updates.return_value = False
+    policy_generation.weight_synchronizer = MagicMock()
+    policy_generation.weight_synchronizer.is_stale = True
+    policy_generation.weight_synchronizer.sync_weights.return_value = {}
     return policy_generation
 
 

@@ -416,8 +416,8 @@ def test_megatron_generation_colocated(
     config["megatron_cfg"]["transformer_impl"] = train_impl
     config["generation"]["mcore_generation_config"]["transformer_impl"] = gen_impl
     if train_impl == "inference_optimized":
-        # The parity block below does not reflect any real use-case.
-        # We must disable CUDA graphs beforehand just for this test.
+        # The parity block's sleep/wake cycle would tear down and recapture
+        # CUDA graphs mid-test; keep them off here.
         config["generation"]["mcore_generation_config"]["cuda_graph_impl"] = "none"
         # The parity block's 2-sample batch shards to 1 sample per DP rank
         # (DP=2 on the 2-GPU cluster); the logprob microbatch must divide it.
@@ -493,6 +493,8 @@ def test_megatron_generation_colocated(
                     "input_lengths": sampled["unpadded_sequence_lengths"],
                 }
             )
+            # Production ordering: the engine stands down before any training-path forward.
+            mg.finish_generation(release_gpu=True)
             policy.prepare_for_lp_inference()
             lp_logprobs = policy.get_logprobs(fprop_data)["logprobs"]
             gen_mask = torch.zeros_like(sampled["logprobs"], dtype=torch.bool)
@@ -510,6 +512,8 @@ def test_megatron_generation_colocated(
                 f"diverge from policy logprobs (avg prob mult error "
                 f"{avg_prob_mult_error:.4f})"
             )
+            # Wake the engine again for the post-shutdown generation check.
+            mg.prepare_for_generation()
 
         # ownership guard: shutdown is a no-op, so the wrapped policy keeps generating
         assert mg.shutdown() is True
