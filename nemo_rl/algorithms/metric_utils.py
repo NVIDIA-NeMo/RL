@@ -28,7 +28,8 @@ class SetupTimingMetrics:
     trtllm_init_time_s: Optional[float] = None
     megatron_generation_init_time_s: Optional[float] = None
 
-    # SC only: generation init (reserve + load).
+    # Generation init phases. generation_init_time_s is SC only (reserve + load);
+    # grpo.py's megatron path also populates reserve and load.
     generation_init_time_s: Optional[float] = None
     generation_init_reserve_time_s: Optional[float] = None
     generation_init_load_time_s: Optional[float] = None
@@ -77,21 +78,24 @@ def print_setup_timing_summary(
     """
     print("\n▶ Worker Initialization Timing:")
 
-    if metrics.generation_init_reserve_time_s:
+    if gen_init_time_key is not None:
+        # grpo.py path; megatron+gym overlap also reserves the server address.
+        assert metrics.generation_init_time_s is None
+        gen_line = f"  Generation init: {getattr(metrics, gen_init_time_key):.1f}s"
+        if metrics.generation_init_reserve_time_s:
+            gen_line += f" (+ reserve {metrics.generation_init_reserve_time_s:.1f}s)"
+        print(gen_line)
+    elif metrics.generation_init_reserve_time_s:
         # SC + gym-on path
         print(
             f"  Generation init: {metrics.generation_init_time_s:.1f}s"
             f" (reserve {metrics.generation_init_reserve_time_s:.1f}s"
             f" + load {metrics.generation_init_load_time_s:.1f}s)"
         )
-    elif gen_init_time_key is None:
+    else:
         # SC + gym-off path
         assert metrics.generation_init_time_s is not None
         print(f"  Generation init: {metrics.generation_init_time_s:.1f}s")
-    else:
-        # grpo.py path
-        assert metrics.generation_init_time_s is None
-        print(f"  Generation init: {getattr(metrics, gen_init_time_key):.1f}s")
 
     print(f"  Policy init: {metrics.policy_init_time_s:.1f}s")
 

@@ -1289,11 +1289,15 @@ def setup(
                 "  ⚡ Reserving the Megatron server address for overlapped NeMo Gym init",
                 flush=True,
             )
+            reserve_t0 = time.perf_counter()
             reserved_url, reserved_http_server_port, port_holder = (
                 MegatronGeneration.reserve_http_server_address(
                     train_cluster if colocated_inference else inference_cluster,
                     policy_config,
                 )
+            )
+            setup_timing_metrics.generation_init_reserve_time_s = (
+                time.perf_counter() - reserve_t0
             )
             print(f"  ✓ Reserved Megatron server URL: {reserved_url}", flush=True)
 
