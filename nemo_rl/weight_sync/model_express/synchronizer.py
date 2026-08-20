@@ -70,10 +70,8 @@ class ModelExpressWeightSynchronizer(WeightSynchronizer):
             raise RuntimeError(
                 "ModelExpress trainer initialization returned no source slots"
             )
-        if len(set(slots)) != len(slots):
-            raise RuntimeError("ModelExpress trainer source slots must be unique")
         self._generation.initialize_model_express(server_url=self._server_url)
-        self._source_slots = sorted(slots)
+        self._source_slots = sorted(set(slots))
 
     def _create_weight_version(self) -> Any:
         assert self._source_slots is not None

@@ -75,20 +75,6 @@ def create_weight_synchronizer(
         )
 
     if generation.cfg.get("refit_transport") == "model_express":
-        policy_cfg = policy.cfg
-        if not policy_cfg["megatron_cfg"]["enabled"]:
-            raise ValueError(
-                "ModelExpress refit currently requires the Megatron policy backend."
-            )
-        if colocated:
-            raise ValueError(
-                "ModelExpress refit currently requires non-colocated trainer "
-                "and generation workers."
-            )
-        if generation_backend != VLLM_BACKEND:
-            raise NotImplementedError(
-                "ModelExpress refit currently supports only the vLLM generation backend."
-            )
         from nemo_rl.weight_sync.model_express import ModelExpressWeightSynchronizer
 
         refit_cfg = generation.cfg.get("refit_cfg")

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Sequence

@@ -2298,9 +2298,7 @@ class MegatronPolicyWorkerImpl(
         ]
 
     def initialize_model_express(self, *, server_url: str | None = None) -> str | None:
-        """Initialize MX publication on one DP/CP replica of each model shard."""
-        if parallel_state.get_data_parallel_rank() != 0:
-            return None
+        """Initialize MX publication on every DP replica of each model shard."""
         if parallel_state.get_context_parallel_rank() != 0:
             return None
         if self._model_express is None:

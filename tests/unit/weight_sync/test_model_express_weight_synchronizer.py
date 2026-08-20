@@ -54,6 +54,21 @@ def test_sync_runs_complete_version_lifecycle():
     assert sync.is_stale is False
 
 
+def test_sync_treats_duplicate_slots_as_redundant_publishers():
+    sync, policy, _generation, control = _sync()
+    policy.initialize_model_express.return_value = [
+        "megatron:partition:a",
+        "megatron:partition:a",
+    ]
+
+    sync.init_communicator()
+    sync.sync_weights()
+
+    assert control.create_weight_version.call_args.kwargs[
+        "expected_source_slots"
+    ] == ["megatron:partition:a"]
+
+
 def test_sync_retires_and_releases_version_when_update_fails():
     sync, policy, generation, control = _sync()
     sync.init_communicator()
@@ -102,9 +117,20 @@ def test_sync_requires_ready_version_before_generator_update():
     policy.release_model_express_version.assert_called_once()
 
 
-def test_factory_routes_model_express_before_checkpoint_engine_parsing():
+@pytest.mark.parametrize(
+    ("generation_backend", "colocated"),
+    [
+        ("vllm", False),
+        ("sglang", True),
+        ("megatron", False),
+        ("dynamo", True),
+    ],
+)
+def test_factory_routes_model_express_without_capability_gates(
+    generation_backend: str, colocated: bool
+):
     policy = MagicMock()
-    policy.cfg = {"megatron_cfg": {"enabled": True}}
+    policy.cfg = {"megatron_cfg": {"enabled": False}}
     generation = MagicMock()
     generation.cfg = {
         "model_name": "test/model",
@@ -114,22 +140,14 @@ def test_factory_routes_model_express_before_checkpoint_engine_parsing():
         ),
     }
 
-    with pytest.raises(ValueError, match="non-colocated"):
-        create_weight_synchronizer(
-            policy=policy,
-            generation=generation,
-            generation_backend="vllm",
-            colocated=True,
-        )
-
     with patch(
         "nemo_rl.weight_sync.model_express.ModelExpressWeightSynchronizer"
     ) as constructor:
         result = create_weight_synchronizer(
             policy=policy,
             generation=generation,
-            generation_backend="vllm",
-            colocated=False,
+            generation_backend=generation_backend,
+            colocated=colocated,
         )
 
     assert result is constructor.return_value
@@ -138,21 +156,3 @@ def test_factory_routes_model_express_before_checkpoint_engine_parsing():
         generation=generation,
         server_url="mx-server:50051",
     )
-
-
-def test_factory_rejects_model_express_with_non_megatron_policy():
-    policy = MagicMock()
-    policy.cfg = {"megatron_cfg": {"enabled": False}}
-    generation = MagicMock()
-    generation.cfg = {
-        "refit_transport": "model_express",
-        "refit_cfg": SimpleNamespace(model_express=SimpleNamespace(server_url=None)),
-    }
-
-    with pytest.raises(ValueError, match="Megatron policy backend"):
-        create_weight_synchronizer(
-            policy=policy,
-            generation=generation,
-            generation_backend="vllm",
-            colocated=False,
-        )

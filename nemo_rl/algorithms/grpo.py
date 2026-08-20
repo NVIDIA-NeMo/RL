@@ -1588,7 +1588,6 @@ def setup(
 
     if model_express_refit_enabled:
         t0 = time.perf_counter()
-        assert isinstance(policy_generation, VllmGeneration)
         policy_generation.weight_synchronizer = create_weight_synchronizer(
             policy=policy,
             generation=policy_generation,
