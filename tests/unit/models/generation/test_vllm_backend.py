@@ -162,9 +162,7 @@ def test_process_hpc_modules_after_loading(monkeypatch):
     model = SimpleNamespace(
         named_modules=lambda: [("", other_module), ("rope_norm", hpc_module)]
     )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.hpc.HpcModule", FakeHpcModule
-    )
+    monkeypatch.setattr("vllm.model_executor.layers.hpc.HpcModule", FakeHpcModule)
 
     vllm_backend._process_hpc_modules_after_loading(model)
 
