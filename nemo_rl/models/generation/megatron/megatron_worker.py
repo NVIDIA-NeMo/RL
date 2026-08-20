@@ -377,8 +377,9 @@ class MegatronGenerationMixin:
                 engine must fully stand down. Pass False between generation
                 phases (e.g. after validation) to let a colocated engine keep
                 serving; tearing it down there would discard KV/prefix caches
-                and CUDA graphs for no reason. Non-colocated engines wind
-                down either way.
+                and CUDA graphs for no reason.
+                For non-colocated engines this body reduces to a rotary-cache clear
+                (their engine pause happens in suspend_for_refit).
         """
         if self.is_generation_colocated and not for_training:
             return
@@ -414,10 +415,24 @@ class MegatronGenerationMixin:
     def prepare_for_generation(self, tags=None, **kwargs) -> None:
         """Enter inference mode and start (or wake) the inference engine.
 
+        Idempotent wake: a plain call (no tags) on an already-serving engine returns immediately.
+        Refit-protocol calls (tags) are never skipped.
+
         Called in both colocated and non-colocated setups.
         Even in non-colocated mode, Megatron's engine has to be intentionally paused before a refit
         (and its weights are not detachable), so we have to switch modes around every refit.
         """
+        if (
+            tags is None
+            and self._inference_engine_initialized
+            and not self._inference_engine_asleep
+        ):
+            print(
+                f"[Rank {self.rank}] prepare_for_generation: engine already "
+                "serving, skipping",
+                flush=True,
+            )
+            return
         log_gpu_memory("prepare_for_generation START")
         mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
 

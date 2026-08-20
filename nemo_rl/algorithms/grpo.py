@@ -4981,13 +4981,23 @@ def async_grpo_train(
                     or (step + 1) % master_config.checkpointing["save_period"] == 0
                     or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
                 )
+                # Checked pre-validation so the wake-deferral below can see it.
+                # A crossing during refit/validation is caught by the lookahead in check_save.
                 should_save_by_timeout = timeout.check_save()
                 will_save_checkpoint = master_config.checkpointing["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 )
+                # An early stop (known only after validation) also saves.
+                saving_this_step = will_save_checkpoint
+                # Save-bound colocated steps leave the engine asleep through save with no transfer.
+                defer_wake_for_save = (
+                    policy_generation.blocks_training()
+                    and will_save_checkpoint
+                    and policy_generation.wake_carries_weight_updates()
+                )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
-                if colocated_inference and will_save_checkpoint:
+                if defer_wake_for_save:
                     # Wake-deferral (checkpoint scheduling, which the backend
                     # cannot see): the engine is about to be saved, so leave it
                     # asleep; just drop training-only buffers and version-stamp
@@ -5003,7 +5013,9 @@ def async_grpo_train(
                         policy.offload_before_refit()
                     POLICY_GENERATION_STALE = False
                     weight_version += 1
-                    trajectory_collector.set_weight_version.remote(weight_version)
+                    ray.get(
+                        trajectory_collector.set_weight_version.remote(weight_version)
+                    )
                 else:
                     timer.start("idle/refit_bubble")
 
@@ -5015,10 +5027,7 @@ def async_grpo_train(
                     # Collect generation logger metrics for performance reporting
                     # inflight batch sizes and num pending samples are collected from each worker
                     # (colocated collects them before the engine sleeps for training).
-                    if (
-                        policy_generation is not None
-                        and generation_logger_metrics is None
-                    ):
+                    if generation_logger_metrics is None:
                         generation_logger_metrics = (
                             policy_generation.get_logger_metrics()
                         )
@@ -5096,11 +5105,21 @@ def async_grpo_train(
                             logger=logger,
                             processor=processor,
                         )
+                        # An early stop triggers a save; must note before engine wake/resume.
+                        early_stop_message = _validation_early_stop_message(
+                            val_metrics,
+                            stop_at_validation_threshold,
+                            stop_at_validation_metric,
+                        )
+                        saving_this_step = will_save_checkpoint or (
+                            master_config.checkpointing["enabled"]
+                            and early_stop_message is not None
+                        )
                         # Save-bound steps need the GPUs for checkpointing,
                         # so the engine must stand down; otherwise a colocated
                         # engine keeps serving (backend's call).
                         policy_generation.finish_generation(
-                            for_training=will_save_checkpoint
+                            for_training=saving_this_step
                         )
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"
@@ -5116,11 +5135,6 @@ def async_grpo_train(
                                     step + 1,
                                     prefix="validation",
                                 )
-                        early_stop_message = _validation_early_stop_message(
-                            val_metrics,
-                            stop_at_validation_threshold,
-                            stop_at_validation_metric,
-                        )
                         if early_stop_message is not None:
                             # Exit at the end of this step, after checkpointing.
                             print(early_stop_message, flush=True)
@@ -5214,13 +5228,7 @@ def async_grpo_train(
                 consumed_samples += master_config.grpo.num_prompts_per_step
                 timeout.mark_iteration()
 
-                # Early stop saves the final state like a last step; it is only
-                # known after validation, so it cannot fold into the earlier
-                # will_save_checkpoint computation.
-                if will_save_checkpoint or (
-                    master_config.checkpointing["enabled"]
-                    and early_stop_message is not None
-                ):
+                if saving_this_step:
                     grpo_save_state.current_step = step + 1
                     grpo_save_state.total_valid_tokens = total_valid_tokens
                     if val_metrics is not None:
@@ -5316,12 +5324,20 @@ def async_grpo_train(
                             checkpointer, last_checkpoint_step=step + 1
                         )
 
-                    # On save-bound steps, engine stayed asleep after training.
-                    # (On an early-stop save it is already awake and the loop
-                    # exits right below, so no wake is needed.)
-                    if colocated_inference and will_save_checkpoint:
+                    # On save-bound steps, engine stayed asleep after training;
+                    # wake it unless the loop exits right below (last step, timeout, early stop),
+                    # where a wake would only feed the teardown.
+                    # The intervening logging runs with the collector paused either way.
+                    if defer_wake_for_save and not (
+                        is_last_step
+                        or should_save_by_timeout
+                        or early_stop_message is not None
+                    ):
+                        # The save onloaded model+optimizer;
+                        # generation windows must start from the offloaded state.
+                        policy.offload_after_refit()
                         policy_generation.prepare_for_generation()
-                        trajectory_collector.resume_after_refit.remote()
+                        ray.get(trajectory_collector.resume_after_refit.remote())
 
             # Logging
             # Log training data (match sync GRPO logging payload for parity).

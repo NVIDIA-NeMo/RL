@@ -379,7 +379,7 @@ def _compute_seq_logprob_error_metrics(
 
 def grpo_train_sync(
     policy: ColocatablePolicyInterface,
-    policy_generation: Optional[GenerationInterface],
+    policy_generation: GenerationInterface,
     wrapped_dataloader,
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer,
@@ -571,8 +571,7 @@ def grpo_train_sync(
                 )
 
             maybe_gpu_profile_step(policy, total_steps + 1)
-            if policy != policy_generation:
-                maybe_gpu_profile_step(policy_generation, total_steps + 1)
+            maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
             with timer.time("total_step_time"):

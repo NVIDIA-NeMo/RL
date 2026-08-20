@@ -259,14 +259,13 @@ class MegatronGeneration(GenerationInterface):
             ]
         return True
 
-    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+    def finish_generation(self, *, for_training: bool = True) -> bool:
         """Clean up after generation.
 
-        Accepts `for_training` (default True): when False, a colocated engine
-        keeps serving instead of standing down (see the worker docstring).
+        When `for_training` is False, a colocated engine keeps serving instead of standing down.
         """
         futures = self._policy.worker_group.run_all_workers_single_data(
-            "finish_generation", **kwargs
+            "finish_generation", for_training=for_training
         )
         ray.get(futures)
         return True
@@ -277,6 +276,10 @@ class MegatronGeneration(GenerationInterface):
         Colocated generation shares the training GPUs, so the training
         loop must wind the engine down before it can train.
         """
+        return bool(self.cfg["colocated"]["enabled"])
+
+    def wake_carries_weight_updates(self) -> bool:
+        """The colocated wake reshards (or shares tensors); see the ABC."""
         return bool(self.cfg["colocated"]["enabled"])
 
     def invalidate_kv_cache(self) -> bool:

@@ -75,11 +75,19 @@ class MCoreGenerationConfig(GenerationConfig):
 def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]:
     """The `megatron_cfg` a dedicated inference model runs with."""
     generation_config = cast(MCoreGenerationConfig, policy_config["generation"])
-    return {
+    merged: dict[str, Any] = {
         **cast(dict[str, Any], policy_config["megatron_cfg"]),
         **(generation_config.get("mcore_generation_config") or {}),
         "activation_checkpointing": False,
     }
+    # inference_optimized layers hard-require SP with TP>1;
+    # this is a derived config, so complete it rather than assert.
+    if (
+        merged.get("transformer_impl") == "inference_optimized"
+        and merged["tensor_model_parallel_size"] > 1
+    ):
+        merged["sequence_parallel"] = True
+    return merged
 
 
 def dedicated_inference_megatron_cfg(
@@ -92,8 +100,8 @@ def dedicated_inference_megatron_cfg(
     builds a second model and reshards into it on every wake. Inference never
     uses CP, so CP is pinned to 1 (CP>1 training therefore always differs).
 
-    Returns None when the resolved config matches training (dual-mode: generate
-    directly on the shared training model).
+    Returns None when the resolved config matches training (reshardless:
+    generate directly on the shared training model).
     """
     inference_mcfg = merged_inference_megatron_cfg(policy_config)
     inference_mcfg["context_parallel_size"] = 1

@@ -415,6 +415,10 @@ def test_megatron_generation_colocated(
     # the shared GPUs.
     config["megatron_cfg"]["transformer_impl"] = train_impl
     config["generation"]["mcore_generation_config"]["transformer_impl"] = gen_impl
+    if train_impl == "inference_optimized":
+        # The parity block below does not reflect any real use-case.
+        # We must disable CUDA graphs beforehand just for this test.
+        config["generation"]["mcore_generation_config"]["cuda_graph_impl"] = "none"
 
     # construction guard: exactly one of `cluster` / `policy` is required
     with pytest.raises(AssertionError):
