@@ -30,6 +30,7 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
+from nemo_rl.weight_sync.mx_collective_bootstrap import mx_lane_order
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 MX_COLLECTIVE_TRANSPORT = "mx_nccl_reshard"
@@ -120,13 +121,33 @@ class MxCollectiveWeightSynchronizer(WeightSynchronizer):
             source_partition_count=pp_size,
             plan_digest=digest,
         )
-        # Both sides block inside the collective bootstrap, so they have to be
-        # in flight together.
-        futures_train = self._policy.init_mx_reshard_comm_group(
-            pp_stages=pp_stages, **common
-        )
-        futures_gen = self._generation.init_mx_reshard_comm_group(**common)
-        ray.get(futures_train + futures_gen)
+
+        def both(phase):
+            """Run one phase on every worker and wait for all of them.
+
+            The wait is the point. Creating two different NCCL communicators
+            concurrently across overlapping rank sets deadlocks, so no worker
+            may start lane N+1 while another is still inside lane N. The
+            TCPStore path separates its all-ranks group from its per-stage
+            groups for exactly this reason.
+            """
+            futures_train = self._policy.init_mx_reshard_comm_group(
+                pp_stages=pp_stages, phase=phase, **common
+            )
+            futures_gen = self._generation.init_mx_reshard_comm_group(
+                phase=phase, **common
+            )
+            ray.get(futures_train + futures_gen)
+
+        # Both sides block inside the rendezvous, so they have to be in flight
+        # together; no communicator is created yet.
+        both("rendezvous")
+
+        # Broadcast lane first: every rank is in it, so the barrier after it is
+        # a full-cluster sync point. Then each reshard lane, one at a time.
+        for lane_id in mx_lane_order(pp_size):
+            both(lane_id)
+        both("finish")
         print("[mx] communicators ready", flush=True)
 
         self._generation.prepare_nccl_reshard_refit_info(refit_info)

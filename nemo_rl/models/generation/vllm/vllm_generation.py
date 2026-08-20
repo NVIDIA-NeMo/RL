@@ -1151,6 +1151,7 @@ class VllmGeneration(GenerationInterface):
         generator_slots: list,
         source_partition_count: int,
         plan_digest: str = "",
+        phase: object = "all",
     ) -> list[ray.ObjectRef]:
         """Initialize the ModelExpress-brokered comm groups on all gen workers."""
         if not self.worker_group or not self.worker_group.workers:
@@ -1177,6 +1178,7 @@ class VllmGeneration(GenerationInterface):
                 "generator_slots": generator_slots,
                 "source_partition_count": source_partition_count,
                 "plan_digest": plan_digest,
+                "phase": phase,
             },
         )
         # co-works with lm_policy; wait for all futures to complete outside

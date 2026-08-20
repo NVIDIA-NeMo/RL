@@ -1240,6 +1240,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         generator_slots: list,
         source_partition_count: int,
         plan_digest: str = "",
+        phase: object = "all",
     ) -> None:
         """Forward ModelExpress comm-group init to vLLM backend workers."""
         self.llm.collective_rpc(
@@ -1252,6 +1253,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 generator_slots,
                 source_partition_count,
                 plan_digest,
+                phase,
             ),
         )
 

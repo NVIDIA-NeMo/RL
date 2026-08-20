@@ -66,7 +66,23 @@ class MxProcessGroup:
         )
 
 
-def build_mx_groups(
+class MxBootstrapState:
+    """Rendezvous result plus the lane communicators built so far.
+
+    Held across phases because lane creation is driven from the driver, one
+    lane at a time with a barrier between them.
+    """
+
+    def __init__(self, membership, ids, device, worker_id):
+        self.membership = membership
+        self.ids = ids
+        self.device = device
+        self.worker_id = worker_id
+        self.reshard_groups = {}
+        self.broadcast_group = None
+
+
+def mx_rendezvous(
     *,
     mx_server_url: str,
     model_name: str,
@@ -81,12 +97,11 @@ def build_mx_groups(
     plan_digest: str = "",
     device=None,
     timeout_s: float = 900.0,
-):
-    """Join the MX group and return this worker's initialized lane groups.
+) -> MxBootstrapState:
+    """Join the MX group and fetch every lane's identifier.
 
-    Returns ``(reshard_group, broadcast_group, lane_ids)``. The reshard group is
-    this worker's own source partition on the trainer side; a generator joins
-    every reshard lane, so it takes the one it was asked for.
+    No communicator is created here. Creation is a separate phase per lane so
+    the driver can barrier between them.
     """
     import grpc
     from modelexpress_rl.collective import CollectiveRendezvous, Role
@@ -127,26 +142,51 @@ def build_mx_groups(
         group_id=membership.group_id, epoch=membership.epoch, timeout_s=timeout_s
     )
     ids = {lane.lane_id: bytes(lane.nccl_unique_id) for lane in group.lanes}
-
     if device is None:
         device = torch.cuda.current_device()
+    return MxBootstrapState(membership, ids, device, worker_id)
 
-    reshard_groups = {}
-    broadcast_group = None
-    # Lane order matters: a generator joins every reshard lane, and the trainers
-    # in each lane are blocked inside their own bootstrap until it does. Creating
-    # them in ascending lane order is what makes the two sides unblock in the
-    # same sequence rather than deadlocking against each other.
-    for lane in sorted(membership.lanes, key=lambda l: l.lane_id):
-        pg = MxProcessGroup(
-            unique_id=ids[lane.lane_id],
-            rank=lane.rank_in_lane,
-            world_size=lane.world_size,
-        )
-        pg.init_nccl_communicator(device=device)
-        if lane.kind == "BROADCAST":
-            broadcast_group = pg
-        else:
-            reshard_groups[lane.lane_id] = pg
 
-    return reshard_groups, broadcast_group, membership
+def mx_init_lane(state: MxBootstrapState, lane_id: int) -> None:
+    """Create this worker's communicator for one lane, if it belongs to it.
+
+    One lane at a time, cluster-wide, is not an optimisation to be undone:
+    creating two different communicators concurrently across overlapping rank
+    sets deadlocks NCCL. A worker not in ``lane_id`` returns immediately and
+    waits at the driver's barrier rather than racing ahead into its next lane.
+    """
+    lane = next((l for l in state.membership.lanes if l.lane_id == lane_id), None)
+    if lane is None:
+        return
+    pg = MxProcessGroup(
+        unique_id=state.ids[lane.lane_id],
+        rank=lane.rank_in_lane,
+        world_size=lane.world_size,
+    )
+    pg.init_nccl_communicator(device=state.device)
+    if lane.kind == "BROADCAST":
+        state.broadcast_group = pg
+    else:
+        state.reshard_groups[lane.lane_id] = pg
+
+
+def mx_lane_order(source_partition_count: int) -> list:
+    """Cluster-wide lane creation order.
+
+    Broadcast first because every rank is in it, so the barrier that follows is
+    a full-cluster sync point; then the reshard lanes in ascending order.
+    """
+    return [source_partition_count] + list(range(source_partition_count))
+
+
+def build_mx_groups(**kwargs):
+    """Single-process convenience wrapper: rendezvous then every lane in order.
+
+    Safe only when one process drives all ranks (tests). Real deployments must
+    use the phased API so the driver can barrier between lanes.
+    """
+    spc = kwargs["source_partition_count"]
+    state = mx_rendezvous(**kwargs)
+    for lane_id in mx_lane_order(spc):
+        mx_init_lane(state, lane_id)
+    return state.reshard_groups, state.broadcast_group, state.membership

@@ -293,29 +293,42 @@ class VllmInternalWorkerExtension:
         generator_slots: list,
         source_partition_count: int,
         plan_digest: str = "",
+        phase: object = "all",
     ) -> None:
-        """Bootstrap this gen worker's comm groups through ModelExpress."""
+        """Bootstrap this gen worker's comm groups through ModelExpress.
+
+        Phased for the same reason the trainer side is: one lane at a time,
+        cluster-wide, with the driver barriering between them.
+        """
         import os
 
-        from nemo_rl.weight_sync.mx_collective_bootstrap import build_mx_groups
-
-        local_rank = torch.distributed.get_rank()
-        index_in_role = rank_prefix + local_rank
-        reshard_groups, broadcast, _ = build_mx_groups(
-            mx_server_url=mx_server_url,
-            model_name=model_name,
-            role="GENERATOR",
-            index_in_role=index_in_role,
-            slot_id=f"gen/{index_in_role}",
-            worker_id=f"gen-{index_in_role}-{os.getpid()}",
-            trainer_slots=trainer_slots,
-            generator_slots=generator_slots,
-            source_partition_count=source_partition_count,
-            plan_digest=plan_digest,
-            device=self.device,
+        from nemo_rl.weight_sync.mx_collective_bootstrap import (
+            mx_init_lane,
+            mx_rendezvous,
         )
-        self.pp_comm_groups = reshard_groups
-        self.model_update_group = broadcast
+
+        if phase == "rendezvous":
+            local_rank = torch.distributed.get_rank()
+            index_in_role = rank_prefix + local_rank
+            self._mx_state = mx_rendezvous(
+                mx_server_url=mx_server_url,
+                model_name=model_name,
+                role="GENERATOR",
+                index_in_role=index_in_role,
+                slot_id=f"gen/{index_in_role}",
+                worker_id=f"gen-{index_in_role}-{os.getpid()}",
+                trainer_slots=trainer_slots,
+                generator_slots=generator_slots,
+                source_partition_count=source_partition_count,
+                plan_digest=plan_digest,
+                device=self.device,
+            )
+            return
+        if phase == "finish":
+            self.pp_comm_groups = self._mx_state.reshard_groups
+            self.model_update_group = self._mx_state.broadcast_group
+            return
+        mx_init_lane(self._mx_state, int(phase))
 
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""

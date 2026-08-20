@@ -1161,6 +1161,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         source_partition_count: int,
         pp_stages: list,
         plan_digest: str = "",
+        phase: object = "all",
     ) -> list[ray.ObjectRef]:
         """Initialize the ModelExpress-brokered comm groups on all train workers."""
         futures = self.worker_group.run_all_workers_multiple_data(
@@ -1173,6 +1174,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "generator_slots": generator_slots,
                 "source_partition_count": source_partition_count,
                 "plan_digest": plan_digest,
+                "phase": phase,
             },
         )
         # co-works with vllm; wait for all futures to complete outside
