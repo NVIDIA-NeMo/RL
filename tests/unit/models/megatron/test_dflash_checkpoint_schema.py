@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
@@ -16,14 +30,12 @@ pytestmark = pytest.mark.mcore
 
 
 _PUBLIC_ARTIFACT_REPO = "z-lab/Qwen3-8B-DFlash-b16"
-_PUBLIC_ARTIFACT_REVISION = "9b41424b7109f9c5413454f481b09a82b85333f4"
-_PUBLIC_CONFIG_SHA256 = (
-    "9834d608c9ca53d5548b415471ae9e8ebc9aab6cedfc2a7af95b6bd097373102"
+_PUBLIC_ARTIFACT_REVISION = (
+    "9b41424b7109f9c5413454f481b09a82b85333f4"  # pragma: allowlist secret
 )
+_PUBLIC_CONFIG_SHA256 = "9834d608c9ca53d5548b415471ae9e8ebc9aab6cedfc2a7af95b6bd097373102"  # pragma: allowlist secret
 _PUBLIC_SAFETENSORS_HEADER_BYTES = 6_232
-_PUBLIC_SAFETENSORS_HEADER_SHA256 = (
-    "6724cbb4ec77638c24d878ce60aa4fbf0505f9ad3bc2b00110176767baf50856"
-)
+_PUBLIC_SAFETENSORS_HEADER_SHA256 = "6724cbb4ec77638c24d878ce60aa4fbf0505f9ad3bc2b00110176767baf50856"  # pragma: allowlist secret
 
 
 _LAYER_SUFFIXES = (
