@@ -111,21 +111,12 @@ def test_default_train_step_calls_production_block_only_attention(
         calls += 1
         return _load_module(_ATTENTION_MODULE).dflash_block_only_attention(**kwargs)
 
-    def reject_full_attention(**_kwargs: Any) -> tuple[Tensor, Tensor]:
-        raise AssertionError("the default benchmark must not call full attention")
-
     monkeypatch.setattr(
         benchmark,
         "dflash_block_only_attention",
         record_block_only_attention,
         raising=False,
     )
-    monkeypatch.setattr(
-        benchmark,
-        "dflash_block_attention",
-        reject_full_attention,
-    )
-
     benchmark._train_step(plan, inputs)
 
     assert calls == 1
@@ -145,9 +136,6 @@ def test_default_correctness_calls_production_block_only_attention(
         calls += 1
         return _load_module(_ATTENTION_MODULE).dflash_block_only_attention(**kwargs)
 
-    def reject_full_attention(**_kwargs: Any) -> tuple[Tensor, Tensor]:
-        raise AssertionError("default correctness must not call full attention")
-
     def run_without_cuda_timing(_device: torch.device, operation: Any) -> float:
         operation()
         return 0.0
@@ -160,12 +148,6 @@ def test_default_correctness_calls_production_block_only_attention(
         record_block_only_attention,
         raising=False,
     )
-    monkeypatch.setattr(
-        benchmark,
-        "dflash_block_attention",
-        reject_full_attention,
-    )
-
     record = benchmark._correctness_comparison(
         device=torch.device("cpu"),
         iterations=1,
@@ -174,12 +156,6 @@ def test_default_correctness_calls_production_block_only_attention(
     assert calls == 2
     assert record["kind"] == "block_only_forward_correctness_comparison"
     assert record["attention_path"] == "dflash_block_only_attention"
-
-
-def _load_attention_contract() -> tuple[type[Any], Any]:
-    plan_module = _load_module(_PLAN_MODULE)
-    attention_module = _load_module(_ATTENTION_MODULE)
-    return plan_module.DFlashBatchPlan, attention_module.dflash_block_attention
 
 
 def _load_block_only_attention_contract() -> tuple[type[Any], Any]:
@@ -245,56 +221,24 @@ def _make_plan(
     )
 
 
-def _dense_attention_oracle(
+def _dense_block_attention_oracle(
     *,
     plan: Any,
-    trunk_q: Tensor,
     trunk_k: Tensor,
     trunk_v: Tensor,
     block_q: Tensor,
     block_k: Tensor,
     block_v: Tensor,
     scale: float | None = None,
-) -> tuple[Tensor, Tensor]:
+) -> Tensor:
     """Independent scalar-loop implementation of the written visibility rules."""
-    batch_size, sequence_length, num_query_heads, head_dim = trunk_q.shape
+    sequence_length = trunk_k.shape[1]
+    num_query_heads = block_q.shape[2]
+    head_dim = block_q.shape[3]
     num_kv_heads = trunk_k.shape[2]
     heads_per_group = num_query_heads // num_kv_heads
     effective_scale = head_dim**-0.5 if scale is None else scale
-    trunk_output = torch.zeros_like(trunk_q)
     block_output = torch.zeros_like(block_q)
-
-    for batch_index in range(batch_size):
-        for query_position in range(sequence_length):
-            if not bool(plan.token_valid_mask[batch_index, query_position]):
-                continue
-            visible_positions = [
-                key_position
-                for key_position in range(query_position + 1)
-                if bool(plan.token_valid_mask[batch_index, key_position])
-            ]
-            for query_head in range(num_query_heads):
-                kv_head = query_head // heads_per_group
-                query = trunk_q[batch_index, query_position, query_head]
-                keys = torch.stack(
-                    [
-                        trunk_k[batch_index, key_position, kv_head]
-                        for key_position in visible_positions
-                    ]
-                )
-                values = torch.stack(
-                    [
-                        trunk_v[batch_index, key_position, kv_head]
-                        for key_position in visible_positions
-                    ]
-                )
-                probabilities = torch.softmax(
-                    torch.mv(keys, query) * effective_scale,
-                    dim=0,
-                )
-                trunk_output[batch_index, query_position, query_head] = (
-                    probabilities.unsqueeze(0) @ values
-                ).squeeze(0)
 
     num_blocks, block_size = plan.slot_valid.shape
     for block_index in range(num_blocks):
@@ -341,7 +285,7 @@ def _dense_attention_oracle(
                     probabilities.unsqueeze(0) @ stacked_values
                 ).squeeze(0)
 
-    return trunk_output, block_output
+    return block_output
 
 
 def _clone_with_grad(tensors: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
@@ -363,12 +307,6 @@ def _random_attention_inputs(
 ) -> tuple[Tensor, ...]:
     generator = torch.Generator(device=device).manual_seed(seed)
     return (
-        torch.randn(
-            (batch_size, sequence_length, num_query_heads, head_dim),
-            generator=generator,
-            device=device,
-            dtype=dtype,
-        ),
         torch.randn(
             (batch_size, sequence_length, num_kv_heads, head_dim),
             generator=generator,
@@ -400,99 +338,6 @@ def _random_attention_inputs(
             dtype=dtype,
         ),
     )
-
-
-@pytest.mark.parametrize(
-    "num_query_heads,num_kv_heads",
-    [
-        pytest.param(2, 2, id="mha"),
-        pytest.param(4, 2, id="gqa"),
-    ],
-)
-def test_dense_fp32_forward_and_qkv_gradient_parity(
-    num_query_heads: int,
-    num_kv_heads: int,
-) -> None:
-    """Catches wrong visibility, GQA head mapping, scaling, or backward math."""
-    plan_type, attention = _load_attention_contract()
-    token_valid_mask = torch.tensor(
-        [
-            [True, True, True, True],
-            [True, True, True, False],
-        ]
-    )
-    plan = _make_plan(
-        plan_type,
-        token_valid_mask=token_valid_mask,
-        sample_rows=[0, 0, 0, 1],
-        anchor_positions=[0, 3, 4, 2],
-        slot_valid=torch.tensor(
-            [
-                [True, True, True],
-                [True, True, True],
-                [True, True, True],
-                [True, True, False],
-            ]
-        ),
-    )
-    generator = torch.Generator().manual_seed(1234)
-    head_dim = 3
-    tensors = (
-        torch.randn((2, 4, num_query_heads, head_dim), generator=generator),
-        torch.randn((2, 4, num_kv_heads, head_dim), generator=generator),
-        torch.randn((2, 4, num_kv_heads, head_dim), generator=generator),
-        torch.randn((4, 3, num_query_heads, head_dim), generator=generator),
-        torch.randn((4, 3, num_kv_heads, head_dim), generator=generator),
-        torch.randn((4, 3, num_kv_heads, head_dim), generator=generator),
-    )
-    production_inputs = _clone_with_grad(tensors)
-    oracle_inputs = _clone_with_grad(tensors)
-
-    production_outputs = attention(
-        plan=plan,
-        trunk_q=production_inputs[0],
-        trunk_k=production_inputs[1],
-        trunk_v=production_inputs[2],
-        block_q=production_inputs[3],
-        block_k=production_inputs[4],
-        block_v=production_inputs[5],
-    )
-    oracle_outputs = _dense_attention_oracle(
-        plan=plan,
-        trunk_q=oracle_inputs[0],
-        trunk_k=oracle_inputs[1],
-        trunk_v=oracle_inputs[2],
-        block_q=oracle_inputs[3],
-        block_k=oracle_inputs[4],
-        block_v=oracle_inputs[5],
-    )
-
-    assert len(production_outputs) == 2
-    torch.testing.assert_close(production_outputs[0], oracle_outputs[0])
-    torch.testing.assert_close(production_outputs[1], oracle_outputs[1])
-
-    trunk_weight = torch.randn(production_outputs[0].shape, generator=generator)
-    block_weight = torch.randn(production_outputs[1].shape, generator=generator)
-    production_loss = (production_outputs[0] * trunk_weight).sum() + (
-        production_outputs[1] * block_weight
-    ).sum()
-    oracle_loss = (oracle_outputs[0] * trunk_weight).sum() + (
-        oracle_outputs[1] * block_weight
-    ).sum()
-    production_gradients = torch.autograd.grad(production_loss, production_inputs)
-    oracle_gradients = torch.autograd.grad(oracle_loss, oracle_inputs)
-
-    for production_gradient, oracle_gradient in zip(
-        production_gradients,
-        oracle_gradients,
-        strict=True,
-    ):
-        torch.testing.assert_close(
-            production_gradient,
-            oracle_gradient,
-            atol=2e-5,
-            rtol=2e-5,
-        )
 
 
 @pytest.mark.parametrize(
@@ -535,7 +380,7 @@ def test_block_only_fp32_forward_and_gradient_parity(
         dtype=torch.float32,
         seed=909,
     )
-    production_inputs = _clone_with_grad(tensors[1:])
+    production_inputs = _clone_with_grad(tensors)
     oracle_inputs = _clone_with_grad(tensors)
 
     actual = attention(
@@ -546,22 +391,21 @@ def test_block_only_fp32_forward_and_gradient_parity(
         block_k=production_inputs[3],
         block_v=production_inputs[4],
     )
-    expected = _dense_attention_oracle(
+    expected = _dense_block_attention_oracle(
         plan=plan,
-        trunk_q=oracle_inputs[0],
-        trunk_k=oracle_inputs[1],
-        trunk_v=oracle_inputs[2],
-        block_q=oracle_inputs[3],
-        block_k=oracle_inputs[4],
-        block_v=oracle_inputs[5],
-    )[1]
+        trunk_k=oracle_inputs[0],
+        trunk_v=oracle_inputs[1],
+        block_q=oracle_inputs[2],
+        block_k=oracle_inputs[3],
+        block_v=oracle_inputs[4],
+    )
     torch.testing.assert_close(actual, expected)
 
     weight = torch.randn_like(actual)
     actual_gradients = torch.autograd.grad((actual * weight).sum(), production_inputs)
     expected_gradients = torch.autograd.grad(
         (expected * weight).sum(),
-        oracle_inputs[1:],
+        oracle_inputs,
     )
     for actual_gradient, expected_gradient in zip(
         actual_gradients,
@@ -573,7 +417,7 @@ def test_block_only_fp32_forward_and_gradient_parity(
 
 def test_block_queries_cover_empty_remainder_and_full_trunk_boundaries() -> None:
     """Catches inclusion of the anchor or exclusion of valid prefix boundaries."""
-    plan_type, attention = _load_attention_contract()
+    plan_type, attention = _load_block_only_attention_contract()
     plan = _make_plan(
         plan_type,
         token_valid_mask=torch.ones((1, 4), dtype=torch.bool),
@@ -581,7 +425,6 @@ def test_block_queries_cover_empty_remainder_and_full_trunk_boundaries() -> None
         anchor_positions=[0, 2, 4],
         slot_valid=torch.ones((3, 2), dtype=torch.bool),
     )
-    trunk_q = torch.zeros((1, 4, 1, 1))
     trunk_k = torch.zeros((1, 4, 1, 1))
     trunk_v = torch.tensor([1.0, 2.0, 3.0, 4.0]).reshape(1, 4, 1, 1)
     block_q = torch.zeros((3, 2, 1, 1))
@@ -594,9 +437,8 @@ def test_block_queries_cover_empty_remainder_and_full_trunk_boundaries() -> None
         ]
     )
 
-    _, block_output = attention(
+    block_output = attention(
         plan=plan,
-        trunk_q=trunk_q,
         trunk_k=trunk_k,
         trunk_v=trunk_v,
         block_q=block_q,
@@ -610,7 +452,7 @@ def test_block_queries_cover_empty_remainder_and_full_trunk_boundaries() -> None
 
 def test_duplicate_anchors_and_multiple_rows_remain_block_local() -> None:
     """Catches cross-block and cross-sample K/V leakage."""
-    plan_type, attention = _load_attention_contract()
+    plan_type, attention = _load_block_only_attention_contract()
     plan = _make_plan(
         plan_type,
         token_valid_mask=torch.ones((2, 2), dtype=torch.bool),
@@ -618,7 +460,6 @@ def test_duplicate_anchors_and_multiple_rows_remain_block_local() -> None:
         anchor_positions=[1, 1, 2, 2],
         slot_valid=torch.ones((4, 2), dtype=torch.bool),
     )
-    trunk_q = torch.zeros((2, 2, 1, 1))
     trunk_k = torch.zeros((2, 2, 1, 1))
     trunk_v = torch.tensor([1.0, 3.0, 100.0, 300.0]).reshape(2, 2, 1, 1)
     block_q = torch.zeros((4, 2, 1, 1))
@@ -632,9 +473,8 @@ def test_duplicate_anchors_and_multiple_rows_remain_block_local() -> None:
         ]
     )
 
-    _, baseline = attention(
+    baseline = attention(
         plan=plan,
-        trunk_q=trunk_q,
         trunk_k=trunk_k,
         trunk_v=trunk_v,
         block_q=block_q,
@@ -643,9 +483,8 @@ def test_duplicate_anchors_and_multiple_rows_remain_block_local() -> None:
     )
     changed_block_v = block_v.clone()
     changed_block_v[1:] = 1_000_000.0
-    _, changed = attention(
+    changed = attention(
         plan=plan,
-        trunk_q=trunk_q,
         trunk_k=trunk_k,
         trunk_v=trunk_v,
         block_q=block_q,
@@ -661,7 +500,7 @@ def test_duplicate_anchors_and_multiple_rows_remain_block_local() -> None:
 
 def test_invalid_block_queries_are_zero_with_finite_isolated_gradients() -> None:
     """Catches NaNs or gradient flow through masked block queries and K/V slots."""
-    plan_type, attention = _load_attention_contract()
+    plan_type, attention = _load_block_only_attention_contract()
     plan = _make_plan(
         plan_type,
         token_valid_mask=torch.ones((1, 2), dtype=torch.bool),
@@ -672,7 +511,6 @@ def test_invalid_block_queries_are_zero_with_finite_isolated_gradients() -> None
     generator = torch.Generator().manual_seed(77)
     inputs = _clone_with_grad(
         (
-            torch.randn((1, 2, 2, 3), generator=generator),
             torch.randn((1, 2, 1, 3), generator=generator),
             torch.randn((1, 2, 1, 3), generator=generator),
             torch.randn((1, 3, 2, 3), generator=generator),
@@ -681,25 +519,23 @@ def test_invalid_block_queries_are_zero_with_finite_isolated_gradients() -> None
         )
     )
 
-    trunk_output, block_output = attention(
+    block_output = attention(
         plan=plan,
-        trunk_q=inputs[0],
-        trunk_k=inputs[1],
-        trunk_v=inputs[2],
-        block_q=inputs[3],
-        block_k=inputs[4],
-        block_v=inputs[5],
+        trunk_k=inputs[0],
+        trunk_v=inputs[1],
+        block_q=inputs[2],
+        block_k=inputs[3],
+        block_v=inputs[4],
     )
-    loss = trunk_output.square().sum() + block_output.square().sum()
+    loss = block_output.square().sum()
     gradients = torch.autograd.grad(loss, inputs)
 
     assert torch.equal(block_output[:, 1], torch.zeros_like(block_output[:, 1]))
-    assert torch.isfinite(trunk_output).all()
     assert torch.isfinite(block_output).all()
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert torch.equal(gradients[2][:, 1], torch.zeros_like(gradients[2][:, 1]))
     assert torch.equal(gradients[3][:, 1], torch.zeros_like(gradients[3][:, 1]))
     assert torch.equal(gradients[4][:, 1], torch.zeros_like(gradients[4][:, 1]))
-    assert torch.equal(gradients[5][:, 1], torch.zeros_like(gradients[5][:, 1]))
 
 
 def test_cuda_implementation_uses_only_public_flex_attention_apis() -> None:
@@ -768,7 +604,7 @@ def test_cuda_implementation_uses_only_public_flex_attention_apis() -> None:
 
 def test_invalid_attention_shapes_fail_before_computation() -> None:
     """Catches silent broadcasting of malformed Q/K/V layouts."""
-    plan_type, attention = _load_attention_contract()
+    plan_type, attention = _load_block_only_attention_contract()
     plan = _make_plan(
         plan_type,
         token_valid_mask=torch.ones((1, 4), dtype=torch.bool),
@@ -792,157 +628,31 @@ def test_invalid_attention_shapes_fail_before_computation() -> None:
     with pytest.raises(ValueError, match="block_q shape"):
         attention(
             plan=plan,
-            trunk_q=inputs[0],
-            trunk_k=inputs[1],
-            trunk_v=inputs[2],
-            block_q=inputs[3][:, :-1],
-            block_k=inputs[4],
-            block_v=inputs[5],
+            trunk_k=inputs[0],
+            trunk_v=inputs[1],
+            block_q=inputs[2][:, :-1],
+            block_k=inputs[3],
+            block_v=inputs[4],
         )
 
     with pytest.raises(ValueError, match="divisible"):
         attention(
             plan=plan,
-            trunk_q=inputs[0][:, :, :3],
-            trunk_k=inputs[1],
-            trunk_v=inputs[2],
-            block_q=inputs[3][:, :, :3],
-            block_k=inputs[4],
-            block_v=inputs[5],
+            trunk_k=inputs[0],
+            trunk_v=inputs[1],
+            block_q=inputs[2][:, :, :3],
+            block_k=inputs[3],
+            block_v=inputs[4],
         )
 
     with pytest.raises(ValueError, match="block value shapes"):
         attention(
             plan=plan,
-            trunk_q=inputs[0],
-            trunk_k=inputs[1],
-            trunk_v=inputs[2],
-            block_q=inputs[3],
-            block_k=inputs[4],
-            block_v=inputs[5][..., :-1],
-        )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.usefixtures("_isolated_flex_compile_cache")
-@pytest.mark.parametrize(
-    "dtype,num_query_heads,num_kv_heads,scale,tolerance",
-    [
-        pytest.param(torch.float32, 2, 2, None, 2e-3, id="fp32-mha-default-scale"),
-        pytest.param(torch.float32, 4, 2, 0.37, 2.75e-3, id="fp32-gqa-custom-scale"),
-        pytest.param(torch.bfloat16, 2, 2, 0.37, 5e-2, id="bf16-mha-custom-scale"),
-        pytest.param(torch.bfloat16, 4, 2, None, 5e-2, id="bf16-gqa-default-scale"),
-    ],
-)
-def test_cuda_forward_and_all_qkv_gradients_match_dense_oracle(
-    dtype: torch.dtype,
-    num_query_heads: int,
-    num_kv_heads: int,
-    scale: float | None,
-    tolerance: float,
-) -> None:
-    """Catches CUDA FlexAttention visibility, scaling, GQA, or backward drift."""
-    if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
-        pytest.skip("CUDA device does not support bfloat16")
-
-    plan_type, attention = _load_attention_contract()
-    device = torch.device("cuda")
-    plan = _make_plan(
-        plan_type,
-        token_valid_mask=torch.tensor(
-            [[True, True, True, True], [True, True, True, False]],
-            device=device,
-        ),
-        sample_rows=[0, 0, 0, 1],
-        anchor_positions=[0, 3, 4, 2],
-        slot_valid=torch.tensor(
-            [
-                [True, True, True],
-                [True, True, True],
-                [True, True, True],
-                [True, True, False],
-            ],
-            device=device,
-        ),
-    )
-    tensors = _random_attention_inputs(
-        batch_size=2,
-        sequence_length=4,
-        num_blocks=4,
-        block_size=3,
-        num_query_heads=num_query_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=16,
-        device=device,
-        dtype=dtype,
-        seed=2026,
-    )
-    production_inputs = _clone_with_grad(tensors)
-    oracle_inputs = _clone_with_grad(tensors)
-
-    production_outputs = attention(
-        plan=plan,
-        trunk_q=production_inputs[0],
-        trunk_k=production_inputs[1],
-        trunk_v=production_inputs[2],
-        block_q=production_inputs[3],
-        block_k=production_inputs[4],
-        block_v=production_inputs[5],
-        scale=scale,
-    )
-    oracle_outputs = _dense_attention_oracle(
-        plan=plan,
-        trunk_q=oracle_inputs[0],
-        trunk_k=oracle_inputs[1],
-        trunk_v=oracle_inputs[2],
-        block_q=oracle_inputs[3],
-        block_k=oracle_inputs[4],
-        block_v=oracle_inputs[5],
-        scale=scale,
-    )
-    for production_output, oracle_output in zip(
-        production_outputs,
-        oracle_outputs,
-        strict=True,
-    ):
-        torch.testing.assert_close(
-            production_output,
-            oracle_output,
-            atol=tolerance,
-            rtol=tolerance,
-        )
-
-    generator = torch.Generator(device=device).manual_seed(8128)
-    trunk_weight = torch.randn(
-        production_outputs[0].shape,
-        generator=generator,
-        device=device,
-        dtype=dtype,
-    )
-    block_weight = torch.randn(
-        production_outputs[1].shape,
-        generator=generator,
-        device=device,
-        dtype=dtype,
-    )
-    production_loss = (production_outputs[0] * trunk_weight).sum() + (
-        production_outputs[1] * block_weight
-    ).sum()
-    oracle_loss = (oracle_outputs[0] * trunk_weight).sum() + (
-        oracle_outputs[1] * block_weight
-    ).sum()
-    production_gradients = torch.autograd.grad(production_loss, production_inputs)
-    oracle_gradients = torch.autograd.grad(oracle_loss, oracle_inputs)
-    for production_gradient, oracle_gradient in zip(
-        production_gradients,
-        oracle_gradients,
-        strict=True,
-    ):
-        torch.testing.assert_close(
-            production_gradient,
-            oracle_gradient,
-            atol=tolerance,
-            rtol=tolerance,
+            trunk_k=inputs[0],
+            trunk_v=inputs[1],
+            block_q=inputs[2],
+            block_k=inputs[3],
+            block_v=inputs[4][..., :-1],
         )
 
 
@@ -974,7 +684,7 @@ def test_cuda_public_geometry_block_only_forward_and_gradients_match_dense() -> 
         dtype=torch.bfloat16,
         seed=32128,
     )
-    production_inputs = _clone_with_grad(tensors[1:])
+    production_inputs = _clone_with_grad(tensors)
     oracle_inputs = _clone_with_grad(tensors)
 
     actual = attention(
@@ -985,15 +695,14 @@ def test_cuda_public_geometry_block_only_forward_and_gradients_match_dense() -> 
         block_k=production_inputs[3],
         block_v=production_inputs[4],
     )
-    expected = _dense_attention_oracle(
+    expected = _dense_block_attention_oracle(
         plan=plan,
-        trunk_q=oracle_inputs[0],
-        trunk_k=oracle_inputs[1],
-        trunk_v=oracle_inputs[2],
-        block_q=oracle_inputs[3],
-        block_k=oracle_inputs[4],
-        block_v=oracle_inputs[5],
-    )[1]
+        trunk_k=oracle_inputs[0],
+        trunk_v=oracle_inputs[1],
+        block_q=oracle_inputs[2],
+        block_k=oracle_inputs[3],
+        block_v=oracle_inputs[4],
+    )
     torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
 
     generator = torch.Generator(device=device).manual_seed(16128)
@@ -1006,7 +715,7 @@ def test_cuda_public_geometry_block_only_forward_and_gradients_match_dense() -> 
     actual_gradients = torch.autograd.grad((actual * weight).sum(), production_inputs)
     expected_gradients = torch.autograd.grad(
         (expected * weight).sum(),
-        oracle_inputs[1:],
+        oracle_inputs,
     )
     for actual_gradient, expected_gradient in zip(
         actual_gradients,
@@ -1025,7 +734,7 @@ def test_cuda_public_geometry_block_only_forward_and_gradients_match_dense() -> 
 @pytest.mark.usefixtures("_isolated_flex_compile_cache")
 def test_cuda_holes_and_all_invalid_rows_are_finite_and_gradient_isolated() -> None:
     """Catches fully masked-row NaNs and gradients through invalid Q/K/V entries."""
-    plan_type, attention = _load_attention_contract()
+    plan_type, attention = _load_block_only_attention_contract()
     device = torch.device("cuda")
     plan = _make_plan(
         plan_type,
@@ -1060,37 +769,31 @@ def test_cuda_holes_and_all_invalid_rows_are_finite_and_gradient_isolated() -> N
         )
     )
 
-    trunk_output, block_output = attention(
+    block_output = attention(
         plan=plan,
-        trunk_q=inputs[0],
-        trunk_k=inputs[1],
-        trunk_v=inputs[2],
-        block_q=inputs[3],
-        block_k=inputs[4],
-        block_v=inputs[5],
+        trunk_k=inputs[0],
+        trunk_v=inputs[1],
+        block_q=inputs[2],
+        block_k=inputs[3],
+        block_v=inputs[4],
     )
     gradients = torch.autograd.grad(
-        trunk_output.square().sum() + block_output.square().sum(),
+        block_output.square().sum(),
         inputs,
     )
 
-    assert torch.isfinite(trunk_output).all()
     assert torch.isfinite(block_output).all()
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
-    assert torch.equal(
-        trunk_output[~plan.token_valid_mask],
-        torch.zeros_like(trunk_output[~plan.token_valid_mask]),
-    )
     assert torch.equal(
         block_output[~plan.slot_valid],
         torch.zeros_like(block_output[~plan.slot_valid]),
     )
-    for gradient in gradients[:3]:
+    for gradient in gradients[:2]:
         assert torch.equal(
             gradient[~plan.token_valid_mask],
             torch.zeros_like(gradient[~plan.token_valid_mask]),
         )
-    for gradient in gradients[3:]:
+    for gradient in gradients[2:]:
         assert torch.equal(
             gradient[~plan.slot_valid],
             torch.zeros_like(gradient[~plan.slot_valid]),
@@ -1101,7 +804,7 @@ def test_cuda_holes_and_all_invalid_rows_are_finite_and_gradient_isolated() -> N
 @pytest.mark.usefixtures("_isolated_flex_compile_cache")
 def test_cuda_duplicate_anchors_do_not_share_block_values() -> None:
     """Catches flattened global K/V masks that leak between duplicate anchors."""
-    plan_type, attention = _load_attention_contract()
+    plan_type, attention = _load_block_only_attention_contract()
     device = torch.device("cuda")
     plan = _make_plan(
         plan_type,
@@ -1110,9 +813,8 @@ def test_cuda_duplicate_anchors_do_not_share_block_values() -> None:
         anchor_positions=[2, 2],
         slot_valid=torch.ones((2, 2), dtype=torch.bool, device=device),
     )
-    trunk_q = torch.zeros((1, 3, 1, 16), device=device)
-    trunk_k = torch.zeros_like(trunk_q)
-    trunk_v = torch.arange(3.0, device=device).reshape(1, 3, 1, 1).expand_as(trunk_q)
+    trunk_k = torch.zeros((1, 3, 1, 16), device=device)
+    trunk_v = torch.arange(3.0, device=device).reshape(1, 3, 1, 1).expand_as(trunk_k)
     block_q = torch.zeros((2, 2, 1, 16), device=device)
     block_k = torch.zeros_like(block_q)
     block_v = (
@@ -1121,9 +823,8 @@ def test_cuda_duplicate_anchors_do_not_share_block_values() -> None:
         .expand_as(block_q)
     )
 
-    _, baseline = attention(
+    baseline = attention(
         plan=plan,
-        trunk_q=trunk_q,
         trunk_k=trunk_k,
         trunk_v=trunk_v,
         block_q=block_q,
@@ -1132,9 +833,8 @@ def test_cuda_duplicate_anchors_do_not_share_block_values() -> None:
     )
     changed_values = block_v.clone()
     changed_values[1] = 1_000_000.0
-    _, changed = attention(
+    changed = attention(
         plan=plan,
-        trunk_q=trunk_q,
         trunk_k=trunk_k,
         trunk_v=trunk_v,
         block_q=block_q,
@@ -1151,7 +851,7 @@ def test_cuda_flex_calls_keep_one_global_trunk_kv_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Catches per-anchor trunk K/V or token-dense mask metadata."""
-    plan_type, _ = _load_attention_contract()
+    plan_type, _ = _load_block_only_attention_contract()
     attention_module = _load_module(_ATTENTION_MODULE)
     device = torch.device("cuda")
     sequence_length = 2048
@@ -1195,46 +895,38 @@ def test_cuda_flex_calls_keep_one_global_trunk_kv_copy(
         record_flex_call,
         raising=False,
     )
-    attention_module.dflash_block_attention(
+    attention_module.dflash_block_only_attention(
         plan=plan,
-        trunk_q=inputs[0],
-        trunk_k=inputs[1],
-        trunk_v=inputs[2],
-        block_q=inputs[3],
-        block_k=inputs[4],
-        block_v=inputs[5],
+        trunk_k=inputs[0],
+        trunk_v=inputs[1],
+        block_q=inputs[2],
+        block_k=inputs[3],
+        block_v=inputs[4],
     )
 
-    assert len(calls) == 2
+    assert len(calls) == 1
     global_kv_length = 2 * sequence_length + 6 * 3
-    assert calls[0][1].shape == (2, 2, sequence_length, 16)
-    assert calls[1][1].shape == (1, 2, global_kv_length, 16)
-    assert calls[1][2].shape == (1, 2, global_kv_length, 16)
-    expected_storage_bytes = (inputs[1].numel() + inputs[4].numel()) * inputs[
-        1
+    assert calls[0][1].shape == (1, 2, global_kv_length, 16)
+    assert calls[0][2].shape == (1, 2, global_kv_length, 16)
+    expected_storage_bytes = (inputs[0].numel() + inputs[3].numel()) * inputs[
+        0
     ].element_size()
-    assert calls[1][1].untyped_storage().nbytes() == expected_storage_bytes
-    assert calls[1][2].untyped_storage().nbytes() == expected_storage_bytes
+    assert calls[0][1].untyped_storage().nbytes() == expected_storage_bytes
+    assert calls[0][2].untyped_storage().nbytes() == expected_storage_bytes
 
-    trunk_mask = calls[0][3]
-    block_mask = calls[1][3]
-    assert trunk_mask.BLOCK_SIZE == (128, 128)
+    block_mask = calls[0][3]
     assert block_mask.BLOCK_SIZE == (128, 128)
-    assert trunk_mask.kv_indices.shape == (2, 1, 16, 16)
     assert block_mask.kv_indices.shape == (6, 1, 1, 19)
     sparse_metadata_elements = sum(
         tensor.numel()
-        for mask in (trunk_mask, block_mask)
         for tensor in (
-            mask.kv_num_blocks,
-            mask.kv_indices,
-            mask.q_num_blocks,
-            mask.q_indices,
+            block_mask.kv_num_blocks,
+            block_mask.kv_indices,
+            block_mask.q_num_blocks,
+            block_mask.q_indices,
         )
     )
-    token_dense_elements = (
-        2 * sequence_length * sequence_length + 6 * 3 * global_kv_length
-    )
+    token_dense_elements = 6 * 3 * global_kv_length
     assert sparse_metadata_elements * 100 < token_dense_elements
 
 
