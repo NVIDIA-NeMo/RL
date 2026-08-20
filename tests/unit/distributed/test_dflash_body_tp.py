@@ -257,6 +257,39 @@ def test_tp2_projection_forward_gradient_and_checkpoint_parity(
         torch.testing.assert_close(restored.state_dict()[name], parameter)
 
 
+def test_tp2_rank_local_malformed_input_fails_synchronously(
+    _tp2_world: None,
+) -> None:
+    rank = torch.distributed.get_rank()
+    device = (
+        torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+    body = DFlashBody(
+        _config(),
+        tp_group=torch.distributed.group.WORLD,
+        parallel_config=_fp32_parallel_config(2),
+    ).to(device)
+    plan, target_taps, block_embeddings = _inputs(device)
+    if rank == 1:
+        block_embeddings = block_embeddings[:, :-1]
+
+    with pytest.raises(ValueError) as error:
+        body(
+            target_taps=target_taps,
+            block_embeddings=block_embeddings,
+            plan=plan,
+        )
+
+    messages: list[str | None] = [None] * 2
+    torch.distributed.all_gather_object(messages, str(error.value))
+    assert messages == [
+        "block_embeddings shape does not match the DFlash plan",
+        "block_embeddings shape does not match the DFlash plan",
+    ]
+
+
 def test_tp2_rejects_sequence_parallel_config(_tp2_world: None) -> None:
     parallel_config = _fp32_parallel_config(2, sequence_parallel=True)
 
