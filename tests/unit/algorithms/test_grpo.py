@@ -2958,6 +2958,11 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
             "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
             return_value=_mock_seq_logprob_error_result(),
         ),
+        # Refit runs unconditionally when generation is stale.
+        patch(
+            "nemo_rl.algorithms.grpo.refit_policy_generation",
+            return_value={},
+        ),
         patch("nemo_rl.algorithms.grpo.torch.save"),
     ):
         grpo_mod.grpo_train(

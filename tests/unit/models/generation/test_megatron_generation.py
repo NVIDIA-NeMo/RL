@@ -419,6 +419,9 @@ def test_megatron_generation_colocated(
         # The parity block below does not reflect any real use-case.
         # We must disable CUDA graphs beforehand just for this test.
         config["generation"]["mcore_generation_config"]["cuda_graph_impl"] = "none"
+        # The parity block's 2-sample batch shards to 1 sample per DP rank
+        # (DP=2 on the 2-GPU cluster); the logprob microbatch must divide it.
+        config["logprob_batch_size"] = 1
 
     # construction guard: exactly one of `cluster` / `policy` is required
     with pytest.raises(AssertionError):
