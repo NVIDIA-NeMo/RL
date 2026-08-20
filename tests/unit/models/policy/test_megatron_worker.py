@@ -210,6 +210,31 @@ def test_megatron_bridge_refit_updates_mxfp8_storage(
     assert destination.scale.data_ptr() == destination_scale_ptr
 
 
+def test_configure_inference_optimized_layer_spec_for_gpt_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        _configure_inference_optimized_layer_spec,
+        _inference_optimized_transformer_layer_spec,
+    )
+
+    class GPTModelProvider:
+        transformer_layer_spec = None
+
+    provider_module = ModuleType("megatron.bridge.models.gpt_provider")
+    provider_module.GPTModelProvider = GPTModelProvider
+    monkeypatch.setitem(
+        sys.modules, "megatron.bridge.models.gpt_provider", provider_module
+    )
+
+    provider = GPTModelProvider()
+    assert _configure_inference_optimized_layer_spec(provider)
+    assert (
+        provider.transformer_layer_spec is _inference_optimized_transformer_layer_spec
+    )
+    assert not _configure_inference_optimized_layer_spec(SimpleNamespace())
+
+
 def test_megatron_m2n_maps_dense_gated_weights_into_bf16_views(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

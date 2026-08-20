@@ -56,6 +56,34 @@ if TYPE_CHECKING:
 G_VERIFY_MXFP8_ENV = "NRL_VERIFY_MEGATRON_MXFP8"
 
 
+def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
+    """Build the generic GPT layer spec backed by MCore inference linears."""
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_inference_spec,
+    )
+
+    return get_gpt_layer_with_inference_spec(
+        qk_layernorm=config.qk_layernorm,
+        multi_latent_attention=config.multi_latent_attention,
+        qk_l2_norm=config.qk_l2_norm,
+        num_experts=config.num_moe_experts,
+        moe_grouped_gemm=config.moe_grouped_gemm,
+        moe_use_legacy_grouped_gemm=getattr(
+            config, "moe_use_legacy_grouped_gemm", False
+        ),
+    )
+
+
+def _configure_inference_optimized_layer_spec(model_provider: Any) -> bool:
+    """Select MCore inference linears for a Bridge generic-GPT provider."""
+    from megatron.bridge.models.gpt_provider import GPTModelProvider
+
+    if not isinstance(model_provider, GPTModelProvider):
+        return False
+    model_provider.transformer_layer_spec = _inference_optimized_transformer_layer_spec
+    return True
+
+
 def _resolve_mxfp8_refit_backend(model_config: Any) -> str:
     """Resolve the MXFP8 storage required by the grouped-GEMM backend."""
     try:

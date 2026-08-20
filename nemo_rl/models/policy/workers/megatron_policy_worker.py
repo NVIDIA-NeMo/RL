@@ -67,6 +67,7 @@ from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
+    _configure_inference_optimized_layer_spec,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import get_moe_metrics
@@ -473,6 +474,13 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
+        if (
+            not init_optimizer
+            and self.megatron_cfg.model.transformer_impl == "inference_optimized"
+        ):
+            # Bridge's generic GPT provider defaults to its training layer spec.
+            # Dedicated inference workers need MCore inference linears instead.
+            _configure_inference_optimized_layer_spec(self.megatron_cfg.model)
         self.dtype = runtime_config.dtype
         self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
         self.offload_optimizer_for_logprob = (
