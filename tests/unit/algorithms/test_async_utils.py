@@ -1433,7 +1433,7 @@ class TestAsyncTrajectoryCollector:
 
         async_config = AsyncPPOConfig(
             max_trajectory_age_steps=3,
-            warmup_max_trajectory_age_steps=5,
+            warmup_generation_lead_steps=5,
         )
         master_config = PPOMasterConfig.model_construct(
             policy={"make_sequence_length_divisible_by": 1},

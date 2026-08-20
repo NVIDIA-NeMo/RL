@@ -10,7 +10,7 @@ ppo:
   overlong_filtering: true
   async_ppo:
     enabled: true
-    warmup_max_trajectory_age_steps: 2
+    warmup_generation_lead_steps: 2
     in_flight_weight_updates: true
   reward_shaping:
     enabled: false

@@ -748,6 +748,7 @@ def _run_mock_ppo_train(
     ppo_epochs: int,
     seq_logprob_error_threshold: float | None,
     policy_training_start_step: int = 0,
+    warmup_generation_lead_steps: int | None = None,
     overlong_filtering: bool = False,
     truncated_samples: tuple[bool, bool] = (False, False),
 ):
@@ -916,7 +917,10 @@ def _run_mock_ppo_train(
 
     master_config = SimpleNamespace(
         ppo=PPOConfig(
-            async_ppo={"enabled": async_mode},
+            async_ppo={
+                "enabled": async_mode,
+                "warmup_generation_lead_steps": warmup_generation_lead_steps,
+            },
             max_num_steps=max_num_steps,
             max_num_epochs=-1 if async_mode else 1,
             max_rollout_turns=1,
@@ -1117,7 +1121,24 @@ def test_ppo_train_critic_warmup_reuses_generation_until_policy_update(
         ]
 
 
-def test_async_ppo_checkpoints_replay_buffer_inside_actor(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    (
+        "policy_training_start_step",
+        "warmup_generation_lead_steps",
+        "expected_restore_max_age",
+    ),
+    [
+        (0, None, 1),
+        (2, 3, 3),
+    ],
+)
+def test_async_ppo_checkpoints_replay_buffer_inside_actor(
+    monkeypatch,
+    tmp_path,
+    policy_training_start_step,
+    warmup_generation_lead_steps,
+    expected_restore_max_age,
+):
     checkpoint_path = tmp_path / "step_0"
     checkpoint_path.mkdir()
     replay_buffer_path = checkpoint_path / "replay_buffer.pt"
@@ -1130,13 +1151,15 @@ def test_async_ppo_checkpoints_replay_buffer_inside_actor(monkeypatch, tmp_path)
         max_num_steps=1,
         ppo_epochs=1,
         seq_logprob_error_threshold=None,
+        policy_training_start_step=policy_training_start_step,
+        warmup_generation_lead_steps=warmup_generation_lead_steps,
     )
 
     harness.replay_actor.load_from_path.remote.assert_called_once_with(
         str(replay_buffer_path),
         num_prompts_per_step=2,
         current_training_step=0,
-        max_age_steps=1,
+        max_age_steps=expected_restore_max_age,
     )
     harness.replay_actor.load_state_dict.remote.assert_not_called()
     harness.replay_actor.save_to_path.remote.assert_called_once_with(
@@ -2216,34 +2239,37 @@ def test_async_ppo_config_allows_kv_cache_recompute_without_inflight_updates():
     assert config.recompute_kv_cache_after_weight_updates
 
 
-def test_async_ppo_config_defaults_to_blocking_weight_updates():
+def test_async_ppo_config_defaults():
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
 
-    assert not AsyncPPOConfig().in_flight_weight_updates
+    config = AsyncPPOConfig()
+
+    assert not config.in_flight_weight_updates
+    assert not config.drop_incomplete_targets_on_restore
 
 
-def test_async_ppo_config_warmup_age_defaults_to_training_age():
+def test_async_ppo_config_warmup_lead_defaults_to_training_age():
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
 
     config = AsyncPPOConfig(max_trajectory_age_steps=3)
 
-    assert config.warmup_max_trajectory_age_steps is None
-    assert config.resolved_warmup_max_trajectory_age_steps == 3
+    assert config.warmup_generation_lead_steps is None
+    assert config.resolved_warmup_generation_lead_steps == 3
 
 
-def test_async_ppo_config_rejects_warmup_age_below_training_age():
+def test_async_ppo_config_rejects_warmup_lead_below_training_age():
     from pydantic import ValidationError
 
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
 
-    with pytest.raises(ValidationError, match="warmup_max_trajectory_age_steps"):
+    with pytest.raises(ValidationError, match="warmup_generation_lead_steps"):
         AsyncPPOConfig(
             max_trajectory_age_steps=2,
-            warmup_max_trajectory_age_steps=1,
+            warmup_generation_lead_steps=1,
         )
 
 
-def test_ppo_config_rejects_warmup_age_without_critic_warmup():
+def test_ppo_config_rejects_warmup_lead_without_critic_warmup():
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError, match="policy_training_start_step > 0"):
@@ -2251,21 +2277,21 @@ def test_ppo_config_rejects_warmup_age_without_critic_warmup():
             policy_training_start_step=0,
             async_ppo={
                 "enabled": True,
-                "warmup_max_trajectory_age_steps": 2,
+                "warmup_generation_lead_steps": 2,
             },
         )
 
 
-def test_ppo_config_allows_warmup_age_with_critic_warmup():
+def test_ppo_config_allows_warmup_lead_with_critic_warmup():
     config = PPOConfig(
         policy_training_start_step=1,
         async_ppo={
             "enabled": True,
-            "warmup_max_trajectory_age_steps": 2,
+            "warmup_generation_lead_steps": 2,
         },
     )
 
-    assert config.async_ppo.warmup_max_trajectory_age_steps == 2
+    assert config.async_ppo.warmup_generation_lead_steps == 2
 
 
 @pytest.mark.parametrize(
@@ -2292,13 +2318,13 @@ def test_async_ppo_warmup_window_has_fixed_safe_frontier(
         step=step,
         policy_training_start_step=4,
         max_trajectory_age_steps=1,
-        warmup_max_trajectory_age_steps=4,
+        warmup_generation_lead_steps=4,
     )
     buffer_age = _async_ppo_buffer_max_age(
         step=step,
         policy_training_start_step=4,
         max_trajectory_age_steps=1,
-        warmup_max_trajectory_age_steps=4,
+        warmup_generation_lead_steps=4,
     )
 
     assert generation_lead == expected_lead
@@ -2318,7 +2344,7 @@ def test_async_ppo_warmup_window_is_disabled_without_critic_warmup():
             step=0,
             policy_training_start_step=0,
             max_trajectory_age_steps=1,
-            warmup_max_trajectory_age_steps=4,
+            warmup_generation_lead_steps=4,
         )
         == 1
     )
@@ -2327,7 +2353,7 @@ def test_async_ppo_warmup_window_is_disabled_without_critic_warmup():
             step=0,
             policy_training_start_step=0,
             max_trajectory_age_steps=1,
-            warmup_max_trajectory_age_steps=4,
+            warmup_generation_lead_steps=4,
         )
         == 1
     )
@@ -2343,7 +2369,7 @@ def test_async_ppo_consumes_frozen_policy_rollout_at_safe_warmup_frontier():
 
     policy_training_start_step = 2
     max_trajectory_age_steps = 1
-    warmup_max_trajectory_age_steps = 3
+    warmup_generation_lead_steps = 3
     frontier = policy_training_start_step + max_trajectory_age_steps
 
     assert (
@@ -2351,7 +2377,7 @@ def test_async_ppo_consumes_frozen_policy_rollout_at_safe_warmup_frontier():
             step=0,
             policy_training_start_step=policy_training_start_step,
             max_trajectory_age_steps=max_trajectory_age_steps,
-            warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+            warmup_generation_lead_steps=warmup_generation_lead_steps,
         )
         == frontier
     )
@@ -2377,7 +2403,7 @@ def test_async_ppo_consumes_frozen_policy_rollout_at_safe_warmup_frontier():
         step=frontier,
         policy_training_start_step=policy_training_start_step,
         max_trajectory_age_steps=max_trajectory_age_steps,
-        warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+        warmup_generation_lead_steps=warmup_generation_lead_steps,
     )
     sample = buffer.sample(
         num_prompt_groups=1,

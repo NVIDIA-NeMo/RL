@@ -52,6 +52,8 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
+        # True discards partial restored rows. The dataloader is not rewound,
+        # so replacement rollouts come from subsequent prompts.
         self._drop_incomplete_targets_on_restore = drop_incomplete_targets_on_restore
         self.trajectories = []  # List[dict[str, Any]]
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
@@ -528,7 +530,8 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         )
         if incomplete_targets and self._drop_incomplete_targets_on_restore:
             print(
-                "   Dropping incomplete restored targets: "
+                "   Dropping incomplete restored targets; replacements will use "
+                "subsequent prompts: "
                 + ", ".join(
                     f"{target}={target_counts[target]}/{num_prompts_per_step}"
                     for target in sorted(incomplete_targets)

@@ -120,34 +120,34 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     enabled: bool = False
     # Maximum generation-version age accepted for training.
     max_trajectory_age_steps: int = Field(default=1, ge=1)
-    # Maximum generation-version age for rollouts banked by a frozen policy.
-    # None keeps the normal trajectory-age limit throughout warmup.
-    warmup_max_trajectory_age_steps: int | None = Field(default=None, ge=1)
+    # Number of future target steps generation may fill during critic warmup.
+    # None uses max_trajectory_age_steps as the generation lead.
+    warmup_generation_lead_steps: int | None = Field(default=None, ge=1)
     # Allows weight updates while rollout requests are still in flight.
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: bool = False
-    # Regenerates a partial replay-buffer frontier after resume.
-    drop_incomplete_targets_on_restore: bool = True
+    # Drops partial restored targets; replacement rollouts use subsequent prompts.
+    drop_incomplete_targets_on_restore: bool = False
 
     @model_validator(mode="after")
     def validate_settings(self) -> "AsyncPPOConfig":
         if (
-            self.warmup_max_trajectory_age_steps is not None
-            and self.warmup_max_trajectory_age_steps < self.max_trajectory_age_steps
+            self.warmup_generation_lead_steps is not None
+            and self.warmup_generation_lead_steps < self.max_trajectory_age_steps
         ):
             raise ValueError(
-                "warmup_max_trajectory_age_steps must be greater than or equal "
+                "warmup_generation_lead_steps must be greater than or equal "
                 "to max_trajectory_age_steps"
             )
         return self
 
     @property
-    def resolved_warmup_max_trajectory_age_steps(self) -> int:
-        """Resolve the warmup override, falling back to the training age."""
-        if self.warmup_max_trajectory_age_steps is None:
+    def resolved_warmup_generation_lead_steps(self) -> int:
+        """Resolve the optional warmup generation lead."""
+        if self.warmup_generation_lead_steps is None:
             return self.max_trajectory_age_steps
-        return self.warmup_max_trajectory_age_steps
+        return self.warmup_generation_lead_steps
 
 
 class AdvEstimatorConfig(TypedDict):
@@ -191,23 +191,8 @@ class PPOConfig(BaseModel, extra="allow"):
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
     ppo_epochs: int = 4
-    reward_shaping: RewardShapingConfig = Field(
-        default_factory=lambda: RewardShapingConfig(
-            enabled=True,
-            overlong_buffer_length=2048,
-            overlong_buffer_penalty=1,
-            max_response_length=14336,
-        )
-    )
-    reward_scaling: RewardScalingConfig = Field(
-        default_factory=lambda: RewardScalingConfig(
-            enabled=True,
-            source_min=0.0,
-            source_max=1.0,
-            target_min=-1.0,
-            target_max=1.0,
-        )
-    )
+    reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
+    reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     # Advantage estimator configuration (gae or raw_reward)
     adv_estimator: AdvEstimatorConfig = Field(
         default_factory=lambda: AdvEstimatorConfig(
@@ -235,11 +220,10 @@ class PPOConfig(BaseModel, extra="allow"):
         if (
             self.async_ppo.enabled
             and self.policy_training_start_step == 0
-            and self.async_ppo.warmup_max_trajectory_age_steps is not None
+            and self.async_ppo.warmup_generation_lead_steps is not None
         ):
             raise ValueError(
-                "warmup_max_trajectory_age_steps requires "
-                "policy_training_start_step > 0"
+                "warmup_generation_lead_steps requires policy_training_start_step > 0"
             )
         return self
 
@@ -2047,7 +2031,7 @@ def _async_ppo_generation_lead_steps(
     step: int,
     policy_training_start_step: int,
     max_trajectory_age_steps: int,
-    warmup_max_trajectory_age_steps: int,
+    warmup_generation_lead_steps: int,
 ) -> int:
     """Return the collector lead without crossing the safe warmup frontier."""
     if step >= policy_training_start_step:
@@ -2057,7 +2041,7 @@ def _async_ppo_generation_lead_steps(
     remaining_to_frontier = max_warmup_target - step
     return max(
         max_trajectory_age_steps,
-        min(warmup_max_trajectory_age_steps, remaining_to_frontier),
+        min(warmup_generation_lead_steps, remaining_to_frontier),
     )
 
 
@@ -2066,12 +2050,12 @@ def _async_ppo_buffer_max_age(
     step: int,
     policy_training_start_step: int,
     max_trajectory_age_steps: int,
-    warmup_max_trajectory_age_steps: int,
+    warmup_generation_lead_steps: int,
 ) -> int:
     """Keep frozen-policy rollouts valid through their safe training frontier."""
     warmup_rollout_frontier = policy_training_start_step + max_trajectory_age_steps
     if policy_training_start_step > 0 and step <= warmup_rollout_frontier:
-        return warmup_max_trajectory_age_steps
+        return warmup_generation_lead_steps
     return max_trajectory_age_steps
 
 
@@ -2095,9 +2079,7 @@ def async_ppo_train(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     async_config = master_config.ppo.async_ppo
     max_trajectory_age_steps = async_config.max_trajectory_age_steps
-    warmup_max_trajectory_age_steps = (
-        async_config.resolved_warmup_max_trajectory_age_steps
-    )
+    warmup_generation_lead_steps = async_config.resolved_warmup_generation_lead_steps
     policy_training_start_step = master_config.ppo.policy_training_start_step
     if master_config.ppo.ppo_epochs < 1:
         raise ValueError("ppo.ppo_epochs must be at least 1")
@@ -2225,13 +2207,13 @@ def async_ppo_train(
     late_arrival_slack = 2
     buffer_age = max(
         max_trajectory_age_steps,
-        warmup_max_trajectory_age_steps,
+        warmup_generation_lead_steps,
     )
     optimal_buffer_size = num_prompts_per_step * buffer_age * late_arrival_slack
     print("📊 Async PPO buffer requirements:")
     print(f"   - num_prompts_per_step: {num_prompts_per_step}")
     print(f"   - max_trajectory_age_steps: {max_trajectory_age_steps}")
-    print(f"   - warmup_max_trajectory_age_steps: {warmup_max_trajectory_age_steps}")
+    print(f"   - warmup_generation_lead_steps: {warmup_generation_lead_steps}")
     print(f"   - optimal_buffer_size: {optimal_buffer_size}")
 
     replay_buffer = ReplayBuffer.options(
@@ -2254,7 +2236,7 @@ def async_ppo_train(
                 step=step,
                 policy_training_start_step=policy_training_start_step,
                 max_trajectory_age_steps=max_trajectory_age_steps,
-                warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+                warmup_generation_lead_steps=warmup_generation_lead_steps,
             )
             ray.get(
                 replay_buffer.load_from_path.remote(
@@ -2329,13 +2311,13 @@ def async_ppo_train(
             step=step,
             policy_training_start_step=policy_training_start_step,
             max_trajectory_age_steps=max_trajectory_age_steps,
-            warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+            warmup_generation_lead_steps=warmup_generation_lead_steps,
         )
         initial_buffer_max_age = _async_ppo_buffer_max_age(
             step=step,
             policy_training_start_step=policy_training_start_step,
             max_trajectory_age_steps=max_trajectory_age_steps,
-            warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+            warmup_generation_lead_steps=warmup_generation_lead_steps,
         )
         ray.get(
             trajectory_collector.set_generation_window.remote(
@@ -2405,6 +2387,7 @@ def async_ppo_train(
     loop_failed = False
     try:
         while step < max_training_steps:
+            ray.get(trajectory_collector.check_health.remote())
             print(f"\n{'=' * 25} Step {step + 1}/{max_training_steps} {'=' * 25}")
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
@@ -2421,9 +2404,7 @@ def async_ppo_train(
                         step=step,
                         policy_training_start_step=policy_training_start_step,
                         max_trajectory_age_steps=max_trajectory_age_steps,
-                        warmup_max_trajectory_age_steps=(
-                            warmup_max_trajectory_age_steps
-                        ),
+                        warmup_generation_lead_steps=(warmup_generation_lead_steps),
                     )
                     sample_result = ray.get(
                         replay_buffer.sample.remote(
@@ -2679,17 +2660,13 @@ def async_ppo_train(
                             step=weight_version,
                             policy_training_start_step=policy_training_start_step,
                             max_trajectory_age_steps=max_trajectory_age_steps,
-                            warmup_max_trajectory_age_steps=(
-                                warmup_max_trajectory_age_steps
-                            ),
+                            warmup_generation_lead_steps=(warmup_generation_lead_steps),
                         )
                         next_buffer_max_age = _async_ppo_buffer_max_age(
                             step=weight_version,
                             policy_training_start_step=policy_training_start_step,
                             max_trajectory_age_steps=max_trajectory_age_steps,
-                            warmup_max_trajectory_age_steps=(
-                                warmup_max_trajectory_age_steps
-                            ),
+                            warmup_generation_lead_steps=(warmup_generation_lead_steps),
                         )
                         ray.get(
                             trajectory_collector.set_generation_window.remote(
