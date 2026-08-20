@@ -18,10 +18,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_rl.models.policy.workers.moe_zero_kl_patches import (
+from nemo_rl.models.generation.megatron.zero_train_gen_kl_patches.moe_zero_kl_patches import (
     _patched_unpermute,
     _unpermute_fixed_order_combine,
-    apply_moe_unpermute_determinism_patch,
+    apply_moe_determinism_patches,
     restore_moe_determinism_patches,
 )
 
@@ -79,8 +79,8 @@ class TestApplyMoeDeterminismPatches:
                 "megatron.core.transformer.moe.token_dispatcher": fake_dispatcher,
             },
         ):
-            apply_moe_unpermute_determinism_patch()
-            apply_moe_unpermute_determinism_patch()
+            apply_moe_determinism_patches()
+            apply_moe_determinism_patches()
             assert fake_mod.unpermute is _patched_unpermute
             assert fake_dispatcher.unpermute is _patched_unpermute
             restore_moe_determinism_patches()

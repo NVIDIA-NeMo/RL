@@ -1662,7 +1662,8 @@ def _enable_batch_invariant_kernels_if_requested(config: PolicyConfig) -> None:
     start of the worker lifetime.
 
     ``zero_train_gen_mismatch`` applies TE cuBLAS workspace shrink via
-    ``patches.apply_te_gemm_cublas_pinned_patch`` instead of Megatron BIK.
+    ``zero_train_gen_kl_patches.core_patches.apply_te_gemm_cublas_pinned_patch``
+    instead of Megatron BIK.
     """
     if config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
@@ -1682,9 +1683,10 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     When True, forces batch_invariant_mode=True, use_mamba_mem_eff_path=False,
     attention_backend=flash (FA4 via TE), and the Transformer Engine generation
     layer spec so generation and scoring share the patched MoE unpermute path.
-    Also applies TE cuBLAS workspace shrink and TP=1 log-softmax via patches.py,
-    deterministic MoE fixed-order combine (train + generation) via moe_zero_kl_patches.py,
-    and Mamba train/prefill/decode alignment via mamba_zero_kl_patches.py.
+    Also applies TE cuBLAS workspace shrink and TP=1 log-softmax via
+    zero_train_gen_kl_patches.core_patches, deterministic MoE fixed-order combine
+    (train + generation) via moe_zero_kl_patches.py, and Mamba train/prefill/decode
+    alignment via mamba_zero_kl_patches.py.
     Generation uses ``logprobs_mode=raw_logprobs`` so gen uses ``F.log_softmax``
     (not FlashInfer processed log-probs). moe_grouped_gemm must be configured explicitly.
     """
@@ -1692,16 +1694,12 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
         return
     import os
 
-    from nemo_rl.models.policy.workers.mamba_zero_kl_patches import (
-        apply_mamba_alignment_patch,
-        policy_uses_mamba_layers,
-    )
-    from nemo_rl.models.policy.workers.moe_zero_kl_patches import (
-        apply_moe_determinism_patches,
-    )
-    from nemo_rl.models.policy.workers.patches import (
+    from nemo_rl.models.generation.megatron.zero_train_gen_kl_patches import (
         apply_log_softmax_determinism_patch,
+        apply_mamba_alignment_patch,
+        apply_moe_determinism_patches,
         apply_te_gemm_cublas_pinned_patch,
+        policy_uses_mamba_layers,
     )
 
     mc = config["megatron_cfg"]

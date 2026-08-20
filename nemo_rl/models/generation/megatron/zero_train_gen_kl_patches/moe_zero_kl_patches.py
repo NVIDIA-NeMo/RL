@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""MoE deterministic unpermute patch for Megatron colocated zero train/gen KL."""
 
 from __future__ import annotations
 
