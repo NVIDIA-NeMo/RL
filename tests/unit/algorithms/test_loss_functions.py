@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import pickle
 
 import pytest
 import torch
@@ -2153,6 +2154,83 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
     torch.testing.assert_close(actual_loss, expected_actor_loss, atol=1e-4, rtol=1e-3)
 
 
+@pytest.mark.parametrize("metrics_level", ["full", "minimal"])
+def test_clipped_pg_loss_gspo_sampling_importance_ratio_batch(metrics_level):
+    """Sequence-level IS metrics reduce one weight per valid sample."""
+    batch_size, seq_len = 3, 4
+    data, *_ = _setup_clipped_pg_test_data(
+        batch_size=batch_size, seq_len=seq_len, device="cpu"
+    )
+    data["sample_mask"] = torch.tensor([1, 0, 1])
+    data["advantages"][:, 1:] = 1.0
+    data["prev_logprobs"][:, 1:] = -1.0
+
+    expected_weights = torch.tensor([2.0, 8.0, 4.0])
+    per_token_log_ratio = expected_weights.log() / (seq_len - 1)
+    data["generation_logprobs"][:, 1:] = data["prev_logprobs"][
+        :, 1:
+    ] - per_token_log_ratio.unsqueeze(-1)
+    curr_logprobs = data["prev_logprobs"][:, 1:].clone().requires_grad_(True)
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            use_importance_sampling_correction=True,
+            sequence_level_importance_ratios=True,
+            token_level_loss=False,
+            metrics_level=metrics_level,
+        )
+    )
+    loss, metrics = loss_fn(
+        curr_logprobs,
+        data,
+        global_valid_seqs=data["sample_mask"].sum().float(),
+        global_valid_toks=(
+            data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+        )
+        .sum()
+        .float(),
+    )
+
+    assert torch.isfinite(loss)
+    assert metrics["sampling_importance_ratio"] == pytest.approx(3.0)
+    loss.backward()
+    assert torch.isfinite(curr_logprobs.grad).all()
+
+
+def test_clipped_pg_loss_gspo_nonfinite_importance_weight_is_zeroed():
+    """Overflowing sequence-level IS weights must not poison the objective."""
+    batch_size, seq_len = 2, 5
+    data, *_ = _setup_clipped_pg_test_data(
+        batch_size=batch_size, seq_len=seq_len, device="cpu"
+    )
+    data["advantages"][:, 1:] = 1.0
+    data["prev_logprobs"][:, 1:] = -1.0
+    data["generation_logprobs"][:, 1:] = -26.0
+    curr_logprobs = data["prev_logprobs"][:, 1:].clone().requires_grad_(True)
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            use_importance_sampling_correction=True,
+            sequence_level_importance_ratios=True,
+            token_level_loss=False,
+            metrics_level="minimal",
+        )
+    )
+    loss, metrics = loss_fn(
+        curr_logprobs,
+        data,
+        global_valid_seqs=data["sample_mask"].sum().float(),
+        global_valid_toks=data["token_mask"][:, 1:].sum().float(),
+    )
+
+    assert torch.isfinite(loss)
+    assert metrics["sampling_importance_ratio"] == 0.0
+    loss.backward()
+    assert torch.isfinite(curr_logprobs.grad).all()
+
+
 def setup_distillation_test_data(batch_size=2, seq_len=4, vocab_size=8, topk=64):
     """Setup test data for distillation loss function tests."""
     if not torch.cuda.is_available():
@@ -2983,6 +3061,135 @@ class TestMetricNormalizationAdvertisement:
         assert norms["loss"] is MetricNormalizer.TOKENS
         assert norms["num_unmasked_tokens"] is MetricNormalizer.NONE
         assert norms["num_valid_samples"] is MetricNormalizer.NONE
+
+    def test_minimal_metrics_preserve_loss_and_drop_diagnostics(self):
+        data, batch_size, seq_len, _ = _setup_clipped_pg_test_data(
+            batch_size=2, seq_len=6, device="cpu"
+        )
+        data["advantages"] = torch.randn(batch_size, seq_len)
+        data["prev_logprobs"] = -torch.rand(batch_size, seq_len)
+        data["generation_logprobs"] = -torch.rand(batch_size, seq_len)
+        curr_logprobs = -torch.rand(batch_size, seq_len - 1)
+        global_valid_seqs = data["sample_mask"].sum().float()
+        global_valid_toks = (
+            (data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1))
+            .sum()
+            .float()
+        )
+
+        full_loss, full_metrics = ClippedPGLossFn(
+            ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
+        )(
+            curr_logprobs,
+            data,
+            global_valid_seqs,
+            global_valid_toks,
+        )
+        minimal_loss, minimal_metrics = ClippedPGLossFn(
+            ClippedPGLossConfig(
+                reference_policy_kl_penalty=0.0,
+                metrics_level="minimal",
+            )
+        )(
+            curr_logprobs,
+            data,
+            global_valid_seqs,
+            global_valid_toks,
+        )
+
+        torch.testing.assert_close(full_loss, minimal_loss)
+        assert "gen_kl_error" in full_metrics
+        assert "gen_kl_error" not in minimal_metrics
+        assert set(minimal_metrics) == {
+            "loss",
+            "kl_penalty",
+            "num_valid_samples",
+            "positive_nll_loss",
+        }
+
+    def test_clipped_pg_metrics_use_one_host_transfer(self, monkeypatch):
+        stacked_values = ()
+        cpu_calls = 0
+
+        class FakeStackedMetrics:
+            def cpu(self):
+                nonlocal cpu_calls
+                cpu_calls += 1
+                return self
+
+            def tolist(self):
+                return [0.0] * len(stacked_values)
+
+        def fake_stack(values):
+            nonlocal stacked_values
+            stacked_values = values
+            return FakeStackedMetrics()
+
+        monkeypatch.setattr(torch, "stack", fake_stack)
+        data, _, _, _ = _setup_clipped_pg_test_data(
+            batch_size=2, seq_len=6, device="cpu"
+        )
+        ClippedPGLossFn(
+            ClippedPGLossConfig(
+                metrics_level="minimal", reference_policy_kl_penalty=0.0
+            )
+        )(
+            data["prev_logprobs"][:, 1:].clone(),
+            data,
+            data["sample_mask"].sum().float(),
+            (data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1))
+            .sum()
+            .float(),
+        )
+
+        assert len(stacked_values) == 4
+        assert cpu_calls == 1
+
+    @pytest.mark.parametrize("metrics_level", ["full", "minimal"])
+    def test_torch_compile_is_lazy_pickleable_and_independent_of_metrics(
+        self, monkeypatch, metrics_level
+    ):
+        compile_call = {}
+
+        def fake_compile(fn, **kwargs):
+            compile_call["fn"] = fn
+            compile_call["kwargs"] = kwargs
+            return fn
+
+        monkeypatch.setattr(torch, "compile", fake_compile)
+        loss_fn = ClippedPGLossFn(
+            ClippedPGLossConfig(
+                enable_torch_compile=True,
+                metrics_level=metrics_level,
+                reference_policy_kl_penalty=0.0,
+            )
+        )
+
+        assert loss_fn._compiled_actor_objective is None
+        assert compile_call == {}
+
+        # Ray serializes the loss before the worker sees it, so compilation
+        # must happen lazily after deserialization.
+        loss_fn = pickle.loads(pickle.dumps(loss_fn))
+        data, _, _, _ = _setup_clipped_pg_test_data(
+            batch_size=2, seq_len=6, device="cpu"
+        )
+        curr_logprobs = data["prev_logprobs"][:, 1:].clone()
+        loss_fn(
+            curr_logprobs,
+            data,
+            data["sample_mask"].sum().float(),
+            (data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1))
+            .sum()
+            .float(),
+        )
+
+        assert loss_fn._compiled_actor_objective is compile_call["fn"]
+        assert compile_call["kwargs"] == {
+            "dynamic": True,
+            "fullgraph": True,
+            "mode": "max-autotune-no-cudagraphs",
+        }
 
 
 def test_split_rescale_matches_sync_normalization():
