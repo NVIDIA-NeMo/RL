@@ -60,7 +60,7 @@ class _FakeStore:
 
 
 class _FakeClient:
-    """Just the attribute surface ``_staging_pool`` touches."""
+    """Just the attribute surface ``_StagingPoolRegistry.pool_for`` touches."""
 
     def __init__(self, store: _FakeStore) -> None:
         self._store = store
@@ -201,6 +201,9 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
 
     monkeypatch.setattr(tq_adapter._StagingPool, "__init__", slow_init)
 
+    # The production registry is a local of _patch_mooncake_staging_buffers, so
+    # build one here rather than reaching into the patch closure.
+    registry = tq_adapter._StagingPoolRegistry(4, _MAX)
     client = _FakeClient(_FakeStore())
     n_threads = 8
     barrier = threading.Barrier(n_threads)
@@ -208,7 +211,7 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
 
     def worker() -> None:
         barrier.wait()
-        seen.append(tq_adapter._staging_pool(client, 4, _MAX))
+        seen.append(registry.pool_for(client))
 
     threads = [threading.Thread(target=worker) for _ in range(n_threads)]
     for t in threads:
@@ -218,4 +221,6 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
 
     assert len(constructed) == 1
     assert len(seen) == n_threads
-    assert all(pool is client._nrl_staging for pool in seen)
+    # Identity, not storage location: every caller must get the one pool that
+    # was actually constructed.
+    assert seen == [constructed[0]] * n_threads

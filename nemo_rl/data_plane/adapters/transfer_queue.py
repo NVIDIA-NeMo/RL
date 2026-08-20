@@ -31,6 +31,7 @@ import socket
 import threading
 import time
 import warnings
+import weakref
 from importlib import resources
 from queue import Empty, SimpleQueue
 from typing import Any, cast
@@ -140,10 +141,6 @@ def _mooncake_transport_config() -> dict:
 # that a transfer is slow. Fail with that diagnosis rather than block forever.
 _STAGING_SLOT_TIMEOUT_S = 600.0
 
-# Guards the lazy per-client pool construction. Module-level rather than
-# per-client because it is only ever contended on the first transfer.
-_staging_pool_lock = threading.Lock()
-
 
 def _memlock_limit() -> str:
     """Return this process's RLIMIT_MEMLOCK soft limit, for error messages."""
@@ -236,23 +233,42 @@ class _StagingPool:
             self._free.put(buf)
 
 
-def _staging_pool(client: Any, n_slots: int, max_bytes: int) -> _StagingPool:
-    """Return ``client``'s pool, building it at most once across threads.
+class _StagingPoolRegistry:
+    """Owns each client's staging pool, keyed weakly so it dies with the client.
 
-    Locked because ``put``/``get`` drive the thread workers from a
-    ``ThreadPoolExecutor``, so two of them reach a cold client at once whenever
-    a call splits into more than one ``BATCH_SIZE_LIMIT`` batch. Unsynchronized,
-    the loser's pool is dropped on the floor and its buffers are freed while
-    still registered — see :func:`_register_checked` for why that surfaces as a
-    bare ``TRANSFER_FAIL``. The lock is taken on every lookup rather than
-    double-checked: it is uncontended after the first transfer, and nanoseconds
-    against a millisecond RDMA transfer is not worth reasoning about visibility.
+    Weak keys because the registry is reachable from the patched class for the
+    process lifetime; a strong table would pin every client's registered
+    buffers for that long.
     """
-    with _staging_pool_lock:
-        pool = getattr(client, "_nrl_staging", None)
-        if pool is None:
-            pool = client._nrl_staging = _StagingPool(client._store, n_slots, max_bytes)
-        return pool
+
+    def __init__(self, n_slots: int, max_bytes: int) -> None:
+        self._n_slots = n_slots
+        self._max_bytes = max_bytes
+        self._lock = threading.Lock()
+        self._pools: weakref.WeakKeyDictionary[Any, _StagingPool] = (
+            weakref.WeakKeyDictionary()
+        )
+
+    def pool_for(self, client: Any) -> _StagingPool:
+        """Return ``client``'s pool, building it at most once across threads.
+
+        Locked because ``put``/``get`` drive the thread workers from a
+        ``ThreadPoolExecutor``, so two of them reach a cold client at once
+        whenever a call splits into more than one ``BATCH_SIZE_LIMIT`` batch.
+        Unsynchronized, the loser's pool is dropped on the floor and its buffers
+        are freed while still registered — see :func:`_register_checked` for why
+        that surfaces as a bare ``TRANSFER_FAIL``. The lock is taken on every
+        lookup rather than double-checked: it is uncontended after the first
+        transfer, and nanoseconds against a millisecond RDMA transfer is not
+        worth reasoning about visibility.
+        """
+        with self._lock:
+            pool = self._pools.get(client)
+            if pool is None:
+                pool = self._pools[client] = _StagingPool(
+                    client._store, self._n_slots, self._max_bytes
+                )
+            return pool
 
 
 def _patch_mooncake_register_check() -> None:
@@ -322,11 +338,12 @@ def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
     if not isinstance(_n_slots_raw, int):
         return
     n_slots: int = _n_slots_raw
+    registry = _StagingPoolRegistry(n_slots, max_bytes)
 
     def _get_tensors_thread_worker(
         self, batch_keys, batch_shapes, batch_dtypes, indexes
     ):  # type: ignore[no-untyped-def]
-        pool = _staging_pool(self, n_slots, max_bytes)
+        pool = registry.pool_for(self)
         batch_nbytes = get_nbytes(batch_dtypes, batch_shapes)
         tensors: list[Any] = [None] * len(batch_keys)
         # Split the payload to fit a bounded buffer rather than sizing the
@@ -352,7 +369,7 @@ def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
 
     def _put_tensors_thread_worker(self, batch_keys, batch_tensors):  # type: ignore[no-untyped-def]
         """PUT direction of the GET patch: stage into the pooled buffer, then transfer."""
-        pool = _staging_pool(self, n_slots, max_bytes)
+        pool = registry.pool_for(self)
         contiguous = [t.contiguous() for t in batch_tensors]
         nbytes = [t.nbytes for t in contiguous]
         for idxs in split_by_bytes(nbytes, max_bytes):
