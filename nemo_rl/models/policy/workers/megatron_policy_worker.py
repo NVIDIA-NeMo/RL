@@ -2265,10 +2265,19 @@ class MegatronPolicyWorkerImpl(
             return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
                 self.megatron_bridge.hf_pretrained, [self.model]
             )
+        # NRL_REFIT_SKIP_MTP=1: drop MTP params from refit entirely. The
+        # nemotron_omni bridge's megatron->HF mapping still misses MTP
+        # layer-norm params on the refit-export path (jobs 6296933, 6371264:
+        # "Unrecognized mapping type" -> TP ranks desync -> ALLGATHER hangs to
+        # the 600s NCCL watchdog in prepare_refit_info). Generation engines
+        # without speculative decoding never consume MTP weights, so skipping
+        # them here (identically on every rank) is safe.
+        skip_mtp = os.environ.get("NRL_REFIT_SKIP_MTP", "0") == "1"
         return [
             task
             for task in self.megatron_bridge.get_conversion_tasks([self.model])
             if task is not None
+            and not (skip_mtp and "mtp." in task.global_param_name)
         ]
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:

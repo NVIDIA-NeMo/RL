@@ -49,6 +49,12 @@ policy:
       enable_thinking: true
       truncate_history_thinking: false
   megatron_cfg:
+    # NRL_REFIT_SKIP_MTP: the upstream bridge mtp export fix does NOT cover the
+    # refit path (job 6371264 reproduced the 6296933 ALLGATHER hang) — keep the
+    # proven workaround: mtp params excluded from refit; gen engines run
+    # without spec decode and never need them. MTP still trains + checkpoints.
+    env_vars:
+      NRL_REFIT_SKIP_MTP: "1"
     # MTP per this branch's canonical super-omni MTP recipe: the checkpoint
     # ships ONE physical MTP layer (mtp_hybrid_override_pattern "*E"), so
     # num_layers=1 non-repeated maps directly onto it. detach_heads keeps the
