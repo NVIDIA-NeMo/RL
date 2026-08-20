@@ -157,13 +157,24 @@ def test_process_group_uses_root_uid_and_warms_up_the_communicator(monkeypatch):
 
     class FakeCommunicator:
         @staticmethod
-        def init(*, nranks, rank, unique_id):
+        def init(*, nranks, rank, unique_id, config):
+            assert config.blocking is False
             events.append(("init", nranks, rank, unique_id))
             return FakeCommunicator()
+
+        def get_async_error(self):
+            return 0
 
         def broadcast(self, *, sendbuf, recvbuf, root, stream):
             recvbuf.value = 1
             events.append(("broadcast", root, stream))
+
+        def abort(self):
+            events.append("abort")
+
+    class FakeConfig:
+        def __init__(self, *, blocking):
+            self.blocking = blocking
 
     class FakeUniqueId:
         @staticmethod
@@ -172,10 +183,15 @@ def test_process_group_uses_root_uid_and_warms_up_the_communicator(monkeypatch):
 
     communicator = ModuleType("nccl.core.communicator")
     communicator.Communicator = FakeCommunicator
+    communicator.NCCLConfig = FakeConfig
     utils = ModuleType("nccl.core.utils")
     utils.UniqueId = FakeUniqueId
+    bindings = ModuleType("nccl.bindings.nccl")
+    bindings.Result = SimpleNamespace(Success=0, InProgress=7)
     monkeypatch.setitem(sys.modules, "nccl", ModuleType("nccl"))
     monkeypatch.setitem(sys.modules, "nccl.core", ModuleType("nccl.core"))
+    monkeypatch.setitem(sys.modules, "nccl.bindings", ModuleType("nccl.bindings"))
+    monkeypatch.setitem(sys.modules, "nccl.bindings.nccl", bindings)
     monkeypatch.setitem(sys.modules, "nccl.core.communicator", communicator)
     monkeypatch.setitem(sys.modules, "nccl.core.utils", utils)
     monkeypatch.setattr(bootstrap.torch.cuda, "empty_cache", lambda: None)
@@ -200,3 +216,57 @@ def test_process_group_uses_root_uid_and_warms_up_the_communicator(monkeypatch):
         ("broadcast", 0, 17),
         "sync",
     ]
+
+
+def test_process_group_aborts_a_nonblocking_init_that_times_out(monkeypatch):
+    events = []
+
+    class FakeCommunicator:
+        @staticmethod
+        def init(**kwargs):
+            return FakeCommunicator()
+
+        def get_async_error(self):
+            return 7
+
+        def abort(self):
+            events.append("abort")
+
+    class FakeConfig:
+        def __init__(self, *, blocking):
+            self.blocking = blocking
+
+    class FakeUniqueId:
+        @staticmethod
+        def from_bytes(raw):
+            return raw
+
+    communicator = ModuleType("nccl.core.communicator")
+    communicator.Communicator = FakeCommunicator
+    communicator.NCCLConfig = FakeConfig
+    utils = ModuleType("nccl.core.utils")
+    utils.UniqueId = FakeUniqueId
+    bindings = ModuleType("nccl.bindings.nccl")
+    bindings.Result = SimpleNamespace(Success=0, InProgress=7)
+    monkeypatch.setitem(sys.modules, "nccl", ModuleType("nccl"))
+    monkeypatch.setitem(sys.modules, "nccl.core", ModuleType("nccl.core"))
+    monkeypatch.setitem(sys.modules, "nccl.bindings", ModuleType("nccl.bindings"))
+    monkeypatch.setitem(sys.modules, "nccl.bindings.nccl", bindings)
+    monkeypatch.setitem(sys.modules, "nccl.core.communicator", communicator)
+    monkeypatch.setitem(sys.modules, "nccl.core.utils", utils)
+    monkeypatch.setattr(bootstrap.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(bootstrap.torch.cuda, "device", lambda device: nullcontext())
+    ticks = iter((0.0, 0.0, 0.2))
+    monkeypatch.setattr(bootstrap.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _: None)
+
+    group = bootstrap.MxProcessGroup(
+        unique_id=b"u" * 128,
+        rank=1,
+        world_size=2,
+        timeout_s=0.1,
+    )
+    with pytest.raises(TimeoutError, match="did not complete"):
+        group.init_nccl_communicator(device=0)
+
+    assert events == ["abort"]

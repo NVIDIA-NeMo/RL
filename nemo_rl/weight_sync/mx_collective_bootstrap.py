@@ -27,7 +27,9 @@ transports comparable: they cannot drift apart, because below the bootstrap
 they are the same code path.
 """
 
+import math
 import os
+import time
 from typing import Any
 
 import torch
@@ -48,6 +50,7 @@ class MxProcessGroup:
         rank: int,
         world_size: int,
         root_unique_id: Any = None,
+        timeout_s: float = 900.0,
     ):
         self.rank = rank
         self.world_size = world_size
@@ -57,9 +60,11 @@ class MxProcessGroup:
         # ncclGetUniqueId, matching StatelessProcessGroup. Peers reconstruct
         # it from the bytes MX brokered.
         self._root_unique_id = root_unique_id
+        self._timeout_s = timeout_s
 
     def init_nccl_communicator(self, device):
-        from nccl.core.communicator import Communicator
+        from nccl.bindings import nccl as bindings
+        from nccl.core import communicator
         from nccl.core.utils import UniqueId
 
         # Mirror the native path: free cached blocks first so the communicator's
@@ -69,25 +74,71 @@ class MxProcessGroup:
             unique_id = self._root_unique_id
             if unique_id is None:
                 unique_id = UniqueId.from_bytes(self._unique_id)
-            self.nccl_communicator = Communicator.init(
-                nranks=self.world_size,
-                rank=self.rank,
-                unique_id=unique_id,
-            )
+            config_type = getattr(communicator, "NCCLConfig", None)
+            if config_type is None:
+                raise RuntimeError(
+                    "MX communicator timeouts require nccl4py NCCLConfig support"
+                )
+            try:
+                self.nccl_communicator = communicator.Communicator.init(
+                    nranks=self.world_size,
+                    rank=self.rank,
+                    unique_id=unique_id,
+                    config=config_type(blocking=False),
+                )
+                deadline = time.monotonic() + self._timeout_s
+                while True:
+                    status = self.nccl_communicator.get_async_error()
+                    if int(status) == int(bindings.Result.Success):
+                        break
+                    if int(status) != int(bindings.Result.InProgress):
+                        raise RuntimeError(
+                            "MX NCCL communicator initialization failed with "
+                            f"{status!r}: {self.nccl_communicator.get_last_error()}"
+                        )
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            "MX NCCL communicator initialization did not complete "
+                            f"within {self._timeout_s:.1f}s"
+                        )
+                    time.sleep(min(0.01, remaining))
+            except BaseException:
+                try:
+                    self.abort()
+                except Exception:
+                    pass
+                raise
 
             # Match the native StatelessProcessGroup bootstrap protocol. This
             # proves the newly-created communicator can execute one collective
             # before it is handed to the refit path.
-            stream = torch.cuda.current_stream()
-            data = (
-                torch.ones(1, device=device)
-                if self.rank == 0
-                else torch.zeros(1, device=device)
-            )
-            self.broadcast(data, 0, stream=stream)
-            stream.synchronize()
-            if not torch.allclose(data, torch.ones(1, device=device)):
-                raise RuntimeError("MX NCCL communicator bootstrap broadcast failed")
+            try:
+                stream = torch.cuda.current_stream()
+                data = (
+                    torch.ones(1, device=device)
+                    if self.rank == 0
+                    else torch.zeros(1, device=device)
+                )
+                self.broadcast(data, 0, stream=stream)
+                stream.synchronize()
+                if not torch.allclose(data, torch.ones(1, device=device)):
+                    raise RuntimeError(
+                        "MX NCCL communicator bootstrap broadcast failed"
+                    )
+            except BaseException:
+                try:
+                    self.abort()
+                except Exception:
+                    pass
+                raise
+
+    def abort(self) -> None:
+        """Abort a partially or fully initialized communicator exactly once."""
+        communicator = self.nccl_communicator
+        self.nccl_communicator = None
+        if communicator is not None:
+            communicator.abort()
 
     def broadcast(self, tensor, src, stream=None):
         if stream is None:
@@ -114,6 +165,19 @@ class MxBootstrapState:
         self.rz = None
         self.channel = None
         self.timeout_s = 900.0
+
+    def abort(self) -> None:
+        """Abort every lane already created for this group."""
+        groups = list(self.reshard_groups.values())
+        if self.broadcast_group is not None:
+            groups.append(self.broadcast_group)
+        self.reshard_groups.clear()
+        self.broadcast_group = None
+        for group in groups:
+            try:
+                group.abort()
+            except Exception:
+                pass
 
 
 def mx_rendezvous(
@@ -144,6 +208,13 @@ def mx_rendezvous(
             "NCCL_COMM_ID must be unset for the MX collective transport; "
             "it overrides ncclGetUniqueId and bypasses MX's per-lane bootstrap"
         )
+    if os.environ.get("NCCL_COMM_BLOCKING") not in (None, "", "0"):
+        raise RuntimeError(
+            "NCCL_COMM_BLOCKING must be unset or 0 for the MX collective "
+            "transport so communicator initialization remains bounded"
+        )
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError(f"timeout_s must be finite and positive, got {timeout_s}")
 
     import grpc
     from modelexpress_rl.collective import CollectiveRendezvous, Role
@@ -258,8 +329,13 @@ def mx_init_lane(state: MxBootstrapState, lane_id: int) -> None:
         rank=lane.rank_in_lane,
         world_size=lane.world_size,
         root_unique_id=root_unique_id,
+        timeout_s=state.timeout_s,
     )
-    pg.init_nccl_communicator(device=state.device)
+    try:
+        pg.init_nccl_communicator(device=state.device)
+    except BaseException:
+        state.abort()
+        raise
     if lane.kind == "BROADCAST":
         state.broadcast_group = pg
     else:
