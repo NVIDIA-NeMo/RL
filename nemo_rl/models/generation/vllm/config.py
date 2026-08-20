@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import warnings
 from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
 
 from pydantic import BaseModel, Field, NonNegativeInt, PositiveFloat, PositiveInt
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+
+logger = logging.getLogger(__name__)
 
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
@@ -210,3 +214,59 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
         VllmCheckpointEnginePluginConfig.model_validate(plugin_config)
     config["refit_cfg"] = refit_config
     return refit_config
+
+
+def merge_hf_overrides(
+    vllm_kwargs: dict[str, Any], *, hf_config_overrides: dict[str, Any] | None
+) -> None:
+    """Merge the training policy's HF config overrides into ``vllm_kwargs`` in place.
+
+    vLLM has to see the same HF config as the training policy, so
+    ``policy.hf_config_overrides`` is propagated to the generation engine. Assigning it
+    wholesale silently discarded a user-supplied
+    ``policy.generation.vllm_kwargs.hf_overrides`` (and reset it to ``{}`` whenever the
+    policy declared no overrides of its own). This is the same overwrite-vs-merge bug
+    that was fixed in the worker; see #1413/#2904.
+
+    The merge is shallow, like ``_merge_fp8_kwargs``. The training policy wins outright on
+    a conflicting top-level key -- a ``rope_scaling`` declared by the policy replaces a
+    generation-side one instead of being merged into it -- so vLLM and the trainer still
+    cannot disagree on anything the policy declares, which is what these call sites exist
+    to guarantee. Only keys the policy leaves unset survive from the generation side.
+
+    Nothing here resolves silently: the merged overrides are logged, and a generation-side
+    value the policy shadows with a different one warns. A callable ``hf_overrides``, which
+    vLLM accepts but which cannot be merged with a mapping, is dropped like the worker
+    already drops a non-dict value -- but with a warning rather than silently.
+    """
+    generation_hf_overrides = vllm_kwargs.get("hf_overrides")
+    if generation_hf_overrides is not None and not isinstance(
+        generation_hf_overrides, dict
+    ):
+        warnings.warn(
+            "policy.generation.vllm_kwargs.hf_overrides is "
+            f"{type(generation_hf_overrides).__name__}, which cannot be merged with "
+            "policy.hf_config_overrides; dropping it.",
+            stacklevel=2,
+        )
+    if not isinstance(generation_hf_overrides, dict):
+        generation_hf_overrides = {}
+    hf_config_overrides = hf_config_overrides or {}
+
+    shadowed = sorted(
+        key
+        for key, value in generation_hf_overrides.items()
+        if key in hf_config_overrides and hf_config_overrides[key] != value
+    )
+    if shadowed:
+        warnings.warn(
+            "policy.hf_config_overrides takes precedence over "
+            f"policy.generation.vllm_kwargs.hf_overrides for {shadowed}, so the "
+            "generation engine sees the same HF config as the training policy.",
+            stacklevel=2,
+        )
+
+    merged = {**generation_hf_overrides, **hf_config_overrides}
+    if merged:
+        logger.info("Generation engine hf_overrides resolved to %s", merged)
+    vllm_kwargs["hf_overrides"] = merged
