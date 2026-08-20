@@ -31,20 +31,9 @@ policy:
   generation:
     vllm_cfg:
       async_engine: true
-      # Required when this recipe is reused by NeMo Gym launchers.
-      expose_http_server: true
       tensor_parallel_size: 2
       expert_parallel_size: 2
       enforce_eager: false
-      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
-      http_server_serving_chat_kwargs:
-        enable_auto_tools: true
-        tool_parser: qwen3_coder
-        reasoning_parser: nano_v3
-        chat_template_content_format: string
-        default_chat_template_kwargs:
-          enable_thinking: true
-          truncate_history_thinking: false
     vllm_kwargs:
       max_num_batched_tokens: 32768
       max_num_seqs: 64
