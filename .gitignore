@@ -42,6 +42,7 @@ checkpoints/
 results/
 code_snapshots*/
 .cache/
+/.tmp/
 
 # Runtime env
 *runtime_env.yaml

@@ -1,0 +1,64 @@
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+
+# One training step over a deterministic 16-row image-tools sample. This is a
+# wiring smoke test for the full Gym agent loop, generated images, multimodal
+# replay, logprobs, and the policy update—not a convergence recipe.
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 16
+  val_num_generations_per_prompt: 1
+  max_num_epochs: 1
+  max_num_steps: 1
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  deduplicate_multimodal_data: false
+  async_grpo:
+    enabled: false
+    in_flight_weight_updates: false
+
+checkpointing:
+  enabled: false
+
+policy:
+  train_global_batch_size: 256
+  max_total_sequence_length: 32768
+  megatron_cfg:
+    scheduler:
+      lr_decay_iters: 1
+      lr_warmup_iters: 0
+  generation:
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 21
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  train:
+    data_path: .tmp/image_tools_grpo_sample/train.jsonl
+  validation:
+    data_path: .tmp/image_tools_grpo_sample/validation.jsonl
+
+env:
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    pad_dynamic_image_shapes: true
+    sanitize_image_placeholders: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/image_tools_agent/configs/image_tools_agent.yaml
+    - resources_servers/string_match/configs/string_match.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/gui_coordinate/configs/gui_coordinate.yaml
+
+logger:
+  log_dir: logs/image-tools-grpo-sample
+  wandb_enabled: false
+  tensorboard_enabled: true
+
+# Kept explicit because the Super launcher reads this value without resolving
+# the defaults chain.
+cluster:
+  num_nodes: 16
+  gpus_per_node: 8
