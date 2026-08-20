@@ -2,8 +2,9 @@
 # SingleController + NeMo-Gym + Megatron generation e2e smoke. Mirrors
 # grpo_async_gym_single_controller.sh with the generation backend swapped to
 # megatron (non-colocated): Gym rollouts go through the persistent Megatron
-# engine's OpenAI server, spun up serially after the engine is live, and each
-# post-step weight sync runs mcore's reshard-capable transfer.
+# engine's OpenAI server, whose address is reserved up front so Gym spinup
+# overlaps engine init, and each post-step weight sync runs mcore's
+# reshard-capable transfer.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
@@ -50,7 +51,7 @@ uv run ng_prepare_data "+config_paths=[resources_servers/workplace_assistant/con
 cd -
 
 # This trimming of the workplace assistant dataset is necessary b/c with all the tools the first prompt is >4000 tokens
-# which will cause vllm to return nothing on the first prompt and crash RL. Since we want to keep this test short to
+# which will cause the generation engine to return nothing on the first prompt and crash RL. Since we want to keep this test short to
 # smoke test, we trim all but the first tool
 TRAIN_PATH=$DATA_DIR/workplace_assistant_train.jsonl
 VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl

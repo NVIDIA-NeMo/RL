@@ -928,7 +928,9 @@ def _maybe_apply_megatron_generation_overrides(
 
     async_config = master_config.async_rl
     if async_config.recompute_kv_cache_after_weight_updates:
-        # Mirror grpo.py: recompute-after-refit is expressed engine-side for Megatron.
+        # As in grpo.py, recompute-after-refit is expressed engine-side for Megatron.
+        # Unlike grpo.py, SC also clears the flag so the actor skips its loop-level
+        # invalidate_kv_cache (a base-class no-op for MegatronGeneration).
         prior_mode = mcore_cfg.get("kv_cache_management_mode")
         if prior_mode != "recompute":
             print(
@@ -1294,6 +1296,8 @@ def setup_single_controller(
             "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
             f"{generation_config['backend']!r}"
         )
+    # Megatron-generation checks are pure config: run them before the dataset download.
+    _maybe_apply_megatron_generation_overrides(master_config, use_nemo_gym=use_nemo_gym)
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
@@ -1328,7 +1332,6 @@ def setup_single_controller(
 
     _clamp_max_num_steps(master_config, dataloader)
     _maybe_inject_megatron_train_iters(master_config)
-    _maybe_apply_megatron_generation_overrides(master_config, use_nemo_gym=use_nemo_gym)
 
     # ==========================
     # Setup Clusters & Workers
@@ -1611,13 +1614,9 @@ def setup_single_controller(
         ) + setup_timing_metrics.teacher_model_init_time_s
 
     if megatron_reserved_url is not None:
-        served_urls = generation.dp_openai_server_base_urls
-        if served_urls != [megatron_reserved_url]:
-            raise RuntimeError(
-                "Megatron server came up at a different address than the one "
-                f"pre-published to NeMo Gym: reserved {megatron_reserved_url}, "
-                f"serving {served_urls}."
-            )
+        MegatronGeneration.verify_served_address(
+            generation.dp_openai_server_base_urls, megatron_reserved_url
+        )
 
     worker_setup_time = time.perf_counter() - setup_start_time
     setup_timing_metrics.worker_setup_time_s = worker_setup_time

@@ -37,6 +37,7 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
+    from nemo_rl.distributed.worker_groups import RayWorkerGroup
     from nemo_rl.models.policy.lm_policy import Policy
 
 
@@ -140,6 +141,17 @@ class MegatronGeneration(GenerationInterface):
         node_ip, port = ray.get(holder.address.remote())
         return f"http://{node_ip}:{port}/v1", port, holder
 
+    @classmethod
+    def verify_served_address(
+        cls, served_urls: list[Optional[str]], reserved_url: str
+    ) -> None:
+        """Fail loud if the engine serves anywhere but the pre-published address."""
+        if served_urls != [reserved_url]:
+            raise RuntimeError(
+                "Megatron server came up at a different address than the one "
+                f"pre-published to NeMo Gym: reserved {reserved_url}, serving {served_urls}."
+            )
+
     def __init__(
         self,
         config: PolicyConfig,
@@ -222,6 +234,11 @@ class MegatronGeneration(GenerationInterface):
         # The engine + HTTP server then first come up at the initial refit.
         if not skip_weight_load:
             self.prepare_for_generation()
+
+    @property
+    def worker_group(self) -> "RayWorkerGroup":
+        """The underlying policy's worker group (fleet-health probes read dp_size)."""
+        return self._policy.worker_group
 
     def init_collective(
         self,
