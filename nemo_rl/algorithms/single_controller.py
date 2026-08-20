@@ -70,6 +70,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
+from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -77,7 +78,7 @@ from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
 from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
-Generation = Union[VllmGeneration, SGLangGeneration]
+Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.
