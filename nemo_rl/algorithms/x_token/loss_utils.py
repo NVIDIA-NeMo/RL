@@ -38,6 +38,7 @@ Used by both :mod:`token_aligner` and
 from __future__ import annotations
 
 import os
+import socket
 from dataclasses import dataclass, fields
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
@@ -53,6 +54,11 @@ from nemo_rl.distributed.model_utils import (
     vocab_parallel_argmax,
 )
 from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
+from nemo_rl.models.policy.utils import (
+    XTokenLogitShard,
+    XTokenSampleHandles,
+    XTokenTransportContext,
+)
 
 
 def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
@@ -409,11 +415,11 @@ def next_token_accuracy(
 
 
 def collect_overlapping_teacher_shards(
-    teacher_shards: list[dict[str, Any]],
+    teacher_shards: list[XTokenLogitShard],
     student_cp_rank: int,
     student_cp_size: int,
     full_seq_len: int,
-) -> list[tuple[dict[str, Any], slice, slice, slice, slice]]:
+) -> list[tuple[XTokenLogitShard, slice, slice, slice, slice]]:
     """Plan ``(src_seq, src_vocab, dest_seq, dest_vocab)`` slices per teacher shard.
 
     Dest is ``[T_t/CP_s, V_t]`` (vocab fully reassembled, seq is this
@@ -422,7 +428,7 @@ def collect_overlapping_teacher_shards(
     student_seq_start = student_cp_rank * full_seq_len // student_cp_size
     student_seq_end = (student_cp_rank + 1) * full_seq_len // student_cp_size
 
-    matches: list[tuple[dict[str, Any], slice, slice, slice, slice]] = []
+    matches: list[tuple[XTokenLogitShard, slice, slice, slice, slice]] = []
     for handle in teacher_shards:
         teacher_vocab_start = int(handle["vocab_start_index"])
         teacher_vocab_end = int(handle["vocab_end_index"])
@@ -449,7 +455,7 @@ def collect_overlapping_teacher_shards(
 
 
 def assemble_teacher_logits_from_shards(
-    teacher_shards: list[dict[str, Any]],
+    teacher_shards: list[XTokenLogitShard],
     student_cp_rank: int,
     student_cp_size: int,
     device: int,
@@ -498,7 +504,7 @@ def assemble_teacher_logits_from_shards(
 
 
 def _try_zero_copy_teacher_logits(
-    per_sample_entries: list[dict[str, Any]],
+    per_sample_entries: list[XTokenSampleHandles],
     *,
     student_cp_rank: int,
     student_cp_size: int,
@@ -526,7 +532,7 @@ def _try_zero_copy_teacher_logits(
     student_seq_end = (student_cp_rank + 1) * full_seq_len // student_cp_size
 
     # Exactly one full-vocab shard must cover this student rank's seq range.
-    chosen: list[dict[str, Any]] = []
+    chosen: list[XTokenLogitShard] = []
     for entry in per_sample_entries:
         covering = [
             h
@@ -562,7 +568,7 @@ def _try_zero_copy_teacher_logits(
 
 
 def rebuild_teacher_full_logits_from_ipc(
-    per_sample_entries: list[dict[str, Any]],
+    per_sample_entries: list[XTokenSampleHandles],
     cp_group: Optional[torch.distributed.ProcessGroup],
     device: int,
 ) -> torch.Tensor:
@@ -601,6 +607,94 @@ def rebuild_teacher_full_logits_from_ipc(
         )
         for entry in per_sample_entries
     ]
+    return torch.stack(rebuilt, dim=0)
+
+
+def rebuild_teacher_full_logits_from_nccl(
+    per_sample_entries: list[XTokenSampleHandles],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    device: int,
+    xtoken_transport: XTokenTransportContext,
+) -> torch.Tensor:
+    """Rebuild a CP window from node-local IPC and received NCCL shards.
+
+    NCCL P2P has already completed before this function runs.
+    """
+    student_cp_rank = (
+        torch.distributed.get_rank(cp_group) if cp_group is not None else 0
+    )
+    student_cp_size = (
+        torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+    )
+    entry_matches: list[list[tuple[XTokenLogitShard, slice, slice, slice, slice]]] = []
+    hostname = socket.gethostname()
+
+    def use_nccl(shard: XTokenLogitShard) -> bool:
+        transport = shard.get("transport", "nccl")
+        return transport == "nccl" or (
+            transport == "hybrid" and shard["hostname"] != hostname
+        )
+
+    for entry in per_sample_entries:
+        teacher_shards = entry["teacher_shards"]
+        full_seq_len = int(teacher_shards[0]["full_seq_len"])
+        matches = collect_overlapping_teacher_shards(
+            teacher_shards,
+            student_cp_rank=student_cp_rank,
+            student_cp_size=student_cp_size,
+            full_seq_len=full_seq_len,
+        )
+        entry_matches.append(matches)
+    ipc_tensors: dict[tuple[Any, ...], torch.Tensor] = {}
+    received_logits, world_rank = xtoken_transport
+
+    rebuilt: list[torch.Tensor] = []
+    for entry, matches in zip(per_sample_entries, entry_matches):
+        teacher_shards = entry["teacher_shards"]
+        full_seq_len = int(teacher_shards[0]["full_seq_len"])
+        full_vocab_size = int(teacher_shards[0]["full_vocab_size"])
+        if full_seq_len % student_cp_size != 0:
+            raise ValueError(
+                f"full_seq_len={full_seq_len} is not divisible by "
+                f"student_cp_size={student_cp_size}"
+            )
+        dest = torch.zeros(
+            (full_seq_len // student_cp_size, full_vocab_size),
+            dtype=torch.float32,
+            device=device,
+        )
+        sources: list[tuple[Any, ...]] = []
+        for shard, src_seq, src_vocab, dest_seq, dest_vocab in matches:
+            if use_nccl(shard):
+                nccl_keys = shard.get("nccl_keys")
+                if nccl_keys is None or world_rank not in nccl_keys:
+                    raise RuntimeError(
+                        "missing NCCL receive key for x-token shard: "
+                        f"teacher_rank={shard['world_rank']}, "
+                        f"world_rank={world_rank}"
+                    )
+                transfer_key = nccl_keys[world_rank]
+                if transfer_key not in received_logits:
+                    raise RuntimeError(
+                        f"NCCL receive {transfer_key!r} was not populated"
+                    )
+                src = received_logits[transfer_key]
+            else:
+                from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+
+                payload = shard["payload_ipc"]
+                storage = ipc_tensors.get(payload)
+                if storage is None:
+                    storage = rebuild_cuda_tensor_from_ipc(payload, device).detach()
+                    ipc_tensors[payload] = storage
+                src = storage[int(shard["buf_idx"]), int(shard["sample_index_in_buf"])]
+            sources.append((src, src_seq, src_vocab, dest_seq, dest_vocab))
+        for src, src_seq, src_vocab, dest_seq, dest_vocab in sources:
+            dest[dest_seq, dest_vocab] = src[src_seq, src_vocab].to(
+                device=device, dtype=torch.float32, non_blocking=True
+            )
+        rebuilt.append(dest)
+    torch.cuda.current_stream().synchronize()
     return torch.stack(rebuilt, dim=0)
 
 
@@ -976,6 +1070,7 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     projection_matrix_paths: list[Optional[str]],
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    xtoken_transport: Optional[XTokenTransportContext] = None,
 ) -> tuple[
     torch.Tensor,
     Dict[int, torch.Tensor],
@@ -1031,11 +1126,22 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     teacher_full_logits_by_idx: Dict[int, torch.Tensor] = {}
     aligns_by_idx: Dict[int, LocalizedAlignment] = {}
     for i, proj_path in enumerate(projection_matrix_paths):
-        teacher_full_logits = rebuild_teacher_full_logits_from_ipc(
-            data[f"teacher_{i}_full_logits_ipc"],
-            cp_group=cp_group,
-            device=device,
-        )
+        transport_key = f"teacher_{i}_full_logits_transport"
+        if transport_key in data:
+            if xtoken_transport is None:
+                raise RuntimeError("NCCL teacher logits require the x-token collective")
+            teacher_full_logits = rebuild_teacher_full_logits_from_nccl(
+                data[transport_key],
+                cp_group=cp_group,
+                device=device,
+                xtoken_transport=xtoken_transport,
+            )
+        else:
+            teacher_full_logits = rebuild_teacher_full_logits_from_ipc(
+                data[f"teacher_{i}_full_logits_ipc"],
+                cp_group=cp_group,
+                device=device,
+            )
         teacher_full_logits_by_idx[i] = teacher_full_logits
         if proj_path is None:
             # Same-tokenizer teacher: identity token alignment, no chunk

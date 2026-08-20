@@ -19,11 +19,9 @@ data plumbing as ``MagicMock``s, then top-level ``def test_*``
 functions exercise the high-level invariants the reviewer flagged.
 CPU-only, no Ray, no CUDA.
 
-The transport is "always-full": every teacher ships full-vocab logits over
-CUDA IPC (``teacher_{i}_full_logits_ipc``) and the loss derives the
-microbatch-global top-k subset student-side. There is no per-teacher
-``send_full_logits`` flag, no top-K IPC variant, and no ``mode=`` argument on
-the IPC producer.
+The transport is "always-full": every teacher exposes full-vocab logits over
+CUDA IPC. Student workers read colocated shards directly and relay only
+cross-node shards over NCCL.
 """
 
 from __future__ import annotations
@@ -47,6 +45,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
     TeacherConfig,
     _default_off_policy_distillation_save_state,
+    build_xtoken_transfer_plan,
     export_teacher_logits_and_pack,
     setup,
     validate,
@@ -224,6 +223,57 @@ def _make_tokenizer(vocab_size: int) -> MagicMock:
     return tok
 
 
+def _make_logit_handles(
+    *, hostname: str = "node0", device_uuid: str = "GPU-0"
+) -> list[dict]:
+    """Return one sample containing one full-vocab teacher shard."""
+    return [
+        {
+            "teacher_shards": [
+                {
+                    "payload_ipc": (4, 32),
+                    "buf_idx": 0,
+                    "sample_index_in_buf": 0,
+                    "storage_shape": (1, 1, 4, 24),
+                    "actual_shape": (4, 24),
+                    "dtype": torch.float32,
+                    "tp_rank": 0,
+                    "cp_rank": 0,
+                    "tp_size": 1,
+                    "cp_size": 1,
+                    "world_rank": 0,
+                    "hostname": hostname,
+                    "device_uuid": device_uuid,
+                    "vocab_start_index": 0,
+                    "vocab_end_index": 24,
+                    "global_seq_start": 0,
+                    "full_vocab_size": 24,
+                    "full_seq_len": 4,
+                    "vocab_sharded": False,
+                    "sequence_sharded": False,
+                }
+            ]
+        }
+    ]
+
+
+def _make_student_route(
+    *,
+    world_rank: int = 0,
+    hostname: str = "node0",
+    device_uuid: str = "GPU-0",
+) -> dict:
+    return {
+        "world_rank": world_rank,
+        "hostname": hostname,
+        "device_uuid": device_uuid,
+        "dp_rank": 0,
+        "tp_rank": 0,
+        "cp_rank": 0,
+        "cp_size": 1,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fixture
 # ---------------------------------------------------------------------------
@@ -233,6 +283,7 @@ def _make_tokenizer(vocab_size: int) -> MagicMock:
 def mock_xtoken_components():
     student_policy = MagicMock()
     student_policy.data_parallel_size = 1
+    student_policy.get_xtoken_worker_routes.return_value = [_make_student_route()]
     student_policy.train.return_value = {
         "loss": torch.tensor(0.5),
         "grad_norm": torch.tensor(1.0),
@@ -241,7 +292,7 @@ def mock_xtoken_components():
 
     teacher_policy = MagicMock()
     teacher_policy.data_parallel_size = 1
-    teacher_policy.get_full_logits_ipc.return_value = [{"payload_ipc": (4, 32)}]
+    teacher_policy.get_full_logits_ipc.return_value = _make_logit_handles()
 
     train_dataloader = _mock_dataloader(num_batches=10)
     val_dataloader = _mock_dataloader(num_batches=2)
@@ -294,8 +345,8 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
         patch.object(xt_mod, "CrossTokenizerDistillationLossFn") as mock_loss_cls,
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
-        patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
     ):
+        mock_cluster.return_value.world_size.return_value = 1
         mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
@@ -404,7 +455,7 @@ def test_setup_val_dataloader_gating(
     train_ds.__len__ = MagicMock(return_value=4)
 
     with (
-        patch.object(xt_mod, "RayVirtualCluster"),
+        patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
         patch.object(xt_mod, "Policy") as mock_policy_cls,
         patch.object(xt_mod, "Logger"),
         patch.object(xt_mod, "CheckpointManager") as mock_cp_cls,
@@ -413,8 +464,8 @@ def test_setup_val_dataloader_gating(
         patch.object(xt_mod, "CrossTokenizerDistillationLossFn"),
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
-        patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
     ):
+        mock_cluster.return_value.world_size.return_value = 1
         mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
@@ -604,7 +655,7 @@ def test_ipc_buffer_released_for_every_teacher_on_train_failure(
     # carries teacher_0_* keys, so this stays valid for any N).
     teacher_policies = [MagicMock(data_parallel_size=1) for _ in range(num_teachers)]
     for t in teacher_policies:
-        t.get_full_logits_ipc.return_value = [{"payload_ipc": (4, 32)}]
+        t.get_full_logits_ipc.return_value = _make_logit_handles()
     c.loss_fn.num_teachers = num_teachers
     c.loss_fn.projection_matrix_paths = [None] * num_teachers
     # teacher_mbs is derived per entry in master_config.teachers, so it must
@@ -655,9 +706,9 @@ def test_skip_keys_builder_cross_and_same_vocab():
     # teacher 0 cross-tokenizer (full logits); teacher 1 same-vocab.
     loss_fn = _FakeLossFn(projection_matrix_paths=["/p0.pt", None])
     keys = xtoken_non_student_seq_keys(loss_fn)
-    # Cross-tokenizer teacher 0: IPC handle list + teacher tokens + the
+    # Cross-tokenizer teacher 0: transport descriptors + teacher tokens + the
     # teacher-seq / max_pairs alignment keys are skipped.
-    assert "teacher_0_full_logits_ipc" in keys
+    assert "teacher_0_full_logits_transport" in keys
     assert "teacher_0_input_ids" in keys
     assert "teacher_0_token_mask" in keys
     assert "alignment_0_pair_valid" in keys
@@ -665,19 +716,19 @@ def test_skip_keys_builder_cross_and_same_vocab():
     # Student-seq alignment keys ([B, T_s]) and num_chunks ([B]) are NOT skipped.
     assert "alignment_0_student_chunk_id" not in keys
     assert "alignment_0_num_chunks" not in keys
-    # Same-vocab teacher 1 also ships full logits over IPC, so its handle-list
+    # Same-vocab teacher 1 also ships full logits, so its descriptor-list
     # key (a non-tensor) is skipped; it reuses the student tokenization, so it
     # has no teacher-seq token keys and no teacher-indexed alignment keys.
-    assert "teacher_1_full_logits_ipc" in keys
+    assert "teacher_1_full_logits_transport" in keys
     assert not any(k.startswith("alignment_1_") for k in keys)
     assert "teacher_1_input_ids" not in keys
 
 
 def test_skip_keys_builder_same_vocab_full_logits():
     loss_fn = _FakeLossFn(projection_matrix_paths=[None])
-    # Same-vocab full-logits teacher: only the IPC handle list is skipped.
+    # Same-vocab full-logits teacher: only the transport descriptors are skipped.
     assert xtoken_non_student_seq_keys(loss_fn) == frozenset(
-        {"teacher_0_full_logits_ipc"}
+        {"teacher_0_full_logits_transport"}
     )
 
 
@@ -693,23 +744,30 @@ def test_export_teacher_logits_packs_indexed_keys_and_runs_serially():
     t1 = MagicMock()
     parent.attach_mock(t0, "t0")
     parent.attach_mock(t1, "t1")
-    t0.get_full_logits_ipc.return_value = [{"payload_ipc": 0}]
-    t1.get_full_logits_ipc.return_value = [{"payload_ipc": 1}]
+    t0.get_full_logits_ipc.return_value = _make_logit_handles()
+    t1.get_full_logits_ipc.return_value = _make_logit_handles()
+    student = MagicMock(data_parallel_size=1)
+    routes = [_make_student_route()]
     # Cross-tokenizer teacher 0 needs teacher_0_*/alignment_0_*; same-vocab
     # teacher 1 reuses the student tokenization (no teacher_1_* token keys).
     batch = _make_batch(num_teachers=1)
 
     train_data = export_teacher_logits_and_pack(
-        [t0, t1], loss_fn, batch, teacher_mbs=[1, 1]
+        student,
+        routes,
+        [t0, t1],
+        loss_fn,
+        batch,
+        teacher_mbs=[1, 1],
     )
 
     # Cross-tokenizer teacher 0 -> full-logits IPC + its alignment payload.
-    assert "teacher_0_full_logits_ipc" in train_data
+    assert "teacher_0_full_logits_transport" in train_data
     assert "alignment_0_pair_valid" in train_data
     assert "teacher_0_input_ids" in train_data
     # Same-vocab teacher 1 -> full-logits IPC handle list, no dense tensors,
     # no projection/alignment keys (it reuses the student tokenization).
-    assert "teacher_1_full_logits_ipc" in train_data
+    assert "teacher_1_full_logits_transport" in train_data
     assert "teacher_1_input_ids" not in train_data
     assert "alignment_1_pair_valid" not in train_data
     # Both teachers ship full logits via get_full_logits_ipc with their own MBS.
@@ -726,6 +784,93 @@ def test_export_teacher_logits_packs_indexed_keys_and_runs_serially():
     assert call_names.index("t0.offload_after_refit") < call_names.index(
         "t1.prepare_for_lp_inference"
     )
+    student.transfer_ipc_logits_nccl.assert_called_once_with({})
+
+
+def test_build_xtoken_transfer_plan_keeps_colocated_shard_on_ipc():
+    handles = _make_logit_handles()
+
+    plan = build_xtoken_transfer_plan(
+        handles,
+        [_make_student_route()],
+        student_dp_size=1,
+        teacher_index=0,
+    )
+
+    assert plan == {}
+    assert handles[0]["teacher_shards"][0]["transport"] == "ipc"
+
+
+def test_build_xtoken_transfer_plan_relays_cross_node_shard_with_nccl():
+    handles = _make_logit_handles(hostname="teacher-node", device_uuid="GPU-T")
+    handles.append(deepcopy(handles[0]))
+    handles[1]["teacher_shards"][0]["sample_index_in_buf"] = 1
+    remote_destination = {
+        **_make_student_route(
+            world_rank=0,
+            hostname="student-node",
+            device_uuid="GPU-S",
+        ),
+        "dp_rank": 0,
+    }
+    colocated_relay = {
+        **_make_student_route(
+            world_rank=1,
+            hostname="teacher-node",
+            device_uuid="GPU-T",
+        ),
+        "dp_rank": 1,
+    }
+
+    plan = build_xtoken_transfer_plan(
+        handles,
+        [remote_destination, colocated_relay],
+        student_dp_size=2,
+        teacher_index=0,
+    )
+
+    first_shard = handles[0]["teacher_shards"][0]
+    assert first_shard["transport"] == "nccl"
+    assert plan[1]["sends"][0]["destination_rank"] == 0
+    assert plan[0]["receives"][0]["source_rank"] == 1
+    assert first_shard["nccl_keys"][0] == plan[0]["receives"][0]["transfer_key"]
+    assert handles[1]["teacher_shards"][0]["transport"] == "ipc"
+
+
+def test_build_xtoken_transfer_plan_marks_local_and_remote_consumers_hybrid():
+    handles = _make_logit_handles()
+    local_route = _make_student_route()
+    remote_route = _make_student_route(
+        world_rank=1,
+        hostname="node1",
+        device_uuid="GPU-1",
+    )
+
+    plan = build_xtoken_transfer_plan(
+        handles,
+        [local_route, remote_route],
+        student_dp_size=1,
+        teacher_index=2,
+    )
+
+    shard = handles[0]["teacher_shards"][0]
+    assert shard["transport"] == "hybrid"
+    assert shard["nccl_keys"] == {1: "teacher2:sample0:src0:dst1"}
+    assert len(plan[0]["sends"]) == 1
+    assert len(plan[1]["receives"]) == 1
+
+
+def test_build_xtoken_transfer_plan_requires_colocated_student_relay():
+    handles = _make_logit_handles(hostname="teacher-node", device_uuid="GPU-T")
+    remote_route = _make_student_route(hostname="student-node", device_uuid="GPU-S")
+
+    with pytest.raises(RuntimeError, match="no colocated student relay"):
+        build_xtoken_transfer_plan(
+            handles,
+            [remote_route],
+            student_dp_size=1,
+            teacher_index=0,
+        )
 
 
 def test_setup_builds_one_policy_per_teacher():
@@ -765,8 +910,8 @@ def test_setup_builds_one_policy_per_teacher():
         patch.object(xt_mod, "CrossTokenizerDistillationLossFn") as mock_loss_cls,
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
-        patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
     ):
+        mock_cluster.return_value.world_size.return_value = 1
         mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)

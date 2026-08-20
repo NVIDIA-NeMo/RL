@@ -14,6 +14,7 @@
 
 import contextlib
 import gc
+import socket
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
@@ -68,6 +69,10 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    XTokenLogitShard,
+    XTokenTransferPlan,
+    XTokenWorkerHandles,
+    XTokenWorkerRoute,
     ensure_teacher_ipc_buffer,
     get_runtime_env_for_policy_worker,
 )
@@ -284,6 +289,7 @@ class DTensorPolicyWorkerV2Impl(
         # IPC-imported storage without pinning an orphaned producer allocation.
         self._teacher_ipc_storage: Optional[torch.Tensor] = None
         self._teacher_ipc_handle: Optional[tuple[Any, ...]] = None
+        self._xtoken_received_logits: dict[str, torch.Tensor] = {}
 
         # Validate configuration and prepare runtime settings
         runtime_config = validate_and_prepare_config(
@@ -445,6 +451,10 @@ class DTensorPolicyWorkerV2Impl(
             dp_size=self.dp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
+            xtoken_transport=(
+                self._xtoken_received_logits,
+                torch.distributed.get_rank(),
+            ),
         )
 
         # Create train context factory
@@ -863,7 +873,7 @@ class DTensorPolicyWorkerV2Impl(
         self,
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
-    ) -> dict[str, Any]:
+    ) -> XTokenWorkerHandles:
         """Teacher forward; full-vocab logits exposed via persistent CUDA IPC storage.
 
         Used by cross-tokenizer distillation; supports heterogeneous teacher
@@ -900,10 +910,12 @@ class DTensorPolicyWorkerV2Impl(
         cp_rank = self.cp_mesh.get_local_rank() if self.cp_mesh is not None else 0
         dp_rank = self.dp_mesh.get_local_rank() if self.dp_mesh is not None else 0
         world_rank = torch.distributed.get_rank()
+        hostname = socket.gethostname()
+        device_uuid = self.report_device_id()
         full_seq_len = target_local_seq * self.cp_size
         global_seq_start = cp_rank * full_seq_len // self.cp_size
 
-        per_sample_handles: list[dict[str, Any]] = []
+        per_sample_handles: list[XTokenLogitShard] = []
         storage: Optional[torch.Tensor] = None
         payload_ipc: Optional[tuple[Any, ...]] = None
         with torch.no_grad():
@@ -980,6 +992,8 @@ class DTensorPolicyWorkerV2Impl(
                             "tp_size": self.tp_size,
                             "cp_size": self.cp_size,
                             "world_rank": world_rank,
+                            "hostname": hostname,
+                            "device_uuid": device_uuid,
                             "vocab_start_index": vocab_start_index,
                             "vocab_end_index": vocab_end_index,
                             "global_seq_start": global_seq_start,
@@ -995,6 +1009,78 @@ class DTensorPolicyWorkerV2Impl(
         # (ports the sync added upstream for the single-buffer export path).
         torch.cuda.synchronize()
         return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
+
+    def get_xtoken_worker_route(self) -> XTokenWorkerRoute:
+        """Return the stable routing coordinates used by hybrid transports."""
+        return {
+            "world_rank": torch.distributed.get_rank(),
+            "hostname": socket.gethostname(),
+            "device_uuid": self.report_device_id(),
+            "dp_rank": self.dp_mesh.get_local_rank() if self.dp_mesh is not None else 0,
+            "tp_rank": self.tp_mesh.get_local_rank() if self.tp_mesh is not None else 0,
+            "cp_rank": self.cp_mesh.get_local_rank() if self.cp_mesh is not None else 0,
+            "cp_size": self.cp_size,
+        }
+
+    def transfer_ipc_logits_nccl(
+        self,
+        plan_by_world_rank: dict[int, XTokenTransferPlan],
+    ) -> None:
+        """Relay teacher IPC shards over the student NCCL process group."""
+        world_rank = torch.distributed.get_rank()
+        plan = plan_by_world_rank.get(world_rank)
+        if plan is None:
+            plan = XTokenTransferPlan(sends=[], receives=[])
+        from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+
+        ipc_tensors: dict[tuple[Any, ...], torch.Tensor] = {}
+        received: dict[str, torch.Tensor] = {}
+        p2p_ops: list[torch.distributed.P2POp] = []
+        for send_item in plan["sends"]:
+            payload = send_item["payload_ipc"]
+            storage = ipc_tensors.get(payload)
+            if storage is None:
+                storage = rebuild_cuda_tensor_from_ipc(
+                    payload, torch.cuda.current_device()
+                ).detach()
+                ipc_tensors[payload] = storage
+            local_seq_len, local_vocab_size = send_item["actual_shape"]
+            row = storage[
+                int(send_item["buf_idx"]),
+                int(send_item["sample_index_in_buf"]),
+                :local_seq_len,
+                :local_vocab_size,
+            ]
+            p2p_ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    row,
+                    int(send_item["destination_rank"]),
+                )
+            )
+        for receive_item in plan["receives"]:
+            row = torch.empty(
+                tuple(receive_item["actual_shape"]),
+                dtype=receive_item["dtype"],
+                device=torch.cuda.current_device(),
+            )
+            p2p_ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.irecv,
+                    row,
+                    int(receive_item["source_rank"]),
+                )
+            )
+            received[receive_item["transfer_key"]] = row
+        if p2p_ops:
+            for request in torch.distributed.batch_isend_irecv(p2p_ops):
+                request.wait()
+            torch.cuda.current_stream().synchronize()
+        self._xtoken_received_logits = received
+
+    def clear_xtoken_received_logits(self) -> None:
+        """Release NCCL receive buffers after the corresponding train call."""
+        self._xtoken_received_logits = {}
 
     def release_ipc_buffer(self) -> None:
         """Free the persistent teacher-logit IPC storage. Called once at end of training/validation."""
