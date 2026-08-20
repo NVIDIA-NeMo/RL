@@ -51,7 +51,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
-from nemo_rl.experience.rollouts import RewardPenaltyConfig
+from nemo_rl.experience.rollouts import EffortLevelsConfig, RewardPenaltyConfig
 
 
 @ray.remote(num_cpus=0)
@@ -1985,6 +1985,17 @@ class TestAsyncTrajectoryCollector:
         replay_buffer = FakeReplayBuffer()
         collector = self.create_local_collector(replay_buffer=replay_buffer)
         collector.running = True
+        collector.master_config.env = {
+            "should_use_nemo_gym": True,
+            "nemo_gym": {
+                "effort_levels": {
+                    "low_weight": 0.25,
+                    "low_penalty": 2.0,
+                    "low_ub": 512,
+                    "low_string": "brief",
+                }
+            },
+        }
         target_weight = 13
         collector._generating_targets.add(target_weight)
         batches = [
@@ -2141,6 +2152,12 @@ class TestAsyncTrajectoryCollector:
             assert (
                 kwargs["reward_penalty_config"]
                 is collector.master_config.reward_penalties
+            )
+            assert kwargs["effort_config"] == EffortLevelsConfig(
+                low_weight=0.25,
+                low_penalty=2.0,
+                low_ub=512,
+                low_string="brief",
             )
             rollout_calls += 1
             yield _rollout_result(7)

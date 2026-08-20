@@ -32,7 +32,7 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.rollouts import RewardPenaltyConfig
+from nemo_rl.experience.rollouts import EffortLevelsConfig, RewardPenaltyConfig
 
 
 def _make_loss_config(
@@ -717,6 +717,8 @@ def _make_ppo_loop_batch(
                         "role": "assistant",
                         "content": "answer-0",
                         "token_ids": torch.tensor([2, 3]),
+                        "generation_logprobs": torch.zeros(2),
+                        "is_invalid_tool_call": True,
                     },
                 ],
                 [
@@ -729,6 +731,8 @@ def _make_ppo_loop_batch(
                         "role": "assistant",
                         "content": "answer-1",
                         "token_ids": torch.tensor([4, 5]),
+                        "generation_logprobs": torch.zeros(2),
+                        "has_malformed_thinking": True,
                     },
                 ],
             ],
@@ -755,6 +759,9 @@ def _run_mock_ppo_train(
     use_nemo_gym: bool = False,
     should_log_nemo_gym_responses: bool = False,
     reward_penalties: RewardPenaltyConfig | None = None,
+    invalid_tool_call_advantage: float | None = None,
+    malformed_thinking_advantage: float | None = None,
+    effort_levels: dict | None = None,
 ):
     """Run the real PPO loop with deterministic in-process collaborators."""
     from nemo_rl.algorithms import ppo as ppo_mod
@@ -945,6 +952,8 @@ def _run_mock_ppo_train(
             reward_scaling={"enabled": False},
             reward_shaping=RewardShapingConfig(enabled=False),
             seq_logprob_error_threshold=seq_logprob_error_threshold,
+            invalid_tool_call_advantage=invalid_tool_call_advantage,
+            malformed_thinking_advantage=malformed_thinking_advantage,
             val_at_start=False,
             val_at_end=False,
             val_period=0,
@@ -968,7 +977,7 @@ def _run_mock_ppo_train(
         cluster={"num_nodes": 1, "gpus_per_node": 2},
         env=(
             {
-                "nemo_gym": {},
+                "nemo_gym": ({"effort_levels": effort_levels} if effort_levels else {}),
                 "should_log_nemo_gym_responses": should_log_nemo_gym_responses,
             }
             if use_nemo_gym
@@ -1137,6 +1146,56 @@ def test_ppo_train_passes_reward_penalties_to_nemo_gym(monkeypatch):
     assert (
         harness.gym_rollout.call_args.kwargs["reward_penalty_config"]
         is reward_penalties
+    )
+
+
+def test_ppo_train_passes_effort_levels_to_nemo_gym(monkeypatch):
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        max_num_steps=1,
+        ppo_epochs=1,
+        seq_logprob_error_threshold=None,
+        use_nemo_gym=True,
+        effort_levels={
+            "low_weight": 0.2,
+            "low_penalty": 1.5,
+            "low_ub": 128,
+            "low_string": "concise",
+        },
+    )
+
+    effort_config = harness.gym_rollout.call_args.kwargs["effort_config"]
+    assert effort_config == EffortLevelsConfig(
+        low_weight=0.2,
+        low_penalty=1.5,
+        low_ub=128,
+        low_string="concise",
+    )
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ppo_train_applies_nemo_gym_message_advantage_overrides(
+    monkeypatch, async_mode
+):
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        async_mode=async_mode,
+        max_num_steps=1,
+        ppo_epochs=1,
+        seq_logprob_error_threshold=None,
+        use_nemo_gym=True,
+        invalid_tool_call_advantage=-5.0,
+        malformed_thinking_advantage=-7.0,
+    )
+
+    train_data = harness.policy.train.call_args.args[0]
+    torch.testing.assert_close(
+        train_data["advantages"],
+        torch.tensor([[0.0, -5.0, -5.0], [0.0, -7.0, -7.0]]),
+    )
+    torch.testing.assert_close(
+        train_data["returns"],
+        torch.tensor([[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]),
     )
 
 
@@ -2090,6 +2149,20 @@ def test_setup_rejects_reward_penalties_without_nemo_gym(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "config_field",
+    ["invalid_tool_call_advantage", "malformed_thinking_advantage"],
+)
+def test_setup_rejects_message_advantage_overrides_without_nemo_gym(
+    monkeypatch, config_field
+):
+    config = _make_noncolocated_setup_config()
+    setattr(config.ppo, config_field, -5.0)
+
+    with pytest.raises(ValueError, match="require the NeMo-Gym path"):
+        _run_noncolocated_setup(monkeypatch, config)
+
+
+@pytest.mark.parametrize(
     ("async_enabled", "expected_train_iters"),
     [(False, 3), (True, 30)],
 )
@@ -2793,7 +2866,16 @@ def test_validate_prefers_nemo_gym_over_native_async_rollout(monkeypatch):
         "wandb_enabled": False,
         "wandb": {"log_nemo_gym_full_result_tables": False},
     }
-    config.env = {"nemo_gym": {}}
+    config.env = {
+        "nemo_gym": {
+            "effort_levels": {
+                "low_weight": 0.1,
+                "low_penalty": 2.0,
+                "low_ub": 256,
+                "low_string": "brief",
+            }
+        }
+    }
     config.reward_penalties = RewardPenaltyConfig(penalize_duplicated_reasoning=True)
     val_task_to_env = {"nemo_gym": MagicMock()}
 
@@ -2813,6 +2895,12 @@ def test_validate_prefers_nemo_gym_over_native_async_rollout(monkeypatch):
     assert gym_rollout.call_args.kwargs["task_to_env"] is val_task_to_env
     assert (
         gym_rollout.call_args.kwargs["reward_penalty_config"] is config.reward_penalties
+    )
+    assert gym_rollout.call_args.kwargs["effort_config"] == EffortLevelsConfig(
+        low_weight=0.1,
+        low_penalty=2.0,
+        low_ub=256,
+        low_string="brief",
     )
     assert gym_rollout.call_args.kwargs["sampling_params"] == (
         GenerationSamplingParams(temperature=0.1, top_p=0.9, top_k=10)
