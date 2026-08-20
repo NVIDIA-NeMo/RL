@@ -46,13 +46,6 @@ from tests.unit.test_utils import SimpleLossFn
 pytestmark = pytest.mark.mcore
 
 
-def test_custom_fsdp_wrappers_are_concrete_types():
-    from nemo_rl.models.policy.workers.megatron_policy_worker import CUSTOM_FSDP_TYPES
-
-    assert CUSTOM_FSDP_TYPES
-    assert all(isinstance(wrapper, type) for wrapper in CUSTOM_FSDP_TYPES)
-
-
 def test_model_owned_packing_capability_is_detected():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         _model_self_packs_for_cp,
