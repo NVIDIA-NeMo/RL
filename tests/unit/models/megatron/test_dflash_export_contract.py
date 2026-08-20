@@ -21,7 +21,6 @@ from nemo_rl.models.megatron.draft.utils import (
     validate_dflash_export_state_dict,
 )
 
-
 pytestmark = pytest.mark.mcore
 
 
