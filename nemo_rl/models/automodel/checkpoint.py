@@ -31,6 +31,9 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig as AutomodelCheckpointingConfig,
 )
+from nemo_automodel.components.checkpoint.config import (
+    _normalize_save_consolidated,
+)
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
@@ -216,6 +219,12 @@ class AutomodelCheckpointManager:
             if k == "model_save_format":
                 # Ensure enum type
                 v = SerializationFormat[v.upper()] if isinstance(v, str) else v
+            elif k == "save_consolidated":
+                # Automodel normalizes legacy bools/strings to SaveConsolidatedMode in
+                # CheckpointingConfig.__post_init__, which setattr bypasses. Without this
+                # a bool True would silently compare unequal to SaveConsolidatedMode.EVERY
+                # and disable consolidated HF export.
+                v = _normalize_save_consolidated(v)
             setattr(cfg, k, v)
 
         # Rebuild _addons list based on updated config
@@ -236,12 +245,33 @@ class AutomodelCheckpointManager:
             ConsolidatedHFAddon,
             PeftAddon,
         )
+        from nemo_automodel.components.checkpoint.checkpointing import (
+            _should_write_hf_metadata,
+        )
 
         self.checkpointer._addons = []
-        if self.checkpointer._should_write_hf_metadata():
+        if _should_write_hf_metadata(self.checkpointer.config):
             self.checkpointer._addons.append(ConsolidatedHFAddon())
         if self.checkpointer.config.is_peft:
             self.checkpointer._addons.append(PeftAddon())
+
+    def finalize_async_save(self) -> None:
+        """Block until in-flight async checkpoint writes have landed on disk.
+
+        With ``is_async=True`` the Automodel Checkpointer hands both the model
+        and optimizer state to ``dcp.async_save``, which stages them and uploads
+        from a separate process. Those writes address files by path, so the
+        caller must not rename ``tmp_step_N`` to ``step_N`` until they finish --
+        otherwise the writer re-creates ``tmp_step_N`` and the promoted
+        checkpoint is missing its optimizer shards and ``.metadata``.
+
+        Safe to call when async saving is off or no save is in flight; both
+        underlying calls are no-ops in that case.
+        """
+        if self.checkpointer is None:
+            return
+        self.checkpointer.maybe_wait_for_staging()
+        self.checkpointer.async_wait()
 
     def save_checkpoint(
         self,
