@@ -123,6 +123,17 @@ ENV RAY_USAGE_STATS_ENABLED=0
 ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 ENV NEMO_GYM_VENV_DIR=/opt/gym_venvs
+# Mooncake reads every MC_* var once, in a function-local static singleton built
+# the first time engine code runs in a process, so these cannot be set reliably
+# from Python — they must already be in the environment. Set at image level so
+# every launcher (CI docker run, ray.sub/pyxis, manual docker run) and every
+# process inherits them, including the TransferQueue actors and mooncake_master
+# subprocess that never run NeMo RL's own setup. Inert without an RDMA engine.
+# MC_ENABLE_DEST_DEVICE_AFFINITY pins each transfer's peer rail to the local one
+# by name; without it mooncake picks the peer independently and, on a fabric
+# where each rail is its own subnet, a cross-rail pair has no route and dies
+# with "transport retry counter exceeded".
+ENV MC_ENABLE_DEST_DEVICE_AFFINITY=1
 
 
 FROM base AS hermetic

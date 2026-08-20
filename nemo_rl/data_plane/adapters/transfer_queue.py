@@ -25,7 +25,6 @@ from __future__ import annotations
 import contextlib
 import glob
 import ipaddress
-import logging
 import os
 import resource
 import socket
@@ -48,8 +47,6 @@ from nemo_rl.data_plane.interfaces import (
     backend_config,
 )
 from nemo_rl.data_plane.schema import PROMOTE_1D_FIELDS
-
-logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
@@ -81,39 +78,23 @@ def _get_local_node_ip() -> str:
         return ""
 
 
-def rdma_devices(dedupe_roce_rails_per_numa_domain: bool = True) -> str:
+def rdma_devices() -> str:
     """Return this host's RDMA devices as mooncake's comma-separated list.
 
     ``MC_MOONCAKE_DEVICE`` wins and is passed through verbatim (one device or
-    a list). Otherwise every domain must be represented: the NICs are split
-    across NUMA domains, so naming only one device makes the other domain's
-    ranks cross the socket on every transfer.
+    a list). Otherwise every rail is offered: the NICs are split across NUMA
+    domains, so naming only one device makes the other domain's ranks cross
+    the socket on every transfer.
 
-    ``dedupe_roce_rails_per_numa_domain`` (default true — see
-    ``MooncakeCpuConfig.dedupe_roce_rails_per_numa_domain``) additionally keeps
-    only the *first* RoCE rail on each domain when more than one is eligible
-    there. Offering more than one rail per domain is not extra bandwidth, it
-    is ambiguity: peer-rail selection depends on
-    ``MC_ENABLE_DEST_DEVICE_AFFINITY``, whose same-name peer hint silently
-    falls back to picking at random whenever the lookup misses (measured to
-    happen in the pinned wheel — see ``maybe_configure_engine_env``), and
-    two same-domain rails give that fallback something to be ambiguous
-    about. On this fleet's RoCE fabric each rail is its own subnet, so a
-    random cross-rail draw has no route and fails with "transport retry
-    counter exceeded" (measured: every cross-rail pair among 4 same-node
-    RoCE rails failed, zero same-rail pairs ever did). Deduplication does
-    not reduce the number of domains in use — every domain still gets a
-    dedicated rail, so a job's aggregate multi-rail bandwidth across domains
-    is unaffected — only the redundant extra rail(s) on an
-    already-represented domain are dropped.
+    Offering every rail is only safe because
+    ``MC_ENABLE_DEST_DEVICE_AFFINITY`` pins each transfer's peer rail to the
+    local one by name, so a cross-rail pair is never formed. That knob has to
+    reach the engine via the container/launcher environment — see
+    ``maybe_configure_engine_env`` for why, and for the measurements. Without
+    it, on a fabric where each rail is its own subnet, a cross-rail draw has no
+    route and dies with "transport retry counter exceeded".
 
-    This applies to the RoCE fallback only. InfiniBand is never deduped,
-    dedup or not: this PR's own intent is to expose every IB rail (see
-    ``feat(data-plane): use all IB rails and reuse RDMA-registered
-    buffers``), and the cross-rail-ambiguity failure above has only been
-    measured on RoCE — collapsing IB down to one rail per domain by default
-    would be an unmeasured, unjustified bandwidth regression for IB fleets.
-    IB and RoCE are never mixed.
+    IB and RoCE are never mixed; InfiniBand is preferred when present.
 
     Also the skip predicate for the mooncake tests — ``mooncake_cpu`` is
     RDMA-only, so they cannot run without a device.
@@ -128,8 +109,6 @@ def rdma_devices(dedupe_roce_rails_per_numa_domain: bool = True) -> str:
     if not glob.glob("/dev/infiniband/uverbs*"):
         return ""
     ib, roce = [], []
-    roce_domains: dict[str, str] = {}  # domain -> the rail kept for it
-    dropped: list[tuple[str, str]] = []  # (rail, domain) skipped as redundant
     for path in sorted(glob.glob("/sys/class/infiniband/mlx5_*/ports/1/link_layer")):
         name = Path(path).parents[2].name
         try:
@@ -137,54 +116,20 @@ def rdma_devices(dedupe_roce_rails_per_numa_domain: bool = True) -> str:
         except OSError:
             continue
         if layer == "InfiniBand":
-            ib.append(name)  # never deduped — see docstring
-            continue
-        if layer != "Ethernet":
-            continue
-        if not dedupe_roce_rails_per_numa_domain:
+            ib.append(name)
+        elif layer == "Ethernet":
             roce.append(name)
-            continue
-        # "-1" (or absent) means sysfs has no NUMA affinity for this device —
-        # never treat two such devices as the same domain, or every RoCE
-        # rail on the host would collapse to one; fall back to the device's
-        # own name so it is only ever deduplicated against a real, matching
-        # domain.
-        try:
-            numa = (
-                Path(path)
-                .parents[2]
-                .joinpath("device", "numa_node")
-                .read_text()
-                .strip()
-            )
-        except OSError:
-            numa = ""
-        domain = numa if numa not in ("", "-1") else name
-        if domain in roce_domains:
-            dropped.append((name, domain))
-            continue
-        roce_domains[domain] = name
-        roce.append(name)
-    if dropped:
-        logger.info(
-            "rdma_devices: kept one RoCE rail per NUMA domain %s, dropped "
-            "redundant same-domain rail(s) %s — set "
-            "data_plane.mooncake_cpu.dedupe_roce_rails_per_numa_domain=false to "
-            "keep every rail instead.",
-            roce_domains,
-            dropped,
-        )
     # No space after the comma: mooncake splits on "," only.
     return ",".join(ib or roce)
 
 
-def _mooncake_transport_config(dedupe_roce_rails_per_numa_domain: bool = True) -> dict:
+def _mooncake_transport_config() -> dict:
     # mooncake_cpu exists for the zero-copy RDMA MooncakeStore path (TQ v0.1.8),
     # so RDMA is the only transport it runs: there is no TCP fallback, and a
     # host without an RDMA device fails here rather than quietly degrading.
     # Runs on the driver only, so it assumes homogeneous nodes — the device it
     # finds is broadcast to every client.
-    devices = rdma_devices(dedupe_roce_rails_per_numa_domain)
+    devices = rdma_devices()
     if not devices:
         raise RuntimeError(
             "data_plane.backend='mooncake_cpu' requires RDMA, but no usable "
@@ -210,10 +155,24 @@ def maybe_configure_engine_env(cfg: DataPlaneConfig) -> None:
     wrong, and its ``findBestGidIndex`` is per-device and cannot disagree.
 
     ``setdefault`` so the launch environment can still set its own value
-    instead of being clobbered; running once on the driver keeps that value
-    uniform cluster-wide too. This is not the same as a way to *disable*
-    ``MC_ENABLE_DEST_DEVICE_AFFINITY`` — see the comment at its own
-    ``setdefault`` call below.
+    instead of being clobbered.
+
+    .. warning::
+       Setting these from Python is **best effort, not sufficient**. Mooncake
+       reads every ``MC_*`` var once, in the constructor of a function-local
+       static singleton (``mooncake-common/src/environ.cpp``
+       ``Environ::Get()``), the first time any engine code runs in the
+       process. A write to ``os.environ`` after that point lands in the Python
+       environment — where it is still visible to anything that inspects it —
+       but the engine has already snapshotted the old value. Mooncake's own
+       docs therefore say to set these *before starting the application*.
+
+       Measured on a gb200 CI-fleet node, 4 GPUs across both NUMA domains,
+       ``MC_ENABLE_DEST_DEVICE_AFFINITY``: set in the container environment,
+       3/3 runs clean; set only here, 3/3 runs failed with cross-rail
+       ``TRANSFER_FAIL`` — while ``os.environ`` read ``"1"`` in *both* cases.
+       The launcher (CI ``action.yml``, ``ray.sub``) must export it; this
+       function only covers processes that start before any engine code runs.
     """
     if cfg["backend"] != "mooncake_cpu":
         return
@@ -224,12 +183,6 @@ def maybe_configure_engine_env(cfg: DataPlaneConfig) -> None:
     # each rail is its own subnet a cross-rail pair has no route. Mooncake
     # recommends this for rail-optimized topologies and sets it as a pod-level
     # variable in its own deployment example, i.e. uniformly, for this reason.
-    # NOTE: verified against the pinned wheel, mooncake's own parsing is
-    # `if (std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY"))` — presence, not
-    # value, enables it. Setting this to "0" does NOT disable it at the
-    # engine level; there is currently no supported way to turn it off once
-    # any value is set. rdma_devices()'s per-domain dedup exists precisely
-    # because this knob cannot be relied on or turned off.
     os.environ.setdefault("MC_ENABLE_DEST_DEVICE_AFFINITY", "1")
 
 
@@ -564,9 +517,7 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     # mooncake_master + the metadata server bind to.
                     "metadata_server": f"{local_ip}:50050",
                     "master_server_address": f"{local_ip}:50051",
-                    **_mooncake_transport_config(
-                        mooncake_cfg.dedupe_roce_rails_per_numa_domain
-                    ),
+                    **_mooncake_transport_config(),
                 },
             },
         }
