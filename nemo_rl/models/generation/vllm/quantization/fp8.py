@@ -1006,25 +1006,6 @@ def _shuffle_mxfp8_moe_batched(
     epilogue_tile_m: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Shuffle stacked expert values and scales with four batched gathers."""
-    if not supports_batched_moe_shuffle(
-        w13_scale.shape[1], w2_scale.shape[1], tile_m=epilogue_tile_m
-    ):
-        logger.warning_once(
-            "MXFP8 MoE scale rows (%d, %d) are not aligned to tile M=%d; "
-            "using the per-expert FlashInfer shuffle.",
-            w13_scale.shape[1],
-            w2_scale.shape[1],
-            epilogue_tile_m,
-        )
-        return _shuffle_mxfp8_moe_per_expert(
-            w13_weight,
-            w2_weight,
-            w13_scale,
-            w2_scale,
-            is_gated,
-            epilogue_tile_m,
-        )
-
     from flashinfer import block_scale_interleave
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         MXFP8_SCALE_DTYPE,
@@ -1042,6 +1023,8 @@ def _shuffle_mxfp8_moe_batched(
 
     w13_scale_u8 = pad_flashinfer_scale_k(w13_scale.view(torch.uint8))
     w2_scale_u8 = pad_flashinfer_scale_k(w2_scale.view(torch.uint8))
+    assert w13_scale_u8.shape[1] % epilogue_tile_m == 0
+    assert w2_scale_u8.shape[1] % epilogue_tile_m == 0
     w13_scale_gathered = torch.index_select(w13_scale_u8, 1, perm_w13)
     w2_scale_gathered = torch.index_select(w2_scale_u8, 1, perm_w2)
     w13_scale_shuffled = (

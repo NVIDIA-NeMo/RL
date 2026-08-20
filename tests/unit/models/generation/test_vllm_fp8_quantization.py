@@ -364,33 +364,6 @@ def test_batched_moe_shuffle_matches_per_expert(
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
-def test_batched_moe_shuffle_falls_back_for_unaligned_scale_rows(
-    fp8_module, monkeypatch
-):
-    fp8 = fp8_module
-    tensors = (
-        torch.zeros(2, 192, 128),
-        torch.zeros(2, 128, 96),
-        torch.zeros(2, 192, 4),
-        torch.zeros(2, 128, 3),
-    )
-    expected = tuple(torch.full_like(tensor, 7) for tensor in tensors)
-    calls = []
-
-    def per_expert(*args):
-        calls.append(args)
-        return expected
-
-    monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_per_expert", per_expert)
-
-    actual = fp8._shuffle_mxfp8_moe_batched(
-        types.SimpleNamespace(), *tensors, True, 128
-    )
-
-    assert actual is expected
-    assert calls == [(*tensors, True, 128)]
-
-
 @pytest.mark.parametrize("is_gated", [True, False])
 def test_process_mxfp8_moe_refit_uses_batched_flashinfer_shuffle(
     fp8_module, monkeypatch, is_gated
