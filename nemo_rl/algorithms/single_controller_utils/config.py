@@ -323,6 +323,10 @@ class RolloutCheckpointConfig(BaseModel, extra="allow"):
     ``trainer_checkpoint`` ignores newer periodic snapshots, while ``none``
     resumes trainer state without restoring rollout, replay, lineage, or the
     dataloader cursor.
+
+    SingleController has no validation loop, so checkpoint selection must use
+    ``checkpointing.metric_name=None`` or a ``train:<name>`` metric. Inherited
+    ``val:<name>`` settings are rejected during setup.
     """
 
     interval_s: Optional[float] = Field(default=None, gt=0)
