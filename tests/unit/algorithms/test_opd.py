@@ -281,6 +281,10 @@ class _RecordingTeacherWorkerGroup(_MockTeacherWorkerGroup):
         self.received = data
         return super().get_logprobs(data)
 
+    def get_topk_logprobs(self, data, k):
+        self.received = data
+        return super().get_topk_logprobs(data, k)
+
 
 def _row_marked_packed_tensor(markers):
     return PackedTensor(
@@ -514,6 +518,57 @@ def test_compute_teacher_topk_logprobs_routes_and_trims_dp_padding():
     torch.testing.assert_close(
         logprobs[2], input_ids[2].unsqueeze(-1).expand(-1, 2) - 1.0
     )
+
+
+def test_compute_teacher_topk_logprobs_routes_multimodal_rows_with_dp_padding():
+    """Teacher top-k keeps media aligned through routing and DP padding."""
+    vision_twg = _RecordingTeacherWorkerGroup(fill_value=-1.0, dp_size=4)
+    text_twg = _RecordingTeacherWorkerGroup(fill_value=-2.0, dp_size=2)
+    collector = _make_collector(
+        teacher_worker_groups={"vision": vision_twg, "text": text_twg},
+        alias_to_group_alias={"vision_agent": "vision", "text_agent": "text"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {
+                "vision_agent": "/ckpt/vision",
+                "text_agent": "/ckpt/text",
+            },
+        },
+        _has_distillation_teachers=True,
+    )
+
+    collector._compute_teacher_topk_logprobs(
+        torch.arange(15).reshape(3, 5),
+        topk=2,
+        agent_refs=[
+            {"name": "vision_agent"},
+            {"name": "text_agent"},
+            {"name": "vision_agent"},
+        ],
+        input_lengths=torch.tensor([5, 4, 3]),
+        multimodal_data={
+            "pixel_values": _row_marked_packed_tensor([0, None, 2]),
+            "imgs_sizes": _row_marked_packed_tensor([10, None, 12]),
+        },
+    )
+
+    assert vision_twg.received is not None
+    assert text_twg.received is not None
+    assert vision_twg.received["input_ids"].shape[0] == 4
+    assert _received_row_markers(vision_twg.received["pixel_values"]) == [
+        0.0,
+        2.0,
+        2.0,
+        2.0,
+    ]
+    assert _received_row_markers(vision_twg.received["imgs_sizes"]) == [
+        10.0,
+        12.0,
+        12.0,
+        12.0,
+    ]
+    assert text_twg.received["input_ids"].shape[0] == 2
+    assert "pixel_values" not in text_twg.received
+    assert "imgs_sizes" not in text_twg.received
 
 
 def test_compute_teacher_logprobs_deduplication():

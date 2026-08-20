@@ -4305,9 +4305,11 @@ def async_grpo_train(
         "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM). "
         "Megatron Inference always uses its async engine."
     )
-    assert master_config.loss_fn.use_importance_sampling_correction, (
-        "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
-    )
+    if not master_config.loss_fn.use_importance_sampling_correction:
+        warnings.warn(
+            "Importance sampling correction is disabled for async GRPO; "
+            "off-policy samples may affect convergence."
+        )
     max_generation_failures = master_config.grpo.async_grpo.max_generation_failures
     opd_topk, topk_source = opd_module.get_topk_support_config(master_config)
 

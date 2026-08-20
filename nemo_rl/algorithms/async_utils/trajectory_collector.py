@@ -959,8 +959,13 @@ class AsyncTrajectoryCollector:
         topk: int,
         agent_refs: list[dict[str, Any]],
         input_lengths: Optional[torch.Tensor] = None,
+        multimodal_data: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
-        """Route one-pass teacher target/top-k inference and restore batch order."""
+        """Route one-pass teacher target/top-k inference and restore batch order.
+
+        ``multimodal_data`` is row-aligned with ``input_ids``. Each teacher gets
+        only its routed rows, including repeated media rows added for DP padding.
+        """
         if topk < 1:
             raise ValueError(f"topk must be at least 1, got {topk}.")
         opd_cfg = self.on_policy_distillation_cfg
@@ -995,6 +1000,7 @@ class AsyncTrajectoryCollector:
                     device=sub_input_ids.device,
                 )
             )
+            row_indices = list(indices)
             actual_batch_size = sub_input_ids.shape[0]
             dp_size = teacher.sharding_annotations.get_axis_size("data_parallel")
             remainder = actual_batch_size % dp_size
@@ -1006,10 +1012,26 @@ class AsyncTrajectoryCollector:
                 sub_lengths = torch.cat(
                     [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
                 )
+                row_indices.extend([row_indices[-1]] * pad_count)
 
             sub_data = BatchedDataDict(
                 {"input_ids": sub_input_ids, "input_lengths": sub_lengths}
             )
+            if multimodal_data:
+                selected_multimodal = BatchedDataDict(multimodal_data).select_indices(
+                    row_indices
+                )
+                sub_data.update(
+                    {
+                        key: value
+                        for key, value in selected_multimodal.items()
+                        if value is not None
+                        and not (
+                            isinstance(value, PackedTensor)
+                            and not any(value.logical_segment_counts_by_row())
+                        )
+                    }
+                )
             lock_started = time.time()
             with self._teacher_locks[group_key]:
                 inference_started = time.time()
