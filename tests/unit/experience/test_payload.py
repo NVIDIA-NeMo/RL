@@ -110,6 +110,7 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
     )
 
     expected_routes = [
@@ -158,6 +159,7 @@ def test_record_to_train_batch_preserves_message_violation_fields() -> None:
     train_batch = record_to_train_batch(
         _record([invalid, malformed]),
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=True,
     )
 
     assert train_batch[INVALID_TOOL_CALL_MASK].dtype == torch.bool
@@ -203,12 +205,34 @@ def test_record_to_train_batch_preserves_message_violation_fields() -> None:
     ]
 
 
-def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
-    record = _record([_completion(route_start=10, reward=1.0, with_routes=False)])
+def test_record_to_train_batch_preserves_clean_violation_fields_when_enabled() -> None:
+    clean = _completion(route_start=10, reward=1.0)
+    clean.message_log[1]["is_invalid_tool_call"] = False
+    clean.message_log[1]["has_malformed_thinking"] = False
+
+    train_batch = record_to_train_batch(
+        _record([clean]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=True,
+    )
+
+    assert not train_batch[INVALID_TOOL_CALL_MASK].any()
+    assert not train_batch[MALFORMED_THINKING_MASK].any()
+    assert train_batch[NUM_INVALID_TOOL_CALLS].tolist() == [0]
+    assert train_batch[NUM_MALFORMED_THINKING].tolist() == [0]
+    assert train_batch[NUM_ASSISTANT_MESSAGES].tolist() == [1]
+
+
+def test_record_to_train_batch_omits_optional_fields_when_disabled() -> None:
+    completion = _completion(route_start=10, reward=1.0, with_routes=False)
+    completion.message_log[1]["is_invalid_tool_call"] = True
+    completion.message_log[1]["has_malformed_thinking"] = True
+    record = _record([completion])
 
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
     )
     assert "routed_experts" not in train_batch
     assert INVALID_TOOL_CALL_MASK not in train_batch
@@ -248,6 +272,7 @@ def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
     )
 
     assert train_batch["input_lengths"].tolist() == [5, 2]

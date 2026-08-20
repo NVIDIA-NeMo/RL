@@ -235,6 +235,34 @@ class TestApplyMessageLevelAdvantagePenalties:
         )
         assert result is advantages
 
+    def test_only_invalid_tool_call_penalty_leaves_malformed_untouched(
+        self,
+    ) -> None:
+        result = apply_message_level_advantage_penalties(
+            torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+            invalid_tool_call_mask=torch.tensor([[False, True, False, False]]),
+            malformed_thinking_mask=torch.tensor([[False, False, True, False]]),
+            invalid_tool_call_advantage=-5.0,
+            malformed_thinking_advantage=None,
+        )
+        torch.testing.assert_close(
+            result, torch.tensor([[1.0, -5.0, 3.0, 4.0]])
+        )
+
+    def test_only_malformed_thinking_penalty_leaves_invalid_untouched(
+        self,
+    ) -> None:
+        result = apply_message_level_advantage_penalties(
+            torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+            invalid_tool_call_mask=torch.tensor([[False, True, False, False]]),
+            malformed_thinking_mask=torch.tensor([[False, False, True, False]]),
+            invalid_tool_call_advantage=None,
+            malformed_thinking_advantage=-7.0,
+        )
+        torch.testing.assert_close(
+            result, torch.tensor([[1.0, 2.0, -7.0, 4.0]])
+        )
+
     def test_rejects_misaligned_mask(self) -> None:
         with pytest.raises(ValueError, match="invalid_tool_call_mask shape"):
             apply_message_level_advantage_penalties(

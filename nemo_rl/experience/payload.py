@@ -45,16 +45,11 @@ def _add_message_violation_fields(
     missing generation_logprobs on prompt/environment messages, since field
     presence is what distinguishes generated assistant turns.
 
-    Native rollout logs carry no violation keys, so they retain their existing
-    payload shape and avoid two extra per-token TQ columns.
+    The caller invokes this only when message-level advantage penalties are
+    enabled. This keeps disabled runs lean while ensuring enabled runs emit the
+    columns even for all-clean groups, since the advantage stage always fetches
+    them when configured.
     """
-    has_violation_metadata = any(
-        "is_invalid_tool_call" in message or "has_malformed_thinking" in message
-        for message_log in message_logs
-        for message in message_log
-    )
-    if not has_violation_metadata:
-        return {}
 
     invalid_counts: list[int] = []
     malformed_counts: list[int] = []
@@ -99,12 +94,15 @@ def record_to_train_batch(
     record: PromptGroupRecord,
     *,
     pad_value_dict: Mapping[str, int],
+    include_message_violation_fields: bool,
 ) -> BatchedDataDict[Any]:
     """Convert one prompt group's record into a packed BatchedDataDict of N rows.
 
     Args:
         record: Rollout's PromptGroupRecord with N completions to flatten into rows.
         pad_value_dict: Field-name → pad value used by batched_message_log_to_flat_message.
+        include_message_violation_fields: Whether to tensorize NeMo-Gym message
+            violation flags for configured advantage penalties.
 
     Returns:
         BatchedDataDict with input_ids, input_lengths, generation_logprobs, token_mask,
@@ -125,7 +123,11 @@ def record_to_train_batch(
     assert n > 0, "PromptGroupRecord has no completions"
 
     message_logs = [c.message_log for c in completions]
-    violation_counts = _add_message_violation_fields(message_logs)
+    violation_counts = (
+        _add_message_violation_fields(message_logs)
+        if include_message_violation_fields
+        else {}
+    )
     prompt_token_count = sum(len(m["token_ids"]) for m in record.prompt)
     prompt_lengths = torch.full((n,), prompt_token_count, dtype=torch.long)
 

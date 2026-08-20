@@ -157,6 +157,24 @@ def apply_message_level_advantage_penalties(
 
     Invalid-tool-call penalties take precedence when both masks select the same
     token, matching the legacy GRPO message-level implementation.
+
+    Args:
+        advantages: Per-token advantages of shape (batch, seq).
+        invalid_tool_call_mask: Bool mask of the same shape as ``advantages``;
+            True at tokens produced by an invalid tool call.
+        malformed_thinking_mask: Bool mask of the same shape as ``advantages``;
+            True at tokens produced by malformed thinking.
+        invalid_tool_call_advantage: Value to overwrite flagged tokens with, or
+            ``None`` to leave the invalid-tool-call branch disabled.
+        malformed_thinking_advantage: Value to overwrite flagged tokens with, or
+            ``None`` to leave the malformed-thinking branch disabled.
+
+    Returns:
+        New tensor with penalties applied. The original ``advantages`` object is
+        returned unchanged when both advantages are ``None``.
+
+    Raises:
+        ValueError: If either mask shape does not match ``advantages``.
     """
     if invalid_tool_call_mask.shape != advantages.shape:
         raise ValueError(

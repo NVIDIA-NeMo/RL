@@ -46,6 +46,7 @@ from nemo_rl.data_plane.schema import (
     NUM_MALFORMED_THINKING,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
@@ -769,7 +770,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         master_config.grpo.invalid_tool_call_advantage is not None
         or master_config.grpo.malformed_thinking_advantage is not None
     )
-    if penalties_enabled and not bool(master_config.env.get("should_use_nemo_gym")):
+    if penalties_enabled and not should_use_nemo_gym(master_config):
         raise ValueError(
             "grpo.invalid_tool_call_advantage and "
             "grpo.malformed_thinking_advantage require the NeMo-Gym rollout "
