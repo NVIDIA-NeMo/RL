@@ -191,8 +191,12 @@ def is_nccl_reshard_param(param_name: str) -> bool:
     ``load_weights`` path.
 
     Shared-expert FFN weights (``*.shared_expert.*``) are routed to misc path.
+    Bare ``mtp.``-prefixed HF names are routed to misc too, because vLLM keeps
+    the MTP drafter separate and updates it through ``load_weights``.
     """
     if "shared_expert" in param_name:
+        return False
+    if param_name.startswith("mtp."):
         return False
     return param_name.endswith(FFN_PROJ_WEIGHT_SUFFIXES) or param_name.endswith(
         FFN_GROUPED_EXPERT_SUFFIXES
