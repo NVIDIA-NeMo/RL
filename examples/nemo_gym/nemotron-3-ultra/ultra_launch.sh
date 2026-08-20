@@ -753,14 +753,33 @@ if [[ -d "${OVERLAY_SOURCE}/nemo_rl" ]]; then
   _append_mount "${OVERLAY_SOURCE}/nemo_rl:/opt/nemo-rl/nemo_rl"
   echo "  Mount: nemo_rl → /opt/nemo-rl/nemo_rl"
 fi
+# The worktree's project files must ride along with the overlaid sources:
+# node-side venv rebuilds run `uv sync --locked` against /opt/nemo-rl, and a
+# mounted Gym/pyproject paired with the container's baked uv.lock fails the
+# lock check (job 6368547).
+for _project_file in pyproject.toml uv.lock .python-version; do
+  if [[ -f "${OVERLAY_SOURCE}/${_project_file}" ]]; then
+    _append_mount "${OVERLAY_SOURCE}/${_project_file}:/opt/nemo-rl/${_project_file}"
+    echo "  Mount: ${_project_file} → /opt/nemo-rl/${_project_file}"
+  fi
+done
 if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
   _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
   echo "  Mount: configs → /opt/nemo-rl/examples/configs"
 fi
-if [[ -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
-  echo "  Mount: Gym → /opt/nemo-rl/3rdparty/Gym-workspace/Gym"
-fi
+_local_project_paths=(
+  "3rdparty/TensorRT-LLM-workspace"
+  "3rdparty/Automodel-workspace/Automodel"
+  "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+  "3rdparty/Gym-workspace/Gym"
+  "research/template_project"
+)
+for _local_project_path in "${_local_project_paths[@]}"; do
+  if [[ -d "${OVERLAY_SOURCE}/${_local_project_path}" ]]; then
+    _append_mount "${OVERLAY_SOURCE}/${_local_project_path}:/opt/nemo-rl/${_local_project_path}"
+    echo "  Mount: ${_local_project_path} → /opt/nemo-rl/${_local_project_path}"
+  fi
+done
 
 if [[ "${USE_SNAPSHOT}" == "1" ]]; then
   _append_mount "${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
