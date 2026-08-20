@@ -215,6 +215,8 @@ project-includes = [
   "nemo_rl/models/huggingface/__init__.py",
   "nemo_rl/models/megatron/__init__.py",
   "nemo_rl/models/megatron/draft/__init__.py",
+  "nemo_rl/models/megatron/draft/eagle_provider.py",
+  "nemo_rl/models/megatron/draft/eagle_ttt.py",
   "nemo_rl/models/megatron/draft/step_state.py",
   "nemo_rl/models/megatron/memory_saver.py",
   "nemo_rl/models/policy/__init__.py",
