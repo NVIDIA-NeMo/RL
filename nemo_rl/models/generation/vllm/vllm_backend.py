@@ -300,23 +300,27 @@ class VllmInternalWorkerExtension:
         Phased for the same reason the trainer side is: one lane at a time,
         cluster-wide, with the driver barriering between them.
         """
-        import os
-
         from nemo_rl.weight_sync.mx_collective_bootstrap import (
             mx_init_lane,
             mx_rendezvous,
         )
 
         if phase == "rendezvous":
+            import uuid
+
             local_rank = torch.distributed.get_rank()
             index_in_role = rank_prefix + local_rank
+            if not hasattr(self, "_mx_worker_id"):
+                self._mx_worker_id = (  # pyrefly: ignore[implicitly-defined-attribute]
+                    f"gen-{index_in_role}-{uuid.uuid4().hex}"
+                )
             self._mx_state = mx_rendezvous(
                 mx_server_url=mx_server_url,
                 model_name=model_name,
                 role="GENERATOR",
                 index_in_role=index_in_role,
                 slot_id=f"gen/{index_in_role}",
-                worker_id=f"gen-{index_in_role}-{os.getpid()}",
+                worker_id=self._mx_worker_id,
                 trainer_slots=trainer_slots,
                 generator_slots=generator_slots,
                 source_partition_count=source_partition_count,

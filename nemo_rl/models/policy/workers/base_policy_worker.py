@@ -105,21 +105,25 @@ class AbstractPolicyWorker:
         deadlocks NCCL -- the same reason the TCPStore path separates its
         all-ranks group from its per-stage groups.
         """
-        import os
-
         from nemo_rl.weight_sync.mx_collective_bootstrap import (
             mx_init_lane,
             mx_rendezvous,
         )
 
         if phase == "rendezvous":
+            import uuid
+
+            if not hasattr(self, "_mx_worker_id"):
+                self._mx_worker_id = (  # pyrefly: ignore[implicitly-defined-attribute]
+                    f"train-{self.rank}-{uuid.uuid4().hex}"
+                )
             self._mx_state = mx_rendezvous(
                 mx_server_url=mx_server_url,
                 model_name=model_name,
                 role="TRAINER",
                 index_in_role=self.rank,
                 slot_id=f"train/{self.rank}",
-                worker_id=f"train-{self.rank}-{os.getpid()}",
+                worker_id=self._mx_worker_id,
                 trainer_slots=trainer_slots,
                 generator_slots=generator_slots,
                 source_partition_count=source_partition_count,
