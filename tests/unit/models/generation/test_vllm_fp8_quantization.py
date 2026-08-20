@@ -572,3 +572,268 @@ def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     assert layer.weight_scale_inv is scale_param
     # The processed values must actually land.
     assert torch.equal(layer.weight.data, torch.ones(4, 4))
+
+
+def _grouped_expert_model(fp8, monkeypatch, experts_dtype, wrap_language_model=False):
+    """Fake model mirroring vLLM's MoERunner -> RoutedExperts layout at
+    ``layers.0.mlp.experts``, with expert weights in ``experts_dtype``.
+
+    With ``wrap_language_model=True``, mirrors the Qwen3.5-VL layout instead:
+    no top-level ``model``/``layers``; the decoder sits at
+    ``language_model.model.layers`` while parameter names still carry the
+    synthetic ``model.language_model.layers.`` prefix — the key shape both
+    FP8 recipes actually refit at vLLM 0.25.1.
+    """
+    import torch
+
+    class _RoutedExperts:
+        pass
+
+    class _MoERunner:
+        pass
+
+    monkeypatch.setattr(fp8, "RoutedExperts", _RoutedExperts)
+    monkeypatch.setattr(fp8, "MoERunner", _MoERunner)
+
+    experts = _RoutedExperts()
+    experts.w13_weight = torch.zeros(2, 4, 4, dtype=experts_dtype)
+    experts.w2_weight = torch.zeros(2, 4, 4, dtype=experts_dtype)
+    runner = _MoERunner()
+    runner.routed_experts = experts
+
+    layer = torch.nn.Module()
+    layer.mlp = types.SimpleNamespace(experts=runner)
+    layers = torch.nn.ModuleList([layer])
+    if wrap_language_model:
+        return types.SimpleNamespace(
+            packed_modules_mapping={},
+            language_model=types.SimpleNamespace(
+                model=types.SimpleNamespace(layers=layers)
+            ),
+        )
+    return types.SimpleNamespace(
+        packed_modules_mapping={},
+        layers=layers,
+    )
+
+
+GROUPED_EXPERT_KEY_SHAPES = pytest.mark.parametrize(
+    "layers_prefix, wrap_language_model",
+    [("model.layers", False), ("model.language_model.layers", True)],
+    ids=["flat", "vl-wrapper"],
+)
+
+
+@GROUPED_EXPERT_KEY_SHAPES
+def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
+    fp8_module, monkeypatch, layers_prefix, wrap_language_model
+):
+    """Grouped-expert refit must respect ``ignored_layers``.
+
+    Experts covered by num_{first,last}_layers_in_bf16 or
+    quantization_ignored_layer_kws are built by vLLM as unquantized bf16 MoE
+    without ``*_weight_scale_inv`` params, so emitting per-expert FP8 + scale
+    entries for them has nowhere to load. The grouped bf16 slab must pass
+    through untouched.
+    """
+    import torch
+
+    fp8 = fp8_module
+    model = _grouped_expert_model(
+        fp8, monkeypatch, torch.bfloat16, wrap_language_model
+    )
+    loaded = []
+    model.load_weights = lambda pairs: loaded.extend(pairs)
+
+    gate_up = torch.randn(2, 256, 128).to(torch.bfloat16)
+    down = torch.randn(2, 128, 128).to(torch.bfloat16)
+    fp8.load_weights(
+        [
+            (f"{layers_prefix}.0.mlp.experts.gate_up_proj", gate_up),
+            (f"{layers_prefix}.0.mlp.experts.down_proj", down),
+        ],
+        types.SimpleNamespace(model=model),
+    )
+
+    assert [k for k, _ in loaded] == [
+        f"{layers_prefix}.0.mlp.experts.gate_up_proj",
+        f"{layers_prefix}.0.mlp.experts.down_proj",
+    ]
+    assert loaded[0][1] is gate_up
+    assert loaded[1][1] is down
+    # Pass-through is also what a failed lookup produces, so pin that the
+    # bf16 RoutedExperts was actually resolved.
+    assert isinstance(
+        fp8._get_module_from_param_name(
+            model, f"{layers_prefix}.0.mlp.experts.gate_up_proj"
+        ),
+        fp8.RoutedExperts,
+    )
+
+
+def _assert_dequant_close(weight_fp8, scale_inv, source_bf16):
+    """Dequantized FP8 must match the bf16 source within e4m3 half-ULP.
+
+    Worst-case blockwise quantization error is half the e4m3 ULP at the
+    block amax: amax * (16 / 448) = amax / 28.
+    """
+    import torch
+
+    dequant = weight_fp8.to(torch.float32) * scale_inv.repeat_interleave(
+        128, dim=0
+    ).repeat_interleave(128, dim=1)
+    source = source_bf16.to(torch.float32)
+    rows, cols = source.shape
+    block_amax = (
+        source.abs().reshape(rows // 128, 128, cols // 128, 128).amax(dim=(1, 3))
+    )
+    atol = block_amax.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1) / 28
+    assert torch.all((dequant - source).abs() <= atol + 1e-6 * source.abs())
+
+
+@GROUPED_EXPERT_KEY_SHAPES
+def test_load_weights_expands_grouped_experts_for_fp8_layers(
+    fp8_module, monkeypatch, layers_prefix, wrap_language_model
+):
+    """FP8-built experts keep the per-expert expand+quantize refit path.
+
+    Non-square expert shards (256x384 gate/up, 384x256 down) give a scale
+    grid larger than 1x1 so a transposed or misrouted scale cannot pass, and
+    the dequantization check pins values, not just names and shapes.
+    """
+    import torch
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(
+        use_weight_pow2_scale=False, is_mx=False
+    )
+    model = _grouped_expert_model(
+        fp8, monkeypatch, torch.float8_e4m3fn, wrap_language_model
+    )
+    loaded = []
+    model.load_weights = lambda pairs: loaded.extend(pairs)
+
+    intermediate, hidden = 256, 384
+    gate_up = torch.randn(2, 2 * intermediate, hidden).to(torch.bfloat16)
+    down = torch.randn(2, hidden, intermediate).to(torch.bfloat16)
+    fp8.load_weights(
+        [
+            (f"{layers_prefix}.0.mlp.experts.gate_up_proj", gate_up),
+            (f"{layers_prefix}.0.mlp.experts.down_proj", down),
+        ],
+        types.SimpleNamespace(model=model),
+    )
+
+    base = f"{layers_prefix}.0.mlp.experts"
+    assert [k for k, _ in loaded] == [
+        f"{base}.{eid}.{proj}.weight{suffix}"
+        for proj in ("gate_proj", "up_proj")
+        for eid in (0, 1)
+        for suffix in ("", "_scale_inv")
+    ] + [
+        f"{base}.{eid}.down_proj.weight{suffix}"
+        for eid in (0, 1)
+        for suffix in ("", "_scale_inv")
+    ]
+    entries = dict(loaded)
+    shards = {
+        "gate_proj": (gate_up[:, :intermediate, :], (intermediate, hidden)),
+        "up_proj": (gate_up[:, intermediate:, :], (intermediate, hidden)),
+        "down_proj": (down, (hidden, intermediate)),
+    }
+    for proj, (source, shape) in shards.items():
+        for eid in (0, 1):
+            weight = entries[f"{base}.{eid}.{proj}.weight"]
+            scale = entries[f"{base}.{eid}.{proj}.weight_scale_inv"]
+            assert weight.dtype == torch.float8_e4m3fn
+            assert weight.shape == shape
+            assert scale.shape == (shape[0] // 128, shape[1] // 128)
+            _assert_dequant_close(weight, scale, source[eid])
+
+
+def test_load_weights_expands_grouped_experts_for_mxfp8(fp8_module, monkeypatch):
+    """MXFP8 grouped slabs emit per-expert values and E8M0 scales."""
+    import torch
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(
+        use_weight_pow2_scale=False, is_mx=True
+    )
+    model = _grouped_expert_model(fp8, monkeypatch, torch.float8_e4m3fn)
+    loaded = []
+    model.load_weights = lambda pairs: loaded.extend(pairs)
+
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    quantized_inputs = []
+
+    def fake_mxfp8_quantize(weight):
+        quantized_inputs.append(weight.clone())
+        rows, cols = weight.shape
+        value = weight.to(torch.float8_e4m3fn)
+        scale = torch.full(
+            (rows, cols // 32, 1),
+            0,
+            dtype=torch.uint8,
+        )
+        return value, scale
+
+    monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", fake_mxfp8_quantize)
+
+    intermediate, hidden = 32, 64
+    gate_up = (
+        torch.arange(2 * 2 * intermediate * hidden, dtype=torch.float32)
+        .remainder(128)
+        .reshape(2, 2 * intermediate, hidden)
+    )
+    down = (
+        torch.arange(2 * hidden * intermediate, dtype=torch.float32)
+        .remainder(128)
+        .reshape(2, hidden, intermediate)
+    )
+    fp8.load_weights(
+        [
+            (
+                "model.layers.0.mlp.experts.gate_up_proj",
+                gate_up.to(torch.bfloat16),
+            ),
+            ("model.layers.0.mlp.experts.down_proj", down.to(torch.bfloat16)),
+        ],
+        types.SimpleNamespace(model=model),
+    )
+
+    base = "model.layers.0.mlp.experts"
+    expected_names = [
+        f"{base}.{eid}.{proj}.weight{suffix}"
+        for proj in ("gate_proj", "up_proj")
+        for eid in (0, 1)
+        for suffix in ("", "_scale_from_checkpoint")
+    ] + [
+        f"{base}.{eid}.down_proj.weight{suffix}"
+        for eid in (0, 1)
+        for suffix in ("", "_scale_from_checkpoint")
+    ]
+    assert [name for name, _ in loaded] == expected_names
+
+    entries = dict(loaded)
+    source_shards = {
+        "gate_proj": gate_up[:, :intermediate, :],
+        "up_proj": gate_up[:, intermediate:, :],
+        "down_proj": down,
+    }
+    quantize_call = 0
+    for proj, source in source_shards.items():
+        for expert_id in (0, 1):
+            quantize_call += 1
+            name = f"{base}.{expert_id}.{proj}.weight"
+            value = entries[name]
+            scale = entries[name + "_scale_from_checkpoint"]
+            assert value.dtype == torch.float8_e4m3fn
+            expected = source[expert_id].to(torch.float8_e4m3fn)
+            assert torch.equal(value.float(), expected.float())
+            assert scale.dtype == torch.uint8
+            assert scale.shape == (*value.shape[:-1], value.shape[-1] // 32)
+            assert torch.all(scale == 1)
+            assert torch.equal(quantized_inputs[quantize_call - 1], source[expert_id])
+
+    assert len(quantized_inputs) == 6
