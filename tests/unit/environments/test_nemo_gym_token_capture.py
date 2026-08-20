@@ -102,6 +102,54 @@ def test_receipt_assembly_poisons_on_failure_rows() -> None:
     assert receipt["failure_reason"] == "worker_capture_failed"
 
 
+def test_receipt_assembly_ignores_uncommitted_call_failures_off_the_terminal_chain() -> None:
+    """A call that died without coordinates never served a completion and can
+    never be a lineage parent (no committed row to resolve against), so it is
+    structurally off-chain — e.g. the doomed final call of a rollout that
+    exhausted the context window. It must not poison the verified chain."""
+    env = _capture_env()
+    manifest = {
+        "rollout_id": "r0",
+        "records": [
+            _manifest_record("c1", logical_request_id="lr-1"),
+            _manifest_record("c2", logical_request_id="lr-2", parent="c1"),
+        ],
+        "failures": [
+            {
+                "model_call_id": "c3",
+                "reason": "request_finished_without_staged_coordinates",
+            }
+        ],
+    }
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_logical_request_id="lr-2", reward=1.0
+    )
+    assert receipt["capture_poisoned"] is False
+    assert receipt["failure_reason"] is None
+    assert receipt["terminal_model_call_id"] == "c2"
+
+
+def test_receipt_assembly_still_poisons_when_the_terminal_call_died_uncommitted() -> None:
+    """If the reported terminal request itself died without coordinates there
+    is no terminal row — the missing-terminal check must mask the rollout."""
+    env = _capture_env()
+    manifest = {
+        "rollout_id": "r0",
+        "records": [_manifest_record("c1", logical_request_id="lr-1")],
+        "failures": [
+            {
+                "model_call_id": "c2",
+                "reason": "request_finished_without_staged_coordinates",
+            }
+        ],
+    }
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_logical_request_id="lr-2", reward=0.0
+    )
+    assert receipt["capture_poisoned"] is True
+    assert receipt["failure_reason"] == "missing_terminal_row"
+
+
 def test_receipt_assembly_poisons_when_the_terminal_row_is_missing() -> None:
     env = _capture_env()
     manifest = {

@@ -143,6 +143,10 @@ _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
+# Mirrors nemo_gym.token_id_capture.sink.UNCOMMITTED_CALL_REASON: the poison
+# reason for an admitted call that finished without worker coordinates (no
+# completion was ever served for it).
+_UNCOMMITTED_CALL_REASON = "request_finished_without_staged_coordinates"
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -740,8 +744,20 @@ Depending on your data shape, you may want to change these values."""
         dead-branch rows: they stay in the manifest (their staged rows are
         fetched, verified, and cleaned) but never join the terminal chain —
         ``verify_and_linearize`` tolerates rows unreferenced by the terminal
-        chain. Poisoning is fail-closed: any failure row, or no row for the
-        terminal request, masks the rollout.
+        chain.
+
+        Poisoning is fail-closed with one carve-out. A failure row whose
+        reason is ``request_finished_without_staged_coordinates`` is a call
+        that never returned a completion (the ledger commit precedes the
+        response leaving the server) and can never be a lineage parent (an
+        uncommitted call has no row to resolve against) — e.g. the doomed
+        final call of a rollout that exhausted the model's context window.
+        Such rows are structurally off-chain and do not poison; if the
+        *terminal* request itself died this way, the missing-terminal-row
+        check below still masks the rollout. Every other failure reason
+        (``worker_capture_failed``, ``invalid_worker_commit_coordinates``)
+        marks a call whose completion WAS served — a hole in the chain —
+        and poisons.
         """
         records = [dict(record) for record in manifest.get("records") or []]
         failures = list(manifest.get("failures") or [])
@@ -756,9 +772,14 @@ Depending on your data shape, you may want to change these values."""
             ),
             None,
         )
+        poisoning_failures = [
+            failure
+            for failure in failures
+            if str(failure.get("reason") or "") != _UNCOMMITTED_CALL_REASON
+        ]
         failure_reason = None
-        if failures:
-            failure_reason = str(failures[0].get("reason") or "capture_failed")
+        if poisoning_failures:
+            failure_reason = str(poisoning_failures[0].get("reason") or "capture_failed")
         elif terminal_record is None:
             failure_reason = "missing_terminal_row"
         return {
