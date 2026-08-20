@@ -32,12 +32,14 @@ class _Tokenizer:
 
     def __init__(self) -> None:
         self.calls = []
+        self.encode_calls = []
 
     def decode(self, token_ids):
         return repr(token_ids)
 
     def encode(self, text, add_special_tokens=False):
         assert add_special_tokens is False
+        self.encode_calls.append(text)
         token_ids = []
         while text:
             if text.startswith(self.eos_token):
@@ -192,6 +194,8 @@ def test_prepare_dynamo_chat_completion_request_first_turn() -> None:
         "enable_thinking": False,
         "force_nonempty_content": True,
     }
+    assert tokenizer.calls[0]["tokenize"] is True
+    assert tokenizer.encode_calls == []
 
 
 def test_public_qwen3_tokenizer_first_turn_matches_chat_template(
@@ -362,8 +366,86 @@ def test_prepare_dynamo_chat_completion_request_preserves_prior_prefix() -> None
     assert "generation_log_probs" not in prepared["messages"][1]
     assert tokenizer.calls[0]["add_generation_prompt"] is True
     assert tokenizer.calls[1]["add_generation_prompt"] is False
-    assert tokenizer.calls[0]["tokenize"] is True
-    assert tokenizer.calls[1]["tokenize"] is True
+    assert tokenizer.calls[0]["tokenize"] is False
+    assert tokenizer.calls[1]["tokenize"] is False
+    assert tokenizer.encode_calls == ["<eos>", "<eos>nextGEN"]
+
+
+def test_prepare_dynamo_chat_completion_request_falls_back_for_unsupported_boundary() -> (
+    None
+):
+    class MissingCloseTokenizer(_Tokenizer):
+        def apply_chat_template(self, *args, **kwargs):
+            rendered = super().apply_chat_template(*args, **kwargs)
+            if (
+                kwargs.get("tokenize", True)
+                or "NEMO_RL_PREFIX_BOUNDARY" not in rendered
+            ):
+                return rendered
+            return rendered.replace("<eos>", "", 1)
+
+    tokenizer = MissingCloseTokenizer()
+    body = {
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "first",
+                "prompt_token_ids": [10],
+                "generation_token_ids": [31, 32, 2],
+                "generation_log_probs": [-0.1, -0.2, -0.3],
+            },
+            {"role": "user", "content": "next"},
+        ]
+    }
+
+    prepared = prepare_dynamo_chat_completion_request(
+        body,
+        tokenizer=tokenizer,
+        exclude_tools_when_tool_choice_none=True,
+    )
+
+    assert prepared["nvext"]["token_data"] == [10, 31, 32, 2, 40, 99]
+    assert [call["tokenize"] for call in tokenizer.calls] == [
+        False,
+        False,
+        True,
+        True,
+    ]
+
+
+def test_prepare_dynamo_chat_completion_request_falls_back_for_media_content() -> None:
+    tokenizer = _Tokenizer()
+    body = {
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "first",
+                "prompt_token_ids": [10],
+                "generation_token_ids": [31, 32, 2],
+                "generation_log_probs": [-0.1, -0.2, -0.3],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/image.png"},
+                    }
+                ],
+            },
+        ]
+    }
+
+    prepared = prepare_dynamo_chat_completion_request(
+        body,
+        tokenizer=tokenizer,
+        exclude_tools_when_tool_choice_none=True,
+    )
+
+    assert prepared["nvext"]["token_data"] == [10, 31, 32, 2, 900, 99]
+    assert [call["tokenize"] for call in tokenizer.calls] == [True, True]
 
 
 def test_prepare_dynamo_chat_completion_request_validates_extra_fields() -> None:
