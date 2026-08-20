@@ -326,11 +326,6 @@ class ClippedPGLossFn(LossFunction):
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max
         self.ratio_clip_c = cfg.ratio_clip_c  # set to None to disable dual-clipping
-        if self.ratio_clip_c is not None:
-            assert self.ratio_clip_c > 1, (
-                "ratio_clip_c must exceed 1 representing a lower bound of the ratios, "
-                f"got {self.ratio_clip_c}."
-            )
         self.reference_policy_kl_penalty = (
             cfg.reference_policy_kl_penalty if not cfg.use_kl_in_reward else 0
         )
@@ -357,13 +352,6 @@ class ClippedPGLossFn(LossFunction):
         self.enable_torch_compile = cfg.enable_torch_compile
         # Compile the actor objective lazily on the worker after Ray has
         # serialized the loss function.
-        # ``max-autotune-no-cudagraphs`` is required, not cosmetic: under
-        # ``dynamic=True`` (needed to avoid recompiling on every rollout shape),
-        # the default Inductor heuristic emits a pathological reduction schedule
-        # for the both-dims-symbolic masked-mean that can run >20x slower than
-        # eager at long sequence lengths. Autotuning searches block sizes and
-        # recovers a good kernel. CUDA graphs are disabled because they are
-        # unstable here and conflict with the trailing host sync in ``__call__``.
         self._compiled_actor_objective = None
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
@@ -634,12 +622,6 @@ class ClippedPGLossFn(LossFunction):
         else:
             kl = curr_logprobs.new_zeros(())
 
-        # The clipped-PG actor objective is assembled after the importance
-        # weights below, so the ratio/clip terms and the masked-mean reduction
-        # can be fused into a single (optionally compiled) region. The actor
-        # terms do not depend on the importance-sampling correction, so this
-        # reordering is numerically identical to computing them earlier.
-
         # -------------------------------------------------------------
         # Off-policy (actor) importance-sampling correction
         # -------------------------------------------------------------
@@ -759,8 +741,6 @@ class ClippedPGLossFn(LossFunction):
         else:
             importance_weights_to_use = None
 
-        # Actor objective: ratio/clip terms + masked-mean reduction, fused into
-        # one region and compiled when requested (eager path is identical).
         if self.enable_torch_compile and self._compiled_actor_objective is None:
             self._compiled_actor_objective = torch.compile(
                 _clipped_pg_actor_objective,
@@ -838,6 +818,10 @@ class ClippedPGLossFn(LossFunction):
         # Keep all reductions on device and perform one scalar materialization
         # for the Python-facing metric dictionary. This avoids a synchronization
         # for every individual metric while preserving the historical values.
+
+        # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
+        # by either sequence or token count, depending on particular metric.
+        # To get the true metric, you'll need to sum over the microbatch.
         metric_tensors = {"loss": loss.detach()}
         if full_metrics:
             with torch.no_grad():
@@ -900,8 +884,7 @@ class ClippedPGLossFn(LossFunction):
             .cpu()
             .tolist()
         )
-        # With global_valid_{seqs/toks}, metrics are globally normalized by either
-        # sequence or token count. Sum them across microbatches for the true metric.
+
         return loss, dict(zip(metric_names, metric_values, strict=True))
 
 
