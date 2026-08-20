@@ -157,7 +157,8 @@ git -C "${REPO}" fetch origin "${BRANCH}"
 git -C "${REPO}" pull --ff-only origin "${BRANCH}"
 git -C "${REPO}" submodule update --init --recursive
 LOCAL_HEAD=$(git -C "${REPO}" rev-parse HEAD)
-REMOTE_HEAD=$(git -C "${REPO}" rev-parse "origin/${BRANCH}")
+REMOTE_HEAD=$(git -C "${REPO}" ls-remote origin "refs/heads/${BRANCH}" | awk '{print $1}')
+test -n "${REMOTE_HEAD}"
 test "${LOCAL_HEAD}" = "${REMOTE_HEAD}"
 if [[ -n "${EXPECTED_HEAD}" ]]; then
   test "${LOCAL_HEAD}" = "${EXPECTED_HEAD}"

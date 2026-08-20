@@ -74,6 +74,8 @@ def test_submitter_checks_top_level_and_submodule_revisions_separately() -> None
 
     assert "status --porcelain --untracked-files=no --ignore-submodules=all" in script
     assert "submodule status --recursive | grep -q '^[+-U]'" in script
+    assert 'ls-remote origin "refs/heads/${BRANCH}"' in script
+    assert 'rev-parse "origin/${BRANCH}"' not in script
 
 
 def test_submitter_does_not_overlay_container_uv_cache() -> None:
