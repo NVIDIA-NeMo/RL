@@ -35,6 +35,7 @@ run_test() {
 }
 
 run_test uv run --no-sync bash ./tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh
+run_test env REFIT_PRECISION=mxfp8 uv run --no-sync bash ./tests/functional/grpo_megatron_nccl_reshard_refit.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

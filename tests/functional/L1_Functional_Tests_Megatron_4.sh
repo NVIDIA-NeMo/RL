@@ -52,6 +52,7 @@ if megatron_generation_supported; then
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topology.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
+    run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_nccl_reshard_refit.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async.sh
     run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_async.sh
     run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async_gym.sh
