@@ -84,6 +84,10 @@ set +a
 
 # Same trailing override as the original invocation. rollout_checkpointing is
 # an extra-allowed (ignored) block in this tree; kept for command fidelity.
+# checkpointing.enabled=false: this tree's SingleController raises
+# NotImplementedError on trainer checkpointing (the recovery-refresh branch
+# supports it); irrelevant to the multi-worker capture path under test.
 exec bash "${HERE}/examples/nemo_gym/nemotron-3.5-nano/nano35_dolphin_launch_sc_smoke.sh" \
   rollout_checkpointing.restore_mode=none \
+  checkpointing.enabled=false \
   "$@"
