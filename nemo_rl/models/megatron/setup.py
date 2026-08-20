@@ -330,7 +330,8 @@ def validate_and_set_config(
     optimizer_path,
 ):
     # inference_optimized layers hard-require SP with TP>1; fail here with the config key.
-    # GRPO's setup() auto-enables SP driver-side, so it never trips this.
+    # This guards the training cfg; the inference cfg is guarded in
+    # merged_inference_megatron_cfg (the colocated build bypasses this function).
     if (
         config["megatron_cfg"].get("transformer_impl") == "inference_optimized"
         and config["megatron_cfg"]["tensor_model_parallel_size"] > 1

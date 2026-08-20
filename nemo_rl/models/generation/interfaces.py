@@ -382,12 +382,13 @@ class GenerationInterface(ABC):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wind down after a generation phase.
 
-        Callers may pass `for_training` (keyword-only, default True):
+        Callers may pass `release_gpu` (keyword-only, default True):
         True means the caller needs the GPUs for itself (a training step or a checkpoint save),
         so even a colocated engine must fully stand down;
         False means the phase is merely over, and a colocated engine must keep serving
         usable with no intervening prepare_for_generation.
-        Colocated backends must honor the flag; engines on dedicated GPUs may ignore it.
+        Only the colocated Megatron backend honors the flag today; other backends
+        ignore it, as do engines on dedicated GPUs.
         """
         pass
 

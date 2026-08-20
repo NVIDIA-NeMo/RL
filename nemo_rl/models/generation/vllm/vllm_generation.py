@@ -1001,14 +1001,6 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy preparation: {e}")
             return False
 
-    def blocks_training(self) -> bool:
-        """Whether the engine must stand down before a training step.
-
-        Colocated vLLM shares the training GPUs (async colocated vLLM is
-        not supported yet, but the capability answers correctly for it).
-        """
-        return bool(self.cfg["colocated"]["enabled"])
-
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""
         try:

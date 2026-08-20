@@ -1140,22 +1140,6 @@ def setup(
                 )
             mcore_cfg["kv_cache_management_mode"] = "recompute"
 
-    # inference_optimized layers hard-require sequence parallelism with TP>1
-    # (asserted at model build). Enable it here, driver-side, so the logged
-    # and checkpointed config reflects the effective value.
-    if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
-        megatron_cfg = policy_config["megatron_cfg"]
-        if (
-            megatron_cfg.get("transformer_impl") == "inference_optimized"
-            and megatron_cfg["tensor_model_parallel_size"] > 1
-            and not megatron_cfg["sequence_parallel"]
-        ):
-            megatron_cfg["sequence_parallel"] = True
-            print(
-                "Auto-enabling `policy.megatron_cfg.sequence_parallel=True`: "
-                "transformer_impl=inference_optimized requires it with TP>1."
-            )
-
     # Define initialization functions that will be used in all paths
     init_reference_model = loss_config.reference_policy_kl_penalty > 0
 
@@ -4450,7 +4434,7 @@ def async_grpo_train(
             initial_val_metrics = val_metrics
             # A colocated engine keeps serving between phases (preserves its
             # KV/prefix cache); the backend makes that call, not the loop.
-            policy_generation.finish_generation(for_training=False)
+            policy_generation.finish_generation(release_gpu=False)
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
             if master_config.grpo.debug_payload_metrics:
@@ -4842,7 +4826,7 @@ def async_grpo_train(
                     with timer.time("exposed_generation"):
                         ray.get(trajectory_collector.prepare_for_refit.remote())
                     generation_logger_metrics = policy_generation.get_logger_metrics()
-                    policy_generation.finish_generation(for_training=True)
+                    policy_generation.finish_generation(release_gpu=True)
 
                 # Training phase (same as sync version)
                 skip_prev_logprobs, skip_reference_logprobs = (
@@ -5083,18 +5067,9 @@ def async_grpo_train(
                 # Run validation if it's a validation step or last step with val_at_end
                 if should_run_validation:
                     with timer.time("idle/validation"):
-                        if POLICY_GENERATION_STALE:
-                            refit_metrics = refit_policy_generation(
-                                policy,
-                                policy_generation,
-                                colocated_inference,
-                            )
-                            POLICY_GENERATION_STALE = False
-                        else:
-                            # No-op on an already-running engine; wakes the
-                            # colocated engine when it stayed asleep for a
-                            # save-bound step.
-                            policy_generation.prepare_for_generation()
+                        # No-op on an already-running engine;
+                        # wakes the colocated engine when it stayed asleep for a save-bound step.
+                        policy_generation.prepare_for_generation()
                         val_metrics, validation_timings = validate(
                             policy_generation,
                             val_dataloader,
@@ -5119,7 +5094,7 @@ def async_grpo_train(
                         # so the engine must stand down; otherwise a colocated
                         # engine keeps serving (backend's call).
                         policy_generation.finish_generation(
-                            for_training=saving_this_step
+                            release_gpu=saving_this_step
                         )
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"

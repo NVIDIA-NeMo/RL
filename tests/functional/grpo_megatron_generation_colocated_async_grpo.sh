@@ -38,7 +38,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     grpo.async_grpo.in_flight_weight_updates=true \
     loss_fn.use_importance_sampling_correction=true \
     grpo.max_num_steps=3 \
-    grpo.val_period=1 \
+    grpo.val_period=3 \
     grpo.max_val_samples=8 \
     grpo.val_batch_size=8 \
     cluster.gpus_per_node=2 \
@@ -58,9 +58,10 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 uv run tests/check_metrics.py $JSON_METRICS \
     'median(data["train/gen_kl_error"]) < 1.3' \
     '"3" in data["train/loss"]' \
-    '"2" in data["validation/accuracy"]'
+    '"3" in data["validation/accuracy"]'
 
 # The save-bound step must defer the engine wake past the checkpoint save.
+# `val_period=3` gives us a step 2 that does not wake/sleep cycle the engine before save.
 if ! grep -q "Keeping colocated engine asleep for checkpointing" $RUN_LOG; then
     echo "FAIL: deferred-wake log line not found (colocated checkpoint path not exercised)"
     exit 1

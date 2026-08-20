@@ -399,7 +399,7 @@ class MegatronConfig(TypedDict):
     moe_router_group_topk: NotRequired[int | None]
     # Transformer implementation backing the model. 'inference_optimized'
     # trains through the TE parent path and requires sequence_parallel with
-    # TP>1 (auto-enabled driver-side for GRPO).
+    # TP>1 (enforced at setup).
     # Options are 'transformer_engine' and 'inference_optimized'.
     transformer_impl: NotRequired[str]
     # CUDA-graph implementation.

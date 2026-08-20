@@ -259,13 +259,13 @@ class MegatronGeneration(GenerationInterface):
             ]
         return True
 
-    def finish_generation(self, *, for_training: bool = True) -> bool:
+    def finish_generation(self, *, release_gpu: bool = True) -> bool:
         """Clean up after generation.
 
-        When `for_training` is False, a colocated engine keeps serving instead of standing down.
+        When `release_gpu` is False, a colocated engine keeps serving instead of standing down.
         """
         futures = self._policy.worker_group.run_all_workers_single_data(
-            "finish_generation", for_training=for_training
+            "finish_generation", release_gpu=release_gpu
         )
         ray.get(futures)
         return True

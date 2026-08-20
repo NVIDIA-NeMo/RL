@@ -80,6 +80,7 @@ if ! grep -q "prepare_for_generation: engine already serving, skipping" $RUN_LOG
 fi
 
 # The save-bound step must defer the engine wake past the checkpoint save.
+# With `val_period=1`, the validation always intervenes before the save.
 if ! grep -q "Keeping colocated engine asleep for checkpointing" $RUN_LOG; then
     echo "FAIL: deferred-wake log line not found (colocated checkpoint path not exercised)"
     exit 1

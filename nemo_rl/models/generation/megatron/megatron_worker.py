@@ -368,20 +368,20 @@ class MegatronGenerationMixin:
             print(f"[Rank {torch.distributed.get_rank()}] HTTP Server not started")
             self.base_url = None
 
-    def finish_generation(self, *, for_training: bool = True) -> None:
+    def finish_generation(self, *, release_gpu: bool = True) -> None:
         """Wind down a generation cycle.
 
         Args:
-            for_training: the caller is about to need the GPUs for itself (a
-                training step or a checkpoint save), so even a colocated
-                engine must fully stand down. Pass False between generation
-                phases (e.g. after validation) to let a colocated engine keep
-                serving; tearing it down there would discard KV/prefix caches
-                and CUDA graphs for no reason.
+            release_gpu: the caller needs the GPUs for itself (a training
+                step or a checkpoint save), so even a colocated engine must
+                fully stand down. Pass False between generation phases (e.g.
+                after validation) to let a colocated engine keep serving;
+                tearing it down there would discard KV/prefix caches and CUDA
+                graphs for no reason.
                 For non-colocated engines this body reduces to a rotary-cache clear
                 (their engine pause happens in suspend_for_refit).
         """
-        if self.is_generation_colocated and not for_training:
+        if self.is_generation_colocated and not release_gpu:
             return
         print(f"[Rank {self.rank}] finishing generation", flush=True)
         log_gpu_memory("finish_generation START")
