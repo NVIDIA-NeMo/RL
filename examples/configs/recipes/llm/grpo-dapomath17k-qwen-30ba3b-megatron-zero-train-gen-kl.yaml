@@ -13,6 +13,8 @@ loss_fn:
   ratio_clip_max: 0.28
 
 policy:
+  router_replay:
+    enabled: false
   train_global_batch_size: 256
   max_total_sequence_length: 10240
   logprob_chunk_size: 2048 # requires defer_fp32_logits
@@ -28,7 +30,7 @@ policy:
     sequence_parallel: true
     moe_token_dispatcher_type: alltoall
     moe_router_dtype: fp32
-    moe_pad_experts_for_cuda_graph_inference: true
+    moe_pad_experts_for_cuda_graph_inference: false
     moe_permute_fusion: false
     cuda_graph_impl: none
     optimizer:
@@ -47,10 +49,13 @@ policy:
     max_new_tokens: 8192
     mcore_generation_config:
       use_cuda_graphs_for_non_decode_steps: false
-      cuda_graph_impl: local
-      num_cuda_graphs: 16
-      inference_cuda_graph_scope: block
-      kv_cache_management_mode: persist
+      cuda_graph_impl: none
+      num_cuda_graphs: 0
+      inference_cuda_graph_scope: none
+      enable_chunked_prefill: false
+      enable_prefix_caching: false
+      kv_cache_management_mode: recompute
+      static_kv_memory_pointers: false
       buffer_size_gb: 16
 
 data:
