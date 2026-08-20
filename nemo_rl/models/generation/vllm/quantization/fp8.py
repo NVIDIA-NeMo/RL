@@ -714,10 +714,6 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
 
 def _expand_grouped_moe_expert_to_mxfp8(key, weight):
     """Expand a grouped Qwen3.5 MoE slab into per-expert MXFP8 entries."""
-    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-        mxfp8_e4m3_quantize,
-    )
-
     base, proj = key.rsplit(".", 1)
     if proj == "gate_up_proj":
         intermediate = weight.shape[1] // 2
@@ -731,12 +727,7 @@ def _expand_grouped_moe_expert_to_mxfp8(key, weight):
     entries = []
     for shard_name, grouped_moe_expert in shards:
         for expert_id, expert_weight in enumerate(grouped_moe_expert):
-            expert_weight = expert_weight.contiguous()
-            value, scale = mxfp8_e4m3_quantize(expert_weight)
-            value = value.reshape(expert_weight.shape)
-            scale = scale.reshape(
-                *expert_weight.shape[:-1], expert_weight.shape[-1] // 32
-            )
+            value, scale = quantize_mxfp8_weight(expert_weight.contiguous())
             name = f"{base}.{expert_id}.{shard_name}.weight"
             entries.append((name, value))
             entries.append((name + "_scale_from_checkpoint", scale))
