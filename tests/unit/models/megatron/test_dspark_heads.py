@@ -28,7 +28,6 @@ import torch.multiprocessing as mp
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-
 pytestmark = pytest.mark.mcore
 
 
