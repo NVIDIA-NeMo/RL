@@ -16,6 +16,7 @@ COMMON_OVERRIDES=(
     checkpointing.enabled=true
     checkpointing.checkpoint_dir="$CHECKPOINT_DIR"
     checkpointing.save_period=1
+    checkpointing.metric_name=null
     data_plane.checkpointing_enabled=true
     async_rl.sampler.name=windowed
     '~async_rl.sampler.max_lookahead_versions'

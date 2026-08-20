@@ -10,20 +10,24 @@ git config --global --add safe.directory $PROJECT_ROOT
 
 set -eou pipefail
 
-EXP_NAME=$(basename $0 .sh)
-EXP_DIR=$SCRIPT_DIR/$EXP_NAME
-LOG_DIR=$EXP_DIR/logs
-JSON_METRICS=$EXP_DIR/metrics.json
-RUN_LOG=$EXP_DIR/run.log
-CHECKPOINT_DIR=$EXP_DIR/checkpoints
-DATA_DIR=$EXP_DIR/data
+EXP_NAME=${SC_GYM_EXP_NAME:-$(basename "$0" .sh)}
+EXP_DIR=${SC_GYM_EXP_DIR:-$SCRIPT_DIR/$EXP_NAME}
+LOG_DIR=${SC_GYM_LOG_DIR:-$EXP_DIR/logs}
+JSON_METRICS=${SC_GYM_JSON_METRICS:-$EXP_DIR/metrics.json}
+RUN_LOG=${SC_GYM_RUN_LOG:-$EXP_DIR/run.log}
+CHECKPOINT_DIR=${SC_GYM_CHECKPOINT_DIR:-$EXP_DIR/checkpoints}
+DATA_DIR=${SC_GYM_DATA_DIR:-$EXP_DIR/data}
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
-rm -rf $EXP_DIR $LOG_DIR
-mkdir -p $EXP_DIR $LOG_DIR $CHECKPOINT_DIR $DATA_DIR
+if [[ "${SC_GYM_CLEAN_EXP_DIR:-1}" == "1" ]]; then
+    rm -rf "$EXP_DIR"
+fi
+mkdir -p "$EXP_DIR" "$LOG_DIR" "$CHECKPOINT_DIR" "$DATA_DIR"
 
-# clean up checkpoint directory on exit
-trap "rm -rf $CHECKPOINT_DIR" EXIT
+# Preserve checkpoints only when a caller is coordinating a restart test.
+if [[ "${SC_GYM_KEEP_CHECKPOINTS:-0}" != "1" ]]; then
+    trap 'rm -rf "$CHECKPOINT_DIR"' EXIT
+fi
 
 cd $PROJECT_ROOT
 
@@ -107,9 +111,11 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     $@ \
     2>&1 | tee $RUN_LOG
 
-uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+if [[ "${SC_GYM_RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
+    uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 
-# Observed to be between 0.8-1.3
-uv run tests/check_metrics.py $JSON_METRICS \
-    'median(data["train/gen_kl_error"]) < 1.3' \
-    'max(data["train/reward"]) > 0'
+    # Observed to be between 0.8-1.3
+    uv run tests/check_metrics.py "$JSON_METRICS" \
+        'median(data["train/gen_kl_error"]) < 1.3' \
+        'max(data["train/reward"]) > 0'
+fi
