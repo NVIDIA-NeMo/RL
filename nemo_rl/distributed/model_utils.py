@@ -2013,6 +2013,9 @@ def get_distillation_topk_logprobs_from_logits(
             # there rather than scattering. The equality holds anyway, because
             # DistillationLossFn masks those positions to exactly 0.0 before
             # reduction, so the accumulated gradient is zero either way.
+            # That is enforced, not assumed: the loss rejects data without
+            # ``token_mask``/``sample_mask`` rather than falling back to an
+            # unmasked mean, which would give those positions real gradient.
             student_topk_logits = student_logits.gather(
                 dim=-1, index=teacher_topk_indices
             ).to(torch.float32)

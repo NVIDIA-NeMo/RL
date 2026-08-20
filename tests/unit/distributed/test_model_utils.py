@@ -1638,6 +1638,11 @@ def test_distillation_topk_gathers_before_upcasting(monkeypatch):
     The equivalence test above cannot catch a revert: its reference is the
     old ``to(float32).gather(...)`` formulation, so it holds whether or not
     the upcast was deferred. This one observes the deferral itself.
+
+    It spies on ``Tensor.gather``, so it is coupled to that specific call. An
+    equivalent rewrite to ``torch.gather(...)`` or ``index_select`` would keep
+    the deferral but stop tripping the spy, failing here as a false alarm --
+    update the spy in that case rather than reading it as a regression.
     """
     torch.manual_seed(0)
     batch, seq, vocab, k = 1, 8, 512, 4
