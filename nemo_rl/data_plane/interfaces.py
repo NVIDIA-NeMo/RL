@@ -77,27 +77,16 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     admitted and never shrink — so raise it only when a per-key payload (one
     sample of one field) genuinely exceeds it, not for headroom.
 
-    ``dedupe_roce_rails_per_numa_domain`` keeps only the first *RoCE* rail per
-    NUMA domain instead of every RoCE rail (InfiniBand is never deduped —
-    see ``rdma_devices``). Default true: peer-rail selection depends on
-    ``MC_ENABLE_DEST_DEVICE_AFFINITY``'s same-name hint, which silently
-    falls back to a random pick whenever the lookup misses — measured to
-    happen in the pinned wheel — and two same-domain rails give that
-    fallback something to be ambiguous about (measured cause of the gb200
-    CI runners' cross-rail ``TRANSFER_FAIL``). Every domain still gets its
-    own dedicated rail either way, so this does not reduce the number of
-    domains in use, only redundant *extra* rails within one. Set false only
-    once same-domain multi-rail has been verified safe on the target RoCE
-    fabric (or a mooncake wheel with a working affinity hint is pinned) — it
-    can give a single domain's transfers more aggregate bandwidth than one
-    rail alone.
+    Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
+    That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1`` exported by the
+    launcher, which pins each transfer's peer rail to the local one by name; on
+    a rail-isolated RoCE fabric a cross-rail pair has no route.
     """
 
     global_segment_size: int = 68719476736  # 64 GiB per client process
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
     staging_buffer_size: int = 268435456  # 256 MiB per pool slot
-    dedupe_roce_rails_per_numa_domain: bool = True
 
 
 class DataPlaneConfig(TypedDict):

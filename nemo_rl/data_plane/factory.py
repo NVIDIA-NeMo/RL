@@ -23,9 +23,16 @@ def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
 
     Call this on the driver **before** ``init_ray()``: ``init_ray`` snapshots the
     driver's environment into ``runtime_env["env_vars"]`` and hands it to every
-    worker, so this is the point at which a setting becomes cluster-wide. A
-    backend whose engine reads a knob once at startup cannot be configured any
-    later than this without processes disagreeing.
+    Ray worker, which are fresh processes, so the value is in place before they
+    run any engine code.
+
+    That covers Ray workers, not everything. It does **not** reach processes the
+    driver did not spawn through Ray — a backend's own subprocesses and actors —
+    and it cannot help a process that already ran engine code, since engines
+    that snapshot their env at first use will have read the old value. Knobs
+    that must hold everywhere belong in the container image / launcher
+    environment instead; see
+    ``nemo_rl.data_plane.adapters.transfer_queue.maybe_configure_engine_env``.
 
     No-op when the data plane is disabled or the backend has no such knobs.
 
