@@ -29,6 +29,11 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.experience.blackbox_finalizer import FinalizedGroup
 from nemo_rl.experience.finalizer_actor import FinalizationRequest
+from nemo_rl.experience.rollout_recovery import (
+    PromptRef,
+    PromptGroupStatus,
+    RolloutRecoveryLedger,
+)
 from nemo_rl.experience.route_plan import (
     ROUTE_PLAN_SCHEMA_VERSION,
     RouteAssemblyPlan,
@@ -74,6 +79,7 @@ def _request() -> FinalizationRequest:
     return FinalizationRequest(
         group_id="group",
         rollout_ids=("group_g0",),
+        canonical_sample_ids=("group_g0",),
         receipts=(
             {
                 "manifest": [
@@ -96,14 +102,19 @@ def _controller(actor: object) -> Any:
     ctrl._finalizer_waiters = 0
     ctrl._finalizer_unknown_outcomes = 0
     ctrl._finalizer_metrics_by_group = {}
+    ctrl._rollout_recovery_ledger = MagicMock()
+    ctrl._rollout_recovery_ledger.__contains__.return_value = False
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
-        token_capture=SimpleNamespace(staging_partition="staging")
+        token_capture=SimpleNamespace(staging_partition="staging"),
+        grpo=SimpleNamespace(num_prompts_per_step=1),
     )
+    ctrl._trainer_version = 3
+    ctrl._train_steps = 3
     return ctrl
 
 
@@ -300,3 +311,68 @@ def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() 
             "partition_id": "staging",
         },
     ]
+
+
+def test_train_selection_transfers_finalized_group_to_open_step() -> None:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    ctrl = _controller(SimpleNamespace())
+    ledger = RolloutRecoveryLedger()
+    group = ledger.reserve_group(
+        group_id="group",
+        prompt_id="17",
+        prompt_ref=PromptRef(sample_id="17", task_name="nemo_gym"),
+        prompt_payload={"idx": 17},  # type: ignore[arg-type]
+        expected_generations=1,
+        target_step=None,
+        start_weight_version=3,
+    )
+    ledger.mark_group_dispatched(group.group_id)
+    gate_id = group.gate_rollout_ids[0]
+    ledger.mark_sibling_sealed(
+        group.group_id,
+        generation_index=0,
+        gate_rollout_id=gate_id,
+        receipt={
+            "rollout_id": gate_id,
+            "manifest": [{"staging_key": f"{gate_id}/call"}],
+        },
+        reward=1.0,
+    )
+    ledger.mark_finalization_started(group.group_id)
+    ledger.mark_group_finalized(
+        group.group_id,
+        meta=meta,
+        group_min_weight_version=3,
+        group_max_weight_version=3,
+    )
+    ctrl._rollout_recovery_ledger = ledger
+
+    selected = ctrl._claim_train_meta(meta, num_groups=1)
+
+    assert selected == ["group"]
+    assert ledger.get_group("group").status == PromptGroupStatus.CLAIMED_FOR_TRAINING
+    assert ledger.open_train_step is not None
+    assert ledger.open_train_step.group_ids == ["group"]
+
+
+def test_train_selection_rejects_group_missing_from_lineage() -> None:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    ctrl = _controller(SimpleNamespace())
+    ctrl._rollout_recovery_ledger = RolloutRecoveryLedger()
+
+    with pytest.raises(RuntimeError, match="missing from the rollout recovery ledger"):
+        ctrl._claim_train_meta(meta, num_groups=1)
