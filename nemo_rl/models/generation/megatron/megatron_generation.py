@@ -329,6 +329,10 @@ class MegatronGeneration(GenerationInterface):
         ray.get(futures)
         return True
 
+    def blocks_training(self) -> bool:
+        """Whether colocated generation must stand down before training."""
+        return bool(self.cfg["colocated"]["enabled"])
+
     def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
         """Pre-initialize NVShmem collectively after CUDA graph capture.
 

@@ -380,7 +380,11 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._rollout_recovery_complete = asyncio.Event()
     ctrl._rollout_recovery_complete.set()
     ctrl._trainer = _NoOpTrainer()
-    ctrl._gen = SimpleNamespace(requires_kv_scale_sync=False)
+    # Continuous-serving default; the pump asks before every step's trainer work.
+    ctrl._gen = SimpleNamespace(
+        requires_kv_scale_sync=False,
+        blocks_training=lambda: False,
+    )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
@@ -466,3 +470,95 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["evicted_stale_prompt_groups"] == 2
     assert train_metrics["aborted_stale_inflight_groups"] == 1
+
+
+@pytest.mark.parametrize(
+    "engine_blocks_training", [False, True], ids=["streaming", "blocking"]
+)
+def test_train_pump_chunked_step_by_engine_regime(
+    monkeypatch, engine_blocks_training
+) -> None:
+    """One two-chunk step, observed under both engine regimes.
+
+    Both regimes: the logprob detour between chunks must not offload the
+    trainer's grad buffers — mcore's offload frees the gradients earlier
+    chunks accumulated rather than copying them out. First chunk: no step
+    open, the offload is worth taking; later chunks: buffers stay resident.
+
+    Streaming: the engine is never stood down, the rollout gate stays open,
+    and the configured streaming minimum reaches the sampler.
+
+    Blocking (colocated Megatron): the pump closes the gate and sleeps the
+    engine exactly once per step, before any trainer GPU work, and demands
+    whole steps from the sampler (min == max). The chunked delivery here is
+    a fake-permitted shape — real samplers honor the min — proving
+    release-once is robust to partial deliveries.
+    """
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    select_bounds: list[tuple[int, int]] = []
+
+    class _BoundsRecordingSampler(_ChunkedSampler):
+        async def select(self, **kwargs):
+            select_bounds.append(
+                (kwargs["min_prompt_groups"], kwargs["max_prompt_groups"])
+            )
+            return await super().select(**kwargs)
+
+    # num_prompts_per_step is 2 in the harness, so two single-group chunks
+    # close the step.
+    ctrl = _train_pump_controller(sampler=_BoundsRecordingSampler(meta, chunks=2))
+    ctrl._policy_logprobs_required = True
+    calls: list[object] = []
+
+    class _RecordingTrainer(_LpRecordingTrainer):
+        def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+            super().prepare_for_lp_inference(keep_train_buffers)
+            calls.append("lp_inference_prep")
+
+        def prepare_for_training(self) -> None:
+            calls.append("prepare_for_training")
+
+        def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+            del meta
+            calls.append("train")
+
+    def _finish_generation() -> None:
+        calls.append(("finish_generation", ctrl._rollout_permitted.is_set()))
+
+    trainer = _RecordingTrainer()
+    ctrl._trainer = trainer
+    ctrl._gen = SimpleNamespace(
+        requires_kv_scale_sync=False,
+        blocks_training=lambda: engine_blocks_training,
+        finish_generation=_finish_generation,
+    )
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._train_steps == 1
+    assert trainer.keep_train_buffers_calls == [False, True]
+    chunk = ["lp_inference_prep", "prepare_for_training", "train"]
+    if engine_blocks_training:
+        # Released exactly once, with the gate already closed, before the
+        # trainer touched the GPUs; both chunks then ran without a second
+        # release. The (mocked) post-step _sync_weights reopens the gate.
+        assert calls == [("finish_generation", False)] + chunk * 2
+        assert not ctrl._rollout_permitted.is_set()
+        assert select_bounds and all(lo == hi for lo, hi in select_bounds)
+    else:
+        assert calls == chunk * 2
+        assert ctrl._rollout_permitted.is_set()
+        assert select_bounds[0] == (1, 2)
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)

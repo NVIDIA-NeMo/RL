@@ -397,7 +397,7 @@ class TestSetup:
                 "num_prompts_per_step.*min_groups_for_streaming_train - 1",
             ),
             ("megatron_dtensor_trainer", ValueError, "megatron_cfg.enabled"),
-            ("megatron_colocated", NotImplementedError, "colocated Megatron"),
+            ("megatron_colocated_small_buffer", ValueError, "max_buffered_rollouts"),
             ("megatron_gym_without_http_server", ValueError, "expose_http_server"),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
         ],
@@ -444,10 +444,11 @@ class TestSetup:
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=False
             )
-        elif invalid_case == "megatron_colocated":
+        elif invalid_case == "megatron_colocated_small_buffer":
             mc = _make_master_config(
                 colocated=True, backend="megatron", megatron_enabled=True
             )
+            mc.async_rl.max_buffered_rollouts = mc.grpo.num_prompts_per_step - 1
         elif invalid_case == "megatron_gym_without_http_server":
             mc = self._make_gym_megatron_config()
             mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = (
@@ -867,9 +868,9 @@ class TestSetup:
         assert metrics.generation_init_reserve_time_s == 3.0
         assert metrics.generation_init_load_time_s is not None
 
-    def _make_gym_megatron_config(self) -> MasterConfig:
+    def _make_gym_megatron_config(self, *, colocated: bool = False) -> MasterConfig:
         mc = _make_master_config(
-            colocated=False, backend="megatron", megatron_enabled=True
+            colocated=colocated, backend="megatron", megatron_enabled=True
         )
         mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = True
         mc.policy["generation"]["stop_strings"] = None
@@ -877,6 +878,7 @@ class TestSetup:
         mc.policy["generation"]["top_k"] = None
         return mc
 
+    @pytest.mark.parametrize("colocated", [True, False])
     @pytest.mark.parametrize(
         ("scenario", "error_match"),
         [
@@ -887,9 +889,13 @@ class TestSetup:
         ids=["gym", "gym_served_mismatch", "native"],
     )
     def test_megatron_setup(
-        self, patched_factories, scenario: str, error_match: str | None
+        self,
+        patched_factories,
+        scenario: str,
+        error_match: str | None,
+        colocated: bool,
     ):
-        """Non-colocated Megatron generation setup, gym and native legs.
+        """Megatron generation setup: gym and native legs, colocated or not.
 
         gym: reserve rank-0's URL, spin Gym up on it, build trainer + engine
         (weight load skipped, reserved port adopted), cross-check the served
@@ -898,17 +904,20 @@ class TestSetup:
         builds when the engine comes up on a different address.
         native: expose_http_server=false and no Gym, so nothing reserves a URL,
         no port holder is created, and the cross-check is skipped.
+        colocated: rank 0 lives with the trainer — the reservation targets the
+        train cluster, the reserved port rides the trainer build, and the
+        engine wraps the trainer's policy instead of a dedicated cluster.
         """
         gym = scenario != "native"
         if gym:
-            mc = self._make_gym_megatron_config()
+            mc = self._make_gym_megatron_config(colocated=colocated)
             patched_factories["setup_response_data"].return_value = (
                 list(range(8)),
                 None,
             )
         else:
             mc = _make_master_config(
-                colocated=False, backend="megatron", megatron_enabled=True
+                colocated=colocated, backend="megatron", megatron_enabled=True
             )
         mc.async_rl.recompute_kv_cache_after_weight_updates = True
         tokenizer = MagicMock(pad_token_id=0)
@@ -947,6 +956,7 @@ class TestSetup:
                 with pytest.raises(RuntimeError, match=error_match):
                     setup_single_controller(mc, tokenizer)
 
+        train_cluster = patched_factories["_build_clusters"].return_value[0]
         inference_cluster = patched_factories["_build_clusters"].return_value[1]
         # The megatron path never uses the generic generation factory and applies
         # its config overrides before any build (_build_generation normally sets
@@ -959,7 +969,7 @@ class TestSetup:
         # Reservation + holder lifecycle exist on the gym legs only.
         if gym:
             mock_megatron.reserve_http_server_address.assert_called_once_with(
-                inference_cluster,
+                train_cluster if colocated else inference_cluster,
                 mc.policy,
             )
             mock_ray.kill.assert_called_once_with(port_holder)
@@ -967,18 +977,25 @@ class TestSetup:
             mock_megatron.reserve_http_server_address.assert_not_called()
             mock_ray.kill.assert_not_called()
 
-        # Construction: trainer first, generation from the dedicated cluster,
-        # with the weight load skipped and the reserved port adopted (gym) or
+        # Construction: trainer first, then generation per mode — colocated
+        # wraps the trainer's policy and hands the reserved port to the trainer
+        # build; non-colocated builds on the dedicated cluster with the weight
+        # load skipped and the reserved port adopted by the engine (gym) or
         # absent (native).
         patched_factories["_build_trainer"].assert_called_once()
+        _, trainer_kwargs = patched_factories["_build_trainer"].call_args
+        assert trainer_kwargs["reserved_http_server_port"] == (
+            5555 if colocated and gym else None
+        )
         mock_megatron.assert_called_once_with(
             config=mc.policy,
             tokenizer=tokenizer,
-            cluster=inference_cluster,
+            cluster=None if colocated else inference_cluster,
+            policy=patched_factories["fake_policy"] if colocated else None,
             processor=None,
             weights_path=None,
-            skip_weight_load=True,
-            reserved_http_server_port=5555 if gym else None,
+            skip_weight_load=not colocated,
+            reserved_http_server_port=5555 if gym and not colocated else None,
         )
         if gym:
             # Gym spins up on the reserved URL, before the served-address
@@ -996,7 +1013,7 @@ class TestSetup:
         assert metrics.policy_init_time_s is not None
         _, factory_kwargs = patched_factories["create_weight_synchronizer"].call_args
         assert factory_kwargs["generation_backend"] == "megatron"
-        assert factory_kwargs["colocated"] is False
+        assert factory_kwargs["colocated"] is colocated
         assert factory_kwargs["inference_cluster"] is inference_cluster
         if gym:
             assert actor_args.env_handles["nemo_gym"] is fake_gym_actor

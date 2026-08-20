@@ -2157,6 +2157,7 @@ class SingleControllerActor:
             evicted_stale_prompt_groups = 0
             min_sample_version = None
             step_open = False
+            generation_released = False
             calibration_batches: list[BatchedDataDict[Any]] = []
             consumed_metas: list[KVBatchMeta] = []
             consumed_group_count = 0
@@ -2206,6 +2207,9 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
+                        if self._gen.blocks_training():
+                            # Always assemble a whole batch in colocated mode.
+                            min_prompt_groups = max_prompt_groups
                         if self._rollout_recovery_ledger is None:
                             train_meta, num_groups = await self._sampler.select(
                                 current_train_weight=self._trainer_version,
@@ -2264,6 +2268,18 @@ class SingleControllerActor:
                                 step_finalizer_metrics.setdefault(name, []).append(
                                     float(value)
                                 )
+
+                    # A generation engine that blocks training must stand down;
+                    # sleep the engine to allow for the trainer to perform GPU work.
+                    # Safe because the select above assembles whole steps for
+                    # blocking engines (min == max), so nothing below waits on
+                    # rollouts the sleeping engine could not deliver.
+                    # In-flight requests freeze, then continue on fresh weights.
+                    # The post-step `_sync_weights` wake reopens the gate.
+                    if not generation_released and self._gen.blocks_training():
+                        self._rollout_permitted.clear()
+                        await asyncio.to_thread(self._gen.finish_generation)
+                        generation_released = True
 
                     # Compute prev_logprobs / ref_logprobs
                     if (
