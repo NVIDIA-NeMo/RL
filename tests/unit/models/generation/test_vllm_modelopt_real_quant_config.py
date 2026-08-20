@@ -18,6 +18,7 @@ import sys
 import types
 import weakref
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 
 import pytest
 import torch
@@ -2367,7 +2368,9 @@ def test_resolve_nvfp4_real_quant_mode_rejects_mixed_activation_formats(
         resolve_nvfp4_real_quant_mode("mixed-input-formats")
 
 
-def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):
+def test_resolve_quant_cfg_resolves_repo_relative_recipe_from_remote_cwd(
+    monkeypatch, tmp_path
+):
     modelopt_recipe = pytest.importorskip("modelopt.recipe")
     captured = {}
 
@@ -2376,13 +2379,16 @@ def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):
         return {"quant_cfg": [{"name": "mock"}], "algorithm": "max"}
 
     monkeypatch.setattr(modelopt_recipe, "load_config", fake_load_config)
+    monkeypatch.chdir(tmp_path)
 
-    assert resolve_quant_cfg("examples/modelopt/quant_configs/nvfp4_a16.yaml") == {
+    quant_cfg = "examples/modelopt/quant_configs/nvfp4_a16.yaml"
+    assert resolve_quant_cfg(quant_cfg) == {
         "quant_cfg": [{"name": "mock"}],
         "algorithm": "max",
     }
 
-    assert captured["config_file"] == "examples/modelopt/quant_configs/nvfp4_a16.yaml"
+    repo_root = Path(modelopt_utils.__file__).resolve().parents[2]
+    assert captured["config_file"] == str((repo_root / quant_cfg).resolve())
 
 
 def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):
