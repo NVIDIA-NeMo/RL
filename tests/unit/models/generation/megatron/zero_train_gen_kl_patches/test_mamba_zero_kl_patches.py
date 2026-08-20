@@ -4,7 +4,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from nemo_rl.models.policy.workers import mamba_zero_kl_patches as patches
+from nemo_rl.models.generation.megatron.zero_train_gen_kl_patches import (
+    mamba_zero_kl_patches as patches,
+)
 
 
 class FakeMambaMixer:
