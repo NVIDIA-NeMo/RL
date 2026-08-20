@@ -19,7 +19,6 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-
 _HASH_MODULUS = 2_147_483_647
 _HASH_MULTIPLIER = 73_244_475
 

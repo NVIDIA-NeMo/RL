@@ -27,7 +27,6 @@ from nemo_rl.models.megatron.draft.block_plan import (
 )
 from nemo_rl.models.megatron.draft.dflash import DFlashBody, DFlashBodyConfig
 
-
 pytestmark = pytest.mark.mcore
 
 

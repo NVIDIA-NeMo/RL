@@ -14,8 +14,8 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
 import os
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,6 @@ import torch
 from megatron.core.model_parallel_config import ModelParallelConfig
 
 from nemo_rl.models.megatron.draft.dflash import DFlashBody, DFlashBodyConfig
-
 
 pytestmark = pytest.mark.mcore
 

@@ -14,9 +14,9 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
-import math
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -423,6 +423,8 @@ class DFlashBody(_ShardedModule):
             )
         elif parallel_config.sequence_parallel:
             raise ValueError("DFlashBody does not support sequence_parallel=True")
+        elif parallel_config.context_parallel_size > 1:
+            raise ValueError("DFlashBody does not support context_parallel_size > 1")
         elif parallel_config.tensor_model_parallel_size != self.tensor_parallel_size:
             raise ValueError(
                 "parallel_config.tensor_model_parallel_size must match the "

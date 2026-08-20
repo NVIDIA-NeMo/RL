@@ -27,7 +27,6 @@ import pytest
 import torch
 from torch import Tensor
 
-
 pytestmark = pytest.mark.mcore
 
 _PLAN_MODULE = "nemo_rl.models.megatron.draft.block_plan"

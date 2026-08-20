@@ -39,7 +39,6 @@ from nemo_rl.models.megatron.draft.block_plan import (
     build_dflash_batch_plan,
 )
 
-
 _DEFAULT_CASES = ((1024, 4, 16), (4096, 8, 16), (1024, 512, 16))
 _NUM_QUERY_HEADS = 32
 _NUM_KV_HEADS = 8

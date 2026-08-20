@@ -26,7 +26,6 @@ from torch.nn.attention.flex_attention import (
 
 from nemo_rl.models.megatron.draft.block_plan import DFlashBatchPlan
 
-
 _COMPILED_FLEX_ATTENTION = torch.compile(flex_attention)
 _FLEX_QUERY_BLOCK_SIZE = 128
 _FLEX_KV_BLOCK_SIZE = 128

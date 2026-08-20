@@ -14,8 +14,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +26,6 @@ from torch import Tensor
 
 from nemo_rl.models.megatron.draft.block_plan import build_dflash_batch_plan
 from nemo_rl.models.megatron.draft.dflash import DFlashBody, DFlashBodyConfig
-
 
 pytestmark = pytest.mark.mcore
 
