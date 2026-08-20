@@ -15,6 +15,10 @@
 from typing import Any
 
 
+def _round_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
 def flashinfer_scale_k_pad_width(k: int) -> int:
     if k < 0:
         raise ValueError("MXFP8 scale K dimension must be non-negative")
@@ -32,9 +36,22 @@ def pad_flashinfer_scale_k(input_tensor: Any) -> Any:
     return padded
 
 
-def supports_batched_moe_shuffle(
-    w13_scale_rows: int, w2_scale_rows: int, *, tile_m: int
-) -> bool:
-    if tile_m <= 0:
-        raise ValueError("MXFP8 MoE shuffle tile size must be positive")
-    return w13_scale_rows % tile_m == 0 and w2_scale_rows % tile_m == 0
+def flashinfer_mxfp8_moe_padding_plan(
+    hidden_size: int, intermediate_size: int
+) -> tuple[int, int]:
+    if hidden_size <= 0:
+        raise ValueError("MXFP8 MoE hidden_size must be positive")
+    if hidden_size % 32 != 0:
+        raise ValueError(
+            "FlashInfer TRTLLM MXFP8 MoE requires hidden_size divisible by 32, "
+            f"got {hidden_size}."
+        )
+    if intermediate_size <= 0:
+        raise ValueError("MXFP8 MoE intermediate_size must be positive")
+    if intermediate_size % 32 != 0:
+        raise ValueError(
+            "FlashInfer TRTLLM MXFP8 MoE requires intermediate_size divisible "
+            f"by 32, got {intermediate_size}."
+        )
+
+    return _round_up(hidden_size, 512), _round_up(intermediate_size, 128)
