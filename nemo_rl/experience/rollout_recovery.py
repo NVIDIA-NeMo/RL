@@ -733,12 +733,13 @@ class RolloutRecoveryLedger:
                 f"recovery group {group_id!r} must contain "
                 f"{expected_generations} siblings"
             )
+        raw_status = raw_group.get("status")
+        if not isinstance(raw_status, str):
+            raise ValueError(f"invalid prompt group status={raw_status!r}")
         try:
-            status = PromptGroupStatus(raw_group.get("status"))
+            status = PromptGroupStatus(raw_status)
         except ValueError as error:
-            raise ValueError(
-                f"invalid prompt group status={raw_group.get('status')!r}"
-            ) from error
+            raise ValueError(f"invalid prompt group status={raw_status!r}") from error
 
         siblings: list[RolloutSiblingRecord] = []
         for generation_index, sibling_state in enumerate(siblings_state):
@@ -765,10 +766,17 @@ class RolloutRecoveryLedger:
                     raise ValueError("duplicate rollout attempt identity")
                 seen_attempt_uuids.add(attempt_uuid)
                 gate_id = f"{logical_id}_a{attempt_uuid.hex}"
+                raw_attempt_status = attempt_state.get("status")
+                if not isinstance(raw_attempt_status, str):
+                    raise ValueError(
+                        f"invalid rollout attempt status={raw_attempt_status!r}"
+                    )
                 try:
-                    attempt_status = RolloutAttemptStatus(attempt_state.get("status"))
+                    attempt_status = RolloutAttemptStatus(raw_attempt_status)
                 except ValueError as error:
-                    raise ValueError("invalid rollout attempt status") from error
+                    raise ValueError(
+                        f"invalid rollout attempt status={raw_attempt_status!r}"
+                    ) from error
                 receipt = attempt_state.get("receipt")
                 reward = attempt_state.get("reward")
                 staging_keys = attempt_state.get("staging_keys")
