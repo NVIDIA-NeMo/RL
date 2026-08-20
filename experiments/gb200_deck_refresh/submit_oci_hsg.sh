@@ -186,6 +186,8 @@ RESULT_ROOT=${RESULT_ROOT:-${BASE}/experiments/gb200-deck-refresh}
 EXPERIMENT_ROOT=${EXPERIMENT_ROOT:-${RESULT_ROOT}/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}}
 CACHE_ROOT=${CACHE_ROOT:-${BASE}/.cache/gb200-deck-refresh/shared}
 WORKER_VENV_ROOT=${WORKER_VENV_ROOT:-/tmp/nemo_rl_worker_venvs/gb200-deck-refresh/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}}
+DRIVER_VENV=${DRIVER_VENV:-${CACHE_ROOT}/driver-venvs/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}}
+DRIVER_PYTHON_ROOT=${DRIVER_PYTHON_ROOT:-${CACHE_ROOT}/driver-python/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}}
 RAY_RUNTIME_VENV=${RAY_RUNTIME_VENV:-${BASE}/.cache/gb200-deck-refresh/ray-runtime-py31314}
 WANDB_PROJECT=${WANDB_PROJECT:-sna-gb200-deck-refresh}
 WANDB_NAME=${WANDB_NAME:-${MODEL}-${MODE}-${ARM}-${MAX_STEPS}step-${RUN_SUFFIX}}
@@ -270,6 +272,7 @@ EOF
 
 COMMAND=$(cat <<EOF
 set -euo pipefail
+trap 'rm -rf "${DRIVER_VENV}" "${DRIVER_PYTHON_ROOT}"' EXIT
 cd ${REPO}
 export HF_HOME=${HF_HOME}
 export HF_DATASETS_CACHE=${HF_HOME}/cache
@@ -283,8 +286,8 @@ export TORCH_CUDA_ARCH_LIST=10.0
 export PYTHONPATH=${REPO}
 export UV_CACHE_DIR=${CACHE_ROOT}/uv-cache
 export UV_PYTHON=${RAY_RUNTIME_VENV}/bin/python
-export UV_PROJECT_ENVIRONMENT=/tmp/nemo_rl_driver_venvs/gb200-deck-refresh/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}
-export UV_PYTHON_INSTALL_DIR=/tmp/nemo_rl_uv_python/gb200-deck-refresh/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}
+export UV_PROJECT_ENVIRONMENT=${DRIVER_VENV}
+export UV_PYTHON_INSTALL_DIR=${DRIVER_PYTHON_ROOT}
 export UV_LOCK_TIMEOUT=7200
 export WANDB_API_KEY="\$(cat ${WANDB_KEY_FILE})"
 printf 'NEMO_RL_SOURCE_COMMIT=%s\n' "\$(git rev-parse HEAD)"

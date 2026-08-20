@@ -83,7 +83,11 @@ def test_submitter_does_not_overlay_container_uv_cache() -> None:
 
     assert "export UV_CACHE_DIR_OVERRIDE" not in script
     assert "unset UV_CACHE_DIR_OVERRIDE" in script
-    assert "UV_PROJECT_ENVIRONMENT=/tmp/" in script
+    assert "DRIVER_VENV=${DRIVER_VENV:-${CACHE_ROOT}/driver-venvs/" in script
+    assert "DRIVER_PYTHON_ROOT=${DRIVER_PYTHON_ROOT:-${CACHE_ROOT}/driver-python/" in script
+    assert "export UV_PROJECT_ENVIRONMENT=${DRIVER_VENV}" in script
+    assert "export UV_PYTHON_INSTALL_DIR=${DRIVER_PYTHON_ROOT}" in script
+    assert "trap 'rm -rf \"${DRIVER_VENV}\" \"${DRIVER_PYTHON_ROOT}\"' EXIT" in script
 
 
 def test_async_bf16_renders_nccl_reshard_with_same_logprob_work() -> None:
@@ -193,4 +197,8 @@ def test_ablation_driver_uses_same_python_as_ray_cluster() -> None:
     assert "status --porcelain --untracked-files=no --ignore-submodules=all" in script
     assert "submodule status --recursive | grep -q '^[+-U]'" in script
     assert "unset UV_CACHE_DIR_OVERRIDE" in script
-    assert "UV_PROJECT_ENVIRONMENT=/tmp/" in script
+    assert "DRIVER_VENV=${DRIVER_VENV:-${CACHE_ROOT}/driver-venvs/" in script
+    assert "DRIVER_PYTHON_ROOT=${DRIVER_PYTHON_ROOT:-${CACHE_ROOT}/driver-python/" in script
+    assert "export UV_PROJECT_ENVIRONMENT=${DRIVER_VENV}" in script
+    assert "export UV_PYTHON_INSTALL_DIR=${DRIVER_PYTHON_ROOT}" in script
+    assert "trap 'rm -rf \"${DRIVER_VENV}\" \"${DRIVER_PYTHON_ROOT}\"' EXIT" in script
