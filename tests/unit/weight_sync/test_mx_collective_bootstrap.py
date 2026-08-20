@@ -163,21 +163,30 @@ def test_process_group_uses_root_uid_and_warms_up_the_communicator(monkeypatch):
             events.append("sync")
 
     class FakeCommunicator:
+        def __init__(self, kind):
+            self.kind = kind
+
         @staticmethod
         def init(*, nranks, rank, unique_id, config):
             assert config.blocking is False
             events.append(("init", nranks, rank, unique_id))
-            return FakeCommunicator()
+            return FakeCommunicator("bootstrap")
+
+        def split(self, *, color, key, config):
+            assert config.blocking is True
+            events.append(("split", color, key))
+            return FakeCommunicator("blocking")
 
         def get_async_error(self):
             return 0
 
         def broadcast(self, *, sendbuf, recvbuf, root, stream):
+            assert self.kind == "blocking"
             recvbuf.value = 1
             events.append(("broadcast", root, stream))
 
         def abort(self):
-            events.append("abort")
+            events.append(f"abort-{self.kind}")
 
     class FakeConfig:
         def __init__(self, *, blocking):
@@ -217,17 +226,21 @@ def test_process_group_uses_root_uid_and_warms_up_the_communicator(monkeypatch):
         root_unique_id=root_unique_id,
     )
     group.init_nccl_communicator(device=0)
+    group.abort()
 
     assert events == [
         ("init", 2, 0, root_unique_id),
+        ("split", 0, 0),
         ("broadcast", 0, 17),
         "sync",
+        "abort-blocking",
+        "abort-bootstrap",
     ]
 
 
 def test_process_group_waits_for_nonblocking_broadcast_before_reading(monkeypatch):
     events = []
-    statuses = iter((0, 7, 0))
+    statuses = iter((0, 7, 0, 0, 7, 0))
 
     class FakeTensor:
         def __init__(self, value):
@@ -240,13 +253,18 @@ def test_process_group_waits_for_nonblocking_broadcast_before_reading(monkeypatc
             events.append("sync")
 
     class FakeCommunicator:
-        def __init__(self):
+        def __init__(self, kind):
+            self.kind = kind
             self.recvbuf = None
 
         @staticmethod
         def init(**kwargs):
             events.append("init")
-            return FakeCommunicator()
+            return FakeCommunicator("bootstrap")
+
+        def split(self, **kwargs):
+            events.append("split")
+            return FakeCommunicator("blocking")
 
         def get_async_error(self):
             status = next(statuses)
@@ -303,6 +321,11 @@ def test_process_group_waits_for_nonblocking_broadcast_before_reading(monkeypatc
 
     assert events == [
         "init",
+        ("status", 0),
+        "split",
+        ("status", 7),
+        "sleep",
+        ("status", 0),
         ("status", 0),
         "broadcast",
         ("status", 7),

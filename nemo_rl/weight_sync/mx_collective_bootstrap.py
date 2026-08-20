@@ -55,6 +55,7 @@ class MxProcessGroup:
         self.rank = rank
         self.world_size = world_size
         self.nccl_communicator = None
+        self._bootstrap_communicator = None
         self._unique_id = unique_id
         # Rank zero keeps and consumes the exact object returned by
         # ncclGetUniqueId, matching StatelessProcessGroup. Peers reconstruct
@@ -62,7 +63,9 @@ class MxProcessGroup:
         self._root_unique_id = root_unique_id
         self._timeout_s = timeout_s
 
-    def _wait_for_async_success(self, bindings, *, operation: str) -> None:
+    def _wait_for_async_success(
+        self, bindings, *, operation: str, communicator=None
+    ) -> None:
         """Drive a nonblocking NCCL host operation to completion.
 
         A nonblocking communicator can return ``ncclInProgress`` not only
@@ -70,15 +73,16 @@ class MxProcessGroup:
         connects its transports.  Until that state becomes ``ncclSuccess`` the
         collective may not have been posted to the CUDA stream yet.
         """
+        communicator = communicator or self.nccl_communicator
         deadline = time.monotonic() + self._timeout_s
         while True:
-            status = self.nccl_communicator.get_async_error()
+            status = communicator.get_async_error()
             if int(status) == int(bindings.Result.Success):
                 return
             if int(status) != int(bindings.Result.InProgress):
                 raise RuntimeError(
                     f"MX NCCL {operation} failed with {status!r}: "
-                    f"{self.nccl_communicator.get_last_error()}"
+                    f"{communicator.get_last_error()}"
                 )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -114,6 +118,30 @@ class MxProcessGroup:
                 )
                 self._wait_for_async_success(
                     bindings, operation="communicator initialization"
+                )
+
+                # M2N currently requires ordinary blocking NCCL semantics and
+                # treats ncclInProgress from its internal collectives as an
+                # error. Keep the original communicator as a bounded bootstrap
+                # parent, then collectively split it into an independent
+                # blocking child with identical ranks for the data path.
+                bootstrap_communicator = self.nccl_communicator
+                blocking_communicator = bootstrap_communicator.split(
+                    color=0,
+                    key=self.rank,
+                    config=config_type(blocking=True),
+                )
+                self._bootstrap_communicator = bootstrap_communicator
+                self.nccl_communicator = blocking_communicator
+                self._wait_for_async_success(
+                    bindings,
+                    operation="blocking communicator split",
+                    communicator=bootstrap_communicator,
+                )
+                self._wait_for_async_success(
+                    bindings,
+                    operation="blocking communicator activation",
+                    communicator=blocking_communicator,
                 )
             except BaseException:
                 try:
@@ -155,9 +183,17 @@ class MxProcessGroup:
 
     def abort(self) -> None:
         """Abort a partially or fully initialized communicator exactly once."""
-        communicator = self.nccl_communicator
+        communicators = (
+            self.nccl_communicator,
+            self._bootstrap_communicator,
+        )
         self.nccl_communicator = None
-        if communicator is not None:
+        self._bootstrap_communicator = None
+        seen = set()
+        for communicator in communicators:
+            if communicator is None or id(communicator) in seen:
+                continue
+            seen.add(id(communicator))
             communicator.abort()
 
     def broadcast(self, tensor, src, stream=None):
