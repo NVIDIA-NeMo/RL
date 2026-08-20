@@ -450,6 +450,41 @@ class TestCollectiveWeightSynchronizer:
 
 
 class TestNcclReshardWeightSynchronizer:
+    def test_parallelism_includes_context_parallelism(self):
+        policy = _mock_policy(
+            cfg={
+                "megatron_cfg": {
+                    "tensor_model_parallel_size": 2,
+                    "expert_model_parallel_size": 1,
+                    "context_parallel_size": 2,
+                    "pipeline_model_parallel_size": 1,
+                },
+                "generation": {
+                    "vllm_cfg": {
+                        "tensor_parallel_size": 4,
+                        "expert_parallel_size": 1,
+                        "pipeline_parallel_size": 1,
+                    }
+                },
+            },
+        )
+        sync = NcclReshardWeightSynchronizer(
+            policy, _mock_generation(), _mock_cluster(), _mock_cluster()
+        )
+
+        assert sync._train_parallelism() == {
+            "tp_size": 2,
+            "ep_size": 1,
+            "cp_size": 2,
+            "pp_size": 1,
+        }
+        assert sync._gen_parallelism() == {
+            "tp_size": 4,
+            "ep_size": 1,
+            "cp_size": 1,
+            "pp_size": 1,
+        }
+
     @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
     def test_init_communicator_ships_wire_safe_refit_info(self, mock_ray):
         # The train-side refit info carries MeshInfo rank tensors; the copy

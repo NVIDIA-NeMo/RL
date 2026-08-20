@@ -89,6 +89,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         return {
             "tp_size": megatron_cfg.get("tensor_model_parallel_size", 1),
             "ep_size": megatron_cfg.get("expert_model_parallel_size", 1),
+            "cp_size": megatron_cfg.get("context_parallel_size", 1),
             "pp_size": megatron_cfg.get("pipeline_model_parallel_size", 1),
         }
 
@@ -97,6 +98,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         return {
             "tp_size": vllm_cfg.get("tensor_parallel_size", 1),
             "ep_size": vllm_cfg.get("expert_parallel_size", 1),
+            "cp_size": 1,
             "pp_size": vllm_cfg.get("pipeline_parallel_size", 1),
         }
 
