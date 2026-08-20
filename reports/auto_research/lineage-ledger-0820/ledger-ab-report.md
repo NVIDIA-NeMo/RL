@@ -94,3 +94,36 @@ these arms are not a rigorous throughput comparison; the prior campaign's
   drops under concurrent capture traffic.
 - CI (`/ok to test`) to run the Ray-heavy RL suites (blackbox_finalizer,
   tq_token_sink, vllm hosting) that cannot run outside the container.
+
+## Addendum: r3 rerun with the off-chain carve-out (job 6365594)
+
+`_assemble_receipt` now ignores `request_finished_without_staged_coordinates`
+failure rows off the terminal chain (commit b39dbd8cd). Capture arm rerun,
+same posture, short QOS, COMPLETED 5/5 in 1:11:49.
+
+| Metric | r2 (blanket poison) | r3 (carve-out) |
+|---|---|---|
+| valid rows / 40 | 24 (60%) | **32 (80%)** |
+| rejection reason | 16× failure-row poison | 9× missing_terminal_row only |
+| `token_mult_prob_error` | 1.0137–1.0147 | 1.0137–1.0171 |
+| `gen_kl_error` | ~0.001 | ~0.001 |
+| `finalize/token_in_rate` | 0.95–0.99 | 0.98–0.99 |
+| ledger census | 2,821 rows / 16 uncommitted failures | 3,525 rows / 19 uncommitted failures |
+
+The carve-out worked exactly as designed: zero rollouts were rejected for
+failure rows. The remaining 9 `missing_terminal_row` rejections split into:
+
+- 2 rollouts whose *first* call died (empty ledger — nothing to train;
+  correctly masked).
+- ~7 overflow rollouts where the terminal id OpenHands reported does not
+  match any committed row: the harness derives it from the last llm_completion
+  file (`swe_agents/app.py:3101`), which for these episodes corresponds to the
+  doomed final attempt rather than the last successful completion. (In the
+  other ~9 overflow rollouts this run, the last file was the last successful
+  call and they trained — the carve-out's win.)
+
+Options for the residue (not taken here): (a) harness-side — report the last
+*successful* response id when the final call errors; (b) receipt-side — fall
+back to the deepest committed row when the terminal is missing and all
+failures are uncommitted. (b) weakens the agent-kept-response attestation, so
+(a) is the better follow-up alongside retry idempotency.

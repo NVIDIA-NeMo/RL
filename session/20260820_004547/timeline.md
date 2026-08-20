@@ -33,3 +33,4 @@
 - BOTH SMOKE ARMS PASSED 5/5 steps. Capture: tmpe 1.0137-1.0147, gen_kl ~0.001, token_in_rate 0.95-0.99, 2821 ledger rows / 0 unresolved / 0 worker failures; 16 rollouts fail-closed on aborted calls (request_finished_without_staged_coordinates — retry-idempotency follow-up). Legacy: tmpe 1.020-1.066, gen_kl ~0.004, all 8 samples valid every step. Capture strictly tighter — matches gate-era campaign bands.
 - Review of legacy fix done via /review-pr (local): fix correct; added 2 regression params to test_nemo_gym_utils (7/7 pass); renamed _content -> item_content.
 - Report: reports/auto_research/lineage-ledger-0820/ledger-ab-report.md.
+- 2026-08-20 11:29:36 r3 rerun 6365594 COMPLETED 5/5 (1:11:49): carve-out validated — valid rows 32/40 (was 24/40), zero failure-row rejections; residue 9x missing_terminal_row (2 first-call deaths + ~7 doomed-attempt terminal ids from harness). Dynamics unchanged (tmpe 1.0137-1.0171, gen_kl ~0.001).
