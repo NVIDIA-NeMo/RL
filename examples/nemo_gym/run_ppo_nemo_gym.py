@@ -18,6 +18,7 @@ import pprint
 
 from omegaconf import OmegaConf
 
+from nemo_rl.algorithms.grpo import shutdown_environments
 from nemo_rl.algorithms.ppo import (
     MasterConfig,
     async_ppo_train,
@@ -118,46 +119,54 @@ def main() -> None:
     task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
     async_ppo_enabled = config.ppo.async_ppo.enabled
-    if async_ppo_enabled:
-        validate_async_ppo_config(config, policy_generation)
 
-    with checkpointer:
+    try:
         if async_ppo_enabled:
-            print("🚀 Running asynchronous PPO training with NeMo Gym")
-            async_ppo_train(
-                policy,
-                policy_generation,
-                value_model,
-                dataloader,
-                val_dataloader,
-                tokenizer,
-                loss_fn,
-                value_loss_fn,
-                task_to_env,
-                val_task_to_env,
-                logger,
-                checkpointer,
-                ppo_state,
-                master_config,
-            )
-        else:
-            print("🚀 Running synchronous PPO training with NeMo Gym")
-            ppo_train(
-                policy,
-                policy_generation,
-                value_model,
-                dataloader,
-                val_dataloader,
-                tokenizer,
-                loss_fn,
-                value_loss_fn,
-                task_to_env,
-                val_task_to_env,
-                logger,
-                checkpointer,
-                ppo_state,
-                master_config,
-            )
+            validate_async_ppo_config(config, policy_generation)
+
+        with checkpointer:
+            if async_ppo_enabled:
+                print("🚀 Running asynchronous PPO training with NeMo Gym")
+                async_ppo_train(
+                    policy,
+                    policy_generation,
+                    value_model,
+                    dataloader,
+                    val_dataloader,
+                    tokenizer,
+                    loss_fn,
+                    value_loss_fn,
+                    task_to_env,
+                    val_task_to_env,
+                    logger,
+                    checkpointer,
+                    ppo_state,
+                    master_config,
+                )
+            else:
+                print("🚀 Running synchronous PPO training with NeMo Gym")
+                ppo_train(
+                    policy,
+                    policy_generation,
+                    value_model,
+                    dataloader,
+                    val_dataloader,
+                    tokenizer,
+                    loss_fn,
+                    value_loss_fn,
+                    task_to_env,
+                    val_task_to_env,
+                    logger,
+                    checkpointer,
+                    ppo_state,
+                    master_config,
+                )
+    finally:
+        shutdown_environments(task_to_env, val_task_to_env)
+        try:
+            policy_generation.shutdown()
+        except Exception as error:
+            print(f"Error shutting down generation: {error}", flush=True)
 
 
 if __name__ == "__main__":

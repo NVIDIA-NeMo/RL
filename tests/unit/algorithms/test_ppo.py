@@ -2907,3 +2907,102 @@ def test_validate_prefers_nemo_gym_over_native_async_rollout(monkeypatch):
     )
     assert metrics["accuracy"] == 1.0
     assert metrics["gym_metric"] == 3.0
+
+
+@pytest.mark.parametrize(
+    ("async_ppo_enabled", "failure_stage", "exception_type", "error_message"),
+    [
+        (False, "training", RuntimeError, "training failed"),
+        (True, "validation", ValueError, "invalid async config"),
+    ],
+)
+def test_nemo_gym_launcher_cleans_up_after_failure(
+    monkeypatch,
+    async_ppo_enabled,
+    failure_stage,
+    exception_type,
+    error_message,
+):
+    from examples.nemo_gym import run_ppo_nemo_gym as runner
+
+    config = SimpleNamespace(
+        logger={"log_dir": "logs"},
+        checkpointing={"enabled": False},
+        policy={"tokenizer": {}, "generation": {}},
+        data={},
+        ppo=SimpleNamespace(
+            max_val_samples=None,
+            val_batch_size=None,
+            async_ppo=SimpleNamespace(enabled=async_ppo_enabled),
+        ),
+    )
+    policy_generation = MagicMock()
+    nemo_gym = MagicMock()
+    checkpointer = MagicMock()
+    shutdown_environments = MagicMock()
+    validate_async_ppo_config = MagicMock()
+    ppo_train = MagicMock()
+    async_ppo_train = MagicMock()
+    if failure_stage == "validation":
+        validate_async_ppo_config.side_effect = ValueError(error_message)
+    else:
+        ppo_train.side_effect = RuntimeError(error_message)
+
+    monkeypatch.setattr(runner, "register_omegaconf_resolvers", MagicMock())
+    monkeypatch.setattr(
+        runner,
+        "parse_args",
+        lambda: (SimpleNamespace(config="test.yaml"), []),
+    )
+    monkeypatch.setattr(runner, "load_config", MagicMock(return_value={}))
+    monkeypatch.setattr(runner.OmegaConf, "to_container", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(runner, "MasterConfig", MagicMock(return_value=config))
+    monkeypatch.setattr(runner, "get_next_experiment_dir", lambda path: path)
+    monkeypatch.setattr(runner, "get_tokenizer", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(
+        runner, "configure_generation_config", MagicMock(return_value={})
+    )
+    monkeypatch.setattr(runner, "setup_nemo_gym_config", MagicMock())
+    monkeypatch.setattr(runner, "should_use_nemo_gym", MagicMock(return_value=True))
+    monkeypatch.setattr(
+        runner,
+        "setup_response_data",
+        MagicMock(return_value=(MagicMock(), [MagicMock()])),
+    )
+    monkeypatch.setattr(runner, "init_ray", MagicMock())
+    monkeypatch.setattr(
+        runner,
+        "setup",
+        MagicMock(
+            return_value=(
+                MagicMock(),
+                policy_generation,
+                nemo_gym,
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+                checkpointer,
+                MagicMock(),
+                config,
+            )
+        ),
+    )
+    monkeypatch.setattr(runner, "validate_async_ppo_config", validate_async_ppo_config)
+    monkeypatch.setattr(runner, "ppo_train", ppo_train)
+    monkeypatch.setattr(runner, "async_ppo_train", async_ppo_train)
+    monkeypatch.setattr(runner, "shutdown_environments", shutdown_environments)
+
+    with pytest.raises(exception_type, match=error_message):
+        runner.main()
+
+    task_to_env = {"nemo_gym": nemo_gym}
+    shutdown_environments.assert_called_once_with(task_to_env, task_to_env)
+    policy_generation.shutdown.assert_called_once_with()
+    if failure_stage == "validation":
+        validate_async_ppo_config.assert_called_once_with(config, policy_generation)
+        ppo_train.assert_not_called()
+        async_ppo_train.assert_not_called()
