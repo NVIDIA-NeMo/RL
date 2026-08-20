@@ -19,7 +19,7 @@ from collections import Counter
 from collections.abc import AsyncGenerator
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, Optional, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
 
 import ray
 import torch
@@ -47,14 +47,14 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
-from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.models.generation.interfaces import should_use_async_rollouts
+from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
-# Kept local (not imported from models.generation) so the gym actor stays free of
-# generation-module imports. Must cover every name resolve_routed_experts_dtype
-# can produce.
+# Kept local so the Gym actor does not depend on model-config dtype resolution.
+# Must cover every name resolve_routed_experts_dtype can produce.
 _ROUTED_EXPERTS_DTYPES = {
     "int8": torch.int8,
     "int16": torch.int16,
@@ -68,6 +68,54 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+class NemoGymCompatibleConfig(Protocol):
+    """Configuration fields required to select the NeMo Gym rollout path."""
+
+    @property
+    def env(self) -> dict[str, Any]: ...
+
+    @property
+    def policy(self) -> PolicyConfig: ...
+
+
+def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
+    """Determine whether NeMo Gym should handle rollouts and validation."""
+    should_use_gym = bool(master_config.env.get("should_use_nemo_gym"))
+    if not should_use_gym:
+        return False
+
+    generation_config = master_config.policy["generation"]
+    assert should_use_async_rollouts(generation_config), (
+        "❌ Error: In order to use NeMo-Gym, you must use a generation "
+        "backend with `async_engine: true`!"
+    )
+
+    if generation_config["backend"] == "vllm":
+        should_expose_http_server = generation_config.get("vllm_cfg", {}).get(
+            "expose_http_server"
+        )
+    elif generation_config["backend"] == "megatron":
+        should_expose_http_server = generation_config.get(
+            "mcore_generation_config", {}
+        ).get("expose_http_server")
+    elif generation_config["backend"] == "trtllm":
+        should_expose_http_server = generation_config.get("trtllm_cfg", {}).get(
+            "expose_http_server"
+        )
+    elif generation_config["backend"] == "dynamo":
+        should_expose_http_server = generation_config.get("vllm_cfg", {}).get(
+            "expose_http_server"
+        )
+    else:
+        should_expose_http_server = False
+    assert should_expose_http_server, (
+        "In order to use NeMo-Gym, you must expose the generation server via "
+        "`expose_http_server: true`!"
+    )
+
+    return True
 
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
