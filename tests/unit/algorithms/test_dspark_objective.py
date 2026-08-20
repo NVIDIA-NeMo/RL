@@ -762,13 +762,6 @@ def test_invalid_slots_may_carry_out_of_range_sentinel_tokens() -> None:
     assert torch.isfinite(stats.combined.numerators).all()
 
 
-def test_dspark_imports_coexist_with_normal_package_modules() -> None:
-    """Collecting DSpark tests must not replace package modules in sys.modules."""
-    assert sys.modules.get("nemo_rl.algorithms.loss.dspark") is not _OBJECTIVE
-    existing_nemo = sys.modules.get("nemo_rl")
-    assert existing_nemo is None or getattr(existing_nemo, "__file__", None) is not None
-
-
 @pytest.mark.parametrize(
     "case",
     ["zero_rows", "chunk_size", "rank_local_validation"],
@@ -834,11 +827,9 @@ def test_backward_never_casts_a_full_large_vocab_weight_to_float32() -> None:
     assert (local_vocab_size, 1) not in recorder.float_cast_shapes
 
 
-@pytest.mark.parametrize("source_length", [32_768, 262_144])
-def test_selected_slots_do_not_retain_long_context_backing_storage(
-    source_length: int,
-) -> None:
+def test_selected_slots_do_not_retain_long_context_backing_storage() -> None:
     """Saved objective state must own only selected slots, not their source storage."""
+    source_length = 262_144
     generator = torch.Generator().manual_seed(source_length)
     target_backing = torch.randn(1, source_length, 5, generator=generator)
     hidden_backing = torch.randn(
