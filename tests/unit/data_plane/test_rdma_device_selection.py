@@ -17,18 +17,22 @@ else would catch it.
 """
 
 import os
+import sys
 
 import pytest
 
 from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+from nemo_rl.data_plane.adapters import transfer_queue_env as tq_env
 
 
 @pytest.fixture
 def fake_fabric(monkeypatch):
     """Install a synthetic device inventory.
 
-    ``rdma_devices`` reads real sysfs, so the layout is injected: the uverbs
-    glob gates on device availability and the link_layer glob enumerates.
+    The sysfs scan lives in ``tq_env.rail_link_layers`` and the uverbs gate in
+    the adapter, but both reach it through the same stdlib ``glob`` module
+    object, so one patch covers both: the uverbs glob gates on device
+    availability and the link_layer glob enumerates.
     """
 
     def _install(layers: dict[str, str], *, uverbs: bool = True):
@@ -40,8 +44,8 @@ def fake_fabric(monkeypatch):
         def fake_read_text(path, *args, **kwargs):
             return layers[path.parents[2].name]
 
-        monkeypatch.setattr(tq_adapter.glob, "glob", fake_glob)
-        monkeypatch.setattr(tq_adapter.Path, "read_text", fake_read_text)
+        monkeypatch.setattr(tq_env.glob, "glob", fake_glob)
+        monkeypatch.setattr(tq_env.Path, "read_text", fake_read_text)
         monkeypatch.setattr(os, "environ", dict(os.environ))
         monkeypatch.delenv("MC_MOONCAKE_DEVICE", raising=False)
 
@@ -144,49 +148,90 @@ def _mooncake_cfg() -> dict:
 
 
 @pytest.fixture
-def stub_client(monkeypatch):
-    """Build a TQDataPlaneClient without touching TQ, mooncake, or the network."""
+def clean_env(monkeypatch):
+    """Isolate os.environ and pretend the engine has not been imported yet.
 
-    def _build(cfg: dict):
-        monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
-        monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
-        monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
-        monkeypatch.setattr(
-            tq_adapter, "_patch_mooncake_staging_buffers", lambda max_bytes: None
-        )
-        monkeypatch.setattr(os, "environ", dict(os.environ))
-        return tq_adapter.TQDataPlaneClient(cfg, bootstrap=False)
-
-    return _build
-
-
-def test_peer_rail_is_pinned_to_the_local_rail(stub_client, monkeypatch):
-    """Same-rail pairing keeps every rail in use instead of narrowing to one."""
+    The real ``sys.modules`` always has ``transfer_queue`` in it here — this
+    test module imports the adapter — so the "not yet imported" case has to be
+    injected rather than arranged.
+    """
+    monkeypatch.setattr(os, "environ", dict(os.environ))
     monkeypatch.delenv("MC_ENABLE_DEST_DEVICE_AFFINITY", raising=False)
-    stub_client(_mooncake_cfg())
+    monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
+    monkeypatch.setattr(tq_env, "_engine_already_imported", lambda: None)
+
+
+@pytest.fixture
+def engine_imported(clean_env, monkeypatch):
+    """Flip ``clean_env``'s verdict: pretend the engine is already loaded."""
+    monkeypatch.setattr(tq_env, "_engine_already_imported", lambda: "transfer_queue")
+
+
+def test_affinity_pinned_on_a_roce_only_fabric(clean_env, fake_fabric):
+    """Same-rail pairing is what makes offering every rail safe."""
+    fake_fabric({"mlx5_0": "Ethernet", "mlx5_1": "Ethernet"})
+    tq_env.configure_engine_env(_mooncake_cfg())
     assert os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
 
 
-def test_setdefault_respects_an_already_set_value(stub_client, monkeypatch):
-    """setdefault must not clobber a value an operator already set.
+def test_affinity_left_alone_on_infiniband(clean_env, fake_fabric):
+    """IB routes cross-rail, so the hint is not our call to make there.
 
-    Does NOT prove the mooncake engine treats "0" as disabled — verified
-    against the pinned wheel, MC_ENABLE_DEST_DEVICE_AFFINITY parsing is
-    ``if (std::getenv(...))``: presence, not value, so any set value (even
-    "0") enables it at the engine level. There is currently no way to
-    disable it once set; this only pins NeMo-RL's own os.environ handling.
+    Scoped deliberately: the cross-rail failure was only ever measured on RoCE,
+    and this cluster cannot test IB.
     """
-    monkeypatch.setenv("MC_ENABLE_DEST_DEVICE_AFFINITY", "0")
-    stub_client(_mooncake_cfg())
+    fake_fabric({"mlx5_0": "InfiniBand", "mlx5_1": "InfiniBand"})
+    tq_env.configure_engine_env(_mooncake_cfg())
+    assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
+
+
+def test_roce_gate_does_not_fail_open_when_sysfs_is_empty(clean_env, fake_fabric):
+    """No rails at all must not read as "InfiniBand, skip the hint"."""
+    fake_fabric({})
+    assert tq_env.fabric_is_roce_only() is False
+
+
+def test_existing_value_is_not_clobbered(clean_env, fake_fabric):
+    """A launcher-supplied value wins; we only fill the gap."""
+    fake_fabric({"mlx5_0": "Ethernet"})
+    os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] = "0"
+    tq_env.configure_engine_env(_mooncake_cfg())
     assert os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "0"
 
 
-def test_peer_rail_pairing_not_applied_to_simple_backend(stub_client, monkeypatch):
-    """The knob is mooncake-only; `simple` never touches RDMA.
-
-    delenv first: the assertion is that *we* do not set it, not that the machine
-    running the tests happens to have it unset.
-    """
-    monkeypatch.delenv("MC_ENABLE_DEST_DEVICE_AFFINITY", raising=False)
-    stub_client({**_mooncake_cfg(), "backend": "simple"})
+def test_not_applied_to_simple_backend(clean_env, fake_fabric):
+    """The knob is mooncake-only; `simple` never touches RDMA."""
+    fake_fabric({"mlx5_0": "Ethernet"})
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "simple"})
     assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
+
+
+def test_raises_when_the_engine_was_already_imported(engine_imported, fake_fabric):
+    """The whole point of the split: too-late must be loud, not silent.
+
+    Mooncake snapshots MC_* as its extension loads, so a value set after that
+    reads back fine from os.environ while the engine ignores it — which is how
+    this cost several CI runs before being caught.
+    """
+    fake_fabric({"mlx5_0": "Ethernet"})
+    with pytest.raises(RuntimeError, match="already imported"):
+        tq_env.configure_engine_env(_mooncake_cfg())
+
+
+def test_no_raise_when_already_set_even_if_engine_imported(
+    engine_imported, fake_fabric
+):
+    """The normal worker path: Ray handed down the driver's environment."""
+    fake_fabric({"mlx5_0": "Ethernet"})
+    os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] = "1"
+    os.environ["MC_STORE_MEMCPY"] = "0"
+    tq_env.configure_engine_env(_mooncake_cfg())  # must not raise
+
+
+def test_engine_already_imported_detects_a_loaded_module(monkeypatch):
+    """Pin the detector itself, since every other test stubs it out."""
+    monkeypatch.setitem(sys.modules, "transfer_queue", object())
+    assert tq_env._engine_already_imported() == "transfer_queue"
+    for name in tq_env._ENGINE_MODULES:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    assert tq_env._engine_already_imported() is None

@@ -56,9 +56,6 @@ ENV RAY_USAGE_STATS_ENABLED=0
 # need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
 ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
-# See docker/Dockerfile for why this must be an image-level ENV: mooncake reads
-# MC_* once, in a static singleton, so setting it from Python is too late.
-ENV MC_ENABLE_DEST_DEVICE_AFFINITY=1
 
 # Build vLLM from source to use with the NVIDIA PyTorch base image
 FROM base AS build_vllm

@@ -124,12 +124,6 @@ fi
 # need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 
-# Mooncake reads MC_* once, in a static singleton built the first time engine
-# code runs in a process, so this cannot be set from Python — it must already be
-# in the environment. The container image sets it too; exported here as well so
-# a run against an older image is still covered. Inert without an RDMA engine.
-export MC_ENABLE_DEST_DEVICE_AFFINITY=1
-
 # Optional override for policy.tokenizer.use_fastokens (Rust-backed BPE tokenizer,
 # ~10x faster encode). The config is the source of truth; propagate this env var
 # to all Ray nodes ONLY when the user explicitly set it before submitting.

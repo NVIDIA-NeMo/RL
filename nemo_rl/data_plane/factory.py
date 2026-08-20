@@ -26,13 +26,14 @@ def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
     Ray worker, which are fresh processes, so the value is in place before they
     run any engine code.
 
-    That covers Ray workers, not everything. It does **not** reach processes the
-    driver did not spawn through Ray — a backend's own subprocesses and actors —
-    and it cannot help a process that already ran engine code, since engines
-    that snapshot their env at first use will have read the old value. Knobs
-    that must hold everywhere belong in the container image / launcher
-    environment instead; see
-    ``nemo_rl.data_plane.adapters.transfer_queue.maybe_configure_engine_env``.
+    The binding constraint is not ``init_ray`` but that this must run before
+    anything imports the backend's engine, which snapshots its configuration as
+    it loads. :func:`~nemo_rl.data_plane.adapters.transfer_queue_env.configure_engine_env`
+    raises rather than silently no-op'ing if that is violated.
+
+    Subprocesses the driver did not spawn through Ray inherit whatever the
+    driver's environment held at fork, so they are covered as long as this ran
+    first.
 
     No-op when the data plane is disabled or the backend has no such knobs.
 
@@ -44,11 +45,13 @@ def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
 
     impl = cfg["impl"]
     if impl == "transfer_queue":
-        from nemo_rl.data_plane.adapters.transfer_queue import (
-            maybe_configure_engine_env,
+        # transfer_queue_env, not the adapter — importing the adapter loads
+        # mooncake, which is what this call has to precede.
+        from nemo_rl.data_plane.adapters.transfer_queue_env import (
+            configure_engine_env,
         )
 
-        maybe_configure_engine_env(cfg)
+        configure_engine_env(cfg)
     else:
         raise ValueError(f"unknown data_plane impl: {impl!r}")
 
