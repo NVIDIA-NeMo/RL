@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,8 +17,9 @@ import subprocess
 import sys
 from collections import Counter
 from collections.abc import AsyncGenerator
+from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, Optional, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
 
 import ray
 import torch
@@ -27,10 +28,9 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.multimodal_utils import (
-    PackedTensor,
+    attach_image_model_inputs_to_message,
     encode_images_in_examples,
-    get_dim_to_pack_along,
-    get_multimodal_keys_from_processor,
+    extract_input_image_sources_from_responses_messages,
     resolve_to_image,
     uses_image_placeholder,
 )
@@ -42,14 +42,19 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.experience.failures import (
+    GymTransportError,
+    RolloutDataFailure,
+    http_status_is_infra,
+)
+from nemo_rl.models.generation.interfaces import should_use_async_rollouts
+from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
-# Kept local (not imported from models.generation) so the gym actor stays free of
-# generation-module imports. Must cover every name resolve_routed_experts_dtype
-# can produce.
+# Kept local so the Gym actor does not depend on model-config dtype resolution.
+# Must cover every name resolve_routed_experts_dtype can produce.
 _ROUTED_EXPERTS_DTYPES = {
     "int8": torch.int8,
     "int16": torch.int16,
@@ -65,6 +70,54 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
 
+class NemoGymCompatibleConfig(Protocol):
+    """Configuration fields required to select the NeMo Gym rollout path."""
+
+    @property
+    def env(self) -> dict[str, Any]: ...
+
+    @property
+    def policy(self) -> PolicyConfig: ...
+
+
+def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
+    """Determine whether NeMo Gym should handle rollouts and validation."""
+    should_use_gym = bool(master_config.env.get("should_use_nemo_gym"))
+    if not should_use_gym:
+        return False
+
+    generation_config = master_config.policy["generation"]
+    assert should_use_async_rollouts(generation_config), (
+        "❌ Error: In order to use NeMo-Gym, you must use a generation "
+        "backend with `async_engine: true`!"
+    )
+
+    if generation_config["backend"] == "vllm":
+        should_expose_http_server = generation_config.get("vllm_cfg", {}).get(
+            "expose_http_server"
+        )
+    elif generation_config["backend"] == "megatron":
+        should_expose_http_server = generation_config.get(
+            "mcore_generation_config", {}
+        ).get("expose_http_server")
+    elif generation_config["backend"] == "trtllm":
+        should_expose_http_server = generation_config.get("trtllm_cfg", {}).get(
+            "expose_http_server"
+        )
+    elif generation_config["backend"] == "dynamo":
+        should_expose_http_server = generation_config.get("vllm_cfg", {}).get(
+            "expose_http_server"
+        )
+    else:
+        should_expose_http_server = False
+    assert should_expose_http_server, (
+        "In order to use NeMo-Gym, you must expose the generation server via "
+        "`expose_http_server: true`!"
+    )
+
+    return True
+
+
 def _has_nan_generation_logprobs(result: dict) -> bool:
     """Return whether a postprocessed rollout contains NaN policy logprobs."""
     return any(
@@ -72,6 +125,39 @@ def _has_nan_generation_logprobs(result: dict) -> bool:
         and torch.isnan(message["generation_logprobs"]).any()
         for message in result["message_log"]
     )
+
+
+def _typed_gym_failure(error: Exception) -> Optional[Exception]:
+    """Map a NeMo-Gym HTTP failure onto a typed, PICKLABLE failure, or None if not one.
+
+    Classification has to happen here, on the raising side, because ``run_rollouts`` runs
+    inside the ``NemoGym`` Ray actor and the exception must survive the actor boundary to
+    reach the retry policy on the driver.
+
+    It does not survive. aiohttp's ``raise_for_status`` passes ``headers=self.headers``,
+    and those are a ``CIMultiDictProxy``, which cloudpickle cannot serialize -- so Ray
+    drops the cause and the driver receives a bare ``RayTaskError`` with no type and no
+    ``.status``. Every gym HTTP failure then classified DATA, capping the gym path at
+    ``max_data_attempts_per_prompt`` (2) and leaving ``max_attempts_per_prompt`` (5)
+    unreachable on the very path whose dead-endpoint scenario motivates it. Two things
+    made that the dominant case rather than a corner: Gym's middleware turns inner-server
+    failures into 500 -- exactly the status the INFRA branch is for -- and its transport
+    layer retries disconnects in an uncapped loop, so those never arrive at all.
+
+    ``GymTransportError`` and ``RolloutDataFailure`` take a single str, so they pickle
+    cleanly and ``classify_rollout_failure``'s explicit-class fast path wins on the far
+    side.
+
+    Returns None when the exception carries no HTTP status, leaving the caller to
+    re-raise it untouched.
+    """
+    status = getattr(error, "status", None)
+    if not isinstance(status, int):
+        return None
+    detail = f"NeMo-Gym /run failed with HTTP {status}: {error}"
+    if http_status_is_infra(status):
+        return GymTransportError(detail)
+    return RolloutDataFailure(detail)
 
 
 def get_nemo_gym_uv_cache_dir() -> str | None:
@@ -126,6 +212,9 @@ class NemoGymConfig(TypedDict):
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
     ]  # For processor reconstruction inside the actor
+    pad_dynamic_image_shapes: NotRequired[
+        bool
+    ]  # Normalize heterogeneous image tensors while retaining exact imgs_sizes
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -244,6 +333,16 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     return images
 
 
+def _is_trainable_output_item(item: dict) -> bool:
+    """Report whether an output item becomes a trainable assistant turn.
+
+    The postprocess loop skips items whose ``generation_token_ids`` is missing
+    *or* empty, so per-turn image binning has to use the same predicate or the
+    two walks disagree and every later turn gets the wrong images.
+    """
+    return bool(item.get("generation_token_ids"))
+
+
 def _index_per_turn_images(
     output: list[dict],
     input_messages: list[dict] | None = None,
@@ -284,11 +383,54 @@ def _index_per_turn_images(
     return per_turn
 
 
+def _image_sources_equal(left: Any, right: Any) -> bool:
+    return (
+        left == right
+        if isinstance(left, str) and isinstance(right, str)
+        else left is right
+    )
+
+
+def _without_initial_image_sources(
+    messages: Any, initial_sources: list[Any]
+) -> tuple[Any, bool]:
+    """Copy Responses messages and remove one ordered copy of initial images."""
+    if not isinstance(messages, list):
+        return messages, False
+
+    filtered = deepcopy(messages)
+    remaining_sources = list(initial_sources)
+    for message in filtered:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+
+        filtered_content = []
+        for part in content:
+            part_sources = extract_input_image_sources_from_responses_messages(
+                [{"content": [part]}]
+            )
+            if (
+                remaining_sources
+                and len(part_sources) == 1
+                and _image_sources_equal(part_sources[0], remaining_sources[0])
+            ):
+                remaining_sources.pop(0)
+                continue
+            filtered_content.append(part)
+        message["content"] = filtered_content
+
+    return filtered, not remaining_sources
+
+
 def _attach_multimodal_data_to_user_message(
     user_message: dict,
     *,
     images: list[Image.Image],
     processor: Any,
+    pad_dynamic_image_shapes: bool = False,
 ) -> None:
     """Attach per-turn multimodal tensors to ``user_message``.
 
@@ -300,52 +442,12 @@ def _attach_multimodal_data_to_user_message(
     already contains expanded ``<img>...<image>*N...</img>`` regions, and the
     processor would try to re-expand every embedded ``<image>``.
     """
-    if not images or processor is None:
-        return
-    image_token = getattr(processor, "image_token", "<image>")
-    processed = processor(
-        text=image_token * len(images),
+    attach_image_model_inputs_to_message(
+        user_message,
         images=images,
-        return_tensors="pt",
+        processor=processor,
+        pad_dynamic_image_shapes=pad_dynamic_image_shapes,
     )
-    uses_placeholder = uses_image_placeholder(processor)
-    multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    # Historical checkpoints may emit dynamic image tiles without imgs_sizes.
-    # Mirror the media-metadata handling in vlm_hf_data_processor.
-    if (
-        uses_placeholder
-        and "pixel_values" in processed
-        and "imgs_sizes" not in processed
-        and processed["pixel_values"].ndim == 4
-    ):
-        pixel_values = processed["pixel_values"]
-        num_tiles, _, height, width = pixel_values.shape
-        processed["imgs_sizes"] = torch.tensor(
-            [[height, width]] * num_tiles, dtype=torch.long
-        )
-
-    # imgs_sizes / num_frames are not always declared in model_input_names by
-    # bundled image processors. RADIO uses temporal patching even for still
-    # images and requires one num_frames=1 entry per image/tile.
-    if "imgs_sizes" in processed and "imgs_sizes" not in multimodal_keys:
-        multimodal_keys.append("imgs_sizes")
-    if "imgs_sizes" in processed and "num_frames" not in processed:
-        processed["num_frames"] = torch.ones(
-            len(processed["imgs_sizes"]), dtype=torch.long
-        )
-    if "num_frames" in processed and "num_frames" not in multimodal_keys:
-        multimodal_keys.append("num_frames")
-    for key in multimodal_keys:
-        if key not in processed:
-            continue
-        value = processed[key]
-        if key == "imgs_sizes":
-            value = value.to(dtype=torch.int32)
-        user_message[key] = PackedTensor(
-            value,
-            dim_to_pack=get_dim_to_pack_along(processor, key),
-            pad_to_max_shape=uses_placeholder and key == "pixel_values",
-        )
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -354,6 +456,19 @@ class NemoGym(EnvironmentInterface):
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
+        # through __init__, which does not start the Gym servers -- reports what
+        # actually happened instead of an AttributeError from deep inside a rollout.
+        self.rh: Any = None
+        self.rch: Any = None
+        self.head_server_config: Any = None
+        self.node_ip: Optional[str] = None
+        self.head_server_port: Optional[int] = None
+        # Installed by set_tokenizer at spinup, not passed per rollout call. Declared
+        # here rather than in _spinup so a second spinup cannot wipe an installed
+        # tokenizer and then report that set_tokenizer was never called.
+        self._tokenizer: Optional[PreTrainedTokenizerBase] = None
+        self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
@@ -372,6 +487,27 @@ class NemoGym(EnvironmentInterface):
                 f"got {type(self._processor).__name__}. Update "
                 "_attach_multimodal_data_to_user_message before enabling."
             )
+
+    def _require_spinup(self) -> None:
+        """Raise a diagnosable error if this instance never ran :meth:`_spinup`."""
+        if self.rh is None:
+            raise RuntimeError(
+                "NeMo-Gym actor has no running servers: _spinup() was never called on "
+                "this instance. Ray recreates a restarted actor through __init__ only, "
+                "so an actor that died and came back reaches this state and cannot "
+                "serve rollouts until it is spun up again."
+            )
+
+    def health_check(self) -> None:
+        """Raise if the Gym head server or any subprocess server has died.
+
+        Thin wrapper over NeMo-Gym's own ``RunHelper.poll``, which is what ``gym env
+        start`` calls every 60s from ``run_forever``. NeMo-RL only calls ``rh.start``,
+        so without this the check Gym already implements never runs and a dead tool
+        server surfaces as unexplained rollout timeouts instead of a named process.
+        """
+        self._require_spinup()
+        self.rh.poll()
 
     def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.
@@ -401,6 +537,7 @@ class NemoGym(EnvironmentInterface):
         # Strip NeMo-RL-only training knobs that must not be forwarded to the
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
         initial_global_config_dict.pop("effort_levels", None)
+        initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
@@ -468,15 +605,45 @@ Depending on your data shape, you may want to change these values."""
         )
         self.rch = RolloutCollectionHelper()
 
+    def set_tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
+        """Install the tokenizer run_rollouts postprocesses with.
+
+        Called once per actor at spinup. It used to be a run_rollouts argument,
+        which meant Ray deserialized a tokenizer per prompt on this actor's
+        task-execution thread. That thread holds the GIL, so it blocked the
+        actor's event loop and no rollout could issue its first HTTP request
+        until its own copy finished loading.
+
+        The cost is not marginal. A tokenizer of this shape measured 7.45 MB on
+        the wire, 286 ms to serialize and 1052 ms to deserialize, so a
+        SingleController recipe admitting ~1000 prompts per step spends roughly
+        18 minutes deserializing a single admission burst, against a step that
+        should take minutes. Runs on that shape stalled without completing a
+        rollout.
+
+        Measured on one CPU node with 1024 concurrent calls against one actor:
+        153 of 1024 prompts finished in 300 s passing the tokenizer per call,
+        versus all 1024 in 16 s holding it here. Passing an ObjectRef instead
+        does not help -- Ray caches the object buffer, not the deserialized
+        value, so it still pays per task.
+        """
+        self._tokenizer = tokenizer
+
     async def run_rollouts(
         self,
         nemo_gym_examples: list[dict],
-        tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
+        deduplicate_multimodal_data: bool = False,
     ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
+        self._require_spinup()
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
+        if self._tokenizer is None:
+            raise RuntimeError(
+                "NemoGym.set_tokenizer must be called before run_rollouts"
+            )
+        tokenizer = self._tokenizer
 
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
@@ -507,11 +674,20 @@ Depending on your data shape, you may want to change these values."""
                             error.response_content,
                             file=sys.stderr,
                         )
+                    typed = _typed_gym_failure(error)
+                    if typed is not None:
+                        # `from None`, deliberately: chaining the original would put the
+                        # unpicklable exception back on the wire as __cause__ and undo
+                        # the whole point. The status and message are already in `detail`.
+                        raise typed from None
                     raise
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_result, tokenizer
+                    nemo_gym_row,
+                    nemo_gym_result,
+                    tokenizer,
+                    include_initial_multimodal_data=not deduplicate_multimodal_data,
                 )
                 if _has_nan_generation_logprobs(nemo_rl_result):
                     raise RuntimeError("Generation logprobs contain NaN")
@@ -548,20 +724,73 @@ Depending on your data shape, you may want to change these values."""
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,
+        nemo_gym_row: dict,
         nemo_gym_result: dict,
         tokenizer: PreTrainedTokenizerBase,
+        *,
+        include_initial_multimodal_data: bool = True,
     ) -> dict:
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
 
         processor = getattr(self, "_processor", None)
+        response = nemo_gym_result["response"]
+        result_input = nemo_gym_result["responses_create_params"].get("input", [])
+        request_input = nemo_gym_row.get("responses_create_params", {}).get("input")
+        raw_input = (
+            request_input
+            if isinstance(request_input, list) and request_input
+            else result_input
+        )
+        initial_input = response.get("agent_input")
+        if not isinstance(initial_input, list) or not initial_input:
+            initial_input = raw_input
+
+        seed_obs = response.get("seed_obs")
+        media_messages = (
+            seed_obs if isinstance(seed_obs, list) and seed_obs else initial_input
+        )
+        raw_initial_sources = extract_input_image_sources_from_responses_messages(
+            raw_input
+        )
+        agent_initial_sources = extract_input_image_sources_from_responses_messages(
+            initial_input
+        )
+        returned_media_sources = extract_input_image_sources_from_responses_messages(
+            media_messages
+        )
+        initial_media_matches_raw_input = (
+            bool(raw_initial_sources)
+            and len(agent_initial_sources) == len(raw_initial_sources)
+            and all(
+                _image_sources_equal(agent_source, raw_source)
+                for agent_source, raw_source in zip(
+                    agent_initial_sources, raw_initial_sources
+                )
+            )
+        )
+        returned_media_matches_raw_input = len(returned_media_sources) == len(
+            raw_initial_sources
+        ) and all(
+            _image_sources_equal(returned_source, raw_source)
+            for returned_source, raw_source in zip(
+                returned_media_sources, raw_initial_sources
+            )
+        )
+        initial_multimodal_data_omitted = (
+            not include_initial_multimodal_data
+            and initial_media_matches_raw_input
+            and returned_media_matches_raw_input
+        )
+        if initial_multimodal_data_omitted:
+            media_messages, _ = _without_initial_image_sources(
+                media_messages, raw_initial_sources
+            )
         per_turn_images = (
             _index_per_turn_images(
-                nemo_gym_result["response"]["output"],
-                input_messages=nemo_gym_result.get("responses_create_params", {}).get(
-                    "input"
-                ),
+                response["output"],
+                input_messages=media_messages,
             )
             if processor is not None
             else []
@@ -578,10 +807,7 @@ Depending on your data shape, you may want to change these values."""
 
             # Note that NeMo-Gym will only return token ids on "assistant" messages and not other message types.
             # Also skip if generation_token_ids is present but empty, e.g. all-EOS generation stripped to [] — torch.tensor([]) defaults to float32 and breaks batch dtype consistency.
-            if (
-                "generation_token_ids" not in output_item_dict
-                or not output_item_dict["generation_token_ids"]
-            ):
+            if not _is_trainable_output_item(output_item_dict):
                 continue
 
             assert (
@@ -659,6 +885,13 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     user_message,
                     images=images_this_turn,
                     processor=processor,
+                    # Read with a default, like _processor above: this method is
+                    # called unbound against lightweight stand-ins that define
+                    # only what they exercise, so a bare attribute access turns
+                    # an unrelated test into an AttributeError.
+                    pad_dynamic_image_shapes=getattr(
+                        self, "_pad_dynamic_image_shapes", False
+                    ),
                 )
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
@@ -736,14 +969,34 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 f"  → If (2): inspect why no assistant content was produced for this rollout."
             )
 
-        return {
+        if initial_multimodal_data_omitted:
+            for container, key in (
+                (nemo_gym_result["responses_create_params"], "input"),
+                (response, "agent_input"),
+                (response, "seed_obs"),
+            ):
+                if key in container:
+                    container[key], _ = _without_initial_image_sources(
+                        container[key], raw_initial_sources
+                    )
+
+        result = {
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
         }
+        if not include_initial_multimodal_data:
+            result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
+        return result
 
     def shutdown(self) -> None:
-        self.rh.shutdown()
+        # Teardown runs in a finally block, so it must not turn a real training error
+        # into a confusing AttributeError from a never-spun-up (e.g. restarted) actor.
+        if self.rh is None:
+            return
+        run_helper = self.rh
+        self.rh = None
+        run_helper.shutdown()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.
@@ -850,9 +1103,10 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
 
 def spinup_nemo_gym_actor(
     env_configs: dict[str, Any],
-    base_urls: list[Optional[str]],
+    base_urls: list[str],
     model_name: str,
     *,
+    tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     routed_experts_dtype: str,
     use_fastokens: bool,
@@ -869,6 +1123,9 @@ def spinup_nemo_gym_actor(
             thinking_tags, num_gpu_nodes).
         base_urls: Per-DP-rank OpenAI-compatible server base URLs from the generation backend.
         model_name: Served model name the Gym rollouts should target.
+        tokenizer: Installed on the actor once, here, rather than passed per
+            rollout call. See NemoGym.set_tokenizer for why that distinction is
+            the difference between a working run and a stalled one.
         enable_router_replay: Sets require_routed_experts on the NemoGymConfig.
         routed_experts_dtype: Dtype name for R3 routed_experts tensors ("int8"/"int16"/"int32"),
             resolved by the caller from the model's expert count.
@@ -885,6 +1142,14 @@ def spinup_nemo_gym_actor(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    # Same treatment for the multimodal knobs: NemoGymConfig declares them as
+    # top-level fields, so populate them here instead of leaving the actor to
+    # read them back out of Gym's global config dict.
+    multimodal_flags: dict[str, bool] = {}
+    for _flag in ("pad_dynamic_image_shapes",):
+        _value = nemo_gym_dict.pop(_flag, None)
+        if _value is not None:
+            multimodal_flags[_flag] = bool(_value)
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
     # image-baked venvs instead of rebuilding them.
@@ -905,6 +1170,7 @@ def spinup_nemo_gym_actor(
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
+        **multimodal_flags,
     )
 
     nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
@@ -930,4 +1196,5 @@ def spinup_nemo_gym_actor(
 
     actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
     ray.get(actor._spinup.remote())
+    ray.get(actor.set_tokenizer.remote(tokenizer))
     return actor

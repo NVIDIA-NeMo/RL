@@ -415,7 +415,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         enabled = 0
         with_amax = 0
         positive_amax = 0
-        for _, module in self.model.named_modules():
+        kv_amax = {}
+        for name, module in self.model.named_modules():
             if isinstance(module, TensorQuantizer):
                 total += 1
                 if module.is_enabled:
@@ -424,11 +425,14 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                         with_amax += 1
                         if (module.amax > 0).all():
                             positive_amax += 1
+                        if name.endswith(("k_bmm_quantizer", "v_bmm_quantizer")):
+                            kv_amax[name] = module.amax.detach().cpu().clone()
         return {
             "total": total,
             "enabled": enabled,
             "with_amax": with_amax,
             "positive_amax": positive_amax,
+            "kv_amax": kv_amax,
         }
 
     def generate(self, **kwargs):

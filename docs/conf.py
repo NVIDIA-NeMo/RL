@@ -117,6 +117,7 @@ html_extra_path = ["project.json", "versions1.json"]
 linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
+    "https://huggingface\\.co/datasets/nvidia/Nemotron-RL-Lightning-Training-Blend",
 ]
 
 

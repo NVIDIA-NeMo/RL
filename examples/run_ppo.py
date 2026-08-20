@@ -18,11 +18,12 @@ import pprint
 
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.ppo import MasterConfig, ppo_train, setup
+from nemo_rl.algorithms.ppo import MasterConfig, async_ppo_train, ppo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -42,6 +43,49 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     args, overrides = parser.parse_known_args()
 
     return args, overrides
+
+
+def _validate_async_ppo_config(
+    config: MasterConfig, policy_generation: GenerationInterface | None
+) -> None:
+    """Validate Async PPO requirements and unsupported features."""
+    generation_config = config.policy["generation"]
+    backend = generation_config.get("backend") if generation_config else None
+    vllm_config = generation_config.get("vllm_cfg") if generation_config else None
+    async_engine = bool(vllm_config and vllm_config.get("async_engine"))
+    if backend != "vllm" or not async_engine:
+        raise ValueError(
+            "Async PPO requires policy.generation.backend=vllm and "
+            "policy.generation.vllm_cfg.async_engine=true"
+        )
+    if not config.loss_fn.use_importance_sampling_correction:
+        raise ValueError(
+            "Async PPO requires loss_fn.use_importance_sampling_correction=true"
+        )
+    if config.loss_fn.force_on_policy_ratio:
+        raise ValueError("Async PPO requires loss_fn.force_on_policy_ratio=false")
+    if generation_config["colocated"]["enabled"]:
+        raise ValueError("Async PPO requires non-colocated generation")
+    if config.ppo.max_num_epochs != -1:
+        raise NotImplementedError(
+            "Async PPO does not support an epoch limit; set "
+            "ppo.max_num_epochs=-1 and use ppo.max_num_steps to control "
+            "training length"
+        )
+
+    unsupported_features = {
+        "Dynamic sampling": config.ppo.use_dynamic_sampling,
+        "Reward scaling": config.ppo.reward_scaling.enabled,
+        "Reward shaping": config.ppo.reward_shaping.enabled,
+        "Multiple dataloaders": config.data["use_multiple_dataloader"],
+        "NeMo Gym rollout": bool(config.env.get("should_use_nemo_gym")),
+        "FP8 KV-scale synchronization": bool(
+            getattr(policy_generation, "requires_kv_scale_sync", False)
+        ),
+    }
+    for feature, enabled in unsupported_features.items():
+        if enabled:
+            raise NotImplementedError(f"{feature} is not supported with async PPO")
 
 
 def main() -> None:
@@ -112,28 +156,48 @@ def main() -> None:
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
-    print("🚀 Running synchronous PPO training")
+    async_config = config.ppo.async_ppo
+    async_ppo_enabled = async_config.enabled
+    if async_ppo_enabled:
+        _validate_async_ppo_config(config, policy_generation)
 
-    # Run standard PPO training. The checkpointer owns background
-    # async-checkpoint finalization threads; the context manager guarantees they
-    # are flushed (rename + delete) on exit.
     with checkpointer:
-        ppo_train(
-            policy,
-            policy_generation,
-            value_model,
-            dataloader,
-            val_dataloader,
-            tokenizer,
-            loss_fn,
-            value_loss_fn,
-            task_to_env,
-            val_task_to_env,
-            logger,
-            checkpointer,
-            ppo_state,
-            master_config,
-        )
+        if async_ppo_enabled:
+            print("🚀 Running asynchronous PPO training")
+            async_ppo_train(
+                policy,
+                policy_generation,
+                value_model,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                value_loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                ppo_state,
+                master_config,
+            )
+        else:
+            print("🚀 Running synchronous PPO training")
+            ppo_train(
+                policy,
+                policy_generation,
+                value_model,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                value_loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                ppo_state,
+                master_config,
+            )
 
 
 if __name__ == "__main__":

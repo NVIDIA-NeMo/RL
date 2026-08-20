@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -27,7 +27,10 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.utils import StragglerDetector
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    PipelineOffloadManager,
+)
+from megatron.core.utils import StragglerDetector, get_model_config
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -70,6 +73,49 @@ PostProcessingFunction = Union[
 ]
 
 
+@contextmanager
+def suspend_activation_offload_for_forward_only(
+    model: Union[GPTModel, List[GPTModel]], forward_only: bool
+) -> Iterator[None]:
+    """Keep inference-only RL phases from consuming MCore's training warmup."""
+    if not forward_only:
+        yield
+        return
+
+    model_chunks = model if isinstance(model, list) else [model]
+    original_values: List[Tuple[Any, bool]] = []
+    seen_configs: set[int] = set()
+    for model_chunk in model_chunks:
+        model_config = get_model_config(model_chunk)
+        if id(model_config) in seen_configs:
+            continue
+        seen_configs.add(id(model_config))
+        original_value = bool(
+            getattr(model_config, "fine_grained_activation_offloading", False)
+        )
+        if original_value:
+            original_values.append((model_config, original_value))
+
+    offload_manager = PipelineOffloadManager.OFFLOAD_MGR
+    suspend_manager = bool(
+        original_values and offload_manager is not None and offload_manager.do_offload
+    )
+
+    try:
+        for model_config, _ in original_values:
+            model_config.fine_grained_activation_offloading = False
+        if suspend_manager and offload_manager is not None:
+            offload_manager.disable_offload()
+        yield
+    finally:
+        try:
+            if suspend_manager and offload_manager is not None:
+                offload_manager.enable_offload()
+        finally:
+            for model_config, original_value in original_values:
+                model_config.fine_grained_activation_offloading = original_value
+
+
 def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
@@ -81,6 +127,7 @@ def model_forward(
     mtp_loss_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
+    media_token_validity_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -97,6 +144,9 @@ def model_forward(
         straggler_timer: Straggler detector for profiling the forward pass
         use_fused_linear_logprobs: Whether to compute logprobs with the fused
             chunked linear cross-entropy kernel (directly from hidden states)
+        media_token_validity_mask: Which media-token positions actually anchor a
+            projected feature, already in this model's token layout. Only passed
+            when the model accepts it; otherwise the model derives its own.
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -116,6 +166,11 @@ def model_forward(
     if mtp_loss_mask is not None:
         additional_kwargs["loss_mask"] = mtp_loss_mask
 
+    # Only sent when the model advertises the parameter, so it never reaches a
+    # forward that would swallow it into **kwargs and quietly ignore it.
+    if media_token_validity_mask is not None:
+        additional_kwargs["media_token_validity_mask"] = media_token_validity_mask
+
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
     if use_fused_linear_logprobs:
@@ -132,6 +187,15 @@ def model_forward(
             **additional_kwargs,
             **multimodal_data,
         )
+
+    # A model that slices context parallelism itself returns (output,
+    # sliced_loss_mask) when it was handed a full-sequence loss_mask, so the
+    # caller can see the mask in the model's own CP-local token order. The MTP
+    # loss is computed inside the model against that mask, so only the logits
+    # are needed here. Without this the tuple reaches the loss wrapper, which
+    # calls .narrow() on it. See modeling_nemotron_omni.py return_sliced_loss_mask.
+    if isinstance(output_tensor, tuple):
+        output_tensor = output_tensor[0]
 
     return output_tensor
 
@@ -204,6 +268,7 @@ def forward_with_post_processing_fn(
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
     mtp_loss_mask = processed_mb.mtp_loss_mask
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
+    media_token_validity_mask = processed_mb.media_token_validity_mask
 
     if use_router_replay:
         if routed_experts_cp_sharded is None:
@@ -227,6 +292,7 @@ def forward_with_post_processing_fn(
                 mtp_loss_mask=mtp_loss_mask,
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
+                media_token_validity_mask=media_token_validity_mask,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -357,20 +423,21 @@ def megatron_forward_backward(
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:
         clear_router_replay(model)
-    try:
-        return forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=num_microbatches,
-            seq_length=seq_length,
-            micro_batch_size=mbs,
-            decoder_seq_length=seq_length,
-            forward_only=forward_only,
-        )
-    finally:
-        if use_router_replay:
-            clear_router_replay(model)
+    with suspend_activation_offload_for_forward_only(model, forward_only):
+        try:
+            return forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=seq_length,
+                micro_batch_size=mbs,
+                decoder_seq_length=seq_length,
+                forward_only=forward_only,
+            )
+        finally:
+            if use_router_replay:
+                clear_router_replay(model)
 
 
 class LossPostProcessor:

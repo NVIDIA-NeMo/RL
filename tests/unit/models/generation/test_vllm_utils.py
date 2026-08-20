@@ -30,9 +30,10 @@ from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
     attach_routed_experts_to_chat_response_choices,
+    attach_token_information_to_chat_response_choices,
     compute_spec_decode_metrics,
     format_prompt_for_vllm_generation,
-    model_dump_chat_response_with_routed_experts,
+    model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
@@ -195,7 +196,7 @@ def test_vllm_utils_vlm_with_missing_images_fallback_to_tokens():
     assert all("prompt_token_ids" in p for p in prompts)
 
 
-def test_vllm_utils_vlm_with_none_content_fallback_to_tokens_and_sample_idx():
+def test_vllm_utils_vlm_with_none_content_uses_updated_tokens_and_media():
     input_ids, input_lengths = _mk_inputs()
     data = BatchedDataDict(
         {
@@ -205,16 +206,21 @@ def test_vllm_utils_vlm_with_none_content_fallback_to_tokens_and_sample_idx():
             "vllm_images": [["img"], ["img"]],
         }
     )
-    # even though images provided, None content should fallback to tokens
     prompts_all = format_prompt_for_vllm_generation(data)
     assert len(prompts_all) == 2
     assert all("prompt_token_ids" in p for p in prompts_all)
+    assert [p["multi_modal_data"]["image"] for p in prompts_all] == ["img", "img"]
+    assert (
+        prompts_all[1]["prompt_token_ids"] == input_ids[1, : input_lengths[1]].tolist()
+    )
 
     # single-sample API
     p0 = format_prompt_for_vllm_generation(data, sample_idx=0)
     p1 = format_prompt_for_vllm_generation(data, sample_idx=1)
     assert isinstance(p0, dict) and isinstance(p1, dict)
     assert "prompt_token_ids" in p0 and "prompt_token_ids" in p1
+    assert p0["multi_modal_data"]["image"] == "img"
+    assert p1["multi_modal_data"]["image"] == "img"
 
 
 def test_normalize_routed_experts_full_sequence_alignment():
@@ -558,13 +564,179 @@ def test_attach_routed_experts_to_chat_response_choices_raises_for_unmatched_cho
         )
 
 
-def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():
-    routed_experts = [[[1]], [[2]]]
+def test_attach_token_information_to_chat_response_choices():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        outputs=[
+            SimpleNamespace(index=1, token_ids=[], logprobs=None),
+            SimpleNamespace(
+                index=0,
+                token_ids=[201, 202],
+                logprobs=[
+                    {201: SimpleNamespace(logprob=-0.1)},
+                    {202: SimpleNamespace(logprob=-10000.0)},
+                ],
+            ),
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(),
+                logprobs=SimpleNamespace(
+                    content=[
+                        SimpleNamespace(token="decoded token", logprob=-10.0),
+                        SimpleNamespace(token="format is ignored", logprob=-20.0),
+                    ]
+                ),
+            ),
+            SimpleNamespace(
+                index=1,
+                message=SimpleNamespace(),
+                logprobs=SimpleNamespace(content=None),
+            ),
+        ],
+        model_dump=lambda: {
+            "choices": [
+                {"message": {"role": "assistant", "content": "first"}},
+                {"message": {"role": "assistant", "content": "second"}},
+            ]
+        },
+    )
+
+    attach_token_information_to_chat_response_choices(response, final_res)
+    response_dict = model_dump_chat_response_with_dynamic_message_fields(response)
+
+    assert response_dict["choices"][0]["message"]["prompt_token_ids"] == [
+        101,
+        102,
+        103,
+    ]
+    assert response_dict["choices"][0]["message"]["generation_token_ids"] == [201, 202]
+    assert response_dict["choices"][0]["message"]["generation_log_probs"] == [
+        -0.1,
+        -9999.0,
+    ]
+    assert response_dict["choices"][1]["message"]["prompt_token_ids"] == [
+        101,
+        102,
+        103,
+    ]
+    assert response_dict["choices"][1]["message"]["generation_token_ids"] == []
+    assert response_dict["choices"][1]["message"]["generation_log_probs"] == []
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "logprobs", "error_match"),
+    [
+        (
+            [201, 202],
+            [{201: SimpleNamespace(logprob=-0.1)}],
+            "mismatched generation token IDs and log probabilities",
+        ),
+        (
+            [201],
+            [{999: SimpleNamespace(logprob=-0.1)}],
+            "did not include the selected token",
+        ),
+    ],
+)
+def test_attach_token_information_to_chat_response_choices_rejects_invalid_logprobs(
+    token_ids, logprobs, error_match
+):
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        outputs=[SimpleNamespace(index=0, token_ids=token_ids, logprobs=logprobs)],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match=error_match):
+        attach_token_information_to_chat_response_choices(response, final_res)
+
+
+@pytest.mark.parametrize(
+    ("prompt_token_ids", "outputs", "choice_indices", "error_match"),
+    [
+        (None, [], [], "did not include prompt_token_ids"),
+        (
+            [101],
+            [
+                SimpleNamespace(index=0, token_ids=[], logprobs=[]),
+                SimpleNamespace(index=0, token_ids=[], logprobs=[]),
+            ],
+            [0],
+            "duplicate generation output indices",
+        ),
+        (
+            [101],
+            [SimpleNamespace(index=0, token_ids=[], logprobs=[])],
+            [0, 0],
+            "duplicate response choice indices",
+        ),
+        (
+            [101],
+            [SimpleNamespace(index=1, token_ids=[], logprobs=[])],
+            [0],
+            "could not be matched to generation outputs",
+        ),
+        (
+            [101],
+            [SimpleNamespace(index=0, logprobs=[])],
+            [0],
+            "did not include token_ids",
+        ),
+        (
+            [101],
+            [SimpleNamespace(index=0, token_ids=[201], logprobs=None)],
+            [0],
+            "did not include logprobs",
+        ),
+    ],
+)
+def test_attach_token_information_to_chat_response_choices_rejects_invalid_structure(
+    prompt_token_ids, outputs, choice_indices, error_match
+):
+    final_res = SimpleNamespace(
+        prompt_token_ids=prompt_token_ids,
+        outputs=outputs,
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=choice_index, message=SimpleNamespace())
+            for choice_index in choice_indices
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match=error_match):
+        attach_token_information_to_chat_response_choices(response, final_res)
+
+
+def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fields():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102],
+        prompt_routed_experts=torch.tensor(
+            [[[10]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+        ),
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[201],
+                logprobs=[{201: SimpleNamespace(logprob=-0.1)}],
+                routed_experts=torch.tensor(
+                    [[[20]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
+            )
+        ],
+    )
 
     class Response:
         choices = [
             SimpleNamespace(
-                message=SimpleNamespace(routed_experts=routed_experts),
+                index=0,
+                message=SimpleNamespace(),
             )
         ]
 
@@ -580,9 +752,20 @@ def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():
                 ]
             }
 
-    response_dict = model_dump_chat_response_with_routed_experts(Response())
+    response = Response()
+    attach_token_information_to_chat_response_choices(response, final_res)
+    attach_routed_experts_to_chat_response_choices(
+        response,
+        final_res,
+        device=torch.device("cpu"),
+    )
+    response_dict = model_dump_chat_response_with_dynamic_message_fields(response)
 
-    assert response_dict["choices"][0]["message"]["routed_experts"] == routed_experts
+    message = response_dict["choices"][0]["message"]
+    assert message["routed_experts"] == response.choices[0].message.routed_experts
+    assert message["prompt_token_ids"] == [101, 102]
+    assert message["generation_token_ids"] == [201]
+    assert message["generation_log_probs"] == [-0.1]
 
 
 @pytest.mark.vllm

@@ -30,10 +30,14 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_materialize_default_pad_value_is_zero` — No `pad_value_dict` → pad with 0.
 - `test_response_from_nested_extracts_response_slice` — Worker write-back: jagged (prompt+response) → response only.
 
-## `test_codec_mooncake.py` (4 tests)
+## `test_codec_mooncake.py`
 
-- `test_promote_1d_leaves_unsqueezes_1d` — `_promote_1d_leaves` turns 1D `(N,)` leaves into `(N, 1)` for mooncake wire.
-- `test_promote_1d_roundtrip_via_from_wire` — `_promote_1d_leaves` + `_from_wire` restores original `(N,)` shape and values.
+- `test_promote_1d_leaves_unsqueezes_1d` — `_promote_1d_leaves` turns schema-declared scalar fields from `(N,)` into `(N, 1)` for the Mooncake wire.
+- `test_promote_1d_roundtrip_via_from_wire` — `_promote_1d_leaves` + `_from_wire` restores the schema-declared field's original `(N,)` shape and values.
+- `test_from_wire_rejects_invalid_declared_field_shape` — Corrupt or incompatible scalar wire shapes fail at the data-plane boundary.
+- `test_promote_1d_leaves_rejects_undeclared_1d_field` — Unknown dense 1D Mooncake fields fail loudly instead of silently hitting TQ's shape mismatch.
+- `test_put_samples_uses_schema_without_private_shape_tags` — Promotion does not add per-row adapter metadata to user tags.
+- `test_get_samples_uses_static_shape_schema` — Reads restore scalar fields by the shared schema while preserving genuine `(N, 1)` columns.
 - `test_pack_per_token_field_truncates_sp_padding` — pack_per_token_field slices each row to its own length, dropping SP padding.
 - `test_pack_per_token_field_exact_fit_matches_to_nested_by_length` — At exact fit, `pack_per_token_field` matches `to_nested_by_length`.
 

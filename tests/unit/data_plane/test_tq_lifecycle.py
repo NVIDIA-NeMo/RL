@@ -134,10 +134,11 @@ def test_smoke_round_trip_backends(tq_client_backends) -> None:
         consumer_tasks=["read"],
     )
     keys = ["a", "b", "c", "d"]
+    values = torch.arange(12).reshape(4, 3)
     client.put_samples(
         sample_ids=keys,
         partition_id="smoke-backend",
-        fields=TensorDict({"x": torch.arange(4)}, batch_size=[4]),
+        fields=TensorDict({"x": values}, batch_size=[4]),
     )
 
     meta = client.claim_meta(
@@ -150,7 +151,9 @@ def test_smoke_round_trip_backends(tq_client_backends) -> None:
     assert meta.size == 4
 
     data = client.get_data(meta)
-    expected = torch.tensor([keys.index(k) for k in meta.sample_ids])
+    expected = torch.stack([values[keys.index(k)] for k in meta.sample_ids])
+    assert not data["x"].is_nested
+    assert data["x"].shape == expected.shape
     assert torch.equal(data["x"], expected)
 
     client.clear_samples(sample_ids=None, partition_id="smoke-backend")
@@ -164,11 +167,11 @@ def test_smoke_round_trip_1d_fields(tq_client_backends) -> None:
     this for mooncake_cpu; simple passes the tensor through unchanged.
     """
     n = 6
-    reward = torch.arange(n, dtype=torch.float32)
+    total_reward = torch.arange(n, dtype=torch.float32)
 
     tq_client_backends.register_partition(
         partition_id="smoke-1d",
-        fields=["reward"],
+        fields=["total_reward"],
         num_samples=n,
         consumer_tasks=["read"],
     )
@@ -176,21 +179,21 @@ def test_smoke_round_trip_1d_fields(tq_client_backends) -> None:
     tq_client_backends.put_samples(
         sample_ids=keys,
         partition_id="smoke-1d",
-        fields=TensorDict({"reward": reward}, batch_size=[n]),
+        fields=TensorDict({"total_reward": total_reward}, batch_size=[n]),
     )
 
     meta = tq_client_backends.claim_meta(
         partition_id="smoke-1d",
         task_name="read",
-        required_fields=["reward"],
+        required_fields=["total_reward"],
         batch_size=n,
         timeout_s=30.0,
     )
     data = tq_client_backends.get_data(meta)
 
-    assert data["reward"].shape == reward.shape, (
-        f"Expected shape {tuple(reward.shape)} for 1D field, "
-        f"got {tuple(data['reward'].shape)}. "
+    assert data["total_reward"].shape == total_reward.shape, (
+        f"Expected shape {tuple(total_reward.shape)} for 1D field, "
+        f"got {tuple(data['total_reward'].shape)}. "
         "TQ must not unsqueeze 1D tensors silently (R-C2)."
     )
 

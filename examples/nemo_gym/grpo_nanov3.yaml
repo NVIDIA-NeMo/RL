@@ -26,6 +26,7 @@ grpo:
     enabled: false # Set to true to enable async training mode
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
+    max_generation_failures: 0
 
   batch_multiplier: 1
   use_dynamic_sampling: False
@@ -147,6 +148,7 @@ policy:
 
       optimizer_cpu_offload: False
       optimizer_offload_fraction: 0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -225,7 +227,6 @@ policy:
       inference_cuda_graph_scope: "block"
       activation_checkpointing: false
       mamba_inference_ssm_states_dtype: "float32"
-      inference_moe_token_dispatcher_type: "nccl"  # Fall back to NCCL for now
       inference_grouped_gemm_backend: "vllm"
       moe_router_num_groups: null  # InferenceTopKRouter requires num_groups=None
       moe_router_group_topk: null  # paired with moe_router_num_groups=null
@@ -244,8 +245,7 @@ policy:
       kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
-      refit_backend: "nvshmem"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nvshmem".
-      async_engine: true
+      refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nccl".
       expose_http_server: true
       enable_prefix_caching: true
       parsers:

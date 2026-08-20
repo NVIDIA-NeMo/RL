@@ -1,5 +1,6 @@
 defaults: ../../vlm_grpo_3B.yaml
 grpo:
+  deduplicate_multimodal_data: true
   num_prompts_per_step: 32
   overlong_filtering: true
   seq_logprob_error_threshold: 2

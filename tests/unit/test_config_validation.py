@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import glob
 import os
 from pathlib import Path
@@ -24,10 +25,11 @@ from pydantic import TypeAdapter, ValidationError
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
 from nemo_rl.algorithms.grpo import (
-    MasterConfig as GRPOMasterConfig,
+    GRPOConfig,
+    RewardPenaltyConfig,
 )
 from nemo_rl.algorithms.grpo import (
-    RewardPenaltyConfig,
+    MasterConfig as GRPOMasterConfig,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
@@ -159,6 +161,38 @@ def test_all_config_files_have_required_keys(config_file):
 
     # Validate the entire config using the appropriate MasterConfig
     validate_config_section(config_dict, master_config_class, config_file)
+
+
+def test_multimodal_dedup_grpo_config_keys_default_off():
+    """Older recipes keep flag-off behavior without duplicating default keys."""
+    assert GRPOConfig.model_fields["deduplicate_multimodal_data"].default is False
+    assert GRPOConfig.model_fields["debug_payload_metrics"].default is False
+
+
+def test_nemo_gym_launcher_forwards_processor_to_both_trainers():
+    """Keep sync and async Gym image processing wired to the selected processor."""
+    launcher = Path(__file__).parents[2] / "examples/nemo_gym/run_grpo_nemo_gym.py"
+    tree = ast.parse(launcher.read_text())
+    trainer_calls = {
+        node.func.id: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"grpo_train", "async_grpo_train"}
+    }
+
+    assert trainer_calls.keys() == {"grpo_train", "async_grpo_train"}
+    for trainer_name, call in trainer_calls.items():
+        processor_keywords = [
+            keyword
+            for keyword in call.keywords
+            if keyword.arg == "processor"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "processor"
+        ]
+        assert len(processor_keywords) == 1, (
+            f"{trainer_name} must receive processor=processor"
+        )
 
 
 def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
