@@ -87,6 +87,7 @@ def test_rollout_only_recipe_uses_two_gb200_nodes_and_required_spec_config(
     assert config["cluster"]["gpus_per_node"] == 4
     assert config["cluster"]["num_nodes"] == 2
     assert config["cluster"]["segment_size"] == 1
+    assert config["logger"]["tensorboard_enabled"] is False
     assert config["logger"]["wandb"]["project"] == "nemo-rl"
 
     policy_nodes = (

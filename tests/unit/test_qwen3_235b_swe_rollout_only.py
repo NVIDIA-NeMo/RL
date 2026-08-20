@@ -83,6 +83,7 @@ def test_recipe_resolves_agentic_swe_and_thinking_chat_template(
     assert config["policy"]["max_total_sequence_length"] == 196608
     assert config["data"]["train"]["data_path"] == "/data/swe/train.jsonl"
     assert config["data"]["validation"]["data_path"] == "/data/swe/val.jsonl"
+    assert config["logger"]["tensorboard_enabled"] is False
     assert config["logger"]["wandb"]["project"] == "nemo-rl"
 
     generation = config["policy"]["generation"]

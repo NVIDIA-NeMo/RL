@@ -22,7 +22,7 @@ env:
     is_trajectory_collection: true
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-thinking-swe1-2n4g-megatron-tp2pp2-rollout-only-specdec
-  tensorboard_enabled: true
+  tensorboard_enabled: false
   wandb:
     project: nemo-rl
     name: qwen3-30ba3b-thinking-swe1-rollout-only-specdec
