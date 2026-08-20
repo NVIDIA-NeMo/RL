@@ -3628,15 +3628,16 @@ def test_zero_train_gen_mismatch_forces_te_generation_spec():
 
     with (
         patch(
-            "nemo_rl.models.policy.workers.mamba_zero_kl_patches."
+            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
             "apply_mamba_alignment_patch"
         ) as apply_mamba_patch,
         patch(
-            "nemo_rl.models.policy.workers.moe_zero_kl_patches."
+            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
             "apply_moe_determinism_patches"
         ) as apply_moe_patches,
         patch(
-            "nemo_rl.models.policy.workers.patches.apply_te_gemm_cublas_pinned_patch"
+            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
+            "apply_te_gemm_cublas_pinned_patch"
         ),
     ):
         _apply_zero_train_gen_mismatch(config)
@@ -3666,15 +3667,16 @@ def test_zero_train_gen_mismatch_skips_mamba_patch_for_non_mamba_models():
 
     with (
         patch(
-            "nemo_rl.models.policy.workers.mamba_zero_kl_patches."
+            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
             "apply_mamba_alignment_patch"
         ) as apply_mamba_patch,
         patch(
-            "nemo_rl.models.policy.workers.moe_zero_kl_patches."
+            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
             "apply_moe_determinism_patches"
         ),
         patch(
-            "nemo_rl.models.policy.workers.patches.apply_te_gemm_cublas_pinned_patch"
+            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
+            "apply_te_gemm_cublas_pinned_patch"
         ),
     ):
         _apply_zero_train_gen_mismatch(config)
