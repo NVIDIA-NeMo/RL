@@ -1231,6 +1231,30 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             ),
         )
 
+    def init_mx_reshard_comm_group(
+        self,
+        rank_prefix: int,
+        mx_server_url: str,
+        model_name: str,
+        trainer_slots: list,
+        generator_slots: list,
+        source_partition_count: int,
+        plan_digest: str = "",
+    ) -> None:
+        """Forward ModelExpress comm-group init to vLLM backend workers."""
+        self.llm.collective_rpc(
+            "init_mx_reshard_comm_group",
+            args=(
+                rank_prefix,
+                mx_server_url,
+                model_name,
+                trainer_slots,
+                generator_slots,
+                source_partition_count,
+                plan_digest,
+            ),
+        )
+
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Forward refit info to vLLM backend workers."""
         self.llm.collective_rpc("prepare_nccl_reshard_refit_info", args=(refit_info,))

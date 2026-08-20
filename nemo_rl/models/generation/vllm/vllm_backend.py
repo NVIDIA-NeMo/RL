@@ -284,6 +284,39 @@ class VllmInternalWorkerExtension:
             group.init_nccl_communicator(device=self.device)
             self.pp_comm_groups[stage] = group
 
+    def init_mx_reshard_comm_group(
+        self,
+        rank_prefix: int,
+        mx_server_url: str,
+        model_name: str,
+        trainer_slots: list,
+        generator_slots: list,
+        source_partition_count: int,
+        plan_digest: str = "",
+    ) -> None:
+        """Bootstrap this gen worker's comm groups through ModelExpress."""
+        import os
+
+        from nemo_rl.weight_sync.mx_collective_bootstrap import build_mx_groups
+
+        local_rank = torch.distributed.get_rank()
+        index_in_role = rank_prefix + local_rank
+        reshard_groups, broadcast, _ = build_mx_groups(
+            mx_server_url=mx_server_url,
+            model_name=model_name,
+            role="GENERATOR",
+            index_in_role=index_in_role,
+            slot_id=f"gen/{index_in_role}",
+            worker_id=f"gen-{index_in_role}-{os.getpid()}",
+            trainer_slots=trainer_slots,
+            generator_slots=generator_slots,
+            source_partition_count=source_partition_count,
+            plan_digest=plan_digest,
+            device=self.device,
+        )
+        self.pp_comm_groups = reshard_groups
+        self.model_update_group = broadcast
+
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
         from nemo_rl.utils.nvml import get_device_uuid

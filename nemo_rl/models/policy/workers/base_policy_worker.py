@@ -83,6 +83,45 @@ class AbstractPolicyWorker:
         self.pp_comm_group.init_nccl_communicator(device=device)
         self.my_pp_stage = my_pp_stage
 
+    def init_mx_reshard_comm_group(
+        self,
+        mx_server_url: str,
+        model_name: str,
+        trainer_slots: list,
+        generator_slots: list,
+        source_partition_count: int,
+        my_pp_stage: int = 0,
+        plan_digest: str = "",
+    ) -> None:
+        """Bootstrap this train worker's comm groups through ModelExpress.
+
+        Same groups the TCPStore path produces, same downstream refit loop; only
+        the ncclUniqueId's provenance differs.
+        """
+        import os
+
+        from nemo_rl.weight_sync.mx_collective_bootstrap import build_mx_groups
+
+        reshard_groups, broadcast, _ = build_mx_groups(
+            mx_server_url=mx_server_url,
+            model_name=model_name,
+            role="TRAINER",
+            index_in_role=self.rank,
+            slot_id=f"train/{self.rank}",
+            worker_id=f"train-{self.rank}-{os.getpid()}",
+            trainer_slots=trainer_slots,
+            generator_slots=generator_slots,
+            source_partition_count=source_partition_count,
+            source_partition=my_pp_stage,
+            plan_digest=plan_digest,
+            device=torch.cuda.current_device(),
+        )
+        # A trainer belongs to exactly one source partition, so it holds one
+        # reshard lane; generators hold all of them.
+        self.pp_comm_group = reshard_groups[my_pp_stage]
+        self.model_update_group = broadcast
+        self.my_pp_stage = my_pp_stage
+
     def prepare_nccl_reshard_refit_info(
         self,
         train_parallelism: dict[str, int],

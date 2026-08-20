@@ -14,29 +14,14 @@
 
 """ModelExpress-brokered variant of the nccl_reshard weight synchronizer.
 
-Same wire path as ``NcclReshardWeightSynchronizer``: bulk FFN parameters move
-through ``nccl.m2n.reshard`` between the train and generation layouts, and the
-remaining parameters ride a packed broadcast. The difference is entirely in how
-the communicators come to exist.
+Identical wire path to ``NcclReshardWeightSynchronizer``. The only difference
+is where each lane's ``ncclUniqueId`` comes from: ModelExpress rather than a
+``TCPStore`` the driver has to allocate a port for per pipeline stage.
 
-The native path bootstraps through a ``StatelessProcessGroup``: a ``TCPStore``
-whose only job is to move 128 bytes of ``ncclUniqueId`` from rank 0 to everyone
-else, at an IP and port the Ray driver allocates and plumbs through both actor
-sets, once per pipeline stage. That works, and it gives up three things a
-coordination service can provide:
-
-* **Admission.** Membership is whoever happens to connect. There is no expected
-  set, so a missing worker is a hang rather than a bounded failure naming it.
-* **Fencing.** A worker that dies and restarts rejoins silently, and the
-  surviving ranks cannot tell the generation changed underneath them.
-* **Observable readiness.** The trainer has no way to check that the generators
-  it is about to push into have prepared their destinations; it can only enter
-  the collective and block.
-
-Routing the bootstrap through ModelExpress supplies all three, and removes the
-per-stage port allocation from the driver. Everything below the rendezvous is
-unchanged, which is deliberate: the two transports should move identical bytes
-so they can be compared directly.
+That containment is deliberate. ``sync_weights`` below calls the *existing*
+``nccl_reshard_refit`` on both sides, unchanged, so the two transports cannot
+drift apart -- which is what makes a measured comparison between them mean
+anything.
 """
 
 from contextlib import nullcontext
@@ -51,17 +36,7 @@ MX_COLLECTIVE_TRANSPORT = "mx_nccl_reshard"
 
 
 class MxCollectiveWeightSynchronizer(WeightSynchronizer):
-    """Weight synchronizer whose NCCL rendezvous is brokered by ModelExpress.
-
-    Args:
-        policy: Policy object implementing ColocatablePolicyInterface (Megatron).
-        generation: Generation object implementing GenerationInterface (vLLM).
-        train_cluster: RayVirtualCluster for the training workers.
-        inference_cluster: RayVirtualCluster for the inference workers.
-        mx_server_url: Address of the ModelExpress server that brokers the
-            group. Every worker on both sides must be given the same one, or
-            they form two groups that never reach READY.
-    """
+    """nccl_reshard refit whose communicator bootstrap is brokered by ModelExpress."""
 
     def __init__(
         self,
@@ -75,93 +50,107 @@ class MxCollectiveWeightSynchronizer(WeightSynchronizer):
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
+        if not mx_server_url:
+            raise ValueError(
+                "policy.generation.mx_server_url is required for "
+                f"refit_transport={MX_COLLECTIVE_TRANSPORT!r}. Every worker on "
+                "both sides must be given the same address; two different "
+                "addresses form two groups, neither of which reaches READY."
+            )
         self._mx_server_url = mx_server_url
         self._stale = True
 
-    def _train_parallelism(self) -> dict[str, int]:
-        megatron_cfg = self._policy.cfg["megatron_cfg"]
+    def _train_parallelism(self) -> dict:
+        cfg = self._policy.cfg["megatron_cfg"]
         return {
-            "tp_size": megatron_cfg.get("tensor_model_parallel_size", 1),
-            "ep_size": megatron_cfg.get("expert_model_parallel_size", 1),
-            "pp_size": megatron_cfg.get("pipeline_model_parallel_size", 1),
+            "tp_size": cfg.get("tensor_model_parallel_size", 1),
+            "ep_size": cfg.get("expert_model_parallel_size", 1),
+            "pp_size": cfg.get("pipeline_model_parallel_size", 1),
         }
 
-    def _gen_parallelism(self) -> dict[str, int]:
-        vllm_cfg = self._policy.cfg["generation"].get("vllm_cfg", {})
+    def _gen_parallelism(self) -> dict:
+        cfg = self._policy.cfg["generation"].get("vllm_cfg", {})
         return {
-            "tp_size": vllm_cfg.get("tensor_parallel_size", 1),
-            "ep_size": vllm_cfg.get("expert_parallel_size", 1),
-            "pp_size": vllm_cfg.get("pipeline_parallel_size", 1),
+            "tp_size": cfg.get("tensor_parallel_size", 1),
+            "ep_size": cfg.get("expert_parallel_size", 1),
+            "pp_size": cfg.get("pipeline_parallel_size", 1),
         }
 
     def init_communicator(self) -> None:
-        """Form the ModelExpress group and build every lane's communicator.
-
-        Runs once. The expensive part is the per-lane ``Communicator.init``,
-        which MX lets us keep across refits: the group is keyed by membership,
-        and only a membership or plan change moves its epoch and invalidates
-        the cached communicators.
-
-        Note what is *absent* compared with the native path: no per-stage IP and
-        port allocation, and no rank arithmetic in the driver. MX assigns
-        ``rank_in_lane`` from the role, the ordinal within the role, and the
-        pipeline stage, using the same convention the native path hardcodes --
-        trainer ranks first, generators after -- so the mesh metadata carries
-        over unchanged.
-        """
         train_parallelism = self._train_parallelism()
         gen_parallelism = self._gen_parallelism()
         train_world_size = self._train_cluster.world_size()
-        inference_world_size = self._inference_cluster.world_size()
+        gen_world_size = self._inference_cluster.world_size()
+        pp_size = train_parallelism["pp_size"]
+        model_name = self._policy.cfg.get("model_name", "unknown-model")
 
         refit_info = self._policy.prepare_nccl_reshard_refit_info(
-            train_parallelism,
-            gen_parallelism,
-            train_world_size,
-            inference_world_size,
+            train_parallelism, gen_parallelism, train_world_size, gen_world_size
         )
-        self._generation.prepare_nccl_reshard_refit_info(refit_info)
 
-        futures_train = self._policy.init_mx_collective_group(
-            mx_server_url=self._mx_server_url,
-            train_world_size=train_world_size,
-            gen_world_size=inference_world_size,
-            source_partition_count=train_parallelism["pp_size"],
+        # Both sides must agree on the digest or the group never reaches READY,
+        # so it is derived from the metadata the trainer already published
+        # rather than computed independently on each side.
+        try:
+            from nemo_rl.weight_sync.mx_collective_plan import build_mx_plan
+            from modelexpress_rl.collective import plan_digest
+
+            digest = plan_digest(build_mx_plan(refit_info))
+        except Exception as error:  # noqa: BLE001 - digest is an agreement token
+            print(f"[mx] plan digest unavailable ({error!r}); using a constant", flush=True)
+            digest = "nccl-reshard-plan"
+
+        trainers = [f"train/{r}" for r in range(train_world_size)]
+        generators = [f"gen/{r}" for r in range(gen_world_size)]
+        ranks_per_stage = max(train_world_size // pp_size, 1)
+        pp_stages = [r // ranks_per_stage for r in range(train_world_size)]
+
+        print(
+            f"[mx] forming group via {self._mx_server_url}: "
+            f"{train_world_size} trainers + {gen_world_size} generators, "
+            f"{pp_size} source partition(s), digest={digest[:12]}",
+            flush=True,
         )
-        futures_inference = self._generation.init_mx_collective_group(
+
+        common = dict(
             mx_server_url=self._mx_server_url,
-            train_world_size=train_world_size,
-            gen_world_size=inference_world_size,
-            source_partition_count=train_parallelism["pp_size"],
+            model_name=model_name,
+            trainer_slots=trainers,
+            generator_slots=generators,
+            source_partition_count=pp_size,
+            plan_digest=digest,
         )
-        ray.get(futures_train + futures_inference)
+        # Both sides block inside the collective bootstrap, so they have to be
+        # in flight together.
+        futures_train = self._policy.init_mx_reshard_comm_group(
+            pp_stages=pp_stages, **common
+        )
+        futures_gen = self._generation.init_mx_reshard_comm_group(**common)
+        ray.get(futures_train + futures_gen)
+        print("[mx] communicators ready", flush=True)
+
+        self._generation.prepare_nccl_reshard_refit_info(refit_info)
 
     def sync_weights(
         self,
         *,
         timer: Optional[Timer] = None,
-        kv_scales: Optional[dict[str, float]] = None,
+        kv_scales: Optional[dict] = None,
     ) -> None:
-        timer_context = (
+        ctx = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
             else nullcontext()
         )
-        with timer_context:
-            futures_train = self._policy.mx_collective_refit(kv_scales=kv_scales)
-            futures_inference = self._generation.mx_collective_refit()
-
+        with ctx:
+            futures_train = self._policy.nccl_reshard_refit(kv_scales=kv_scales)
+            futures_inference = self._generation.nccl_reshard_refit()
             ray.get(futures_train)
             results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
-
-            if not update_success:
+            if not all(r for r in results if r is not None):
                 raise RuntimeError(
-                    "Weight transfer failed during the ModelExpress collective refit. "
-                    "Check the ModelExpress server logs for the group's state: a group "
-                    "that never reached READY names the participants it was waiting on."
+                    "Weight transfer failed during the ModelExpress collective refit."
                 )
-
         self._stale = False
 
     @property
@@ -172,7 +161,4 @@ class MxCollectiveWeightSynchronizer(WeightSynchronizer):
         self._stale = True
 
     def shutdown(self) -> None:
-        # Communicator teardown follows Ray actor teardown, as with the native
-        # path. The MX group is reclaimed on its own once every participant's
-        # registration lapses, so there is nothing to delete here.
         pass
