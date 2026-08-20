@@ -76,6 +76,14 @@ def test_submitter_checks_top_level_and_submodule_revisions_separately() -> None
     assert "submodule status --recursive | grep -q '^[+-U]'" in script
 
 
+def test_submitter_does_not_overlay_container_uv_cache() -> None:
+    script = SCRIPT.read_text()
+
+    assert "export UV_CACHE_DIR_OVERRIDE" not in script
+    assert "unset UV_CACHE_DIR_OVERRIDE" in script
+    assert "UV_PROJECT_ENVIRONMENT=/tmp/" in script
+
+
 def test_async_bf16_renders_nccl_reshard_with_same_logprob_work() -> None:
     result = render(MODE="async", MODEL="nano", ARM="bf16")
 
@@ -95,6 +103,7 @@ def test_qwen235_legacy_arm_uses_current_mxfp8_recipe_without_reshard() -> None:
     assert "grpo.async_grpo.enabled=false" in result.stdout
     assert "policy.generation.refit_transport=null" in result.stdout
     assert "policy.generation.vllm_cfg.gpu_memory_utilization=0.88" in result.stdout
+    assert "++policy.generation.vllm_kwargs.max_num_seqs=32" in result.stdout
     assert "cluster.num_nodes=32" in result.stdout
 
 

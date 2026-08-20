@@ -9,8 +9,9 @@ ARM=${ARM:-bf16}
 MAX_STEPS=${MAX_STEPS:-20}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-}
 RUN_SUFFIX=${RUN_SUFFIX:-$(date +%Y%m%d-%H%M%S)}
-BRANCH=${BRANCH:-sna/exp-gb200-deck-refresh-20260818}
+BRANCH=${BRANCH:-sna/exp-gb200-deck-refresh-current}
 EXPECTED_HEAD=${EXPECTED_HEAD:-}
+MAX_NUM_SEQS=
 
 case "${MODEL}:${MODE}:${ARM}" in
   nano:sync:bf16|nano:sync:mxfp8)
@@ -48,6 +49,7 @@ case "${MODEL}:${MODE}:${ARM}" in
     ASYNC_GRPO=false
     VLLM_TP=4
     DEFAULT_VLLM_GPU_MEMORY_UTILIZATION=0.88
+    MAX_NUM_SEQS=32
     ;;
   qwen235:sync:mxfp8_nccl)
     CONFIG=examples/configs/recipes/llm/performance/grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml
@@ -60,6 +62,7 @@ case "${MODEL}:${MODE}:${ARM}" in
     ASYNC_GRPO=false
     VLLM_TP=4
     DEFAULT_VLLM_GPU_MEMORY_UTILIZATION=0.88
+    MAX_NUM_SEQS=32
     ;;
   *)
     echo "Combination MODEL=${MODEL}, MODE=${MODE}, ARM=${ARM} is not supported" >&2
@@ -78,7 +81,7 @@ case "${ARM}" in
   mxfp8|mxfp8_legacy|mxfp8_nccl)
     ROLLOUT_PRECISION=fp8
     IS_MX=true
-    QUANTIZATION_SCOPE=routed_expert_fc1_fc2_only
+    QUANTIZATION_SCOPE=all_supported_linear_and_moe
     ;;
 esac
 
@@ -119,6 +122,9 @@ RUN_ARGS=(
 if [[ "${IS_MX}" == true ]]; then
   RUN_ARGS+=("++policy.generation.vllm_cfg.is_mx=true")
 fi
+if [[ -n "${MAX_NUM_SEQS}" ]]; then
+  RUN_ARGS+=("++policy.generation.vllm_kwargs.max_num_seqs=${MAX_NUM_SEQS}")
+fi
 
 printf -v RUN_COMMAND '%q ' uv run --frozen examples/run_grpo.py "${RUN_ARGS[@]}"
 if [[ "${ACTION}" == render ]]; then
@@ -133,7 +139,7 @@ case "${ACTION}" in
 esac
 
 BASE=${BASE:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna}
-REPO=${REPO:-${BASE}/RL-gb200-deck-refresh-20260818}
+REPO=${REPO:-${BASE}/RL-gb200-deck-refresh-current}
 CONTAINER=${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/mkar/containers/nemo-rl-nightly-ngc-20260815_212622.sqsh}
 HF_HOME=${HF_HOME:-${BASE}/hf_home}
 ACCOUNT=${SLURM_ACCOUNT:-nemotron_sw_post}
@@ -141,7 +147,7 @@ PARTITION=${PARTITION:-batch}
 WALLTIME=${WALLTIME:-04:00:00}
 RESULT_ROOT=${RESULT_ROOT:-${BASE}/experiments/gb200-deck-refresh}
 EXPERIMENT_ROOT=${EXPERIMENT_ROOT:-${RESULT_ROOT}/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}}
-CACHE_ROOT=${CACHE_ROOT:-${BASE}/.cache/gb200-deck-refresh/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}}
+CACHE_ROOT=${CACHE_ROOT:-${BASE}/.cache/gb200-deck-refresh/shared}
 WORKER_VENV_ROOT=${WORKER_VENV_ROOT:-/tmp/nemo_rl_worker_venvs/gb200-deck-refresh/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}}
 RAY_RUNTIME_VENV=${RAY_RUNTIME_VENV:-${BASE}/.cache/gb200-deck-refresh/ray-runtime-py31314}
 WANDB_PROJECT=${WANDB_PROJECT:-sna-gb200-deck-refresh}
@@ -238,8 +244,8 @@ export TORCH_CUDA_ARCH_LIST=10.0
 export PYTHONPATH=${REPO}
 export UV_CACHE_DIR=${CACHE_ROOT}/uv-cache
 export UV_PYTHON=${RAY_RUNTIME_VENV}/bin/python
-export UV_PROJECT_ENVIRONMENT=${CACHE_ROOT}/driver-venv-py31314
-export UV_PYTHON_INSTALL_DIR=${CACHE_ROOT}/uv-python
+export UV_PROJECT_ENVIRONMENT=/tmp/nemo_rl_driver_venvs/gb200-deck-refresh/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}
+export UV_PYTHON_INSTALL_DIR=/tmp/nemo_rl_uv_python/gb200-deck-refresh/${MODEL}/${MODE}/${ARM}/${RUN_SUFFIX}
 export UV_LOCK_TIMEOUT=7200
 export WANDB_API_KEY="\$(cat ${WANDB_KEY_FILE})"
 printf 'NEMO_RL_SOURCE_COMMIT=%s\n' "\$(git rev-parse HEAD)"
@@ -262,7 +268,7 @@ export CONTAINER
 export CONTAINER_REMAP_ROOT=1
 export GPUS_PER_NODE=4
 export MOUNTS=/lustre:/lustre
-export UV_CACHE_DIR_OVERRIDE=${CACHE_ROOT}/uv-cache
+unset UV_CACHE_DIR_OVERRIDE
 
 SBATCH_ARGS=(
   --nodes="${TOTAL_NODES}"
