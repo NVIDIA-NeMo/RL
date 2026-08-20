@@ -28,6 +28,8 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self
 
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.experience.route_plan import decode_route_plan
 
 if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
@@ -301,15 +303,32 @@ class RolloutRecoveryLedger:
             )
 
     def expected_staging_keys(self) -> set[str]:
-        """Return every durable staging row still owned by the ledger."""
-        return {
-            staging_key
-            for record in self._groups.values()
-            for sibling in record.siblings
-            for attempt in sibling.attempts[-1:]
-            if attempt.status == RolloutAttemptStatus.SEALED
-            for staging_key in attempt.staging_keys
-        }
+        """Return every staging row required to restore the current ownership.
+
+        Before canonical publication, sealed receipts own their staged token
+        rows. Finalization transfers that ownership to canonical TQ rows and
+        normally clears staging. Deferred router replay is the exception: its
+        canonical metadata carries route plans naming the staged rows that the
+        policy still needs.
+        """
+        expected: set[str] = set()
+        for record in self._groups.values():
+            if record.canonical_meta is None:
+                expected.update(
+                    staging_key
+                    for sibling in record.siblings
+                    for attempt in sibling.attempts[-1:]
+                    if attempt.status == RolloutAttemptStatus.SEALED
+                    for staging_key in attempt.staging_keys
+                )
+                continue
+            for tag in record.canonical_meta.tags or []:
+                encoded_plan = tag.get(ROUTE_PLAN_TAG)
+                if encoded_plan is not None:
+                    expected.update(
+                        decode_route_plan(encoded_plan).cleanup_staging_keys
+                    )
+        return expected
 
     def reserve_group(
         self,

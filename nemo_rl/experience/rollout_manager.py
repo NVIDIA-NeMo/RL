@@ -1761,6 +1761,9 @@ class RolloutManager:
             self._tq_buffer.abort(group_id)
             async with self._recovery_mutation():
                 self._recovery_ledger.abandon_unsealed(group_id)
+            # A failure after the last sibling sealed leaves the group ready to
+            # finalize; an earlier failure leaves it generating. The outer retry
+            # loop deliberately supports both entry states.
             # The capture ledger has no per-rollout fail endpoint. Rows from
             # abandoned attempts are unreferenced and are swept with the
             # staging partition at run teardown.
