@@ -880,12 +880,13 @@ def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
 
 
 def _encode_single_image_source(source: str) -> str:
-    """Resolve and encode one local image source."""
+    """Resolve and encode one image source."""
     image = resolve_to_image(source)
     try:
-        return image_to_data_url(image)
+        data_url = image_to_data_url(image)
     finally:
         image.close()
+    return data_url
 
 
 def extract_input_image_sources_from_responses_messages(
@@ -1066,6 +1067,8 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
             if not isinstance(content, list):
                 continue
             for part in content:
+                # Preserve the existing NeMo Gym request wire format: only
+                # Responses API input_image parts with image_url are rewritten.
                 if not isinstance(part, dict) or part.get("type") != "input_image":
                     continue
                 url = part.get("image_url", "")

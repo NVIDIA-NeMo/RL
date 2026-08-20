@@ -39,6 +39,14 @@ def _write_png(tmp_path, name: str, size: tuple[int, int]) -> str:
     return str(path)
 
 
+class _CloseTrackingImage:
+    def __init__(self) -> None:
+        self.closed: bool = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def test_image_to_data_url_round_trips_through_resolve_to_image():
     url = image_to_data_url(Image.new("RGB", (4, 3)))
     assert url.startswith("data:image/png;base64,")
@@ -90,7 +98,7 @@ def test_encode_images_passes_through_http_and_data_urls():
     assert parts[2]["image_url"] == data_url
 
 
-def test_encode_images_deduplicates_sources_and_uses_eight_workers(
+def test_encode_images_deduplicates_sources_and_uses_a_bounded_thread_pool(
     tmp_path, monkeypatch
 ):
     first = _write_png(tmp_path, "first.png", (2, 3))
@@ -127,22 +135,49 @@ def test_encode_images_deduplicates_sources_and_uses_eight_workers(
     encode_images_in_examples(examples)
 
     assert Counter(resolve_calls) == Counter({first: 1, second: 1})
-    assert observed_max_workers == [8]
+    assert observed_max_workers == [multimodal_utils.NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS]
     for example in examples:
         parts = example["responses_create_params"]["input"][0]["content"]
         assert parts[0]["image_url"] == expected[first]
         assert parts[1]["image_url"] == expected[second]
 
 
+def test_encode_images_does_not_partially_mutate_on_error(tmp_path):
+    existing = _write_png(tmp_path, "existing.png", (2, 3))
+    missing = str(tmp_path / "missing.png")
+    examples = [
+        _example(
+            {"type": "input_image", "image_url": existing},
+            {"type": "input_image", "image_url": missing},
+        )
+    ]
+
+    with pytest.raises(FileNotFoundError):
+        encode_images_in_examples(examples)
+
+    parts = examples[0]["responses_create_params"]["input"][0]["content"]
+    assert parts[0]["image_url"] == existing
+    assert parts[1]["image_url"] == missing
+
+
+def test_encode_single_image_source_closes_image_on_success(monkeypatch):
+    image = _CloseTrackingImage()
+    monkeypatch.setattr(multimodal_utils, "resolve_to_image", lambda _: image)
+    monkeypatch.setattr(
+        multimodal_utils,
+        "image_to_data_url",
+        lambda _: "data:image/png;base64,AA",
+    )
+
+    assert (
+        multimodal_utils._encode_single_image_source("image.png")
+        == "data:image/png;base64,AA"
+    )
+    assert image.closed
+
+
 def test_encode_single_image_source_closes_image_on_error(monkeypatch):
-    class CloseTrackingImage:
-        def __init__(self):
-            self.closed = False
-
-        def close(self):
-            self.closed = True
-
-    image = CloseTrackingImage()
+    image = _CloseTrackingImage()
     monkeypatch.setattr(multimodal_utils, "resolve_to_image", lambda _: image)
 
     def fail_to_encode(_):
