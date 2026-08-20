@@ -56,7 +56,7 @@ def test_nano_mxfp8_quantizes_only_routed_expert_projections() -> None:
 
     expected = (
         "++policy.generation.vllm_cfg.quantization_ignored_layer_kws="
-        "[q_proj,k_proj,v_proj,o_proj,in_proj,out_proj,shared_experts,gate,lm_head]"
+        "[q_proj,k_proj,v_proj,o_proj,in_proj,out_proj,shared_experts,gate]"
     )
     assert sync_mxfp8.returncode == 0, sync_mxfp8.stderr
     assert async_mxfp8.returncode == 0, async_mxfp8.stderr

@@ -117,7 +117,7 @@ esac
 
 if [[ "${MODEL}" == nano && "${IS_MX}" == true ]]; then
   QUANTIZATION_SCOPE=routed_expert_projections_only
-  QUANTIZATION_IGNORED_LAYER_KWS='[q_proj,k_proj,v_proj,o_proj,in_proj,out_proj,shared_experts,gate,lm_head]'
+  QUANTIZATION_IGNORED_LAYER_KWS='[q_proj,k_proj,v_proj,o_proj,in_proj,out_proj,shared_experts,gate]'
 fi
 
 RUN_ARGS=(

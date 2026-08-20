@@ -50,6 +50,8 @@ MXFP8_BLOCK_QUANT_KWARGS = {
     "quant_algo": "MXFP8",
 }
 
+DEFAULT_QUANTIZATION_IGNORED_LAYERS = ("lm_head",)
+
 
 @dataclass(frozen=True)
 class FP8Config:
@@ -330,6 +332,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         else:
             fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
         print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
+
+    ignored_layers = fp8_block_quant_kwargs.setdefault("ignored_layers", [])
+    ignored_layers.extend(DEFAULT_QUANTIZATION_IGNORED_LAYERS)
+    fp8_block_quant_kwargs["ignored_layers"] = list(dict.fromkeys(ignored_layers))
     if "ignored_layers" in fp8_block_quant_kwargs:
         fp8_block_quant_kwargs["ignore"] = fp8_block_quant_kwargs["ignored_layers"]
 

@@ -96,7 +96,13 @@ def test_init_fp8_uses_mxfp8_quantization_config(
     assert vllm_kwargs == {
         "quantization": "fp8",
         "kv_cache_dtype": "auto",
-        "hf_overrides": {"quantization_config": fp8.MXFP8_BLOCK_QUANT_KWARGS},
+        "hf_overrides": {
+            "quantization_config": {
+                **fp8.MXFP8_BLOCK_QUANT_KWARGS,
+                "ignored_layers": ["lm_head"],
+                "ignore": ["lm_head"],
+            }
+        },
     }
     if async_engine:
         assert applied_configs == []
@@ -131,7 +137,7 @@ def test_init_fp8_reload_api_keeps_blockwise_vllm_native(
         lambda fp8_config: applied_configs.append(fp8_config),
     )
 
-    fp8.init_fp8(
+    vllm_kwargs = fp8.init_fp8(
         {
             "precision": "fp8",
             "kv_cache_dtype": "auto",
@@ -144,6 +150,11 @@ def test_init_fp8_reload_api_keeps_blockwise_vllm_native(
     )
 
     assert applied_configs == []
+    assert vllm_kwargs["hf_overrides"]["quantization_config"] == {
+        **fp8.FP8_BLOCK_QUANT_KWARGS,
+        "ignored_layers": ["lm_head"],
+        "ignore": ["lm_head"],
+    }
     assert fp8.EngineCoreProc.run_engine_core is original_run_engine_core
     assert fp8.CoreEngineProcManager.__init__ is original_core_manager_init
 
