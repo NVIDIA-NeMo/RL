@@ -1383,8 +1383,8 @@ class AsyncTrajectoryCollector:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
         """Route one-pass teacher target/top-k inference and restore batch order.
 
-        Multimodal inputs are selected and padded with the same row mapping as
-        ``input_ids`` so each teacher receives aligned media payloads.
+        ``multimodal_data`` is row-aligned with ``input_ids``. Each teacher gets
+        only its routed rows, including repeated media rows added for DP padding.
         """
         if topk < 1:
             raise ValueError(f"topk must be at least 1, got {topk}.")
