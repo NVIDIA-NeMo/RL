@@ -149,6 +149,14 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         train_parallelism = self._train_parallelism()
         gen_parallelism = self._gen_parallelism()
         train_world_size = self._train_cluster.world_size()
+        pp_size = train_parallelism["pp_size"]
+        if pp_size <= 0 or train_world_size % pp_size != 0:
+            raise ValueError(
+                f"Cannot divide train_world_size={train_world_size} into "
+                f"TP={train_parallelism['tp_size']} "
+                f"EP={train_parallelism['ep_size']} "
+                f"CP={train_parallelism['cp_size']} PP={pp_size}."
+            )
         inference_world_size = self._inference_cluster.world_size()
         world_size = train_world_size + inference_world_size
 
@@ -168,7 +176,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         #    all train + gen ranks).  Separate NCCL communicator from
         #    model_update_group; the workers run the misc broadcast strictly
         #    after the bulk reshard (concurrent communicators can deadlock).
-        pp_size = train_parallelism["pp_size"]
         train_gpus_per_node = self._train_cluster.num_gpus_per_node
         train_ranks_per_stage = train_world_size // pp_size
         sub_world_size = train_ranks_per_stage + inference_world_size
