@@ -332,7 +332,13 @@ class DTensorPolicyWorkerV2Impl(
         # budget, which defeats the anchor over multi-window runs. Instead,
         # build the model from the pristine base weights, capture the
         # reference, then load the checkpoint below.
-        defer_checkpoint_load = init_reference_model and weights_path is not None
+        defer_checkpoint_load = init_reference_model and bool(weights_path)
+        if defer_checkpoint_load:
+            print(
+                "Deferring NeMo RL checkpoint load until after the KL reference "
+                "is captured from base weights; the 'No weights path provided' "
+                "message from setup_model_and_optimizer is expected on this path."
+            )
         model_and_optimizer_state = setup_model_and_optimizer(
             config=config,
             tokenizer=self.tokenizer,
