@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import importlib.util
 import math
 import sys
@@ -52,7 +66,9 @@ _OBJECTIVE = _load_objective_without_poisoning_packages()
 DSparkLossBins = _OBJECTIVE.DSparkLossBins
 dspark_tiled_objective = _OBJECTIVE.dspark_tiled_objective
 
-_SPECULATORS_DSPARK_METRICS_REVISION = "ba4cc76e4e75102660d0bb954e299725f3092d58"
+_SPECULATORS_DSPARK_METRICS_REVISION = (
+    "ba4cc76e4e75102660d0bb954e299725f3092d58"  # pragma: allowlist secret
+)
 
 
 def _distributed_inputs(
