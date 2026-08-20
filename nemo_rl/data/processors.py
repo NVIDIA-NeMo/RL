@@ -265,10 +265,16 @@ def preference_preprocessor(
     messages_rejected = datum_dict["context"] + rejected_completion["completion"]
 
     message_log_chosen = get_formatted_message_log(
-        messages_chosen, tokenizer, task_data_spec
+        messages_chosen,
+        tokenizer,
+        task_data_spec,
+        tools=datum_dict.get("tools", None),  # Pass tools from data if present
     )
     message_log_rejected = get_formatted_message_log(
-        messages_rejected, tokenizer, task_data_spec
+        messages_rejected,
+        tokenizer,
+        task_data_spec,
+        tools=datum_dict.get("tools", None),  # Pass tools from data if present
     )
 
     length_chosen = sum(len(m["token_ids"]) for m in message_log_chosen)
