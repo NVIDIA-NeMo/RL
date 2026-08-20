@@ -1567,9 +1567,15 @@ def build_inference_model(
         ]
     # CUDA graph config needs to be set correctly before init.
     if "cuda_graph_impl" in policy_cfg["megatron_cfg"]:
-        inference_provider.cuda_graph_impl = policy_cfg["megatron_cfg"][
-            "cuda_graph_impl"
-        ]
+        cuda_graph_impl = policy_cfg["megatron_cfg"]["cuda_graph_impl"]
+        if cuda_graph_impl not in ("none", "local"):
+            raise ValueError(
+                "Megatron generation supports only cuda_graph_impl 'none' or "
+                f"'local' for inference CUDA graphs, got '{cuda_graph_impl}'. "
+                "'transformer_engine' and 'full_iteration' are training-only "
+                "capture modes."
+            )
+        inference_provider.cuda_graph_impl = cuda_graph_impl
     if "inference_cuda_graph_scope" in policy_cfg["megatron_cfg"]:
         inference_provider.inference_cuda_graph_scope = InferenceCudaGraphScope[
             policy_cfg["megatron_cfg"]["inference_cuda_graph_scope"]

@@ -16,6 +16,7 @@ import gc
 from copy import deepcopy
 
 import pytest
+import ray
 import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -481,6 +482,23 @@ def test_megatron_generation_colocated(
         outputs = mg.generate(test_input_data, greedy=True)
         _assert_valid_generation_output(outputs, test_input_data)
 
+        # CUDA-graph capture proof: count the number of actually-created graphs.
+        # The inference_optimized train leg pins cuda_graph_impl="none" above,
+        # so it must stay at zero captures; the other legs must really capture.
+        graphs_enabled = (
+            config["generation"]["mcore_generation_config"]["cuda_graph_impl"]
+            != "none"
+        )
+        capture_counts = ray.get(
+            mg._policy.worker_group.run_all_workers_single_data(
+                "get_inference_cuda_graph_capture_count"
+            )
+        )
+        if graphs_enabled:
+            assert all(count > 0 for count in capture_counts), capture_counts
+        else:
+            assert all(count == 0 for count in capture_counts), capture_counts
+
         if train_impl == "inference_optimized":
             # 3490-review follow-up: bound token mult-prob error on the
             # matched-impl leg — generation and recomputed policy logprobs
@@ -519,6 +537,19 @@ def test_megatron_generation_colocated(
         assert mg.shutdown() is True
         after_shutdown = mg.generate(test_input_data, greedy=True)
         _assert_valid_generation_output(after_shutdown, test_input_data)
+
+        # Capture-once: a full sleep/wake cycle re-attaches the same managers and replays
+        # the same graphs; a growing count means managers were rebuilt and the old graphs leaked.
+        mg.finish_generation()
+        mg.prepare_for_generation()
+        after_cycle = mg.generate(test_input_data, greedy=True)
+        _assert_valid_generation_output(after_cycle, test_input_data)
+        recapture_counts = ray.get(
+            mg._policy.worker_group.run_all_workers_single_data(
+                "get_inference_cuda_graph_capture_count"
+            )
+        )
+        assert recapture_counts == capture_counts, (capture_counts, recapture_counts)
     finally:
         if policy is not None:
             policy.shutdown()

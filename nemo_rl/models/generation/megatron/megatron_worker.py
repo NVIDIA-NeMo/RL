@@ -38,7 +38,13 @@ from megatron.core.resharding.refit import (
     swap_model_weights,
 )
 from megatron.core.transformer import MegatronModule
-from megatron.core.transformer.cuda_graphs import CudaGraphManager
+from megatron.core.transformer.cuda_graph_config import (
+    normalize_inference_cuda_graph_scope,
+)
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    _CudagraphGlobalRecord,
+)
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.utils import (
@@ -111,7 +117,9 @@ class MegatronGenerationMixin:
         Colocated policies build the shared training model without CUDA graphs.
         But CUDA graphs configs MUST be in-place at initialization.
 
-        Colocated reshard skips this; that case has a dedicated inference model.
+        Must run at worker init: colocated reshard is detected via the pending reshard plan
+        (its dedicated inference model is built later, with graphs enabled);
+        the plan is consumed on the first generation cycle.
         """
         generation_cfg = self.cfg.get("generation")
         if (
@@ -125,21 +133,32 @@ class MegatronGenerationMixin:
         cuda_graph_impl = mcore_generation_config["cuda_graph_impl"]
         if cuda_graph_impl == "none":
             return
+        if cuda_graph_impl != "local":
+            raise ValueError(
+                "Colocated Megatron generation supports only cuda_graph_impl "
+                f"'none' or 'local' for inference CUDA graphs, got '{cuda_graph_impl}'. "
+                "'transformer_engine' and 'full_iteration' are training-only capture modes."
+            )
 
         lang_module = unwrap_model(self.model)
         # A model built with graphs enabled already owns managers.
         if not any(
             hasattr(module, "cudagraph_manager") for module in lang_module.modules()
         ):
-            scope = InferenceCudaGraphScope[
-                mcore_generation_config.get("inference_cuda_graph_scope", "block")
-            ]
+            scope = normalize_inference_cuda_graph_scope(
+                mcore_generation_config.get("inference_cuda_graph_scope"),
+                cuda_graph_impl,
+            )
             # Need the correct configs.
             set_model_config_attribute(lang_module, "cuda_graph_impl", cuda_graph_impl)
             set_model_config_attribute(lang_module, "inference_cuda_graph_scope", scope)
             set_model_config_attribute(lang_module, "cuda_graph_modules", [])
 
             # Need to recurse the configs' effects down into modules.
+            # Megatron-LM has no API for attaching inference CUDA-graph managers to
+            # an already-built model (reported upstream), so this mirrors its
+            # construction-time setup.
+            # TODO: switch to the upstream API once it exists.
             for module in lang_module.modules():
                 if not isinstance(module, GraphableMegatronModule):
                     continue
@@ -149,6 +168,7 @@ class MegatronGenerationMixin:
                     module.cudagraph_manager = CudaGraphManager(module.config)
 
             # Handle MTP as well.
+            # TODO: this path only becomes testable once #3331 merges.
             if (
                 getattr(lang_module, "mtp_process", False)
                 and hasattr(lang_module, "_setup_mtp_cuda_graphs")
@@ -165,6 +185,10 @@ class MegatronGenerationMixin:
 
         # Detach for training; this caches the managers built above.
         toggle_cuda_graphs(lang_module, set_to="none")
+
+    def get_inference_cuda_graph_capture_count(self) -> int:
+        """Inference CUDA graphs captured in this worker process (0 = eager decode)."""
+        return len(_CudagraphGlobalRecord.cudagraph_inference_record)
 
     def _initialize_inference_engine(self, mcore_generation_config: dict) -> None:
         """Initialize the persistent inference engine and client."""
@@ -464,6 +488,7 @@ class MegatronGenerationMixin:
             if cuda_graph_impl != "none":
                 toggle_cuda_graphs(lang_module, set_to="none")
                 # Need to turn off padding before training.
+                # Gains nightly MoE coverage once #2884 and #3570 merge.
                 set_decode_expert_padding(lang_module, set_to=False)
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
