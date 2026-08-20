@@ -50,6 +50,7 @@ RUN_ARGS=(
   "++policy.generation.vllm_cfg.refit_prequantize=${REFIT_PREQUANTIZE}"
   "grpo.max_num_steps=${MAX_STEPS}"
   "grpo.seed=42"
+  "grpo.val_period=0"
   "grpo.val_at_start=false"
   "++grpo.val_at_end=false"
   "checkpointing.enabled=false"
@@ -81,6 +82,7 @@ esac
 
 BASE=${BASE:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna}
 CONTROLLER_REPO=${CONTROLLER_REPO:-${BASE}/RL-gb200-deck-refresh-20260818}
+CONTROLLER_BRANCH=${CONTROLLER_BRANCH:-sna/exp-gb200-deck-refresh-20260818}
 if [[ "${STUDY}" == full_ablation ]]; then
   DEFAULT_TARGET_REPO=${BASE}/RL-gb200-pr3294-ablation-313f
 else
@@ -100,7 +102,7 @@ RAY_RUNTIME_VENV=${RAY_RUNTIME_VENV:-${BASE}/.cache/gb200-deck-refresh/ray-runti
 WANDB_PROJECT=${WANDB_PROJECT:-sna-gb200-${STUDY}}
 WANDB_NAME=${WANDB_NAME:-qwen30-sync-${STUDY}-${ARM}-${MAX_STEPS}step-${RUN_SUFFIX}}
 
-git -C "${CONTROLLER_REPO}" pull --ff-only origin sna/exp-gb200-deck-refresh-20260818
+git -C "${CONTROLLER_REPO}" pull --ff-only origin "${CONTROLLER_BRANCH}"
 test "$(git -C "${TARGET_REPO}" rev-parse HEAD)" = "${TARGET_COMMIT}"
 test -z "$(git -C "${TARGET_REPO}" status --porcelain --untracked-files=no --ignore-submodules=all)"
 git -C "${TARGET_REPO}" submodule update --init --recursive
@@ -180,8 +182,8 @@ export TORCH_CUDA_ARCH_LIST=10.0
 export PYTHONPATH=${TARGET_REPO}
 export UV_CACHE_DIR=${CACHE_ROOT}/uv-cache
 export UV_PYTHON=${RAY_RUNTIME_VENV}/bin/python
-export UV_PROJECT_ENVIRONMENT=${CACHE_ROOT}/driver-venv-py31314
-export UV_PYTHON_INSTALL_DIR=${CACHE_ROOT}/uv-python
+export UV_PROJECT_ENVIRONMENT=/tmp/nemo_rl_driver_venvs/gb200-deck-refresh/${STUDY}/${ARM}/${RUN_SUFFIX}
+export UV_PYTHON_INSTALL_DIR=/tmp/nemo_rl_uv_python/gb200-deck-refresh/${STUDY}/${ARM}/${RUN_SUFFIX}
 export UV_LOCK_TIMEOUT=7200
 export WANDB_API_KEY="\$(cat ${WANDB_KEY_FILE})"
 ${RUNTIME_TOGGLE_EXPORTS}
@@ -205,7 +207,7 @@ export CONTAINER
 export CONTAINER_REMAP_ROOT=1
 export GPUS_PER_NODE=4
 export MOUNTS=/lustre:/lustre
-export UV_CACHE_DIR_OVERRIDE=${CACHE_ROOT}/uv-cache
+unset UV_CACHE_DIR_OVERRIDE
 
 exec sbatch "${SBATCH_ACTION[@]}" \
   --nodes=4 \

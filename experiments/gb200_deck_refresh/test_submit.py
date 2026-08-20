@@ -145,6 +145,7 @@ def test_pr3294_baseline_disables_all_three_refit_optimizations() -> None:
     assert "policy.generation.vllm_cfg.refit_prequantize=false" in result.stdout
     assert "NRL_MXFP8_BATCHED_SHUFFLE=0" in result.stdout
     assert "NRL_REFIT_CACHED_LOADERS=0" in result.stdout
+    assert "grpo.val_period=0" in result.stdout
 
 
 def test_full_ablation_exports_runtime_toggles_outside_hydra() -> None:
@@ -191,3 +192,5 @@ def test_ablation_driver_uses_same_python_as_ray_cluster() -> None:
     assert "export UV_PYTHON=${RAY_RUNTIME_VENV}/bin/python" in script
     assert "status --porcelain --untracked-files=no --ignore-submodules=all" in script
     assert "submodule status --recursive | grep -q '^[+-U]'" in script
+    assert "unset UV_CACHE_DIR_OVERRIDE" in script
+    assert "UV_PROJECT_ENVIRONMENT=/tmp/" in script
