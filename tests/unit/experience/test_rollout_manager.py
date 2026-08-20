@@ -1006,25 +1006,6 @@ class _FakeCaptureBuffer(_FakeBuffer):
         )
 
 
-class _FakeGymEnvHandle:
-    """NemoGym actor stand-in exposing fail_rollouts.remote."""
-
-    def __init__(self):
-        self.failed: list[tuple[list[str], str]] = []
-        outer = self
-
-        class _FailRollouts:
-            def remote(self, rollout_ids, reason):
-                outer.failed.append((list(rollout_ids), reason))
-
-                async def _done():
-                    return None
-
-                return _done()
-
-        self.fail_rollouts = _FailRollouts()
-
-
 def _receipt_record(rollout_ids, receipts):
     completions = [
         Completion(
@@ -1050,7 +1031,7 @@ def _make_capture_manager(buf, *, on_run=None, num_generations=2):
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
     mgr._tq_buffer = buf
-    mgr._env_handles = {"nemo_gym": _FakeGymEnvHandle()}
+    mgr._env_handles = {}
     mgr._weight_version = 7
 
     class _CaptureImpl:
@@ -1090,9 +1071,8 @@ class TestGenerateForFinalizationFlow:
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.
         assert buf.commit_calls == []
-        assert mgr._env_handles["nemo_gym"].failed == []
 
-    def test_failed_dispatch_aborts_and_fails_gate_rollouts(self):
+    def test_failed_dispatch_aborts_the_reservation(self):
         buf = _FakeCaptureBuffer()
 
         async def _boom(_sample):
@@ -1101,8 +1081,6 @@ class TestGenerateForFinalizationFlow:
         mgr = _make_capture_manager(buf, on_run=_boom)
         with pytest.raises(RuntimeError, match="rollout exploded"):
             _run(mgr.generate_for_finalization({"prompt": "p"}))
+        # The slot is released; abandoned staged rows are swept with the
+        # staging partition at run end (no per-rollout control-plane call).
         assert len(buf.abort_calls) == 1
-        (failed_ids, reason) = mgr._env_handles["nemo_gym"].failed[0]
-        (group_id,) = [buf.abort_calls[0]]
-        assert failed_ids == [f"{group_id}_g0", f"{group_id}_g1"]
-        assert reason == "dispatch_failed"

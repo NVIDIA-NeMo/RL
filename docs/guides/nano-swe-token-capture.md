@@ -1,9 +1,9 @@
-# Nano SWE RL with Gate-Authoritative Token Capture
+# Nano SWE RL with Ledger-Authoritative Token Capture
 
 A reproducible 6-node recipe that runs agentic SWE RL on
 Nemotron-3-Nano-30B-A3B with **exact-token capture** enabled: the vLLM worker
 stages each model call's token delta durably into the TransferQueue data
-plane, the Gym gate serves verified prefix token ids back on every follow-up
+plane, the Gym capture ledger serves verified prefix token ids back on every follow-up
 call (token-in), and the trainer consumes rows rebuilt from the staged deltas.
 No token echo over HTTP, no re-tokenization of agent history — the tokens the
 engine sampled are byte-for-byte the tokens the trainer sees.
@@ -45,29 +45,29 @@ The call flow for a single SWE rollout, end to end:
 1. **Dispatch.** The `SingleControllerActor`'s rollout pump pulls a prompt
    group from the dataset and hands it to the NemoGym environment actor,
    which POSTs `/run` to the `swe_agents_train` Gym server. The run body
-   carries a fresh `ng_rollout_id`; RL **registers** the rollout with the gate
-   (control plane) before dispatch and mounts the returned rollout-local data
-   capability into the agent sandbox without serializing the secret.
+   carries a fresh `ng_rollout_id`. There is no registration step: the
+   rollout's ledger file is created lazily by its first committed call.
 2. **Sandbox + agent.** The SWE harness materializes the SWE-bench instance
    in a sandbox and starts the OpenHands agent. The rollout id is snapshotted
    into the agent's config so every LLM request uses the rollout-prefixed
-   route and its data-capability header. The capability file is mode `0600`
-   and is removed when the request finishes.
+   token-capture route.
 3. **Agent turn loop.** Each turn, OpenHands POSTs `/v1/chat/completions`
    with the *full rendered history* to the policy model server, which runs
-   in **gate mode**:
-   - the gate admits the call (rejects unregistered rollouts), fingerprints
-     the incoming history, and resolves which previously served call this
-     one continues (its *parent*) in the lineage index;
+   in **ledger mode**:
+   - the server fingerprints the incoming history and resolves which
+     committed ledger row this call continues (its *parent*); admission is a
+     pure function of that lineage result;
    - on a match it attaches the parent's **exact cumulative token ids**
      (`required_prefix_token_ids`) plus a capture context
      (`rollout_id`, `model_call_id`, `parent_call_id`, `prev_len`), and
      forwards the request to a vLLM engine;
-   - no match (a true root, or a rewritten/condensed history) starts a new
-     chain — a fallback, never an error.
-   Gate state and lineage are file-backed under the shared capture directory,
-   so registration, consecutive calls, and sealing may land on different
-   serving workers without losing ancestry.
+   - no assistant-authored history is a true text root; assistant history
+     without one verified committed parent is `UNRESOLVED` and fails closed
+     instead of silently starting a new chain.
+   Lineage and capture custody are stored together in a per-rollout
+   append-only JSONL file under the shared capture directory, so consecutive
+   calls may land on different serving workers without losing ancestry or
+   serializing unrelated rollouts.
 4. **Generate + stage.** The vLLM worker splices the supplied prefix
    verbatim, renders only the new tail through the chat template, and
    generates. Before acknowledging the call it **stages the call's token
@@ -75,18 +75,21 @@ The call flow for a single SWE rollout, end to end:
    (0.0 on carried prompt, 1.0 on generated), and per-token logprobs — to
    the TransferQueue staging partition (synchronous `tq_put`: bytes are
    durable before the response leaves the worker). The response back to the
-   gate carries only text plus token-light `CommitCoords` (~4 B/token).
-5. **Commit.** The gate ingests the coords into its lineage index (this
-   *is* the authoritative commit — the next turn's parent resolution
-   depends on it), strips them, and returns a plain OpenAI-shaped
-   completion to the agent. Steps 3-5 repeat for every tool call the agent
+   ledger carries only text plus token-light `CommitCoords` (~4 B/token).
+5. **Commit.** Gym reconstructs cumulative tokens from the coordinates and
+   appends one ledger row carrying both lineage and staging custody
+   (including the call's `logical_request_id`). This is the authoritative
+   commit the next turn resolves against; Gym strips the coordinates and
+   returns a plain OpenAI-shaped completion to the agent. Steps 3-5 repeat for every tool call the agent
    makes (tool execution happens agent-side between turns).
-6. **Verify + seal.** When the agent finishes, the harness runs the
-   SWE-bench verifier to score the patch (reward 0/1). The `/run` response
-   returns the reward plus a **token-free `RolloutReceipt`**: the ordered
-   manifest of committed calls (model-call ids, staging keys, digests, weight
-   versions) and a `terminal_model_call_id` naming the chain that is the
-   training row.
+6. **Verify + assemble.** When the agent finishes, the harness runs the
+   SWE-bench verifier to score the patch (reward 0/1) and reports the
+   terminal response id. RL fetches the rollout's **token-free manifest**
+   (`GET /training-token-capture/rollouts/{id}/manifest`) and assembles the
+   `RolloutReceipt` locally: the manifest of committed calls (model-call ids,
+   staging keys, digests, weight versions), a `terminal_model_call_id`
+   selected by the terminal logical request id, and fail-closed poisoning
+   (any failure row, or a missing terminal row, masks the rollout).
 7. **Finalize.** The controller constructs a metadata-only
    `FinalizationRequest`, releases the rollout concurrency permit, and submits
    it to a fixed pool of CPU Ray actors. Each actor owns a connect-only TQ
@@ -107,9 +110,8 @@ The call flow for a single SWE rollout, end to end:
 The token path in that flow, compressed:
 
 ```
-agent (nv-OpenHands)                     gate (vllm_model, gate mode)
-  prefixed path + data capability  ───►  admits registered calls,
-                                         fingerprints incoming history →
+agent (nv-OpenHands)                     ledger (vllm_model, external staging)
+  rollout-prefixed capture path    ───►  fingerprints incoming history →
                                          resolves the parent call → sends the
                                          parent's exact prefix token ids
                                               │  required_prefix_token_ids
@@ -120,23 +122,23 @@ vLLM worker: splices the prefix verbatim, renders only the new tail,
   acked — and returns token-light CommitCoords on the response
                                               │  coords (≈4 B/token)
                                               ▼
-gate ingests coords into its lineage index; when the rollout ends it
-returns a token-free RolloutReceipt (a manifest of model_call_ids and staging
-keys) on the /run response
+ledger atomically publishes coords + lineage; when the rollout ends RL
+fetches the token-free manifest (model_call_ids and staging keys) from the
+control route and assembles the RolloutReceipt itself
                                               ▼
 fixed CPU Ray finalizer pool: accepts metadata only, fetches staged deltas
 by key, verifies digests, rebuilds the exact row, and publishes it to TQ
 ```
 
 The heavy bytes (token arrays, logprobs) move exactly once, worker→TQ,
-node-locally. The gate hop and the `/run` response stay token-light.
+node-locally. The ledger hop and the `/run` response stay token-light.
 
 The pieces, by repo:
 
 | Component | Where |
 |---|---|
-| Gate mode, prefix serving, lineage | Gym `responses_api_models/vllm_model/app.py` + `nemo_gym/token_id_capture/gate.py` |
-| Rollout attribution + capability custody | Gym capture middleware + `swe_agents` sandbox mount/header forwarding |
+| Ledger mode, prefix serving, lineage | Gym `responses_api_models/vllm_model/app.py` + `nemo_gym/token_id_capture/lineage.py` |
+| Rollout attribution | Gym capture middleware + `swe_agents` rollout-prefixed routing |
 | Wire schema (deltas, coords, receipts) | Gym `nemo_gym/token_id_capture/staging/records.py` |
 | Worker-side capture + prefix splice | `nemo_rl/models/generation/vllm/vllm_worker_async.py` |
 | Staging sink/source over TransferQueue | `nemo_rl/data_plane/tq_token_sink.py` |
@@ -200,8 +202,8 @@ DRY_RUN=0 SC_EXP_NAME=my-capture-smoke NG_TIC_FP_CANONICAL=1 \
 `2 × 4 = 8`. The finalizer pool is mandatory whenever capture is enabled,
 and `num_finalizer_workers` must be positive. There is no pool enable/disable
 or legacy-inline-finalizer flag. The smoke deliberately runs two Gym policy
-model workers; their gate state and lineage are shared, so it does not rely on
-single-worker request affinity.
+model workers; their per-rollout ledger files are shared, so it does not rely
+on single-worker request affinity. Different rollouts use different locks.
 
 The 1h49 allocation is suitable when the model and compilation caches are
 warm and automatically selects the `short` QOS in `ultra_launch.sh`. For a
@@ -245,7 +247,7 @@ its absence broke a run:
 | `token_capture.enabled=true` | Capture never engages. The launcher flips the config's default. Enabling it always constructs the fixed CPU finalizer actor pool sized by `token_capture.num_finalizer_workers`; there is no inline fallback. |
 | `token_capture.defer_routed_experts_to_policy=true` + `+policy.router_replay.enabled=true` | The validated R3 posture keeps routed-expert tensors out of controller RPCs and canonical rows, then reconstructs them on policy workers from staged-fragment plans. Set both together. |
 | `async_rl.sampler.name=windowed` + `max_staleness_versions=1` | The smoke does not exercise the intended bounded-staleness sampling policy. |
-| `NG_TIC_FP_CANONICAL=1` | Token-in silently degrades to ~0: reasoning models echo history with `<think>` blocks stripped, the gate's fingerprint of the served turn never matches, and every call falls back to text mode. With it, `token_in_rate ≈ 0.9999`. |
+| `NG_TIC_FP_CANONICAL=1` | Reasoning models otherwise echo history with `<think>` blocks stripped, so the ledger cannot verify a unique parent and fails the call as `UNRESOLVED`. With canonical fingerprints, `token_in_rate ≈ 0.9999`. |
 | `NRL_DRIVER_PYTHONPATH=/opt/nemo-rl/3rdparty/Gym-workspace/Gym` | Driver `ModuleNotFoundError: nemo_gym` — the driver imports the staging record schema, and the baked driver venv has no nemo_gym. |
 | `NRL_DRIVER_PIP_INSTALL=orjson` | Driver `ModuleNotFoundError: orjson` — Gym's `token_id_capture/__init__` eagerly imports the store. |
 | `NRL_DRIVER_UV_RUN_FLAGS="--locked --no-sync"` | `uv run` otherwise replaces the prefetched driver environment and can give the driver a different Python/Ray version from the already-running Ray cluster. Lock mutation is forbidden; worker-specific environments are still rebuilt. |
@@ -257,21 +259,21 @@ its absence broke a run:
 
 Config echo is not evidence. Check, in order:
 
-1. **Gate metrics in the SC step output.** Grade from the SC worker `.out`
-   under `<job>-logs/ray/session_*/logs/worker-*-<pid>.out` — the driver
-   log's actor-stdout forwarding is not reliable and can make a healthy run
-   look stalled:
+1. **Ledger-derived admission counters in the finalize metrics.** Each
+   manifest row records its admission mode, and the finalizer aggregates them
+   per group into `step_metrics` (W&B prefix `train`):
 
    ```
-   gate_metrics={'registered': 128.0, 'admitted': 7048.0,
-                 'token_in': 7042.0, 'text': 6.0,
-                 'capture_failed': 0.0, ...}
+   finalize/token_in_calls, finalize/text_root_calls,
+   finalize/token_in_rate, finalize/capture_poisoned_rollouts
    ```
 
-   `token_in / admitted` should be ≥ 0.99 after the root calls. A rate near 0
-   with a large `text` count means canonical fingerprints are off (see above).
-   `capability_rejected` or `unattributed_calls` above zero means the harness
-   is not forwarding the rollout capability/path correctly.
+   `finalize/token_in_rate` should be ≥ 0.99 after the root calls (each chain
+   opens with exactly one `text` root). A rate near 0 with a large
+   `text_root_calls` count means canonical fingerprints are off (see above).
+   Nonzero `capture_poisoned_rollouts` means calls are failing admission or
+   commit — check the model-server logs for `unresolved_parent` /
+   `worker_capture_failed` poison reasons.
 
 2. **Finalizer-pool health.** In `step_metrics`, require
    `finalize/invalid_row_rate=0` and, for the R3 command above,

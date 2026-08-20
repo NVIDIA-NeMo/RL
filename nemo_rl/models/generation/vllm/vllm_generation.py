@@ -536,12 +536,12 @@ class VllmGeneration(GenerationInterface):
     def setup_token_capture(
         self, dp_cfg: dict[str, Any], staging_partition: str
     ) -> None:
-        """Install gate-authoritative token capture in every DP-leader worker.
+        """Install ledger-authoritative token capture in every DP-leader worker.
 
         Called once at setup when ``token_capture.enabled``; each async worker
         builds its in-worker data-plane client + TQTokenSink and makes the
         single Gym ``install_capture`` call (see
-        docs/design-docs/tq-gym-gate-authoritative.md § 9.1).
+        docs/design-docs/token-capture-ledger.md).
         """
         assert self.cfg["vllm_cfg"]["async_engine"], (
             "token capture requires the async vLLM engine (the capture host "

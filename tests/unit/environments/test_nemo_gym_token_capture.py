@@ -22,35 +22,29 @@ from nemo_rl.environments.nemo_gym import NemoGym
 
 def _capture_env() -> NemoGym:
     env_cls = NemoGym.__ray_metadata__.modified_class
-    env = object.__new__(env_cls)
-    env._control_owner_id = "owner-1"
-    return env
+    return object.__new__(env_cls)
 
 
-def test_register_rollouts_returns_capabilities_and_uses_idempotent_ownership() -> None:
-    env = _capture_env()
-    env._control = AsyncMock(
-        side_effect=[
-            {"data_capability": "cap-r0"},
-            {"data_capability": "cap-r1"},
-        ]
-    )
-
-    capabilities = asyncio.run(env.register_rollouts(["r0", "r1"]))
-
-    assert capabilities == {"r0": "cap-r0", "r1": "cap-r1"}
-    for rollout_id, call in zip(("r0", "r1"), env._control.await_args_list):
-        assert call.args == (
-            "PUT",
-            f"/training-token-capture/control/rollouts/{rollout_id}",
-        )
-        assert call.kwargs["json"]["owner_id"] == "owner-1"
-        assert call.kwargs["json"]["operation_id"].startswith("register-")
+def _manifest_record(call_id: str, *, logical_request_id: str, parent: str | None = None) -> dict:
+    prev_len = 0 if parent is None else 900
+    return {
+        "model_call_id": call_id,
+        "parent_call_id": parent,
+        "prev_len": prev_len,
+        "delta_len": 100,
+        "cum_len": prev_len + 100,
+        "weight_version": 3,
+        "digest": "a" * 64,
+        "extras_digest": "b" * 64,
+        "staging_key": f"r0/{call_id}",
+        "mode": "text" if parent is None else "token_in",
+        "logical_request_id": logical_request_id,
+    }
 
 
 def test_receipt_postprocess_fails_closed_without_a_terminal_logical_id() -> None:
     env = _capture_env()
-    env.fail_rollouts = AsyncMock()
+    env._control = AsyncMock()
 
     result = asyncio.run(
         env._postprocess_receipt_mode(
@@ -59,32 +53,96 @@ def test_receipt_postprocess_fails_closed_without_a_terminal_logical_id() -> Non
         )
     )
 
-    env.fail_rollouts.assert_awaited_once_with(
-        ["r0"], reason="missing_terminal_logical_request_id"
-    )
+    env._control.assert_not_awaited()
     assert result["receipt"] is None
 
 
-def test_receipt_postprocess_seals_the_trusted_logical_terminal() -> None:
+def test_receipt_postprocess_fetches_manifest_and_selects_terminal_row() -> None:
     env = _capture_env()
-    env._control = AsyncMock(return_value={"rollout_id": "r0", "manifest": []})
+    records = [
+        _manifest_record("c1", logical_request_id="lr-1"),
+        _manifest_record("c2", logical_request_id="lr-2", parent="c1"),
+    ]
+    env._control = AsyncMock(
+        return_value={"rollout_id": "r0", "records": records, "failures": []}
+    )
 
     result = asyncio.run(
         env._postprocess_receipt_mode(
             {"_ng_rollout_id": "r0"},
-            {
-                "reward": 1.0,
-                "terminal_logical_request_id": "logical-terminal",
-            },
+            {"reward": 1.0, "terminal_logical_request_id": "lr-2"},
         )
     )
 
     call = env._control.await_args
     assert call.args == (
-        "POST",
-        "/training-token-capture/control/rollouts/r0/seal",
+        "GET",
+        "/training-token-capture/control/rollouts/r0/manifest",
     )
-    assert call.kwargs["json"]["owner_id"] == "owner-1"
-    assert call.kwargs["json"]["operation_id"].startswith("seal-")
-    assert call.kwargs["json"]["terminal_logical_request_id"] == ("logical-terminal")
-    assert result["receipt"] == {"rollout_id": "r0", "manifest": []}
+    receipt = result["receipt"]
+    assert receipt["rollout_id"] == "r0"
+    assert receipt["terminal_model_call_id"] == "c2"
+    assert receipt["capture_poisoned"] is False
+    assert receipt["failure_reason"] is None
+    assert receipt["reward"] == 1.0
+    assert [r["model_call_id"] for r in receipt["manifest"]] == ["c1", "c2"]
+
+
+def test_receipt_assembly_poisons_on_failure_rows() -> None:
+    env = _capture_env()
+    manifest = {
+        "rollout_id": "r0",
+        "records": [_manifest_record("c1", logical_request_id="lr-1")],
+        "failures": [{"model_call_id": "c2", "reason": "worker_capture_failed"}],
+    }
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_logical_request_id="lr-1", reward=0.0
+    )
+    assert receipt["capture_poisoned"] is True
+    assert receipt["failure_reason"] == "worker_capture_failed"
+
+
+def test_receipt_assembly_poisons_when_the_terminal_row_is_missing() -> None:
+    env = _capture_env()
+    manifest = {
+        "rollout_id": "r0",
+        "records": [_manifest_record("c1", logical_request_id="lr-1")],
+        "failures": [],
+    }
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_logical_request_id="lr-lost", reward=0.0
+    )
+    assert receipt["capture_poisoned"] is True
+    assert receipt["failure_reason"] == "missing_terminal_row"
+    assert receipt["terminal_model_call_id"] is None
+
+
+def test_receipt_assembly_keeps_dead_branch_siblings_in_the_manifest() -> None:
+    """A retry sibling stays enumerable (its staged row must be cleaned) but
+    never becomes the terminal call."""
+    env = _capture_env()
+    records = [
+        _manifest_record("c1", logical_request_id="lr-1"),
+        _manifest_record("c2", logical_request_id="lr-2", parent="c1"),
+        _manifest_record("c2r", logical_request_id="lr-2r", parent="c1"),
+    ]
+    manifest = {"rollout_id": "r0", "records": records, "failures": []}
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_logical_request_id="lr-2r", reward=1.0
+    )
+    assert receipt["terminal_model_call_id"] == "c2r"
+    assert receipt["capture_poisoned"] is False
+    assert {r["model_call_id"] for r in receipt["manifest"]} == {"c1", "c2", "c2r"}
+
+
+def test_receipt_postprocess_returns_placeholder_on_fetch_failure() -> None:
+    env = _capture_env()
+    env._control = AsyncMock(side_effect=RuntimeError("control plane down"))
+
+    result = asyncio.run(
+        env._postprocess_receipt_mode(
+            {"_ng_rollout_id": "r0"},
+            {"reward": 1.0, "terminal_logical_request_id": "lr-1"},
+        )
+    )
+    assert result["receipt"] is None

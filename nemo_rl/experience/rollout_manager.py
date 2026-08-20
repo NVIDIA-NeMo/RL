@@ -783,8 +783,6 @@ class RolloutManager:
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
-        # The NeMo-Gym env handle doubles as the gate control-plane proxy
-        # (gate_metrics / fail_rollouts) on the capture path.
         self._env_handles = task_to_env
         self._weight_version: int = 0
 
@@ -795,20 +793,6 @@ class RolloutManager:
             version: Trainer weight version to stamp on future rollout tags.
         """
         self._weight_version = int(version)
-
-    async def gate_metrics(self) -> Optional[dict[str, int]]:
-        """Fetch the capture gate's § 8 counters, or None off the capture path.
-
-        Returns:
-            Cumulative gate counters (token_in, fallback_*, capture_failed,
-            registered/sealed/failed/expired) from Gym's token-capture control
-            metrics route,
-            or None when no NemoGym env handle is wired.
-        """
-        env = self._env_handles.get("nemo_gym") if self._env_handles else None
-        if env is None:
-            return None
-        return await env.gate_metrics.remote()
 
     async def run_rollout(
         self, input_sample: DatumSpec, *, rollout_ids: Optional[list[str]] = None
@@ -926,10 +910,10 @@ class RolloutManager:
             assert_metadata_only(request)
             return request
         except BaseException:
+            # Abandoned dispatch: no receipt will name these rollouts' staged
+            # rows, so they leak until the staging partition is torn down at
+            # run end (there is no prefix-clear primitive in the data plane
+            # yet). Their ledger files are inert — failure rows or missing
+            # terminal rows keep any later read fail-closed.
             self._tq_buffer.abort(group_id)
-            nemo_gym_env = self._env_handles.get("nemo_gym")
-            if nemo_gym_env is not None:
-                await nemo_gym_env.fail_rollouts.remote(
-                    list(rollout_ids), reason="dispatch_failed"
-                )
             raise

@@ -657,7 +657,7 @@ class TQReplayBuffer:
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
-        # Token-capture mode only (docs/design-docs/tq-gym-gate-authoritative.md):
+        # Token-capture mode only (docs/design-docs/token-capture-ledger.md):
         # the staging partition whose per-call delta rows `remove` must clear
         # alongside the canonical rows. None on the legacy path.
         self._staging_partition_id = staging_partition_id
@@ -687,7 +687,7 @@ class TQReplayBuffer:
             weight_version: Weight version stamped on the slot.
             target_step: Training step this slot targets; only consulted by StalenessSampler.force_in_order.
             group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
-            rollout_ids: Token-capture mode: the gate-registered rollout ids
+            rollout_ids: Token-capture mode: the ledger-registered rollout ids
                 this slot dispatched, recorded so cleanup can name what it
                 owns even before a receipt exists.
 

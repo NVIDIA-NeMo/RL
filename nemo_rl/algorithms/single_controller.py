@@ -837,8 +837,6 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 timing_metrics, step=self._train_steps, prefix="timing/train"
             )
-            if self._master_config.token_capture.enabled:
-                await self._log_gate_metrics()
             self._timer.reset()
 
             # min sample version refers to the version each consumed sample was
@@ -959,27 +957,6 @@ class SingleControllerActor:
             )
         self._rollout_permitted.set()
         return aborted_stale_inflight_groups
-
-    async def _log_gate_metrics(self) -> None:
-        """Log the capture gate's cumulative § 8 counters + token_in_rate.
-
-        Counters are cumulative over the run; ``gate/token_in_rate`` is the
-        cumulative marker-hit rate over all admitted model calls. Fetch
-        failures are logged and swallowed — metrics must never kill a step.
-        """
-        try:
-            counters = await self._rollout_manager.gate_metrics()
-        except (RuntimeError, OSError) as error:
-            print(f"gate metrics fetch failed: {error}", flush=True)
-            return
-        if not counters:
-            return
-        calls = counters.get("admitted", 0)
-        gate_metrics: dict[str, float] = {k: float(v) for k, v in counters.items()}
-        if calls:
-            gate_metrics["token_in_rate"] = counters.get("token_in", 0) / calls
-        self._logger.log_metrics(gate_metrics, step=self._train_steps, prefix="gate")
-        print(f"gate_metrics={gate_metrics}", flush=True)
 
     async def _advantage_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Fetch advantage inputs, compute advantages, and write them back.

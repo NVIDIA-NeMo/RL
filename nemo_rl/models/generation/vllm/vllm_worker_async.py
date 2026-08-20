@@ -101,9 +101,9 @@ class VllmAsyncGenerationWorkerImpl(
         self.base_url = None
         self.http_server = None
 
-        # Gate-authoritative token capture (dormant until the
+        # Ledger-authoritative token capture (dormant until the
         # setup_token_capture fan-out runs; see
-        # docs/design-docs/tq-gym-gate-authoritative.md § 9.1). The weight
+        # docs/design-docs/token-capture-ledger.md). The weight
         # version is stamped per model call at begin_call time and rotated by
         # the set_rollout_weight_version fan-out from the SC's _sync_weights.
         self.token_capture = None
@@ -364,7 +364,7 @@ class VllmAsyncGenerationWorkerImpl(
     async def setup_token_capture(
         self, dp_cfg: dict[str, Any], staging_partition: str
     ) -> bool:
-        """Host gate-authoritative token capture in this worker.
+        """Host ledger-authoritative token capture in this worker.
 
         Fan-out target (token_capture.enabled only): builds the in-worker
         data-plane client and TQTokenSink, then makes the single
@@ -396,11 +396,11 @@ class VllmAsyncGenerationWorkerImpl(
         self._rollout_weight_version = int(version)
 
     def _begin_request_capture(self, request: Any, prompt_token_ids: list[int]) -> None:
-        """Admit one gate-forwarded call into the capture layer.
+        """Admit one ledger-forwarded call into the capture layer.
 
         Called from preprocess_chat once the exact engine prompt is known
         (post-splice in token-in mode, full render in text mode). No-op
-        unless capture is installed and the request carries the gate's
+        unless capture is installed and the request carries the ledger's
         ``ng_capture`` context.
         """
         capture = self.token_capture
@@ -750,7 +750,7 @@ class VllmAsyncGenerationWorkerImpl(
             NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest
         ):
             required_prefix_token_ids: Optional[List[int]] = None
-            # Gate-authoritative token capture: the call identity the gate
+            # Ledger-authoritative token capture: the call identity the ledger
             # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
             ng_capture: Optional[dict[str, Any]] = None
 

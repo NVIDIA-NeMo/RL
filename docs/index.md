@@ -153,7 +153,7 @@ Six-node SWE RL smoke on Nemotron-3-Nano-30B-A3B with rollouts flowing through t
 :link: guides/nano-swe-token-capture
 :link-type: doc
 
-Exact-token SWE RL: the worker stages each call's token delta into TransferQueue and the gate serves verified prefixes back — no token echo, no re-tokenization.
+Exact-token SWE RL: the worker stages each call's token delta into TransferQueue and the capture ledger serves verified prefixes back — no token echo, no re-tokenization.
 :::
 
 :::{grid-item-card} {octicon}`plus-circle` Adding New Models
@@ -384,6 +384,8 @@ design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
+design-docs/token-capture-ledger.md
+design-docs/rollout-verification-boundary.md
 design-docs/modelopt-real-quant-architecture.md
 design-docs/nccl-reshard-refit.md
 ```

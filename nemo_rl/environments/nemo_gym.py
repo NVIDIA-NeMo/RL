@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import hashlib
 import math
 import os
 import subprocess
@@ -129,20 +128,19 @@ class NemoGymConfig(TypedDict):
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
     ]  # For processor reconstruction inside the actor
-    # Gate-authoritative token capture (token_capture.enabled): the dumped
-    # TokenCaptureConfig. Turns on the gate in Gym's policy model server,
-    # switches run_rollouts to receipt mode, and adds the register/seal/fail
-    # control-plane helpers. None/absent = legacy token-echo path.
+    # Ledger-authoritative token capture (token_capture.enabled): the dumped
+    # TokenCaptureConfig. Turns on external staging in Gym's policy model
+    # server, switches run_rollouts to receipt mode, and assembles receipts
+    # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
 
 
-# Gym control-plane server name (the model server hosting the gate) and the
+# Gym control-plane server name (the model server hosting the ledger) and the
 # opaque run-body key rollout ids ride on (Gym's ROLLOUT_ID_KEY_NAME): the
 # agent derives the id from the run body and stamps /ng-rollout/<id> on every
 # model call, so the TQ sample id IS the capture key end to end.
 _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
-_NG_CAPTURE_CAPABILITY_BODY_KEY = "_ng_capture_capability"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 
@@ -479,12 +477,12 @@ Depending on your data shape, you may want to change these values."""
             "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
         )
 
-        # Gate-authoritative token capture: turn on the gate in the policy
-        # model server (via the policy_model global-config override block the
-        # env yamls already use) and disable the legacy token echo. Receipt
-        # mode is incompatible with re-dispatching a batch under the same
-        # rollout ids, so the NaN retry must be exactly 1 (create-only
-        # registration would fail the retry loudly anyway; fail at setup).
+        # Ledger-authoritative token capture: enable external staging in the
+        # policy model server (via the policy_model global-config override
+        # block the env yamls already use) and disable the legacy token echo.
+        # Receipt mode is incompatible with re-dispatching a batch under the
+        # same rollout ids — the retry's calls would resolve against the
+        # first attempt's ledger rows — so the NaN retry must be exactly 1.
         token_capture = self.cfg.get("token_capture") or None
         self._token_capture_enabled = bool(
             token_capture and token_capture.get("enabled")
@@ -492,13 +490,12 @@ Depending on your data shape, you may want to change these values."""
         self._server_client = None
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
-        self._control_owner_id = f"nemo-rl-{os.getpid()}-{id(self):x}"
         if self._token_capture_enabled:
             if self.rollout_max_attempts_to_avoid_lp_nan != 1:
                 raise ValueError(
                     "token_capture.enabled requires "
                     "rollout_max_attempts_to_avoid_lp_nan == 1: a NaN retry "
-                    "would re-register create-only rollout ids at the gate"
+                    "would resolve against the first attempt's ledger rows"
                 )
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
@@ -512,18 +509,14 @@ Depending on your data shape, you may want to change these values."""
                 "all_agents": True,
                 "rebuild_response": False,
                 "dir": capture_dir,
-                # Both stores are process-shared. Every uvicorn worker builds
-                # its own handle over these same paths, so token-in ancestry
-                # remains valid when consecutive calls land on different
-                # workers.
+                # The lineage store is process-shared and doubles as the
+                # per-rollout capture ledger. Every uvicorn worker builds its
+                # own handle over the same root, so token-in ancestry remains
+                # valid when consecutive calls land on different workers.
                 "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
-                "gate": {
-                    "enabled": True,
-                    "state_store_path": os.path.join(capture_dir, "gate-state.json"),
-                    "registration_ttl_s": token_capture["registration_ttl_s"],
-                    "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
-                },
+                "external_staging": True,
+                "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
             # only the variable name in serialized config and inherit the
@@ -533,8 +526,8 @@ Depending on your data shape, you may want to change these values."""
                 "Authorization": f"Bearer {token_capture['control_auth_token']}"
             }
             # S5 chaos finding: Gym's shared request() retries connection
-            # errors indefinitely; a dead gate must surface as a failed
-            # dispatch (placeholders + TTL), not a silent stall.
+            # errors indefinitely; a dead control plane must surface as a
+            # failed manifest fetch (placeholder row), not a silent stall.
             self._control_timeout_s = float(
                 token_capture.get("control_timeout_s") or 60.0
             )
@@ -556,7 +549,7 @@ Depending on your data shape, you may want to change these values."""
         )
         self.rch = RolloutCollectionHelper()
 
-    # ── gate control plane (token-capture mode) ─────────────────────────────
+    # ── ledger control plane (token-capture mode) ───────────────────────────
 
     def _control_client(self):
         """Gym ServerClient resolving servers by name from the head server."""
@@ -583,60 +576,15 @@ Depending on your data shape, you may want to change these values."""
             )
         except asyncio.TimeoutError:
             raise RuntimeError(
-                f"gate control call {method} {path} exceeded "
-                f"{self._control_timeout_s}s (gate unreachable or stalled)"
+                f"ledger control call {method} {path} exceeded "
+                f"{self._control_timeout_s}s (control plane unreachable or stalled)"
             ) from None
         if response.status != 200:
             raise RuntimeError(
-                f"gate control call {method} {path} failed: "
+                f"ledger control call {method} {path} failed: "
                 f"HTTP {response.status} {await response.text()}"
             )
         return await response.json()
-
-    def _control_operation_id(self, operation: str, rollout_id: str) -> str:
-        payload = f"{self._control_owner_id}\0{operation}\0{rollout_id}".encode()
-        return f"{operation}-{hashlib.sha256(payload).hexdigest()}"
-
-    async def register_rollouts(self, rollout_ids: list[str]) -> dict[str, str]:
-        """Register each rollout and return its worker-facing data capability."""
-        capabilities: dict[str, str] = {}
-        for rollout_id in rollout_ids:
-            registration = await self._control(
-                "PUT",
-                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}",
-                json={
-                    "owner_id": self._control_owner_id,
-                    "operation_id": self._control_operation_id("register", rollout_id),
-                },
-            )
-            capability = registration.get("data_capability")
-            if not isinstance(capability, str) or not capability:
-                raise RuntimeError(
-                    f"gate registration for {rollout_id} returned no data capability"
-                )
-            capabilities[rollout_id] = capability
-        return capabilities
-
-    async def fail_rollouts(self, rollout_ids: list[str], *, reason: str) -> None:
-        """Best-effort gate cleanup for a cancelled/failed dispatch (§ 7)."""
-        for rollout_id in rollout_ids:
-            try:
-                await self._control(
-                    "POST",
-                    f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/fail",
-                    json={
-                        "owner_id": self._control_owner_id,
-                        "operation_id": self._control_operation_id("fail", rollout_id),
-                        "reason": reason,
-                    },
-                )
-            except (RuntimeError, OSError) as error:
-                # The registration TTL is the backstop when the gate is
-                # unreachable during teardown.
-                print(f"fail_rollout({rollout_id}) failed: {error}", flush=True)
-
-    async def gate_metrics(self) -> dict:
-        return await self._control("GET", f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/metrics")
 
     async def run_rollouts(
         self,
@@ -660,16 +608,6 @@ Depending on your data shape, you may want to change these values."""
         # examples with base64 data URLs before shipping to vLLM. No-op when
         # examples carry no `input_image` items (text-only case).
         encode_images_in_examples(nemo_gym_examples)
-
-        if self._token_capture_enabled:
-            # Receipt mode: register the ids riding each row's run body
-            # before dispatch; seal at completion.
-            rollout_ids = [
-                example[_NG_ROLLOUT_ID_BODY_KEY] for example in nemo_gym_examples
-            ]
-            capabilities = await self.register_rollouts(rollout_ids)
-            for example, rollout_id in zip(nemo_gym_examples, rollout_ids):
-                example[_NG_CAPTURE_CAPABILITY_BODY_KEY] = capabilities[rollout_id]
 
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
@@ -701,9 +639,10 @@ Depending on your data shape, you may want to change these values."""
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 if self._token_capture_enabled:
-                    # Receipt mode: seal at the gate; token-free result. The
-                    # canonical row is rebuilt by the finalizer, so no
-                    # message_log walk (and no NaN check) applies here.
+                    # Receipt mode: fetch the ledger manifest and assemble the
+                    # receipt locally; token-free result. The canonical row is
+                    # rebuilt by the finalizer, so no message_log walk (and no
+                    # NaN check) applies here.
                     nemo_rl_result = await self._postprocess_receipt_mode(
                         nemo_gym_row, nemo_gym_result
                     )
@@ -749,11 +688,11 @@ Depending on your data shape, you may want to change these values."""
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict
     ) -> dict:
-        """Seal the rollout and return a token-free result (§ 9.1).
+        """Fetch the ledger manifest and assemble the receipt locally.
 
         The legacy token walk (and its contiguity assert) does not run: the
-        gate owns lineage now, output items carry no token arrays, and the
-        canonical row is rebuilt by the finalizer from staged deltas. The
+        capture ledger owns lineage, output items carry no token arrays, and
+        the canonical row is rebuilt by the finalizer from staged deltas. The
         Ray return carries only the receipt (~100 B/call) beside the
         agent-level result.
         """
@@ -762,41 +701,78 @@ Depending on your data shape, you may want to change these values."""
         )
         rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
         terminal_logical_request_id = nemo_gym_result.get("terminal_logical_request_id")
-        if not isinstance(terminal_logical_request_id, str) or not (
-            terminal_logical_request_id
-        ):
-            await self.fail_rollouts(
-                [rollout_id], reason="missing_terminal_logical_request_id"
-            )
-            return {
-                "message_log": [],
-                "input_message_log": [],
-                "full_result": nemo_gym_result,
-                "rollout_id": rollout_id,
-                "receipt": None,
-            }
-        try:
-            receipt = await self._control(
-                "POST",
-                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/seal",
-                json={
-                    "owner_id": self._control_owner_id,
-                    "operation_id": self._control_operation_id("seal", rollout_id),
-                    "terminal_logical_request_id": terminal_logical_request_id,
-                    "reward": float(nemo_gym_result.get("reward") or 0.0),
-                },
-            )
-        except (RuntimeError, OSError) as error:
-            # An unsealable rollout finalizes as a placeholder; the gate's
-            # registration TTL sweeps its state.
-            print(f"seal({rollout_id}) failed: {error}", flush=True)
-            receipt = None
+        receipt = None
+        if isinstance(terminal_logical_request_id, str) and terminal_logical_request_id:
+            try:
+                manifest = await self._control(
+                    "GET",
+                    f"{_TOKEN_CAPTURE_CONTROL_PREFIX}"
+                    f"/rollouts/{rollout_id}/manifest",
+                )
+                receipt = self._assemble_receipt(
+                    rollout_id,
+                    manifest,
+                    terminal_logical_request_id=terminal_logical_request_id,
+                    reward=float(nemo_gym_result.get("reward") or 0.0),
+                )
+            except (RuntimeError, OSError) as error:
+                # An unfetchable manifest finalizes as a placeholder row.
+                print(f"manifest({rollout_id}) fetch failed: {error}", flush=True)
         return {
             "message_log": [],
             "input_message_log": [],
             "full_result": nemo_gym_result,
             "rollout_id": rollout_id,
             "receipt": receipt,
+        }
+
+    @staticmethod
+    def _assemble_receipt(
+        rollout_id: str,
+        manifest: dict,
+        *,
+        terminal_logical_request_id: str,
+        reward: float,
+    ) -> dict:
+        """Build the token-free RolloutReceipt payload from a ledger manifest.
+
+        The terminal row is the manifest row whose ``logical_request_id``
+        equals the response id the agent actually kept. Retry duplicates are
+        dead-branch rows: they stay in the manifest (their staged rows are
+        fetched, verified, and cleaned) but never join the terminal chain —
+        ``verify_and_linearize`` tolerates rows unreferenced by the terminal
+        chain. Poisoning is fail-closed: any failure row, or no row for the
+        terminal request, masks the rollout.
+        """
+        records = [dict(record) for record in manifest.get("records") or []]
+        failures = list(manifest.get("failures") or [])
+        deduped: dict[str, dict] = {}
+        for record in records:
+            deduped.setdefault(str(record.get("model_call_id")), record)
+        terminal_record = next(
+            (
+                record
+                for record in deduped.values()
+                if record.get("logical_request_id") == terminal_logical_request_id
+            ),
+            None,
+        )
+        failure_reason = None
+        if failures:
+            failure_reason = str(failures[0].get("reason") or "capture_failed")
+        elif terminal_record is None:
+            failure_reason = "missing_terminal_row"
+        return {
+            "rollout_id": rollout_id,
+            "reward": reward,
+            "terminal_model_call_id": (
+                terminal_record.get("model_call_id")
+                if terminal_record is not None
+                else None
+            ),
+            "manifest": list(deduped.values()),
+            "capture_poisoned": failure_reason is not None,
+            "failure_reason": failure_reason,
         }
 
     def _postprocess_nemo_gym_to_nemo_rl_result(

@@ -302,7 +302,7 @@ def _spinup_gym(master_config: MasterConfig, base_urls: list[str]) -> tuple[Any,
         enable_router_replay=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
-        # Gate config rides into Gym's policy model server (§ 9.1).
+        # Ledger config rides into Gym's policy model server (§ 9.1).
         token_capture=(
             master_config.token_capture.model_dump()
             if master_config.token_capture.enabled
@@ -416,7 +416,7 @@ def setup_single_controller(
         if not _should_use_nemo_gym(master_config):
             raise ValueError(
                 "token_capture.enabled requires the NeMo-Gym rollout path "
-                "(env.should_use_nemo_gym=true) — the gate lives in Gym's "
+                "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
         if generation_config["backend"] != "vllm":
@@ -439,7 +439,7 @@ def setup_single_controller(
             "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
         ] = PY_EXECUTABLES.VLLM_GYM
 
-        # Fill the derived gate-hosting fields (see TokenCaptureConfig): a
+        # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
         # per-run control-plane bearer token and the process-shared capture
         # directory used by every Gym worker.
         if token_capture_cfg.control_auth_token is None:

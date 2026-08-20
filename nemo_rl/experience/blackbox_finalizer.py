@@ -13,7 +13,7 @@
 # limitations under the License.
 """Blackbox finalization: token-free receipts + staged deltas -> canonical rows.
 
-Orchestration only (docs/design-docs/tq-gym-gate-authoritative.md § 5, § 9.1):
+Orchestration only (docs/design-docs/token-capture-ledger.md):
 per rollout, fetch the staged rows the receipt manifest names through the
 ``TokenSource``, re-verify them (digest recomputation over fetched values,
 shape/mask/finite-logprob checks, length chaining, weight-version tag
@@ -530,6 +530,33 @@ class BlackboxFinalizer:
                 sum(len(row.staging_keys) for row in rows) / len(rows)
             ),
         }
+        # Ledger-derived admission counters (per group): each manifest row
+        # carries its admission mode. token_in_rate near 1.0 is the capture
+        # health signal (a text root only opens each chain); this replaces the
+        # deleted gate metrics route.
+        manifest_rows = [
+            record
+            for receipt in receipts
+            if isinstance(receipt, dict)
+            for record in (receipt.get("manifest") or [])
+            if isinstance(record, dict)
+        ]
+        if manifest_rows:
+            token_in_calls = sum(
+                1 for record in manifest_rows if record.get("mode") == "token_in"
+            )
+            metrics["finalize/token_in_calls"] = float(token_in_calls)
+            metrics["finalize/text_root_calls"] = float(
+                len(manifest_rows) - token_in_calls
+            )
+            metrics["finalize/token_in_rate"] = token_in_calls / len(manifest_rows)
+        metrics["finalize/capture_poisoned_rollouts"] = float(
+            sum(
+                1
+                for receipt in receipts
+                if isinstance(receipt, dict) and receipt.get("capture_poisoned")
+            )
+        )
         for row in rows:
             if not row.valid:
                 print(
@@ -660,7 +687,7 @@ class BlackboxFinalizer:
             weight_version=group_min_wv,
         )
         assert sample_ids == rollout_ids, (
-            "canonical sample ids must equal the gate-registered rollout ids: "
+            "canonical sample ids must equal the ledger-registered rollout ids: "
             f"{sample_ids} != {rollout_ids}"
         )
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0

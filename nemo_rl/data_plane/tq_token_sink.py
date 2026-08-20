@@ -14,7 +14,7 @@
 """TransferQueue implementations of NeMo-Gym's token staging protocols.
 
 ``TQTokenSink``/``TQTokenSource`` are NeMo-RL's providers for the
-gate-authoritative capture design (docs/design-docs/tq-gym-gate-authoritative.md):
+ledger-authoritative capture design (docs/design-docs/token-capture-ledger.md):
 the sink is the worker-side write of one model call's token delta to the
 ``rollout_staging`` partition — the design's only heavy token hop — and the
 source is the finalizer's read-back of those rows by staging key. This module

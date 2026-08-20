@@ -75,7 +75,7 @@ loss_fn:
   # Enable a small KL (matches grpo_math_1B_megatron_single_controller.yaml).
   reference_policy_kl_penalty: 0.01
 
-# Gate-authoritative token capture (token-in/token-out via NeMo-Gym; see
+# Ledger-authoritative token capture (token-in/token-out via NeMo-Gym; see
 # docs/guides/nano-swe-token-capture.md). Dormant by default: with
 # enabled=false every legacy codepath behaves exactly as before — flip to
 # true (or override token_capture.enabled=true) for the capture arm.
@@ -88,7 +88,7 @@ token_capture:
   # retains these through policy consumption; direct mode clears in finalizer.
   staging_partition: "rollout_staging"
   # continue: a failed worker-side stage poisons the rollout (placeholder row);
-  # abort: fails the whole rollout at the gate.
+  # abort: fails the whole rollout in the ledger.
   on_capture_failure: "continue"
   # allow: train groups whose calls span a refit (staleness = group's oldest
   # call version); reject: placeholder such rollouts.
@@ -96,16 +96,12 @@ token_capture:
   # Drop the whole group when fewer than this fraction of its rollouts
   # produced valid rows (null keeps every group).
   min_valid_fraction_per_group: null
-  # Gate registration expiry. staging_ttl_s is reserved configuration only;
-  # TQ does not currently provide an operational staging TTL/reaper.
-  registration_ttl_s: 3600.0
-  staging_ttl_s: 3600.0
   # Bearer token for Gym's token-capture control routes. null = minted per run.
   control_auth_token: null
-  # Hard deadline per control-plane call (gate death must surface as failed
+  # Hard deadline per control-plane call (control-plane death must surface as failed
   # dispatches + placeholders, not a silent retry stall).
   control_timeout_s: 60.0
-  # Process-shared gate state, lineage, and capture root. null resolves to
+  # Process-shared per-rollout ledger and capture root. null resolves to
   # <logger.log_dir>/gym_token_capture.
   capture_dir: null
   # Keep route bytes out of canonical rows and assemble them on policy workers.

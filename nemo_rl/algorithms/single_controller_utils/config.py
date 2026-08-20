@@ -54,12 +54,12 @@ class AsyncRLConfig(BaseModel, extra="allow"):
 
 
 class TokenCaptureConfig(BaseModel, extra="allow"):
-    """Gate-authoritative token capture (token-in/token-out via NeMo-Gym).
+    """Ledger-authoritative token capture (token-in/token-out via NeMo-Gym).
 
     Dormant by default: with ``enabled=False`` every legacy codepath behaves
-    exactly as before — no staging partition is registered, no gate is
+    exactly as before — no staging partition is registered, no ledger is
     installed, and rollouts ride the token-echo path. See
-    docs/design-docs/tq-gym-gate-authoritative.md.
+    docs/design-docs/token-capture-ledger.md.
     """
 
     enabled: bool = False
@@ -68,7 +68,7 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     staging_partition: str = "rollout_staging"
     # A failed worker-side stage poisons the rollout; "continue" serves the
     # completion and lets the finalizer emit a placeholder row, "abort" fails
-    # the whole rollout at the gate.
+    # the whole rollout in the ledger.
     on_capture_failure: Literal["continue", "abort"] = "continue"
     # "allow" trains groups whose calls span a refit (staleness accounted via
     # group_min_wv); "reject" placeholders them. Strict modes beyond the MVP
@@ -77,19 +77,15 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Drop the whole group when fewer than this fraction of its rollouts
     # produced valid rows (None keeps every group).
     min_valid_fraction_per_group: Optional[float] = None
-    # Gate-side cleanup backstops.
-    registration_ttl_s: float = 3600.0
-    staging_ttl_s: float = 3600.0
     # Bearer token for Gym's token-capture control routes. None =
     # minted per run at setup; set explicitly only for multi-controller
-    # setups that must share one gate.
+    # setups that must share one ledger.
     control_auth_token: Optional[str] = None
-    # Hard deadline per control-plane call (S5 finding: gate death must
+    # Hard deadline per control-plane call (S5 finding: control-plane death must
     # surface as a failed dispatch, not a silent retry stall).
     control_timeout_s: float = 60.0
-    # Directory for the Gym base capture layer the gate rides on (#2124-c1:
-    # the capture middleware only engages with a capture dir configured; the
-    # dir stays essentially empty on the gate path). None = derived at setup
+    # Root for Gym's per-rollout capture ledgers and base capture layer. None =
+    # derived at setup
     # under the run's log dir.
     capture_dir: Optional[str] = None
     # Keep routed_experts out of canonical rows and assemble them on policy
