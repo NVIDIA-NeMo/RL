@@ -80,6 +80,9 @@ class MxBootstrapState:
         self.worker_id = worker_id
         self.reshard_groups = {}
         self.broadcast_group = None
+        self.rz = None
+        self.channel = None
+        self.timeout_s = 900.0
 
 
 def mx_rendezvous(
@@ -124,27 +127,54 @@ def mx_rendezvous(
         source_partition=source_partition,
     )
 
-    # Rank 0 of a lane owes it an identifier. Publishing before waiting is what
-    # lets the group reach READY at all: readiness requires every lane
-    # bootstrapped for the current epoch.
-    if membership.is_bootstrap_leader:
-        for lane in membership.lanes:
-            if lane.rank_in_lane == 0:
-                rz.publish_bootstrap(
-                    group_id=membership.group_id,
-                    epoch=membership.epoch,
-                    lane_id=lane.lane_id,
-                    worker_id=worker_id,
-                    nccl_unique_id=new_unique_id(),
-                )
-
-    group = rz.await_ready(
-        group_id=membership.group_id, epoch=membership.epoch, timeout_s=timeout_s
-    )
-    ids = {lane.lane_id: bytes(lane.nccl_unique_id) for lane in group.lanes}
+    # No identifier is minted here. ncclGetUniqueId opens the bootstrap
+    # listening socket as a side effect, and that socket has to still be
+    # accepting when the lane's peers dial in. Minting at rendezvous means it
+    # must survive an actor-method return, a driver round-trip and a barrier;
+    # peers then get "connection refused" from an address that looks correct.
+    # Each lane mints its own identifier in the phase that uses it instead.
     if device is None:
         device = torch.cuda.current_device()
-    return MxBootstrapState(membership, ids, device, worker_id)
+    state = MxBootstrapState(membership, {}, device, worker_id)
+    state.rz = rz
+    state.channel = channel
+    state.timeout_s = timeout_s
+    return state
+
+
+def _await_lane_id(state: MxBootstrapState, lane_id: int) -> bytes:
+    """Block until MX has this lane's identifier at the admitted epoch.
+
+    Per-lane rather than whole-group: with mint-at-use the later lanes are not
+    published yet, so waiting for group READY here would deadlock the very
+    ordering it is meant to protect.
+    """
+    import time
+
+    from modelexpress_rl import refit_collective_pb2 as pb
+    from modelexpress_rl import refit_collective_pb2_grpc as pb_grpc
+
+    stub = pb_grpc.RefitCollectiveServiceStub(state.channel)
+    deadline = time.monotonic() + state.timeout_s
+    while True:
+        group = stub.GetCollectiveGroup(
+            pb.GetCollectiveGroupRequest(group_id=state.membership.group_id),
+            timeout=30.0,
+        )
+        if group.epoch != state.membership.epoch:
+            raise RuntimeError(
+                f"collective group epoch moved {state.membership.epoch} -> "
+                f"{group.epoch} while bootstrapping lane {lane_id}"
+            )
+        for lane in group.lanes:
+            if lane.lane_id == lane_id and len(lane.nccl_unique_id) == 128:
+                return bytes(lane.nccl_unique_id)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"lane {lane_id} identifier not published within "
+                f"{state.timeout_s:.0f}s"
+            )
+        time.sleep(0.2)
 
 
 def mx_init_lane(state: MxBootstrapState, lane_id: int) -> None:
@@ -158,8 +188,22 @@ def mx_init_lane(state: MxBootstrapState, lane_id: int) -> None:
     lane = next((l for l in state.membership.lanes if l.lane_id == lane_id), None)
     if lane is None:
         return
+    from modelexpress_rl.collective.comm import new_unique_id
+
+    if lane.rank_in_lane == 0:
+        # Mint and publish in the same breath as the init below, so the
+        # listening socket ncclGetUniqueId opens is still accepting when the
+        # peers dial it.
+        state.rz.publish_bootstrap(
+            group_id=state.membership.group_id,
+            epoch=state.membership.epoch,
+            lane_id=lane.lane_id,
+            worker_id=state.worker_id,
+            nccl_unique_id=new_unique_id(),
+        )
+    uid = _await_lane_id(state, lane.lane_id)
     pg = MxProcessGroup(
-        unique_id=state.ids[lane.lane_id],
+        unique_id=uid,
         rank=lane.rank_in_lane,
         world_size=lane.world_size,
     )
