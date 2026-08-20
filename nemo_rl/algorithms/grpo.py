@@ -1391,12 +1391,9 @@ def setup(
             setup_timing_metrics.generation_init_load_time_s = megatron_gen_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
-            served_urls = policy_generation.dp_openai_server_base_urls
-            if served_urls != [reserved_url]:
-                raise RuntimeError(
-                    "Megatron server came up at a different address than the one "
-                    f"pre-published to NeMo Gym: reserved {reserved_url}, serving {served_urls}."
-                )
+            MegatronGeneration.verify_served_address(
+                policy_generation.dp_openai_server_base_urls, reserved_url
+            )
         else:
             # Initialize training first so checkpoint conversion completes before inference starts.
             policy, policy_time = init_policy()
