@@ -1,9 +1,13 @@
-# GLM-5.2 131K recipe on 72 H100 nodes: 64 nodes for
-# TP2/PP8/CP32/EP64 training and 8 nodes for non-colocated vLLM generation.
+# GLM-5.2 non-colocated recipe on 72 H100 nodes: 64 nodes for
+# TP2/PP8/CP32/EP64 training and 8 nodes for vLLM generation.
+# The training configuration has 131K context-length capacity. GRPO has been
+# validated at 8K and with 32K-input/4K-output synthetic data; end-to-end 131K
+# GRPO validation is pending because of vLLM timeouts and resource constraints.
+# Megatron Core SFT has been tested at 131K, confirming backend capability.
 defaults: ../../grpo_math_1B.yaml
 
 grpo:
-  # GBS32 is the largest batch validated on this 131K topology without OOM.
+  # GBS32 is the largest batch validated on this topology without OOM.
   num_prompts_per_step: 8
   num_generations_per_prompt: 4
   max_num_steps: 100

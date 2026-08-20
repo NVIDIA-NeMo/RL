@@ -5,15 +5,15 @@ source $SCRIPT_DIR/common.env
 # ===== BEGIN CONFIG =====
 NUM_NODES=72
 GPUS_PER_NODE=8
-STEPS_PER_RUN=20
-MAX_STEPS=20
+STEPS_PER_RUN=15
+MAX_STEPS=15
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
-# Run the experiment
+# Run the manual validation experiment.
 cd $PROJECT_ROOT
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \

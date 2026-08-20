@@ -308,6 +308,7 @@ guides/environments.md
 guides/eval.md
 guides/deepseek.md
 guides/models/index.md
+guides/models/glm5.md
 guides/models/nemotron/index.md
 guides/models/nemotron/nemotron-3-nano.md
 guides/models/nemotron/nemotron-3-nano-omni.md

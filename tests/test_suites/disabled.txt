@@ -6,8 +6,8 @@
 # so this is the pre-existing Qwen3.5 + Megatron + EP hang.
 tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
 
-# Long-context GLM validation is manual-only because it exceeds the recurring-suite GPU-hour budget.
-tests/test_suites/llm/grpo-glm5.2-72n8g-megatron-131K-noncolocated.sh
+# Long-context-capable GLM validation is manual-only because it exceeds the recurring-suite GPU-hour budget.
+tests/test_suites/llm/grpo-glm5.2-72n8g-megatron-noncolocated.sh
 
 # First multimodal NeMo-Gym recipe (circle_click at the pinned Gym). Disabled on
 # landing for two reasons: the recipe has not been run end to end yet, so its

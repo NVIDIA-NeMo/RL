@@ -27,7 +27,7 @@ loss_fn:
 
 checkpointing:
   checkpoint_dir: results/grpo-glm5.2-64n8g-megatron-6K-colocated
-  keep_top_k: 2
+  keep_top_k: 1
   save_period: 3
   checkpoint_must_save_by: "00:03:45:00"
 
@@ -39,7 +39,7 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 6144
-  make_sequence_length_divisible_by: 128
+  make_sequence_length_divisible_by: 6144
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: true
   dtensor_cfg:
@@ -64,6 +64,8 @@ policy:
       lr: 1.0e-06
       min_lr: 1.0e-06
       weight_decay: 0.1
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
     scheduler:
       lr_decay_iters: 10000
       lr_warmup_iters: 10
