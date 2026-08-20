@@ -151,6 +151,13 @@ def test_qwen30_dapo_pair_keeps_workload_matched() -> None:
     assert "policy.generation.vllm_cfg.precision=fp8" in mxfp8.stdout
 
 
+def test_qwen30_mxfp8_metadata_records_moe_only_scope() -> None:
+    script = SCRIPT.read_text()
+
+    assert '[[ "${MODEL}" == qwen30 && "${IS_MX}" == true ]]' in script
+    assert "QUANTIZATION_SCOPE=routed_expert_projections_only" in script
+
+
 def test_qwen30_topology_can_be_scaled_without_changing_the_workload() -> None:
     result = render(
         MODE="sync",
