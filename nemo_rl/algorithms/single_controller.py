@@ -1720,6 +1720,7 @@ class SingleControllerActor:
             evicted_stale_prompt_groups = 0
             min_sample_version = None
             step_open = False
+            generation_released = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
             # One chunk per step on the PPO path, so these are the step's own
@@ -1770,6 +1771,9 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
+                        if self._gen.blocks_training():
+                            # Always assemble a whole batch in colocated mode.
+                            min_prompt_groups = max_prompt_groups
                         train_meta, num_groups = await self._sampler.select(
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
@@ -1804,6 +1808,18 @@ class SingleControllerActor:
                         # Release buffer capacity
                         for _ in range(num_groups):
                             self._buffer_capacity.release()
+
+                    # A generation engine that blocks training must stand down;
+                    # sleep the engine to allow for the trainer to perform GPU work.
+                    # Safe because the select above assembles whole steps for
+                    # blocking engines (min == max), so nothing below waits on
+                    # rollouts the sleeping engine could not deliver.
+                    # In-flight requests freeze, then continue on fresh weights.
+                    # The post-step `_sync_weights` wake reopens the gate.
+                    if not generation_released and self._gen.blocks_training():
+                        self._rollout_permitted.clear()
+                        await asyncio.to_thread(self._gen.finish_generation)
+                        generation_released = True
 
                     # ---- 2. Prepare the batch ----
                     # Compute prev_logprobs / ref_logprobs

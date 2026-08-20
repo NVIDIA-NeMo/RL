@@ -806,13 +806,26 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "shaping. Disable them."
         )
 
-    if master_config.policy["generation"]["colocated"]["enabled"]:
-        raise ValueError(
-            "The SingleController path requires "
-            "policy.generation.colocated.enabled=false: SC drives rollout via "
-            "RolloutManager.generate_and_push, which is only supported on the "
-            "disaggregated async engine."
-        )
+    generation_config = master_config.policy["generation"]
+    if generation_config["colocated"]["enabled"]:
+        if generation_config["backend"] != "megatron":
+            raise ValueError(
+                "The SingleController path requires "
+                "policy.generation.colocated.enabled=false for the "
+                f"{generation_config['backend']!r} backend: SC drives rollout "
+                "via RolloutManager.generate_and_push, which is only supported "
+                "on the disaggregated async engine. Colocated generation is "
+                "supported only with backend='megatron', which shares the "
+                "training policy's worker group."
+            )
+        if master_config.async_rl.max_buffered_rollouts < algo_cfg.num_prompts_per_step:
+            raise ValueError(
+                f"async_rl.max_buffered_rollouts "
+                f"({master_config.async_rl.max_buffered_rollouts}) must be >= "
+                f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) for "
+                "colocated megatron generation: the buffer must be able to "
+                "hold a full step before the trainer takes the GPUs."
+            )
 
     async_config = master_config.async_rl
     # Capacity is sized from the peak window whatever the algorithm, so an inert

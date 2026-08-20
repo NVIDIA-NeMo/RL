@@ -577,6 +577,7 @@ def _build_trainer(
     *,
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
+    reserved_http_server_port: Optional[int] = None,
 ) -> tuple[Any, float]:
     """Build the TQ-mediated trainer (driver-side TQPolicy).
 
@@ -587,6 +588,7 @@ def _build_trainer(
         processor: Optional AutoProcessor for VLM paths.
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
+        reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym.
 
     Returns:
         A tuple of (TQPolicy trainer, wall time spent in this call).
@@ -604,6 +606,7 @@ def _build_trainer(
         init_optimizer=True,
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
+        reserved_http_server_port=reserved_http_server_port,
     )
     return trainer, time.perf_counter() - t0
 
@@ -1126,6 +1129,13 @@ def setup_single_controller(
             processor,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
+            # Colocated Megatron generation serves from the trainer's workers,
+            # so rank 0 of the trainer adopts the pre-published OpenAI socket.
+            reserved_http_server_port=(
+                reserved_http_server_port
+                if megatron_backend and colocated
+                else None
+            ),
         )
         if not is_ppo_run(master_config):
             return trainer, None, time_metrics
@@ -1176,6 +1186,41 @@ def setup_single_controller(
 
         return generation, trainer, value, time_metrics
 
+    def _build_trainer_then_megatron_generation() -> tuple[
+        Any, Any, Optional[TQValue], dict[str, float]
+    ]:
+        """Build the trainer (and critic), then colocated Megatron generation.
+
+        Serial by construction: colocated generation wraps the trainer's
+        policy (shared worker group), so the trainer must exist first; the
+        reserved OpenAI port is adopted by the trainer's rank 0. Non-colocated
+        Megatron generation never comes through here — it builds a dedicated
+        inference policy in parallel with the trainer via ``_build_generation``.
+
+        Returns:
+            A tuple of (MegatronGeneration, TQPolicy trainer, TQValue critic or
+            None, per-phase wall times keyed as "gen_time", "trainer_time" and
+            "value_time").
+        """
+        time_metrics = {}
+
+        trainer, value, train_side_metrics = _build_trainer_and_value()
+        time_metrics.update(train_side_metrics)
+
+        t0 = time.perf_counter()
+        generation = MegatronGeneration(
+            config=master_config.policy,
+            tokenizer=tokenizer,
+            policy=trainer,
+            processor=processor,
+        )
+        # Stood down like every other backend; the setup-time initial refit
+        # (gym) or the actor's startup sync (native) wakes it with weights.
+        generation.finish_generation()
+        time_metrics["gen_time"] = time.perf_counter() - t0
+
+        return generation, trainer, value, time_metrics
+
     if not use_nemo_gym and master_config.async_rl.generation_router.enabled:
         # The router exists to hand NeMo-Gym one URL; the native path calls generation
         # over Ray and never sees it. Silently ignoring the flag would be the opposite of
@@ -1195,7 +1240,7 @@ def setup_single_controller(
                 reserved_http_server_port,
                 megatron_port_holder,
             ) = MegatronGeneration.reserve_http_server_address(
-                inference_cluster,
+                train_cluster if colocated else inference_cluster,
                 master_config.policy,
             )
             gen_reserve_time = time.perf_counter() - t0
@@ -1236,7 +1281,12 @@ def setup_single_controller(
             tokenizer=tokenizer,
         )
 
-    if colocated:
+    if megatron_backend and colocated:
+        # Colocated Megatron generation wraps the trainer's worker group, so
+        # the trainer must come first; serial by construction. Non-colocated
+        # Megatron takes the parallel path below.
+        build_tasks["generation_trainer"] = _build_trainer_then_megatron_generation
+    elif colocated:
         # Colocated: vLLM prefers a clean GPU at load time, so generation comes up before the trainer.
         build_tasks["generation_trainer"] = partial(
             _build_generation_then_trainer,

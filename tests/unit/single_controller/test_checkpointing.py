@@ -343,6 +343,13 @@ class _BlockingDPClient(_FakeDPClient):
         super().save_checkpoint(checkpoint_dir, metadata=metadata)
 
 
+class _FakeGeneration:
+    """Continuous-serving stand-in; the pump asks it before every train step."""
+
+    def blocks_training(self) -> bool:
+        return False
+
+
 class _FakeWeightSynchronizer:
     def __init__(self) -> None:
         self.sync_count = 0
@@ -543,7 +550,7 @@ def _make_actor_args(
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
-        gen_handle=object(),
+        gen_handle=_FakeGeneration(),
         trainer_handle=trainer if trainer is not None else _FakeTrainer(),
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]
