@@ -683,9 +683,12 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
         shards = (("down_proj", weight),)
 
     entries = []
+    # gate/up are dim-1 slices; feed the views directly — per-expert rows stay
+    # consecutive because the export side hands over a contiguous slab, and a
+    # .contiguous() here would materialize a 0.5 GiB copy at refit peak.
     for shard_name, grouped_moe_expert in shards:
         weight_fp8, scale_inv = _quantize_grouped_experts_blockwise(
-            grouped_moe_expert.contiguous()
+            grouped_moe_expert
         )
         for expert_id in range(weight_fp8.shape[0]):
             name = f"{base}.{expert_id}.{shard_name}.weight"
