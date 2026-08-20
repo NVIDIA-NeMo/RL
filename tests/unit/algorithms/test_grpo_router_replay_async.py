@@ -175,7 +175,7 @@ def test_build_async_grpo_train_data_uses_policy_dtype_without_expanding_dedup(
         flat_messages,
         torch.tensor([3] * 4),
         BatchedDataDict({"loss_multiplier": torch.ones(4)}),
-        {"precision": precision, "router_replay": {"enabled": False}},
+        {"precision": precision, "router_replay": RouterReplayConfigDisabled()},
     )
 
     cast_pixels = train_data["pixel_values"]

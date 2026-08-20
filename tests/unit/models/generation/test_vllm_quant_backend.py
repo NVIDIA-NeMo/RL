@@ -92,7 +92,7 @@ def _make_vllm_config(
 def _make_megatron_config(vllm_config, *, quant_cfg=_QUANT_CFG):
     cfg = get_basic_megatron_test_config(tp=1, pp=1, precision="bfloat16")
     cfg["model_name"] = _MODEL_NAME
-    cfg["tokenizer"]["name"] = _MODEL_NAME
+    cfg["tokenizer"].name = _MODEL_NAME
     cfg["quant_cfg"] = quant_cfg
     cfg["quant_calib_size"] = 1
     cfg["quant_calib_data"] = "random"
