@@ -330,6 +330,21 @@ export NRL_IGNORE_VERSION_MISMATCH=1
 >
 > Always make dependency changes in `pyproject.toml` and use the recommended workflows so that your environment stays consistent and traceable.
 
+## Speculative-decoding version boundary
+
+vLLM 0.25.1 and 0.27.1 both define the `dflash` and `dspark` methods in their
+speculative-config schema. See the upstream [`v0.25.1` schema][vllm-0251-spec]
+and [`v0.27.1` schema][vllm-0271-spec]. Shared config keys do not make packages
+or cached worker environments interchangeable: use one complete,
+version-matched dependency set. This repository currently locks vLLM 0.25.1.
+
+The Qwen3 SWE rollout-only recipes validate config resolution and launcher
+contracts. They do not claim Qwen3-30B or Qwen3-235B DFlash/DSpark GPU runtime
+or performance validation.
+
+[vllm-0251-spec]: https://github.com/vllm-project/vllm/blob/v0.25.1/vllm/config/speculative.py
+[vllm-0271-spec]: https://github.com/vllm-project/vllm/blob/v0.27.1/vllm/config/speculative.py
+
 ## Summary
 
 NeMo RL's dependency management balances flexibility and performance:
@@ -346,4 +361,3 @@ Choose the approach that best fits your scale and development velocity:
 - When iterating on submodule code, the **classic mount workflow** offers a fast middle ground
 - For significant dependency changes, use **`NRL_FORCE_REBUILD_VENVS`** for small runs or **rebuild containers** for large-scale deployments
 - For manual dependency management, **frozen environments** are available, though `uv run` is recommended for reproducibility
-

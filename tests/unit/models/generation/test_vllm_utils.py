@@ -789,12 +789,14 @@ def test_aggregate_spec_decode_counters():
             "vllm:spec_decode_num_drafts": 100.0,
             "vllm:spec_decode_num_draft_tokens": 300.0,
             "vllm:spec_decode_num_accepted_tokens": 240.0,
+            "vllm:spec_decode_num_accepted_tokens_per_pos": [80.0, 60.0],
             "other_metric": 999.0,  # Should be ignored
         },
         {
             "vllm:spec_decode_num_drafts": 150.0,
             "vllm:spec_decode_num_draft_tokens": 450.0,
             "vllm:spec_decode_num_accepted_tokens": 360.0,
+            "vllm:spec_decode_num_accepted_tokens_per_pos": [120.0, 90.0],
         },
     ]
 
@@ -803,6 +805,8 @@ def test_aggregate_spec_decode_counters():
     assert counters["vllm:spec_decode_num_drafts"] == 250.0
     assert counters["vllm:spec_decode_num_draft_tokens"] == 750.0
     assert counters["vllm:spec_decode_num_accepted_tokens"] == 600.0
+    assert counters["vllm:spec_decode_num_accepted_tokens_per_pos", 1] == 200.0
+    assert counters["vllm:spec_decode_num_accepted_tokens_per_pos", 2] == 150.0
     assert "other_metric" not in counters
 
 
@@ -812,11 +816,17 @@ def test_compute_spec_decode_metrics():
         "vllm:spec_decode_num_drafts": 100.0,
         "vllm:spec_decode_num_draft_tokens": 300.0,
         "vllm:spec_decode_num_accepted_tokens": 200.0,
+        ("vllm:spec_decode_num_accepted_tokens_per_pos", 1): 40.0,
+        ("vllm:spec_decode_num_accepted_tokens_per_pos", 2): 30.0,
+        ("vllm:spec_decode_num_accepted_tokens_per_pos", 3): 20.0,
     }
     end_counters = {
         "vllm:spec_decode_num_drafts": 200.0,
         "vllm:spec_decode_num_draft_tokens": 600.0,
         "vllm:spec_decode_num_accepted_tokens": 440.0,
+        ("vllm:spec_decode_num_accepted_tokens_per_pos", 1): 140.0,
+        ("vllm:spec_decode_num_accepted_tokens_per_pos", 2): 110.0,
+        ("vllm:spec_decode_num_accepted_tokens_per_pos", 3): 80.0,
     }
 
     metrics = compute_spec_decode_metrics(start_counters, end_counters)
@@ -831,6 +841,17 @@ def test_compute_spec_decode_metrics():
     assert math.isclose(metrics["vllm/spec_acceptance_length"], 3.4, rel_tol=1e-6)
     # acceptance_rate = accepted / draft_tokens = 240 / 300 = 0.8
     assert math.isclose(metrics["vllm/spec_acceptance_rate"], 0.8, rel_tol=1e-6)
+    assert metrics["vllm/spec_acceptance_rate-pos-1"] == 1.0
+    assert metrics["vllm/spec_acceptance_rate-pos-2"] == 0.8
+    assert metrics["vllm/spec_acceptance_rate-pos-3"] == 0.6
+    assert math.isclose(
+        metrics["vllm/spec_acceptance_length"],
+        1
+        + metrics["vllm/spec_acceptance_rate-pos-1"]
+        + metrics["vllm/spec_acceptance_rate-pos-2"]
+        + metrics["vllm/spec_acceptance_rate-pos-3"],
+        rel_tol=1e-6,
+    )
 
 
 def test_resolve_routed_experts_dtype_boundaries():

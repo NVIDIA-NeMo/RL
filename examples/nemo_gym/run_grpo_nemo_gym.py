@@ -88,7 +88,8 @@ def collect_trajectories(
 
     print("\n🔍 Running trajectory collection...", flush=True)
     generation_config = master_config.policy["generation"]
-    for val_batch in val_dataloader:
+    for collection_step, val_batch in enumerate(val_dataloader, start=1):
+        policy_generation.snapshot_step_metrics()
         nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
             policy_generation=policy_generation,
             input_batch=val_batch,
@@ -101,7 +102,6 @@ def collect_trajectories(
             max_rollout_turns=None,
             greedy=False,
         )
-
         rows_to_log: list[str] = []
         for key, value in nemo_gym_rollout_result.rollout_metrics.items():
             if "full_result" not in key:
@@ -112,6 +112,14 @@ def collect_trajectories(
             rows_to_log.extend(v[0] for v in data)
 
         logger.log_string_list_as_jsonl(rows_to_log, log_filename)
+
+        generation_metrics = policy_generation.get_step_metrics()
+        if generation_metrics:
+            logger.log_metrics(
+                generation_metrics,
+                step=collection_step,
+                prefix="trajectory_collection",
+            )
 
         # TODO: eventually as trajectory collection use cases exceed 4 hours, we can leverage the dataloader save functionality to resume
         # And also leverage the TimeoutChecker functionality as well
@@ -252,6 +260,7 @@ The validation set you pass in will directly be used for validation with no addi
             train_dataset,
             val_dataset,
             processor=processor,
+            init_optimizer=not is_trajectory_collection,
         )
 
     rl_init_timer.record("total", time.perf_counter() - main_start)
