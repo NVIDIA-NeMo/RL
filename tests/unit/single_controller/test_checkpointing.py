@@ -388,6 +388,13 @@ class _BlockingDPClient(_FakeDPClient):
         super().save_checkpoint(checkpoint_dir, metadata=metadata)
 
 
+class _FakeGeneration:
+    """Continuous-serving stand-in; the pump asks it before every train step."""
+
+    def blocks_training(self) -> bool:
+        return False
+
+
 class _FakeWeightSynchronizer:
     def __init__(self) -> None:
         self.sync_count = 0

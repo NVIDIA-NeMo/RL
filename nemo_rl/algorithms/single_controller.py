@@ -2370,6 +2370,7 @@ class SingleControllerActor:
             evicted_stale_prompt_groups = 0
             min_sample_version = None
             step_open = False
+            generation_released = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
             # One chunk per step on the PPO path, so these are the step's own
@@ -2427,6 +2428,9 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
+                        if self._gen.blocks_training():
+                            # Always assemble a whole batch in colocated mode.
+                            min_prompt_groups = max_prompt_groups
                         selected_group_ids: list[str] = []
                         selected_training_claim_ids: list[str] = []
                         async with self._data_plane_checkpoint_barrier.mutation(
@@ -2514,6 +2518,15 @@ class SingleControllerActor:
                                 step_finalizer_metrics.setdefault(name, []).append(
                                     float(value)
                                 )
+
+                    # A generation engine that blocks training must stand down before
+                    # trainer GPU work. A blocking engine selects whole steps above, so
+                    # nothing below waits on generation while it is asleep. The
+                    # post-step weight sync wakes the engine and reopens the gate.
+                    if not generation_released and self._gen.blocks_training():
+                        self._rollout_permitted.clear()
+                        await asyncio.to_thread(self._gen.finish_generation)
+                        generation_released = True
 
                     # ---- 2. Prepare the batch ----
                     # Compute prev_logprobs / ref_logprobs

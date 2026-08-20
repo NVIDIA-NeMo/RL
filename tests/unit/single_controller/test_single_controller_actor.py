@@ -1112,7 +1112,10 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._ppo_epochs = 1
     ctrl._value = None
     ctrl._value_loss_fn = None
-    ctrl._gen = SimpleNamespace(requires_kv_scale_sync=False)
+    ctrl._gen = SimpleNamespace(
+        requires_kv_scale_sync=False,
+        blocks_training=lambda: False,
+    )
     ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
@@ -1410,6 +1413,78 @@ def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> No
 
     assert ctrl._train_steps == 1
     assert trainer.keep_train_buffers_calls == [False, True]
+
+
+@pytest.mark.parametrize(
+    "engine_blocks_training", [False, True], ids=["streaming", "blocking"]
+)
+def test_train_pump_chunked_step_by_engine_regime(
+    monkeypatch, engine_blocks_training
+) -> None:
+    """A blocking engine stands down once before trainer work for the step."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    select_bounds: list[tuple[int, int]] = []
+
+    class _BoundsRecordingSampler(_ChunkedSampler):
+        async def select(self, **kwargs):
+            select_bounds.append(
+                (kwargs["min_prompt_groups"], kwargs["max_prompt_groups"])
+            )
+            return await super().select(**kwargs)
+
+    ctrl = _train_pump_controller(sampler=_BoundsRecordingSampler(meta, chunks=2))
+    ctrl._policy_logprobs_required = True
+    calls: list[object] = []
+
+    class _RecordingTrainer(_LpRecordingTrainer):
+        def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+            super().prepare_for_lp_inference(keep_train_buffers)
+            calls.append("lp_inference_prep")
+
+        def prepare_for_training(self) -> None:
+            calls.append("prepare_for_training")
+
+        def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+            del meta
+            calls.append("train")
+
+    def _finish_generation() -> None:
+        calls.append(("finish_generation", ctrl._rollout_permitted.is_set()))
+
+    trainer = _RecordingTrainer()
+    ctrl._trainer = trainer
+    ctrl._gen = SimpleNamespace(
+        requires_kv_scale_sync=False,
+        blocks_training=lambda: engine_blocks_training,
+        finish_generation=_finish_generation,
+    )
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._train_steps == 1
+    assert trainer.keep_train_buffers_calls == [False, True]
+    chunk = ["lp_inference_prep", "prepare_for_training", "train"]
+    if engine_blocks_training:
+        assert calls == [("finish_generation", False)] + chunk * 2
+        assert not ctrl._rollout_permitted.is_set()
+        assert select_bounds and all(lo == hi for lo, hi in select_bounds)
+    else:
+        assert calls == chunk * 2
+        assert ctrl._rollout_permitted.is_set()
+        assert select_bounds[0] == (1, 2)
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
 
 
 def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> None:
