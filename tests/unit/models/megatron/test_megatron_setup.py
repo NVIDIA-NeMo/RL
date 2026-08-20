@@ -33,6 +33,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from nemo_rl.models.policy import (
+    DraftConfig,
+    DynamicBatchingConfigDisabled,
+    RewardModelConfig,
+    SequencePackingConfig,
+    SequencePackingConfigDisabled,
+    TokenizerConfig,
+)
+
 
 @dataclass
 class _NestedModelConfig:
@@ -629,7 +638,7 @@ class TestApplyParallelismConfig:
                 "sequence_parallel": True,
                 "context_parallel_size": 1,
             },
-            "sequence_packing": {"enabled": False},
+            "sequence_packing": SequencePackingConfigDisabled(),
         }
 
         _apply_parallelism_config(model_cfg, config)
@@ -653,7 +662,7 @@ class TestApplyParallelismConfig:
                 "sequence_parallel": False,
                 "context_parallel_size": 2,
             },
-            "sequence_packing": {"enabled": False},
+            "sequence_packing": SequencePackingConfigDisabled(),
         }
 
         with pytest.raises(AssertionError) as exc_info:
@@ -675,7 +684,10 @@ class TestApplyParallelismConfig:
                 "sequence_parallel": False,
                 "context_parallel_size": 4,
             },
-            "sequence_packing": {"enabled": True},
+            "sequence_packing": SequencePackingConfig(
+                train_mb_tokens=256,
+                algorithm="modified_first_fit_decreasing",
+            ),
         }
 
         _apply_parallelism_config(model_cfg, config)
@@ -2248,7 +2260,10 @@ class TestValidateAndSetConfig:
         from nemo_rl.models.megatron.setup import validate_and_set_config
 
         config = {
-            "reward_model_cfg": {"enabled": True},
+            "reward_model_cfg": RewardModelConfig(
+                enabled=True,
+                reward_model_type="sequence_classification",
+            ),
             "precision": "bfloat16",
             "megatron_cfg": {
                 "optimizer": {
@@ -2377,7 +2392,7 @@ class TestMakePolicyLikeConfig:
         """Build the minimum ValueConfig shape used by make_policy_like_config."""
         return {
             "model_name": "test-model",
-            "tokenizer": {"name": "test-model"},
+            "tokenizer": TokenizerConfig(name="test-model"),
             "train_global_batch_size": 8,
             "train_micro_batch_size": 2,
             "precision": "bfloat16",
@@ -2387,7 +2402,7 @@ class TestMakePolicyLikeConfig:
                 "pipeline_model_parallel_size": 1,
                 "context_parallel_size": 1,
             },
-            "dynamic_batching": {"enabled": False},
+            "dynamic_batching": DynamicBatchingConfigDisabled(),
             "make_sequence_length_divisible_by": 1,
             "max_total_sequence_length": 128,
         }
@@ -2406,7 +2421,7 @@ class TestMakePolicyLikeConfig:
             policy_config["logprob_batch_size"]
             == value_config["train_micro_batch_size"]
         )
-        assert policy_config["sequence_packing"] == {"enabled": False}
+        assert policy_config["sequence_packing"] == SequencePackingConfigDisabled()
         assert policy_config["max_grad_norm"] == 1.0
         assert policy_config["hf_config_overrides"] == {}
         assert policy_config["offload_optimizer_for_logprob"] is False
@@ -2434,7 +2449,10 @@ class TestMakePolicyLikeConfig:
         value_config.update(
             {
                 "logprob_batch_size": 4,
-                "sequence_packing": {"enabled": True, "train_mb_tokens": 256},
+                "sequence_packing": SequencePackingConfig(
+                    train_mb_tokens=256,
+                    algorithm="modified_first_fit_decreasing",
+                ),
                 "max_grad_norm": None,
                 "hf_config_overrides": {"rope_scaling": {"rope_type": "yarn"}},
             }
@@ -2451,10 +2469,10 @@ class TestMakePolicyLikeConfig:
         policy_config = make_policy_like_config(value_config)
 
         assert policy_config["logprob_batch_size"] == 4
-        assert policy_config["sequence_packing"] == {
-            "enabled": True,
-            "train_mb_tokens": 256,
-        }
+        assert policy_config["sequence_packing"] == SequencePackingConfig(
+            train_mb_tokens=256,
+            algorithm="modified_first_fit_decreasing",
+        )
         assert policy_config["max_grad_norm"] is None
         assert policy_config["hf_config_overrides"] == {
             "rope_scaling": {"rope_type": "yarn"}
@@ -3171,7 +3189,7 @@ class TestDraftSetup:
         mock_get_pg_collection.return_value = MagicMock()
 
         hook = _create_draft_pre_wrap_hook(
-            policy_cfg={"draft": {"enabled": True, "model_name": None}},
+            policy_cfg={"draft": DraftConfig()},
             megatron_cfg=MagicMock(),
             state=MagicMock(),
             preload_policy_from_pretrained=False,
@@ -3225,7 +3243,7 @@ class TestDraftSetup:
 
         returned_model = build_draft_model(
             model_provider=self._build_model_provider(),
-            draft_config={"enabled": True, "model_name": "dummy-draft"},
+            draft_config=DraftConfig(model_name="dummy-draft"),
             pg_collection=SimpleNamespace(tp=None),
             policy_model_chunk=policy_model_chunk,
         )
@@ -3281,7 +3299,7 @@ class TestDraftSetup:
         def attach_fresh_draft():
             chunk = DummyChunk()
             hook = _create_draft_pre_wrap_hook(
-                policy_cfg={"draft": {"enabled": True, "model_name": None}},
+                policy_cfg={"draft": DraftConfig()},
                 megatron_cfg=MagicMock(),
                 state=MagicMock(),
                 preload_policy_from_pretrained=False,

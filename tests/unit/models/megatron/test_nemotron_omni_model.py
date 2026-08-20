@@ -47,6 +47,10 @@ from nemo_rl.models.megatron.train import (
     LogprobsPostProcessor,
     megatron_forward_backward,
 )
+from nemo_rl.models.policy import (
+    DynamicBatchingConfigDisabled,
+    SequencePackingConfig,
+)
 
 pytestmark = pytest.mark.mcore
 
@@ -611,8 +615,11 @@ def _run_pipeline_forward_contract(rank: int, world_size: int) -> None:
     data.micro_batch_indices = [[[0, 2]]]
     data.micro_batch_lengths = [[int(lengths.sum().item())]]
     cfg = {
-        "dynamic_batching": {"enabled": False},
-        "sequence_packing": {"enabled": True},
+        "dynamic_batching": DynamicBatchingConfigDisabled(),
+        "sequence_packing": SequencePackingConfig(
+            train_mb_tokens=512,
+            algorithm="modified_first_fit_decreasing",
+        ),
         "make_sequence_length_divisible_by": 1,
         "megatron_cfg": {
             "tensor_model_parallel_size": 1,

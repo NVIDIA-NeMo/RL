@@ -23,6 +23,12 @@ from nemo_rl.environments.reward_model_environment import (
     RewardModelEnvironment,
     RewardModelEnvironmentConfig,
 )
+from nemo_rl.models.policy import (
+    DynamicBatchingConfigDisabled,
+    RewardModelConfig,
+    SequencePackingConfigDisabled,
+    TokenizerConfig,
+)
 
 # Model configuration constants for testing
 REWARD_MODEL_NAME = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
@@ -33,17 +39,17 @@ MAX_MODEL_LEN = 1024
 basic_env_config: RewardModelEnvironmentConfig = {
     "enabled": True,
     "model_name": REWARD_MODEL_NAME,
-    "tokenizer": {"name": REWARD_MODEL_NAME},
+    "tokenizer": TokenizerConfig(name=REWARD_MODEL_NAME),
     "precision": "bfloat16",
     "offload_optimizer_for_logprob": False,
     "batch_size": 32,
     "checkpoint_path": None,
     "max_model_len": MAX_MODEL_LEN,
     "resources": {"gpus_per_node": 1, "num_nodes": 1},
-    "reward_model_cfg": {
-        "enabled": True,
-        "reward_model_type": "bradley_terry",
-    },
+    "reward_model_cfg": RewardModelConfig(
+        enabled=True,
+        reward_model_type="bradley_terry",
+    ),
     "dtensor_cfg": {
         "_v2": True,
         "enabled": True,
@@ -54,8 +60,8 @@ basic_env_config: RewardModelEnvironmentConfig = {
         "context_parallel_size": 1,
         "custom_parallel_plan": None,
     },
-    "dynamic_batching": {"enabled": False},
-    "sequence_packing": {"enabled": False},
+    "dynamic_batching": DynamicBatchingConfigDisabled(),
+    "sequence_packing": SequencePackingConfigDisabled(),
     "max_grad_norm": None,
 }
 

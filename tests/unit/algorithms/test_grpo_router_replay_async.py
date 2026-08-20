@@ -28,6 +28,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy import RouterReplayConfig, RouterReplayConfigDisabled
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -57,7 +58,7 @@ def _make_async_master_config(data_plane=None) -> MasterConfig:
         **{
             "policy": {
                 "precision": "bfloat16",
-                "router_replay": {"enabled": True},
+                "router_replay": RouterReplayConfig(),
                 "generation": {
                     "backend": "vllm",
                     "vllm_cfg": {"async_engine": True},
@@ -78,8 +79,14 @@ def _make_async_master_config(data_plane=None) -> MasterConfig:
 @pytest.mark.parametrize(
     ("policy_config", "expect_routed_experts"),
     [
-        ({"precision": "bfloat16", "router_replay": {"enabled": True}}, True),
-        ({"precision": "bfloat16", "router_replay": {"enabled": False}}, False),
+        ({"precision": "bfloat16", "router_replay": RouterReplayConfig()}, True),
+        (
+            {
+                "precision": "bfloat16",
+                "router_replay": RouterReplayConfigDisabled(),
+            },
+            False,
+        ),
     ],
 )
 def test_build_async_grpo_train_data_preserves_routed_experts_for_r3(
@@ -168,7 +175,7 @@ def test_build_async_grpo_train_data_uses_policy_dtype_without_expanding_dedup(
         flat_messages,
         torch.tensor([3] * 4),
         BatchedDataDict({"loss_multiplier": torch.ones(4)}),
-        {"precision": precision, "router_replay": {"enabled": False}},
+        {"precision": precision, "router_replay": RouterReplayConfigDisabled()},
     )
 
     cast_pixels = train_data["pixel_values"]

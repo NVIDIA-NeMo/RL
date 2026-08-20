@@ -42,6 +42,12 @@ from nemo_rl.models.megatron.community_import import (
     export_model_from_megatron,
     import_model_from_hf_name,
 )
+from nemo_rl.models.policy import (
+    DynamicBatchingConfigDisabled,
+    PytorchOptimizerConfig,
+    SequencePackingConfigDisabled,
+    TokenizerConfig,
+)
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf
 
@@ -81,7 +87,7 @@ def create_test_config() -> Dict[str, Any]:
         },
         "policy": {
             "model_name": "Qwen/Qwen2-0.5B",
-            "tokenizer": {"name": "Qwen/Qwen2-0.5B"},
+            "tokenizer": TokenizerConfig(name="Qwen/Qwen2-0.5B"),
             "train_global_batch_size": 4,
             "train_micro_batch_size": 2,
             "max_total_sequence_length": 128,
@@ -97,13 +103,13 @@ def create_test_config() -> Dict[str, Any]:
                 "context_parallel_size": 1,
                 "custom_parallel_plan": None,
             },
-            "dynamic_batching": {"enabled": False},
-            "sequence_packing": {"enabled": False},
+            "dynamic_batching": DynamicBatchingConfigDisabled(),
+            "sequence_packing": SequencePackingConfigDisabled(),
             "make_sequence_length_divisible_by": 1,
             "max_grad_norm": 1.0,
-            "optimizer": {
-                "name": "torch.optim.AdamW",
-                "kwargs": {
+            "optimizer": PytorchOptimizerConfig(
+                name="torch.optim.AdamW",
+                kwargs={
                     "lr": 5.0e-6,
                     "weight_decay": 0.1,
                     "betas": [0.9, 0.98],
@@ -111,7 +117,7 @@ def create_test_config() -> Dict[str, Any]:
                     "foreach": False,
                     "fused": False,
                 },
-            },
+            ),
             "megatron_cfg": {
                 "enabled": False,  # We'll use DCP for this test
             },

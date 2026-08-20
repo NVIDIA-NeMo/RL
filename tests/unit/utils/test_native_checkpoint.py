@@ -21,6 +21,12 @@ from transformers import AutoModelForCausalLM
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.policy import (
+    DynamicBatchingConfigDisabled,
+    PytorchOptimizerConfig,
+    SequencePackingConfigDisabled,
+    TokenizerConfig,
+)
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.native_checkpoint import (
     ModelState,
@@ -34,24 +40,22 @@ from tests.unit.test_utils import SimpleLossFn
 # Define basic test config
 simple_policy_config = {
     "model_name": "Qwen/Qwen3-0.6B",  # "hf-internal-testing/tiny-random-Gemma3ForCausalLM",
-    "tokenizer": {
-        "name": "Qwen/Qwen3-0.6B",
-    },
+    "tokenizer": TokenizerConfig(name="Qwen/Qwen3-0.6B"),
     "train_global_batch_size": 4,
     "train_micro_batch_size": 1,
     "logprob_batch_size": 1,
     "max_total_sequence_length": 1024,
     "precision": "float32",
     "offload_optimizer_for_logprob": False,
-    "optimizer": {
-        "name": "torch.optim.AdamW",
-        "kwargs": {
+    "optimizer": PytorchOptimizerConfig(
+        name="torch.optim.AdamW",
+        kwargs={
             "lr": 5e-6,
             "weight_decay": 0.01,
             "betas": [0.9, 0.999],
             "eps": 1e-8,
         },
-    },
+    ),
     "dtensor_cfg": {
         "enabled": True,
         "_v2": False,
@@ -62,12 +66,8 @@ simple_policy_config = {
         "context_parallel_size": 1,
         "custom_parallel_plan": None,
     },
-    "dynamic_batching": {
-        "enabled": False,
-    },
-    "sequence_packing": {
-        "enabled": False,
-    },
+    "dynamic_batching": DynamicBatchingConfigDisabled(),
+    "sequence_packing": SequencePackingConfigDisabled(),
     "max_grad_norm": 1.0,
     "generation": {
         "temperature": 1.0,

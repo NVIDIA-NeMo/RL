@@ -17,6 +17,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from nemo_rl.models.policy import RouterReplayConfig
+
 
 @pytest.mark.mcore
 def test_configure_vllm_for_router_replay_preserves_prefix_cache():
@@ -26,7 +28,7 @@ def test_configure_vllm_for_router_replay_preserves_prefix_cache():
     )
 
     config = {
-        "router_replay": {"enabled": True},
+        "router_replay": RouterReplayConfig(),
         "generation": {
             "backend": "vllm",
             "vllm_cfg": {"enable_prefix_caching": True},
@@ -47,7 +49,7 @@ def test_validate_router_replay_config_allows_prefix_cache_default():
     from nemo_rl.models.megatron.router_replay import validate_router_replay_config
 
     config = {
-        "router_replay": {"enabled": True},
+        "router_replay": RouterReplayConfig(),
         "generation": {"backend": "vllm", "vllm_cfg": {}, "vllm_kwargs": {}},
         "megatron_cfg": {"enabled": True},
     }

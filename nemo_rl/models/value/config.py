@@ -22,12 +22,10 @@ from nemo_rl.models.policy import (
     MegatronConfig,
     MegatronConfigDisabled,
     PytorchOptimizerConfig,
+    PytorchSchedulerConfig,
     RewardModelConfig,
-    SchedulerMilestones,
     SequencePackingConfig,
     SequencePackingConfigDisabled,
-    SinglePytorchMilestonesConfig,
-    SinglePytorchSchedulerConfig,
     TokenizerConfig,
 )
 
@@ -76,8 +74,4 @@ class ValueConfig(TypedDict):
 
     # Optimizer and scheduler
     optimizer: NotRequired[PytorchOptimizerConfig | None]
-    scheduler: NotRequired[
-        list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
-        | SchedulerMilestones
-        | None
-    ]
+    scheduler: NotRequired[PytorchSchedulerConfig | None]

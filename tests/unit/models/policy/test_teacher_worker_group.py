@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import MagicMock, patch
+
+from nemo_rl.models.policy import (
+    DraftConfig,
+    DraftConfigDisabled,
+    DynamicBatchingConfigDisabled,
+    SequencePackingConfig,
+    SequencePackingConfigDisabled,
+)
+
 
 def test_teacher_resource_config_defaults():
     from nemo_rl.algorithms.opd import TeacherResourceConfig
@@ -77,3 +87,100 @@ def test_create_teacher_configs_deduplicates():
         }
     )
     assert len(configs) == 2
+
+
+@patch("nemo_rl.distributed.worker_groups.RayWorkerGroup")
+@patch("nemo_rl.distributed.worker_groups.RayWorkerBuilder")
+def test_teacher_replaces_enabled_draft_with_disabled_config(
+    mock_worker_builder, mock_worker_group
+):
+    from nemo_rl.models.policy.teacher_worker_group import (
+        TeacherConfig,
+        TeacherWorkerGroup,
+    )
+
+    teacher_cfg = TeacherConfig(
+        alias="teacher",
+        model_name="teacher-model",
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        num_nodes=1,
+        gpus_per_node=1,
+        precision="bf16",
+        micro_batch_size=1,
+        megatron_cfg_overrides={},
+    )
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    policy_config = {
+        "megatron_cfg": {"enabled": True},
+        "dtensor_cfg": {"enabled": False},
+        "draft": DraftConfig(model_name="student-draft"),
+        "sequence_packing": SequencePackingConfigDisabled(),
+        "dynamic_batching": DynamicBatchingConfigDisabled(),
+    }
+
+    teacher = TeacherWorkerGroup(
+        teacher_cfg=teacher_cfg,
+        cluster=cluster,
+        policy_config=policy_config,
+        tokenizer=MagicMock(),
+    )
+
+    worker_config = mock_worker_builder.call_args.args[1]
+    assert isinstance(worker_config["draft"], DraftConfigDisabled)
+    assert policy_config["draft"].enabled is True
+    assert teacher.cfg is worker_config
+    mock_worker_group.assert_called_once()
+
+
+@patch("nemo_rl.distributed.worker_groups.RayWorkerGroup")
+@patch("nemo_rl.distributed.worker_groups.RayWorkerBuilder")
+def test_teacher_forwards_sequence_packing_microbatch_order(
+    mock_worker_builder, mock_worker_group
+):
+    from nemo_rl.models.policy.teacher_worker_group import (
+        TeacherConfig,
+        TeacherWorkerGroup,
+    )
+
+    teacher_cfg = TeacherConfig(
+        alias="teacher",
+        model_name="teacher-model",
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        num_nodes=1,
+        gpus_per_node=1,
+        precision="bf16",
+        micro_batch_size=1,
+        megatron_cfg_overrides={},
+    )
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    policy_config = {
+        "megatron_cfg": {"enabled": True},
+        "dtensor_cfg": {"enabled": False},
+        "draft": DraftConfigDisabled(),
+        "sequence_packing": SequencePackingConfig(
+            train_mb_tokens=512,
+            logprob_mb_tokens=256,
+            algorithm="modified_first_fit_decreasing",
+            microbatch_order="largest_first",
+        ),
+        "dynamic_batching": DynamicBatchingConfigDisabled(),
+    }
+
+    teacher = TeacherWorkerGroup(
+        teacher_cfg=teacher_cfg,
+        cluster=cluster,
+        policy_config=policy_config,
+        tokenizer=MagicMock(),
+    )
+
+    assert teacher.sequence_packing_args["microbatch_order"] == "largest_first"
+    mock_worker_builder.assert_called_once()
+    mock_worker_group.assert_called_once()

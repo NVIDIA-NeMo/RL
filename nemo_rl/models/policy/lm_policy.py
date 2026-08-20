@@ -117,7 +117,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
-        draft_enabled = bool(config.get("draft", {}).get("enabled", False))
+        draft_config = config.get("draft")
+        draft_enabled = draft_config is not None and draft_config.enabled
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
@@ -128,8 +129,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
             )
-        if draft_enabled and bool(
-            config.get("sequence_packing", {}).get("enabled", False)
+        sequence_packing_config = config.get("sequence_packing")
+        if (
+            draft_enabled
+            and sequence_packing_config is not None
+            and sequence_packing_config.enabled
         ):
             raise ValueError(
                 "policy.draft.enabled=true does not support sequence packing yet. "
@@ -270,7 +274,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if use_v2:
             # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
             # pickling across incompatible transformers versions (v4 head → v5 worker).
-            config["tokenizer"]["use_processor"] = processor is not None
+            config["tokenizer"].use_processor = processor is not None
         else:
             worker_kwargs["tokenizer"] = tokenizer
             worker_kwargs["processor"] = processor
@@ -309,7 +313,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 env_vars=env_vars or {},
             )
 
-        if config["dynamic_batching"]["enabled"]:
+        if config["dynamic_batching"].enabled:
             assert pp_size == 1, (
                 "Dynamic batching is only supported for single pipeline parallel stage"
             )
@@ -317,12 +321,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.dynamic_batching_args: DynamicBatchingArgs = {
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
-                "sequence_length_round": config["dynamic_batching"][
-                    "sequence_length_round"
-                ],
+                "sequence_length_round": config[
+                    "dynamic_batching"
+                ].sequence_length_round,
                 "max_tokens_per_microbatch": 0,  # Override this in each different call (presumably different sizes)
             }
-            assert not config["sequence_packing"]["enabled"], (
+            assert not config["sequence_packing"].enabled, (
                 "Dynamic Batching is exclusive of Sequence Packing. Please disable Sequence Packing to use Dynamic Batching"
             )
         else:
@@ -337,19 +341,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.flops_tracker = None
             print(f"FLOPS tracker not supported for model {config['model_name']}: {e}")
 
-        if config["sequence_packing"]["enabled"]:
+        if config["sequence_packing"].enabled:
             self.use_sequence_packing = True
             sequence_length_pad_multiple = config["make_sequence_length_divisible_by"]
             self.sequence_packing_args: SequencePackingArgs = {
-                "algorithm": config["sequence_packing"]["algorithm"],
+                "algorithm": config["sequence_packing"].algorithm,
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
                 "sequence_length_pad_multiple": sequence_length_pad_multiple,
             }
-            microbatch_order = config["sequence_packing"].get("microbatch_order")
+            microbatch_order = config["sequence_packing"].microbatch_order
             if microbatch_order is not None:
                 self.sequence_packing_args["microbatch_order"] = microbatch_order
-            assert not config["dynamic_batching"]["enabled"], (
+            assert not config["dynamic_batching"].enabled, (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
             )
         else:
@@ -470,18 +474,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """
         dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
-            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
-                "dynamic_batching"
-            ]["logprob_mb_tokens"]
+            logprob_mb_tokens = self.cfg["dynamic_batching"].logprob_mb_tokens
+            assert logprob_mb_tokens is not None, (
+                "dynamic_batching.logprob_mb_tokens must be configured for logprob"
+            )
+            self.dynamic_batching_args["max_tokens_per_microbatch"] = logprob_mb_tokens
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
                 dp_size,
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
             )
         elif self.use_sequence_packing:
-            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
-                "sequence_packing"
-            ]["logprob_mb_tokens"]
+            logprob_mb_tokens = self.cfg["sequence_packing"].logprob_mb_tokens
+            assert logprob_mb_tokens is not None, (
+                "sequence_packing.logprob_mb_tokens must be configured for logprob"
+            )
+            self.sequence_packing_args["max_tokens_per_microbatch"] = logprob_mb_tokens
             # we just shard into DP shards here as Sequence packing allows for CP.
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(
                 dp_size,
@@ -513,7 +521,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
-            ]["train_mb_tokens"]
+            ].train_mb_tokens
             sharded_data, _ = data.shard_by_batch_size(
                 dp_size,
                 batch_size=batch_size,
@@ -522,7 +530,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         elif self.use_sequence_packing:
             self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
                 "sequence_packing"
-            ]["train_mb_tokens"]
+            ].train_mb_tokens
             sharded_data, _ = data.shard_by_batch_size(
                 dp_size,
                 batch_size=batch_size,
@@ -1012,18 +1020,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """
         dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
-            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
-                "dynamic_batching"
-            ]["logprob_mb_tokens"]
+            logprob_mb_tokens = self.cfg["dynamic_batching"].logprob_mb_tokens
+            assert logprob_mb_tokens is not None, (
+                "dynamic_batching.logprob_mb_tokens must be configured for calibration"
+            )
+            self.dynamic_batching_args["max_tokens_per_microbatch"] = logprob_mb_tokens
             sharded_data, _ = data.shard_by_batch_size(  # type: ignore
                 dp_size,
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
             )
         elif self.use_sequence_packing:
-            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
-                "sequence_packing"
-            ]["logprob_mb_tokens"]
+            logprob_mb_tokens = self.cfg["sequence_packing"].logprob_mb_tokens
+            assert logprob_mb_tokens is not None, (
+                "sequence_packing.logprob_mb_tokens must be configured for calibration"
+            )
+            self.sequence_packing_args["max_tokens_per_microbatch"] = logprob_mb_tokens
             sharded_data, _ = data.shard_by_batch_size(
                 dp_size,
                 batch_size=None,

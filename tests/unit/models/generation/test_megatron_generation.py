@@ -23,7 +23,13 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.megatron import MegatronGeneration
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import (
+    DraftConfigDisabled,
+    DynamicBatchingConfigDisabled,
+    PolicyConfig,
+    SequencePackingConfigDisabled,
+    TokenizerConfig,
+)
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.weight_sync.megatron_weight_synchronizer import (
     MegatronWeightSynchronizer,
@@ -33,7 +39,7 @@ model_name = "Qwen/Qwen3-0.6B"
 
 basic_megatron_test_config: PolicyConfig = {
     "model_name": model_name,
-    "tokenizer": {"name": model_name},
+    "tokenizer": TokenizerConfig(name=model_name),
     "generation_batch_size": 2,
     "train_global_batch_size": 4,
     "train_micro_batch_size": 2,
@@ -43,8 +49,8 @@ basic_megatron_test_config: PolicyConfig = {
     "precision": "bfloat16",
     "offload_optimizer_for_logprob": False,
     "dtensor_cfg": {"enabled": False},
-    "dynamic_batching": {"enabled": False},
-    "sequence_packing": {"enabled": False},
+    "dynamic_batching": DynamicBatchingConfigDisabled(),
+    "sequence_packing": SequencePackingConfigDisabled(),
     "megatron_cfg": {
         "enabled": True,
         "empty_unused_memory_level": 0,
@@ -107,7 +113,7 @@ basic_megatron_test_config: PolicyConfig = {
             "data_parallel_sharding_strategy": "optim_grads_params",
         },
     },
-    "draft": {"enabled": False},
+    "draft": DraftConfigDisabled(),
     "optimizer": None,
     "scheduler": None,
     "max_grad_norm": 1.0,

@@ -32,6 +32,10 @@ import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.models.policy import (
+    SequencePackingConfig,
+    SequencePackingConfigDisabled,
+)
 
 pytestmark = pytest.mark.mcore
 
@@ -249,7 +253,7 @@ class TestForwardWithPostProcessingFn:
 
         data_iterator = iter([processed_mb])
         mock_model = MagicMock()
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {"sequence_packing": SequencePackingConfigDisabled()}
 
         mock_loss_fn = MagicMock()
         post_processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg)
@@ -288,7 +292,7 @@ class TestForwardWithPostProcessingFn:
         )
 
         data_iterator = iter([processed_mb])
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {"sequence_packing": SequencePackingConfigDisabled()}
         post_processor = LogprobsPostProcessor(cfg=cfg)
 
         with patch.object(post_processor, "__call__", return_value=MagicMock()):
@@ -323,7 +327,7 @@ class TestForwardWithPostProcessingFn:
 
         data_iterator = iter([processed_mb])
         cfg = {
-            "sequence_packing": {"enabled": False},
+            "sequence_packing": SequencePackingConfigDisabled(),
             "megatron_cfg": {"context_parallel_size": 1},
         }
         post_processor = TopkLogitsPostProcessor(cfg=cfg, k=5)
@@ -380,7 +384,7 @@ class TestForwardWithPostProcessingFn:
         )
 
         cfg = {
-            "sequence_packing": {"enabled": False},
+            "sequence_packing": SequencePackingConfigDisabled(),
             "generation": {"temperature": 0.7, "top_p": 1.0, "top_k": None},
         }
         post_processor = LossPostProcessor(loss_fn=MagicMock(), cfg=cfg)
@@ -424,7 +428,7 @@ class TestForwardWithPostProcessingFn:
         )
 
         cfg = {
-            "sequence_packing": {"enabled": False},
+            "sequence_packing": SequencePackingConfigDisabled(),
             "generation": {"temperature": 0.5, "top_p": 1.0, "top_k": None},
         }
         post_processor = LogprobsPostProcessor(cfg=cfg)
@@ -468,7 +472,7 @@ class TestForwardWithPostProcessingFn:
         )
 
         cfg = {
-            "sequence_packing": {"enabled": False},
+            "sequence_packing": SequencePackingConfigDisabled(),
             "megatron_cfg": {"context_parallel_size": 1},
             "generation": {"temperature": 1.5, "top_p": 1.0, "top_k": None},
         }
@@ -549,7 +553,7 @@ class TestForwardWithPostProcessingFn:
             cu_seqlens_padded=None,
         )
 
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {"sequence_packing": SequencePackingConfigDisabled()}
         post_processor = LossPostProcessor(loss_fn=MagicMock(), cfg=cfg)
         mock_timer = MagicMock()
 
@@ -618,7 +622,7 @@ class TestForwardWithPostProcessingFn:
             cu_seqlens_padded=None,
         )
         post_processor = LogprobsPostProcessor(
-            cfg={"sequence_packing": {"enabled": False}}
+            cfg={"sequence_packing": SequencePackingConfigDisabled()}
         )
 
         with patch.object(post_processor, "__call__", return_value=MagicMock()):
@@ -680,7 +684,7 @@ class TestForwardWithPostProcessingFn:
             cu_seqlens_padded=None,
         )
         post_processor = LogprobsPostProcessor(
-            cfg={"sequence_packing": {"enabled": False}}
+            cfg={"sequence_packing": SequencePackingConfigDisabled()}
         )
         draft_model = MagicMock(return_value=student_logits)
 
@@ -722,7 +726,7 @@ class TestMegatronForwardBackward:
 
         mock_model = MagicMock()
         mock_loss_fn = MagicMock()
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {"sequence_packing": SequencePackingConfigDisabled()}
         post_processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg)
 
         megatron_forward_backward(
@@ -754,7 +758,7 @@ class TestMegatronForwardBackward:
         mock_fb_func = MagicMock()
         mock_get_fb.return_value = mock_fb_func
 
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {"sequence_packing": SequencePackingConfigDisabled()}
         post_processor = LossPostProcessor(loss_fn=MagicMock(), cfg=cfg)
 
         megatron_forward_backward(
@@ -1090,7 +1094,7 @@ class TestLossPostProcessor:
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(0.5), {"loss": 0.5}))
         mock_loss_fn.input_type = LossInputType.LOGIT
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {"sequence_packing": SequencePackingConfigDisabled()}
 
         processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg, cp_normalize=False)
 
@@ -1129,7 +1133,7 @@ class TestLossPostProcessor:
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(1.0), {}))
         mock_loss_fn.input_type = LossInputType.LOGIT
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {"sequence_packing": SequencePackingConfigDisabled()}
 
         processor = LossPostProcessor(
             loss_fn=mock_loss_fn, cfg=cfg, num_microbatches=4, cp_normalize=True
@@ -1167,7 +1171,7 @@ class TestLossPostProcessor:
         mock_cp_grp.return_value = MagicMock()
 
         mock_loss_fn = MagicMock()
-        cfg = {"sequence_packing": {"enabled": True}}
+        cfg = {"sequence_packing": SequencePackingConfig.model_construct(enabled=True)}
 
         mock_packed_seq_params = MagicMock()
         mock_packed_seq_params.cu_seqlens_q = torch.tensor([0, 5, 10])
@@ -1198,7 +1202,7 @@ class TestLogprobsPostProcessor:
         # Set up mock return values for process groups
         mock_tp_grp.return_value = MagicMock()
 
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {"sequence_packing": SequencePackingConfigDisabled()}
         processor = LogprobsPostProcessor(cfg=cfg)
 
         mock_data_dict = MagicMock()
@@ -1243,7 +1247,7 @@ class TestLogprobsPostProcessor:
         mock_tp_grp.return_value = MagicMock()
         mock_cp_grp.return_value = MagicMock()
 
-        cfg = {"sequence_packing": {"enabled": True}}
+        cfg = {"sequence_packing": SequencePackingConfig.model_construct(enabled=True)}
         processor = LogprobsPostProcessor(cfg=cfg)
 
         mock_data_dict = MagicMock()
@@ -1283,7 +1287,7 @@ class TestTopkLogitsPostProcessor:
         mock_tp_grp.return_value = MagicMock()
 
         cfg = {
-            "sequence_packing": {"enabled": False},
+            "sequence_packing": SequencePackingConfigDisabled(),
             "megatron_cfg": {"context_parallel_size": 1},
         }
         k = 5
@@ -1329,7 +1333,7 @@ class TestTopkLogitsPostProcessor:
         mock_tp_grp.return_value = MagicMock()
 
         cfg = {
-            "sequence_packing": {"enabled": True},
+            "sequence_packing": SequencePackingConfig.model_construct(enabled=True),
             "megatron_cfg": {"context_parallel_size": 1},
         }
         k = 3
@@ -1380,7 +1384,7 @@ class TestTopkLogitsPostProcessor:
         mock_cp_grp.return_value = MagicMock()
 
         cfg = {
-            "sequence_packing": {"enabled": False},
+            "sequence_packing": SequencePackingConfigDisabled(),
             "megatron_cfg": {"context_parallel_size": 2},
         }
         processor = TopkLogitsPostProcessor(cfg=cfg, k=5)
@@ -1428,7 +1432,7 @@ class TestTopkLogitsPostProcessor:
         local_seq_len = seq_len // cp_size  # Each CP rank sees half
 
         cfg = {
-            "sequence_packing": {"enabled": True},
+            "sequence_packing": SequencePackingConfig.model_construct(enabled=True),
             "megatron_cfg": {"context_parallel_size": cp_size},
         }
         processor = TopkLogitsPostProcessor(cfg=cfg, k=k)
@@ -1496,7 +1500,7 @@ class TestTopkLogitsPostProcessor:
         unpacked_seqlen = 6  # Max seq length in batch (for output shape)
 
         cfg = {
-            "sequence_packing": {"enabled": True},
+            "sequence_packing": SequencePackingConfig.model_construct(enabled=True),
             "megatron_cfg": {"context_parallel_size": cp_size},
         }
         processor = TopkLogitsPostProcessor(cfg=cfg, k=k)

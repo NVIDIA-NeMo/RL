@@ -62,7 +62,7 @@ def main():
     print("Final config:")
     pprint.pprint(config)
 
-    assert config.policy["reward_model_cfg"]["enabled"]
+    assert config.policy["reward_model_cfg"].enabled
 
     config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
     print(f"📊 Using log directory: {config.logger['log_dir']}")

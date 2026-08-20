@@ -32,7 +32,7 @@ from nemo_rl.algorithms.loss import (
     DistillationLossDataDict,
     DistillationLossFn,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import is_fastokens_enabled, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -259,7 +259,7 @@ def setup(
         # Therefore, we disable SP + packing for distillation.
         dtensor_enabled = cfg["dtensor_cfg"]["enabled"]
         sequence_packing_enabled = (
-            "sequence_packing" in cfg and cfg["sequence_packing"]["enabled"]
+            "sequence_packing" in cfg and cfg["sequence_packing"].enabled
         )
         sequence_parallel_enabled = (
             "sequence_parallel" in cfg["dtensor_cfg"]
@@ -544,7 +544,7 @@ def setup(
                     base_urls=deferred_vllm.dp_openai_server_base_urls,
                     invalid_tool_call_patterns=invalid_tool_call_patterns,
                     thinking_tags=thinking_tags,
-                    use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+                    use_fastokens=is_fastokens_enabled(policy_config["tokenizer"]),
                     initial_global_config_dict=nemo_gym_dict,
                 )
                 nemo_gym_opts = {

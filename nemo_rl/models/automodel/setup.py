@@ -71,7 +71,12 @@ from nemo_rl.models.automodel.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
-from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
+from nemo_rl.models.policy import (
+    PolicyConfig,
+    SinglePytorchMilestonesConfig,
+    SinglePytorchSchedulerConfig,
+    TokenizerConfig,
+)
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
 
 STRING_TO_DTYPE = {
@@ -157,7 +162,7 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
 
 
 def get_tokenizer(
-    tokenizer_config: TokenizerConfig, get_processor: bool = False
+    tokenizer_config: TokenizerConfig | dict[str, Any], get_processor: bool = False
 ) -> Union[PreTrainedTokenizerBase, AutoProcessor]:
     """Get tokenizer using NeMoAutoTokenizer for automodel workers.
 
@@ -165,7 +170,7 @@ def get_tokenizer(
     and falls back to NeMoAutoTokenizerWithBosEosEnforced for default handling.
 
     Args:
-        tokenizer_config: A dictionary containing tokenizer configuration.
+        tokenizer_config: Tokenizer configuration.
             Required keys:
                 - name: The name or path of the pretrained tokenizer
             Optional keys:
@@ -181,47 +186,47 @@ def get_tokenizer(
     Returns:
         The configured tokenizer or processor instance.
     """
+    if isinstance(tokenizer_config, dict):
+        tokenizer_config = TokenizerConfig(**tokenizer_config)
+
     processor = None
 
     if get_processor:
         processor = AutoProcessor.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+            tokenizer_config.name, trust_remote_code=True, use_fast=True
         )
         tokenizer = processor.tokenizer
     else:
         tokenizer = NeMoAutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
+            tokenizer_config.name, trust_remote_code=True
         )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if "chat_template" in tokenizer_config:
-        if tokenizer_config["chat_template"] is None:
+    if "chat_template" in tokenizer_config.model_fields_set:
+        if tokenizer_config.chat_template is None:
             print("Using passthrough chat template")
             tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
-        elif tokenizer_config["chat_template"].lower() == "default":
+        elif tokenizer_config.chat_template.lower() == "default":
             print("Using tokenizer's default chat template")
-        elif tokenizer_config["chat_template"].endswith(".jinja"):
-            template_path = tokenizer_config["chat_template"]
+        elif tokenizer_config.chat_template.endswith(".jinja"):
+            template_path = tokenizer_config.chat_template
             print(f"Loading chat template from file: {template_path}")
             with open(template_path, "r") as f:
                 tokenizer.chat_template = f.read()
         else:
             print("Using custom chat template")
-            tokenizer.chat_template = tokenizer_config["chat_template"]
+            tokenizer.chat_template = tokenizer_config.chat_template
     else:
         print("No chat template provided, using tokenizer's default")
 
-    if (
-        "chat_template_kwargs" in tokenizer_config
-        and tokenizer_config["chat_template_kwargs"] is not None
-    ):
-        assert isinstance(tokenizer_config["chat_template_kwargs"], dict), (
+    if tokenizer_config.chat_template_kwargs is not None:
+        assert isinstance(tokenizer_config.chat_template_kwargs, dict), (
             "chat_template_kwargs should be a dictionary"
         )
         tokenizer.apply_chat_template = partial(
-            tokenizer.apply_chat_template, **tokenizer_config["chat_template_kwargs"]
+            tokenizer.apply_chat_template, **tokenizer_config.chat_template_kwargs
         )
 
     if processor is not None:
@@ -292,7 +297,7 @@ def validate_and_prepare_config(
     cpu_offload = config["dtensor_cfg"]["cpu_offload"]
     offload_optimizer_for_logprob = config.get("offload_optimizer_for_logprob", False)
     max_grad_norm = config["max_grad_norm"]
-    enable_seq_packing = config["sequence_packing"]["enabled"]
+    enable_seq_packing = config["sequence_packing"].enabled
     model_name = config["model_name"]
 
     # Validate sequence packing
@@ -343,7 +348,7 @@ def validate_and_prepare_config(
 
     # Determine if reward model
     is_reward_model = (
-        "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]
+        "reward_model_cfg" in config and config["reward_model_cfg"].enabled
     )
 
     if is_reward_model:
@@ -353,7 +358,7 @@ def validate_and_prepare_config(
                 "Sequence packing is not supported for reward models"
             )
 
-        rm_type = config["reward_model_cfg"]["reward_model_type"]
+        rm_type = config["reward_model_cfg"].reward_model_type
         if rm_type == "bradley_terry":
             model_class = NeMoAutoModelForSequenceClassification
             if model_config.num_labels != 1:
@@ -803,8 +808,8 @@ def setup_model_and_optimizer(
     # Initialize optimizer
     optimizer = None
     if init_optimizer:
-        optimizer_cls = get_class(config["optimizer"]["name"])
-        optimizer_kwargs = dict(config["optimizer"]["kwargs"])
+        optimizer_cls = get_class(config["optimizer"].name)
+        optimizer_kwargs = dict(config["optimizer"].kwargs)
         # Resolve string-valued torch dtypes (e.g. "torch.bfloat16" -> torch.bfloat16)
         for key, value in optimizer_kwargs.items():
             if isinstance(value, str) and value.startswith("torch."):
@@ -822,24 +827,22 @@ def setup_model_and_optimizer(
     # Initialize scheduler
     scheduler = None
     if "scheduler" in config and optimizer is not None:
-        if isinstance(config["scheduler"], dict):
-            scheduler_cls = get_class(config["scheduler"]["name"])
-            scheduler = scheduler_cls(optimizer, **config["scheduler"]["kwargs"])
+        if isinstance(config["scheduler"], SinglePytorchSchedulerConfig):
+            scheduler_cls = get_class(config["scheduler"].name)
+            scheduler = scheduler_cls(optimizer, **config["scheduler"].kwargs)
         else:
             schedulers = []
             for scheduler_cfg in config["scheduler"]:
-                if "name" in scheduler_cfg:
+                if isinstance(scheduler_cfg, SinglePytorchSchedulerConfig):
                     schedulers.append(
-                        get_class(scheduler_cfg["name"])(
-                            optimizer, **scheduler_cfg["kwargs"]
-                        )
+                        get_class(scheduler_cfg.name)(optimizer, **scheduler_cfg.kwargs)
                     )
                 else:
-                    assert "milestones" in scheduler_cfg, (
+                    assert isinstance(scheduler_cfg, SinglePytorchMilestonesConfig), (
                         "unknown scheduler config: ",
                         scheduler_cfg,
                     )
-                    milestones: list[int] = scheduler_cfg["milestones"]
+                    milestones: list[int] = scheduler_cfg.milestones
 
             scheduler = torch.optim.lr_scheduler.SequentialLR(
                 optimizer, schedulers, milestones

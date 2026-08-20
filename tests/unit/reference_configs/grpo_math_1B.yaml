@@ -132,8 +132,11 @@ policy:
   model_name: "Qwen/Qwen2.5-1.5B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
+    chat_template: "default"
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
     use_fastokens: false # opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the fastokens-b10 wheel. NRL_USE_FASTOKENS overrides at runtime.
+    audio: null
+    video: null
   hf_config_overrides: {}
   train_global_batch_size: 512
   train_micro_batch_size: 4
@@ -322,6 +325,7 @@ policy:
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
     microbatch_order: "packer"
+    fuse_loss: false
     sequence_length_round: 64
 
   # makes the training sequence length divisible by the tensor parallel size

@@ -14,6 +14,8 @@
 
 import math
 from datetime import datetime
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -26,12 +28,29 @@ from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
+    is_fastokens_enabled,
     maybe_pad_last_batch,
     print_efficiency_summary,
     print_performance_metrics,
 )
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy import TokenizerConfig
+
+
+@pytest.mark.parametrize(
+    "config,expected",
+    [
+        ({"name": "model"}, False),
+        ({"name": "model", "use_fastokens": True}, True),
+        (TokenizerConfig(name="model"), False),
+        (TokenizerConfig(name="model", use_fastokens=True), True),
+    ],
+)
+def test_is_fastokens_enabled(
+    config: TokenizerConfig | dict[str, Any], expected: bool
+) -> None:
+    assert is_fastokens_enabled(config) is expected
 
 
 @pytest.fixture
@@ -89,6 +108,36 @@ def get_format_with_simple_role_header(messages):
             + "<|eot_id|>"
         )
     return message
+
+
+@pytest.mark.parametrize(
+    "config,expected_chat_template",
+    [
+        ({"name": "model"}, "tokenizer-default"),
+        (
+            {"name": "model", "chat_template": "default"},
+            "tokenizer-default",
+        ),
+        (
+            {"name": "model", "chat_template": None},
+            COMMON_CHAT_TEMPLATES.passthrough_prompt_response,
+        ),
+    ],
+)
+@patch("nemo_rl.algorithms.utils.AutoTokenizer.from_pretrained")
+def test_get_tokenizer_chat_template_semantics_without_hub(
+    from_pretrained, config, expected_chat_template
+):
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.chat_template = "tokenizer-default"
+    from_pretrained.return_value = tokenizer
+
+    result = get_tokenizer(config)
+
+    assert result is tokenizer
+    assert result.chat_template == expected_chat_template
 
 
 @pytest.mark.hf_gated
