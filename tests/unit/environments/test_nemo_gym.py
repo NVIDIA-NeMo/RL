@@ -1515,9 +1515,11 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
                 )
                 return {"message_log": []}
 
+        mock_self = _MockSelf()
+        mock_self._tokenizer = tokenizer
         streamed_results = []
         async for result in NemoGym.__ray_metadata__.modified_class.run_rollouts(
-            _MockSelf(), [nemo_gym_row], tokenizer, "test"
+            mock_self, [nemo_gym_row], "test"
         ):
             streamed_results.append(result)
 

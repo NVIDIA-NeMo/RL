@@ -778,8 +778,8 @@ def multichoice_qa_processor(
 
 def nemo_gym_data_processor(
     datum_dict: dict[str, Any],
-    task_data_spec: TaskDataSpec,
-    tokenizer: TokenizerType,
+    task_data_spec: TaskDataSpec | None,
+    tokenizer: TokenizerType | None,
     max_seq_length: int | None,
     idx: int,
 ) -> DatumSpec:
@@ -790,7 +790,7 @@ def nemo_gym_data_processor(
     the complete rollout has been collected.
     """
     extra_env_info = json.loads(datum_dict["extra_env_info"])
-    if task_data_spec.video_sampling_style is not None:
+    if task_data_spec is not None and task_data_spec.video_sampling_style is not None:
         if not (
             hasattr(tokenizer, "apply_chat_template")
             and hasattr(tokenizer, "tokenizer")
