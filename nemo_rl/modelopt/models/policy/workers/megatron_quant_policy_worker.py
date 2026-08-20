@@ -603,13 +603,21 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if name not in existing_names:
                     yield name, amax
 
-    def _iter_params_with_optional_kv_scales(self, kv_scales=None):
+    def _iter_params_with_optional_kv_scales(
+        self,
+        kv_scales=None,
+        *,
+        draft_metadata_only: bool = False,
+    ):
         """Pre-fold weights on-the-fly via lazy proxy tasks.
 
         Wraps each conversion task so that reading task.param_weight returns
         weight_quantizer(weight) instead of the raw weight. The folded tensor
         is computed lazily when export_hf_weights accesses it, so only one
         extra weight-sized tensor exists at a time — O(1) extra memory.
+
+        ``draft_metadata_only`` is forwarded to the base refit iterator after
+        quant folding so draft metadata keeps the base worker's PP-lane behavior.
 
         Raises:
             RuntimeError: If weight folding fails for a specific parameter,
@@ -670,7 +678,10 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         self.refit_conversion_tasks = folded_tasks
         try:
             yielded_names = set()
-            for name, tensor in super()._iter_params_with_optional_kv_scales(kv_scales):
+            for name, tensor in super()._iter_params_with_optional_kv_scales(
+                kv_scales,
+                draft_metadata_only=draft_metadata_only,
+            ):
                 if "weight_quantizer" in name:
                     continue
                 yielded_names.add(name)
