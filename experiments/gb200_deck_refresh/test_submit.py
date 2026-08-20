@@ -136,6 +136,13 @@ def test_qwen30_dapo_pair_keeps_workload_matched() -> None:
         assert "policy.max_total_sequence_length=22528" in result.stdout
         assert "policy.megatron_cfg.defer_fp32_logits=true" in result.stdout
         assert "policy.logprob_chunk_size=512" in result.stdout
+        assert "policy.megatron_cfg.use_fused_linear_logprobs=true" in result.stdout
+        assert "policy.megatron_cfg.fused_linear_logprobs_chunk_size=256" in result.stdout
+        assert "policy.sequence_packing.enabled=false" in result.stdout
+        assert (
+            "policy.megatron_cfg.distributed_data_parallel_config."
+            "overlap_param_gather=false" in result.stdout
+        )
         assert "policy.generation.vllm_cfg.enforce_eager=false" in result.stdout
         assert "loss_fn.force_on_policy_ratio=false" in result.stdout
         assert "++grpo.skip_reference_policy_logprobs_calculation=false" in result.stdout

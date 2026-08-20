@@ -175,6 +175,10 @@ if [[ "${MODEL}" == qwen30 ]]; then
     "policy.max_total_sequence_length=22528"
     "policy.megatron_cfg.defer_fp32_logits=true"
     "policy.logprob_chunk_size=512"
+    "policy.megatron_cfg.use_fused_linear_logprobs=true"
+    "policy.megatron_cfg.fused_linear_logprobs_chunk_size=256"
+    "policy.sequence_packing.enabled=false"
+    "policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=false"
     "loss_fn.reference_policy_kl_penalty=0.01"
   )
 fi
