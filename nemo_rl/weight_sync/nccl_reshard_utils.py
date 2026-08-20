@@ -816,6 +816,11 @@ def build_nccl_reshard_refit_info(
     tp_size = train_parallelism.get("tp_size", 1)
     ep_size = train_parallelism.get("ep_size", 1)
     cp_size = train_parallelism.get("cp_size", 1)
+    if train_world_size <= 0 or pp_size <= 0 or train_world_size % pp_size != 0:
+        raise ValueError(
+            f"Cannot divide train_world_size={train_world_size} into TP={tp_size} "
+            f"EP={ep_size} CP={cp_size} PP={pp_size}."
+        )
     use_per_stage = pp_size > 1
     if use_per_stage:
         assert layer_to_pp_stage is not None, (

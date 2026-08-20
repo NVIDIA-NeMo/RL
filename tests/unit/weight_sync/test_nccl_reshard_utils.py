@@ -556,6 +556,21 @@ def test_build_refit_info_sets_pp_stage_when_pp_gt_1():
             assert p["pp_stage"] == layer_to_pp_stage[layer]
 
 
+def test_build_refit_info_rejects_train_world_not_divisible_by_pp():
+    with pytest.raises(
+        ValueError,
+        match="train_world_size=14.*TP=1.*EP=1.*CP=2.*PP=3",
+    ):
+        build_nccl_reshard_refit_info(
+            _dense_metadata(),
+            train_parallelism={"tp_size": 1, "ep_size": 1, "cp_size": 2, "pp_size": 3},
+            gen_parallelism={"tp_size": 1, "ep_size": 1, "cp_size": 1, "pp_size": 1},
+            train_world_size=14,
+            gen_world_size=1,
+            layer_to_pp_stage={"model.layers.0": 0},
+        )
+
+
 def test_build_refit_info_groups_experts_and_tags_them():
     info = build_nccl_reshard_refit_info(
         _moe_metadata(num_experts=2),

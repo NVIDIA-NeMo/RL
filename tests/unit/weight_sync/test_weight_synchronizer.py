@@ -486,6 +486,27 @@ class TestNcclReshardWeightSynchronizer:
         }
 
     @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
+    def test_init_communicator_rejects_generation_context_parallelism_before_collectives(
+        self, mock_ray
+    ):
+        policy = _mock_policy(
+            cfg={
+                "megatron_cfg": {},
+                "generation": {"vllm_cfg": {"context_parallel_size": 2}},
+            },
+        )
+        generation = _mock_generation()
+        sync = NcclReshardWeightSynchronizer(
+            policy, generation, _mock_cluster(), _mock_cluster()
+        )
+
+        with pytest.raises(ValueError, match="context_parallel_size must be 1"):
+            sync.init_communicator()
+
+        policy.init_collective.assert_not_called()
+        generation.init_collective.assert_not_called()
+
+    @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
     def test_init_communicator_ships_wire_safe_refit_info(self, mock_ray):
         # The train-side refit info carries MeshInfo rank tensors; the copy
         # handed to the generation side must be the wire-safe (plain-dict)
