@@ -338,6 +338,9 @@ def test_local_eval_yaml_load_flow(monkeypatch):
         lambda *args, **kwargs: Dataset.from_list([{"Question": "1 + 1", "Answer": 2}]),
     )
     repo_root = Path(__file__).resolve().parents[4]
+    # local_eval.yaml references prompt_file relative to the repo root, and
+    # TaskDataSpec resolves it against the current working directory.
+    monkeypatch.chdir(repo_root)
     config = load_config(repo_root / "examples/configs/evals/local_eval.yaml")
     config_dict = OmegaConf.to_container(config, resolve=True)
     master_config = MasterConfig(**config_dict)
