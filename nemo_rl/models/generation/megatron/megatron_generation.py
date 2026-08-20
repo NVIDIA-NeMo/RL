@@ -227,6 +227,37 @@ class MegatronGeneration(GenerationInterface):
             "update_generation_weights_from_collective"
         )
 
+    def init_nccl_reshard_comm_group(
+        self,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Join every training PP stage's NCCL M-to-N communicator."""
+        return self._policy.worker_group.run_all_workers_single_data(
+            "init_nccl_reshard_comm_groups_generation",
+            pp_ips=pp_ips,
+            pp_ports=pp_ports,
+            pp_size=pp_size,
+            train_ranks_per_stage=train_ranks_per_stage,
+            sub_world_size=sub_world_size,
+        )
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Build each inference worker's HF-to-Megatron M-to-N receive map."""
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "prepare_nccl_reshard_generation_refit_info", refit_info=refit_info
+        )
+        ray.get(futures)
+
+    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
+        """Receive one NCCL M-to-N refit on every Megatron inference worker."""
+        return self._policy.worker_group.run_all_workers_single_data(
+            "nccl_reshard_generation_refit"
+        )
+
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:

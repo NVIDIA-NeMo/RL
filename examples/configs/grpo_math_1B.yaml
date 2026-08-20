@@ -362,6 +362,7 @@ policy:
     stop_strings: null
     # null = topology default (IPC colocated, NCCL non-colocated).
     # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
+    # Non-colocated vLLM or Megatron generation supports nccl_reshard (M-to-N).
     refit_transport: null
     # Keep real-quant export tensors on CPU by default. Set false only for
     # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.

@@ -74,10 +74,12 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # processors. Policy recomputation uses raw model logits, so numerical
     # parity checks should select raw_logprobs explicitly.
     logprobs_mode: Literal["processed_logprobs", "raw_logprobs"]
-    inference_mxfp8_backend: NotRequired[Literal["flashinfer", "torch"]]
 
 
 class MCoreGenerationConfig(GenerationConfig):
     """Generation config for Megatron Inference."""
 
+    # None uses Bridge packed broadcast or native MCore refit according to
+    # refit_impl. nccl_reshard selects the non-colocated NCCL M-to-N transport.
+    refit_transport: NotRequired[Literal["nccl_reshard"] | None]
     mcore_generation_config: MCoreGenerationSpecificArgs

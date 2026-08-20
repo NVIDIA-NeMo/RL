@@ -10,6 +10,8 @@ policy:
     expert_model_parallel_size: 2
     sequence_parallel: false
   generation:
+    # Exercise shard-to-shard M-to-N transfer followed by inference-side MXFP8 quantization.
+    refit_transport: nccl_reshard
     max_new_tokens: 8
     colocated:
       enabled: false
@@ -21,9 +23,8 @@ policy:
       tensor_model_parallel_size: 1
       expert_model_parallel_size: 2
       sequence_parallel: false
+      # PyTorch grouped GEMM uses the Triton MXFP8 storage layout.
       inference_grouped_gemm_backend: torch
-      # Use fused Triton refit quantization for the PyTorch scaled GEMM paths.
-      inference_mxfp8_backend: triton
       # NVLS supports CUDA graphs for both prefill and decode in the
       # inference-optimized expert-parallel path.
       inference_moe_token_dispatcher_type: nvls

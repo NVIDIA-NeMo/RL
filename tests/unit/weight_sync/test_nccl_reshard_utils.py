@@ -71,7 +71,7 @@ def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
         ),
         (
             {"backend": "sglang"},
-            "policy.generation.backend must be 'vllm' (got 'sglang')",
+            "policy.generation.backend must be 'vllm' or 'megatron' (got 'sglang')",
         ),
     ],
 )
@@ -85,6 +85,42 @@ def test_check_nccl_reshard_refit_support_rejects_invalid_config(
         check_nccl_reshard_refit_support(config)
 
     assert expected_violation in str(exc_info.value)
+
+
+def test_check_nccl_reshard_refit_support_accepts_megatron_bf16_and_mxfp8() -> None:
+    for fp8_cfg in ({"enabled": False}, {"enabled": True, "fp8_recipe": "mxfp8"}):
+        config = _valid_nccl_reshard_config()
+        config.policy["precision"] = "bfloat16"
+        config.policy["generation"] = {
+            "backend": "megatron",
+            "colocated": {"enabled": False},
+            "mcore_generation_config": {
+                "refit_impl": "bridge",
+                "expert_tensor_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "fp8_cfg": fp8_cfg,
+            },
+        }
+
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_keeps_native_megatron_refit_separate() -> (
+    None
+):
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "refit_impl": "mcore",
+            "pipeline_model_parallel_size": 1,
+        },
+    }
+
+    with pytest.raises(ValueError, match="refit_impl must be 'bridge'"):
+        check_nccl_reshard_refit_support(config)
 
 
 # --------------------------------------------------------------------------
@@ -476,3 +512,21 @@ def test_build_refit_info_groups_experts_and_tags_them():
         for layer in info["layer_names"]
         for p in info["per_layer_params"][layer]
     )
+
+
+def test_build_refit_info_replicates_megatron_experts_when_etp_is_one():
+    info = build_nccl_reshard_refit_info(
+        _moe_metadata(num_experts=2),
+        train_parallelism={"tp_size": 1, "ep_size": 2, "pp_size": 1},
+        gen_parallelism={
+            "tp_size": 2,
+            "ep_size": 1,
+            "etp_size": 1,
+            "pp_size": 1,
+        },
+        train_world_size=2,
+        gen_world_size=2,
+    )
+
+    gate = _find(info, "model.layers.0.mlp.experts.gate_proj.weight")
+    assert all(isinstance(placement, Replicate) for placement in gate["dst_placements"])

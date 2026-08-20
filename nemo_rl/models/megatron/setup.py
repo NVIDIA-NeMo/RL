@@ -885,10 +885,6 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.inference_grouped_gemm_backend = config["megatron_cfg"][
             "inference_grouped_gemm_backend"
         ]
-    if "inference_mxfp8_backend" in config["megatron_cfg"]:
-        model_cfg.inference_mxfp8_backend = config["megatron_cfg"][
-            "inference_mxfp8_backend"
-        ]
     if "moe_router_num_groups" in config["megatron_cfg"]:
         model_cfg.moe_router_num_groups = config["megatron_cfg"][
             "moe_router_num_groups"

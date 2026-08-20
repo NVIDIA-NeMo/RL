@@ -468,6 +468,46 @@ class TestFactory:
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
 
+    def test_non_colocated_megatron_m2n_uses_effective_parallelism(self):
+        from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+            NcclReshardWeightSynchronizer,
+        )
+
+        policy = _mock_policy()
+        policy.cfg = {
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 2,
+                "expert_model_parallel_size": 4,
+                "pipeline_model_parallel_size": 1,
+            },
+            "generation": {
+                "backend": "megatron",
+                "refit_transport": "nccl_reshard",
+                "mcore_generation_config": {
+                    "tensor_model_parallel_size": 8,
+                    "expert_model_parallel_size": 2,
+                },
+            },
+        }
+        generation = _mock_generation(cfg=policy.cfg["generation"])
+
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=generation,
+            generation_backend=MEGATRON_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        assert isinstance(sync, NcclReshardWeightSynchronizer)
+        assert sync._gen_parallelism() == {
+            "tp_size": 8,
+            "ep_size": 2,
+            "etp_size": 1,
+            "pp_size": 1,
+        }
+
     def test_non_colocated_sglang_raises(self):
         policy = _mock_policy()
         gen = _mock_generation()

@@ -383,7 +383,6 @@ class MegatronConfig(TypedDict):
     # Backend for grouped-GEMM during inference-optimized MoE forward.
     # Options: 'flashinfer', 'torch', 'vllm' (mcore default).
     inference_grouped_gemm_backend: NotRequired[str]
-    inference_mxfp8_backend: NotRequired[str]
     # InferenceTopKRouter requires moe_router_num_groups=None
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]

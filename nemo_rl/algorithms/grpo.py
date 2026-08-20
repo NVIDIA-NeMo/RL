@@ -1417,12 +1417,13 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
+    nccl_reshard_refit_enabled = (
+        generation_config.get("refit_transport") == "nccl_reshard"
+    )
     native_megatron_refit = (
         isinstance(policy_generation, MegatronGeneration)
         and policy_generation.uses_native_refit
-    )
-    nccl_reshard_refit_enabled = (
-        generation_config.get("refit_transport") == "nccl_reshard"
+        and not nccl_reshard_refit_enabled
     )
     if nccl_reshard_refit_enabled:
         from nemo_rl.weight_sync.nccl_reshard_utils import (
@@ -1431,13 +1432,15 @@ def setup(
 
         check_nccl_reshard_refit_support(master_config)
 
-    if generation_config.get("refit_transport") is not None and backend != "vllm":
+    if (
+        generation_config.get("refit_transport") not in (None, "nccl_reshard")
+        and backend != "vllm"
+    ):
         raise NotImplementedError(
-            "Non-default refit transports are only supported for the vLLM "
+            "This non-default refit transport is only supported for the vLLM "
             f"generation backend, but policy.generation.backend={backend!r}. "
-            "Set policy.generation.refit_transport=null. Support for other "
-            "generation backends is tracked in "
-            "https://github.com/NVIDIA-NeMo/RL/issues/3288."
+            "Set policy.generation.refit_transport=null. NCCL M-to-N "
+            "refit_transport='nccl_reshard' also supports Megatron generation."
         )
 
     # if it is not colocated inference, initialize collective communication for update weights
@@ -1456,7 +1459,8 @@ def setup(
 
         # init collective
         if native_megatron_refit:
-            refit_backend = generation_config["mcore_generation_config"][
+            assert isinstance(policy_generation, MegatronGeneration)
+            refit_backend = policy_generation.cfg["mcore_generation_config"][
                 "refit_backend"
             ]
             futures_train = policy.init_collective_mcore_generation(
@@ -2313,7 +2317,15 @@ def refit_policy_generation(
     """
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
-        return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
+        if isinstance(policy_generation, MegatronGeneration):
+            policy_generation.suspend_for_refit()
+            policy.offload_before_refit()
+            policy_generation.prepare_for_generation(tags=["weights"])
+        metrics = synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
+        if isinstance(policy_generation, MegatronGeneration):
+            policy_generation.prepare_for_generation(tags=["kv_cache"])
+            policy_generation.resume_after_refit()
+        return metrics
 
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):

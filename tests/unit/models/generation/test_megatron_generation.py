@@ -14,7 +14,7 @@
 
 import gc
 from copy import deepcopy
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import ray
@@ -42,6 +42,7 @@ def test_megatron_generation_dispatches_refit_implementation(refit_impl):
         }
     }
     generation._policy = MagicMock()
+    generation._owns_policy = False
 
     generation.init_collective(
         "127.0.0.1", 1234, 4, train_world_size=2
@@ -72,6 +73,51 @@ def test_megatron_generation_dispatches_refit_implementation(refit_impl):
             "update_generation_weights_from_collective"
         )
         generation._policy.init_collective_mcore_generation.assert_not_called()
+
+
+def test_megatron_generation_forwards_m2n_refit_lifecycle() -> None:
+    generation = object.__new__(MegatronGeneration)
+    generation._policy = MagicMock()
+    generation._owns_policy = False
+    generation._policy.worker_group.run_all_workers_single_data.side_effect = [
+        ["init"],
+        ["prepare"],
+        ["refit"],
+    ]
+
+    assert generation.init_nccl_reshard_comm_group(
+        pp_ips=["10.0.0.1"],
+        pp_ports=[1234],
+        pp_size=1,
+        train_ranks_per_stage=2,
+        sub_world_size=4,
+    ) == ["init"]
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        get = MagicMock(return_value=["prepare"])
+        monkeypatch.setattr(ray, "get", get)
+        generation.prepare_nccl_reshard_refit_info({"layer_names": []})
+        get.assert_called_once_with(["prepare"])
+    assert generation.nccl_reshard_refit() == ["refit"]
+
+    assert (
+        generation._policy.worker_group.run_all_workers_single_data.call_args_list
+        == [
+            call(
+                "init_nccl_reshard_comm_groups_generation",
+                pp_ips=["10.0.0.1"],
+                pp_ports=[1234],
+                pp_size=1,
+                train_ranks_per_stage=2,
+                sub_world_size=4,
+            ),
+            call(
+                "prepare_nccl_reshard_generation_refit_info",
+                refit_info={"layer_names": []},
+            ),
+            call("nccl_reshard_generation_refit"),
+        ]
+    )
+
 
 basic_megatron_test_config: PolicyConfig = {
     "model_name": model_name,

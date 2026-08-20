@@ -28,17 +28,21 @@ single `ValueError` listing every violation. The current requirements are:
   path uses IPC and is unaffected by this feature.
 * **Megatron training backend** — `policy.megatron_cfg.enabled=true` (the DTensor
   training backend is not supported yet.).
-* **vLLM generation backend** — `policy.generation.backend=vllm` (SGLang and TRTLLM
-  backend is not supported yet.).
+* **vLLM or Megatron generation backend** — `policy.generation.backend` must be
+  `vllm` or `megatron` (SGLang and TRTLLM are not supported yet).
 * Megatron `expert_tensor_parallel_size` (i.e., ETP) must be 1; custom PP layouts
   (`pipeline_model_parallel_layout`, virtual PP > 1, embedding/loss pipeline-split
   accounting) are not supported yet.
-* **Precision** must match end to end: BF16 train ↔ BF16 gen, or FP8 train
-  (`fp8_param=true` + blockwise recipe) ↔ FP8 gen (`vllm_cfg.precision=fp8`).
-  BF16 train ↔ FP8 gen is not supported yet.
+* **Precision** for vLLM must match end to end: BF16 train ↔ BF16 gen, or FP8
+  train (`fp8_param=true` + blockwise recipe) ↔ FP8 gen
+  (`vllm_cfg.precision=fp8`). Megatron generation accepts BF16 training weights
+  into either BF16 or MXFP8 inference storage; MXFP8 quantization happens on the
+  destination after each fused local weight is complete.
 * vLLM expert parallelism is supported with the NeMo RL convention
-  `expert_parallel_size == tensor_parallel_size`. 
-* Generation-side, PP > 1 is not supported. 
+  `expert_parallel_size == tensor_parallel_size`.
+* Megatron generation uses `mcore_generation_config.refit_impl=bridge` for this
+  transport. Set `refit_transport=null` to retain Megatron Core's native refit.
+* Generation-side PP > 1 is not supported.
 
 Operational knobs:
 
@@ -65,7 +69,7 @@ nccl-reshard-refit implementation:
   regular `load_weights` machinery.
 
 The feature is integrated into the `nemo_rl/weight_sync/` framework:
-`create_weight_synchronizer(..., nccl_reshard_refit=True)` returns a
+`create_weight_synchronizer(...)` with `refit_transport=nccl_reshard` returns a
 `NcclReshardWeightSynchronizer` whose `init_communicator()` performs the one-time setup
 and whose `sync_weights()` runs one refit.
 
@@ -182,6 +186,11 @@ generation side maps those HF names onto whatever its own storage layout is.
   deliberately **shape-driven** so the same code handles generation TP and generation
   EP; the comm bootstrap methods; the `nccl_reshard_refit()` receive loop; the misc
   consumer feeding `load_weights`.
+* **Megatron generation side** (`megatron_worker.py`): mapping the same canonical
+  HF FFN shards to local fused dense/expert views. BF16 destinations receive in
+  place; MXFP8 destinations use short-lived BF16 staging buffers and quantize into
+  their persistent MCore storage. Misc weights continue through Megatron Bridge's
+  packed-broadcast import path.
 
 **To extend to a new backend**, the only piece with genuinely new logic is
 `build_hf_to_local_param_map`. Everything else is boilerplate that follows a fixed
