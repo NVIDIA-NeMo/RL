@@ -92,6 +92,15 @@ def _detach_pending_layerwise_weights(
                 arguments.arguments["loaded_weight"] = loaded_weight.clone()
 
 
+def _process_hpc_modules_after_loading(model: torch.nn.Module) -> None:
+    """Refresh derived HPC state omitted by vLLM's layerwise finalizer."""
+    from vllm.model_executor.layers.hpc import HpcModule
+
+    for _, module in model.named_modules():
+        if isinstance(module, HpcModule):
+            module.process_weights_after_loading(model)
+
+
 def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
     """Return whether a model realized the unquantized TRTLLM MoE backend."""
     # Import backend types only when inspecting a constructed vLLM model.
@@ -638,6 +647,7 @@ class VllmInternalWorkerExtension:
                     initialize_layerwise_reload(draft_model)
                     self._load_draft_weights(weights)
                     finalize_layerwise_reload(draft_model, draft_model_config)
+                    _process_hpc_modules_after_loading(draft_model)
         else:
             from vllm.model_executor.model_loader.utils import (
                 process_weights_after_loading,
@@ -749,6 +759,7 @@ class VllmInternalWorkerExtension:
             def finalize() -> None:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
+                    _process_hpc_modules_after_loading(model)
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.accelerator.synchronize()
 
