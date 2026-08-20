@@ -282,7 +282,9 @@ class MegatronGenerationMixin:
 
         # The value may be overwritten by `recompute_kv_cache_after_weight_updates`.
         kv_cache_management_mode = mcore_generation_config["kv_cache_management_mode"]
-        needs_static_kv_pointers = kv_cache_management_mode != "persist"
+        needs_static_kv_pointers = mcore_generation_config.get(
+            "static_kv_memory_pointers", kv_cache_management_mode != "persist"
+        )
 
         materialize_only_last_token_logits = mcore_generation_config[
             "materialize_only_last_token_logits"
