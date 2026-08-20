@@ -126,10 +126,10 @@ class DailyOmniDataset(RawDataset):
             )
         return prompt
 
-    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
-        video_dir = os.path.join(self.hf_cache_dir, "Videos", data["video_id"])
-        video_path = os.path.join(video_dir, data["video_id"] + "_video.mp4")
-        audio_path = os.path.join(video_dir, data["video_id"] + "_audio.wav")
+    def format_data(self, datum_dict: dict[str, Any]) -> dict[str, Any]:
+        video_dir = os.path.join(self.hf_cache_dir, "Videos", datum_dict["video_id"])
+        video_path = os.path.join(video_dir, datum_dict["video_id"] + "_video.mp4")
+        audio_path = os.path.join(video_dir, datum_dict["video_id"] + "_audio.wav")
         # Audio + video flow as two independent content items so the
         # Qwen2.5-Omni chat template renders both <|VIDEO|> and <|AUDIO|>
         # placeholders (Daily-Omni is an audio-visual benchmark).
@@ -139,7 +139,7 @@ class DailyOmniDataset(RawDataset):
             {
                 "type": "text",
                 "text": self.get_prompt(
-                    data,
+                    datum_dict,
                     include_single_letter_instruction=self.include_single_letter_instruction,
                 ),
             },
@@ -147,7 +147,7 @@ class DailyOmniDataset(RawDataset):
         return {
             "messages": [
                 {"role": "user", "content": user_content},
-                {"role": "assistant", "content": data["Answer"]},
+                {"role": "assistant", "content": datum_dict["Answer"]},
             ],
             "task_name": self.task_name,
         }
