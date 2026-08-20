@@ -230,6 +230,7 @@ def _new_buffer(dp: NoOpDataPlaneClient) -> TQReplayBuffer:
         dp,
         partition_id=PARTITION,
         pad_value_dict={"input_ids": 0},
+        include_message_violation_fields=False,
         require_routed_experts=False,
     )
     buf.set_data_plane_checkpoint_barrier(DataPlaneCheckpointBarrier())

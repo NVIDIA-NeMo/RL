@@ -210,7 +210,6 @@ class PPOConfig(BaseModel, extra="allow"):
     # Advantage value assigned to malformed-thinking tokens; None disables it.
     malformed_thinking_advantage: float | None = None
 
-
     # Asynchronous PPO uses a replay buffer with non-colocated generation.
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_ppo: AsyncPPOConfig | None = Field(default_factory=AsyncPPOConfig)

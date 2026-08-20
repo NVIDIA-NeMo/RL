@@ -15,7 +15,7 @@
 """Producer-side payload helpers for the async-RL TQ path."""
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -69,7 +69,7 @@ def _add_message_violation_masks(
     """
     for message_log in message_logs:
         for message in message_log:
-            token_ids = message["token_ids"]
+            token_ids = cast(torch.Tensor, message["token_ids"])
             is_generated_assistant = (
                 message["role"] == "assistant" and "generation_logprobs" in message
             )
@@ -120,6 +120,7 @@ def record_to_train_batch(
     assert n > 0, "PromptGroupRecord has no completions"
 
     message_logs = [c.message_log for c in completions]
+    violation_counts = [_violation_counts(message_log) for message_log in message_logs]
     prompt_token_count = sum(len(m["token_ids"]) for m in record.prompt)
     if include_message_violation_fields:
         _add_message_violation_masks(message_logs)
@@ -155,7 +156,7 @@ def record_to_train_batch(
         "sample_mask": sample_mask,
         "prompt_ids_for_adv": prompt_flat["token_ids"],
         "total_reward": total_reward,
-        _VIOLATION_COUNTS_KEY: [_violation_counts(ml) for ml in message_logs],
+        _VIOLATION_COUNTS_KEY: violation_counts,
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]

@@ -93,6 +93,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
+    apply_message_level_advantage_penalties,
     fields_for_put,
     reduce_advantage_pump_metrics,
     squeeze_trailing_unit_dim,

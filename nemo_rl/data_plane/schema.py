@@ -60,6 +60,8 @@ SC_ROLLOUT_SCHEMA_FIELDS = (
     "values",
     "returns",
     "teacher_reference_logprobs",
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
 )
 
 # Subset fetched by logprob / ref-logprob workers.
