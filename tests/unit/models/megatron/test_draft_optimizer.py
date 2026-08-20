@@ -34,7 +34,6 @@ from nemo_rl.models.policy.draft_config import (
     Eagle3DraftConfig,
 )
 
-
 pytestmark = pytest.mark.mcore
 
 
