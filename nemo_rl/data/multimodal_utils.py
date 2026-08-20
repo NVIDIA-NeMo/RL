@@ -21,6 +21,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from copy import deepcopy
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Optional, Union
 
 import requests
@@ -858,23 +859,52 @@ def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
         return Image.open(image_path_or_image).convert("RGB")
 
 
-def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
-    """Encode a PIL Image as a base64 ``data:`` URL.
+# Image format (PIL name or file extension) -> MIME subtype. Formats listed here
+# are embedded in a data URL as-is, without re-encoding. MPO is the format PIL
+# reports for multi-picture JPEGs (common from phone cameras); its bytes are
+# JPEG and decode as such.
+_IMAGE_MIME_SUBTYPES = {
+    "PNG": "png",
+    "JPEG": "jpeg",
+    "JPG": "jpeg",
+    "MPO": "jpeg",
+    "GIF": "gif",
+    "WEBP": "webp",
+}
+
+
+def image_to_data_url(image: Image.Image | str, fmt: Optional[str] = None) -> str:
+    """Encode a PIL Image or a local image file as a base64 ``data:`` URL.
+
+    A path is embedded byte-for-byte when its on-disk format is already
+    web-safe (only the image header is parsed, never the pixels); other formats
+    are decoded and re-serialized as ``fmt``.
 
     Args:
-        image: PIL image to encode.
-        fmt: PIL image format used for serialization (e.g. ``"PNG"``, ``"JPEG"``).
-            The value is also lowercased and embedded in the MIME type of the
-            returned URL.
+        image: PIL image, or path to a local image file.
+        fmt: PIL format used when serializing (e.g. ``"PNG"``, ``"JPEG"``).
+            Defaults to the image's own format, or PNG if it has none (in-memory
+            images) or an unembeddable one. Ignored for paths embedded as-is.
 
     Returns:
-        A ``data:image/<fmt>;base64,<payload>`` URL suitable for embedding in
-        an OpenAI Responses ``input_image`` content part.
+        A ``data:image/<subtype>;base64,<payload>`` URL suitable for embedding
+        in an OpenAI Responses ``input_image`` content part.
     """
+    if isinstance(image, str):
+        raw = Path(image).read_bytes()
+        with Image.open(BytesIO(raw)) as opened:
+            # `Image.format` is None for images that were not read from a file.
+            subtype = _IMAGE_MIME_SUBTYPES.get(opened.format or "")
+            if subtype is not None:
+                return f"data:image/{subtype};base64,{base64.b64encode(raw).decode()}"
+            image = opened.convert("RGB")
+    # Keep the source encoding when it is one we can embed, so a JPEG never
+    # comes back out as a (much larger) PNG.
+    fmt = fmt or (image.format if image.format in _IMAGE_MIME_SUBTYPES else "PNG")
     buf = BytesIO()
-    image.save(buf, format=fmt)
-    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/{fmt.lower()};base64,{encoded}"
+    image.save(buf, format="JPEG" if fmt.upper() in ("JPG", "MPO") else fmt)
+    subtype = _IMAGE_MIME_SUBTYPES.get(fmt.upper(), fmt.lower())
+    return f"data:image/{subtype};base64,{base64.b64encode(buf.getvalue()).decode()}"
 
 
 def extract_input_image_sources_from_responses_messages(
@@ -1025,10 +1055,11 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
     Walks each example's ``responses_create_params.input[].content[]`` items
     and rewrites any ``input_image`` part whose ``image_url`` is a local path
     (or ``file://`` URL) into a base64 ``data:`` URL via
-    :func:`image_to_data_url`. Parts whose URL already starts with ``http://``,
-    ``https://``, or ``data:`` are left untouched. Malformed items (non-dict
-    entries, missing/empty URLs, non-list ``input``/``content``) are skipped
-    without raising.
+    :func:`image_to_data_url`, which preserves the on-disk encoding instead of
+    decoding and re-encoding the pixels. Parts whose URL already
+    starts with ``http://``, ``https://``, or ``data:`` are left untouched.
+    Malformed items (non-dict entries, missing/empty URLs, non-list
+    ``input``/``content``) are skipped without raising.
 
     The examples are mutated in place; the same list is also returned for
     convenience so callers can chain the call.
@@ -1062,7 +1093,7 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
                     continue
                 if url.startswith(("http://", "https://", "data:")):
                     continue
-                part["image_url"] = image_to_data_url(resolve_to_image(url))
+                part["image_url"] = image_to_data_url(url.removeprefix("file://"))
     return nemo_gym_examples
 
 
