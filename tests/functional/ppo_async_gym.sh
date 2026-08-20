@@ -25,16 +25,19 @@ if [[ ! -f env.yaml ]]; then
 fi
 
 uv run ng_prepare_data \
-    "+config_paths=[resources_servers/math_with_judge/configs/math_with_judge.yaml]" \
-    +output_dirpath=data/math_with_judge \
+    "+config_paths=[resources_servers/workplace_assistant/configs/workplace_assistant.yaml]" \
+    +output_dirpath=data/workplace_assistant \
     +mode=train_preparation \
     +should_download=true \
     +data_source=huggingface
 
-TRAIN_PATH="${DATA_DIR}/math_with_judge_train.jsonl"
-VALIDATION_PATH="${DATA_DIR}/math_with_judge_validation.jsonl"
-cp data/math_with_judge/train.jsonl "${TRAIN_PATH}"
-cp data/math_with_judge/validation.jsonl "${VALIDATION_PATH}"
+TRAIN_PATH="${DATA_DIR}/workplace_assistant_train.jsonl"
+VALIDATION_PATH="${DATA_DIR}/workplace_assistant_validation.jsonl"
+# Keep the smoke-test prompts within the model context window.
+jq -c '.responses_create_params.tools |= (.[0:1])' \
+    data/workplace_assistant/train.jsonl > "${TRAIN_PATH}"
+jq -c '.responses_create_params.tools |= (.[0:1])' \
+    data/workplace_assistant/validation.jsonl > "${VALIDATION_PATH}"
 
 cd "${PROJECT_ROOT}"
 uv run coverage run -a \
@@ -49,7 +52,9 @@ uv run coverage run -a \
     value.dtensor_cfg.enabled=true \
     value.megatron_cfg.enabled=false \
     policy.generation.vllm_cfg.tensor_parallel_size=1 \
-    policy.max_total_sequence_length=512 \
+    ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.enable_auto_tools=true \
+    ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.tool_parser=hermes \
+    policy.max_total_sequence_length=768 \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.num_nodes=1 \
     policy.generation.colocated.resources.gpus_per_node=1 \
@@ -74,6 +79,7 @@ uv run coverage run -a \
     checkpointing.enabled=true \
     checkpointing.save_period=5 \
     checkpointing.checkpoint_dir="${CHECKPOINT_DIR}" \
+    'env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/workplace_assistant/configs/workplace_assistant.yaml]' \
     data.train.data_path="${TRAIN_PATH}" \
     data.validation.data_path="${VALIDATION_PATH}" \
     "$@" \
