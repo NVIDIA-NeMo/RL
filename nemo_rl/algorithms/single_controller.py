@@ -1654,6 +1654,15 @@ class SingleControllerActor:
                 _release_capacity(acquired)
                 raise
 
+        def _num_prompts_to_dispatch(
+            batch_size: int, target_step: Optional[int]
+        ) -> int:
+            """Return only the target-step shortfall after replay restoration."""
+            if target_step is None:
+                return batch_size
+            buffered = self._buffer.count_for_target_step(target_step)
+            return max(0, batch_size - buffered)
+
         max_epochs = self._master_config.grpo.max_num_epochs
         token_capture_config = getattr(self._master_config, "token_capture", None)
         token_capture_enabled = bool(
@@ -1707,15 +1716,9 @@ class SingleControllerActor:
                                     target_step = self._sampler.commit_admission(
                                         trainer_version=self._trainer_version
                                     )
-                                    num_prompts = prompt_batch.size
-                                    if target_step is not None:
-                                        buffered = self._buffer.count_for_target_step(
-                                            target_step
-                                        )
-                                        if buffered:
-                                            num_prompts = max(
-                                                0, prompt_batch.size - buffered
-                                            )
+                                    num_prompts = _num_prompts_to_dispatch(
+                                        prompt_batch.size, target_step
+                                    )
                                     unused_capacity = (
                                         preacquired_capacity - num_prompts
                                     )
@@ -1755,8 +1758,11 @@ class SingleControllerActor:
                         target_step = await self._sampler.admit(
                             trainer_version_fn=lambda: self._trainer_version
                         )
+                        num_prompts = _num_prompts_to_dispatch(
+                            prompt_batch.size, target_step
+                        )
                         rollout_work_items = []
-                        for prompt_idx in range(prompt_batch.size):
+                        for prompt_idx in range(num_prompts):
                             prompt = {  # type: ignore
                                 key: value[prompt_idx]
                                 for key, value in prompt_batch.items()
