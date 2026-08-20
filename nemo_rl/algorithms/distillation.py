@@ -564,6 +564,7 @@ def setup(
                     )
                 actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
                 ray.get(actor._spinup.remote())
+                ray.get(actor.set_tokenizer.remote(tokenizer))
                 return actor
 
             init_tasks = {

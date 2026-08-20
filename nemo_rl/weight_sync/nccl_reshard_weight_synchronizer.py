@@ -135,9 +135,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
     def is_stale(self) -> bool:
         return self._stale
 
-    def mark_stale(self) -> None:
-        self._stale = True
-
     def init_communicator(self) -> None:
         train_parallelism = self._train_parallelism()
         gen_parallelism = self._gen_parallelism()

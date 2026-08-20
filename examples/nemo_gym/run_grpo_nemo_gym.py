@@ -37,6 +37,7 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     refit_policy_generation,
     setup,
+    shutdown_environments,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
@@ -266,76 +267,87 @@ The validation set you pass in will directly be used for validation with no addi
     task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
 
-    if is_trajectory_collection:
-        collect_trajectories(
-            policy=policy,
-            policy_generation=policy_generation,
-            val_dataloader=val_dataloader,
-            tokenizer=tokenizer,
-            val_task_to_env=val_task_to_env,
-            logger=logger,
-            master_config=master_config,
-        )
-    # Check if async mode is enabled
-    elif config.grpo.async_grpo.enabled:
-        # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
-        if config.grpo.use_dynamic_sampling:
-            raise NotImplementedError(
-                "use_dynamic_sampling is not supported with async GRPO"
+    try:
+        if is_trajectory_collection:
+            collect_trajectories(
+                policy=policy,
+                policy_generation=policy_generation,
+                val_dataloader=val_dataloader,
+                tokenizer=tokenizer,
+                val_task_to_env=val_task_to_env,
+                logger=logger,
+                master_config=master_config,
             )
-        if config.grpo.reward_scaling.enabled:
-            raise NotImplementedError("reward_scaling is not supported with async GRPO")
-        if config.grpo.reward_shaping.enabled:
-            raise NotImplementedError("reward_shaping is not supported with async GRPO")
+        # Check if async mode is enabled
+        elif config.grpo.async_grpo.enabled:
+            # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+            if config.grpo.use_dynamic_sampling:
+                raise NotImplementedError(
+                    "use_dynamic_sampling is not supported with async GRPO"
+                )
+            if config.grpo.reward_scaling.enabled:
+                raise NotImplementedError(
+                    "reward_scaling is not supported with async GRPO"
+                )
+            if config.grpo.reward_shaping.enabled:
+                raise NotImplementedError(
+                    "reward_shaping is not supported with async GRPO"
+                )
 
-        # Async GRPO does not support multiple dataloaders
-        if config.data["use_multiple_dataloader"]:
-            raise NotImplementedError(
-                "use_multiple_dataloader is not supported with async GRPO"
+            # Async GRPO does not support multiple dataloaders
+            if config.data["use_multiple_dataloader"]:
+                raise NotImplementedError(
+                    "use_multiple_dataloader is not supported with async GRPO"
+                )
+
+            from nemo_rl.algorithms.grpo import async_grpo_train
+
+            print("🚀 Running async GRPO training")
+
+            # Run async GRPO training
+            async_grpo_train(
+                policy=policy,
+                policy_generation=policy_generation,
+                dataloader=dataloader,
+                val_dataloader=val_dataloader,
+                tokenizer=tokenizer,
+                loss_fn=loss_fn,
+                task_to_env=task_to_env,
+                val_task_to_env=val_task_to_env,
+                logger=logger,
+                checkpointer=checkpointer,
+                grpo_save_state=grpo_state,
+                master_config=master_config,
+                max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
+                teacher_worker_groups=teacher_worker_groups,
+                alias_to_group_alias=alias_to_group_alias,
+                processor=processor,
             )
+        else:
+            print("🚀 Running synchronous GRPO training")
 
-        from nemo_rl.algorithms.grpo import async_grpo_train
-
-        print("🚀 Running async GRPO training")
-
-        # Run async GRPO training
-        async_grpo_train(
-            policy=policy,
-            policy_generation=policy_generation,
-            dataloader=dataloader,
-            val_dataloader=val_dataloader,
-            tokenizer=tokenizer,
-            loss_fn=loss_fn,
-            task_to_env=task_to_env,
-            val_task_to_env=val_task_to_env,
-            logger=logger,
-            checkpointer=checkpointer,
-            grpo_save_state=grpo_state,
-            master_config=master_config,
-            max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
-            teacher_worker_groups=teacher_worker_groups,
-            alias_to_group_alias=alias_to_group_alias,
-            processor=processor,
-        )
-    else:
-        print("🚀 Running synchronous GRPO training")
-
-        # Run standard GRPO training
-        grpo_train(
-            policy,
-            policy_generation,
-            dataloader,
-            val_dataloader,
-            tokenizer,
-            loss_fn,
-            task_to_env,
-            val_task_to_env,
-            logger,
-            checkpointer,
-            grpo_state,
-            master_config,
-            processor=processor,
-        )
+            # Run standard GRPO training
+            grpo_train(
+                policy,
+                policy_generation,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                grpo_state,
+                master_config,
+                processor=processor,
+            )
+    finally:
+        shutdown_environments(task_to_env, val_task_to_env)
+        try:
+            policy_generation.shutdown()
+        except Exception as error:
+            print(f"Error shutting down generation: {error}", flush=True)
 
 
 if __name__ == "__main__":
