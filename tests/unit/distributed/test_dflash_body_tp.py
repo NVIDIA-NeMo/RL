@@ -85,11 +85,11 @@ def _config() -> DFlashBodyConfig:
 
 def _tp4_config() -> DFlashBodyConfig:
     return DFlashBodyConfig(
-        hidden_size=32,
-        intermediate_size=48,
+        hidden_size=64,
+        intermediate_size=96,
         num_attention_heads=4,
         num_key_value_heads=4,
-        head_dim=8,
+        head_dim=16,
         num_hidden_layers=1,
         num_target_taps=2,
         rope_theta=10_000.0,
@@ -174,7 +174,11 @@ def _gather_global_gradients(
     return global_gradients
 
 
-def _inputs(device: torch.device) -> tuple[Any, Tensor, Tensor]:
+def _inputs(
+    device: torch.device,
+    *,
+    hidden_size: int = 32,
+) -> tuple[Any, Tensor, Tensor]:
     token_valid = torch.ones((1, 5), dtype=torch.bool, device=device)
     plan = build_dflash_batch_plan(
         token_valid,
@@ -185,8 +189,16 @@ def _inputs(device: torch.device) -> tuple[Any, Tensor, Tensor]:
         seed=19,
     )
     generator = torch.Generator(device=device).manual_seed(2026)
-    target_taps = torch.randn((1, 5, 2, 32), generator=generator, device=device)
-    block_embeddings = torch.randn((1, 3, 32), generator=generator, device=device)
+    target_taps = torch.randn(
+        (1, 5, 2, hidden_size),
+        generator=generator,
+        device=device,
+    )
+    block_embeddings = torch.randn(
+        (1, 3, hidden_size),
+        generator=generator,
+        device=device,
+    )
     return plan, target_taps, block_embeddings
 
 
@@ -199,7 +211,10 @@ def _assert_forward_gradient_parity(
 ) -> None:
     global_state = _gather_global_state(body, group=tp_group)
     reference.load_state_dict(global_state, strict=True)
-    plan, target, blocks = _inputs(device)
+    plan, target, blocks = _inputs(
+        device,
+        hidden_size=body.config.hidden_size,
+    )
     target_actual = target.clone().requires_grad_()
     blocks_actual = blocks.clone().requires_grad_()
     target_reference = target.clone().requires_grad_()
