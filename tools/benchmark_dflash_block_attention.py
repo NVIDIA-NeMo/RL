@@ -32,7 +32,6 @@ from torch import Tensor
 from nemo_rl.models.megatron.draft.block_attention import (
     _block_visibility,
     _grouped_masked_attention,
-    dflash_block_attention,
     dflash_block_only_attention,
 )
 from nemo_rl.models.megatron.draft.block_plan import (
@@ -153,46 +152,6 @@ def _train_step(plan: DFlashBatchPlan, inputs: tuple[Tensor, ...]) -> None:
     block_output.float().square().mean().backward()
 
 
-def _make_full_attention_inputs(
-    plan: DFlashBatchPlan,
-    *,
-    device: torch.device,
-) -> tuple[Tensor, ...]:
-    block_only_inputs = _make_inputs(plan, device=device)
-    generator = torch.Generator(device=device).manual_seed(plan.sequence_length + 2026)
-    trunk_q = torch.randn(
-        (
-            plan.batch_size,
-            plan.sequence_length,
-            _NUM_QUERY_HEADS,
-            _HEAD_DIM,
-        ),
-        dtype=torch.bfloat16,
-        device=device,
-        generator=generator,
-    ).requires_grad_(True)
-    return (trunk_q, *block_only_inputs)
-
-
-def _full_attention_train_step(
-    plan: DFlashBatchPlan,
-    inputs: tuple[Tensor, ...],
-) -> None:
-    for tensor in inputs:
-        tensor.grad = None
-    trunk_output, block_output = dflash_block_attention(
-        plan=plan,
-        trunk_q=inputs[0],
-        trunk_k=inputs[1],
-        trunk_v=inputs[2],
-        block_q=inputs[3],
-        block_k=inputs[4],
-        block_v=inputs[5],
-    )
-    loss = trunk_output.float().square().mean() + block_output.float().square().mean()
-    loss.backward()
-
-
 def _time_call(device: torch.device, operation: Any) -> float:
     torch.cuda.synchronize(device)
     start = time.perf_counter()
@@ -210,7 +169,6 @@ def _benchmark_case(
     warmup: int,
     iterations: int,
     device: torch.device,
-    full_attention: bool = False,
 ) -> dict[str, Any]:
     torch.compiler.reset()
     plan = _build_plan(
@@ -220,32 +178,23 @@ def _benchmark_case(
         block_size=block_size,
         device=device,
     )
-    if full_attention:
-        inputs = _make_full_attention_inputs(plan, device=device)
-        train_step = _full_attention_train_step
-        kind = "full_flex_synchronized_train_step"
-        attention_path = "dflash_block_attention"
-    else:
-        inputs = _make_inputs(plan, device=device)
-        train_step = _train_step
-        kind = "block_only_flex_synchronized_train_step"
-        attention_path = "dflash_block_only_attention"
+    inputs = _make_inputs(plan, device=device)
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
-    first_train_step_ms = _time_call(device, lambda: train_step(plan, inputs))
+    first_train_step_ms = _time_call(device, lambda: _train_step(plan, inputs))
     first_train_step_peak_bytes = torch.cuda.max_memory_allocated(device)
 
     for _ in range(warmup):
-        train_step(plan, inputs)
+        _train_step(plan, inputs)
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
     durations_ms = [
-        _time_call(device, lambda: train_step(plan, inputs)) for _ in range(iterations)
+        _time_call(device, lambda: _train_step(plan, inputs)) for _ in range(iterations)
     ]
     return {
-        "kind": kind,
-        "attention_path": attention_path,
+        "kind": "block_only_flex_synchronized_train_step",
+        "attention_path": "dflash_block_only_attention",
         "batch_size": batch_size,
         "sequence_length": sequence_length,
         "anchors_per_sample": anchors_per_sample,
@@ -349,11 +298,6 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=5)
-    parser.add_argument(
-        "--benchmark-full-attention",
-        action="store_true",
-        help="also benchmark the explicitly requested trunk-and-block attention path",
-    )
     args = parser.parse_args()
     if args.batch_size < 1 or args.warmup < 0 or args.iterations < 1:
         parser.error("batch size and iterations must be positive; warmup must be >= 0")
@@ -394,19 +338,6 @@ def main() -> None:
         )
         records.append(record)
         print(json.dumps(record), flush=True)
-        if args.benchmark_full_attention:
-            full_attention_record = _benchmark_case(
-                batch_size=args.batch_size,
-                sequence_length=sequence_length,
-                anchors_per_sample=anchors_per_sample,
-                block_size=block_size,
-                warmup=args.warmup,
-                iterations=args.iterations,
-                device=device,
-                full_attention=True,
-            )
-            records.append(full_attention_record)
-            print(json.dumps(full_attention_record), flush=True)
     correctness_record = _correctness_comparison(
         device=device,
         iterations=args.iterations,
