@@ -2569,14 +2569,10 @@ def async_ppo_train(
                     if "values" in train_data:
                         adv_kwargs["values"] = train_data["values"]
                     result = adv_estimator.compute_advantage(**adv_kwargs)
-                    if isinstance(result, tuple):
-                        advantages, returns = result
-                    else:
-                        advantages, returns = result, None
                     del prompt_ids_for_adv
-                    train_data["advantages"] = advantages
-                    if returns is not None:
-                        train_data["returns"] = returns
+                    train_data["advantages"] = result.advantages
+                    if result.returns is not None:
+                        train_data["returns"] = result.returns
 
                 # ---- 7. ppo_epochs inner loop (critic, then actor) ----
                 # Each epoch: value on GPU -> train -> off. Then, once past critic
