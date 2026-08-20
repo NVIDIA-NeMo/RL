@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+import inspect
 import os
 import threading
 import time
@@ -53,27 +54,36 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 G_VERIFY_MXFP8_ENV = "NRL_VERIFY_MEGATRON_MXFP8"
 
 
-def _resolve_mxfp8_refit_backend(model_config: Any) -> tuple[str, str]:
+def _resolve_mxfp8_refit_backend(model_config: Any) -> str:
     """Resolve MXFP8 naming across supported Megatron Core revisions.
 
     Newer MCore revisions derive the quantizer from the grouped-GEMM backend
-    and name the transform argument ``backend``. Earlier revisions expose an
-    independent ``inference_mxfp8_backend`` setting and call the argument
-    ``quantization_backend``.
+    while earlier revisions expose an independent
+    ``inference_mxfp8_backend`` setting. The earliest supported revision has
+    neither setting and supports the original FlashInfer format only.
     """
     try:
         from megatron.core.inference.quantization.utils import (
             resolve_mxfp8_backend,
         )
     except ImportError:
-        return (
-            getattr(model_config, "inference_mxfp8_backend", "flashinfer"),
-            "quantization_backend",
+        return getattr(model_config, "inference_mxfp8_backend", "flashinfer")
+    return resolve_mxfp8_backend(model_config.inference_grouped_gemm_backend)
+
+
+def _mxfp8_transform_kwargs(transform_cls: type, backend: str) -> dict[str, str]:
+    """Build backend kwargs accepted by the installed MCore transform API."""
+    parameters = inspect.signature(transform_cls).parameters
+    if "backend" in parameters:
+        return {"backend": backend}
+    if "quantization_backend" in parameters:
+        return {"quantization_backend": backend}
+    if backend != "flashinfer":
+        raise ValueError(
+            "This Megatron Core revision only supports FlashInfer MXFP8 refit; "
+            f"got backend {backend!r}."
         )
-    return (
-        resolve_mxfp8_backend(model_config.inference_grouped_gemm_backend),
-        "backend",
-    )
+    return {}
 
 
 class _RefittableMXFP8Tensor(MXFP8Tensor):
@@ -937,7 +947,7 @@ class MegatronNativeRefitMixin:
                 self.model if isinstance(self.model, (list, tuple)) else [self.model]
             )
             model_config = unwrap_model(model_chunks[0]).config
-            expected_backend, _ = _resolve_mxfp8_refit_backend(model_config)
+            expected_backend = _resolve_mxfp8_refit_backend(model_config)
             mxfp8_weight_count = _verify_mxfp8_inference_weights(
                 self.model, expected_backend=expected_backend
             )
@@ -1023,7 +1033,7 @@ class MegatronGenerationRefitMixin(MegatronNativeRefitMixin):
             id(param): name for name, param in decoder.named_parameters()
         }
         logical_metadata = collect_mxfp8_param_metadata(decoder)
-        backend, transform_backend_arg = _resolve_mxfp8_refit_backend(core.config)
+        backend = _resolve_mxfp8_refit_backend(core.config)
         persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
 
         # Bridge mappings query the destination's logical shape/dtype/device.
@@ -1043,14 +1053,11 @@ class MegatronGenerationRefitMixin(MegatronNativeRefitMixin):
             persistent_buffers[name] = refittable
 
         convertible_params = {f"decoder.{name}" for name in persistent_buffers}
-        transform_kwargs = {
-            transform_backend_arg: backend,
-        }
         self._generation_refit_mxfp8_transform = MXFP8ReshardTransform(
             convertible_params=convertible_params,
             persistent_buffers=persistent_buffers,
             buffer_key_prefix="decoder.",
-            **transform_kwargs,
+            **_mxfp8_transform_kwargs(MXFP8ReshardTransform, backend),
         )
 
         for task in tasks:

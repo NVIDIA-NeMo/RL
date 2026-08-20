@@ -158,6 +158,34 @@ def test_megatron_bridge_refit_uses_mxfp8_transform():
     assert torch.equal(received[0], converted_weight.to(torch.bfloat16))
 
 
+def test_megatron_mxfp8_transform_kwargs_support_mcore_api_versions():
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        _mxfp8_transform_kwargs,
+    )
+
+    class OriginalTransform:
+        def __init__(self, convertible_params, persistent_buffers):
+            pass
+
+    class QuantizationBackendTransform:
+        def __init__(self, *, quantization_backend):
+            pass
+
+    class BackendTransform:
+        def __init__(self, *, backend):
+            pass
+
+    assert _mxfp8_transform_kwargs(OriginalTransform, "flashinfer") == {}
+    assert _mxfp8_transform_kwargs(
+        QuantizationBackendTransform, "torch"
+    ) == {"quantization_backend": "torch"}
+    assert _mxfp8_transform_kwargs(BackendTransform, "triton") == {
+        "backend": "triton"
+    }
+    with pytest.raises(ValueError, match="only supports FlashInfer"):
+        _mxfp8_transform_kwargs(OriginalTransform, "triton")
+
+
 def test_policy_collective_applies_rank_offset(monkeypatch: pytest.MonkeyPatch):
     from nemo_rl.distributed import stateless_process_group
     from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
