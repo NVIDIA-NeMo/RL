@@ -705,6 +705,58 @@ def _local_draft_refit_result(
     return list(owner_export.tensors)
 
 
+def _validate_lane_request(
+    *,
+    metadata_only: bool,
+    expected_pp_size: int,
+    cp_rank: int,
+    pp_ranks: tuple[int, ...],
+    pp_group: dist.ProcessGroup,
+    device: torch.device,
+) -> None:
+    if expected_pp_size <= 0:
+        status = 1
+    elif cp_rank < 0:
+        status = 2
+    elif len(pp_ranks) != expected_pp_size:
+        status = 3
+    else:
+        status = 0
+    request_minimum, request_maximum = _reduce_lane_consensus(
+        [status, int(metadata_only), expected_pp_size, cp_rank],
+        pp_group=pp_group,
+        device=device,
+    )
+    if request_minimum != request_maximum:
+        raise _draft_refit_error(
+            "LANE_CONFIG_MISMATCH",
+            f"PP lane requests differ: min={request_minimum}, max={request_maximum}",
+            cp_rank=request_minimum[3],
+            pp_ranks=pp_ranks,
+        )
+    if status == 1:
+        raise _draft_refit_error(
+            "INVALID_ARGUMENT",
+            "expected_pp_size must be positive",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+    if status == 2:
+        raise _draft_refit_error(
+            "INVALID_ARGUMENT",
+            "cp_rank must be non-negative",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+    if status == 3:
+        raise _draft_refit_error(
+            "TOPOLOGY_MISMATCH",
+            f"expected PP group size {expected_pp_size}, found {len(pp_ranks)}",
+            cp_rank=cp_rank,
+            pp_ranks=pp_ranks,
+        )
+
+
 def broadcast_draft_weights_from_pp_owner(
     *,
     local_exporter: DraftRefitExporter | None,
@@ -714,14 +766,13 @@ def broadcast_draft_weights_from_pp_owner(
     cp_rank: int = 0,
 ) -> list[tuple[str, Tensor]]:
     """Broadcast one CP lane's ordered draft export in dtype-sized payloads."""
-    if expected_pp_size <= 0:
-        raise ValueError("expected_pp_size must be positive")
-    if cp_rank < 0:
-        raise ValueError("cp_rank must be non-negative")
-
     distributed = dist.is_available() and dist.is_initialized()
     if pp_group is None or not distributed:
         pp_ranks = (dist.get_rank(),) if distributed else (0,)
+        if expected_pp_size <= 0:
+            raise ValueError("expected_pp_size must be positive")
+        if cp_rank < 0:
+            raise ValueError("cp_rank must be non-negative")
         if expected_pp_size != 1:
             raise _draft_refit_error(
                 "TOPOLOGY_MISMATCH",
@@ -737,13 +788,15 @@ def broadcast_draft_weights_from_pp_owner(
         )
 
     pp_ranks = tuple(dist.get_process_group_ranks(pp_group))
-    if len(pp_ranks) != expected_pp_size:
-        raise _draft_refit_error(
-            "TOPOLOGY_MISMATCH",
-            f"expected PP group size {expected_pp_size}, found {len(pp_ranks)}",
-            cp_rank=cp_rank,
-            pp_ranks=pp_ranks,
-        )
+    device = _collective_device(pp_group)
+    _validate_lane_request(
+        metadata_only=metadata_only,
+        expected_pp_size=expected_pp_size,
+        cp_rank=cp_rank,
+        pp_ranks=pp_ranks,
+        pp_group=pp_group,
+        device=device,
+    )
     if len(pp_ranks) == 1:
         return _local_draft_refit_result(
             local_exporter=local_exporter,
@@ -753,14 +806,11 @@ def broadcast_draft_weights_from_pp_owner(
         )
 
     global_rank = dist.get_rank()
-    device = _collective_device(pp_group)
-    owner_export = (
-        _materialize_draft_refit_export(local_exporter)
-        if local_exporter is not None
-        else None
-    )
     owner_state = torch.tensor(
-        [int(local_exporter is not None), global_rank if local_exporter else 0],
+        [
+            int(local_exporter is not None),
+            global_rank if local_exporter is not None else 0,
+        ],
         dtype=torch.int64,
         device=device,
     )
@@ -774,6 +824,11 @@ def broadcast_draft_weights_from_pp_owner(
             pp_ranks=pp_ranks,
         )
 
+    owner_export = (
+        _materialize_draft_refit_export(local_exporter)
+        if global_rank == owner_global_rank and local_exporter is not None
+        else None
+    )
     if global_rank == owner_global_rank:
         assert owner_export is not None
         if owner_export.status == _DRAFT_REFIT_STATUS_OK:

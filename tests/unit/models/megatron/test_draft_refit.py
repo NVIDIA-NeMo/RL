@@ -23,6 +23,19 @@ import torch.distributed as dist
 from nemo_rl.models.megatron.draft import utils as draft_utils
 
 
+class _FalseyExporter:
+    def __init__(self, value: list[tuple[str, torch.Tensor]]) -> None:
+        self.value = value
+        self.calls = 0
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __call__(self) -> list[tuple[str, torch.Tensor]]:
+        self.calls += 1
+        return self.value
+
+
 @pytest.mark.mcore
 def test_dtype_bucket_pp1_preserves_current_validated_export() -> None:
     calls = 0
@@ -203,13 +216,44 @@ def _run_cp2_dtype_bucket_owner_preflight(rank: int, world_size: int) -> None:
         assert payload_broadcasts == before
         assert all(tensor.device.type == "meta" for _, tensor in metadata)
 
-        error_cases: list[tuple[str, int, Callable[[], object] | None, bool, str]] = [
+        falsey_exporter = _FalseyExporter(_current_export(refit_step=3))
+        falsey_result = draft_utils.broadcast_draft_weights_from_pp_owner(
+            local_exporter=falsey_exporter if rank == owner_rank else None,
+            metadata_only=False,
+            pp_group=pp_group,
+            expected_pp_size=2,
+            cp_rank=cp_rank,
+        )
+        assert falsey_exporter.calls == int(rank == owner_rank)
+        for (_, actual), (_, wanted) in zip(
+            falsey_result,
+            _current_export(refit_step=3),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+
+        exporter_calls = 0
+
+        def counted_exporter() -> list[tuple[str, torch.Tensor]]:
+            nonlocal exporter_calls
+            exporter_calls += 1
+            return _current_export(refit_step=3)
+
+        error_cases: list[
+            tuple[
+                str,
+                int,
+                draft_utils.DraftRefitExporter | None,
+                bool,
+                str,
+            ]
+        ] = [
             ("pp_size", 3, None, False, "TOPOLOGY_MISMATCH"),
             ("zero_owner", 2, None, False, "OWNER_COUNT"),
             (
                 "two_owners",
                 2,
-                lambda: _current_export(refit_step=3),
+                counted_exporter,
                 False,
                 "OWNER_COUNT",
             ),
@@ -236,6 +280,7 @@ def _run_cp2_dtype_bucket_owner_preflight(rank: int, world_size: int) -> None:
             error_match,
         ) in error_cases:
             before = payload_broadcasts
+            calls_before = exporter_calls
             corrupt_manifest = inject_corruption
             integer_broadcasts = 0
             if case in {"exporter_error", "manifest_mismatch"} and rank != owner_rank:
@@ -252,6 +297,33 @@ def _run_cp2_dtype_bucket_owner_preflight(rank: int, world_size: int) -> None:
                     )
                 ),
                 match=error_match,
+                pp_group=pp_group,
+                original_all_reduce=original_all_reduce,
+            )
+            assert payload_broadcasts == before
+            if case in {"zero_owner", "two_owners"}:
+                assert exporter_calls == calls_before
+
+        request_cases = [
+            (rank == pp_ranks[0], 2, cp_rank),
+            (False, 3 if rank == pp_ranks[0] else 2, cp_rank),
+            (False, 2, cp_rank + int(rank == pp_ranks[-1])),
+        ]
+        for metadata_only, expected_pp_size, request_cp_rank in request_cases:
+            before = payload_broadcasts
+            _assert_lane_error_matches(
+                call=lambda: draft_utils.broadcast_draft_weights_from_pp_owner(
+                    local_exporter=(
+                        (lambda: _current_export(refit_step=3))
+                        if rank == owner_rank
+                        else None
+                    ),
+                    metadata_only=metadata_only,
+                    pp_group=pp_group,
+                    expected_pp_size=expected_pp_size,
+                    cp_rank=request_cp_rank,
+                ),
+                match="LANE_CONFIG_MISMATCH",
                 pp_group=pp_group,
                 original_all_reduce=original_all_reduce,
             )
