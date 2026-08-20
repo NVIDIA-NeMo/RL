@@ -21,6 +21,7 @@ mesh construction, placement rules, expert grouping, and the top-level
 torch.distributed, no model object — so this module runs on CPU with no extras.
 """
 
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -38,6 +39,8 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     group_expert_params_in_metadata,
     is_expert_param,
     is_nccl_reshard_param,
+    make_nccl_reshard_refit_info_wire_safe,
+    restore_refit_info_placements,
 )
 
 
@@ -47,6 +50,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 def _valid_nccl_reshard_config() -> SimpleNamespace:
     return SimpleNamespace(
         policy={
+            "precision": "bfloat16",
             "generation": {
                 "backend": "vllm",
                 "colocated": {"enabled": False},
@@ -60,6 +64,71 @@ def _valid_nccl_reshard_config() -> SimpleNamespace:
 
 def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
     check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
+
+
+def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("trainer_precision", ["float16", "float32", "bf16", None])
+def test_check_nccl_reshard_refit_support_rejects_non_bf16_to_mxfp8(
+    trainer_precision: str | None,
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = trainer_precision
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+
+    with pytest.raises(ValueError, match="requires policy.precision='bfloat16'"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_keeps_matching_blockwise_fp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("fp8_recipe", ["tensorwise", "mxfp8", None])
+def test_check_nccl_reshard_refit_support_rejects_non_blockwise_fp8_storage(
+    fp8_recipe: str | None,
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "fp8_param": True,
+        "fp8_recipe": fp8_recipe,
+    }
+
+    with pytest.raises(ValueError, match="fp8_recipe must be 'blockwise'"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_bf16_to_blockwise_fp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+
+    with pytest.raises(ValueError, match="is_mx=True for BF16-to-MXFP8 refit"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_to_mxfp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+
+    with pytest.raises(ValueError, match="does not support blockwise-FP8 storage"):
+        check_nccl_reshard_refit_support(config)
 
 
 @pytest.mark.parametrize(
@@ -198,6 +267,7 @@ def test_get_tp_shard_dim(name, expected):
         ("model.layers.0.mlp.down_proj.weight", True),
         ("model.layers.0.mlp.experts.3.gate_proj.weight", True),
         ("model.language_model.layers.7.mlp.experts.3.up_proj.weight", True),
+        ("model.layers.0.mlp.experts.3.up_proj.weight_scale_inv", False),
         # shared experts are FFN-named but fuse differently -> misc
         ("model.layers.0.mlp.shared_expert.gate_proj.weight", False),
         ("model.language_model.layers.1.mlp.shared_expert.down_proj.weight", False),
@@ -476,3 +546,109 @@ def test_build_refit_info_groups_experts_and_tags_them():
         for layer in info["layer_names"]
         for p in info["per_layer_params"][layer]
     )
+
+
+# --------------------------------------------------------------------------
+# make_nccl_reshard_refit_info_wire_safe / restore_refit_info_placements
+# --------------------------------------------------------------------------
+def _contains_tensor(obj) -> bool:
+    if isinstance(obj, torch.Tensor):
+        return True
+    if isinstance(obj, dict):
+        return any(_contains_tensor(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_contains_tensor(v) for v in obj)
+    if hasattr(obj, "__dict__"):  # e.g. MeshInfo wrapping its rank tensor
+        return any(_contains_tensor(v) for v in vars(obj).values())
+    return False
+
+
+def _refit_info_for_wire() -> dict:
+    return build_nccl_reshard_refit_info(
+        _dense_metadata(),
+        train_parallelism={"tp_size": 2, "ep_size": 1, "pp_size": 1},
+        gen_parallelism={"tp_size": 4, "ep_size": 1, "pp_size": 1},
+        train_world_size=2,
+        gen_world_size=4,
+    )
+
+
+def test_wire_safe_refit_info_carries_no_tensors_and_pickles_plainly():
+    # MeshInfo holds a rank tensor; a tensor pickled in a megatron-importing
+    # process needs `import megatron` at unpickle time, so the wire form must
+    # be tensor-free end to end (the invariant this function exists for).
+    info = _refit_info_for_wire()
+    assert _contains_tensor(info)
+
+    wire = make_nccl_reshard_refit_info_wire_safe(info)
+
+    assert not _contains_tensor(wire)
+    # Placements are encoded exactly as restore expects: Shard -> {"dim": d},
+    # Replicate -> {}.
+    for params in wire["per_layer_params"].values():
+        for p in params:
+            assert isinstance(p["src_mesh_info"], dict)
+            assert isinstance(p["dst_mesh_info"], dict)
+            for placement in p["src_placements"] + p["dst_placements"]:
+                assert isinstance(placement, dict)
+    pickle.loads(pickle.dumps(wire))
+
+
+def test_wire_safe_does_not_mutate_the_train_side_refit_info():
+    info = _refit_info_for_wire()
+
+    make_nccl_reshard_refit_info_wire_safe(info)
+
+    for layer in info["layer_names"]:
+        for p in info["per_layer_params"][layer]:
+            assert isinstance(p["src_mesh_info"], MeshInfo)
+            assert isinstance(p["dst_mesh_info"], MeshInfo)
+            for placement in p["src_placements"] + p["dst_placements"]:
+                assert isinstance(placement, (Shard, Replicate))
+
+
+def test_wire_safe_then_restore_reproduces_placements_and_meshes():
+    info = _refit_info_for_wire()
+
+    wire = pickle.loads(pickle.dumps(make_nccl_reshard_refit_info_wire_safe(info)))
+    restored = restore_refit_info_placements(wire)
+
+    assert restored["layer_names"] == info["layer_names"]
+    for layer in info["layer_names"]:
+        original = {p["name"]: p for p in info["per_layer_params"][layer]}
+        assert len(restored["per_layer_params"][layer]) == len(original)
+        for p in restored["per_layer_params"][layer]:
+            o = original[p["name"]]
+            for key in ("src_mesh_info", "dst_mesh_info"):
+                assert isinstance(p[key], MeshInfo)
+                assert torch.equal(p[key].mesh, o[key].mesh)
+            for key in ("src_placements", "dst_placements"):
+                assert p[key] == o[key]
+
+
+def test_wire_safe_pickle_is_independent_of_a_patched_storage_loader(monkeypatch):
+    # megatron.core replaces torch.storage._load_from_bytes at import time; a
+    # tensor pickled under the patch records the patcher's module path and
+    # cannot be unpickled without it. Mimic the patch with a dummy module and
+    # assert only the raw form references it — the invariant the wire-safe
+    # conversion exists to guarantee.
+    import io
+    import sys
+    import types
+
+    dummy = types.ModuleType("dummy_unpickler_module")
+
+    def _dummy_load_from_bytes(b):
+        return torch.load(io.BytesIO(b), weights_only=True)
+
+    _dummy_load_from_bytes.__module__ = "dummy_unpickler_module"
+    _dummy_load_from_bytes.__qualname__ = "_dummy_load_from_bytes"
+    dummy._dummy_load_from_bytes = _dummy_load_from_bytes
+    monkeypatch.setitem(sys.modules, "dummy_unpickler_module", dummy)
+    monkeypatch.setattr(torch.storage, "_load_from_bytes", _dummy_load_from_bytes)
+
+    info = _refit_info_for_wire()
+    wire = make_nccl_reshard_refit_info_wire_safe(info)
+
+    assert b"dummy_unpickler_module" in pickle.dumps(info)
+    assert b"dummy_unpickler_module" not in pickle.dumps(wire)

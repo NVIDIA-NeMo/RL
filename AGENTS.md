@@ -29,6 +29,9 @@ skill keyword — infer it from the artifact you read.
 
 Use `/review-pr <pr-number>` for interactive local PR review.
 
+Use `/review-pr-team <pr-number>` for a deeper review by a coordinated team of
+specialized agents (requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`).
+
 When reviewing code, follow these principles:
 
 - **Be concise and actionable.** Focus on bugs, logic errors, missing tests, outdated docs, and guideline violations. Lead with the issue, then a concrete suggested fix (name the file/function; give the snippet/schema when known).

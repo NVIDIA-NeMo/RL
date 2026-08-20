@@ -52,6 +52,7 @@ class ProcessedInputs:
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
+    media_token_validity_mask: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -74,6 +75,9 @@ class ProcessedMicrobatch:
             None when MTP is disabled or token/sample masks are absent.
         routed_experts: Optional token-aligned routed expert ids
         routed_experts_cp_sharded: Context-parallel sharded routed expert ids
+        media_token_validity_mask: Which media-token positions actually anchor a
+            projected feature, in the model's own token layout. None when the
+            batch needs no correction and the model should derive its own.
     """
 
     data_dict: BatchedDataDict[Any]
@@ -87,6 +91,7 @@ class ProcessedMicrobatch:
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
+    media_token_validity_mask: Optional[torch.Tensor] = None
 
 
 def make_processed_microbatch_iterator(
@@ -150,6 +155,7 @@ def make_processed_microbatch_iterator(
             routed_experts=processed_inputs.routed_experts,
             routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
             original_seq_length=processed_inputs.original_seq_length,
+            media_token_validity_mask=processed_inputs.media_token_validity_mask,
         )
 
 
@@ -356,6 +362,7 @@ def process_microbatch(
         cu_seqlens = None
         cu_seqlens_padded = None
         mtp_loss_mask = None
+        media_token_validity_mask = None
 
         if pack_sequences:
             # For packed sequences with padded input, we need sequence lengths
@@ -375,6 +382,17 @@ def process_microbatch(
                     "MTP training requires a self-packing VLM that advertises "
                     "model_owns_mtp_loss_mask_packing"
                 )
+                if "media_token_validity_mask" in data_dict:
+                    # A self-packing model repacks internally, so a mask built
+                    # against caller-side rows would reach the merge in a layout
+                    # that no longer matches its tokens -- and a media mask that
+                    # is merely misaligned silently attaches features to the
+                    # wrong positions rather than failing.
+                    raise NotImplementedError(
+                        "media_token_validity_mask is not supported for models "
+                        "that pack sequences internally (delegate_pack_to_model); "
+                        "the mask would need to be packed inside the model."
+                    )
                 # VLM path: model (e.g. mbridge Qwen3VL) does its own
                 # preprocess_packed_seqs; NeMo-RL must NOT pre-pack + CP-shard,
                 # or the double-processing produces shape mismatches downstream
@@ -424,14 +442,6 @@ def process_microbatch(
                     )
                 position_ids = None
             else:
-                if (
-                    model_slices_context_parallel_inputs
-                    and "mtp_loss_mask" in data_dict
-                ):
-                    raise NotImplementedError(
-                        "Nemotron Omni caller-packed THD inputs do not yet support MTP. "
-                        "Disable MTP for the Nano image/text path."
-                    )
                 token_identity = None
                 if routed_experts is not None and r3_trace_verify_forward_enabled():
                     token_identity = _make_r3_trace_token_identity(
@@ -554,8 +564,8 @@ def process_microbatch(
                 # Pack pre-computed mtp_loss_mask the same way as input_ids
                 if "mtp_loss_mask" in data_dict:
                     (
-                        _,
-                        mtp_loss_mask,
+                        packed_mtp_loss_mask,
+                        local_mtp_loss_mask,
                         _,
                         _,
                         _,
@@ -568,6 +578,53 @@ def process_microbatch(
                         cp_rank=get_context_parallel_rank(),
                         cp_size=get_context_parallel_world_size(),
                     )
+                    # Mirror the input_ids layout choice above. A model that
+                    # slices CP itself receives the full THD row so it can insert
+                    # media before selecting its CP-owned embeddings, so its MTP
+                    # mask has to stay unsharded to line up with the labels.
+                    # Every other model consumes the CP-local shard.
+                    mtp_loss_mask = (
+                        packed_mtp_loss_mask
+                        if model_slices_context_parallel_inputs
+                        else local_mtp_loss_mask
+                    )
+
+                # Pack the media-token validity mask the same way as input_ids.
+                # The mask answers a per-token question, so it only means
+                # anything while it sits in the same layout as the tokens the
+                # model will compare it against. Packing is what destroys the
+                # per-sample rows it was built from, so it has to travel through
+                # the identical transform rather than be rebuilt afterwards.
+                if "media_token_validity_mask" in data_dict:
+                    (
+                        packed_media_mask,
+                        local_media_mask,
+                        _,
+                        _,
+                        _,
+                    ) = _pack_sequences_for_megatron(
+                        # Pack in the token dtype: padding is filled with 0,
+                        # which is a valid token id but not a valid bool. Read
+                        # the dtype off the unpacked ids, since the local
+                        # input_ids is already the packed tensor here.
+                        data_dict["media_token_validity_mask"].to(
+                            data_dict["input_ids"].dtype
+                        ),
+                        seq_lengths,
+                        pad_individual_seqs_to_multiple_of,
+                        pad_packed_seq_to_multiple_of,
+                        pad_full_seq_to,
+                        cp_rank=get_context_parallel_rank(),
+                        cp_size=get_context_parallel_world_size(),
+                    )
+                    # Mirror the input_ids layout choice above, for the same
+                    # reason the MTP mask does: a model that slices CP itself
+                    # merges media against the full THD row.
+                    media_token_validity_mask = (
+                        packed_media_mask
+                        if model_slices_context_parallel_inputs
+                        else local_media_mask
+                    ).bool()
 
                 # For packed sequences, position_ids and attention_mask are typically None
                 # The PackedSeqParams handles all necessary sequence information
@@ -618,6 +675,12 @@ def process_microbatch(
             )
             if "mtp_loss_mask" in data_dict:
                 mtp_loss_mask = data_dict["mtp_loss_mask"]
+            # Unpacked: rows still are samples, so the mask is already in the
+            # layout the model will see.
+            if "media_token_validity_mask" in data_dict:
+                media_token_validity_mask = data_dict[
+                    "media_token_validity_mask"
+                ].bool()
     return ProcessedInputs(
         input_ids=input_ids,
         input_ids_cp_sharded=input_ids_cp_sharded,
@@ -629,6 +692,7 @@ def process_microbatch(
         routed_experts=routed_experts,
         routed_experts_cp_sharded=routed_experts_cp_sharded,
         original_seq_length=original_seq_length,
+        media_token_validity_mask=media_token_validity_mask,
     )
 
 

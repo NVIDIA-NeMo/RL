@@ -8,7 +8,7 @@
 #   - 0 nodes: SWE judge is CPU-based (no GPU nodes required)
 #
 # Data: nvidia/Nemotron-RL-Super-Training-Blends (swe1 split).
-# See docs/guides/nemotron-3-super.md for download instructions.
+# See docs/guides/models/nemotron/nemotron-3-super.md for download instructions.
 defaults: ../../../nemo_gym/nemotron-3-super/stage2_swe1.yaml
 
 checkpointing:
