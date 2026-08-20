@@ -221,6 +221,13 @@ class _FakeDPClient:
         self.clear_calls.append((list(sample_ids), partition_id))
 
 
+class _FakeGeneration:
+    """Continuous-serving stand-in; the pump asks it before every train step."""
+
+    def blocks_training(self) -> bool:
+        return False
+
+
 class _FakeWeightSynchronizer:
     def __init__(self) -> None:
         self.sync_count = 0
@@ -379,7 +386,7 @@ def _make_actor_args(
     last_checkpoint_path: Optional[str] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
-        gen_handle=object(),
+        gen_handle=_FakeGeneration(),
         trainer_handle=trainer if trainer is not None else _FakeTrainer(),
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]

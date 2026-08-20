@@ -278,6 +278,7 @@ def _build_trainer(
     *,
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
+    reserved_http_server_port: Optional[int] = None,
 ) -> tuple[Any, float]:
     """Build the TQ-mediated trainer (driver-side TQPolicy).
 
@@ -288,6 +289,7 @@ def _build_trainer(
         processor: Optional AutoProcessor for VLM paths.
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
+        reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym.
 
     Returns:
         A tuple of (TQPolicy trainer, wall time spent in this call).
@@ -305,6 +307,7 @@ def _build_trainer(
         init_optimizer=True,
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
+        reserved_http_server_port=reserved_http_server_port,
     )
     return trainer, time.perf_counter() - t0
 
@@ -315,25 +318,23 @@ def _build_trainer_then_megatron_generation(
     tokenizer,
     processor,
     *,
-    inference_cluster: RayVirtualCluster,
+    inference_cluster: Optional[RayVirtualCluster],
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
     reserved_http_server_port: Optional[int] = None,
 ) -> tuple[Any, Any, dict[str, float]]:
-    """Build the trainer, then dedicated Megatron generation, serially.
+    """Build the trainer, then Megatron generation, serially in that order.
 
-    The trainer comes first: its checkpoint load/conversion must complete
-    before the inference-side model build starts (grpo.py ordering). The
-    dedicated inference policy is then built on ``inference_cluster`` with the
-    weight load skipped — the actor's first weight sync transfers the real
-    weights over the refit collective.
+    Colocated (`inference_cluster` None) wraps the trainer's policy (shared worker group).
+    Non-colocated builds a dedicated inference policy on `inference_cluster` with the weight
+    load skipped; the first weight sync transfers the real weights over the refit collective.
 
     Args:
         train_cluster: Ray virtual cluster the trainer workers run on.
         master_config: SC MasterConfig.
         tokenizer: Tokenizer used by the policy.
         processor: Optional AutoProcessor for VLM paths.
-        inference_cluster: Dedicated cluster the generation workers run on.
+        inference_cluster: Dedicated generation cluster for non-colocated, or None when colocated.
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
         reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym.
@@ -351,6 +352,9 @@ def _build_trainer_then_megatron_generation(
         processor,
         weights_path=weights_path,
         optimizer_path=optimizer_path,
+        reserved_http_server_port=reserved_http_server_port
+        if inference_cluster is None
+        else None,
     )
 
     t0 = time.perf_counter()
@@ -358,10 +362,13 @@ def _build_trainer_then_megatron_generation(
         config=master_config.policy,
         tokenizer=tokenizer,
         cluster=inference_cluster,
+        policy=trainer if inference_cluster is None else None,
         processor=processor,
         weights_path=weights_path,
-        skip_weight_load=True,
-        reserved_http_server_port=reserved_http_server_port,
+        skip_weight_load=inference_cluster is not None,
+        reserved_http_server_port=None
+        if inference_cluster is None
+        else reserved_http_server_port,
     )
     time_metrics["gen_time"] = time.perf_counter() - t0
 
@@ -459,13 +466,8 @@ def _maybe_apply_megatron_generation_overrides(
     ):
         raise ValueError(
             "policy.generation.backend='megatron' requires the Megatron trainer "
-            "(policy.megatron_cfg.enabled=true): refit transfers weights via Megatron's reshard "
-            "collective from the Megatron trainer."
-        )
-
-    if generation_config["colocated"]["enabled"]:
-        raise NotImplementedError(
-            "SC does not support colocated Megatron generation currently."
+            "(policy.megatron_cfg.enabled=true): refit transfers weights via Megatron's reshard; "
+            "colocated generation shares the training policy's worker group."
         )
 
     mcore_cfg = cast(MCoreGenerationConfig, generation_config)[
@@ -491,6 +493,17 @@ def _maybe_apply_megatron_generation_overrides(
         # pyrefly: ignore[typed-dict-key-error]
         mcore_cfg["kv_cache_management_mode"] = "recompute"
         async_config.recompute_kv_cache_after_weight_updates = False
+
+    if generation_config["colocated"]["enabled"]:
+        num_prompts_per_step = master_config.grpo.num_prompts_per_step
+        if async_config.max_buffered_rollouts < num_prompts_per_step:
+            raise ValueError(
+                f"async_rl.max_buffered_rollouts "
+                f"({async_config.max_buffered_rollouts}) must be >= "
+                f"grpo.num_prompts_per_step ({num_prompts_per_step}) for "
+                "colocated megatron generation: the buffer must be able to "
+                "hold a full step before the trainer takes the GPUs."
+            )
 
 
 def _maybe_attach_fleet_health(
@@ -806,7 +819,7 @@ def setup_single_controller(
                 reserved_http_server_port,
                 megatron_port_holder,
             ) = MegatronGeneration.reserve_http_server_address(
-                inference_cluster,
+                train_cluster if colocated else inference_cluster,
                 master_config.policy,
             )
             gen_reserve_time = time.perf_counter() - t0
@@ -852,14 +865,16 @@ def setup_single_controller(
         )
 
     if megatron_backend:
-        # Non-colocated is guaranteed here, since colocated is rejected at config validation.
+        # Serial trainer-first in both modes:
+        # colocated generation is constructed from the trainer's policy;
+        # non-colocated waits for the trainer's checkpoint conversion.
         build_tasks["generation_trainer"] = partial(
             _build_trainer_then_megatron_generation,
             train_cluster,
             master_config,
             tokenizer,
             processor,
-            inference_cluster=inference_cluster,
+            inference_cluster=None if colocated else inference_cluster,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             reserved_http_server_port=reserved_http_server_port,
