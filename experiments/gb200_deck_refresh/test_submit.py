@@ -138,6 +138,10 @@ def test_qwen30_dapo_pair_keeps_workload_matched() -> None:
         assert "policy.logprob_chunk_size=512" in result.stdout
         assert "policy.megatron_cfg.use_fused_linear_logprobs=true" in result.stdout
         assert "policy.megatron_cfg.fused_linear_logprobs_chunk_size=256" in result.stdout
+        assert (
+            "policy.megatron_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF="
+            "expandable_segments:True" in result.stdout
+        )
         assert "policy.sequence_packing.enabled=false" in result.stdout
         assert (
             "policy.megatron_cfg.distributed_data_parallel_config."
