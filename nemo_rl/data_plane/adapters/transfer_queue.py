@@ -32,14 +32,17 @@ import threading
 import time
 import warnings
 from importlib import resources
-from pathlib import Path
 from queue import Empty, SimpleQueue
 from typing import Any, cast
 
 import torch
+
+# Loading this loads mooncake, which snapshots MC_* on the way in. Configure the
+# engine before this import — see nemo_rl.data_plane.adapters.transfer_queue_env.
 import transfer_queue as tq
 from tensordict import TensorDict
 
+from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     DataPlaneConfig,
@@ -88,11 +91,10 @@ def rdma_devices() -> str:
 
     Offering every rail is only safe because
     ``MC_ENABLE_DEST_DEVICE_AFFINITY`` pins each transfer's peer rail to the
-    local one by name, so a cross-rail pair is never formed. That knob has to
-    reach the engine via the container/launcher environment — see
-    ``maybe_configure_engine_env`` for why, and for the measurements. Without
-    it, on a fabric where each rail is its own subnet, a cross-rail draw has no
-    route and dies with "transport retry counter exceeded".
+    local one by name, so a cross-rail pair is never formed — see
+    :mod:`nemo_rl.data_plane.adapters.transfer_queue_env`. Without it, on a
+    fabric where each rail is its own subnet, a cross-rail draw has no route and
+    dies with "transport retry counter exceeded".
 
     IB and RoCE are never mixed; InfiniBand is preferred when present.
 
@@ -108,17 +110,9 @@ def rdma_devices() -> str:
     # well after setup has begun — so treat a missing verbs node as no device.
     if not glob.glob("/dev/infiniband/uverbs*"):
         return ""
-    ib, roce = [], []
-    for path in sorted(glob.glob("/sys/class/infiniband/mlx5_*/ports/1/link_layer")):
-        name = Path(path).parents[2].name
-        try:
-            layer = Path(path).read_text().strip()
-        except OSError:
-            continue
-        if layer == "InfiniBand":
-            ib.append(name)
-        elif layer == "Ethernet":
-            roce.append(name)
+    layers = rail_link_layers()
+    ib = [n for n, layer in layers.items() if layer == "InfiniBand"]
+    roce = [n for n, layer in layers.items() if layer == "Ethernet"]
     # No space after the comma: mooncake splits on "," only.
     return ",".join(ib or roce)
 
@@ -139,51 +133,6 @@ def _mooncake_transport_config() -> dict:
             "MC_MOONCAKE_DEVICE=<dev>, or use data_plane.backend='simple'."
         )
     return {"protocol": "rdma", "device_name": devices}
-
-
-def maybe_configure_engine_env(cfg: DataPlaneConfig) -> None:
-    """Set the mooncake knobs that must be identical in every process.
-
-    No-op unless the backend is ``mooncake_cpu``; ``simple`` has no engine.
-    Must run before ``init_ray`` — see :func:`maybe_configure_data_plane_env`.
-
-    Only knobs that must agree cluster-wide belong here. ``MC_TCP_BIND_ADDRESS``
-    does not: it must differ per node, so it is force-assigned per process in
-    :class:`TQDataPlaneClient`. Nor does ``MC_GID_INDEX``: mooncake documents it
-    as an escape hatch for failed GID auto-detection whose correct value depends
-    on the network, so pinning one would break every rail at once where it is
-    wrong, and its ``findBestGidIndex`` is per-device and cannot disagree.
-
-    ``setdefault`` so the launch environment can still set its own value
-    instead of being clobbered.
-
-    .. warning::
-       Setting these from Python is **best effort, not sufficient**. Mooncake
-       reads every ``MC_*`` var once, in the constructor of a function-local
-       static singleton (``mooncake-common/src/environ.cpp``
-       ``Environ::Get()``), the first time any engine code runs in the
-       process. A write to ``os.environ`` after that point lands in the Python
-       environment — where it is still visible to anything that inspects it —
-       but the engine has already snapshotted the old value. Mooncake's own
-       docs therefore say to set these *before starting the application*.
-
-       Measured on a gb200 CI-fleet node, 4 GPUs across both NUMA domains,
-       ``MC_ENABLE_DEST_DEVICE_AFFINITY``: set in the container environment,
-       3/3 runs clean; set only here, 3/3 runs failed with cross-rail
-       ``TRANSFER_FAIL`` — while ``os.environ`` read ``"1"`` in *both* cases.
-       The launcher (CI ``action.yml``, ``ray.sub``) must export it; this
-       function only covers processes that start before any engine code runs.
-    """
-    if cfg["backend"] != "mooncake_cpu":
-        return
-    # See TQDataPlaneClient.__init__ for why the LOCAL_MEMCPY fast path is off.
-    os.environ.setdefault("MC_STORE_MEMCPY", "0")
-    # Pair each transfer's peer rail with the local one by name. Mooncake
-    # otherwise picks the peer independently (Topology::selectDevice), and where
-    # each rail is its own subnet a cross-rail pair has no route. Mooncake
-    # recommends this for rail-optimized topologies and sets it as a pod-level
-    # variable in its own deployment example, i.e. uniformly, for this reason.
-    os.environ.setdefault("MC_ENABLE_DEST_DEVICE_AFFINITY", "1")
 
 
 # A slot is held for exactly one transfer, so waiting minutes for one means
@@ -665,21 +614,18 @@ class TQDataPlaneClient(DataPlaneClient):
         """
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
-        # env vars and they can't be changed. Three per-process knobs
+        # env vars and they can't be changed. Two per-process knobs are
         # needed in EVERY process that builds a TQ client (driver,
         # SyncRolloutActor, every MegatronPolicyWorker rank):
         #   1. MC_TCP_BIND_ADDRESS — Mooncake engine.so writes this into
         #      desc.ip_or_host_name, the address peers receive from the
         #      metadata service. Without it, getifaddrs()[0] picks usb0
         #      (169.254.x APIPA) and peers fail to connect.
-        #   2. MC_STORE_MEMCPY=0 — Mooncake LOCAL_MEMCPY fast-path
-        #      reinterpret_casts cross-process pointers, segfaulting
-        #      MemcpyWorkerPool. PR #1995 (merged 2026-04-30) fixes the
-        #      root cause but isn't in any published wheel yet
-        #      (mooncake-transfer-engine 0.3.10.post2 was bumped before
-        #      that merge). Drop this once the wheel includes the fix.
-        #   3. KV-path 1D promotion — works around TQ's
+        #   2. KV-path 1D promotion — works around TQ's
         #      extract_field_schema schema/data mismatch for 1D fields.
+        # The cluster-wide MC_* knobs are NOT among them; they are set
+        # once on the driver, before this module is importable — see
+        # nemo_rl.data_plane.adapters.transfer_queue_env.
         if cfg["backend"] == "mooncake_cpu":
             local_ip = _get_local_node_ip()
             if local_ip:
@@ -688,11 +634,8 @@ class TQDataPlaneClient(DataPlaneClient):
                 # be a no-op and the actor would announce the driver's
                 # IP — peers fail with "connection refused".
                 os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
-            # Normally a no-op: the launcher already set these before
-            # init_ray(), so Ray's env snapshot carried them here. Repeated for
-            # processes that never saw that snapshot — a client built outside
-            # the launcher path, or a unit test.
-            maybe_configure_engine_env(cfg)
+            # Do not add MC_* setup here — mooncake snapshotted its config when
+            # this module imported, so a write now is silently ignored.
             # Both must run before the first get, in every process with a TQ
             # client. The registration check is unconditional: it also covers
             # the two bytes workers the staging patch leaves untouched, which

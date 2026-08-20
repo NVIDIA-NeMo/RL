@@ -219,13 +219,21 @@ def test_maybe_configure_data_plane_env_then_init_ray_threads_env_vars():
     docstrings). init_ray itself has no data-plane awareness; the ordering
     at the call site is what makes this work, so exercise the two calls
     together rather than mocking either one out.
+
+    The fabric probe and the already-imported guard ARE mocked: both read
+    process/host state (sysfs, sys.modules) that would otherwise make this
+    test's outcome depend on the machine it runs on and on whether another
+    test already imported the transfer_queue adapter.
     """
     from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
     from nemo_rl.distributed.virtual_cluster import init_ray
 
+    env_mod = "nemo_rl.data_plane.adapters.transfer_queue_env"
     with (
         patch("ray.init") as mock_ray_init,
         patch("ray.cluster_resources") as mock_cluster_resources,
+        patch(f"{env_mod}.fabric_is_roce_only", return_value=True),
+        patch(f"{env_mod}._engine_already_imported", return_value=None),
     ):
         # Matching tag -> init_ray takes the "reuse existing cluster" path
         # and returns after exactly one ray.init call, the one whose

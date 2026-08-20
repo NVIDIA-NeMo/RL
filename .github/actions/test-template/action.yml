@@ -160,10 +160,11 @@ runs:
         # host-side check (see detect_rdma.sh for what it gates on).
         source "${{ github.workspace }}/${{ github.run_id }}/${{ steps.uuid.outputs.id }}/nemo-rl/tests/scripts/detect_rdma.sh"
         RDMA_FLAGS=()
-        # MC_ENABLE_DEST_DEVICE_AFFINITY is also set as an image-level ENV; it is
-        # repeated here so a run against an older image is still covered. It must
-        # come from the environment rather than Python — see
-        # maybe_configure_engine_env in nemo_rl/data_plane/adapters/transfer_queue.py.
+        # MC_ENABLE_DEST_DEVICE_AFFINITY is normally decided by
+        # configure_engine_env in nemo_rl/data_plane/adapters/transfer_queue_env.py,
+        # which sets it only on a RoCE-only fabric. Passing it here overrides that
+        # gate (an already-set value is left alone) and also covers processes that
+        # never run the data-plane factory, e.g. a bare pytest invocation.
         if [[ "${{ inputs.is_doc_test }}" != "true" ]] && rdma_device_available; then
           RDMA_FLAGS=(--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1
                       --env NEMO_RL_REQUIRE_MOONCAKE=1

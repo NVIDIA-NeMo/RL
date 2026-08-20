@@ -78,9 +78,10 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     sample of one field) genuinely exceeds it, not for headroom.
 
     Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
-    That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1`` exported by the
-    launcher, which pins each transfer's peer rail to the local one by name; on
-    a rail-isolated RoCE fabric a cross-rail pair has no route.
+    That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``, which pins each
+    transfer's peer rail to the local one by name; on a rail-isolated RoCE
+    fabric a cross-rail pair has no route. It is set on RoCE-only hosts by
+    ``nemo_rl.data_plane.adapters.transfer_queue_env.configure_engine_env``.
     """
 
     global_segment_size: int = 68719476736  # 64 GiB per client process
