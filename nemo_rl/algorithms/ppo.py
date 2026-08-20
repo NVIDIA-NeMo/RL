@@ -1113,10 +1113,11 @@ def dynamic_sampling(
 def _create_advantage_estimator(master_config: MasterConfig) -> AdvantageEstimator:
     """Create and return an advantage estimator based on configuration.
 
-    PPO's training loop consumes a `(advantages, returns)` pair from a
-    value-model-based estimator, so only `gae` and `raw_reward` are supported
-    here. Group-relative estimators like GRPO / Reinforce++ are not compatible
-    with PPO's loop and live in `grpo.py`.
+    Both supported estimators return an ``AdvantageResult``. `gae` populates
+    ``returns`` with its value target; `raw_reward` leaves it None, and the
+    loop only writes ``train_data["returns"]`` when it is present. Only these
+    two are offered here -- group-relative estimators like GRPO / Reinforce++
+    are not compatible with PPO's loop and live in `grpo.py`.
 
     Args:
         master_config: The master configuration dictionary.

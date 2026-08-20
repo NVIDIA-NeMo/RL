@@ -542,7 +542,7 @@ class GeneralizedAdvantageEstimator:
             raise ValueError(
                 "GAE needs per-token value estimates; enable the critic so that "
                 "'values' is present in the training batch, or switch "
-                "grpo.adv_estimator.name to an estimator that needs no value model."
+                "ppo.adv_estimator.name to an estimator that needs no value model."
             )
 
         token_level_rewards = self._build_token_level_rewards(
