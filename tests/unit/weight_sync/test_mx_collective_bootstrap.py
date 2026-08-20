@@ -48,9 +48,13 @@ def bootstrap_state(*, rank=0, epoch=7):
 class FakeRendezvous:
     def __init__(self):
         self.published = []
+        self.closed = False
 
     def publish_bootstrap(self, **kwargs):
         self.published.append(kwargs)
+
+    def close(self):
+        self.closed = True
 
 
 class RootUniqueId:
@@ -83,12 +87,15 @@ def test_lane_root_rejects_a_uid_different_from_what_it_published(monkeypatch):
     minted = b"a" * 128
     install_unique_id_module(monkeypatch, RootUniqueId(minted))
     state = bootstrap_state()
-    state.rz = FakeRendezvous()
+    rendezvous = FakeRendezvous()
+    state.rz = rendezvous
     monkeypatch.setattr(bootstrap, "_await_lane_id", lambda *_: b"b" * 128)
 
     with pytest.raises(RuntimeError, match="different ncclUniqueId"):
         bootstrap.mx_init_lane(state, 1)
-    assert state.rz.published[0]["nccl_unique_id"] == minted
+    assert rendezvous.published[0]["nccl_unique_id"] == minted
+    assert rendezvous.closed
+    assert state.rz is None
 
 
 def test_lane_root_keeps_the_minted_uid_object_through_communicator_init(monkeypatch):

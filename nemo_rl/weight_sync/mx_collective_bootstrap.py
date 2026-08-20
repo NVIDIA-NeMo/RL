@@ -178,6 +178,18 @@ class MxBootstrapState:
                 group.abort()
             except Exception:
                 pass
+        rendezvous = self.rz
+        self.rz = None
+        if rendezvous is not None:
+            close = getattr(rendezvous, "close", None)
+            if callable(close):
+                close()
+        channel = self.channel
+        self.channel = None
+        if channel is not None:
+            close = getattr(channel, "close", None)
+            if callable(close):
+                close()
 
 
 def mx_rendezvous(
@@ -319,6 +331,7 @@ def mx_init_lane(state: MxBootstrapState, lane_id: int) -> None:
         )
     uid = _await_lane_id(state, lane.lane_id)
     if minted_uid is not None and uid != minted_uid:
+        state.abort()
         raise RuntimeError(
             f"MX returned a different ncclUniqueId for lane {lane.lane_id} "
             "than rank zero published"
