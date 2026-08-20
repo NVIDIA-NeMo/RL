@@ -257,6 +257,23 @@ def test_state_dict_excludes_runtime_prompt_payload() -> None:
     assert state["groups"][0]["prompt_ref"]["sample_id"] == "17"
 
 
+@pytest.mark.parametrize("missing_status", ["group", "attempt"])
+def test_state_dict_rejects_missing_status_with_context(missing_status: str) -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(ledger)
+    state = ledger.state_dict()
+    group_state = state["groups"][0]
+    if missing_status == "group":
+        group_state.pop("status")
+        expected_message = "invalid prompt group status=None"
+    else:
+        group_state["siblings"][0]["attempts"][0].pop("status")
+        expected_message = "invalid rollout attempt status=None"
+
+    with pytest.raises(ValueError, match=expected_message):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
 def test_finalizer_unknown_outcome_is_terminal() -> None:
     ledger = RolloutRecoveryLedger()
     group = _reserve(ledger)
