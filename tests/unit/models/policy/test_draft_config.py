@@ -65,6 +65,19 @@ def test_draft_optimizer_config_is_typed() -> None:
     )
 
 
+def test_dflash_accepts_excluded_legacy_aux_layer_field() -> None:
+    config = DFlashDraftConfig(
+        enabled=True,
+        aux_layer_indices=None,
+        gamma=5,
+        anchors_per_sample=4,
+        mask_token_id=151669,
+        target_hidden_state_layer_ids=[1, 17, 33],
+    )
+
+    assert "aux_layer_indices" not in config.model_dump()
+
+
 def test_eagle3_draft_config_accepts_legacy_mapping_without_speculator_type() -> None:
     from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
