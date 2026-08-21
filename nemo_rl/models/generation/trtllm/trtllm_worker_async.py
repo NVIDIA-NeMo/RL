@@ -335,7 +335,8 @@ class TrtllmAsyncGenerationWorkerImpl:
         """Continuously drain per-iteration stats from the engine.
 
         Records the in-flight batching size (context + generation requests
-        scheduled this iteration).
+        scheduled this iteration), the number of pending (queued) samples and
+        the KV-cache usage percentage.
         """
         assert self.llm is not None
         assert "trtllm_metrics_logger_interval" in self.cfg["trtllm_cfg"], (

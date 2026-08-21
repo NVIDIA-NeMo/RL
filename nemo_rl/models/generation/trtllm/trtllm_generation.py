@@ -436,9 +436,11 @@ class TrtllmGeneration(GenerationInterface):
             return False
 
     def get_logger_metrics(self) -> dict[str, Any]:
-        """Collect in-flight batching telemetry from DP-leader workers.
+        """Collect in-flight batching, pending-request and KV-cache telemetry from DP-leader workers.
 
-        Returns ``{metric_name: {dp_idx: list[...]}}``; mirrors vLLM's get_vllm_logger_metrics.
+        Returns ``{metric_name: {dp_idx: list[...]}}`` for ``inflight_batch_sizes``,
+        ``num_pending_samples`` and ``kv_cache_usage_perc``; mirrors vLLM's
+        get_vllm_logger_metrics.
         """
         if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger"):
             return {}
@@ -478,7 +480,6 @@ class TrtllmGeneration(GenerationInterface):
         return logger_metrics
 
     def clear_logger_metrics(self) -> None:
-        """Clear logger metrics for performance reporting."""
         """Clear logger metrics for performance reporting."""
         if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger"):
             return
