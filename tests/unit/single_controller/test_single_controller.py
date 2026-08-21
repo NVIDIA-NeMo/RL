@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
+from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
@@ -285,6 +286,83 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     )
 
 
+def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
+    """SC passes the TQ teacher column under OPD's estimator contract."""
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    captured_kwargs = {}
+
+    class FakeEstimator:
+        last_metrics = {"on_policy_distillation/teacher_student_logprob_gap_mean": 0.25}
+
+        def compute_advantage(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return kwargs["teacher_logprobs"] - kwargs["prev_logprobs"]
+
+    class FakeDataPlane:
+        def __init__(self):
+            self.put_fields = None
+
+        def get_samples(self, sample_ids, partition_id, select_fields):
+            del sample_ids, partition_id
+            assert "teacher_reference_logprobs" in select_fields
+            return TensorDict(
+                {
+                    "prompt_ids_for_adv": torch.zeros(2, 3, dtype=torch.long),
+                    "total_reward": torch.zeros(2),
+                    "token_mask": torch.ones(2, 3),
+                    "sample_mask": torch.ones(2),
+                    "prev_logprobs": torch.full((2, 3), 0.5),
+                    "teacher_reference_logprobs": torch.full((2, 3), 0.75),
+                },
+                batch_size=(2,),
+            )
+
+        def put_samples(self, sample_ids, partition_id, fields):
+            del sample_ids, partition_id
+            self.put_fields = fields
+
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = FakeEstimator()
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._opd_enabled = True
+    ctrl._dp_client = FakeDataPlane()
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+    }
+    ctrl._advantage_metric_values = {}
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["a", "b"],
+        fields=[],
+        sequence_lengths=[3, 3],
+    )
+
+    enriched = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert set(captured_kwargs) >= {
+        "teacher_logprobs",
+        "prev_logprobs",
+        "prompt_ids",
+        "rewards",
+        "mask",
+        "repeated_batch",
+    }
+    assert "logprobs_policy" not in captured_kwargs
+    assert torch.allclose(
+        captured_kwargs["teacher_logprobs"] - captured_kwargs["prev_logprobs"],
+        torch.full((2, 3), 0.25),
+    )
+    assert "advantages" in enriched.fields
+    assert ctrl._advantage_metric_values == {
+        "on_policy_distillation/teacher_student_logprob_gap_mean": [0.25]
+    }
+
+
 class _EmptySampler:
     async def evict(self, *, current_train_weight: int) -> int:
         del current_train_weight
@@ -401,6 +479,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
+    ctrl._opd_enabled = False
     ctrl._advantage_estimator = None
     ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler
@@ -423,6 +502,8 @@ def _train_pump_controller(*, sampler) -> object:
         "masked_advantages": [],
         "sequence_lengths": [],
     }
+    ctrl._advantage_metric_values = {}
+    ctrl._teacher_coordinator = None
     return ctrl
 
 

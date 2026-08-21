@@ -24,7 +24,10 @@ import torch
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    PostWriteEnrichmentError,
+    TQReplayBuffer,
+)
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -1286,6 +1289,11 @@ class RolloutManager:
                         f"  warn: remove_group({group_id}) cleanup failed: {cleanup_exc!r}",
                         flush=True,
                     )
+                # The rollout itself succeeded. Re-running generation cannot repair
+                # a required downstream stage (for example MOPD teacher inference),
+                # and would spend the rollout retry budget on the wrong subsystem.
+                if isinstance(error, PostWriteEnrichmentError):
+                    raise
                 reason = type(error).__name__
 
                 if classify_rollout_failure(error) is FailureClass.INFRA:

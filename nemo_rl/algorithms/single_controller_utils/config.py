@@ -36,6 +36,8 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
@@ -544,6 +546,7 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
+    on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
 
 
 def validate_sampler_buffer_capacity(
@@ -758,6 +761,32 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "loss_fn.reference_policy_kl_penalty=0."
         )
 
+    opd_enabled = opd_module.is_opd_enabled(master_config)
+    if master_config.grpo.adv_estimator.name == "opd" and not opd_enabled:
+        raise ValueError(
+            "grpo.adv_estimator.name='opd' requires "
+            "on_policy_distillation.enabled=true."
+        )
+    if opd_enabled:
+        opd_config = master_config.on_policy_distillation
+        assert opd_config is not None
+        if master_config.grpo.adv_estimator.name != "opd":
+            raise ValueError(
+                "on_policy_distillation.enabled=true requires "
+                "grpo.adv_estimator.name='opd'."
+            )
+        if not opd_module.is_non_colocated_teachers_enabled(master_config):
+            raise ValueError(
+                "SingleController MOPD currently requires "
+                "on_policy_distillation.non_colocated_teachers.enabled=true."
+            )
+        if not opd_config.teacher_model_by_agent_name:
+            raise ValueError(
+                "on_policy_distillation.teacher_model_by_agent_name must contain "
+                "at least one teacher mapping."
+            )
+        opd_module.assert_prev_logprobs_available(master_config)
+
     _validate_failure_settings(async_config, num_prompts_per_step)
 
     # Nesting says which knob applies to which path, but nothing stops an operator
@@ -808,3 +837,4 @@ class AdvantageConfig:
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: str = "prev_logprobs"
     reference_logprobs_field: str = "reference_policy_logprobs"
+    teacher_logprobs_field: str = "teacher_reference_logprobs"

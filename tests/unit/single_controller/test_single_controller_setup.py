@@ -25,8 +25,10 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSamplerConfig,
     SamplerConfig,
 )
+from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -139,6 +141,7 @@ def patched_factories():
             return_value=(
                 MagicMock(name="train_cluster"),
                 MagicMock(name="inference_cluster"),
+                None,
             ),
         ) as mock_clusters,
         patch.object(
@@ -223,6 +226,36 @@ def test_build_clusters_rejects_non_colocated_megatron_generation():
         sc_setup_mod._build_clusters(master_config)
 
 
+def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
+    """Teacher nodes are removed before the student train/inference split."""
+    master_config = _make_master_config(colocated=False)
+    master_config.cluster = {"num_nodes": 3, "gpus_per_node": 8}
+    master_config.policy["generation"]["colocated"]["resources"] = {
+        "gpus_per_node": 8,
+        "num_nodes": 1,
+    }
+    master_config.on_policy_distillation = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"default_teacher": "Qwen/Qwen3-1.7B"},
+        default_teacher_alias="default_teacher",
+        non_colocated_teachers={"enabled": True},
+    )
+    constructed = []
+
+    class FakeCluster:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            constructed.append(kwargs)
+
+    monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", FakeCluster)
+
+    _, _, teacher_topology = sc_setup_mod._build_clusters(master_config)
+
+    assert constructed[0]["bundle_ct_per_node_list"] == [8]
+    assert constructed[1]["bundle_ct_per_node_list"] == [8]
+    assert teacher_topology is None
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
@@ -235,6 +268,89 @@ class TestSetup:
         mc = _make_master_config(use_multiple_dataloader=True)
         with pytest.raises(NotImplementedError, match="use_multiple_dataloader"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    @pytest.mark.parametrize(
+        ("opd_enabled", "teacher_enabled", "adv_name", "match"),
+        [
+            (False, False, "opd", "requires on_policy_distillation.enabled=true"),
+            (True, True, "grpo", "requires grpo.adv_estimator.name='opd'"),
+            (True, False, "opd", "non_colocated_teachers.enabled=true"),
+        ],
+    )
+    def test_invalid_mopd_config_fails_before_allocating_resources(
+        self,
+        opd_enabled: bool,
+        teacher_enabled: bool,
+        adv_name: str,
+        match: str,
+        patched_factories,
+    ):
+        mc = _make_master_config()
+        mc.grpo.adv_estimator = AdvEstimatorConfig(name=adv_name)
+        mc.on_policy_distillation = OnPolicyDistillationConfig(
+            enabled=opd_enabled,
+            teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+            non_colocated_teachers={"enabled": teacher_enabled},
+        )
+
+        with pytest.raises(ValueError, match=match):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_mopd_reserves_before_models_and_initializes_teacher_last(
+        self, patched_factories, monkeypatch
+    ):
+        mc = _make_master_config()
+        mc.cluster = {"num_nodes": 3, "gpus_per_node": 8}
+        mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+        mc.on_policy_distillation = OnPolicyDistillationConfig(
+            enabled=True,
+            teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+            default_teacher_alias="teacher",
+            non_colocated_teachers={"enabled": True},
+        )
+        events = []
+        teacher_cluster = MagicMock(name="teacher_cluster")
+        teacher_group = MagicMock(name="teacher_group")
+
+        def reserve_teachers(*args, **kwargs):
+            del args, kwargs
+            events.append("reserve_teacher")
+            return {"teacher": teacher_cluster}
+
+        original_build_generation = patched_factories["_build_generation"].return_value
+
+        def build_generation(*args, **kwargs):
+            del args, kwargs
+            events.append("build_generation")
+            return original_build_generation
+
+        def create_teachers(*args, **kwargs):
+            del args, kwargs
+            events.append("create_teacher")
+            return {"teacher": teacher_group}, {"teacher": "teacher"}
+
+        patched_factories["_build_generation"].side_effect = build_generation
+        monkeypatch.setattr(
+            sc_setup_mod.opd_module,
+            "reserve_teacher_clusters",
+            reserve_teachers,
+        )
+        monkeypatch.setattr(
+            sc_setup_mod.opd_module,
+            "create_teacher_worker_groups",
+            create_teachers,
+        )
+
+        actor_args, timings = setup_single_controller(mc, MagicMock(pad_token_id=17))
+
+        assert events == ["reserve_teacher", "build_generation", "create_teacher"]
+        assert actor_args.teacher_worker_groups == {"teacher": teacher_group}
+        assert actor_args.alias_to_group_alias == {"teacher": "teacher"}
+        teacher_group.setup_data_plane.assert_called_once_with(mc.data_plane)
+        assert timings.teacher_reservation_time_s is not None
+        assert timings.teacher_model_init_time_s is not None
 
     @pytest.mark.parametrize(
         ("invalid_case", "match"),

@@ -47,6 +47,7 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
+from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.grpo import GRPOSaveState, _write_latest_checkpoint_status
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -123,6 +124,7 @@ class SingleControllerActor:
 
         self._master_config = master_config
         self._async_cfg = master_config.async_rl
+        self._opd_enabled = opd_module.is_opd_enabled(master_config)
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
             and master_config.grpo.seq_logprob_error_threshold is None
@@ -154,6 +156,21 @@ class SingleControllerActor:
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
+        teacher_worker_groups = getattr(actor_args, "teacher_worker_groups", None) or {}
+        if teacher_worker_groups:
+            self._teacher_coordinator: Optional[
+                opd_module.TQTeacherLogprobCoordinator
+            ] = opd_module.TQTeacherLogprobCoordinator(
+                dp_client=self._dp_client,
+                teacher_worker_groups=teacher_worker_groups,
+                alias_to_group_alias=(
+                    getattr(actor_args, "alias_to_group_alias", None) or {}
+                ),
+                on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
+            )
+            self._buffer.set_post_write_enricher(self._teacher_coordinator.enrich)
+        else:
+            self._teacher_coordinator = None
 
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
@@ -257,6 +274,7 @@ class SingleControllerActor:
             "masked_advantages": [],
             "sequence_lengths": [],
         }
+        self._advantage_metric_values: dict[str, list[float]] = {}
 
         print(
             f"SingleControllerActor: "
@@ -1055,6 +1073,16 @@ class SingleControllerActor:
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
+                step_metrics.update(
+                    {
+                        name: float(sum(values) / len(values))
+                        for name, values in self._advantage_metric_values.items()
+                        if values
+                    }
+                )
+                self._advantage_metric_values.clear()
+                if self._teacher_coordinator is not None:
+                    step_metrics.update(self._teacher_coordinator.drain_metrics())
 
                 self._trainer_version += 1
                 self._train_steps += 1
@@ -1693,14 +1721,20 @@ class SingleControllerActor:
 
         kwargs: dict[str, torch.Tensor] = {}
         if self._policy_logprobs_required:
-            kwargs["logprobs_policy"] = tensor_field(
-                data,
-                adv_cfg.policy_logprobs_field,
-            )
+            policy_logprobs = tensor_field(data, adv_cfg.policy_logprobs_field)
+            if self._opd_enabled:
+                kwargs["prev_logprobs"] = policy_logprobs
+            else:
+                kwargs["logprobs_policy"] = policy_logprobs
         if self._reference_logprobs_required:
             kwargs["logprobs_reference"] = tensor_field(
                 data,
                 adv_cfg.reference_logprobs_field,
+            )
+        if self._opd_enabled:
+            kwargs["teacher_logprobs"] = tensor_field(
+                data,
+                adv_cfg.teacher_logprobs_field,
             )
 
         advantages = self._advantage_estimator.compute_advantage(
@@ -1715,6 +1749,9 @@ class SingleControllerActor:
         self._step_log_dict["masked_advantages"].append(
             response_advantages.detach().cpu()
         )
+        estimator_metrics = getattr(self._advantage_estimator, "last_metrics", {})
+        for name, value in estimator_metrics.items():
+            self._advantage_metric_values.setdefault(name, []).append(float(value))
 
         await self._call_dp(
             "put_samples",
@@ -1742,4 +1779,6 @@ class SingleControllerActor:
             fields.append(adv_cfg.policy_logprobs_field)
         if self._reference_logprobs_required:
             fields.append(adv_cfg.reference_logprobs_field)
+        if self._opd_enabled:
+            fields.append(adv_cfg.teacher_logprobs_field)
         return list(dict.fromkeys(fields))

@@ -158,6 +158,12 @@ def main() -> None:
                 except Exception as kill_error:
                     print(f"Env {env_name!r} kill failed: {kill_error}")
 
+        for teacher_alias, teacher in (actor_args.teacher_worker_groups or {}).items():
+            try:
+                teacher.shutdown()
+            except Exception as e:
+                print(f"Teacher {teacher_alias!r} shutdown failed: {e}")
+
         for resource_name, resource in (
             ("Generation", actor_args.gen_handle),
             ("Trainer", actor_args.trainer_handle),
