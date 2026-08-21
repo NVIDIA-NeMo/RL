@@ -409,43 +409,59 @@ global_forward_pad_seqlen = round_up(1320, 64) = 1344
 ## Configuration
 
 The data plane is configured via a `data_plane:` block in the master
-YAML (`examples/configs/...`). The canonical exemplar is
+YAML (`examples/configs/...`). **YAML is the single source of truth
+for defaults** — the adapter has no hidden `cfg.get(key, default)`
+fallbacks. The canonical exemplar is
 `examples/configs/grpo_math_1B.yaml`.
 
-`enabled`, `impl`, `backend` and `claim_meta_poll_interval_s` are
-**required** when `enabled=true`. Backend sizing lives in a block named
-for the backend that reads it; only the block named by `backend` is
-consulted. An absent `mooncake_cpu:` block means that backend's
-defaults, declared on `MooncakeCpuConfig` in
-`nemo_rl/data_plane/interfaces.py`. `simple:` is **not** optional —
-`num_storage_units` has no static default, since no single value is
-right across cluster sizes, so a `simple` run without the block fails
-validation. Recipes under `examples/configs/recipes/**/*.yaml` inherit
-all of it via `defaults:`.
+All eight keys below are **required** when `enabled=true`. Recipes
+under `examples/configs/recipes/**/*.yaml` inherit them via
+`defaults:` from the exemplar.
 
 ```yaml
 data_plane:
   enabled: false                       # flip to true to engage grpo_train_sync
   impl: transfer_queue                 # only one impl today
   backend: "simple"                    # "simple" or "mooncake_cpu"
+  storage_capacity: 1000000            # max samples retained per partition
+  num_storage_units: 2                 # storage shards
   claim_meta_poll_interval_s: 0.5      # blocking-claim poll cadence
-  simple:
-    storage_capacity: 1000000          # max samples retained per partition
-    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
-  mooncake_cpu:
-    global_segment_size: 68719476736   # 64 GiB/process
-    local_buffer_size:    4294967296   # 4 GiB/process
-    reuse_registered_buffers: true     # reuse RDMA-registered buffers
-    staging_buffer_size:   268435456   # 256 MiB/pool slot; bigger transfers bypass the pool
-  # observability:                     # NotRequired
-  #   enabled: false
+  global_segment_size: 549755813888    # 512 GiB — used when backend == "mooncake_cpu"
+  local_buffer_size:   68719476736     # 64 GiB  — used when backend == "mooncake_cpu"
+  observability:                       # NotRequired
+    enabled: false                     # per-op timing / latency percentiles / volume
+    verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check
 ```
 
-These keys used to sit directly under `data_plane:`. That spelling is not
-rejected — it is simply never read. A config still using it silently gets
-this backend's defaults instead of its own values: an inherited config
-supplies the nested block, so a surviving flat key always loses the merge,
-with no warning either way.
+### Observability
+
+`enabled: true` wraps the adapter in `MetricsDataPlaneClient`, which records
+per-op wall time, latency percentiles (fixed-bucket histogram, so per-rank
+counts sum into one cluster-wide distribution) and byte volume. `snapshot()`
+returns the cumulative view; `get_step_metrics(step_time_s)` returns the
+per-step delta already flattened for the logger.
+
+The wrapper is measured against a no-op inner client at 256 keys and an
+18 MB payload: **~54 µs per put, ~33 µs per get** — under 0.1% of a 59 ms
+operation. Most of that is the byte walk over the `TensorDict`; the rest is
+the per-key attribution `clear_samples` needs to undo. `on_event` defaults to
+`None` when unset, in which case the per-op event dict is never built.
+
+`verify_tensor_hash: true` additionally records a per-row
+`torch.hash_tensor` fingerprint on every put and re-checks it on every get,
+so a tensor that changes between wire-in and wire-out is reported
+(`hash/mismatches`) instead of being trained on silently. Fingerprints are
+per row, so a 256-row put read back as eight shards of 32 still reconciles.
+Two things to know before turning it on:
+
+- It reads every tensor byte again on both sides — measured at ~1.2 ms
+  per 18 MB on put and the same on get, i.e. ~2% of the 59 ms operation it
+  is guarding. Keep it to debugging runs.
+- `hash_tensor` reduces by XOR, so it cannot see a permutation of elements
+  *within* a row. Dtype and per-row shape are folded into the fingerprint;
+  element order within a row is not covered.
+- Only rows this process wrote can be checked. A consumer-side client
+  reports them under `hash/rows_unverified` rather than counting them clean.
 
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
