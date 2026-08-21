@@ -20,12 +20,16 @@ from torch import nn
 
 @dataclass(frozen=True)
 class DraftUpdateProbe:
+    """Snapshot collected immediately before a draft optimizer step."""
+
     before: tuple[float, float]
     grad_l2: float
 
 
 @dataclass(frozen=True)
 class DraftUpdateResult:
+    """Gradient and parameter-change evidence for one draft optimizer step."""
+
     before: tuple[float, float]
     after: tuple[float, float]
     grad_l2: float
@@ -33,6 +37,14 @@ class DraftUpdateResult:
 
 
 def format_draft_update_probe(result: DraftUpdateResult) -> str:
+    """Format a draft optimizer update result for structured logging.
+
+    Args:
+        result: Completed update probe.
+
+    Returns:
+        A single-line diagnostic message.
+    """
     return (
         f"draft_update_probe=complete grad_l2={result.grad_l2:.17g} "
         f"checksum_sum_before={result.before[0]:.17g} "
@@ -69,6 +81,14 @@ def _gradient_l2(module: nn.Module) -> float:
 
 
 def start_draft_update_probe(module: nn.Module) -> DraftUpdateProbe:
+    """Capture parameter and gradient state before a draft optimizer step.
+
+    Args:
+        module: Draft model whose update is being checked.
+
+    Returns:
+        The pre-step parameter checksum and gradient norm.
+    """
     return DraftUpdateProbe(
         before=_parameter_checksum(module),
         grad_l2=_gradient_l2(module),
@@ -78,6 +98,15 @@ def start_draft_update_probe(module: nn.Module) -> DraftUpdateProbe:
 def finalize_draft_update_probe(
     module: nn.Module, probe: DraftUpdateProbe
 ) -> DraftUpdateResult:
+    """Compare draft parameters after an optimizer step.
+
+    Args:
+        module: Draft model after the optimizer step.
+        probe: Snapshot captured before the optimizer step.
+
+    Returns:
+        Gradient and parameter-change evidence for the step.
+    """
     after = _parameter_checksum(module)
     delta = abs(after[0] - probe.before[0]) + abs(after[1] - probe.before[1])
     return DraftUpdateResult(
@@ -89,6 +118,14 @@ def finalize_draft_update_probe(
 
 
 def require_draft_update(result: DraftUpdateResult) -> None:
+    """Require evidence that a draft optimizer step updated parameters.
+
+    Args:
+        result: Completed update probe.
+
+    Raises:
+        RuntimeError: If gradients or parameter changes are absent.
+    """
     if result.grad_l2 <= 0:
         raise RuntimeError("draft update probe requires a nonzero gradient")
     if result.checksum_delta <= 0 or result.before == result.after:
