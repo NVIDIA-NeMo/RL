@@ -603,7 +603,6 @@ class MegatronPolicyWorkerImpl(
                 pre_load_checkpoint_hook=getattr(
                     self, "_pre_load_checkpoint_hook", None
                 ),
-                policy_model=self.model,
             )
             self.model = self.move_model(self.model, "cuda")
             log_gpu_memory_diagnostics(
