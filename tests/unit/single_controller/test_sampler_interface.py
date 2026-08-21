@@ -546,7 +546,7 @@ class TestSelectionStaleness:
         ],
         ids=["windowed", "ready_first", "weight_fifo"],
     )
-    def test_every_built_in_sampler_reports_it(self, sampler_factory):
+    def test_every_weight_selecting_sampler_reports_it(self, sampler_factory):
         buf = FakeBuffer()
         buf.add("g0", weight=3)
         s = sampler_factory(buf)
@@ -557,3 +557,43 @@ class TestSelectionStaleness:
 
         assert n == 1
         assert s.last_selection_trajectory_ages == [2]
+
+    def test_in_order_reports_it_too(self):
+        """InOrderSampler selects on target_step, but still reports by weight.
+
+        Its ``select`` keys on ``target_step == current_train_weight`` rather
+        than on ``start_weight``, so it is the one built-in whose selection
+        filter does not itself bound the age. The reported value is still
+        ``current_train_weight - start_weight``, which is what the importance
+        ratio spans regardless of how the group was chosen.
+        """
+        buf = FakeBuffer()
+        buf.add("g0", weight=3, target_step=5)
+        s = InOrderSampler(buf, max_lookahead_versions=4)
+
+        _, n = _run(
+            s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1)
+        )
+
+        assert n == 1
+        assert s.last_selection_trajectory_ages == [2]
+
+    def test_age_is_reported_unclamped(self):
+        """A group newer than the trainer reports a negative age, not zero.
+
+        Not expected in practice, but worth pinning: the three weight-filtering
+        samplers bound this by construction, while InOrderSampler's filter is
+        on ``target_step``, so nothing local to it rules the case out.
+        Clamping would turn a stamping inversion into a plausible-looking zero;
+        reporting it is what makes it findable.
+        """
+        buf = FakeBuffer()
+        buf.add("g0", weight=7, target_step=5)
+        s = InOrderSampler(buf, max_lookahead_versions=4)
+
+        _, n = _run(
+            s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1)
+        )
+
+        assert n == 1
+        assert s.last_selection_trajectory_ages == [-2]
