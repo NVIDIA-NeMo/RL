@@ -5,8 +5,8 @@ source "$SCRIPT_DIR/common.env"
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
 GPUS_PER_NODE=4
-STEPS_PER_RUN=1
-MAX_STEPS=1
+STEPS_PER_RUN=2
+MAX_STEPS=2
 NUM_RUNS=1
 NUM_MINUTES=45
 # ===== END CONFIG =====
@@ -36,6 +36,11 @@ uv run examples/run_grpo.py \
 
 grep -q "Draft Loss:" "$RUN_LOG"
 grep -q "draft_update_probe=complete" "$RUN_LOG"
+awk '
+    /draft_update_probe=complete/ { updated = 1; next }
+    updated && /draft_refit_manifest=draft_count=/ { refitted = 1 }
+    END { exit !refitted }
+' "$RUN_LOG"
 
 uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 uv run tests/check_metrics.py "$JSON_METRICS" \
