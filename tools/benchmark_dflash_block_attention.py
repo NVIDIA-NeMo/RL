@@ -258,7 +258,7 @@ def _correctness_comparison(
             inputs[2],
             global_key,
             global_value,
-            _block_visibility(plan),
+            _block_visibility(plan, None),
             scale=_HEAD_DIM**-0.5,
         )
 
