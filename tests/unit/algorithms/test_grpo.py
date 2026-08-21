@@ -2437,6 +2437,7 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         enable_router_replay=False,
         routed_experts_dtype="int16",
         use_fastokens=False,
+        rollout_fan_in=None,
     )
 
 
@@ -2809,6 +2810,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         enable_router_replay=False,
         routed_experts_dtype="int16",
         use_fastokens=False,
+        rollout_fan_in=None,
     )
 
 

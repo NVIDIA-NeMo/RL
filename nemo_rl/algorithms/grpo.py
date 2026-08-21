@@ -753,6 +753,17 @@ def setup(
             enable_router_replay=enable_router_replay,
             routed_experts_dtype=routed_experts_dtype,
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+            # This path fans in per prompt *batch* (one run_rollouts call per
+            # in-flight AsyncTrajectoryCollector batch worker, or one per step
+            # on the synchronous path), not per prompt, so its true fan-in is
+            # single digits and has never approached Ray's default -- there is
+            # no v1 config knob to derive one from. Declaring no fan-in leaves
+            # max_concurrency off the actor entirely, keeping it byte-for-byte
+            # as it was configured before this option became explicit, and holds
+            # an explicit env.nemo_gym.max_concurrency to no floor it could not
+            # have known about. The fan-in that needed sizing is the
+            # SingleController one.
+            rollout_fan_in=None,
         )
         return actor, time.perf_counter() - t0
 
