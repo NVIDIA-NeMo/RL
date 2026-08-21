@@ -593,6 +593,13 @@ class BaseVllmGenerationWorker:
             enable_sleep_mode=True,
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
+            # Resolve sampling params NeMo-RL leaves unset (min_p,
+            # repetition_penalty, ...) to vLLM's neutral defaults instead of the
+            # model's generation_config.json, so policy.generation.* stays the
+            # single source of truth for the sampling distribution that the
+            # train-side logprob rescaling assumes. Overridable via
+            # generation.vllm_kwargs.generation_config. See #3497.
+            generation_config="vllm",
             **vllm_kwargs,
         )
 
