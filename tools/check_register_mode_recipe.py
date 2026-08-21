@@ -26,11 +26,14 @@ import sys
 from omegaconf import OmegaConf
 
 from nemo_rl.data_plane.interfaces import backend_config
-from nemo_rl.utils.config import load_config
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 
 def main(path: str) -> int:
     """Print the resolved mesh / data-plane facts; return non-zero on mismatch."""
+    # Exemplar configs use NeMo-RL's own resolvers (``${mul:...}``); resolving
+    # without registering them first fails the way the entrypoint never would.
+    register_omegaconf_resolvers()
     cfg = load_config(path)
     resolved = OmegaConf.to_container(cfg, resolve=True)
 

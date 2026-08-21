@@ -88,7 +88,11 @@ def test_cpu_only_client_may_attach_with_gdr_config(monkeypatch) -> None:
     monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
     monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
     monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
-    monkeypatch.setattr(tq_adapter, "_patch_mooncake_staging_buffers", lambda **_: None)
+    # Positional on this stack: the CPU-RDMA work passes staging_buffer_size,
+    # where the first GDR integration passed n_slots/max_bytes as keywords.
+    monkeypatch.setattr(
+        tq_adapter, "_patch_mooncake_staging_buffers", lambda *_, **__: None
+    )
     monkeypatch.setattr(tq_adapter.os, "environ", dict(tq_adapter.os.environ))
 
     client = tq_adapter.TQDataPlaneClient(_gdr_cfg(), bootstrap=False)
