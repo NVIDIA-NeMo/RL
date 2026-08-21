@@ -22,3 +22,9 @@ truth for those models.
 > Qwen3 and Qwen3.5 thinking models need a large generation budget. See
 > [Qwen3.5 → Example Recipes](qwen3-5.md#example-recipes) for the
 > `max_new_tokens` guidance.
+
+```{toctree}
+:hidden:
+
+qwen3-5.md
+```

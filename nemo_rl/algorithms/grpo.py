@@ -2644,7 +2644,11 @@ def grpo_train(
                         master_config.grpo.deduplicate_multimodal_data
                         and should_use_nemo_gym(master_config)
                     ):
-                        attach_initial_nemo_gym_image_payloads(batch, processor)
+                        attach_initial_nemo_gym_image_payloads(
+                            batch,
+                            processor,
+                            env_config=master_config.env,
+                        )
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
@@ -3668,7 +3672,11 @@ def validate(
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if should_use_nemo_gym(master_config):
                 if master_config.grpo.deduplicate_multimodal_data:
-                    attach_initial_nemo_gym_image_payloads(val_batch, processor)
+                    attach_initial_nemo_gym_image_payloads(
+                        val_batch,
+                        processor,
+                        env_config=master_config.env,
+                    )
                 generation_config = master_config.policy["generation"]
                 # Validation-only sampling (e.g. near-greedy validation);
                 # defaults to the train profile via the exemplar YAML

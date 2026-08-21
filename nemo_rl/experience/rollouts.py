@@ -21,7 +21,7 @@ import json
 import statistics
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -54,7 +54,10 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
-from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
+from nemo_rl.environments.nemo_gym import (
+    DEFAULT_THINKING_TAGS,
+    get_pad_dynamic_image_shapes,
+)
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
@@ -77,6 +80,8 @@ TokenizerType = PreTrainedTokenizerBase
 def attach_initial_nemo_gym_image_payloads(
     batch: BatchedDataDict[DatumSpec],
     processor: Any,
+    *,
+    env_config: Mapping[str, Any],
 ) -> None:
     """Attach initial Gym image tensors once, before prompt repeat.
 
@@ -85,7 +90,17 @@ def attach_initial_nemo_gym_image_payloads(
     prompt batch, allowing ``repeat_interleave(..., share_immutable_media=True)``
     to retain one physical processor output per prompt. Flag-off runs never call
     this helper.
+
+    Takes ``master_config.env`` and resolves ``pad_dynamic_image_shapes``
+    itself, mirroring the per-turn attach inside the NeMo-Gym actor. Resolving
+    here rather than at each call site means a caller cannot supply the wrong
+    value -- the divergence between the two attach paths that this helper
+    previously had. The flag only matters for a turn carrying more than one
+    image at differing resolutions, where the processor returns a ragged CHW
+    list; without it the processor is asked to stack those and raises before
+    the shapes are read.
     """
+    pad_dynamic_image_shapes = get_pad_dynamic_image_shapes(env_config)
     for message_log, extra_env_info in zip(
         batch["message_log"], batch["extra_env_info"]
     ):
@@ -114,6 +129,7 @@ def attach_initial_nemo_gym_image_payloads(
             user_message,
             images=images,
             processor=processor,
+            pad_dynamic_image_shapes=pad_dynamic_image_shapes,
         )
 
 
