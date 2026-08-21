@@ -203,6 +203,8 @@ mcore = [
   "causal-conv1d",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
+  # Megatron batch_invariant_mode with MoE (Nano hybrid) requires DeepGEMM bf16 grouped GEMM.
+  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",

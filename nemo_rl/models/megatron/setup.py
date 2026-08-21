@@ -245,7 +245,6 @@ from nemo_rl.models.megatron.draft.utils import (
 from nemo_rl.models.megatron.memory_saver import inference_model_alloc_region
 from nemo_rl.models.megatron.router_replay import (
     clear_global_router_replay_instances,
-    rebuild_global_router_replay_registry,
     router_replay_enabled,
     validate_router_replay_config,
 )
@@ -1552,13 +1551,13 @@ def _enable_batch_invariant_kernels_if_requested(config: PolicyConfig) -> None:
 def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     """Propagate zero_train_gen_mismatch flag to its constituent sub-knobs.
 
-    When True, forces batch_invariant_mode=True, use_mamba_mem_eff_path=False,
-    attention_backend=flash (FA4 via TE), and the Transformer Engine generation
-    layer spec so generation and scoring share the patched MoE unpermute path.
-    Also applies TE cuBLAS workspace shrink and TP=1 log-softmax via
-    zero_train_gen_kl_patches.core_patches, deterministic MoE fixed-order combine
-    (train + generation) via moe_zero_kl_patches.py, and Mamba train/prefill/decode
-    alignment via mamba_zero_kl_patches.py.
+    When True, forces batch_invariant_mode=True, use_mamba_mem_eff_path=False (Mamba
+    models only), attention_backend=flash (FA4 via TE), and the Transformer Engine
+    generation layer spec so generation and scoring share aligned MoE/Mamba paths.
+    MoE batch_invariant_mode requires DeepGEMM in the mcore worker venv (see
+    pyproject.toml mcore extra). Also applies TE cuBLAS workspace shrink and TP=1
+    log-softmax via zero_train_gen_kl_patches.core_patches, deterministic MoE
+    fixed-order combine (train + generation) via moe_zero_kl_patches.py.
     Generation uses ``logprobs_mode=raw_logprobs`` so gen uses ``F.log_softmax``
     (not FlashInfer processed log-probs). moe_grouped_gemm must be configured explicitly.
     """
@@ -1576,11 +1575,12 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
 
     mc = config["megatron_cfg"]
     mc["batch_invariant_mode"] = True
+    if policy_uses_mamba_layers(config):
+        mc.setdefault(
+            "use_mamba_mem_eff_path", False
+        )  # Disable Mamba's memory-efficient path
     mc.setdefault("attention_backend", "flash")
     mc.setdefault("flash_attention_version", 4)
-    mc.setdefault(
-        "use_mamba_mem_eff_path", False
-    )  # Disable Mamba's memory-efficient path
     generation = config.get("generation")
     if generation is not None and "mcore_generation_config" in generation:
         generation["mcore_generation_config"]["transformer_impl"] = "transformer_engine"
@@ -2103,7 +2103,6 @@ def setup_reference_model_state(
     megatron_cfg: ConfigContainer,
     pretrained_path: str,
     pre_load_checkpoint_hook: Optional[Callable] = None,
-    policy_model: Optional[Any] = None,
 ) -> dict:
     """Setup the reference model for inference and return its state dict."""
     # Create reference checkpoint config
@@ -2233,10 +2232,7 @@ def setup_reference_model_state(
         else:
             print("Reference model not loaded")
     finally:
-        if policy_model is not None:
-            rebuild_global_router_replay_registry(policy_model)
-        else:
-            clear_global_router_replay_instances()
+        clear_global_router_replay_instances()
 
     return reference_state_dict
 
