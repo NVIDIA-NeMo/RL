@@ -192,6 +192,38 @@ def test_partial_refit_failure_makes_worker_fail_closed(monkeypatch):
             pass
 
 
+@pytest.mark.vllm
+def test_fp8_kv_postprocess_failure_makes_worker_fail_closed(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=object(), vllm_config=SimpleNamespace(speculative_config=None)
+    )
+    ext.model_config = object()
+    ext.device = object()
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        MagicMock(),
+    )
+    ext._maybe_process_fp8_kv_cache = MagicMock(
+        side_effect=RuntimeError("KV scale conversion failed")
+    )
+
+    with pytest.raises(RuntimeError, match="KV scale conversion failed"):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            finalize(False)
+
+    with pytest.raises(RuntimeError, match="unusable after a partial refit"):
+        with ext._weight_update_lifecycle("collective"):
+            pass
+
+
 def _write_sharded_checkpoint(model_dir, shards):
     """Write safetensors shards plus a model.safetensors.index.json.
 

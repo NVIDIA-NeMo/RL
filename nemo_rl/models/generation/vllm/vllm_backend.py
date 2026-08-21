@@ -709,12 +709,12 @@ class VllmInternalWorkerExtension:
 
         try:
             yield finalize
+            # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
+            # this optional second pass, just as it was before lifecycle hooks.
+            self._maybe_process_fp8_kv_cache()
         except BaseException as error:
             self._mark_refit_unusable(error)
             raise
-        # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
-        # this optional second pass, just as it was before lifecycle hooks.
-        self._maybe_process_fp8_kv_cache()
 
     def _new_model_update_coverage(self) -> ModelUpdateCoverage | None:
         manifest = self._model_update_manifest
