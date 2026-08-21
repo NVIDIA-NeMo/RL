@@ -588,7 +588,8 @@ def _build_trainer(
         processor: Optional AutoProcessor for VLM paths.
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
-        reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym.
+        reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym;
+            set only when colocated Megatron generation serves from the trainer's rank 0.
 
     Returns:
         A tuple of (TQPolicy trainer, wall time spent in this call).
