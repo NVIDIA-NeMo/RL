@@ -164,9 +164,15 @@ DraftSpeculator = DraftTrainingProvider
 class Eagle3Speculator:
     """Current EAGLE-3 draft speculator."""
 
-    supports_context_parallel: ClassVar[bool] = False
-    supports_sequence_packing: ClassVar[bool] = False
-    supports_target_sequence_parallel: ClassVar[bool] = False
+    supports_context_parallel: ClassVar[bool] = (
+        Eagle3DraftConfig.supports_context_parallel
+    )
+    supports_sequence_packing: ClassVar[bool] = (
+        Eagle3DraftConfig.supports_sequence_packing
+    )
+    supports_target_sequence_parallel: ClassVar[bool] = (
+        Eagle3DraftConfig.supports_target_sequence_parallel
+    )
     requires_full_cp_local_capture: ClassVar[bool] = False
     config: Eagle3DraftConfig
 
@@ -278,9 +284,15 @@ class Eagle3Speculator:
 class DFlashSpeculator:
     """DFlash body provider sharing embeddings and output head with the target."""
 
-    supports_context_parallel: ClassVar[bool] = True
-    supports_sequence_packing: ClassVar[bool] = True
-    supports_target_sequence_parallel: ClassVar[bool] = True
+    supports_context_parallel: ClassVar[bool] = (
+        DFlashDraftConfig.supports_context_parallel
+    )
+    supports_sequence_packing: ClassVar[bool] = (
+        DFlashDraftConfig.supports_sequence_packing
+    )
+    supports_target_sequence_parallel: ClassVar[bool] = (
+        DFlashDraftConfig.supports_target_sequence_parallel
+    )
     requires_full_cp_local_capture: ClassVar[bool] = True
     config: DFlashDraftConfig
 
@@ -605,9 +617,15 @@ class DFlashSpeculator:
 class DSparkSpeculator:
     """DSpark provider reusing the DFlash body with Markov/confidence heads."""
 
-    supports_context_parallel: ClassVar[bool] = True
-    supports_sequence_packing: ClassVar[bool] = True
-    supports_target_sequence_parallel: ClassVar[bool] = True
+    supports_context_parallel: ClassVar[bool] = (
+        DSparkDraftConfig.supports_context_parallel
+    )
+    supports_sequence_packing: ClassVar[bool] = (
+        DSparkDraftConfig.supports_sequence_packing
+    )
+    supports_target_sequence_parallel: ClassVar[bool] = (
+        DSparkDraftConfig.supports_target_sequence_parallel
+    )
     requires_full_cp_local_capture: ClassVar[bool] = True
     config: DSparkDraftConfig
 

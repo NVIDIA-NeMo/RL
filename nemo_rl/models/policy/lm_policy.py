@@ -129,12 +129,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
             )
-        if draft_enabled and bool(
-            config.get("sequence_packing", {}).get("enabled", False)
+        if (
+            draft_config is not None
+            and draft_config.enabled
+            and bool(config.get("sequence_packing", {}).get("enabled", False))
+            and not draft_config.supports_sequence_packing
         ):
             raise ValueError(
-                "policy.draft.enabled=true does not support sequence packing yet. "
-                "Disable policy.sequence_packing.enabled or policy.draft."
+                "the configured draft provider does not support sequence packing. "
+                "Disable policy.sequence_packing.enabled or select a capable "
+                "Megatron draft provider."
             )
         if megatron_enable:
             worker_builder_cls_fqn = resolve_policy_worker_cls(

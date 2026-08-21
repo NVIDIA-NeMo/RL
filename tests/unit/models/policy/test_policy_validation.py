@@ -25,6 +25,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import (
+    DFlashDraftConfig,
+    DSparkDraftConfig,
+    Eagle3DraftConfig,
+)
 from nemo_rl.models.policy.lm_policy import Policy
 
 
@@ -169,6 +174,79 @@ def create_megatron_config(
             "betas": [0.9, 0.999],
         },
     }
+
+
+def _dflash_config() -> DFlashDraftConfig:
+    return DFlashDraftConfig(
+        enabled=True,
+        gamma=5,
+        anchors_per_sample=2,
+        mask_token_id=151669,
+        target_hidden_state_layer_ids=[1, 9, 17, 25, 33],
+    )
+
+
+def _dspark_config() -> DSparkDraftConfig:
+    return DSparkDraftConfig(
+        enabled=True,
+        block_size=6,
+        anchors_per_sample=2,
+        mask_token_id=151669,
+        target_hidden_state_layer_ids=[1, 9, 17, 25, 33],
+    )
+
+
+@pytest.mark.parametrize("draft_config", [_dflash_config(), _dspark_config()])
+@patch.dict("os.environ", {"TORCH_CUDA_ARCH_LIST": "10.0"})
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_megatron_packed_policy_accepts_capable_draft_provider(
+    mock_ray_worker_group,
+    draft_config,
+) -> None:
+    config = create_megatron_config("test-model", tp=2, cp=2)
+    config["dynamic_batching"]["enabled"] = False
+    config["sequence_packing"] = {
+        "enabled": True,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+    config["make_sequence_length_divisible_by"] = 16
+    config["megatron_cfg"]["sequence_parallel"] = True
+    config["draft"] = draft_config
+
+    with patch(
+        "nemo_rl.models.policy.lm_policy.get_default_hf_config",
+        side_effect=ValueError("unsupported test model"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=4),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    mock_ray_worker_group.assert_called_once()
+
+
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_megatron_packed_policy_rejects_draft_without_packing_capability(
+    mock_ray_worker_group,
+) -> None:
+    config = create_megatron_config("test-model", tp=2)
+    config["dynamic_batching"]["enabled"] = False
+    config["sequence_packing"] = {
+        "enabled": True,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+    config["make_sequence_length_divisible_by"] = 16
+    config["draft"] = Eagle3DraftConfig(enabled=True)
+
+    with pytest.raises(ValueError, match="provider does not support sequence packing"):
+        Policy(
+            cluster=create_mock_cluster(world_size=2),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    mock_ray_worker_group.assert_not_called()
 
 
 @pytest.mark.parametrize(

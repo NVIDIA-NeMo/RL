@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Annotated, Literal, Self, TypeAlias
+from typing import Annotated, ClassVar, Literal, Self, TypeAlias
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -35,6 +35,10 @@ class DraftOptimizerConfig(BaseModel, extra="forbid"):
 class Eagle3DraftConfig(BaseModel, extra="allow"):
     """Configuration for EAGLE-3 draft-model co-training with the policy."""
 
+    supports_context_parallel: ClassVar[bool] = False
+    supports_sequence_packing: ClassVar[bool] = False
+    supports_target_sequence_parallel: ClassVar[bool] = False
+
     speculator_type: Literal["eagle3"] = "eagle3"
     enabled: bool = False
     model_name: str | None = None
@@ -46,6 +50,10 @@ class Eagle3DraftConfig(BaseModel, extra="allow"):
 
 class DFlashDraftConfig(BaseModel, extra="forbid"):
     """Configuration for body-only DFlash co-training with a live target."""
+
+    supports_context_parallel: ClassVar[bool] = True
+    supports_sequence_packing: ClassVar[bool] = True
+    supports_target_sequence_parallel: ClassVar[bool] = True
 
     speculator_type: Literal["dflash"] = "dflash"
     enabled: bool = False
@@ -82,6 +90,10 @@ class DFlashDraftConfig(BaseModel, extra="forbid"):
 
 class DSparkDraftConfig(BaseModel, extra="forbid"):
     """Configuration for DSpark co-training with target-owned embeddings/head."""
+
+    supports_context_parallel: ClassVar[bool] = True
+    supports_sequence_packing: ClassVar[bool] = True
+    supports_target_sequence_parallel: ClassVar[bool] = True
 
     speculator_type: Literal["dspark"] = "dspark"
     enabled: bool = False
