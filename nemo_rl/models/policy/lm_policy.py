@@ -117,7 +117,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
-        draft_enabled = bool(config.get("draft", {}).get("enabled", False))
+        draft_config = config.get("draft")
+        draft_enabled = bool(draft_config is not None and draft_config.enabled)
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "

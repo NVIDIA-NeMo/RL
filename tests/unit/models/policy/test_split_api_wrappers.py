@@ -31,6 +31,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -46,7 +48,10 @@ class _SplitStubWorker(TQWorkerMixin):
 
     def _fetch(self, meta):
         self.calls.append(("fetch", meta))
-        return {"data_from": meta}
+        return {
+            "data_from": meta,
+            "input_ids": torch.zeros(len(meta.sample_ids), 2, dtype=torch.int64),
+        }
 
     def _attach_or_repack_pack_metadata(self, data, meta):
         self.calls.append(("attach", meta))
@@ -95,7 +100,31 @@ class TestPreshardedWrappers:
         out = w.train_microbatch_presharded(meta=meta)
         assert out is None  # metrics accumulate in the open-step state
         assert [c[0] for c in w.calls] == ["fetch", "attach", "train_microbatch"]
-        assert w.calls[-1][1] == {"data_from": meta}
+        dispatched = w.calls[-1][1]
+        assert dispatched["data_from"] is meta
+        assert dispatched["draft_sample_ids"].dtype == torch.int64
+        assert dispatched["draft_sample_ids"].shape == (2,)
+
+    def test_stable_sample_ids_do_not_depend_on_microbatch_order(self):
+        first = _SplitStubWorker()
+        second = _SplitStubWorker()
+        forward = KVBatchMeta(
+            partition_id="train",
+            task_name="train",
+            sample_ids=["prompt-a_g0", "prompt-b_g0"],
+        )
+        reverse = KVBatchMeta(
+            partition_id="train",
+            task_name="train",
+            sample_ids=["prompt-b_g0", "prompt-a_g0"],
+        )
+
+        first.train_microbatch_presharded(meta=forward)
+        second.train_microbatch_presharded(meta=reverse)
+
+        forward_ids = first.calls[-1][1]["draft_sample_ids"]
+        reverse_ids = second.calls[-1][1]["draft_sample_ids"]
+        assert torch.equal(forward_ids, reverse_ids.flip(0))
 
     def test_finish_tags_replica_leader(self):
         leader = _SplitStubWorker(is_leader=True)
@@ -206,6 +235,22 @@ class TestTQPolicySplitFanout:
         assert out["all_mb_metrics"]["loss"] == [0.1, 0.1]  # twins dropped
         # _aggregate_train_results surfaces global_loss under "loss"
         assert out["loss"] == 1.0
+
+    def test_finish_surfaces_draft_grad_norm(self):
+        p, _ = _make_tq_policy()
+        with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
+            mock_ray.get.return_value = [
+                {
+                    "global_loss": 1.0,
+                    "grad_norm": 0.5,
+                    "draft_grad_norm": 0.25,
+                    "all_mb_metrics": {"draft_loss": [0.1]},
+                    "is_replica_leader": True,
+                }
+            ]
+            out = p.finish_train_step()
+
+        assert out["draft_grad_norm"] == 0.25
 
     def test_abort_consumes_single_data_futures_with_ray_get(self):
         p, wg = _make_tq_policy()

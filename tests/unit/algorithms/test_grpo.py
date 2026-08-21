@@ -35,6 +35,7 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
     RewardScalingConfig,
+    _attach_grpo_draft_sample_ids,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
@@ -113,6 +114,30 @@ def test_save_async_replay_buffer_checkpoint(tmp_path):
     replay_buffer.save_to_path.remote.assert_called_once_with(
         str(tmp_path / "replay_buffer.pt")
     )
+
+
+def test_grpo_dflash_sample_ids_are_stable_across_prompt_group_order() -> None:
+    forward = BatchedDataDict(
+        {
+            "idx": [17, 17, 23, 23],
+            "task_name": ["math"] * 4,
+        }
+    )
+    reverse = BatchedDataDict(
+        {
+            "idx": [23, 23, 17, 17],
+            "task_name": ["math"] * 4,
+        }
+    )
+
+    _attach_grpo_draft_sample_ids(forward, num_generations_per_prompt=2)
+    _attach_grpo_draft_sample_ids(reverse, num_generations_per_prompt=2)
+
+    forward_ids = forward["draft_sample_ids"]
+    reverse_ids = reverse["draft_sample_ids"]
+    assert forward_ids.dtype == torch.int64
+    assert torch.equal(forward_ids, reverse_ids.roll(2))
+    assert torch.unique(forward_ids).numel() == 4
 
 
 @patch("nemo_rl.algorithms.grpo.ray")

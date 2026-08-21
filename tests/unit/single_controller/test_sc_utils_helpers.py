@@ -96,6 +96,16 @@ class TestAggregateStepMetrics:
         assert out["num_ranks"] == 4
         assert "grad_norm" not in out
 
+    def test_draft_grad_norm_tensor_is_preserved(self) -> None:
+        out = aggregate_step_metrics({"draft_grad_norm": torch.tensor([1.0, 3.0])})
+
+        assert out["draft_grad_norm"] == pytest.approx(2.0)
+
+    def test_draft_grad_norm_scalar_is_preserved(self) -> None:
+        out = aggregate_step_metrics({"draft_grad_norm": 0.25})
+
+        assert out["draft_grad_norm"] == pytest.approx(0.25)
+
     def test_mb_metric_reduction_rules(self) -> None:
         result = {
             "all_mb_metrics": {

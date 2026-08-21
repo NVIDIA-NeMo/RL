@@ -240,6 +240,9 @@ class DraftLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        defer_normalization: bool = False,
+        draft_provider: Any | None = None,
+        draft_normalization_counts: torch.Tensor | None = None,
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
@@ -248,6 +251,9 @@ class DraftLossWrapper:
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
+        self.defer_normalization = defer_normalization
+        self.draft_provider = draft_provider
+        self.draft_normalization_counts = draft_normalization_counts
         self.draft_loss_fn = DraftCrossEntropyLossFn(
             vocab_parallel_group=vocab_parallel_group,
         )
@@ -270,20 +276,60 @@ class DraftLossWrapper:
             **kwargs,
         )
 
-        loss_input, data = self.prepare_fn(
-            logits=next_token_logits,
-            data=data,
-            loss_fn=self.draft_loss_fn,
-            vocab_parallel_rank=self.vocab_parallel_rank,
-            vocab_parallel_group=self.vocab_parallel_group,
-            context_parallel_group=self.context_parallel_group,
-        )
-        draft_loss = self.draft_loss_fn(
-            data=data,
-            global_valid_seqs=global_valid_seqs,
-            global_valid_toks=global_valid_toks,
-            **loss_input,
-        )
+        if self.draft_provider is None:
+            loss_input, data = self.prepare_fn(
+                logits=next_token_logits,
+                data=data,
+                loss_fn=self.draft_loss_fn,
+                vocab_parallel_rank=self.vocab_parallel_rank,
+                vocab_parallel_group=self.vocab_parallel_group,
+                context_parallel_group=self.context_parallel_group,
+            )
+            stats = (
+                self.draft_loss_fn.loss_stats(data=data, **loss_input)
+                if self.defer_normalization
+                else None
+            )
+        else:
+            stats = self.draft_provider.loss_stats(
+                target_logits=next_token_logits,
+                data=data,
+                prepare_fn=self.prepare_fn,
+                vocab_parallel_rank=self.vocab_parallel_rank,
+                vocab_parallel_group=self.vocab_parallel_group,
+                context_parallel_group=self.context_parallel_group,
+            )
+        if self.defer_normalization:
+            assert stats is not None
+            draft_loss = (stats.numerators * stats.weights).sum()
+            # Deferred payloads are only consumed by the Megatron split API.
+            from nemo_rl.models.megatron.draft.step_state import (
+                DRAFT_STEP_PAYLOAD_KEY,
+                DraftStepState,
+            )
+
+            metrics[DRAFT_STEP_PAYLOAD_KEY] = DraftStepState.metric_payload(stats)
+        else:
+            if self.draft_provider is None:
+                draft_loss = self.draft_loss_fn(
+                    data=data,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    **loss_input,
+                )
+            else:
+                assert stats is not None
+                if self.draft_provider.config.speculator_type in ("dflash", "dspark"):
+                    if self.draft_normalization_counts is None:
+                        raise RuntimeError(
+                            "block-draft synchronous loss requires full-batch global counts"
+                        )
+                    normalization_counts = self.draft_normalization_counts
+                else:
+                    normalization_counts = global_valid_toks.reshape(1)
+                draft_loss = stats.normalized(
+                    normalization_counts=normalization_counts,
+                )
         combined_loss = policy_loss + self.loss_weight * draft_loss
         metrics["draft_loss"] = float(draft_loss.detach().item())
         return combined_loss, metrics

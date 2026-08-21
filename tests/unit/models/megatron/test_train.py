@@ -662,6 +662,7 @@ class TestForwardWithPostProcessingFn:
         mock_get_cp_group.return_value = cp_group
         mock_roll_tensor.return_value = (shifted_embeds, None)
         mock_capture = MagicMock()
+        draft_sequence_layout = MagicMock()
         mock_capture.get_captured_states.return_value = SimpleNamespace(
             hidden_states=hidden_states,
             inputs_embeds=inputs_embeds,
@@ -678,6 +679,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            draft_sequence_layout=draft_sequence_layout,
         )
         post_processor = LogprobsPostProcessor(
             cfg={"sequence_packing": {"enabled": False}}
@@ -697,6 +699,9 @@ class TestForwardWithPostProcessingFn:
             shifts=-1,
             dims=0,
             cp_group=cp_group,
+        )
+        mock_capture.get_captured_states.assert_called_once_with(
+            sequence_layout=draft_sequence_layout
         )
         draft_model.assert_called_once_with(
             hidden_states=hidden_states,

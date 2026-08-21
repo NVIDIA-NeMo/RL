@@ -1,0 +1,57 @@
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  max_num_steps: 1
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 4
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen3-8b-1n8g-megatron-dflash
+
+policy:
+  model_name: Qwen/Qwen3-8B
+  tokenizer:
+    name: Qwen/Qwen3-8B
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    scheduler:
+      lr_warmup_iters: 1
+  dtensor_cfg:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  sequence_packing:
+    enabled: false
+  draft:
+    speculator_type: dflash
+    enabled: true
+    model_name: z-lab/Qwen3-8B-DFlash-b16
+    loss_weight: 1.0
+    gamma: 5
+    anchors_per_sample: 2
+    mask_token_id: 151669
+    target_hidden_state_layer_ids: [1, 9, 17, 25, 33]
+    num_layers: 5
+    seed: 13
+    vocab_tile_size: 256
+    position_decay: 1.0
+    max_cp_boundary_exclusion_fraction: 0.25
+  generation:
+    vllm_kwargs:
+      speculative_config:
+        method: dflash
+        model: ${policy.draft.model_name}
+        num_speculative_tokens: ${policy.draft.gamma}
+        draft_tensor_parallel_size: 1
+
+logger:
+  log_dir: logs/grpo-qwen3-8b-1n8g-megatron-dflash
+  wandb:
+    name: grpo-qwen3-8b-1n8g-megatron-dflash
+
+cluster:
+  gpus_per_node: 8

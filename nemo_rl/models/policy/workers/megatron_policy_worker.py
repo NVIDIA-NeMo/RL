@@ -70,6 +70,21 @@ from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.megatron.draft.diagnostics import (
+    finalize_draft_update_probe,
+    format_draft_update_probe,
+    require_draft_update,
+    start_draft_update_probe,
+)
+from nemo_rl.models.megatron.draft.step_state import (
+    DRAFT_STEP_PAYLOAD_KEY,
+    DraftStepPayload,
+    DraftStepState,
+)
+from nemo_rl.models.megatron.draft.training import (
+    DraftTrainingProvider,
+    resolve_draft_speculator,
+)
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -162,6 +177,115 @@ def assert_refit_weight_manifest_rank_agreement(
     )
     if not torch.equal(minimum, maximum):
         raise ValueError("refit weight manifest differs across ranks")
+
+
+def _all_reduce_draft_normalization_counts(
+    counts: torch.Tensor,
+    *,
+    group: torch.distributed.ProcessGroup,
+) -> torch.Tensor:
+    """Place draft counts on the collective backend before reducing them."""
+    if torch.distributed.get_backend(group) == "nccl" and counts.device.type != "cuda":
+        counts = counts.to(device=torch.cuda.current_device())
+    torch.distributed.all_reduce(counts, group=group)
+    return counts
+
+
+def _validate_draft_training_setup(
+    *,
+    draft_provider: DraftTrainingProvider | None,
+    config: PolicyConfig,
+    model_cfg: Any,
+) -> None:
+    """Reject layouts that do not preserve block-draft plan/tensor semantics."""
+    if draft_provider is None or draft_provider.config.speculator_type not in (
+        "dflash",
+        "dspark",
+    ):
+        return
+    method = draft_provider.config.speculator_type
+    display_method = "DFlash" if method == "dflash" else "DSpark"
+
+    unsupported: list[str] = []
+    pipeline_parallel_size = int(model_cfg.pipeline_model_parallel_size)
+    context_parallel_size = int(model_cfg.context_parallel_size)
+    sequence_parallel = bool(model_cfg.sequence_parallel)
+    sequence_packing = bool(config.get("sequence_packing", {}).get("enabled", False))
+    virtual_pipeline_size = getattr(
+        model_cfg,
+        "virtual_pipeline_model_parallel_size",
+        None,
+    )
+
+    if pipeline_parallel_size != 1:
+        unsupported.append("pipeline_model_parallel_size must be 1")
+    if virtual_pipeline_size not in (None, 1):
+        unsupported.append("virtual_pipeline_model_parallel_size must be 1")
+    if context_parallel_size not in (1, 2, 4):
+        unsupported.append("context_parallel_size must be one of 1, 2, or 4")
+    if context_parallel_size > 1:
+        if not draft_provider.supports_context_parallel:
+            unsupported.append("provider does not support context parallel training")
+        if not sequence_packing:
+            unsupported.append(
+                "context_parallel_size > 1 requires sequence_packing.enabled=true"
+            )
+    if sequence_packing and not draft_provider.supports_sequence_packing:
+        unsupported.append("provider does not support sequence packing")
+    if sequence_parallel and not draft_provider.supports_target_sequence_parallel:
+        unsupported.append("provider does not support target sequence parallelism")
+    if sequence_parallel and not sequence_packing:
+        unsupported.append(
+            "sequence_parallel requires sequence_packing.enabled=true for draft training"
+        )
+    if config.get("megatron_cfg", {}).get("use_fused_linear_logprobs", False):
+        unsupported.append("use_fused_linear_logprobs must be disabled")
+
+    invalid_taps = [
+        layer_id
+        for layer_id in getattr(
+            draft_provider.config,
+            "target_hidden_state_layer_ids",
+            (),
+        )
+        if layer_id >= model_cfg.num_layers
+    ]
+    if invalid_taps:
+        unsupported.append(
+            "target_hidden_state_layer_ids exceed the target model: "
+            + ", ".join(str(layer_id) for layer_id in invalid_taps)
+        )
+    speculative_config = (
+        (config.get("generation") or {}).get("vllm_kwargs") or {}
+    ).get("speculative_config")
+    if speculative_config is not None and speculative_config.get("method") != method:
+        unsupported.append(f"generation speculative method must be {method}")
+    mcore_generation_config = (config.get("generation") or {}).get(
+        "mcore_generation_config"
+    ) or {}
+    if int(mcore_generation_config.get("pipeline_model_parallel_size", 1)) != 1:
+        unsupported.append("generation pipeline_model_parallel_size must be 1")
+    if int(mcore_generation_config.get("context_parallel_size", 1)) != 1:
+        unsupported.append("generation context_parallel_size must be 1")
+    if unsupported:
+        raise ValueError(
+            f"{display_method} co-training setup is unsupported: "
+            + "; ".join(unsupported)
+        )
+
+
+def _validate_draft_training_entrypoint(
+    *,
+    draft_provider: DraftTrainingProvider | None,
+    context_parallel_size: int,
+    split_api: bool,
+) -> None:
+    """Fail before CP draft training can use globally normalized sync counts."""
+    if draft_provider is not None and context_parallel_size > 1 and not split_api:
+        raise ValueError(
+            "context-parallel draft co-training requires the split "
+            "begin/train_microbatch/finish API"
+        )
 
 
 def _should_use_router_replay(
@@ -569,6 +693,12 @@ class MegatronPolicyWorkerImpl(
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
+        self.draft_provider = resolve_draft_speculator(config.get("draft"))
+        _validate_draft_training_setup(
+            draft_provider=self.draft_provider,
+            config=config,
+            model_cfg=runtime_config.model_cfg,
+        )
 
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
@@ -817,6 +947,11 @@ class MegatronPolicyWorkerImpl(
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
             "Megatron does not run cross-tokenizer distillation."
         )
+        _validate_draft_training_entrypoint(
+            draft_provider=getattr(self, "draft_provider", None),
+            context_parallel_size=parallel_state.get_context_parallel_world_size(),
+            split_api=False,
+        )
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
@@ -911,12 +1046,29 @@ class MegatronPolicyWorkerImpl(
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
 
+                draft_normalization_counts = None
+                draft_provider = getattr(self, "draft_provider", None)
+                if draft_provider is not None:
+                    draft_normalization_counts = draft_provider.normalization_counts(
+                        batch,
+                        optimizer_step=int(self.scheduler.num_steps),
+                    )
+                    if draft_normalization_counts is not None:
+                        draft_normalization_counts = (
+                            _all_reduce_draft_normalization_counts(
+                                draft_normalization_counts,
+                                group=parallel_state.get_data_parallel_group(),
+                            )
+                        )
+
                 loss_post_processor = LossPostProcessor(
                     loss_fn=loss_fn,
                     cfg=self.cfg,
                     num_microbatches=num_microbatches,
                     sampling_params=self.sampling_params,
                     draft_model=self.draft_model,
+                    draft_provider=draft_provider,
+                    draft_normalization_counts=draft_normalization_counts,
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
@@ -947,7 +1099,7 @@ class MegatronPolicyWorkerImpl(
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
-                    draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+                    draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
                     use_router_replay = _should_use_router_replay(
                         enabled=self._router_replay_enabled,
                         data=batch,
@@ -969,6 +1121,8 @@ class MegatronPolicyWorkerImpl(
                             sampling_params=self.sampling_params,
                             straggler_timer=self.mcore_state.straggler_timer,
                             draft_model=self.draft_model,
+                            draft_provider=getattr(self, "draft_provider", None),
+                            draft_optimizer_step=int(self.scheduler.num_steps),
                             enable_hidden_capture=draft_enabled,
                             use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
                                 "use_fused_linear_logprobs", False
@@ -990,9 +1144,22 @@ class MegatronPolicyWorkerImpl(
 
                 # Update parameters.
                 if not eval_mode:
+                    draft_update_probe = None
+                    draft_cfg = self.cfg["draft"]
+                    if (
+                        self.draft_model is not None
+                        and getattr(draft_cfg, "update_probe_enabled", False)
+                    ):
+                        draft_update_probe = start_draft_update_probe(self.draft_model)
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
+                    if draft_update_probe is not None:
+                        draft_update_result = finalize_draft_update_probe(
+                            self.draft_model, draft_update_probe
+                        )
+                        require_draft_update(draft_update_result)
+                        log.info(format_draft_update_probe(draft_update_result))
                     # Megatron-LM PR #4116 replaced the optimizer.mtp_grad_norm attribute
                     # with a per-group dict populated during gradient clipping. Value is
                     # None when clip_grad == 0 or this rank owns no MTP-tagged params
@@ -1231,9 +1398,10 @@ class MegatronPolicyWorkerImpl(
     #    ``forward_backward_func``, i.e. once per chunk). All three are nulled
     #    for the duration of the step and restored at finish/abort; see
     #    ``begin_train_step`` for what each one does.
-    # 3. Grad clip is bundled inside ``MegatronOptimizer.step()``; the 1/N
-    #    rescale via ``self.model.scale_gradients(1/N)`` must run before
-    #    ``optimizer.step()`` so the clip operates on the rescaled grad.
+    # 3. Grad clip is bundled inside ``MegatronOptimizer.step()``; the policy
+    #    1/N rescale and relative draft-denominator correction must run before
+    #    end-of-step finalization and ``optimizer.step()`` so clipping sees
+    #    normalized gradients.
     # 4. With ``calculate_per_token_loss=True`` + ``average_in_collective=
     #    False``, mcore's DDP sums (does not average) grads across DP, so
     #    no FSDP-style ``loss *= dp_size*cp_size`` cancellation is needed
@@ -1270,6 +1438,7 @@ class MegatronPolicyWorkerImpl(
             # streaming chunks the controller has fed into this optimizer step
             # so far.
             "num_chunks": 0,
+            "draft_step_state": DraftStepState(),
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
             "saved_no_sync_func": None,
@@ -1515,6 +1684,8 @@ class MegatronPolicyWorkerImpl(
             num_microbatches=num_microbatches,
             sampling_params=self.sampling_params,
             draft_model=self.draft_model,
+            draft_provider=getattr(self, "draft_provider", None),
+            defer_draft_normalization=True,
         )
 
         # Placeholder N=1: loss returns un-normalized sums. ``backward``
@@ -1522,7 +1693,7 @@ class MegatronPolicyWorkerImpl(
         # hooks. The 1/N rescale happens once at finish.
         placeholder_n = torch.tensor(1.0, device="cuda")
 
-        draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+        draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
             data=data,
@@ -1552,6 +1723,8 @@ class MegatronPolicyWorkerImpl(
                     sampling_params=self.sampling_params,
                     straggler_timer=self.mcore_state.straggler_timer,
                     draft_model=self.draft_model,
+                    draft_provider=getattr(self, "draft_provider", None),
+                    draft_optimizer_step=int(self.scheduler.num_steps),
                     enable_hidden_capture=draft_enabled,
                     use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
                         "use_fused_linear_logprobs", False
@@ -1580,6 +1753,14 @@ class MegatronPolicyWorkerImpl(
         )
 
         for m in mb_metrics_collected:
+            draft_payload = m.get(DRAFT_STEP_PAYLOAD_KEY)
+            if draft_payload is not None:
+                if not isinstance(draft_payload, DraftStepPayload):
+                    raise TypeError(
+                        "draft step metric payload must be DraftStepPayload, "
+                        f"got {type(draft_payload).__name__}."
+                    )
+                state["draft_step_state"].accumulate(draft_payload)
             state["all_mb_metrics"].append(m)
             # ``loss`` key is the un-normalized per-mb scalar; collect for
             # the global_loss aggregation at finish.
@@ -1608,15 +1789,28 @@ class MegatronPolicyWorkerImpl(
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
-        # All-reduce accumulated mask sums across DP to recover true N.
-        to_reduce = torch.stack(
+        # Policy rows are replicated across CP, while draft windows are owned by
+        # exactly one CP rank. Reduce their denominators over the corresponding
+        # replica groups without multiplying either count.
+        draft_step_state: DraftStepState = state["draft_step_state"]
+        policy_counts = torch.stack(
             [state["local_valid_seqs"], state["local_valid_toks"]]
         ).to(torch.float64)
         torch.distributed.all_reduce(
-            to_reduce, group=parallel_state.get_data_parallel_group()
+            policy_counts,
+            group=parallel_state.get_data_parallel_group(),
         )
-        global_valid_seqs = to_reduce[0]
-        global_valid_toks = to_reduce[1]
+        global_valid_seqs = policy_counts[0]
+        global_valid_toks = policy_counts[1]
+        draft_counts = draft_step_state.counts_for_reduction(policy_counts)
+        if draft_step_state.active:
+            torch.distributed.all_reduce(
+                draft_counts,
+                group=parallel_state.get_data_parallel_group(
+                    with_context_parallel=True
+                ),
+            )
+        draft_step_state.set_global_counts(draft_counts)
 
         if state["loss_type"] == LossType.TOKEN_LEVEL:
             n_true = global_valid_toks
@@ -1630,6 +1824,11 @@ class MegatronPolicyWorkerImpl(
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
         self.model.scale_gradients(inv_n)
+        if draft_step_state.active:
+            draft_step_state.correct_main_grads(
+                self.model.parameters(),
+                policy_normalization_count=n_true,
+            )
 
         # End-of-step gradient finalization, exactly once per optimizer step.
         # ``begin_train_step`` nulled ``finalize_model_grads_func`` so mcore's
@@ -1683,7 +1882,24 @@ class MegatronPolicyWorkerImpl(
 
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
+        draft_update_probe = None
+        draft_cfg = self.cfg["draft"]
+        if self.draft_model is not None and getattr(
+            draft_cfg, "update_probe_enabled", False
+        ):
+            draft_update_probe = start_draft_update_probe(self.draft_model)
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        if draft_update_probe is not None:
+            draft_update_result = finalize_draft_update_probe(
+                self.draft_model, draft_update_probe
+            )
+            require_draft_update(draft_update_result)
+            log.info(format_draft_update_probe(draft_update_result))
+
+        draft_grad_norm = None
+        if draft_step_state.active:
+            grad_norms_by_group = self.optimizer.grad_norms_by_group
+            draft_grad_norm = grad_norms_by_group.get("draft")
 
         pg_collection = get_pg_collection(self.model)
         update_successful = logical_and_across_model_parallel_group(
@@ -1694,6 +1910,9 @@ class MegatronPolicyWorkerImpl(
         )
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, mp_group=pg_collection.mp
+        )
+        draft_grad_norm = reduce_max_stat_across_model_parallel_group(
+            draft_grad_norm, mp_group=pg_collection.mp
         )
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
@@ -1787,7 +2006,11 @@ class MegatronPolicyWorkerImpl(
         for m in state["all_mb_metrics"]:
             out: dict[str, Any] = {}
             for k, v in m.items():
-                if "_min" in k or "_max" in k:
+                if k == DRAFT_STEP_PAYLOAD_KEY:
+                    continue
+                if k == "draft_loss" and draft_step_state.active:
+                    out[k] = draft_step_state.normalize_metric(v)
+                elif "_min" in k or "_max" in k:
                     out[k] = v
                 else:
                     out[k] = _scale_metric(k, v)
@@ -1815,6 +2038,8 @@ class MegatronPolicyWorkerImpl(
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
         }
+        if draft_grad_norm is not None:
+            metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
 
         # MoE aux-loss metrics: same convention as sync train() — scale
         # by the total pipeline-microbatch count accumulated across all
@@ -2388,10 +2613,15 @@ class MegatronPolicyWorkerImpl(
         ) = None
         if draft_model is not None:
             owner_draft_model = draft_model
-            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
+            draft_provider = getattr(self, "draft_provider", None)
+            if draft_provider is None:
+                raise RuntimeError("attached draft model has no training provider")
 
             def export_local_draft_weights() -> list[tuple[str, torch.Tensor]]:
-                weights = export_eagle_weights_to_hf(owner_draft_model)
+                weights = draft_provider.export_weights(owner_draft_model)
+                if not weights:
+                    raise RuntimeError("attached draft model exported no weights")
+                log.info("draft_refit_manifest=draft_count=%d", len(weights))
                 if not metadata_only:
                     return weights
                 return [

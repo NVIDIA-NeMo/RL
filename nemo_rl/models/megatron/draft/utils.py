@@ -18,7 +18,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, cast
 
 import torch
 import torch.distributed as dist
@@ -27,6 +27,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.utils import unwrap_model
 from torch import Tensor
+
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
 StateDict = dict[str, Tensor]
 CheckpointLoader = Callable[[Path], StateDict]
@@ -46,6 +48,9 @@ _HF_SNAPSHOT_ALLOW_PATTERNS = [
     "pytorch_model.bin.index.json",
 ]
 _HF_SNAPSHOT_IGNORE_PATTERNS = ["*.pt", "*.pth", "*.ckpt"]
+_DFLASH_FORBIDDEN_EXPORT_COMPONENTS = frozenset(
+    {"lm_head", "output_layer", "mask_embedding", "mask_token"}
+)
 _MODEL_LAYER_QKV_KEY_PATTERN = re.compile(
     r"^eagle_module\.decoder\.layers\.(\d+)\.self_attention\.linear_qkv\.weight$"
 )
@@ -1105,7 +1110,7 @@ def _gather_tp_weight_if_needed(
     split_axis: int | None = None,
 ) -> Tensor:
     if split_axis is None:
-        tp_group = expected_shape_or_tp_group
+        tp_group = cast(dist.ProcessGroup | None, expected_shape_or_tp_group)
         if tp_group is None or not dist.is_available() or not dist.is_initialized():
             return local_weight
 
@@ -1640,7 +1645,10 @@ def load_hf_weights_to_eagle(
         config=unwrap_model(model).config,
     )
 
-    return model.load_state_dict(new_state, strict=False)
+    return cast(
+        tuple[list[str], list[str]],
+        model.load_state_dict(new_state, strict=False),
+    )
 
 
 def _require_state_tensor(
@@ -1802,6 +1810,226 @@ def export_eagle_weights_to_hf(
     return hf_state
 
 
+def validate_dflash_export_state_dict(
+    state_dict: Mapping[str, Tensor],
+) -> None:
+    """Reject target-owned parameters from a standalone DFlash artifact."""
+    forbidden_keys = sorted(
+        key
+        for key in state_dict
+        if _DFLASH_FORBIDDEN_EXPORT_COMPONENTS.intersection(
+            component.casefold() for component in key.split(".")
+        )
+    )
+    if forbidden_keys:
+        raise ValueError(
+            "[draft] DFlash export contains target-owned parameter keys: "
+            + ", ".join(forbidden_keys)
+        )
+
+
+def _dflash_weight_layout(
+    parameter_name: str,
+    *,
+    config: Any,
+) -> tuple[tuple[int, ...], int | None]:
+    """Return the logical public shape and TP split axis for a body tensor."""
+    hidden_size = int(config.hidden_size)
+    intermediate_size = int(config.intermediate_size)
+    key_value_size = int(config.num_key_value_heads) * int(config.head_dim)
+    if parameter_name == "fc.weight":
+        return (hidden_size, hidden_size * int(config.num_target_taps)), 0
+    if parameter_name in {"hidden_norm.weight", "norm.weight"}:
+        return (hidden_size,), None
+
+    suffix = parameter_name.split(".", 2)[-1]
+    layouts: dict[str, tuple[tuple[int, ...], int | None]] = {
+        "input_layernorm.weight": ((hidden_size,), None),
+        "self_attn.q_proj.weight": ((hidden_size, hidden_size), 0),
+        "self_attn.k_proj.weight": ((key_value_size, hidden_size), 0),
+        "self_attn.v_proj.weight": ((key_value_size, hidden_size), 0),
+        "self_attn.o_proj.weight": ((hidden_size, hidden_size), 1),
+        "self_attn.q_norm.weight": ((int(config.head_dim),), None),
+        "self_attn.k_norm.weight": ((int(config.head_dim),), None),
+        "post_attention_layernorm.weight": ((hidden_size,), None),
+        "mlp.gate_proj.weight": ((intermediate_size, hidden_size), 0),
+        "mlp.up_proj.weight": ((intermediate_size, hidden_size), 0),
+        "mlp.down_proj.weight": ((hidden_size, intermediate_size), 1),
+    }
+    try:
+        return layouts[suffix]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"[draft] Unsupported DFlash body parameter '{parameter_name}'."
+        ) from exc
+
+
+def export_dflash_weights_to_hf(
+    model: torch.nn.Module,
+) -> list[tuple[str, Tensor]]:
+    """Export logical full DFlash body weights without target-owned tensors."""
+    unwrapped_model = unwrap_model(model)
+    source_state = unwrapped_model.state_dict()
+    validate_dflash_export_state_dict(source_state)
+    exported: list[tuple[str, Tensor]] = []
+    for parameter_name, tensor in source_state.items():
+        logical_shape, split_axis = _dflash_weight_layout(
+            parameter_name,
+            config=unwrapped_model.config,
+        )
+        if split_axis is not None:
+            tensor = _gather_tp_weight_if_needed(
+                tensor,
+                logical_shape,
+                split_axis=split_axis,
+            )
+        elif tuple(tensor.shape) != logical_shape:
+            raise RuntimeError(
+                f"[draft] DFlash parameter '{parameter_name}' has shape "
+                f"{tuple(tensor.shape)}, expected {logical_shape}."
+            )
+        exported.append((parameter_name, tensor))
+    return exported
+
+
+def load_hf_weights_to_dflash(
+    model: torch.nn.Module,
+    model_name: str,
+) -> tuple[list[str], list[str]]:
+    """Load an exact-schema public DFlash body checkpoint into local TP shards."""
+    if not model_name or not model_name.strip():
+        raise ValueError(
+            "load_hf_weights_to_dflash requires a non-empty model name or path."
+        )
+    raw_state = _load_checkpoint_state(model_name)
+    normalized_state = _normalize_draft_state_dict(raw_state)
+    return _load_normalized_hf_weights_to_dflash(model, normalized_state)
+
+
+def _normalize_draft_state_dict(state: Mapping[str, Tensor]) -> dict[str, Tensor]:
+    normalized: dict[str, Tensor] = {}
+    for raw_name, tensor in state.items():
+        name = raw_name
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ("module.", "draft.", "model."):
+                if name.startswith(prefix):
+                    name = name.removeprefix(prefix)
+                    changed = True
+        normalized[name] = tensor
+    return normalized
+
+
+def _load_normalized_hf_weights_to_dflash(
+    model: torch.nn.Module,
+    normalized_state: Mapping[str, Tensor],
+) -> tuple[list[str], list[str]]:
+    unwrapped_model = unwrap_model(model)
+    model_state = unwrapped_model.state_dict()
+    validate_dflash_export_state_dict(normalized_state)
+
+    mapped_state: dict[str, Tensor] = {}
+    tp_rank = _get_tp_rank()
+    for parameter_name in model_state:
+        if parameter_name not in normalized_state:
+            continue
+        _, split_axis = _dflash_weight_layout(
+            parameter_name,
+            config=unwrapped_model.config,
+        )
+        mapped_state[parameter_name] = _shard_to_local_tp(
+            parameter_name=parameter_name,
+            tensor=normalized_state[parameter_name],
+            model_state=model_state,
+            split_axis_by_parameter=(
+                {parameter_name: split_axis} if split_axis is not None else {}
+            ),
+            tp_rank=tp_rank,
+        )
+    incompatible = unwrapped_model.load_state_dict(mapped_state, strict=False)
+    unexpected_keys = sorted(set(normalized_state).difference(model_state))
+    return list(incompatible.missing_keys), unexpected_keys
+
+
+def load_hf_weights_to_dspark(
+    model: torch.nn.Module,
+    model_name: str,
+) -> tuple[list[str], list[str]]:
+    """Load an exact DSpark body/head checkpoint while excluding target weights."""
+    if not model_name or not model_name.strip():
+        raise ValueError(
+            "load_hf_weights_to_dspark requires a non-empty model name or path."
+        )
+    adapter = unwrap_model(model)
+    body = adapter.body
+    normalized = _normalize_draft_state_dict(_load_checkpoint_state(model_name))
+    body_names = set(body.state_dict())
+    body_state = {name: tensor for name, tensor in normalized.items() if name in body_names}
+    missing, _ = _load_normalized_hf_weights_to_dflash(body, body_state)
+
+    head_state = {
+        name: tensor
+        for name, tensor in normalized.items()
+        if name.startswith(("markov_head.", "confidence_head."))
+    }
+    model_state = adapter.state_dict()
+    mapped_heads: dict[str, Tensor] = {}
+    tp_rank = _get_tp_rank()
+    for name, target in model_state.items():
+        if name.startswith("body."):
+            continue
+        tensor = head_state.get(name)
+        if tensor is None:
+            missing.append(name)
+            continue
+        mapped_heads[name] = _shard_to_local_tp(
+            parameter_name=name,
+            tensor=tensor,
+            model_state=model_state,
+            split_axis_by_parameter=(
+                {name: 0} if name == "markov_head.markov_w2.weight" else {}
+            ),
+            tp_rank=tp_rank,
+        )
+    adapter.load_state_dict(mapped_heads, strict=False)
+    ignored_target_names = {"embed_tokens.weight", "lm_head.weight"}
+    expected_head_names = {
+        name for name in model_state if not name.startswith("body.")
+    }
+    consumed = body_names | expected_head_names | ignored_target_names
+    unexpected = sorted(set(normalized).difference(consumed))
+    return sorted(set(missing)), unexpected
+
+
+def export_dspark_heads_to_hf(
+    model: torch.nn.Module,
+) -> list[tuple[str, Tensor]]:
+    """Export logical DSpark heads using the names consumed by vLLM."""
+    adapter = unwrap_model(model)
+    markov_head = adapter.markov_head
+    exported = [
+        ("markov_head.markov_w1.weight", markov_head.markov_w1.weight),
+        (
+            "markov_head.markov_w2.weight",
+            _gather_tp_weight_if_needed(
+                markov_head.markov_w2.weight,
+                (markov_head.draft_vocab_size, markov_head.markov_rank),
+                split_axis=0,
+            ),
+        ),
+    ]
+    confidence_head = adapter.confidence_head
+    if confidence_head is not None:
+        exported.extend(
+            (
+                ("confidence_head.proj.weight", confidence_head.proj.weight),
+                ("confidence_head.proj.bias", confidence_head.proj.bias),
+            )
+        )
+    return exported
+
+
 def get_policy_lm_head_weight(policy_model_chunk: MegatronModule) -> torch.Tensor:
     """Return the local policy LM-head shard for draft initialization."""
     unwrapped_policy_model = unwrap_model(policy_model_chunk)
@@ -1916,12 +2144,12 @@ def register_draft_grad_norm_group() -> None:
 
 def build_draft_model(
     model_provider,
-    draft_config: dict[str, Any],
+    draft_config: Eagle3DraftConfig,
     pg_collection: ProcessGroupCollection,
     policy_model_chunk: MegatronModule,
 ) -> MegatronModule | None:
     """Build an Eagle draft model before parent mixed-precision/DDP wrapping."""
-    if not draft_config["enabled"]:
+    if not draft_config.enabled:
         return None
 
     from transformers import AutoConfig
@@ -1931,9 +2159,9 @@ def build_draft_model(
         get_eagle3_aux_hidden_state_layers,
     )
 
-    model_name = draft_config.get("model_name")
+    model_name = draft_config.model_name
     hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
-    draft_num_layers = draft_config.get("num_layers")
+    draft_num_layers = draft_config.num_layers
     config = TransformerConfig(
         normalization="RMSNorm",
         activation_func=torch.nn.functional.silu,
@@ -2004,9 +2232,7 @@ def build_draft_model(
             "eagle_aux_hidden_state_layer_ids", []
         )
     else:
-        config.eagle_aux_hidden_state_layer_ids = (
-            draft_config.get("aux_layer_indices") or []
-        )
+        config.eagle_aux_hidden_state_layer_ids = draft_config.aux_layer_indices or []
     if (
         config.use_aux_hidden_state
         and len(config.eagle_aux_hidden_state_layer_ids) == 0
