@@ -106,15 +106,16 @@ class AbstractPolicyWorker:
         )
 
     def _refit_transport_state(self, key: str) -> dict:
-        """Mutable per-transport refit state, created on first use.
+        """Return the mutable state dict for one refit transport, e.g. ``"sglang_ipc"``.
 
-        Keeps transport bookkeeping (gather groups, weight versions, engine
-        handles) out of worker constructors: no backend-conditional state, and
-        every transport initializes lazily at its first call — the same shape
-        as ``maybe_init_zmq`` on the ZMQ path.
+        Transports stash their bookkeeping here (gather groups, engine handles,
+        weight versions) instead of each backend adding fields to the worker
+        constructors. Created on first use because this base class has no
+        ``__init__`` — the same lazy shape as ``maybe_init_zmq`` on the ZMQ path.
         """
-        states = self.__dict__.setdefault("_refit_state", {})
-        return states.setdefault(key, {})
+        if not hasattr(self, "_refit_state"):
+            self._refit_state: dict[str, dict] = {}
+        return self._refit_state.setdefault(key, {})
 
     @torch.no_grad()
     @wrap_with_nvtx_name("policy_worker/connect_sglang_rollout_engines")

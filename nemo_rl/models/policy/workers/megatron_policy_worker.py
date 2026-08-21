@@ -2574,12 +2574,13 @@ class MegatronPolicyWorkerImpl(
             sglang_quantization_cfg=sglang_quantization_cfg,
             buffer_size_bytes=buffer_size_bytes,
         )
-        # ``send_hf_buckets_via_ipc_actor_impl`` tracks the weight version in
-        # ``worker_state``, same as the DTensor path.
+        state = self._refit_transport_state("sglang_ipc")
+        state["weight_version"] = state.get("weight_version", 0) + 1
         send_hf_buckets_via_ipc_actor_impl(
             bucket_iterator=bucket_iter,
             rollout_engines=list(rollout_engines),
-            worker_state=self._refit_transport_state("sglang_ipc"),
+            worker_state=state,
+            weight_version=state["weight_version"],
         )
 
     @torch.no_grad()
