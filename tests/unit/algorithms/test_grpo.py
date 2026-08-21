@@ -4163,6 +4163,54 @@ def _enter_stop_test_mocks(
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_trainers_allow_opd_metrics_without_pg_diagnostics(
+    mock_grpo_components, train_func, capsys
+):
+    """OPD losses need not report policy-ratio diagnostics used by GRPO."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+
+    all_mb_metrics = mock_grpo_components["policy"].train.return_value[
+        "all_mb_metrics"
+    ]
+    all_mb_metrics.pop("gen_kl_error")
+    all_mb_metrics.pop("token_mult_prob_error")
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    with ExitStack() as stack:
+        _enter_stop_test_mocks(
+            stack,
+            train_func,
+            master_config,
+            mock_grpo_components,
+            mock_batch,
+            mock_rollout_metrics,
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert "Generation KL Error" not in capsys.readouterr().out
+    mock_grpo_components["logger"].log_plot_token_mult_prob_error.assert_not_called()
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
 def test_training_stops_at_validation_threshold(mock_grpo_components, train_func):
     """All three trainers stop early once the stop metric reaches the threshold."""
     master_config = mock_grpo_components["master_config"]
