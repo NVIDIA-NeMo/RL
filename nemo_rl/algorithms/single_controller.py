@@ -2460,6 +2460,9 @@ class SingleControllerActor:
             version_during_step = self._trainer_version
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
+            # Trajectory age, in trainer versions, of every group this step trains
+            # on. Accumulated across selects: a step is assembled from several.
+            step_trajectory_ages: list[int] = []
             min_sample_version = None
             step_open = False
             chunks_dispatched = 0
@@ -2563,6 +2566,15 @@ class SingleControllerActor:
                                 "returning batch metadata: "
                                 f"{sorted(new_training_claim_ids)!r}"
                             )
+                        # getattr, not a Protocol member: a sampler loaded by FQN
+                        # from outside this repo need not provide it, and then
+                        # simply reports no staleness.
+                        step_trajectory_ages.extend(
+                            getattr(
+                                self._sampler, "last_selection_trajectory_ages", None
+                            )
+                            or ()
+                        )
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
@@ -2966,6 +2978,18 @@ class SingleControllerActor:
                             )
                 self._retune_lookahead_versions()
                 self._rollout_manager.set_weight_version(self._trainer_version)
+                if step_trajectory_ages:
+                    # Keep the pre-SC async GRPO metric name so both paths can be
+                    # compared on one dashboard. The max exposes the long tail
+                    # that ready_first permits but eviction counters cannot show.
+                    step_metrics.update(
+                        {
+                            "avg_trajectory_age": (
+                                sum(step_trajectory_ages) / len(step_trajectory_ages)
+                            ),
+                            "max_trajectory_age": max(step_trajectory_ages),
+                        }
+                    )
                 step_metrics.update(
                     {
                         "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
