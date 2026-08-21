@@ -93,6 +93,7 @@ from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
     backfill_missing_routed_experts,
+    get_nemo_gym_pad_dynamic_image_shapes,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -2844,10 +2845,8 @@ def grpo_train(
                         attach_initial_nemo_gym_image_payloads(
                             batch,
                             processor,
-                            pad_dynamic_image_shapes=bool(
-                                master_config.env.get("nemo_gym", {}).get(
-                                    "pad_dynamic_image_shapes", False
-                                )
+                            pad_dynamic_image_shapes=(
+                                get_nemo_gym_pad_dynamic_image_shapes(master_config.env)
                             ),
                         )
                     # Repeat batch items
@@ -3876,10 +3875,8 @@ def validate(
                     attach_initial_nemo_gym_image_payloads(
                         val_batch,
                         processor,
-                        pad_dynamic_image_shapes=bool(
-                            master_config.env.get("nemo_gym", {}).get(
-                                "pad_dynamic_image_shapes", False
-                            )
+                        pad_dynamic_image_shapes=(
+                            get_nemo_gym_pad_dynamic_image_shapes(master_config.env)
                         ),
                     )
                 generation_config = master_config.policy["generation"]

@@ -1782,6 +1782,14 @@ def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
     return list(DEFAULT_THINKING_TAGS)
 
 
+def get_nemo_gym_pad_dynamic_image_shapes(env_config: dict[str, Any]) -> bool:
+    """Return whether NeMo Gym should pad heterogeneous image shapes."""
+    nemo_gym_config = env_config.get("nemo_gym")
+    if isinstance(nemo_gym_config, dict):
+        return bool(nemo_gym_config.get("pad_dynamic_image_shapes"))
+    return False
+
+
 def should_mask_flagged_samples(env_config: dict[str, Any]) -> bool:
     """Read ``env.should_mask_flagged_samples``; absent means True.
 

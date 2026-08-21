@@ -135,6 +135,24 @@ def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch):
     assert calls[0][3] is True
     assert batch["message_log"][0][0]["pixel_values"] is attached
 
+    default_batch = _initial_gym_image_batch()
+    rollouts_mod.attach_initial_nemo_gym_image_payloads(default_batch, processor)
+    assert len(calls) == 2
+    assert calls[1][3] is False
+
+
+@pytest.mark.parametrize(
+    ("env_config", "expected"),
+    [
+        ({}, False),
+        ({"nemo_gym": {}}, False),
+        ({"nemo_gym": {"pad_dynamic_image_shapes": False}}, False),
+        ({"nemo_gym": {"pad_dynamic_image_shapes": True}}, True),
+    ],
+)
+def test_get_nemo_gym_pad_dynamic_image_shapes(env_config, expected):
+    assert rollouts_mod.get_nemo_gym_pad_dynamic_image_shapes(env_config) is expected
+
 
 def test_attach_initial_nemo_gym_image_payloads_requires_processor():
     batch = _initial_gym_image_batch()
