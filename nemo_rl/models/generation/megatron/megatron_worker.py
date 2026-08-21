@@ -37,11 +37,7 @@ from megatron.core.resharding.refit import (
 )
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import InferenceCudaGraphScope
-from megatron.core.transformer.utils import (
-    init_cuda_graph_cache,
-    toggle_cuda_graphs,
-    transition_moe_cudagraphs,
-)
+from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.utils import unwrap_model
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -60,79 +56,6 @@ from nemo_rl.models.megatron.memory_saver import (
     resume_inference_weights,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-
-
-def _invalidate_cuda_graph_attr_cache(model: torch.nn.Module) -> None:
-    """Drop cached CUDA-graph module lists so newly created managers are visible."""
-    import megatron.core.transformer.utils as cg_utils
-
-    model_id = id(model)
-    if cg_utils.cuda_graph_attr_cache is not None:
-        cg_utils.cuda_graph_attr_cache.pop(model_id, None)
-
-
-def _ensure_inference_cuda_graph_managers(
-    lang_module: torch.nn.Module, mcore_generation_config: dict
-) -> None:
-    """Attach block/layer CudaGraphManager instances for colocated inference.
-
-    Colocated policies are built with ``megatron_cfg.cuda_graph_impl=none`` (train
-    path). ``toggle_cuda_graphs('local')`` only restores managers that existed at
-    model init, so without this hook warmup/decoding stay on the eager path even
-    though the dynamic engine reports graph buckets.
-    """
-    cuda_graph_impl = mcore_generation_config.get("cuda_graph_impl", "none")
-    if cuda_graph_impl == "none":
-        return
-
-    from megatron.core.transformer.cuda_graphs import CudaGraphManager
-    from megatron.core.transformer.transformer_block import TransformerBlock
-    from megatron.core.transformer.transformer_layer import (
-        MoETransformerLayer,
-        TransformerLayer,
-    )
-
-    config = lang_module.config
-    config.cuda_graph_impl = cuda_graph_impl
-    config.cuda_graph_modules = []
-
-    scope_name = mcore_generation_config.get("inference_cuda_graph_scope", "block")
-    scope = InferenceCudaGraphScope[scope_name]
-    config.inference_cuda_graph_scope = scope
-
-    if scope == InferenceCudaGraphScope.block:
-        for module in lang_module.modules():
-            if isinstance(module, TransformerBlock) and not hasattr(
-                module, "cudagraph_manager"
-            ):
-                module.cudagraph_manager = CudaGraphManager(config)
-        # Block-scope graphs capture the whole TransformerBlock; MoE layers
-        # intentionally skip per-layer managers (see create_mcore_cudagraph_manager).
-        # transition_cudagraph_scope('full') asserts layer cudagraph_manager exists.
-        for module in lang_module.modules():
-            if isinstance(module, MoETransformerLayer):
-                module.use_partial_cudagraphs = False
-                module.mlp.fwd_execution_map = [
-                    "route",
-                    "expert_compute",
-                    "postprocess",
-                ]
-    elif scope == InferenceCudaGraphScope.layer:
-        for module in lang_module.modules():
-            if (
-                isinstance(module, TransformerLayer)
-                and hasattr(module, "create_mcore_cudagraph_manager")
-                and not hasattr(module, "cudagraph_manager")
-            ):
-                module.create_mcore_cudagraph_manager(config)
-
-        if any(
-            isinstance(module, MoETransformerLayer) for module in lang_module.modules()
-        ):
-            transition_moe_cudagraphs(lang_module, "full")
-
-    _invalidate_cuda_graph_attr_cache(lang_module)
-    init_cuda_graph_cache(lang_module)
 
 
 class MegatronGenerationMixin:
@@ -558,7 +481,6 @@ class MegatronGenerationMixin:
             ]
             if cuda_graph_impl != "none":
                 toggle_cuda_graphs(lang_module, set_to="none")
-                _invalidate_cuda_graph_attr_cache(lang_module)
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
         if rotary_module is not None and hasattr(
@@ -637,7 +559,6 @@ class MegatronGenerationMixin:
 
         cuda_graph_impl = mcore_generation_config["cuda_graph_impl"]
         if cuda_graph_impl != "none":
-            _ensure_inference_cuda_graph_managers(lang_module, mcore_generation_config)
             toggle_cuda_graphs(lang_module, set_to=cuda_graph_impl)
 
         # tags=["weights"] means we are inside refit_policy_generation between
