@@ -157,6 +157,29 @@ REFIT_TIMEOUT_S=${REFIT_TIMEOUT_S:-60}
 # worker parks at the top of its receive, the victim is killed there, and removing the
 # file lets the survivors walk into a collective the victim will never join.
 KILL_DURING_REFIT=${KILL_DURING_REFIT:-false}
+
+# FREEZE_VICTIM: SIGSTOP the victim instead of SIGKILL, so it stays alive and simply
+# stops participating.
+#
+# This is the only way to reach the refit watchdog. Job 6405953 ran both
+# KILL_DURING_REFIT variants green and never once produced a RefitAborted: SIGKILL makes
+# Ray notice within milliseconds, ActorDiedError reaches _sync_weights first, and the
+# recovery runs off that instead. The deadline was armed at 60s the whole time and never
+# fired. So those runs exercise the actor-death path -- worth having -- but say nothing
+# about the abort path.
+#
+# A stopped process is exactly the case the abort exists for, and the one the failure
+# message names: "a rank that is alive but not participating". Ray sees a healthy actor,
+# NCCL waits forever, and only refit_timeout_s can break it. Requires
+# KILL_DURING_REFIT=true, since freezing a shard at a step boundary just makes it look
+# slow until the probe condemns it -- a different path again.
+FREEZE_VICTIM=${FREEZE_VICTIM:-false}
+if [[ "$FREEZE_VICTIM" == "true" && "$KILL_DURING_REFIT" != "true" ]]; then
+    echo "[recovery] FATAL: FREEZE_VICTIM=true requires KILL_DURING_REFIT=true; freezing"
+    echo "[recovery] a shard outside a refit never reaches the abort path."
+    exit 1
+fi
+
 HOLD_FILE="$EXP_DIR/hold_refit"
 rm -f "$HOLD_FILE"
 
@@ -204,6 +227,10 @@ cleanup() {
     # Before anything else: a hold file surviving this run would park the next run's
     # refits until NRL_REFIT_HOLD_MAX_S, which reads as a hang with no visible cause.
     rm -f "$HOLD_FILE" 2>/dev/null || true
+    # SIGCONT first: a SIGSTOPped process cannot be reaped and ignores SIGKILL until it
+    # is scheduled again, so a frozen victim would survive this cleanup holding its share
+    # of device memory and fail the next test for the wrong reason.
+    [[ -n "${VICTIM:-}" ]] && kill -CONT "$VICTIM" 2>/dev/null || true
     kill -9 $TRAIN_PID 2>/dev/null || true
     # vLLM runs the engine in a VLLM::EngineCore child that outlives its parent actor;
     # leaving it behind holds tens of GB and makes the next run fail for the wrong reason.
@@ -329,12 +356,28 @@ fi
 
 VICTIM=${GEN_PIDS[0]}
 VICTIM_CMD=$(tr '\0' ' ' < "/proc/$VICTIM/cmdline" 2>/dev/null | sed -E 's/ +$//')
-echo "[recovery] killing generation shard pid=$VICTIM of ${#GEN_PIDS[@]}: $VICTIM_CMD"
-kill -9 "$VICTIM"
-sleep 2
-if kill -0 "$VICTIM" 2>/dev/null; then
-    echo "[recovery] FAIL: victim $VICTIM survived SIGKILL; nothing was actually killed"
-    exit 1
+if [[ "$FREEZE_VICTIM" == "true" ]]; then
+    echo "[recovery] freezing generation shard pid=$VICTIM of ${#GEN_PIDS[@]}: $VICTIM_CMD"
+    kill -STOP "$VICTIM"
+    sleep 2
+    # State T in field 3 of /proc/PID/stat is the only proof it actually stopped. `kill -0`
+    # succeeds for a running process too, so it cannot tell the two apart -- and a victim
+    # that kept running would make this test silently assert nothing.
+    VICTIM_STATE=$(awk '{print $3}' "/proc/$VICTIM/stat" 2>/dev/null || echo "gone")
+    if [[ "$VICTIM_STATE" != "T" ]]; then
+        echo "[recovery] FAIL: victim $VICTIM is in state '$VICTIM_STATE', expected T (stopped)."
+        echo "[recovery] Without a genuinely frozen rank the collective never stalls and the"
+        echo "[recovery] refit deadline has nothing to fire on."
+        exit 1
+    fi
+else
+    echo "[recovery] killing generation shard pid=$VICTIM of ${#GEN_PIDS[@]}: $VICTIM_CMD"
+    kill -9 "$VICTIM"
+    sleep 2
+    if kill -0 "$VICTIM" 2>/dev/null; then
+        echo "[recovery] FAIL: victim $VICTIM survived SIGKILL; nothing was actually killed"
+        exit 1
+    fi
 fi
 # Release the survivors into a collective the victim will never join. Removed only after
 # the kill is confirmed: dropping it earlier would let them enter the receive alongside a
@@ -403,9 +446,40 @@ if ! grep -Eq "$REBUILD_RE" "$RUN_LOG"; then
 fi
 echo "[recovery] rebuild observed:"; grep -E "$REBUILD_RE" "$RUN_LOG" | head -3
 
+# The whole point of the frozen variant: prove the deadline fired, not merely that the
+# run survived. Job 6405953 passed both KILL_DURING_REFIT variants with RefitAborted
+# appearing exactly zero times -- ActorDiedError won the race every time and the abort
+# path went untested while four green ticks implied otherwise. A frozen rank cannot
+# produce ActorDiedError, so if RefitAborted is still absent here the watchdog did not
+# fire and this variant is testing nothing.
+if [[ "$FREEZE_VICTIM" == "true" ]]; then
+    if ! grep -q "RefitAborted" "$RUN_LOG"; then
+        echo "[recovery] FAIL: the run survived, but no RefitAborted appears in the log."
+        echo "[recovery] A frozen rank cannot die, so recovery must have come from the"
+        echo "[recovery] watchdog -- its absence means the deadline never fired and the"
+        echo "[recovery] abort path is still unexercised. Check refit_timeout_s"
+        echo "[recovery] (=${REFIT_TIMEOUT_S}s) against how long a refit actually takes."
+        grep -E "refit|abort|deadline|fleet" "$RUN_LOG" | tail -20
+        exit 1
+    fi
+    echo "[recovery] abort observed:"; grep -m3 "RefitAborted" "$RUN_LOG"
+    # The victim was never killed, so it must still be there -- stopped. If it is gone,
+    # something else reaped it and this was the actor-death path after all.
+    if [[ "$(awk '{print $3}' "/proc/$VICTIM/stat" 2>/dev/null || echo gone)" == "gone" ]]; then
+        echo "[recovery] FAIL: the frozen victim disappeared; it was not the frozen-rank"
+        echo "[recovery] scenario that recovered, so the result does not mean what it says."
+        exit 1
+    fi
+    echo "[recovery] victim $VICTIM still present and frozen -- recovery came from the deadline"
+fi
+
 uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 uv run tests/check_metrics.py "$JSON_METRICS" \
     "len(data[\"train/reward\"]) == $MAX_STEPS" \
     'max(data["train/reward"]) > 0'
 
-echo "[recovery] PASS: survived a shard loss and completed all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT)"
+if [[ "$FREEZE_VICTIM" == "true" ]]; then
+    echo "[recovery] PASS: the refit deadline broke a stalled collective and the run finished all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT)"
+else
+    echo "[recovery] PASS: survived a shard loss and completed all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT)"
+fi
