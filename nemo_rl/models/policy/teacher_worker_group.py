@@ -30,6 +30,10 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.opd import TeacherPrecision, TeacherResourceConfig
+from nemo_rl.algorithms.opd_packed import (
+    OPD_TEACHER_TOPK_PACKED_KEY,
+    resolve_packed_field,
+)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     SequencePackingArgs,
@@ -436,7 +440,12 @@ class TeacherWorkerGroup:
         k: int,
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[TopkLogprobsOutputSpec]:
-        """Return target logprobs and teacher-selected support in one forward."""
+        """Return target logprobs and teacher-selected support in one forward.
+
+        With sequence packing, the heavy support tensors remain in per-sample
+        Ray objects emitted by the Megatron workers. Only the small target
+        logprobs are reconstructed here.
+        """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         mbs = micro_batch_size or self._micro_batch_size
         if self.use_sequence_packing:
@@ -472,19 +481,67 @@ class TeacherWorkerGroup:
             },
         )
         worker_batches = self.worker_group.get_all_worker_results(futures)
-        result = BatchedDataDict[TopkLogprobsOutputSpec](
-            {
-                "reference_logprobs": torch.cat(
-                    [batch["logprobs"] for batch in worker_batches], dim=0
-                ).cpu(),
-                "topk_indices": torch.cat(
-                    [batch["topk_indices"] for batch in worker_batches], dim=0
-                ).cpu(),
-                "topk_logprobs": torch.cat(
-                    [batch["topk_logprobs"] for batch in worker_batches], dim=0
-                ).cpu(),
-            }
-        )
+        if self.use_sequence_packing:
+            if not all(
+                isinstance(batch, dict) and "per_sample_refs" in batch
+                for batch in worker_batches
+            ):
+                raise RuntimeError(
+                    "Packed teacher top-k workers must return per-sample refs."
+                )
+            unpacked_seq_length = int(data["input_ids"].shape[1])
+            for worker_idx, batch in enumerate(worker_batches):
+                worker_seq_length = int(batch["unpacked_seq_length"])
+                if worker_seq_length != unpacked_seq_length:
+                    raise ValueError(
+                        "Packed teacher workers disagree on unpacked sequence "
+                        f"length: worker {worker_idx} returned "
+                        f"{worker_seq_length}, expected {unpacked_seq_length}."
+                    )
+            flat_refs = [
+                entry for batch in worker_batches for entry in batch["per_sample_refs"]
+            ]
+            if len(flat_refs) != data.size:
+                raise ValueError(
+                    "Packed teacher top-k returned an unexpected number of rows: "
+                    f"got {len(flat_refs)}, expected {data.size}."
+                )
+
+            target_tensors = resolve_packed_field(flat_refs, "target_logprobs")
+            target_dtype = target_tensors[0].dtype if target_tensors else torch.float32
+            reference_logprobs = torch.zeros((len(flat_refs), unpacked_seq_length), dtype=target_dtype)
+            for sample_idx, (entry, target_logprobs) in enumerate(zip(flat_refs, target_tensors)):
+                seq_len = int(entry["seq_len"])
+                if tuple(target_logprobs.shape) != (seq_len,):
+                    raise ValueError(
+                        f"Packed target_logprobs sample {sample_idx} has shape "
+                        f"{tuple(target_logprobs.shape)}, expected {(seq_len,)}."
+                    )
+                if seq_len > max(unpacked_seq_length - 1, 0):
+                    raise ValueError(
+                        f"Packed target_logprobs sample {sample_idx} has "
+                        f"seq_len={seq_len}, larger than the available next-token "
+                        f"width {max(unpacked_seq_length - 1, 0)}."
+                    )
+                if seq_len:
+                    reference_logprobs[sample_idx, 1 : 1 + seq_len].copy_(target_logprobs)
+                entry.pop("target_logprobs", None)
+                entry.pop("target_logprobs_ref", None)
+
+            result = BatchedDataDict[TopkLogprobsOutputSpec](
+                {
+                    "reference_logprobs": reference_logprobs,
+                    OPD_TEACHER_TOPK_PACKED_KEY: flat_refs,
+                }
+            )
+        else:
+            result = BatchedDataDict[TopkLogprobsOutputSpec](
+                {
+                    "reference_logprobs": torch.cat([batch["logprobs"] for batch in worker_batches], dim=0).cpu(),
+                    "topk_indices": torch.cat([batch["topk_indices"] for batch in worker_batches], dim=0).cpu(),
+                    "topk_logprobs": torch.cat([batch["topk_logprobs"] for batch in worker_batches], dim=0).cpu(),
+                }
+            )
         if unsorted_data_indices is not None:
             result.reorder_data(unsorted_data_indices)
         return result

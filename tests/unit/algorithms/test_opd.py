@@ -22,6 +22,7 @@ from nemo_rl.algorithms.opd import (
     get_topk_support_config,
     topk_reverse_kl_loss,
 )
+from nemo_rl.algorithms.opd_packed import OPD_TEACHER_TOPK_PACKED_KEY
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -190,6 +191,7 @@ class _MockTeacherWorkerGroup:
 
     def get_topk_logprobs(self, data, k):
         input_ids = data["input_ids"]
+        input_lengths = data["input_lengths"]
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         assert input_ids.shape[0] % dp_size == 0
         offsets = torch.arange(k).view(1, 1, k)
@@ -199,13 +201,23 @@ class _MockTeacherWorkerGroup:
         )
         if self._include_input_ids:
             topk_logprobs = topk_logprobs + input_ids.unsqueeze(-1)
+        packed = []
+        for sample_idx, input_length in enumerate(input_lengths.tolist()):
+            seq_len = max(int(input_length) - 1, 0)
+            packed.append(
+                {
+                    "seq_len": seq_len,
+                    "topk": k,
+                    "topk_indices": topk_indices[sample_idx, :seq_len].to(torch.int32),
+                    "topk_logprobs": topk_logprobs[sample_idx, :seq_len],
+                }
+            )
         return BatchedDataDict(
             {
                 "reference_logprobs": torch.full(
                     input_ids.shape, self._fill_value, dtype=torch.float32
                 ),
-                "topk_indices": topk_indices,
-                "topk_logprobs": topk_logprobs,
+                OPD_TEACHER_TOPK_PACKED_KEY: packed,
             }
         )
 
@@ -496,7 +508,7 @@ def test_compute_teacher_topk_logprobs_routes_and_trims_dp_padding():
     input_ids = torch.arange(15).reshape(3, 5)
     agent_refs = [{"name": "math"}, {"name": "code"}, {"name": "math"}]
 
-    target_logprobs, indices, logprobs, _ = collector._compute_teacher_topk_logprobs(
+    target_logprobs, packed, _ = collector._compute_teacher_topk_logprobs(
         input_ids,
         topk=2,
         agent_refs=agent_refs,
@@ -504,19 +516,28 @@ def test_compute_teacher_topk_logprobs_routes_and_trims_dp_padding():
     )
 
     expected_indices = input_ids.unsqueeze(-1) * 10 + torch.arange(2).view(1, 1, 2)
-    torch.testing.assert_close(indices, expected_indices)
+    assert [entry["seq_len"] for entry in packed] == [4, 3, 2]
+    for sample_idx, entry in enumerate(packed):
+        seq_len = entry["seq_len"]
+        torch.testing.assert_close(
+            entry["topk_indices"],
+            expected_indices[sample_idx, :seq_len].to(torch.int32),
+        )
     torch.testing.assert_close(
         target_logprobs,
         torch.tensor([[-1.0] * 5, [-2.0] * 5, [-1.0] * 5]),
     )
     torch.testing.assert_close(
-        logprobs[0], input_ids[0].unsqueeze(-1).expand(-1, 2) - 1.0
+        packed[0]["topk_logprobs"],
+        input_ids[0, :4].unsqueeze(-1).expand(-1, 2) - 1.0,
     )
     torch.testing.assert_close(
-        logprobs[1], input_ids[1].unsqueeze(-1).expand(-1, 2) - 2.0
+        packed[1]["topk_logprobs"],
+        input_ids[1, :3].unsqueeze(-1).expand(-1, 2) - 2.0,
     )
     torch.testing.assert_close(
-        logprobs[2], input_ids[2].unsqueeze(-1).expand(-1, 2) - 1.0
+        packed[2]["topk_logprobs"],
+        input_ids[2, :2].unsqueeze(-1).expand(-1, 2) - 1.0,
     )
 
 
@@ -1062,6 +1083,26 @@ def test_attach_teacher_topk_from_replay_validates_pads_and_assigns_support():
     torch.testing.assert_close(padded_indices[:, 2:], torch.zeros(1, 2, 2).long())
     torch.testing.assert_close(padded_logprobs[:, :2], logprobs)
     torch.testing.assert_close(padded_logprobs[:, 2:], torch.zeros(1, 2, 2))
+
+    packed = [
+        {
+            "seq_len": 2,
+            "topk": 2,
+            "topk_indices": indices[0],
+            "topk_logprobs": logprobs[0],
+        }
+    ]
+    packed_train_data = BatchedDataDict(
+        {"input_ids": torch.ones(1, 4, dtype=torch.long)}
+    )
+    _attach_teacher_topk_from_replay(
+        train_data=packed_train_data,
+        support_indices=None,
+        support_logprobs=None,
+        packed_support=packed,
+    )
+    assert packed_train_data[OPD_TEACHER_TOPK_PACKED_KEY] is packed
+    assert "opd_support_indices" not in packed_train_data
 
     with pytest.raises(ValueError, match="collection-time teacher support"):
         _attach_teacher_topk_from_replay(

@@ -438,6 +438,7 @@ def test_get_topk_logprobs_routes_shards_and_preserves_worker_order():
 
 
 def test_get_topk_logprobs_packs_and_restores_original_order():
+    from nemo_rl.algorithms.opd_packed import OPD_TEACHER_TOPK_PACKED_KEY
     from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
 
     teacher = object.__new__(TeacherWorkerGroup)
@@ -459,22 +460,41 @@ def test_get_topk_logprobs_packs_and_restores_original_order():
     teacher.worker_group.run_all_workers_sharded_data.return_value = ["future"]
     sorted_indices = torch.tensor([[[10, 11]], [[20, 21]]])
     sorted_support = torch.tensor([[[-1.0, -2.0]], [[-3.0, -4.0]]])
-    sorted_targets = torch.tensor([[-0.1], [-0.2]])
+    sorted_targets = [torch.tensor([-0.1]), torch.tensor([-0.2])]
+    sorted_entries = [
+        {
+            "seq_len": 1,
+            "topk": 2,
+            "topk_indices": sorted_indices[i],
+            "topk_logprobs": sorted_support[i],
+            "target_logprobs": sorted_targets[i],
+        }
+        for i in range(2)
+    ]
     teacher.worker_group.get_all_worker_results.return_value = [
         {
-            "logprobs": sorted_targets,
-            "topk_indices": sorted_indices,
-            "topk_logprobs": sorted_support,
+            "per_sample_refs": sorted_entries,
+            "unpacked_seq_length": 2,
         }
     ]
     data = MagicMock()
+    data.size = 2
+    data.__getitem__.side_effect = lambda key: (
+        torch.zeros(2, 2, dtype=torch.long)
+        if key == "input_ids"
+        else torch.ones(2, dtype=torch.long)
+    )
     data.shard_by_batch_size.return_value = (["packed_shard"], [1, 0])
 
     result = teacher.get_topk_logprobs(data, k=2)
 
-    torch.testing.assert_close(result["topk_indices"], sorted_indices.flip(0))
-    torch.testing.assert_close(result["topk_logprobs"], sorted_support.flip(0))
-    torch.testing.assert_close(result["reference_logprobs"], sorted_targets.flip(0))
+    packed = result[OPD_TEACHER_TOPK_PACKED_KEY]
+    torch.testing.assert_close(packed[0]["topk_indices"], sorted_indices[1])
+    torch.testing.assert_close(packed[1]["topk_indices"], sorted_indices[0])
+    torch.testing.assert_close(
+        result["reference_logprobs"],
+        torch.tensor([[0.0, -0.2], [0.0, -0.1]]),
+    )
     assert teacher.sequence_packing_args["max_tokens_per_microbatch"] == 128
     data.shard_by_batch_size.assert_called_once_with(
         1,

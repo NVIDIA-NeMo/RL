@@ -1413,6 +1413,13 @@ class TestTopkLogitsPostProcessor:
                 "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
                 return_value=0,
             ),
+            patch(
+                "nemo_rl.models.megatron.train.get_context_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "nemo_rl.models.megatron.train.ray.put", side_effect=lambda value: value
+            ),
             patch("torch.distributed.get_world_size", return_value=1),
             patch("torch.distributed.all_gather", side_effect=local_all_gather),
             patch(
@@ -1445,15 +1452,22 @@ class TestTopkLogitsPostProcessor:
         )
         assert gather_selected.call_args.kwargs["chunk_size"] == 2
 
-        for sample_idx, seq_len in enumerate(input_lengths.tolist()):
-            for key in ("topk_logits", "topk_indices", "topk_logprobs"):
-                torch.testing.assert_close(
-                    packed[key][sample_idx, :seq_len],
-                    unpacked[key][sample_idx, :seq_len],
-                )
+        assert len(packed["per_sample_refs"]) == len(input_lengths)
+        for sample_idx, input_len in enumerate(input_lengths.tolist()):
+            seq_len = input_len - 1
+            entry = packed["per_sample_refs"][sample_idx]
+            assert entry["seq_len"] == seq_len
             torch.testing.assert_close(
-                packed["logprobs"][sample_idx, :seq_len],
-                unpacked["logprobs"][sample_idx, :seq_len],
+                entry["topk_indices_ref"],
+                unpacked["topk_indices"][sample_idx, :seq_len].to(torch.int32),
+            )
+            torch.testing.assert_close(
+                entry["topk_logprobs_ref"],
+                unpacked["topk_logprobs"][sample_idx, :seq_len],
+            )
+            torch.testing.assert_close(
+                entry["target_logprobs_ref"],
+                unpacked["logprobs"][sample_idx, 1:input_len],
             )
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
@@ -1612,25 +1626,28 @@ class TestTopkLogitsPostProcessor:
                 return_value=selected_logprobs,
             ) as gather_selected,
             patch(
-                "nemo_rl.models.megatron.train.torch.distributed.get_rank",
+                "nemo_rl.models.megatron.train.get_context_parallel_rank",
                 return_value=0,
+            ),
+            patch(
+                "nemo_rl.models.megatron.train.ray.put", side_effect=lambda value: value
             ),
         ):
             loss, result = wrapped_fn(output_tensor)
 
         # Verify allgather was called for logits and indices.
         assert mock_allgather.call_count == 2
-        assert "topk_logits" in result
-        assert "topk_indices" in result
-        assert "topk_logprobs" in result
-        assert "logprobs" in result
-        # Output should be unpacked: (batch_size=1, unpacked_seqlen=8, k=3)
-        assert result["topk_logits"].shape == (1, 8, k)
-        assert result["topk_indices"].shape == (1, 8, k)
-        torch.testing.assert_close(result["topk_logprobs"], selected_logprobs[..., :k])
+        assert len(result["per_sample_refs"]) == 1
+        entry = result["per_sample_refs"][0]
+        assert entry["seq_len"] == seq_len - 1
         torch.testing.assert_close(
-            result["logprobs"],
-            torch.cat([torch.zeros(1, 1), selected_logprobs[:, :-1, k]], dim=1),
+            entry["topk_indices_ref"], gathered_idx[0, :-1].to(torch.int32)
+        )
+        torch.testing.assert_close(
+            entry["topk_logprobs_ref"], selected_logprobs[0, :-1, :k]
+        )
+        torch.testing.assert_close(
+            entry["target_logprobs_ref"], selected_logprobs[0, :-1, k]
         )
         assert gather_selected.call_args.kwargs["chunk_size"] == 2
         torch.testing.assert_close(

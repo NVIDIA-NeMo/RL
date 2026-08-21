@@ -17,11 +17,13 @@ from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
+import ray
 import torch
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
+    get_context_parallel_rank,
     get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -706,7 +708,7 @@ class TopkLogitsPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         cu_seqlens_padded: torch.Tensor,
-    ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+    ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a post-processing function that computes top-k logits and indices.
 
         This function returns a processor that extracts the top-k highest logits
@@ -719,9 +721,10 @@ class TopkLogitsPostProcessor:
 
         Returns:
             Callable: Function that takes output tensor and returns a dummy loss
-            plus top-k logits/indices. With ``return_logprobs=True``, the result
-            also contains normalized ``topk_logprobs`` and sampled-token
-            ``logprobs``.
+            plus top-k logits/indices. With ``return_logprobs=True``, non-packed
+            output also contains normalized ``topk_logprobs`` and sampled-token
+            ``logprobs``. Packed output instead contains per-sample object refs
+            for unpadded indices, support logprobs, and target logprobs.
 
         Raises:
             RuntimeError: If context parallelism is enabled without packing.
@@ -867,6 +870,53 @@ class TopkLogitsPostProcessor:
             else:
                 topk_vals_full = topk_vals_local
                 topk_idx_full = topk_idx_local
+
+            if pack and self.return_logprobs:
+                # Keep the heavy teacher support out of the driver. Only one
+                # TP x CP rank publishes each sample's unpadded next-token
+                # slices; the student training workers resolve these refs one
+                # microbatch at a time.
+                assert support_logprobs_full is not None
+                assert target_logprobs_full is not None
+                per_sample_refs: list[dict[str, Any]] = []
+                is_emitter = (
+                    get_tensor_model_parallel_rank() == 0
+                    and get_context_parallel_rank() == 0
+                )
+                if is_emitter:
+                    for sample_idx in range(data_dict["input_ids"].shape[0]):
+                        input_length = min(int(seq_lengths[sample_idx].item()), unpacked_seqlen)
+                        next_token_length = max(input_length - 1, 0)
+                        start_idx = int(cu_seqlens_padded[sample_idx].item())
+                        end_idx = start_idx + next_token_length
+                        indices = (
+                            topk_idx_full[0, start_idx:end_idx]
+                            .detach()
+                            .to(device="cpu", dtype=torch.int32)
+                            .contiguous()
+                        )
+                        support_logprobs = (
+                            support_logprobs_full[0, start_idx:end_idx]
+                            .detach()
+                            .cpu()
+                            .contiguous()
+                        )
+                        target_logprobs = (
+                            target_logprobs_full[0, start_idx:end_idx]
+                            .detach()
+                            .cpu()
+                            .contiguous()
+                        )
+                        per_sample_refs.append(
+                            {
+                                "seq_len": next_token_length,
+                                "topk": int(self.k),
+                                "topk_indices_ref": ray.put(indices),
+                                "topk_logprobs_ref": ray.put(support_logprobs),
+                                "target_logprobs_ref": ray.put(target_logprobs),
+                            }
+                        )
+                return output_tensor.new_zeros(()), {"per_sample_refs": per_sample_refs}
 
             if pack:
                 batch_size = data_dict["input_ids"].shape[0]

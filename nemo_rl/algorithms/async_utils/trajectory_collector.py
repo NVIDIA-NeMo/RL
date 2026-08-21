@@ -29,6 +29,10 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_multiple
+from nemo_rl.algorithms.opd_packed import (
+    OPD_TEACHER_TOPK_PACKED_KEY,
+    pack_teacher_topk_for_replay,
+)
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -960,11 +964,13 @@ class AsyncTrajectoryCollector:
         agent_refs: list[dict[str, Any]],
         input_lengths: Optional[torch.Tensor] = None,
         multimodal_data: Optional[dict[str, Any]] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
-        """Route one-pass teacher target/top-k inference and restore batch order.
+    ) -> tuple[torch.Tensor, list[dict[str, Any]], float]:
+        """Route teacher inference while keeping top-k support per-sample packed.
 
         ``multimodal_data`` is row-aligned with ``input_ids``. Each teacher gets
         only its routed rows, including repeated media rows added for DP padding.
+        The returned list contains lightweight metadata/object refs in the
+        original batch order; it never constructs a routed ``[B, S, K]`` tensor.
         """
         if topk < 1:
             raise ValueError(f"topk must be at least 1, got {topk}.")
@@ -982,10 +988,9 @@ class AsyncTrajectoryCollector:
 
         batch_size, seq_len = input_ids.shape
         target_logprobs = torch.zeros(batch_size, seq_len, dtype=torch.float32)
-        support_indices = torch.zeros(batch_size, seq_len, topk, dtype=torch.long)
-        support_logprobs = torch.zeros(batch_size, seq_len, topk, dtype=torch.float32)
+        packed_support: list[Optional[dict[str, Any]]] = [None] * batch_size
         if not group_to_indices:
-            return target_logprobs, support_indices, support_logprobs, 0.0
+            return target_logprobs, [], 0.0
 
         def _evaluate_group(group_key: str, indices: list[int]):
             teacher = self.teacher_worker_groups[group_key]
@@ -1042,11 +1047,29 @@ class AsyncTrajectoryCollector:
                 f"lock_wait={inference_started - lock_started:.2f}s "
                 f"inference={finished - inference_started:.2f}s"
             )
+            if OPD_TEACHER_TOPK_PACKED_KEY in topk_output:
+                group_packed_support = topk_output[OPD_TEACHER_TOPK_PACKED_KEY][
+                    :actual_batch_size
+                ]
+            else:
+                # Compatibility path for a non-packed teacher. This still
+                # avoids global driver materialization, although the refs are
+                # published by the collector rather than the teacher workers.
+                group_packed_support = pack_teacher_topk_for_replay(
+                    topk_output["topk_indices"][:actual_batch_size],
+                    topk_output["topk_logprobs"][:actual_batch_size],
+                    sub_lengths[:actual_batch_size],
+                )
+            if len(group_packed_support) != actual_batch_size:
+                raise ValueError(
+                    f"Teacher group {group_key!r} returned "
+                    f"{len(group_packed_support)} packed top-k rows for "
+                    f"{actual_batch_size} samples."
+                )
             return (
                 indices,
                 topk_output["reference_logprobs"][:actual_batch_size],
-                topk_output["topk_indices"][:actual_batch_size],
-                topk_output["topk_logprobs"][:actual_batch_size],
+                group_packed_support,
             )
 
         started = time.time()
@@ -1061,16 +1084,19 @@ class AsyncTrajectoryCollector:
                 (
                     indices,
                     group_target_logprobs,
-                    group_support_indices,
-                    group_support_logprobs,
+                    group_packed_support,
                 ) = future.result()
                 target_logprobs[indices] = group_target_logprobs
-                support_indices[indices] = group_support_indices
-                support_logprobs[indices] = group_support_logprobs
+                for sample_index, entry in zip(indices, group_packed_support):
+                    packed_support[sample_index] = entry
+        missing = [idx for idx, entry in enumerate(packed_support) if entry is None]
+        if missing:
+            raise RuntimeError(
+                f"Teacher top-k routing did not populate samples {missing}."
+            )
         return (
             target_logprobs,
-            support_indices,
-            support_logprobs,
+            [entry for entry in packed_support if entry is not None],
             time.time() - started,
         )
 
@@ -1292,8 +1318,7 @@ class AsyncTrajectoryCollector:
                 else:
                     (
                         teacher_logprobs,
-                        teacher_topk_indices,
-                        teacher_topk_logprobs,
+                        teacher_topk_packed,
                         teacher_logprob_time,
                     ) = await asyncio.to_thread(
                         self._compute_teacher_topk_logprobs,
@@ -1303,8 +1328,7 @@ class AsyncTrajectoryCollector:
                         input_lengths=teacher_input_lengths,
                         multimodal_data=flat_for_teacher.get_multimodal_dict(as_tensors=False),
                     )
-                    final_batch_cpu["teacher_topk_indices"] = teacher_topk_indices
-                    final_batch_cpu["teacher_topk_logprobs"] = teacher_topk_logprobs
+                    final_batch_cpu[OPD_TEACHER_TOPK_PACKED_KEY] = teacher_topk_packed
                 # Keep the tensor inside the batch so replay-buffer collation can
                 # pad variable-length prompt groups correctly.
                 final_batch_cpu["teacher_reference_logprobs"] = teacher_logprobs

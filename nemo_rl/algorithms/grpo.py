@@ -52,6 +52,7 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
+from nemo_rl.algorithms.opd_packed import OPD_TEACHER_TOPK_PACKED_KEY
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -2416,12 +2417,27 @@ def _attach_teacher_topk_from_replay(
     train_data: BatchedDataDict[Any],
     support_indices: Optional[torch.Tensor],
     support_logprobs: Optional[torch.Tensor],
+    packed_support: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     """Validate, pad, and attach collection-time teacher support for training."""
+    if packed_support is not None:
+        if support_indices is not None or support_logprobs is not None:
+            raise ValueError(
+                "Teacher-top-k replay cannot contain both packed and dense support."
+            )
+        if len(packed_support) != train_data.size:
+            raise ValueError(
+                "Teacher-top-k packed support must have one entry per training "
+                f"sample, got {len(packed_support)} for batch size "
+                f"{train_data.size}."
+            )
+        train_data[OPD_TEACHER_TOPK_PACKED_KEY] = packed_support
+        return
+
     if support_indices is None or support_logprobs is None:
         raise ValueError(
-            "Teacher-top-k OPD requires collection-time teacher support in the "
-            "replay batch."
+            "Teacher-top-k OPD requires packed or dense collection-time teacher "
+            "support in the replay batch."
         )
     if support_indices.shape != support_logprobs.shape:
         raise ValueError(
@@ -4824,11 +4840,12 @@ def async_grpo_train(
                         ),
                     )
 
-                    # Teacher logprobs are stored in batch dict by collection-time
-                    # computation and padded by from_batches. Extract here.
+                    # Collection-time target logprobs are padded by from_batches.
+                    # Teacher top-k support stays as flattened per-sample refs.
                     trajectory_teacher_logprobs = None
                     trajectory_teacher_topk_indices = None
                     trajectory_teacher_topk_logprobs = None
+                    trajectory_teacher_topk_packed = None
                     teacher_agent_refs = None
                     if opd_module.is_opd_enabled(master_config):
                         if "teacher_reference_logprobs" in repeated_batch:
@@ -4842,6 +4859,10 @@ def async_grpo_train(
                         if "teacher_topk_logprobs" in repeated_batch:
                             trajectory_teacher_topk_logprobs = repeated_batch[
                                 "teacher_topk_logprobs"
+                            ]
+                        if OPD_TEACHER_TOPK_PACKED_KEY in repeated_batch:
+                            trajectory_teacher_topk_packed = repeated_batch[
+                                OPD_TEACHER_TOPK_PACKED_KEY
                             ]
                         teacher_agent_refs = repeated_batch.get("agent_ref")
 
@@ -5024,6 +5045,7 @@ def async_grpo_train(
                                 train_data=train_data,
                                 support_indices=trajectory_teacher_topk_indices,
                                 support_logprobs=trajectory_teacher_topk_logprobs,
+                                packed_support=trajectory_teacher_topk_packed,
                             )
 
                     if not skip_reference_logprobs:

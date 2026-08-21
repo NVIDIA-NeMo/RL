@@ -28,6 +28,7 @@ from megatron.core.parallel_state import (
 from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.opd_packed import materialize_teacher_topk_microbatch
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
@@ -102,6 +103,7 @@ def make_processed_microbatch_iterator(
     delegate_pack_to_model: bool = False,
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    materialize_opd_teacher_topk: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -123,6 +125,8 @@ def make_processed_microbatch_iterator(
     pack_sequences = cfg["sequence_packing"]["enabled"]
 
     for data_dict in raw_iterator:
+        if materialize_opd_teacher_topk:
+            materialize_teacher_topk_microbatch(data_dict)
         # Move to GPU
         data_dict = data_dict.to("cuda")
 
@@ -164,6 +168,7 @@ def get_microbatch_iterator(
     delegate_pack_to_model: bool = False,
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    materialize_opd_teacher_topk: bool = False,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -230,6 +235,7 @@ def get_microbatch_iterator(
         delegate_pack_to_model=delegate_pack_to_model,
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+        materialize_opd_teacher_topk=materialize_opd_teacher_topk,
     )
 
     # Compute padded sequence length for pipeline parallelism

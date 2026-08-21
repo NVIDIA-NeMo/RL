@@ -862,6 +862,7 @@ class MegatronPolicyWorkerImpl(
                     delegate_pack_to_model=self.delegate_pack_to_model,
                     delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
                     model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+                    materialize_opd_teacher_topk=True,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -2098,6 +2099,21 @@ class MegatronPolicyWorkerImpl(
             sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
         )
+
+        if self.cfg.get("sequence_packing", {}).get("enabled") and return_logprobs:
+            if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+                raise NotImplementedError(
+                    "Packed teacher top-k object refs currently require "
+                    "pipeline_model_parallel_size=1."
+                )
+            per_sample_refs: list[dict[str, Any]] = []
+            for microbatch_output in list_of_outputs:
+                per_sample_refs.extend(microbatch_output.get("per_sample_refs", []))
+            no_grad.__exit__(None, None, None)
+            return {
+                "per_sample_refs": per_sample_refs,
+                "unpacked_seq_length": seq_length,
+            }
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             logits_chunks = []

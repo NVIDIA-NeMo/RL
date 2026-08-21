@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypedDict
+from typing import Any, NotRequired, Optional, TypedDict
 
 import ray
 import torch
@@ -52,8 +52,9 @@ class TopkLogprobsOutputSpec(TypedDict):
     """Teacher target logprobs plus selected support indices and logprobs."""
 
     reference_logprobs: torch.Tensor
-    topk_indices: torch.Tensor
-    topk_logprobs: torch.Tensor
+    topk_indices: NotRequired[torch.Tensor]
+    topk_logprobs: NotRequired[torch.Tensor]
+    opd_teacher_topk_per_sample_packed: NotRequired[list[dict[str, Any]]]
 
 
 class PolicyInterface(ABC):
