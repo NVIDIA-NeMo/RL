@@ -79,7 +79,7 @@ The generated fields are:
 |---|---:|---|---|
 | `POOL_MODEL` | yes | — | Checkpoint path under `EXTERNAL_VLLM_SHARED_ROOT` or Hugging Face model ID. |
 | `POOL_CONTAINER` | yes | — | Container used by this pool's replicas. |
-| `POOL_VLLM_PYTHON` | yes | — | Python executable containing vLLM, Ray, and NeMo RL's compatibility patch. |
+| `POOL_VLLM_PYTHON` | yes | — | Python executable containing vLLM and Ray. |
 | `POOL_REPLICAS` | yes | — | Number of independent DP=1 servers. |
 | `POOL_TENSOR_PARALLEL_SIZE` | yes | — | Tensor parallel size per server. |
 | `POOL_LB_PORT` | yes | — | Unique load-balancer port on the Ray head node. |
@@ -176,11 +176,17 @@ also accepted.
 Each pool container must provide:
 
 - its configured `POOL_VLLM_PYTHON`;
-- importable `nemo_rl`, `ray`, and `vllm` packages in that environment; and
+- importable `ray` and `vllm` packages in that environment;
+- access to the matching NeMo RL source checkout, or an importable `nemo_rl`
+  package as a fallback; and
 - the `ray` command on `PATH`.
 
-`serve_vllm_on_ray.py` applies NeMo RL's vLLM compatibility patches before it
-imports the vLLM API server. `CONTAINER` must provide
+`serve_vllm_on_ray.py` loads NeMo RL's vLLM compatibility patch module directly
+from the matching source checkout and applies it before importing the vLLM API
+server. This avoids importing NeMo RL's policy modules and training dependency
+stack into a purpose-built serving container. If the source checkout is not
+available, the wrapper falls back to the installed `nemo_rl` package.
+`CONTAINER` must provide
 `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
 
 ## Slurm submission

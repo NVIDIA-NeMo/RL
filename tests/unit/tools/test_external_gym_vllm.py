@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -35,6 +36,31 @@ from tools.external_gym_vllm.vllm_pool_lb import (
 )
 
 REPO_ROOT = Path(__file__).parents[3]
+
+
+def test_serve_wrapper_loads_patches_without_importing_nemo_rl_package():
+    script = REPO_ROOT / "tools/external_gym_vllm/serve_vllm_on_ray.py"
+    program = textwrap.dedent(
+        f"""
+        import runpy
+        import sys
+        import types
+
+        sys.modules["ray"] = types.ModuleType("ray")
+        namespace = runpy.run_path({str(script)!r})
+        namespace["_load_apply_vllm_patches"]()
+        assert "nemo_rl.models.generation" not in sys.modules
+        assert "nemo_rl.models.policy" not in sys.modules
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_shutdown_timeout_bounds_watchdog_restart_outage():
