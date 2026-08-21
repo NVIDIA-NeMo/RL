@@ -38,6 +38,9 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         data_plane={"enabled": True},
         logger={"log_dir": "/tmp/logs"},
         checkpointing={"enabled": False},
+        async_rl=SimpleNamespace(
+            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0)
+        ),
         grpo=GRPOConfig(async_grpo=None),
     )
     configured_generation = {"backend": "vllm", "_mtp_weights_from_refit": True}
@@ -49,6 +52,10 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         trainer_handle=SimpleNamespace(shutdown=MagicMock()),
     )
     ray_get = MagicMock(return_value={})
+    # The driver now polls ping() around the run. Report the run as ready on the first
+    # check so these tests keep exercising the same path they always did.
+    ray_wait = MagicMock(side_effect=lambda refs, timeout=None: (list(refs), []))
+    ray_kill = MagicMock()
 
     monkeypatch.setattr(
         run_grpo_single_controller,
@@ -89,6 +96,8 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         MagicMock(return_value=actor),
     )
     monkeypatch.setattr(run_grpo_single_controller.ray, "get", ray_get)
+    monkeypatch.setattr(run_grpo_single_controller.ray, "wait", ray_wait)
+    monkeypatch.setattr(run_grpo_single_controller.ray, "kill", ray_kill)
 
     return SimpleNamespace(
         actor_args=actor_args,
@@ -97,6 +106,8 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         configured_generation=configured_generation,
         generation_config=generation_config,
         ray_get=ray_get,
+        ray_wait=ray_wait,
+        ray_kill=ray_kill,
     )
 
 
@@ -121,7 +132,8 @@ def test_cleanup_is_best_effort_and_preserves_run_error(
     main_context.actor_args.gen_handle = generation
     main_context.actor_args.trainer_handle = trainer
 
-    def get(ref: object) -> None:
+    def get(ref: object, timeout: float | None = None) -> None:
+        del timeout
         if ref == "run":
             raise RuntimeError("training failed")
         if ref == "failing-env":
@@ -134,6 +146,8 @@ def test_cleanup_is_best_effort_and_preserves_run_error(
         run_grpo_single_controller.main()
 
     healthy_env.shutdown.remote.assert_called_once_with()
+    # A hung env must not replace the training error with an indefinite wait.
+    main_context.ray_kill.assert_called_once_with(failing_env)
     generation.shutdown.assert_called_once_with()
     trainer.shutdown.assert_called_once_with()
     output = capsys.readouterr().out

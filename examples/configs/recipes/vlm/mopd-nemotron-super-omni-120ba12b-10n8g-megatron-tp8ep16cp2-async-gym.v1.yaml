@@ -1,0 +1,78 @@
+# Super Omni image MOPD: 1 generation, 1 teacher, and 8 policy nodes.
+# The default mapping is self-distillation; override it for a stronger teacher.
+defaults: vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+checkpointing:
+  checkpoint_dir: results/mopd-nemotron-super-omni-circle-count
+  keep_top_k: 1
+cluster:
+  num_nodes: 10
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_epochs: 5
+  max_num_steps: 200
+  async_grpo:
+    in_flight_weight_updates: false
+  adv_estimator:
+    name: opd
+loss_fn:
+  disable_ppo_ratio: true
+  truncated_importance_sampling_type: icepop
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: 0.2
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+policy:
+  train_global_batch_size: 64
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  generation:
+    max_new_tokens: 4096
+    colocated:
+      resources:
+        num_nodes: 1
+    vllm_cfg:
+      gpu_memory_utilization: 0.5
+      enforce_eager: true
+      reset_encoder_cache_after_weight_update: true
+data:
+  train:
+    data_path: /path/to/circle_count_train.jsonl
+  validation:
+    data_path: /path/to/circle_count_train.jsonl
+env:
+  nemo_gym:
+    uv_pip_set_python: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/circle_count/configs/circle_count.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          max_input_tokens: ${policy.max_total_sequence_length}
+on_policy_distillation:
+  enabled: true
+  teacher_model_by_agent_name:
+    circle_count_simple_agent: ${policy.model_name}
+  strict_agent_name_match: true
+  deduplicate_shared_teacher_checkpoints: true
+  non_colocated_teachers:
+    enabled: true
+    default_teacher_cfg:
+      tensor_model_parallel_size: 8
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 8
+      context_parallel_size: 1
+      num_nodes: 1
+      gpus_per_node: 8
+      precision: bf16
+      micro_batch_size: 1
+      moe_shared_expert_overlap: false
+logger:
+  log_dir: logs/mopd-nemotron-super-omni-circle-count
+  wandb:
+    project: mopd-nemotron-super-omni
+    name: mopd-nemotron-super-omni-circle-count
+    log_nemo_gym_full_result_tables: true

@@ -226,6 +226,41 @@ class GenerationConfig(TypedDict):
     _debug_payload_metrics: NotRequired[bool]
 
 
+def should_use_async_rollouts(
+    generation_config: GenerationConfig | None,
+) -> bool:
+    """Determine whether a generation backend uses asynchronous rollouts."""
+    if generation_config is None:
+        return False
+    backend = generation_config.get("backend", "")
+
+    if backend == "dynamo":
+        return True
+
+    if backend == "sglang":
+        return bool(generation_config.get("use_async_rollouts", False))
+
+    if backend == "vllm":
+        return bool(generation_config.get("vllm_cfg", {}).get("async_engine", False))
+
+    if backend == "trtllm":
+        assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
+            "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
+            "synchronous engine path (async_engine=false) is no longer supported."
+        )
+        return True
+
+    if backend == "megatron":
+        mcore_cfg = generation_config.get("mcore_generation_config", {})
+        assert mcore_cfg.get("async_engine") is None, (
+            "Megatron Inference always uses the async engine. The parameter "
+            "policy.generation.mcore_generation_config.async_engine was removed."
+        )
+        return True
+
+    return False
+
+
 @dataclass
 class GenerationSamplingParams:
     """Sampling profile threaded explicitly through rollout entry points.
@@ -345,6 +380,15 @@ class GenerationOutputSpec(TypedDict):
     __extra__: Any
 
 
+@dataclass(frozen=True)
+class CollectiveSenderSpec:
+    """Policy-side protocol and packing geometry for NCCL weight transfer."""
+
+    nccl_peer: str = "nemo"
+    buffer_size_bytes: int | None = None
+    num_buffers: int | None = None
+
+
 class GenerationInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
@@ -369,6 +413,11 @@ class GenerationInterface(ABC):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         pass
 
+    @abstractmethod
+    def shutdown(self) -> bool:
+        """Shut down generation resources; repeated calls must be safe."""
+        pass
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Whether the generation backend requires KV cache scales synchronization."""
@@ -386,6 +435,14 @@ class GenerationInterface(ABC):
         """Update the model weights from collective communication."""
         raise NotImplementedError
 
+    def get_collective_sender_spec(self) -> CollectiveSenderSpec:
+        """Return policy-side NCCL protocol and packed-buffer requirements."""
+        return CollectiveSenderSpec()
+
+    def get_inference_world_size(self) -> int | None:
+        """Return a backend-specific collective world size when required."""
+        return None
+
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""
         raise NotImplementedError
@@ -393,6 +450,23 @@ class GenerationInterface(ABC):
     def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
         """Receive weights from training workers via nccl_reshard."""
         raise NotImplementedError
+
+    def attach_fleet_health(self, monitor: Any, selector: Any) -> None:
+        """Route this backend's shard selection through fleet health.
+
+        Declared here rather than discovered with ``hasattr`` at the call site, so an
+        unsupported backend says so itself and the capability is greppable from the
+        interface. Same shape as the refit hooks above.
+
+        Args:
+            monitor: ``GenerationFleetHealth`` owning shard eligibility, which the
+                backend also reports observed failures and successes to.
+            selector: ``HealthyShardSelector`` picking among the serving shards.
+        """
+        raise NotImplementedError(
+            "async_rl.generation_fleet_health.enabled=true is not supported for the "
+            f"{type(self).__name__} generation backend"
+        )
 
     # Optional hook; backends may override to invalidate any reusable caches
     # (e.g., vLLM prefix/KV caches) after weight updates.

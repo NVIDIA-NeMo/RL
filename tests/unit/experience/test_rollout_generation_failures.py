@@ -177,6 +177,7 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
     )
     manager._stats = RolloutStats()
     manager._skipped_prompts = 0
+    manager._consecutive_infra_drops = 0
     return manager
 
 
@@ -460,8 +461,8 @@ class _PartialGymMethod:
         del kwargs
         return self
 
-    def remote(self, inputs, tokenizer, timer_prefix):
-        del tokenizer, timer_prefix
+    def remote(self, inputs, timer_prefix):
+        del timer_prefix
         self.dispatched.append([row["_rowidx"] for row in inputs])
         attempt = self.attempts
         self.attempts += 1
@@ -500,8 +501,8 @@ class _FakeGymMethod:
         del kwargs
         return self
 
-    def remote(self, inputs, tokenizer, timer_prefix):
-        del tokenizer, timer_prefix
+    def remote(self, inputs, timer_prefix):
+        del timer_prefix
         return self._stream(len(inputs))
 
     async def _stream(self, num_inputs):
