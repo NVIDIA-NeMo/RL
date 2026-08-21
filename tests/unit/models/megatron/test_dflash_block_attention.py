@@ -1049,7 +1049,7 @@ def test_global_block_mask_candidates_are_prefix_bounded() -> None:
         slot_valid=torch.ones((len(sample_rows), block_size), dtype=torch.bool),
     )
 
-    block_mask = attention_module._create_global_block_mask(plan)
+    block_mask = attention_module._create_global_block_mask(plan, None)
 
     max_sample_prefix_blocks = (
         sequence_length + 2 * block_mask.BLOCK_SIZE[1] - 2
