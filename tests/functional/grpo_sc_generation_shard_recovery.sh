@@ -372,22 +372,30 @@ if [[ "$KILL_DURING_REFIT" == "true" ]]; then
     # refit. Only then is "killed during the refit" a fact rather than a hope.
     echo "[recovery] arming the refit hold at $HOLD_FILE"
     : > "$HOLD_FILE"
+    # Wait for EVERY generation worker to report, not just the first.
+    #
+    # The victim is a fixed pid (GEN_PIDS[0]) but the old check matched a message from
+    # ANY worker, so the harness could freeze a shard that had not reached the hold yet
+    # -- leaving it somewhere else entirely and making "frozen inside the refit" a hope
+    # rather than a fact. Counting the reports removes the race.
     HELD=false
     for _ in $(seq 1 1200); do
-        grep -q "refit: holding the receive open" "$RUN_LOG" 2>/dev/null && { HELD=true; break; }
+        HOLDING=$(grep -c "refit: holding the receive open" "$RUN_LOG" 2>/dev/null || echo 0)
+        (( HOLDING >= GEN_GPUS )) && { HELD=true; break; }
         kill -0 $TRAIN_PID 2>/dev/null || {
             echo "[recovery] FAIL: run ended before a refit could be held"
             tail -40 "$RUN_LOG"; exit 1; }
         sleep 0.1
     done
     if [[ "$HELD" != "true" ]]; then
-        echo "[recovery] FAIL: no worker reported holding a refit within 120s."
+        echo "[recovery] FAIL: only $HOLDING of $GEN_GPUS generation workers reported"
+        echo "[recovery] holding a refit within 120s."
         echo "[recovery] The hook reads NRL_REFIT_HOLD_FILE; without it this test cannot"
         echo "[recovery] reach the mid-refit window at all and would silently test the"
         echo "[recovery] step-boundary case instead."
         tail -60 "$RUN_LOG"; exit 1
     fi
-    echo "[recovery] a refit is held open; killing the victim inside it"
+    echo "[recovery] all $GEN_GPUS generation workers are parked in the refit; the victim is one of them"
 fi
 
 VICTIM=${GEN_PIDS[0]}
