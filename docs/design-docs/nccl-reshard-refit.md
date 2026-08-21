@@ -35,9 +35,13 @@ single `ValueError` listing every violation. The current requirements are:
   accounting) are not supported yet.
 * **Precision** for vLLM must match end to end: BF16 train ↔ BF16 gen, or FP8
   train (`fp8_param=true` + blockwise recipe) ↔ FP8 gen
-  (`vllm_cfg.precision=fp8`). Megatron generation accepts BF16 training weights
-  into either BF16 or MXFP8 inference storage; MXFP8 quantization happens on the
-  destination after each fused local weight is complete.
+  (`vllm_cfg.precision=fp8`). Megatron generation accepts BF16 parameters or
+  MXFP8 parameters (`fp8_param=true` + MXFP8 recipe) from training. MXFP8
+  sources are materialized as logical BF16 for transport; the destination then
+  either stores BF16 or quantizes each complete local weight into MXFP8. When
+  MXFP8 parameter all-gather reuses the gradient buffer, that aliased allocation
+  stays GPU-resident across refit so persistent DDP/autograd views remain valid;
+  ordinary gradient buffers and optimizer state are still offloaded.
 * vLLM expert parallelism is supported with the NeMo RL convention
   `expert_parallel_size == tensor_parallel_size`.
 * Megatron generation uses `mcore_generation_config.refit_impl=bridge` for this

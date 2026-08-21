@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Optional
@@ -669,6 +670,103 @@ def test_refit_size_estimate_casts_floating_weight_to_export_dtype():
     )
 
 
+def test_megatron_refit_bridge_tasks_export_logical_mxfp8_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    @dataclass(frozen=True)
+    class Task:
+        param_weight: torch.Tensor | None
+        param_name: str = ""
+        megatron_module: object | None = None
+
+    mxfp8_source = torch.zeros((4, 2), dtype=torch.uint8)
+    bridge_payload = torch.ones((4, 2), dtype=torch.uint8)
+    logical_weight = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
+    bf16_source = torch.ones((2, 2), dtype=torch.bfloat16)
+    dequantize = MagicMock(
+        side_effect=lambda tensor: logical_weight if tensor is mxfp8_source else tensor
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_is_mxfp8_refit_source",
+        lambda tensor: tensor is mxfp8_source,
+    )
+    monkeypatch.setattr(worker_module, "_dequantize_mxfp8_refit_source", dequantize)
+
+    tasks = [
+        Task(
+            bridge_payload,
+            param_name="decoder.layers.0.mlp.weight",
+            megatron_module=SimpleNamespace(weight=mxfp8_source),
+        ),
+        None,
+        Task(bf16_source),
+    ]
+    exported = list(
+        worker_module.MegatronPolicyWorkerImpl._iter_logical_refit_conversion_tasks(
+            tasks
+        )
+    )
+
+    assert exported[0] is not tasks[0]
+    assert exported[0].param_weight is logical_weight
+    assert exported[1] is None
+    assert exported[2] is tasks[2]
+    assert dequantize.call_args_list == [call(mxfp8_source), call(bf16_source)]
+
+
+def test_megatron_refit_mxfp8_source_dequantizes_once_per_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    mxfp8_source = torch.zeros((2, 4, 2), dtype=torch.uint8)
+    logical_weight = torch.arange(16, dtype=torch.bfloat16).reshape(2, 4, 2)
+    dequantize = MagicMock(return_value=logical_weight)
+    monkeypatch.setattr(
+        worker_module,
+        "_is_mxfp8_refit_source",
+        lambda tensor: tensor is mxfp8_source,
+    )
+    monkeypatch.setattr(worker_module, "_dequantize_mxfp8_refit_source", dequantize)
+
+    gate_spec = worker._local_refit_source_spec(mxfp8_source, "gate")
+    up_spec = worker._local_refit_source_spec(mxfp8_source, "up")
+    grouped_spec = worker_module.LocalParamSpec(
+        base=worker_module._GroupedRefitSource((gate_spec, up_spec))
+    )
+    logical_source_cache = {}
+
+    gate = worker._materialize_local_refit_spec(gate_spec, logical_source_cache).buf
+    grouped = worker._materialize_local_refit_spec(
+        grouped_spec, logical_source_cache
+    ).buf
+
+    assert gate.is_contiguous()
+    assert torch.equal(grouped[0], logical_weight[:, :2])
+    assert torch.equal(grouped[1], logical_weight[:, 2:])
+    dequantize.assert_called_once_with(mxfp8_source)
+
+
+def test_megatron_refit_bf16_source_remains_a_live_view() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    fused_weight = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
+
+    gate_spec = worker._local_refit_source_spec(fused_weight, "gate")
+    fused_weight[0, 0] = 99
+
+    assert gate_spec.pre is None
+    assert gate_spec.base.data_ptr() == fused_weight.data_ptr()
+    assert gate_spec.base[0, 0] == 99
+
+
 def test_qwen3vl_type_fallback_still_delegates_packing():
     from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
 
@@ -715,8 +813,9 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     worker.fp8_cfg = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
     worker.move_model = lambda model, device, move_params, move_grads: (
-        events.append("move_model") or model
+        events.append(("move_model", move_grads)) or model
     )
 
     class _AllocatorWakeup:
@@ -739,10 +838,54 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     MegatronPolicyWorkerImpl.offload_before_refit(worker)
 
     assert events[0] == "finalize_async_save"
-    assert events.index("finalize_async_save") < events.index("move_model")
+    assert events.index("finalize_async_save") < events.index(("move_model", True))
 
 
-def test_megatron_offload_after_refit_finalizes_before_model_move(monkeypatch):
+def test_megatron_offload_before_refit_materializes_latest_mxfp8_weights(monkeypatch):
+    """Refit must see optimizer updates before the next overlapped train forward."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    events = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.optimizer = None
+    worker.optimizer_cpu_offload = False
+    worker.fp8_cfg = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
+    worker.finalize_async_save = lambda: events.append("finalize_async_save")
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
+    worker._forward_pre_hook_enabled = lambda: True
+    worker._disable_forward_pre_hook_until_next_train_step = (
+        lambda *, param_sync=False: events.append(("disable_hook", param_sync))
+    )
+    worker.move_model = lambda model, device, move_params, move_grads: (
+        events.append(("move_model", move_grads)) or model
+    )
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            return self
+
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+
+    MegatronPolicyWorkerImpl.offload_before_refit(worker)
+
+    assert events[:3] == [
+        "finalize_async_save",
+        ("disable_hook", True),
+        ("move_model", False),
+    ]
+
+
+@pytest.mark.parametrize("keep_shared_buffer", [False, True])
+def test_megatron_offload_after_refit_finalizes_before_model_move(
+    monkeypatch, keep_shared_buffer
+):
     """Checkpoint CUDA IPC handles must be dropped before model storage is replaced."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
@@ -752,7 +895,10 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(monkeypatch):
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model = _FakeTrainableModel()
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
-    worker.move_model = lambda model, device: events.append("move_model") or model
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: keep_shared_buffer
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append(("move_model", kwargs)) or model
+    )
     worker.offload_before_refit = lambda: events.append("offload_before_refit")
 
     class _AllocatorWakeup:
@@ -774,7 +920,15 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(monkeypatch):
     MegatronPolicyWorkerImpl.offload_after_refit(worker)
 
     assert events[0] == "finalize_async_save"
-    assert events.index("finalize_async_save") < events.index("move_model")
+    assert events.index("finalize_async_save") < events.index(
+        (
+            "move_model",
+            {
+                "move_params": not keep_shared_buffer,
+                "move_grads": not keep_shared_buffer,
+            },
+        )
+    )
 
 
 @pytest.mark.parametrize("cache_active", [True, False])
@@ -880,6 +1034,70 @@ def test_megatron_prepare_for_training_restores_optimizer():
 
     assert model.train_called
     assert restored_devices == ["cuda"]
+
+
+def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(monkeypatch):
+    """MXFP8 param gather cannot run from an offloaded shared grad buffer."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    model = _FakeTrainableModel()
+    move_calls = []
+
+    worker.model = model
+    worker.optimizer = None
+    worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_logprob = False
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
+    worker.move_model = lambda model, device, **kwargs: (
+        move_calls.append((device, kwargs)) or model
+    )
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            return self
+
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MegatronPolicyWorkerImpl.prepare_for_lp_inference(worker)
+
+    assert model.eval_called
+    assert move_calls == [("cuda", {"move_grads": True})]
+
+
+def test_megatron_prepare_for_logprobs_restages_enabled_mxfp8_param_gather(
+    monkeypatch,
+):
+    """A reloaded shared buffer must not all-gather its freshly zeroed contents."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = _FakeTrainableModel()
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_logprob = False
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
+    worker.move_model = lambda model, device, **kwargs: model
+    stage_calls = []
+    worker._copy_main_params_to_param_buffer = lambda zero_grad_buffer=False: (
+        stage_calls.append(zero_grad_buffer)
+    )
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            return self
+
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MegatronPolicyWorkerImpl.prepare_for_lp_inference(worker)
+
+    assert stage_calls == [True]
 
 
 def test_set_moe_grad_scale_func_sets_and_clears_on_model_config():

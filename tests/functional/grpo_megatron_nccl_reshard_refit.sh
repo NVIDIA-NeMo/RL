@@ -17,8 +17,9 @@
 # nccl_reshard with CUDA graphs. The default CI environment may exercise the
 # exact-transfer Python implementation. Set REQUIRE_REAL_NCCL_M2N=1 in an
 # environment with nccl-extensions installed to require nccl.m2n.reshard
-# instead. Set REFIT_PRECISION=mxfp8 on Blackwell to cover inference-side
-# MXFP8 refit and Torch-layout weights; BF16 is the portable default.
+# instead. Set REFIT_PRECISION=mxfp8 on Blackwell to cover MXFP8 training
+# parameters, inference-side MXFP8 refit, and Torch-layout weights; BF16 is the
+# portable default.
 
 set -eou pipefail
 
@@ -39,6 +40,13 @@ case "$REFIT_PRECISION" in
         model_name=Qwen/Qwen3-0.6B
         max_token_mult_prob_error=1.10
         precision_args=(
+            ++policy.megatron_cfg.fp8_cfg.enabled=true
+            ++policy.megatron_cfg.fp8_cfg.fp8=e4m3
+            ++policy.megatron_cfg.fp8_cfg.fp8_recipe=mxfp8
+            ++policy.megatron_cfg.fp8_cfg.fp8_param=true
+            # Match NeMo-RL's FP8 end-to-end recipes: MXFP8 model parameters
+            # with the standard FP32-master distributed optimizer.
+            ++policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false
             ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized
             ++policy.generation.mcore_generation_config.fp8_cfg.enabled=true
             ++policy.generation.mcore_generation_config.fp8_cfg.fp8=e4m3

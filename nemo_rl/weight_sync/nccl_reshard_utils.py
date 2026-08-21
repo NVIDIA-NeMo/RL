@@ -612,12 +612,14 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             )
 
         # Precision compatibility (train ↔ gen). vLLM supports byte-compatible
-        # BF16/BF16 and blockwise-FP8/FP8. Megatron generation supports BF16
-        # source weights and either BF16 or on-receive MXFP8 destinations.
+        # BF16/BF16 and blockwise-FP8/FP8. Megatron generation sends logical
+        # BF16 weights from BF16 or MXFP8 training storage, then writes BF16 or
+        # performs on-receive MXFP8 quantization at the destination.
         #   BF16 train  ↔ BF16 gen   (default, tested)
         #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm precision=fp8)
-        # BF16→FP8 (train-side quant on the fly) is not implemented; FP8→BF16
-        # has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
+        # The vLLM byte-transfer path cannot convert between BF16 and FP8. The
+        # Megatron path intentionally converts MXFP8 sources to logical BF16,
+        # which supports either BF16 or MXFP8 generation destinations.
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
         fp8_param = fp8_cfg.get("fp8_param", False)
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
@@ -669,11 +671,16 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
                     "policy.precision must be 'bfloat16' for Megatron-generation "
                     "nccl_reshard refit."
                 )
-            if fp8_param:
+            if fp8_param and not fp8_cfg.get("enabled", False):
                 violations.append(
-                    "Megatron-generation nccl_reshard refit requires BF16 training "
-                    "weights (policy.megatron_cfg.fp8_cfg.fp8_param must be False); "
-                    "MXFP8 inference quantization is performed after each shard arrives."
+                    "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
+                    "policy.megatron_cfg.fp8_cfg.enabled=True."
+                )
+            if fp8_param and fp8_recipe != "mxfp8":
+                violations.append(
+                    "Megatron-generation nccl_reshard refit supports fp8_param=True "
+                    "only with policy.megatron_cfg.fp8_cfg.fp8_recipe='mxfp8' "
+                    f"(got {fp8_recipe!r})."
                 )
 
             if mcore_generation_cfg.get("refit_impl") != "bridge":

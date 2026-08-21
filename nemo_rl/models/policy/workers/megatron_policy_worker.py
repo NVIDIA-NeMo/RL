@@ -20,7 +20,8 @@ import time
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+from dataclasses import dataclass, replace
+from typing import Any, Iterable, Iterator, Literal, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
 
@@ -199,6 +200,63 @@ def _estimate_refit_tensor_size_in_bytes(
         else param.element_size()
     )
     return param.numel() * tp_size * ep_size * element_size
+
+
+def _is_mxfp8_refit_source(tensor: torch.Tensor) -> bool:
+    """Whether a training parameter uses TE MXFP8 physical storage."""
+    # Defer optional TE FP8 helpers until a refit source is inspected.
+    from megatron.core.fp8_utils import is_grouped_mxfp8tensor, is_mxfp8tensor
+
+    return is_mxfp8tensor(tensor) or is_grouped_mxfp8tensor(tensor)
+
+
+def _dequantize_mxfp8_refit_source(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialize a logical BF16 weight from TE MXFP8 parameter storage."""
+    # Defer optional TE FP8 helpers until an MXFP8 source is materialized.
+    from megatron.core.fp8_utils import (
+        dequantize_fp8_tensor,
+        get_grouped_quantized_members,
+        is_grouped_mxfp8tensor,
+        is_mxfp8tensor,
+    )
+
+    if is_grouped_mxfp8tensor(tensor):
+        members = get_grouped_quantized_members(tensor, create_if_missing=True)
+        return torch.stack(
+            [dequantize_fp8_tensor(member).to(torch.bfloat16) for member in members]
+        )
+    if is_mxfp8tensor(tensor):
+        return dequantize_fp8_tensor(tensor).to(torch.bfloat16)
+    return tensor
+
+
+def _get_refit_task_source(task: Any) -> Optional[torch.Tensor]:
+    """Return the original TE parameter when Bridge exposes an export payload."""
+    source = task.param_weight
+    module = getattr(task, "megatron_module", None)
+    param_name = getattr(task, "param_name", "")
+    if source is None or module is None or not param_name:
+        return source
+
+    original = getattr(module, param_name.rsplit(".", 1)[-1], None)
+    if original is not None and _is_mxfp8_refit_source(original):
+        return original
+    return source
+
+
+@dataclass(frozen=True)
+class _MXFP8RefitSource:
+    """A live MXFP8 parameter plus the logical HF component to transfer."""
+
+    tensor: torch.Tensor
+    component: Literal["full", "gate", "up"] = "full"
+
+
+@dataclass(frozen=True)
+class _GroupedRefitSource:
+    """Local expert source specs that must be stacked before transfer."""
+
+    specs: tuple[LocalParamSpec, ...]
 
 
 @contextmanager
@@ -2101,6 +2159,24 @@ class MegatronPolicyWorkerImpl(
             )
         return param_info
 
+    @staticmethod
+    def _iter_logical_refit_conversion_tasks(
+        conversion_tasks: Iterable[Any],
+    ) -> Iterator[Any]:
+        """Yield Bridge tasks whose MXFP8 sources are materialized as BF16."""
+        for task in conversion_tasks:
+            if task is None or task.param_weight is None:
+                yield task
+                continue
+            source = _get_refit_task_source(task)
+            assert source is not None
+            logical_weight = _dequantize_mxfp8_refit_source(source)
+            yield (
+                replace(task, param_weight=logical_weight)
+                if logical_weight is not task.param_weight
+                else task
+            )
+
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,
@@ -2126,7 +2202,9 @@ class MegatronPolicyWorkerImpl(
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
-            conversion_tasks=conversion_tasks,  # used for metadata caching
+            conversion_tasks=self._iter_logical_refit_conversion_tasks(
+                conversion_tasks
+            ),
         )
 
         # Yield the original parameters first.
@@ -2176,7 +2254,64 @@ class MegatronPolicyWorkerImpl(
             ).reshape(1)
             yield param_name, scale_tensor
 
-    def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, torch.Tensor]]:
+    @staticmethod
+    def _select_local_refit_component(
+        tensor: torch.Tensor, component: Literal["full", "gate", "up"]
+    ) -> torch.Tensor:
+        if component == "full":
+            return tensor
+        # The output dimension is dim 0 for an ordinary matrix and dim 1 for
+        # stacked/grouped expert matrices, i.e. always the penultimate dim.
+        gate, up = torch.chunk(tensor, 2, dim=-2)
+        return gate if component == "gate" else up
+
+    def _local_refit_source_spec(
+        self,
+        tensor: torch.Tensor,
+        component: Literal["full", "gate", "up"] = "full",
+    ) -> LocalParamSpec:
+        """Build a live BF16 source spec for a BF16 or TE MXFP8 parameter."""
+        if not _is_mxfp8_refit_source(tensor):
+            return LocalParamSpec(
+                base=self._select_local_refit_component(tensor, component)
+            )
+
+        return LocalParamSpec(base=_MXFP8RefitSource(tensor, component))
+
+    def _materialize_local_refit_spec(
+        self,
+        spec: LocalParamSpec,
+        logical_source_cache: dict[int, torch.Tensor],
+    ) -> RefitCtx:
+        """Materialize one local source, reusing MXFP8 dequantization within a layer."""
+        base = spec.base
+        if isinstance(base, _MXFP8RefitSource):
+            source_id = id(base.tensor)
+            logical = logical_source_cache.get(source_id)
+            if logical is None:
+                logical = _dequantize_mxfp8_refit_source(base.tensor)
+                logical_source_cache[source_id] = logical
+            return RefitCtx(
+                buf=self._select_local_refit_component(
+                    logical, base.component
+                ).contiguous()
+            )
+        if isinstance(base, _GroupedRefitSource):
+            return RefitCtx(
+                buf=torch.stack(
+                    [
+                        self._materialize_local_refit_spec(
+                            expert_spec, logical_source_cache
+                        ).buf
+                        for expert_spec in base.specs
+                    ]
+                )
+            )
+        if spec.pre is not None:
+            return spec.pre(base)
+        return RefitCtx(buf=base)
+
+    def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, LocalParamSpec]]:
         """Yield (hf_name, local_tp_shard) for this rank's locally owned FFN params.
 
         Used by the nccl_reshard_refit bulk path (``build_hf_to_local_param_map``).
@@ -2185,11 +2320,11 @@ class MegatronPolicyWorkerImpl(
         and are skipped here (see ``is_nccl_reshard_param``).
 
         Unlike ``_iter_params_with_optional_kv_scales`` (PP broadcast + TP gather
-        via ``export_hf_weights``), this yields TP-local shards directly from the
-        Megatron params — no collectives.  Returned tensors are views and must
-        not be modified in place.  EP: ``refit_conversion_tasks`` already holds
-        only this rank's local experts; PP non-local params have
-        ``param_weight is None``.
+        via ``export_hf_weights``), this yields TP-local source specs directly
+        from the Megatron params — no collectives. BF16 specs retain live tensor
+        views; MXFP8 specs materialize logical BF16 during each refit. EP:
+        ``refit_conversion_tasks`` already holds only this rank's local experts;
+        PP non-local params have ``param_weight is None``.
         """
         from megatron.bridge.models.conversion.param_mapping import (
             FusedExpertMapping,
@@ -2206,7 +2341,7 @@ class MegatronPolicyWorkerImpl(
             return m.group()
 
         for task in self.refit_conversion_tasks:
-            local_tensor = task.param_weight  # local megatron tensor
+            local_tensor = _get_refit_task_source(task)
             if local_tensor is None:
                 continue  # non-local PP rank
             # FP8 scale siblings take the misc path.
@@ -2215,9 +2350,14 @@ class MegatronPolicyWorkerImpl(
 
             if isinstance(task.mapping, GatedMLPMapping):
                 # FFN gate/up fused in linear_fc1 as [gate_shard; up_shard] (dim 0).
-                gate, up = torch.chunk(local_tensor, 2, dim=0)
-                yield task.mapping.hf_param["gate"], gate
-                yield task.mapping.hf_param["up"], up
+                yield (
+                    task.mapping.hf_param["gate"],
+                    self._local_refit_source_spec(local_tensor, "gate"),
+                )
+                yield (
+                    task.mapping.hf_param["up"],
+                    self._local_refit_source_spec(local_tensor, "up"),
+                )
                 continue
 
             if isinstance(task.mapping, FusedGatedExpertMapping):
@@ -2227,9 +2367,14 @@ class MegatronPolicyWorkerImpl(
                 # into gate/up AND re-attach the per-expert index.
                 idx = _expert_idx(task.global_param_name)
                 prefix = str(task.mapping.hf_param)[: -len(".gate_up_proj")]
-                gate, up = torch.chunk(local_tensor, 2, dim=0)
-                yield f"{prefix}.{idx}.gate_proj.weight", gate
-                yield f"{prefix}.{idx}.up_proj.weight", up
+                yield (
+                    f"{prefix}.{idx}.gate_proj.weight",
+                    self._local_refit_source_spec(local_tensor, "gate"),
+                )
+                yield (
+                    f"{prefix}.{idx}.up_proj.weight",
+                    self._local_refit_source_spec(local_tensor, "up"),
+                )
                 continue
 
             if isinstance(task.mapping, FusedExpertMapping):
@@ -2237,7 +2382,10 @@ class MegatronPolicyWorkerImpl(
                 # ``.weight`` so it matches standard per-expert down_proj.
                 idx = _expert_idx(task.global_param_name)
                 prefix = str(task.mapping.hf_param)[: -len(".down_proj")]
-                yield f"{prefix}.{idx}.down_proj.weight", local_tensor
+                yield (
+                    f"{prefix}.{idx}.down_proj.weight",
+                    self._local_refit_source_spec(local_tensor),
+                )
                 continue
 
             # Simple 1:1 mappings: only the FFN down_proj (and any non-gated
@@ -2245,7 +2393,7 @@ class MegatronPolicyWorkerImpl(
             # every non-FFN param fall through to misc, so they are skipped.
             hf_param = task.mapping.hf_param
             if not isinstance(hf_param, dict) and is_nccl_reshard_param(str(hf_param)):
-                yield str(hf_param), local_tensor
+                yield str(hf_param), self._local_refit_source_spec(local_tensor)
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
@@ -2492,10 +2640,10 @@ class MegatronPolicyWorkerImpl(
         return self.nccl_reshard_refit_info
 
     def _build_expert_groups(self, param_map):
-        """Group this rank's local expert params into stack-ready views.
+        """Group this rank's local expert params into stack-ready source specs.
 
         Keyed by (prefix, proj_type) and resolved to ordered ``param_map``
-        views ready for ``torch.stack``.
+        specs ready for per-refit materialization and ``torch.stack``.
 
         Megatron exposes each expert's projection as a separate param; this bins
         them so ``_group_experts`` can stack a layer's experts into one grouped
@@ -2509,18 +2657,16 @@ class MegatronPolicyWorkerImpl(
           * group 3 = proj type    -> ``"gate_proj"``
         so the name keys into ``("model.layers.3.mlp.experts", "gate_proj")``.
 
-        Returns ``{(prefix, proj): [tensor_0, tensor_1, ...]}`` — the per-expert
-        ``param_map`` views sorted by expert index.  Example — a layer with 2
+        Returns ``{(prefix, proj): [spec_0, spec_1, ...]}`` — the per-expert
+        ``param_map`` specs sorted by expert index. Example — a layer with 2
         local experts (gated MoE) yields three keys:
-          ``(".../experts", "gate_proj"): [view(expert 0), view(expert 1)]``
-          ``(".../experts", "up_proj")  : [view(expert 0), view(expert 1)]``
-          ``(".../experts", "down_proj"): [view(expert 0), view(expert 1)]``
+          ``(".../experts", "gate_proj"): [spec(expert 0), spec(expert 1)]``
+          ``(".../experts", "up_proj")  : [spec(expert 0), spec(expert 1)]``
+          ``(".../experts", "down_proj"): [spec(expert 0), spec(expert 1)]``
 
-        Resolving names → views here (rather than per refit in ``_group_experts``)
-        costs nothing extra — ``param_map`` already owns these views and they
-        stay valid across refits (weights are updated in place; the name→view
-        mapping is stable), so ``_group_experts`` only has to ``torch.stack``.
-        The index sort matters: the views are stacked in this order, so expert 0
+        Resolving names → specs here costs nothing extra and stays valid across
+        refits because weights are updated in place. The index sort matters:
+        source tensors are stacked in this order, so expert 0
         must precede expert 1 to match the EP ``Shard(0)`` layout the gen side
         expects.
         """
@@ -2543,26 +2689,23 @@ class MegatronPolicyWorkerImpl(
         }
 
     def _group_experts(self, proj, grouped_name, expert_groups):
-        """Stack this rank's local experts for one projection into ``[E_local, ...]``.
-
-        Using the pre-calculated ``expert_groups`` (from ``_build_expert_groups``)
-        it is just calling torch.stack of all the local expert params.
-        """
+        """Describe local experts that must be stacked into ``[E_local, ...]``."""
         prefix = grouped_name.rsplit(f".{proj}.weight", 1)[0]
-        expert_tensors = expert_groups.get((prefix, proj))
-        assert expert_tensors, (
+        expert_specs = expert_groups.get((prefix, proj))
+        assert expert_specs, (
             f"no local experts for {grouped_name!r} (proj={proj!r}); "
             "PP-filter / expert-group-metadata inconsistency"
         )
-        return torch.stack(expert_tensors)
+        return _GroupedRefitSource(tuple(expert_specs))
 
     def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
         """Build the Megatron-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
 
         Wraps this rank's local Megatron shards into ``LocalParamSpec``s:
         - direct: ``base`` is sharded local tensor view, sent as-is.
-        - grouped MoE expert: ``pre`` stacks the per-expert views into
-          ``[E_local, ...]`` fresh each refit via ``_group_experts``.
+        - MXFP8: ``base`` describes the quantized source and logical component.
+        - grouped MoE expert: ``base`` holds the ordered per-expert specs, which
+          are materialized and stacked into ``[E_local, ...]`` each refit.
         """
         # This rank's local TP/EP HF param shards (live views), and the
         # per-expert views grouped for torch.stack.  Build-time only.
@@ -2570,12 +2713,9 @@ class MegatronPolicyWorkerImpl(
         expert_groups = self._build_expert_groups(param_map)
 
         def _expert_spec(proj, grouped_name):
-            def pre(_base):
-                return RefitCtx(
-                    buf=self._group_experts(proj, grouped_name, expert_groups)
-                )
-
-            return LocalParamSpec(base=None, pre=pre)
+            return LocalParamSpec(
+                base=self._group_experts(proj, grouped_name, expert_groups)
+            )
 
         mapping = {}
         for layer_name in refit_info["layer_names"]:
@@ -2584,7 +2724,12 @@ class MegatronPolicyWorkerImpl(
                 if p.get("grouped_expert_proj"):
                     mapping[name] = _expert_spec(p["grouped_expert_proj"], name)
                 else:
-                    mapping[name] = LocalParamSpec(base=param_map.get(name))
+                    spec = param_map.get(name)
+                    if spec is None:
+                        raise RuntimeError(
+                            f"No local Megatron refit source maps to {name!r}."
+                        )
+                    mapping[name] = spec
         return HFToLocalParamMap(specs=mapping)
 
     @torch.no_grad()
@@ -2605,53 +2750,57 @@ class MegatronPolicyWorkerImpl(
         # refits.
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
-        # spec.pre (grouped-MoE expert stacking) and spec.post enqueue on this
-        # worker's current stream; xferdtensor should use the same stream.
+        # MXFP8 source dequantization, grouped-MoE stacking, and spec.post enqueue
+        # on this worker's current stream; xferdtensor uses the same stream.
         nccl_reshard_stream = torch.cuda.current_stream()
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
-            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
-                layer_name
-            ]:
-                # Each train worker handles only its own PP stage's params
-                # (non-PP = every param is in pp_stage 0).
-                if param_info.get("pp_stage", 0) != self.my_pp_stage:
-                    continue
-                group = self.pp_comm_group
+            # Gate/up and grouped expert specs in one logical layer can share a
+            # training parameter. Keep those materializations only until every
+            # parameter in the layer has been enqueued, rather than retaining a
+            # model-sized BF16 cache for the full refit.
+            logical_source_cache: dict[int, torch.Tensor] = {}
+            try:
+                for param_info in self.nccl_reshard_refit_info["per_layer_params"][
+                    layer_name
+                ]:
+                    # Each train worker handles only its own PP stage's params
+                    # (non-PP = every param is in pp_stage 0).
+                    if param_info.get("pp_stage", 0) != self.my_pp_stage:
+                        continue
+                    group = self.pp_comm_group
 
-                spec = self.hf_to_local_param_map.get(param_info["name"])
-                assert spec is not None, (
-                    f"no spec for {param_info['name']!r} in hf_to_local_param_map"
-                )
-                # pre stacks grouped MoE experts fresh each refit; a direct
-                # param sends its live TP/EP-local view as-is.
-                ctx = (
-                    spec.pre(spec.base)  # stack grouped MoE experts
-                    if spec.pre is not None
-                    else RefitCtx(buf=spec.base)  # send local shard as-is
-                )
-                assert ctx.buf is not None, (
-                    f"no local tensor for {param_info['name']!r}"
-                )
-                src_tensor = DTensorRef(
-                    local_tensor=ctx.buf, global_shape=param_info["global_shape"]
-                )
-                xferdtensor(
-                    src_tensor,
-                    param_info["src_mesh_info"],
-                    param_info["src_placements"],
-                    None,
-                    param_info["dst_mesh_info"],
-                    param_info["dst_placements"],
-                    group,
-                    nccl_reshard_stream,
-                )
-                if spec.post is not None:
-                    spec.post(ctx)
-                # Drop refs to the per-iteration grouped MoE tensor so its CUDA
-                # memory returns to the caching allocator
-                del ctx, src_tensor
+                    spec = self.hf_to_local_param_map.get(param_info["name"])
+                    assert spec is not None, (
+                        f"no spec for {param_info['name']!r} in hf_to_local_param_map"
+                    )
+                    ctx = self._materialize_local_refit_spec(spec, logical_source_cache)
+                    assert ctx.buf is not None, (
+                        f"no local tensor for {param_info['name']!r}"
+                    )
+                    src_tensor = DTensorRef(
+                        local_tensor=ctx.buf, global_shape=param_info["global_shape"]
+                    )
+                    xferdtensor(
+                        src_tensor,
+                        param_info["src_mesh_info"],
+                        param_info["src_placements"],
+                        None,
+                        param_info["dst_mesh_info"],
+                        param_info["dst_placements"],
+                        group,
+                        nccl_reshard_stream,
+                    )
+                    if spec.post is not None:
+                        spec.post(ctx)
+                    # Drop refs to per-param views and grouped tensors promptly.
+                    del ctx, src_tensor
+            finally:
+                # Never retain stale BF16 materializations across layers or
+                # optimizer steps.
+                logical_source_cache.clear()
 
         torch.cuda.synchronize()
+
         torch.cuda.empty_cache()
 
         import time
@@ -2685,13 +2834,29 @@ class MegatronPolicyWorkerImpl(
         )
 
     def prepare_for_lp_inference(self):
-        self.model = self.move_model(self.model, "cuda", move_grads=False)
+        # MXFP8 overlap aliases the parameter all-gather buffer to grad storage.
+        # Keep that allocation available for logprob forwards, whose pre-hooks
+        # may need it for parameter all-gather. reload_from_cpu is a no-op for
+        # the normal refit path, which deliberately keeps the allocation resident.
+        uses_mxfp8_shared_buffer = self._uses_mxfp8_overlap_shared_param_buffer()
+        self.model = self.move_model(
+            self.model, "cuda", move_grads=uses_mxfp8_shared_buffer
+        )
+        if uses_mxfp8_shared_buffer and self.optimizer is not None:
+            # reload_from_cpu() intentionally zeros grad_data. When forward
+            # hooks are still enabled, that storage is also the parameter AG
+            # buffer, so restage the optimizer masters before inference can
+            # dispatch a gather from it. This is a no-op when refit already
+            # disabled the hooks after a forced sync.
+            self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
         self.model.eval()
 
-        # offload grads to cpu
-        self.model = self.move_model(
-            self.model, "cpu", move_params=False, move_grads=True
-        )  # get rid of grad buffers
+        # Ordinary parameter and grad buffers have independent storage, so their
+        # gradients can still be released during logprob inference.
+        if not uses_mxfp8_shared_buffer:
+            self.model = self.move_model(
+                self.model, "cpu", move_params=False, move_grads=True
+            )  # get rid of grad buffers
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
@@ -2761,12 +2926,25 @@ class MegatronPolicyWorkerImpl(
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
-        """Offload the optimizer and buffers to the CPU."""
+        """Offload optimizer state and buffers that are safe to release."""
         # An in-flight async checkpoint keeps references to the CUDA tensors in
         # its sharded state dict until the write is finalized. Offloading swaps
         # those tensors for CPU storage, so the checkpoint references would keep
         # the old CUDA storage alive and defeat the offload.
         self.finalize_async_save()
+
+        # With MXFP8 overlap, the optimizer updates FP32 master shards and the
+        # next parameter all-gather requantizes them into the model weights. A
+        # refit happens between optimizer steps, before that next training
+        # forward, so force the gather now. This both gives generation the
+        # latest weights and leaves hooks disabled while the shared param/grad
+        # buffer is held across refit. The normal train-step transition
+        # re-enables them.
+        if (
+            self._uses_mxfp8_overlap_shared_param_buffer()
+            and self._forward_pre_hook_enabled()
+        ):
+            self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
 
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -2775,9 +2953,17 @@ class MegatronPolicyWorkerImpl(
         print(
             f"GPU Memory before optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
+        # MXFP8 overlap aliases parameter all-gather and gradient storage. Keep
+        # that allocation resident: resizing it out from under the persistent
+        # autograd/DDP views makes the next backward accumulate into invalid
+        # storage. Ordinary independent grad buffers remain safe to offload.
+        keep_shared_buffer = self._uses_mxfp8_overlap_shared_param_buffer()
         self.model = self.move_model(
-            self.model, "cpu", move_params=False, move_grads=True
-        )  # get rid of grad buffers
+            self.model,
+            "cpu",
+            move_params=False,
+            move_grads=not keep_shared_buffer,
+        )
 
         # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
         # buffers in offload_before_refit (before weight transfer to the inference
@@ -2866,7 +3052,13 @@ class MegatronPolicyWorkerImpl(
 
         no_grad = torch.no_grad()
         no_grad.__enter__()
-        self.model = self.move_model(self.model, "cpu")
+        keep_shared_buffer = self._uses_mxfp8_overlap_shared_param_buffer()
+        self.model = self.move_model(
+            self.model,
+            "cpu",
+            move_params=not keep_shared_buffer,
+            move_grads=not keep_shared_buffer,
+        )
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function

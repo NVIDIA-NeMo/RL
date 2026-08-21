@@ -12,17 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit test for the train-side expert stacking (``_group_experts``).
+"""Unit tests for train-side expert source grouping and materialization.
 
-``_group_experts`` (``MegatronPolicyWorkerImpl``) stacks this rank's local
-per-expert tensors for one projection into ``[E_local, ...]``.  It doesn't use
-``self`` and operates on plain tensors, so a dummy ``self`` + CPU tensors suffice.
+``_group_experts`` (``MegatronPolicyWorkerImpl``) records this rank's local
+per-expert sources for one projection. The refit loop materializes and stacks
+them into ``[E_local, ...]``. Plain CPU tensors suffice for the BF16 path.
 
 Importing ``megatron_policy_worker`` pulls in megatron.core, so this is
 mcore-marked and skipped where mcore is unavailable.
 """
-
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -37,15 +35,15 @@ pytest.importorskip("megatron.bridge")
 from nemo_rl.models.policy.workers.megatron_policy_worker import (  # noqa: E402
     MegatronPolicyWorkerImpl,
 )
+from nemo_rl.weight_sync.nccl_reshard_utils import LocalParamSpec  # noqa: E402
 
 pytestmark = pytest.mark.mcore
 
 
 def _group(proj, grouped_name, expert_groups):
-    # _group_experts ignores self; pass a dummy.
-    return MegatronPolicyWorkerImpl._group_experts(
-        SimpleNamespace(), proj, grouped_name, expert_groups
-    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    grouped = worker._group_experts(proj, grouped_name, expert_groups)
+    return worker._materialize_local_refit_spec(LocalParamSpec(base=grouped), {}).buf
 
 
 def test_group_experts_stacks_in_order():
@@ -53,7 +51,13 @@ def test_group_experts_stacks_in_order():
     e0 = torch.randn(1536, 4096)
     e1 = torch.randn(1536, 4096)
     e2 = torch.randn(1536, 4096)
-    groups = {(prefix, "gate_proj"): [e0, e1, e2]}
+    groups = {
+        (prefix, "gate_proj"): [
+            LocalParamSpec(base=e0),
+            LocalParamSpec(base=e1),
+            LocalParamSpec(base=e2),
+        ]
+    }
     out = _group("gate_proj", f"{prefix}.gate_proj.weight", groups)
     assert out.shape == (3, 1536, 4096)
     # Order preserved (expert 0 first).
@@ -63,7 +67,7 @@ def test_group_experts_stacks_in_order():
 
 
 def test_group_experts_missing_group_raises():
-    groups = {("other.experts", "gate_proj"): [torch.randn(8, 8)]}
+    groups = {("other.experts", "gate_proj"): [LocalParamSpec(base=torch.randn(8, 8))]}
     with pytest.raises(AssertionError):
         _group("gate_proj", "model.layers.0.mlp.experts.gate_proj.weight", groups)
 
@@ -88,9 +92,9 @@ def test_build_hf_to_local_param_map_train_side():
     e0 = torch.randn(128, 16)  # this rank's local expert 0 gate_proj
     e1 = torch.randn(128, 16)  # local expert 1 gate_proj
     w._iter_local_hf_param_shards = lambda: [
-        ("model.layers.0.mlp.down_proj.weight", direct),
-        (f"{prefix}.0.gate_proj.weight", e0),
-        (f"{prefix}.1.gate_proj.weight", e1),
+        ("model.layers.0.mlp.down_proj.weight", LocalParamSpec(base=direct)),
+        (f"{prefix}.0.gate_proj.weight", LocalParamSpec(base=e0)),
+        (f"{prefix}.1.gate_proj.weight", LocalParamSpec(base=e1)),
     ]
     refit_info = {
         "layer_names": ["model.layers.0"],
@@ -116,10 +120,10 @@ def test_build_hf_to_local_param_map_train_side():
     d = pmap.get("model.layers.0.mlp.down_proj.weight")
     assert d.base is direct and d.pre is None and d.post is None
 
-    # Grouped expert: pre stacks this rank's per-expert views into [E_local, ...]
-    # fresh each refit (base unused — the views are captured in the hook).
+    # Grouped expert: the base recipe retains the per-expert live views and the
+    # refit loop stacks them into [E_local, ...] on each refit.
     g = pmap.get(f"{prefix}.gate_proj.weight")
-    assert g.pre is not None
-    ctx = g.pre(g.base)
+    assert g.pre is None
+    ctx = w._materialize_local_refit_spec(g, {})
     assert ctx.buf.shape == (2, 128, 16)
     assert torch.equal(ctx.buf[0], e0) and torch.equal(ctx.buf[1], e1)
