@@ -20,8 +20,6 @@ from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.dynamo.token_wrapper import (
     DynamoTokenWrapperServer,
-    _inject_gym_token_metadata,
-    _validate_engine_data,
     prepare_dynamo_chat_completion_request,
 )
 
@@ -299,7 +297,12 @@ def test_public_qwen3_multiturn_prefix_splice_parity(
     expected_splice = assistant_prefix[:-2] + expected[assistant_eos_index:]
 
     prepared = prepare_dynamo_chat_completion_request(
-        {"model": "Qwen/Qwen3-0.6B", "messages": messages, "tools": TOOLS},
+        {
+            "model": "Qwen/Qwen3-0.6B",
+            "messages": messages,
+            "tools": TOOLS,
+            "required_prefix_token_ids": first_prompt + generation_token_ids,
+        },
         tokenizer=tokenizer,
         tokenizer_chat_template_kwargs=template_kwargs,
         exclude_tools_when_tool_choice_none=True,
@@ -331,18 +334,18 @@ def test_prepare_dynamo_chat_completion_request_preserves_logprob_fields() -> No
     }
 
 
-def test_prepare_dynamo_chat_completion_request_preserves_prior_prefix() -> None:
+def test_prepare_dynamo_chat_completion_request_uses_gym_prefix() -> None:
     tokenizer = _Tokenizer()
     body = {
         "model": "dummy-model",
-        "required_prefix_token_ids": [999],
+        "required_prefix_token_ids": [10, 31, 32, 2],
         "messages": [
             {"role": "user", "content": "hello"},
             {
                 "role": "assistant",
                 "content": "first",
                 "prompt_token_ids": [10],
-                "generation_token_ids": [31, 32, 2],
+                "generation_token_ids": [55, 56, 2],
                 "generation_log_probs": [-0.1, -0.2, -0.3],
             },
             {"role": "user", "content": "next"},
@@ -364,6 +367,57 @@ def test_prepare_dynamo_chat_completion_request_preserves_prior_prefix() -> None
     assert tokenizer.calls[1]["add_generation_prompt"] is False
     assert tokenizer.calls[0]["tokenize"] is True
     assert tokenizer.calls[1]["tokenize"] is True
+
+
+@pytest.mark.parametrize("required_prefix_token_ids", [None, []])
+def test_prepare_dynamo_chat_completion_request_requires_gym_prefix(
+    required_prefix_token_ids,
+) -> None:
+    body = {
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "first",
+                "prompt_token_ids": [10],
+                "generation_token_ids": [31, 32, 2],
+                "generation_log_probs": [-0.1, -0.2, -0.3],
+            },
+            {"role": "user", "content": "next"},
+        ],
+    }
+
+    if required_prefix_token_ids is not None:
+        body["required_prefix_token_ids"] = required_prefix_token_ids
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "requires required_prefix_token_ids.*"
+            "return_token_id_information.*engine_data"
+        ),
+    ):
+        prepare_dynamo_chat_completion_request(
+            body,
+            tokenizer=_Tokenizer(),
+            exclude_tools_when_tool_choice_none=True,
+        )
+
+
+def test_prepare_dynamo_chat_completion_request_rejects_prefix_without_metadata() -> (
+    None
+):
+    body = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "required_prefix_token_ids": [10, 31, 32, 2],
+    }
+
+    with pytest.raises(ValueError, match="requires a tokenized assistant message"):
+        prepare_dynamo_chat_completion_request(
+            body,
+            tokenizer=_Tokenizer(),
+            exclude_tools_when_tool_choice_none=True,
+        )
 
 
 def test_prepare_dynamo_chat_completion_request_validates_extra_fields() -> None:
@@ -419,6 +473,7 @@ def test_prepare_dynamo_chat_completion_request_normalizes_prior_tool_arguments(
     tokenizer = _Tokenizer()
     body = {
         "model": "dummy-model",
+        "required_prefix_token_ids": [10, 777, 2, 40, 31, 32, 2],
         "messages": [
             {"role": "user", "content": "hello"},
             {
@@ -523,89 +578,18 @@ def test_prepare_dynamo_chat_completion_request_rejects_multiple_choices() -> No
         )
 
 
-def test_validate_engine_data_requires_prompt_completion_and_logprobs() -> None:
-    _validate_engine_data(
-        {
-            "nvext": {
-                "engine_data": {
-                    "prompt_token_ids": [1, 2],
-                    "completion_token_ids": [3],
-                    "completion_logprobs": [-0.25],
-                }
-            }
-        }
-    )
-
-    with pytest.raises(ValueError, match="engine_data"):
-        _validate_engine_data({"nvext": {}})
-    with pytest.raises(ValueError, match="prompt_token_ids"):
-        _validate_engine_data(
-            {
-                "nvext": {
-                    "engine_data": {
-                        "completion_token_ids": [],
-                        "completion_logprobs": [],
-                    }
-                }
-            }
-        )
-    with pytest.raises(ValueError, match="completion_token_ids"):
-        _validate_engine_data(
-            {
-                "nvext": {
-                    "engine_data": {
-                        "prompt_token_ids": [],
-                        "completion_logprobs": [],
-                    }
-                }
-            }
-        )
-    with pytest.raises(ValueError, match="completion_logprobs"):
-        _validate_engine_data(
-            {
-                "nvext": {
-                    "engine_data": {
-                        "prompt_token_ids": [],
-                        "completion_token_ids": [],
-                    }
-                }
-            }
-        )
-
-
-def test_inject_gym_token_metadata_validates_and_populates_message() -> None:
-    response = {
-        "choices": [
-            {
-                "message": {"role": "assistant", "content": "answer"},
-                "logprobs": None,
-            }
-        ],
+def test_forward_chat_completion_reuses_loop_bound_session() -> None:
+    raw_response = {
+        "choices": [{"message": {"role": "assistant", "content": "answer"}}],
         "nvext": {
             "engine_data": {
-                "prompt_token_ids": [1, 2, 3],
-                "completion_token_ids": [4, 5],
-                "completion_logprobs": [-0.25, -0.5],
+                "prompt_token_ids": [1, 2],
+                "completion_token_ids": [3],
+                "completion_logprobs": [-0.25],
             }
         },
     }
 
-    _inject_gym_token_metadata(response)
-
-    assert response["choices"][0]["message"] == {
-        "role": "assistant",
-        "content": "answer",
-        "prompt_token_ids": [1, 2, 3],
-        "generation_token_ids": [4, 5],
-        "generation_log_probs": [-0.25, -0.5],
-    }
-
-    response["nvext"]["engine_data"]["completion_logprobs"] = [-0.25]
-    with pytest.raises(ValueError, match="1 generation log probabilities for 2"):
-        _inject_gym_token_metadata(response)
-
-
-def test_forward_chat_completion_reuses_loop_bound_session() -> None:
     class FakeResponse:
         status = 200
 
@@ -616,7 +600,7 @@ def test_forward_chat_completion_reuses_loop_bound_session() -> None:
             return None
 
         async def text(self):
-            return json.dumps({"choices": []})
+            return json.dumps(raw_response)
 
     class FakeSession:
         def __init__(self):
@@ -637,10 +621,13 @@ def test_forward_chat_completion_reuses_loop_bound_session() -> None:
     server._client_session = session
 
     async def forward_twice():
-        await server._forward_chat_completion({}, authorization=None)
-        await server._forward_chat_completion({}, authorization="Bearer token")
+        first = await server._forward_chat_completion({}, authorization=None)
+        second = await server._forward_chat_completion({}, authorization="Bearer token")
+        return first, second
 
-    asyncio.run(forward_twice())
+    first, second = asyncio.run(forward_twice())
 
     assert len(session.calls) == 2
     assert session.calls[1][2]["Authorization"] == "Bearer token"
+    assert first == (200, raw_response)
+    assert second == (200, raw_response)

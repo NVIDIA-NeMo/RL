@@ -57,8 +57,11 @@ must update and reverify these coupled locations:
   the version-specific #44814 backport
 - `tests/unit/distributed/test_stateless_process_group.py`: vLLM's
   `broadcast_from/0/0` weight-transfer wire key
-- `nemo_rl/models/generation/dynamo/token_wrapper.py`: the real Dynamo response
-  keys `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
+- `nemo_rl/models/generation/dynamo/token_wrapper.py`: the request-side
+  `nvext.extra_fields=["engine_data"]` signal and `nvext.token_data` prompt
+- `3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py`: the real
+  Dynamo response keys
+  `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
   reverify them against real Dynamo output because unit tests validate only the
   expected local response shape
 - `nemo_rl/models/generation/dynamo/managed_runtime.py`: the managed
