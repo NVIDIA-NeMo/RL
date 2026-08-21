@@ -36,7 +36,6 @@ from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
     RewardScalingConfig,
     _apply_configured_message_level_advantage_penalties,
-    _apply_message_level_advantage_penalties,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
@@ -63,7 +62,10 @@ from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
 )
-from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.algorithms.utils import (
+    apply_message_level_advantage_penalties,
+    calculate_baseline_and_std_per_prompt,
+)
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -475,7 +477,7 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
             ]
         }
     )
-    _apply_message_level_advantage_penalties(
+    apply_message_level_advantage_penalties(
         train_data=train_data,
         message_logs=repeated_batch["message_log"],
         invalid_tool_call_advantage=-5.0,
@@ -531,7 +533,7 @@ def test_apply_message_level_advantage_penalties_materializes_broadcasted_advant
         ],
     ]
 
-    _apply_message_level_advantage_penalties(
+    apply_message_level_advantage_penalties(
         train_data=train_data,
         message_logs=message_logs,
         invalid_tool_call_advantage=-5.0,

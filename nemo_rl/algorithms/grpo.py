@@ -58,15 +58,13 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import (
     apply_mask_sample_filter,
+    apply_message_level_advantage_penalties,
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_efficiency_summary,
     print_performance_metrics,
     set_seed,
-)
-from nemo_rl.algorithms.utils import (
-    apply_message_level_advantage_penalties as _apply_message_level_advantage_penalties,
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -1953,7 +1951,7 @@ def _apply_configured_message_level_advantage_penalties(
         invalid_tool_call_advantage,
         malformed_thinking_advantage,
     ) = _resolve_message_level_advantage_penalties(master_config)
-    return _apply_message_level_advantage_penalties(
+    return apply_message_level_advantage_penalties(
         train_data=train_data,
         message_logs=message_logs,
         invalid_tool_call_advantage=invalid_tool_call_advantage,
