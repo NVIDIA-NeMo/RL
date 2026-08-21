@@ -14,13 +14,31 @@
 
 from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
 
-from pydantic import BaseModel, Field, NonNegativeInt, PositiveFloat, PositiveInt
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+)
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
+
+
+# TODO(rohitrango): Move model-specific video fields behind ProcessorInterface.
+class VllmVideoConfig(BaseModel):
+    """Video sampling contract shared by policy preprocessing and vLLM."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sampling_style: Literal["nemotron_vl"]
+    num_frames: PositiveInt
+    temporal_patch_size: PositiveInt
 
 
 class VllmSpecificArgs(TypedDict):
@@ -32,6 +50,9 @@ class VllmSpecificArgs(TypedDict):
     # Additional arguments for vLLM inserted by nemo rl based on the context of when vllm is used
     skip_tokenizer_init: bool
     async_engine: bool
+    # Optional video contract. When present, NeMo RL registers its TorchCodec
+    # loader and uses these exact sampling values on both sides of GRPO.
+    video: NotRequired[VllmVideoConfig]
     load_format: NotRequired[str]
     precision: NotRequired[str]
     # Whether vLLM returns logprobs before or after generation-time logit
@@ -163,6 +184,74 @@ class VllmConfig(GenerationConfig):
     # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
     real_quant_export_cpu_offload: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
+
+
+def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
+    """Validate and return the optional vLLM video sampling contract."""
+    raw_video_config = config["vllm_cfg"].get("video")
+    if raw_video_config is None:
+        return None
+    return VllmVideoConfig.model_validate(raw_video_config)
+
+
+def materialize_vllm_video_config(
+    policy_config: dict[str, Any], data_config: dict[str, Any]
+) -> None:
+    """Apply one video contract to tokenizer, data, and vLLM request config."""
+    generation_config = policy_config["generation"]
+    if generation_config["backend"] != "vllm":
+        return
+
+    video_config = resolve_vllm_video_config(generation_config)
+    if video_config is None:
+        return
+
+    # Keep the normalized value dict-shaped for OmegaConf/Ray serialization.
+    generation_config["vllm_cfg"]["video"] = video_config.model_dump()
+
+    tokenizer_video_config = policy_config["tokenizer"].setdefault("video", {})
+    tokenizer_video_config["num_frames"] = video_config.num_frames
+
+    # TODO(rohitrango): Let ProcessorInterface materialize model-specific data keys.
+    data_defaults = data_config.setdefault("default", {})
+    data_defaults.update(
+        {
+            "num_frames": video_config.num_frames,
+            "video_sampling_style": video_config.sampling_style,
+            "video_temporal_patch_size": video_config.temporal_patch_size,
+        }
+    )
+
+    vllm_kwargs = generation_config.get("vllm_kwargs")
+    if vllm_kwargs is None:
+        raise ValueError(
+            "policy.generation.vllm_kwargs is required when vllm_cfg.video is set"
+        )
+    limit_mm_per_prompt = vllm_kwargs.get("limit_mm_per_prompt")
+    if not isinstance(limit_mm_per_prompt, dict):
+        raise ValueError(
+            "policy.generation.vllm_kwargs.limit_mm_per_prompt must configure video"
+        )
+    video_limit = limit_mm_per_prompt.get("video")
+    if not isinstance(video_limit, dict):
+        raise ValueError(
+            "policy.generation.vllm_kwargs.limit_mm_per_prompt.video must be a mapping"
+        )
+    video_limit["num_frames"] = video_config.num_frames
+
+    media_io_kwargs = vllm_kwargs.setdefault("media_io_kwargs", {})
+    if not isinstance(media_io_kwargs, dict):
+        raise ValueError(
+            "policy.generation.vllm_kwargs.media_io_kwargs must be a mapping"
+        )
+    video_media_io_kwargs = media_io_kwargs.setdefault("video", {})
+    if not isinstance(video_media_io_kwargs, dict):
+        raise ValueError(
+            "policy.generation.vllm_kwargs.media_io_kwargs.video must be a mapping"
+        )
+    # VideoMediaIO otherwise defaults to 32 independently of the policy-side
+    # frame count. Materializing the value here makes a mismatch impossible.
+    video_media_io_kwargs["num_frames"] = video_config.num_frames
 
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:

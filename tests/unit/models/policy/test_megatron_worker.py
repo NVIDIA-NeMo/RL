@@ -681,6 +681,8 @@ def test_prepare_for_generation_disables_param_gather_hook_before_wake(
         lambda *, param_sync=False: events.append(("disable_hook", param_sync))
     )
     worker._inference_engine_initialized = True
+    # Asleep, so the idempotent-wake guard falls through to the full wake path.
+    worker._inference_engine_asleep = True
     worker._wake = lambda: events.append("wake_engine")
 
     monkeypatch.setattr(megatron_worker, "log_gpu_memory", lambda *_: None)
