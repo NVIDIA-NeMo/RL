@@ -191,32 +191,62 @@ if [[ "$FREEZE_VICTIM" == "true" && "$KILL_DURING_REFIT" != "true" ]]; then
     exit 1
 fi
 
+# FREEZE_MODE: which side of the probe's condemnation clock the refit deadline lands on.
+# The two orderings reach different code and assert different outcomes; neither subsumes
+# the other. Set at the top level, not inside the FREEZE_VICTIM block, because the
+# assertion section reads it unconditionally under `set -u`.
+FREEZE_MODE=${FREEZE_MODE:-condemn-first}
+if [[ "$FREEZE_VICTIM" == "true" && "$FREEZE_MODE" != "condemn-first" && "$FREEZE_MODE" != "abort-first" ]]; then
+    echo "[recovery] FATAL: FREEZE_MODE='$FREEZE_MODE'; expected condemn-first or abort-first."
+    exit 1
+fi
+
 if [[ "$FREEZE_VICTIM" == "true" ]]; then
-    # The deadline has to land in a window with a floor AND a ceiling.
+    # Floor, shared by both modes -- the deadline must outlast the hold. The hold sits
+    # INSIDE the watchdog window by design (see test_the_hold_is_inside_the_watchdog_not_
+    # before_it), so the clock starts when the refit begins, not when the victim is frozen.
+    # The harness then spends a couple of seconds confirming every worker is parked,
+    # freezing one, and proving it reached state T. Job 6414909 set the deadline to 5s and
+    # the abort fired during that window: RefitAborted was raised correctly, but before any
+    # shard was frozen, so the recovery had nothing to exclude.
     #
-    # Ceiling -- it must beat the probe. A frozen shard stops answering is_alive, so the
-    # probe condemns it after unhealthy_threshold * probe_interval_s. Once it is DEAD the
-    # reconcile before each refit drops it, the collective never stalls, and the watchdog
-    # has nothing to fire on. Job 6408766: probe 15s, deadline 60s, probe won by 45 and
-    # the run finished all 24 steps with zero RefitAborted.
-    #
-    # Floor -- it must outlast the hold. The hold sits INSIDE the watchdog window by
-    # design (see test_the_hold_is_inside_the_watchdog_not_before_it), so the clock starts
-    # when the refit begins, not when the victim is frozen. The harness then spends a
-    # couple of seconds confirming every worker is parked, freezing one, and proving it
-    # reached state T. Job 6414909 set the deadline to 5s and the abort fired during that
-    # window: RefitAborted was raised correctly, but before any shard was frozen, so the
-    # recovery had nothing to exclude and the run died instead of carrying on.
-    #
-    # HOLD_BUDGET_S covers confirm + freeze + verify. 10s then sits ~7s after the freeze
-    # and ~8s before condemnation, and is still far above a healthy refit (2.2-2.4s
-    # observed on 4xGB200 for this 1.5B model) so it cannot fire on a merely slow one.
-    # 5, not a guess: job 6414909 ran with a 5s deadline and the abort fired before the
-    # freeze landed, so confirm+freeze+verify demonstrably takes at least that long. The
-    # `sleep 2` after SIGSTOP is 2s of it on its own.
+    # HOLD_BUDGET_S covers confirm + freeze + verify. 5, not a guess: job 6414909 ran with
+    # a 5s deadline and the abort fired before the freeze landed, so confirm+freeze+verify
+    # demonstrably takes at least that long. The `sleep 2` after SIGSTOP is 2s on its own.
     HOLD_BUDGET_S=${HOLD_BUDGET_S:-5}
+
+    # Where the deadline sits relative to PROBE_CONDEMN_S decides which path the recovery
+    # takes, because a frozen rank is condemned by the probe and by nothing else -- it
+    # cannot die, so ActorDiedError never comes.
+    #
+    #   condemn-first (default, and the production ordering: refit_timeout_s defaults to
+    #     60s against a 15s condemnation). The probe condemns the frozen shard to DEAD while
+    #     the collective is still hung -- condemning it does NOT unblock the collective,
+    #     since membership is reconciled before a refit, not during one. The deadline then
+    #     fires, RefitAborted propagates, and the recovery finds absent=[victim] and rebuilds
+    #     over the survivor. Asserts the whole path: abort AND recover.
+    #
+    #   abort-first. The deadline beats the probe, so the victim is still SUSPECT when the
+    #     recovery runs -- and SUSPECT is deliberately not absent, because a suspect shard is
+    #     alive and joins the refit normally (FleetHealthMonitor.absent_shards). absent comes
+    #     back empty and _reconcile_refit_membership refuses to rebuild rather than hang on
+    #     the same silent rank again. Asserts the abort fires and the run dies ATTRIBUTABLY
+    #     rather than wedging, which is the whole gain over pre-deadline behaviour.
+    #
+    # Job 6415228 ran the condemn-first assertions against an abort-first deadline (12.5s vs
+    # a 15s condemnation) and failed for that reason alone: the abort fired exactly as
+    # designed, absent came back empty, and the run exited 1 on the deliberate refusal.
     if [[ -z "$REFIT_TIMEOUT_S_SET_BY_CALLER" ]]; then
-        REFIT_TIMEOUT_S=$(awk "BEGIN{printf \"%.1f\", $HOLD_BUDGET_S + $PROBE_CONDEMN_S / 2}")
+        if [[ "$FREEZE_MODE" == "condemn-first" ]]; then
+            # Two full condemnation windows of margin, not one. The probe's own calls to a
+            # frozen actor have to time out before a round counts as failed, so condemnation
+            # measured from the freeze runs somewhat longer than the nominal
+            # unhealthy_threshold * probe_interval_s. Overshooting costs only wall-clock;
+            # undershooting silently turns this into abort-first and fails confusingly.
+            REFIT_TIMEOUT_S=$(awk "BEGIN{printf \"%.1f\", $HOLD_BUDGET_S + 2 * $PROBE_CONDEMN_S}")
+        else
+            REFIT_TIMEOUT_S=$(awk "BEGIN{printf \"%.1f\", $HOLD_BUDGET_S + $PROBE_CONDEMN_S / 2}")
+        fi
     fi
     if ! awk "BEGIN{exit !($REFIT_TIMEOUT_S > $HOLD_BUDGET_S)}"; then
         echo "[recovery] FATAL: refit_timeout_s=${REFIT_TIMEOUT_S}s does not outlast the"
@@ -226,14 +256,27 @@ if [[ "$FREEZE_VICTIM" == "true" ]]; then
         echo "[recovery] the run dies (job 6414909)."
         exit 1
     fi
-    if ! awk "BEGIN{exit !($REFIT_TIMEOUT_S < $PROBE_CONDEMN_S)}"; then
-        echo "[recovery] FATAL: refit_timeout_s=${REFIT_TIMEOUT_S}s is not below the ${PROBE_CONDEMN_S}s"
-        echo "[recovery] the probe takes to condemn a frozen shard (${UNHEALTHY_THRESHOLD} x ${PROBE_INTERVAL_S}s)."
-        echo "[recovery] The probe would drop the shard from the refit membership first, the"
-        echo "[recovery] collective would never stall, and this variant would assert nothing."
-        exit 1
+    if [[ "$FREEZE_MODE" == "condemn-first" ]]; then
+        CONDEMN_BY_S=$(awk "BEGIN{printf \"%.1f\", $HOLD_BUDGET_S + $PROBE_CONDEMN_S}")
+        if ! awk "BEGIN{exit !($REFIT_TIMEOUT_S > $CONDEMN_BY_S)}"; then
+            echo "[recovery] FATAL: FREEZE_MODE=condemn-first needs refit_timeout_s above ${CONDEMN_BY_S}s"
+            echo "[recovery] (the ~${HOLD_BUDGET_S}s hold+freeze plus the ${PROBE_CONDEMN_S}s the probe takes to"
+            echo "[recovery] condemn a frozen shard), but it is ${REFIT_TIMEOUT_S}s. The abort would beat the"
+            echo "[recovery] probe, the victim would still be SUSPECT, absent would come back empty"
+            echo "[recovery] and the rebuild would be refused -- that is FREEZE_MODE=abort-first."
+            exit 1
+        fi
+        echo "[recovery] frozen variant (condemn-first): deadline ${REFIT_TIMEOUT_S}s, above the ${PROBE_CONDEMN_S}s probe condemnation; expect abort THEN recovery"
+    else
+        if ! awk "BEGIN{exit !($REFIT_TIMEOUT_S < $PROBE_CONDEMN_S)}"; then
+            echo "[recovery] FATAL: FREEZE_MODE=abort-first needs refit_timeout_s below the ${PROBE_CONDEMN_S}s"
+            echo "[recovery] the probe takes to condemn a frozen shard (${UNHEALTHY_THRESHOLD} x ${PROBE_INTERVAL_S}s), but it"
+            echo "[recovery] is ${REFIT_TIMEOUT_S}s. The probe would condemn the victim first and the run"
+            echo "[recovery] would recover -- that is FREEZE_MODE=condemn-first."
+            exit 1
+        fi
+        echo "[recovery] frozen variant (abort-first): deadline ${REFIT_TIMEOUT_S}s, between the ~${HOLD_BUDGET_S}s hold+freeze and the ${PROBE_CONDEMN_S}s probe condemnation; expect an attributable failure"
     fi
-    echo "[recovery] frozen variant: deadline ${REFIT_TIMEOUT_S}s, between the ~${HOLD_BUDGET_S}s hold+freeze and the ${PROBE_CONDEMN_S}s probe condemnation"
 fi
 
 HOLD_FILE="$EXP_DIR/hold_refit"
@@ -499,6 +542,46 @@ fi
 # on exactly the failure this test exists to report. Same form as the chaos harness.
 wait $TRAIN_PID && EXIT_CODE=0 || EXIT_CODE=$?
 echo "[recovery] job exited $EXIT_CODE, ${ELAPSED}s after the kill"
+
+# abort-first is the one variant where a non-zero exit is the PASS. The victim is still
+# SUSPECT when the recovery runs, nothing is absent, and the reconcile refuses to rebuild
+# over a fleet that still contains a silent rank -- see the FREEZE_MODE block above. What
+# is under test is that the refusal is REACHED, by way of the abort, and says why: before
+# the deadline existed this same scenario wedged forever (job 5898311). Handled before the
+# generic exit-code check below, which would otherwise report it as a failure.
+if [[ "$FREEZE_VICTIM" == "true" && "$FREEZE_MODE" == "abort-first" ]]; then
+    if (( EXIT_CODE == 0 )); then
+        echo "[recovery] FAIL: abort-first expects the run to stop attributably, but it"
+        echo "[recovery] exited 0. Most likely the probe condemned the victim before the"
+        echo "[recovery] ${REFIT_TIMEOUT_S}s deadline fired (condemnation is ${PROBE_CONDEMN_S}s), which is"
+        echo "[recovery] condemn-first behaviour -- run FREEZE_MODE=condemn-first instead."
+        exit 1
+    fi
+    if ! grep -q "RefitAborted" "$RUN_LOG"; then
+        echo "[recovery] FAIL: the run died, but no RefitAborted appears in the log, so it"
+        echo "[recovery] did not die of the abort. Something else killed it."
+        grep -E "Error|Traceback|RayActorError" "$RUN_LOG" | tail -20
+        exit 1
+    fi
+    if ! grep -q "no generation shard could be identified as absent" "$RUN_LOG"; then
+        echo "[recovery] FAIL: RefitAborted fired, but the run did not stop on the"
+        echo "[recovery] reconcile's refusal, so it died somewhere unintended."
+        grep -E "Error|Traceback|RuntimeError" "$RUN_LOG" | tail -20
+        exit 1
+    fi
+    # Never killed, so it must still be there -- stopped. If it is gone, something else
+    # reaped it and this was the actor-death path after all.
+    if [[ "$(awk '{print $3}' "/proc/$VICTIM/stat" 2>/dev/null || echo gone)" == "gone" ]]; then
+        echo "[recovery] FAIL: the frozen victim disappeared; it was not the frozen-rank"
+        echo "[recovery] scenario that stopped the run, so the result does not mean what it says."
+        exit 1
+    fi
+    echo "[recovery] abort observed:"; grep -m3 "RefitAborted" "$RUN_LOG"
+    echo "[recovery] refusal observed:"; grep -m1 "no generation shard could be identified as absent" "$RUN_LOG"
+    echo "[recovery] PASS: the deadline broke a stalled collective and the run stopped"
+    echo "[recovery] attributably ${ELAPSED}s after the freeze instead of wedging (refit_transport=$REFIT_TRANSPORT)"
+    exit 0
+fi
 
 if (( EXIT_CODE != 0 )); then
     echo "[recovery] FAIL: a surviving shard should have carried the run to completion"
