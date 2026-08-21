@@ -283,6 +283,23 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
 
 
 @requires_weight_folding
+def test_real_quant_refit_forwards_draft_metadata_mode():
+    worker = _make_real_quant_worker()
+    metadata_modes = []
+
+    def iter_draft_weights(*, metadata_only):
+        metadata_modes.append(metadata_only)
+        yield "draft.layers.0.weight", torch.empty(2, device="meta")
+
+    worker._iter_draft_weights_for_refit = iter_draft_weights
+
+    output = list(worker._iter_params_with_optional_kv_scales(draft_metadata_only=True))
+
+    assert metadata_modes == [True]
+    assert output[-1][0] == "draft.layers.0.weight"
+
+
+@requires_weight_folding
 def test_iter_real_quant_refit_params_can_keep_export_on_gpu() -> None:
     worker = _make_real_quant_worker()
     worker.cfg["generation"]["real_quant_export_cpu_offload"] = False
