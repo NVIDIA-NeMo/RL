@@ -619,6 +619,10 @@ class DSparkSpeculator:
     ) -> MegatronModule | None:
         if not self.config.enabled:
             return None
+        target_vocab_size = int(model_provider.vocab_size)
+        draft_vocab_size = self.config.resolve_draft_vocab_size(
+            target_vocab_size=target_vocab_size
+        )
         body_config = DFlashDraftConfig(
             enabled=True,
             model_name=None,
@@ -648,8 +652,6 @@ class DSparkSpeculator:
         )
 
         tp_group = getattr(pg_collection, "tp", None)
-        target_vocab_size = int(model_provider.vocab_size)
-        draft_vocab_size = self.config.draft_vocab_size or target_vocab_size
         tp_size = int(model_provider.tensor_model_parallel_size)
         tp_rank = 0
         if tp_group is not None and torch.distributed.is_initialized():

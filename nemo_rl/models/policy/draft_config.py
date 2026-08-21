@@ -131,6 +131,19 @@ class DSparkDraftConfig(BaseModel, extra="forbid"):
             raise ValueError("at least one DSpark loss weight must be positive")
         return self
 
+    def resolve_draft_vocab_size(self, *, target_vocab_size: int) -> int:
+        """Require the online draft to share the live target vocabulary."""
+        if target_vocab_size <= 0:
+            raise ValueError("live target vocabulary size must be positive")
+        if (
+            self.draft_vocab_size is not None
+            and self.draft_vocab_size != target_vocab_size
+        ):
+            raise ValueError(
+                "DSpark draft vocabulary must match the live target vocabulary"
+            )
+        return target_vocab_size
+
 
 DraftConfig: TypeAlias = Eagle3DraftConfig | DFlashDraftConfig | DSparkDraftConfig
 

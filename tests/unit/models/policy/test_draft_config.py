@@ -183,6 +183,44 @@ def test_dspark_config_preserves_public_qwen3_8b_contract() -> None:
     assert config.target_hidden_state_layer_ids == [1, 9, 17, 25, 33]
 
 
+def test_dspark_config_rejects_vocab_different_from_live_target() -> None:
+    config = DSparkDraftConfig(
+        enabled=True,
+        block_size=7,
+        anchors_per_sample=2,
+        mask_token_id=151669,
+        target_hidden_state_layer_ids=[1, 9, 17, 25, 33],
+        draft_vocab_size=32_000,
+    )
+
+    with pytest.raises(ValueError, match="must match the live target vocabulary"):
+        config.resolve_draft_vocab_size(target_vocab_size=151_936)
+
+
+def test_dspark_config_resolves_target_owned_vocab() -> None:
+    values = {
+        "enabled": True,
+        "block_size": 7,
+        "anchors_per_sample": 2,
+        "mask_token_id": 151669,
+        "target_hidden_state_layer_ids": [1, 9, 17, 25, 33],
+    }
+
+    assert (
+        DSparkDraftConfig(**values).resolve_draft_vocab_size(
+            target_vocab_size=151_936
+        )
+        == 151_936
+    )
+    assert (
+        DSparkDraftConfig(
+            **values,
+            draft_vocab_size=151_936,
+        ).resolve_draft_vocab_size(target_vocab_size=151_936)
+        == 151_936
+    )
+
+
 def test_dspark_update_probe_is_explicitly_opt_in() -> None:
     values = {
         "block_size": 7,

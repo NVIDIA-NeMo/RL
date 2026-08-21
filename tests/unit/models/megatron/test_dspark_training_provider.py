@@ -48,6 +48,21 @@ def test_dspark_registry_resolves_public_training_provider() -> None:
     assert provider.requires_full_cp_local_capture
 
 
+def test_dspark_build_rejects_split_vocab_before_body_creation() -> None:
+    provider = DSparkSpeculator(
+        _config().model_copy(
+            update={"model_name": None, "draft_vocab_size": 32_000}
+        )
+    )
+
+    with pytest.raises(ValueError, match="must match the live target vocabulary"):
+        provider.build_model(
+            model_provider=SimpleNamespace(vocab_size=151_936),
+            pg_collection=SimpleNamespace(),
+            policy_model_chunk=SimpleNamespace(),
+        )
+
+
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_dspark_packed_cp_masks_label_positions_for_counts(cp_size: int) -> None:
     config = _config().model_copy(
