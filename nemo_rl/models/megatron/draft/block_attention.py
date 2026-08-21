@@ -18,6 +18,7 @@ import math
 from typing import TYPE_CHECKING, cast
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.nn.attention.flex_attention import (
     BlockMask,
@@ -474,7 +475,10 @@ def dflash_block_only_attention(
             cp_group=context_parallel_group,
             sequence_dim=1,
         )
-    elif context_parallel_group is not None:
+    elif (
+        context_parallel_group is not None
+        and dist.get_world_size(context_parallel_group) > 1
+    ):
         raise ValueError("context_parallel_group requires a draft sequence layout")
     _validate_block_only_attention_inputs(
         plan=plan,
