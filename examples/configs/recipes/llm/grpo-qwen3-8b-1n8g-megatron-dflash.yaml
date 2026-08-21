@@ -48,6 +48,9 @@ policy:
         model: ${policy.draft.model_name}
         num_speculative_tokens: ${policy.draft.gamma}
         draft_tensor_parallel_size: 1
+      compilation_config:
+        backend: eager
+        cudagraph_mode: PIECEWISE
 
 logger:
   log_dir: logs/grpo-qwen3-8b-1n8g-megatron-dflash
