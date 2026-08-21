@@ -1329,6 +1329,170 @@ def mock_sync_grpo_infrastructure(policy):
     return stack
 
 
+def _run_sync_draft_refit_marker_case(
+    mock_grpo_components,
+    capsys,
+    *,
+    total_steps: int = 0,
+    current_step: int = 0,
+    max_steps: int = 2,
+    val_period: int = 0,
+    refit_side_effect=None,
+):
+    components = mock_grpo_components
+    master_config = components["master_config"]
+    master_config.data_plane = {"enabled": True}
+    master_config.grpo.max_num_steps = max_steps
+    master_config.grpo.max_num_epochs = 2
+    master_config.grpo.val_period = val_period
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.checkpointing["enabled"] = False
+    master_config.policy["draft"] = MagicMock(enabled=True)
+
+    save_state = _initial_grpo_save_state()
+    save_state.total_steps = total_steps
+    save_state.current_step = current_step
+    events: list[str] = []
+    train_result = components["policy"].train.return_value
+    components["policy"].train_from_meta.side_effect = (
+        lambda *args, **kwargs: (events.append("update"), train_result)[1]
+    )
+
+    def refit(*args, **kwargs):
+        events.append("refit")
+        if refit_side_effect is not None:
+            return refit_side_effect()
+
+    def validate(**kwargs):
+        events.append(f"validate:{kwargs['step']}")
+        return {}, {}
+
+    error = None
+    with (
+        mock_sync_grpo_infrastructure(components["policy"]),
+        patch(
+            "nemo_rl.algorithms.grpo_sync.MemoryTracker",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo_sync.refit_policy_generation",
+            side_effect=refit,
+        ),
+        patch("nemo_rl.algorithms.grpo_sync.validate_sync", side_effect=validate),
+    ):
+        try:
+            grpo_train_sync(
+                components["policy"],
+                _mock_policy_generation(),
+                components["train_dataloader"],
+                components["val_dataloader"],
+                components["tokenizer"],
+                components["loss_fn"],
+                components["task_to_env"],
+                components["val_task_to_env"],
+                components["logger"],
+                components["checkpointer"],
+                save_state,
+                master_config,
+            )
+        except RuntimeError as caught:
+            error = caught
+
+    markers = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("draft_post_update_refit=")
+    ]
+    return events, markers, error
+
+
+def test_sync_draft_refit_marker_follows_fresh_update(
+    mock_grpo_components, capsys
+) -> None:
+    events, markers, error = _run_sync_draft_refit_marker_case(
+        mock_grpo_components,
+        capsys,
+    )
+
+    assert error is None
+    assert events == ["refit", "update", "refit", "update"]
+    assert markers == ["draft_post_update_refit=complete step=1"]
+
+
+def test_sync_draft_refit_marker_ignores_resumed_startup_refit(
+    mock_grpo_components, capsys
+) -> None:
+    events, markers, error = _run_sync_draft_refit_marker_case(
+        mock_grpo_components,
+        capsys,
+        total_steps=1,
+        current_step=1,
+    )
+
+    assert error is None
+    assert events == ["refit", "update"]
+    assert markers == []
+
+
+def test_sync_draft_refit_marker_consumes_validation_refits(
+    mock_grpo_components, capsys
+) -> None:
+    events, markers, error = _run_sync_draft_refit_marker_case(
+        mock_grpo_components,
+        capsys,
+        val_period=1,
+    )
+
+    assert error is None
+    assert events == [
+        "refit",
+        "update",
+        "refit",
+        "validate:1",
+        "update",
+        "refit",
+        "validate:2",
+    ]
+    assert markers == [
+        "draft_post_update_refit=complete step=1",
+        "draft_post_update_refit=complete step=2",
+    ]
+
+
+def test_sync_draft_refit_marker_is_silent_on_failure_and_resume(
+    mock_grpo_components, capsys
+) -> None:
+    refit_count = 0
+
+    def fail_second_refit() -> None:
+        nonlocal refit_count
+        refit_count += 1
+        if refit_count == 2:
+            raise RuntimeError("refit failed")
+
+    first_events, first_markers, first_error = _run_sync_draft_refit_marker_case(
+        mock_grpo_components,
+        capsys,
+        refit_side_effect=fail_second_refit,
+    )
+    retry_events, retry_markers, retry_error = _run_sync_draft_refit_marker_case(
+        mock_grpo_components,
+        capsys,
+        total_steps=1,
+        current_step=1,
+    )
+
+    assert isinstance(first_error, RuntimeError)
+    assert str(first_error) == "refit failed"
+    assert first_events == ["refit", "update", "refit"]
+    assert first_markers == []
+    assert retry_error is None
+    assert retry_events == ["refit", "update"]
+    assert retry_markers == []
+
+
 def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components):
     """A fatal collector health result aborts the trainer and still cleans up."""
     master_config = mock_grpo_components["master_config"]
