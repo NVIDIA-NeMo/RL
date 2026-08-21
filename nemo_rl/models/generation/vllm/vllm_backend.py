@@ -757,7 +757,13 @@ class VllmInternalWorkerExtension:
             "qkv_proj": ("q_proj", "k_proj", "v_proj"),
             "gate_up_proj": ("gate_proj", "up_proj"),
         }
-        skipped = _DRAFT_SKIPPED_KEY_SUBSTRINGS[self._speculative_method()]
+        method = self._speculative_method()
+        if method is None:
+            raise RuntimeError(
+                "[draft] Expected draft keys require an active "
+                "speculative_config method, but none is configured."
+            )
+        skipped = _DRAFT_SKIPPED_KEY_SUBSTRINGS[method]
         expected: set[str] = set()
         for name, _ in draft_model.named_parameters():
             if any(s in name for s in skipped):
@@ -785,7 +791,7 @@ class VllmInternalWorkerExtension:
         entirely and are never required to have a drafter.
         """
         method = self._speculative_method()
-        if method not in COTRAINED_SPECULATIVE_METHODS:
+        if method is None or method not in COTRAINED_SPECULATIVE_METHODS:
             return
         if not self._draft_owns_speculator():
             return
