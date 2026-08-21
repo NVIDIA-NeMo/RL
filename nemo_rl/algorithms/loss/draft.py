@@ -116,7 +116,15 @@ def _tp_assert_projected_metadata_agreement(
     exact_tensors: tuple[tuple[str, torch.Tensor | None], ...],
 ) -> None:
     """Fail all TP ranks together before rank-local validation or CE collectives."""
+    max_header_dimensions = 4
     if tp_group is None:
+        if any(
+            tensor is not None and tensor.ndim > max_header_dimensions
+            for _, tensor in tensors
+        ):
+            raise ValueError(
+                "projected soft-CE tensors support at most four dimensions."
+            )
         return
 
     dtype_codes = {
@@ -138,7 +146,9 @@ def _tp_assert_projected_metadata_agreement(
         if tensor is None:
             header_values.extend((0, 0, 0, 0, 0, 0, -1, 0))
             continue
-        shape = (*tensor.shape[:4], *(0 for _ in range(4 - min(tensor.ndim, 4))))
+        shape = tuple(tensor.shape[:max_header_dimensions]) + (0,) * (
+            max_header_dimensions - min(tensor.ndim, max_header_dimensions)
+        )
         header_values.extend(
             (
                 1,
@@ -153,6 +163,12 @@ def _tp_assert_projected_metadata_agreement(
     world_size = torch.distributed.get_world_size(tp_group)
     gathered_headers = [torch.empty_like(header) for _ in range(world_size)]
     torch.distributed.all_gather(gathered_headers, header, group=tp_group)
+    tensor_header_width = max_header_dimensions + 4
+    gathered_tensor_headers = torch.stack(gathered_headers)[
+        :, : len(tensors) * tensor_header_width
+    ].view(world_size, len(tensors), tensor_header_width)
+    if torch.any(gathered_tensor_headers[:, :, 1] > max_header_dimensions).item():
+        raise ValueError("projected soft-CE tensors support at most four dimensions.")
     if any(
         not torch.equal(gathered_headers[0], other) for other in gathered_headers[1:]
     ):

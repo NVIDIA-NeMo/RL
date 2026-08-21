@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from functools import partial
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -367,4 +368,45 @@ def test_tp2_projected_soft_ce_rejects_rank_local_metadata(
     distributed_test_runner(
         partial(_run_tp2_projected_soft_ce_metadata_mismatch, field=field),
         world_size=2,
+    )
+
+
+def _run_tp2_projected_soft_ce_high_rank_mismatch(
+    rank: int,
+    world_size: int,
+) -> None:
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    fifth_dimension = rank + 1
+    student_hidden = torch.ones(1, 1, 1, 1, fifth_dimension, 3)
+    output_weight = torch.ones(8, 3)
+    teacher_logits = torch.ones(1, 1, 1, 1, fifth_dimension, 8)
+    mask = torch.ones(1, 1, 1, 1, fifth_dimension)
+    bin_ids = torch.zeros_like(mask, dtype=torch.long)
+    weights = torch.ones(1)
+
+    with patch.object(
+        torch.distributed,
+        "broadcast",
+        side_effect=AssertionError("unsafe variable-sized broadcast entered"),
+    ):
+        with pytest.raises(ValueError, match="at most four dimensions"):
+            projected_streaming_vocab_parallel_soft_ce(
+                student_hidden=student_hidden,
+                output_weight=output_weight,
+                selected_teacher_logits=teacher_logits,
+                mask=mask,
+                bin_ids=bin_ids,
+                weights=weights,
+                token_chunk_size=1,
+                tp_group=tp_group,
+            )
+
+
+def test_tp2_projected_soft_ce_rejects_high_rank_metadata_before_broadcast(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(
+        _run_tp2_projected_soft_ce_high_rank_mismatch,
+        world_size=2,
+        backend="gloo",
     )
