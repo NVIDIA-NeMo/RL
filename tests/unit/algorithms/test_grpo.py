@@ -43,6 +43,7 @@ from nemo_rl.algorithms.grpo import (
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
     _maybe_restore_async_replay_buffer_checkpoint,
+    _needs_initial_lookahead_barrier,
     _needs_hf_refit_handshake,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
@@ -186,6 +187,23 @@ def test_restore_async_replay_buffer_checkpoint_missing_file(tmp_path):
 
     assert metadata is None
     replay_buffer.load_from_path.remote.assert_not_called()
+
+
+def test_initial_lookahead_barrier_requires_restored_buffer() -> None:
+    args = {
+        "max_trajectory_age_steps": 1,
+        "step": 0,
+        "max_num_steps": 4,
+    }
+
+    assert not _needs_initial_lookahead_barrier(replay_buffer_restored=False, **args)
+    assert _needs_initial_lookahead_barrier(replay_buffer_restored=True, **args)
+    assert not _needs_initial_lookahead_barrier(
+        replay_buffer_restored=True,
+        max_trajectory_age_steps=1,
+        step=3,
+        max_num_steps=4,
+    )
 
 
 @patch("nemo_rl.algorithms.grpo.ray")
