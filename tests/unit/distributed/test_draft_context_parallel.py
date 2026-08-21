@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import socket
 import sys
@@ -329,7 +330,12 @@ def test_tp2_cp_reconstruction_and_projected_gather_are_group_isolated(
     )
 
 
-def _run_cuda_cp_zero_owner_attention(rank: int, world_size: int, port: int) -> None:
+def _run_cuda_cp_zero_owner_attention(
+    rank: int,
+    world_size: int,
+    port: int,
+    all_zero: bool,
+) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     torch.cuda.set_device(rank)
@@ -353,8 +359,9 @@ def _run_cuda_cp_zero_owner_attention(rank: int, world_size: int, port: int) -> 
             tp_size=1,
             device=device,
         )
+        token_valid = torch.zeros if all_zero else torch.ones
         plan = plan_module.build_dflash_batch_plan(
-            torch.ones(1, 16, dtype=torch.bool, device=device),
+            token_valid(1, 16, dtype=torch.bool, device=device),
             sample_ids,
             anchors_per_sample=1,
             gamma=2,
@@ -367,20 +374,30 @@ def _run_cuda_cp_zero_owner_attention(rank: int, world_size: int, port: int) -> 
         )
         owner_counts = [torch.zeros_like(local_blocks) for _ in range(world_size)]
         dist.all_gather(owner_counts, local_blocks)
-        assert sum(int(count.item()) for count in owner_counts) == 1
+        expected_owners = 0 if all_zero else 1
+        assert sum(int(count.item()) for count in owner_counts) == expected_owners
         assert any(int(count.item()) == 0 for count in owner_counts)
 
-        local_length = layout.cp_global_positions.numel()
-        trunk_k = torch.randn(
-            1, local_length, 1, 16, device=device, requires_grad=True
+        full_shape = (1, 16, 1, 16)
+        full_k_value = torch.arange(
+            math.prod(full_shape), dtype=torch.float32, device=device
+        ).reshape(full_shape) / 100
+        full_v_value = torch.flip(full_k_value, dims=(1,))
+        local_positions = layout.cp_global_positions
+        trunk_k = (
+            full_k_value[:, local_positions].detach().clone().requires_grad_(True)
         )
-        trunk_v = torch.randn(
-            1, local_length, 1, 16, device=device, requires_grad=True
+        trunk_v = (
+            full_v_value[:, local_positions].detach().clone().requires_grad_(True)
         )
         block_shape = (plan.sample_rows.numel(), plan.block_size, 1, 16)
-        block_q = torch.randn(block_shape, device=device, requires_grad=True)
-        block_k = torch.randn(block_shape, device=device, requires_grad=True)
-        block_v = torch.randn(block_shape, device=device, requires_grad=True)
+        full_block_shape = (expected_owners, plan.block_size, 1, 16)
+        full_block_value = torch.arange(
+            math.prod(full_block_shape), dtype=torch.float32, device=device
+        ).reshape(full_block_shape) / 50
+        block_q = full_block_value[: block_shape[0]].clone().requires_grad_(True)
+        block_k = (full_block_value[: block_shape[0]] + 0.25).requires_grad_(True)
+        block_v = (full_block_value[: block_shape[0]] - 0.25).requires_grad_(True)
 
         output = attention_module.dflash_block_only_attention(
             plan=plan,
@@ -399,17 +416,73 @@ def _run_cuda_cp_zero_owner_attention(rank: int, world_size: int, port: int) -> 
         assert block_q.grad is not None
         assert block_k.grad is not None
         assert block_v.grad is not None
+
+        oracle_layout = layout_module.build_draft_sequence_layout(
+            logical_sample_ids=sample_ids,
+            cu_seqlens_q=torch.tensor([0, 16], dtype=torch.int64, device=device),
+            cu_seqlens_q_padded=torch.tensor(
+                [0, 16], dtype=torch.int64, device=device
+            ),
+            cp_rank=0,
+            cp_size=1,
+            tp_rank=0,
+            tp_size=1,
+            device=device,
+        )
+        oracle_plan = plan_module.build_dflash_batch_plan(
+            token_valid(1, 16, dtype=torch.bool, device=device),
+            sample_ids,
+            anchors_per_sample=1,
+            gamma=2,
+            optimizer_step=0,
+            seed=0,
+            sequence_layout=oracle_layout,
+        )
+        oracle_k = full_k_value.detach().clone().requires_grad_(True)
+        oracle_v = full_v_value.detach().clone().requires_grad_(True)
+        oracle_q = full_block_value.detach().clone().requires_grad_(True)
+        oracle_block_k = (full_block_value.detach().clone() + 0.25).requires_grad_(
+            True
+        )
+        oracle_block_v = (full_block_value.detach().clone() - 0.25).requires_grad_(
+            True
+        )
+        oracle_output = attention_module.dflash_block_only_attention(
+            plan=oracle_plan,
+            trunk_k=oracle_k,
+            trunk_v=oracle_v,
+            block_q=oracle_q,
+            block_k=oracle_block_k,
+            block_v=oracle_block_v,
+            sequence_layout=oracle_layout,
+        )
+        oracle_output.float().sum().backward()
+        assert oracle_k.grad is not None
+        assert oracle_v.grad is not None
+        torch.testing.assert_close(trunk_k.grad, oracle_k.grad[:, local_positions])
+        torch.testing.assert_close(trunk_v.grad, oracle_v.grad[:, local_positions])
+        if block_shape[0]:
+            assert oracle_q.grad is not None
+            assert oracle_block_k.grad is not None
+            assert oracle_block_v.grad is not None
+            torch.testing.assert_close(output, oracle_output)
+            torch.testing.assert_close(block_q.grad, oracle_q.grad)
+            torch.testing.assert_close(block_k.grad, oracle_block_k.grad)
+            torch.testing.assert_close(block_v.grad, oracle_block_v.grad)
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA GPUs")
-def test_cuda_cp_zero_owner_runs_flex_attention_forward_backward() -> None:
+@pytest.mark.parametrize("all_zero", [False, True], ids=["one_owner", "all_zero"])
+def test_cuda_cp_zero_owner_runs_flex_attention_forward_backward(
+    all_zero: bool,
+) -> None:
     """Both CP ranks must enter K/V collectives when one owns no draft blocks."""
     world_size = 2
     mp.spawn(
         _run_cuda_cp_zero_owner_attention,
-        args=(world_size, _find_free_port()),
+        args=(world_size, _find_free_port(), all_zero),
         nprocs=world_size,
         join=True,
     )

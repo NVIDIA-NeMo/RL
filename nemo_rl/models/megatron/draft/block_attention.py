@@ -489,6 +489,17 @@ def dflash_block_only_attention(
     if not math.isfinite(effective_scale):
         raise ValueError("attention scale must be finite")
 
+    if block_q.shape[0] == 0:
+        # K/V gathering above is collective across CP ranks, and its autograd
+        # backward is collective as well. Keep an explicit zero-valued edge to
+        # both gathered tensors so this empty-query rank still enters backward
+        # while other CP ranks differentiate their owned draft blocks.
+        gathered_dependency = trunk_k.sum() + trunk_v.sum()
+        local_dependency = block_k.sum() + block_v.sum()
+        return block_q * 0 + torch.zeros_like(block_q) * (
+            gathered_dependency + local_dependency
+        )
+
     if block_q.device.type == "cuda":
         block_output = _flex_block_only_attention_cuda(
             plan=plan,
