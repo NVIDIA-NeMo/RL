@@ -387,7 +387,8 @@ def test_provider_resolves_one_dp_cp_group_for_body_and_all_dspark_heads(
     dp_cp_group = object()
     resolved_metadata = {"dp_cp_group": dp_cp_group}
     monkeypatch.setattr(
-        "nemo_rl.models.megatron.draft.dspark_provider.ensure_metadata_has_dp_cp_group",
+        _PROVIDER,
+        "ensure_metadata_has_dp_cp_group",
         lambda metadata: resolved_metadata if metadata is None else metadata,
     )
     provider = build_dspark_provider(
