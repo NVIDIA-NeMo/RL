@@ -4604,14 +4604,15 @@ def async_grpo_train(
                 print(f"Error stopping replay buffer: {e}")
             return
 
-    print("✅ All setup complete, starting buffer wait...")
+    print("✅ All setup complete, starting buffer wait...", flush=True)
     # Clear logger metrics at start of training
     if policy_generation is not None:
         policy_generation.clear_logger_metrics()
 
     # Wait for initial buffer fill for the current training step.
     print(
-        f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
+        f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}...",
+        flush=True,
     )
     timer.start("init/total")
     wait_iterations = 0
@@ -4626,7 +4627,8 @@ def async_grpo_train(
 
         print(
             f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
-            f"step {step} ready={current_step_ready}"
+            f"step {step} ready={current_step_ready}",
+            flush=True,
         )
 
         if current_step_ready:
@@ -4649,7 +4651,8 @@ def async_grpo_train(
                     print(
                         f"  Pipeline barrier: step {step} ready but "
                         f"step {step + 1} not yet — waiting for lookahead fill "
-                        f"to prevent resume deadlock"
+                        f"to prevent resume deadlock",
+                        flush=True,
                     )
                     wait_iterations += 1
                     time.sleep(1.0)
@@ -4664,7 +4667,8 @@ def async_grpo_train(
         if buffer_size_current >= min_trajectories_needed and trajectories_needed > 0:
             print(
                 f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
-                f"trajectories for step {step}"
+                f"trajectories for step {step}",
+                flush=True,
             )
 
         collector_status = ray.get(trajectory_collector.get_status.remote())
@@ -4687,7 +4691,7 @@ def async_grpo_train(
         time.sleep(1.0)
 
     timer.stop("init/total")
-    print(f"✅ Buffer ready for step {step}! Starting training loop...")
+    print(f"✅ Buffer ready for step {step}! Starting training loop...", flush=True)
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
 
