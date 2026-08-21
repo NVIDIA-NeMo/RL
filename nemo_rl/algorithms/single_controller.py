@@ -259,6 +259,7 @@ class SingleControllerActor:
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
             "masked_advantages": [],
+            "num_mask_sample_filtered": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
         }
@@ -1062,8 +1063,9 @@ class SingleControllerActor:
                 if not step_open:
                     raise RuntimeError(
                         "SingleController has no valid response tokens after "
-                        "filtering. Check grpo.seq_logprob_error_threshold to "
-                        "avoid an optimizer step with an empty batch."
+                        "filtering. Check grpo.seq_logprob_error_threshold, "
+                        "grpo.overlong_filtering, and environment mask_sample "
+                        "flags to avoid an optimizer step with an empty batch."
                     )
 
                 with self._timer.time("policy_training"):
@@ -1704,6 +1706,17 @@ class SingleControllerActor:
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
+        mask_sample = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.mask_sample_field)
+        ).bool()
+        truncated = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.truncated_field)
+        ).bool()
+
+        # Advantage statistics use the complete prompt group. Environment,
+        # overlong, and sequence-error masks are composed only for training.
+        advantage_mask = token_mask * sample_mask.unsqueeze(-1)
+        final_sample_mask = sample_mask.clone()
 
         seq_logprob_error_threshold = (
             self._master_config.grpo.seq_logprob_error_threshold
@@ -1715,7 +1728,7 @@ class SingleControllerActor:
             masking_data = BatchedDataDict(
                 {
                     "token_mask": token_mask,
-                    "sample_mask": sample_mask,
+                    "sample_mask": final_sample_mask,
                     "prev_logprobs": tensor_field(
                         data,
                         adv_cfg.policy_logprobs_field,
@@ -1727,7 +1740,7 @@ class SingleControllerActor:
                 }
             )
             num_valid_seqs_before = float(
-                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
                 .sum()
                 .item()
             )
@@ -1736,9 +1749,9 @@ class SingleControllerActor:
                 rewards=rewards,
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
             )
-            sample_mask = masking_data["sample_mask"]
+            final_sample_mask = masking_data["sample_mask"]
             num_valid_seqs_after = float(
-                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
                 .sum()
                 .item()
             )
@@ -1748,8 +1761,6 @@ class SingleControllerActor:
             seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
-
-        mask = token_mask * sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
@@ -1771,28 +1782,45 @@ class SingleControllerActor:
                 adv_cfg.reference_logprobs_field,
             )
 
-        # Training predicts token t from position t - 1, so token_mask[:, 1:]
-        # is the exact mask used when global_valid_toks and the loss are built.
-        has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
-        if has_valid_training_tokens:
+        has_valid_advantage_tokens = bool(advantage_mask[:, 1:].bool().any().item())
+        if has_valid_advantage_tokens:
             advantages = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
-                mask=mask,
+                mask=advantage_mask,
                 repeated_batch=repeated_batch,
                 **kwargs,
             )
         else:
-            advantages = torch.zeros_like(mask)
-        response_advantages = torch.masked_select(advantages, mask.bool())
+            advantages = torch.zeros_like(advantage_mask)
+        response_advantages = torch.masked_select(advantages, advantage_mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["masked_advantages"].append(
             response_advantages.detach().cpu()
         )
 
+        num_mask_sample_filtered = int(mask_sample.sum().item())
+        self._step_log_dict["num_mask_sample_filtered"].append(num_mask_sample_filtered)
+        final_sample_mask = final_sample_mask * (~mask_sample).to(
+            final_sample_mask.dtype
+        )
+        if self._master_config.grpo.overlong_filtering:
+            final_sample_mask = final_sample_mask * (~truncated).to(
+                final_sample_mask.dtype
+            )
+
+        # Training predicts token t from position t - 1, so token_mask[:, 1:]
+        # is the exact mask used when global_valid_toks and the loss are built.
+        final_mask = token_mask * final_sample_mask.unsqueeze(-1)
+        has_valid_training_tokens = bool(final_mask[:, 1:].bool().any().item())
+
         fields_to_put = {adv_cfg.output_field: advantages}
-        if seq_logprob_error_threshold is not None:
-            fields_to_put[adv_cfg.sample_mask_field] = sample_mask
+        if (
+            seq_logprob_error_threshold is not None
+            or self._master_config.grpo.overlong_filtering
+            or num_mask_sample_filtered > 0
+        ):
+            fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
 
         await self._call_dp(
             "put_samples",
@@ -1814,6 +1842,8 @@ class SingleControllerActor:
             adv_cfg.reward_field,
             adv_cfg.token_mask_field,
             adv_cfg.sample_mask_field,
+            adv_cfg.mask_sample_field,
+            adv_cfg.truncated_field,
             *adv_cfg.repeated_batch_fields,
         ]
         if self._policy_logprobs_required:

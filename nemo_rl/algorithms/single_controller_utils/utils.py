@@ -95,6 +95,7 @@ def reduce_advantage_pump_metrics(
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
+    num_mask_sample_filtered: list[int] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -104,6 +105,8 @@ def reduce_advantage_pump_metrics(
         sequence_lengths: All input_lengths trained on this step.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
+        num_mask_sample_filtered: Environment-flagged sample counts, one per
+            streaming chunk.
 
     Returns:
         Step-level reward, advantage, token-count, and optional sequence
@@ -124,6 +127,8 @@ def reduce_advantage_pump_metrics(
             out["advantages/min"] = 0.0
     if sequence_lengths:
         out["total_num_tokens"] = float(sum(sequence_lengths))
+    if num_mask_sample_filtered is not None:
+        out["num_mask_sample_filtered"] = float(sum(num_mask_sample_filtered))
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     return out

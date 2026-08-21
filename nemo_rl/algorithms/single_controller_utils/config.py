@@ -805,6 +805,8 @@ class AdvantageConfig:
     reward_field: str = "total_reward"
     token_mask_field: str = "token_mask"
     sample_mask_field: str = "sample_mask"
+    mask_sample_field: str = "mask_sample"
+    truncated_field: str = "truncated"
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: str = "prev_logprobs"
     generation_logprobs_field: str = "generation_logprobs"
