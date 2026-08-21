@@ -18,8 +18,10 @@ import torch
 
 from nemo_rl.models.generation.megatron.zero_train_gen_kl_patches.core_patches import (
     apply_log_softmax_determinism_patch,
+    apply_te_bik_attention_assert_skip_patch,
     apply_te_gemm_cublas_pinned_patch,
     restore_log_softmax_determinism_patch,
+    restore_te_bik_attention_assert_skip_patch,
     restore_te_gemm_cublas_pinned_patch,
 )
 
@@ -110,3 +112,44 @@ class TestApplyLogSoftmaxDeterminismPatch:
         )
         restore_log_softmax_determinism_patch()
         assert model_utils._compute_distributed_log_softmax_with_grad is original
+
+
+class TestApplyTeBikAttentionAssertSkipPatch:
+    def setup_method(self):
+        restore_te_bik_attention_assert_skip_patch()
+
+    def teardown_method(self):
+        restore_te_bik_attention_assert_skip_patch()
+
+    def test_noops_assert_and_is_idempotent(self, capsys):
+        orig_assert = MagicMock(side_effect=AssertionError("TE too old"))
+        mock_bik_mod = MagicMock()
+        mock_bik_mod.assert_te_supports_batch_invariant_attention = orig_assert
+
+        with patch(
+            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
+            "core_patches.importlib.import_module",
+            return_value=mock_bik_mod,
+        ):
+            apply_te_bik_attention_assert_skip_patch()
+            apply_te_bik_attention_assert_skip_patch()
+            mock_bik_mod.assert_te_supports_batch_invariant_attention()
+
+        orig_assert.assert_not_called()
+        captured = capsys.readouterr()
+        assert captured.out.count("skipped Megatron TE batch-invariant attention") == 1
+
+    def test_restore_puts_back_original(self):
+        orig_assert = MagicMock()
+        mock_bik_mod = MagicMock()
+        mock_bik_mod.assert_te_supports_batch_invariant_attention = orig_assert
+
+        with patch(
+            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
+            "core_patches.importlib.import_module",
+            return_value=mock_bik_mod,
+        ):
+            apply_te_bik_attention_assert_skip_patch()
+            restore_te_bik_attention_assert_skip_patch()
+
+        assert mock_bik_mod.assert_te_supports_batch_invariant_attention is orig_assert
