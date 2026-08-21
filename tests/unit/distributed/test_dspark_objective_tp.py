@@ -23,6 +23,8 @@ import torch.nn.functional as F
 from nemo_rl.algorithms.loss.dspark import dspark_tiled_objective
 from nemo_rl.models.megatron.draft.dspark_provider import build_dspark_provider
 
+pytestmark = pytest.mark.mcore
+
 
 class _CheckpointBody(torch.nn.Module):
     def __init__(

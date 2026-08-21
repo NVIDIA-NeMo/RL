@@ -72,6 +72,7 @@ def test_dflash_setup_rejects_layout_and_target_mismatches_together() -> None:
         "generation": {"vllm_kwargs": {"speculative_config": {"method": "eagle3"}}},
     }
     model_cfg = SimpleNamespace(
+        tensor_model_parallel_size=2,
         pipeline_model_parallel_size=2,
         context_parallel_size=2,
         sequence_parallel=True,
@@ -97,6 +98,7 @@ def test_dflash_setup_allows_training_without_generation() -> None:
         draft_provider=_provider(),
         config={"sequence_packing": {"enabled": False}, "generation": None},
         model_cfg=SimpleNamespace(
+            tensor_model_parallel_size=2,
             pipeline_model_parallel_size=1,
             context_parallel_size=1,
             sequence_parallel=False,
@@ -150,6 +152,7 @@ def test_dflash_setup_allows_packed_cp_with_target_sp(
         draft_provider=_provider(),
         config={"sequence_packing": {"enabled": True}, "generation": None},
         model_cfg=SimpleNamespace(
+            tensor_model_parallel_size=2,
             pipeline_model_parallel_size=1,
             context_parallel_size=context_parallel_size,
             sequence_parallel=True,
@@ -165,6 +168,7 @@ def test_dflash_setup_requires_nemo_owned_packing_for_cp() -> None:
             draft_provider=_provider(),
             config={"sequence_packing": {"enabled": False}, "generation": None},
             model_cfg=SimpleNamespace(
+                tensor_model_parallel_size=2,
                 pipeline_model_parallel_size=1,
                 context_parallel_size=2,
                 sequence_parallel=True,
@@ -180,6 +184,7 @@ def test_dflash_setup_requires_packing_to_reconstruct_target_sp() -> None:
             draft_provider=_provider(),
             config={"sequence_packing": {"enabled": False}, "generation": None},
             model_cfg=SimpleNamespace(
+                tensor_model_parallel_size=2,
                 pipeline_model_parallel_size=1,
                 context_parallel_size=1,
                 sequence_parallel=True,
@@ -204,6 +209,7 @@ def test_dflash_setup_rejects_vpp_and_generation_cp() -> None:
             draft_provider=_provider(),
             config=config,
             model_cfg=SimpleNamespace(
+                tensor_model_parallel_size=2,
                 pipeline_model_parallel_size=1,
                 context_parallel_size=2,
                 sequence_parallel=True,
@@ -239,6 +245,7 @@ def test_dspark_setup_allows_packed_cp4_target_sp_and_matching_generation() -> N
             "generation": {"vllm_kwargs": {"speculative_config": {"method": "dspark"}}},
         },
         model_cfg=SimpleNamespace(
+            tensor_model_parallel_size=2,
             pipeline_model_parallel_size=1,
             context_parallel_size=4,
             sequence_parallel=True,
@@ -261,6 +268,7 @@ def test_dspark_setup_rejects_mismatched_generation_method() -> None:
                 },
             },
             model_cfg=SimpleNamespace(
+                tensor_model_parallel_size=2,
                 pipeline_model_parallel_size=1,
                 context_parallel_size=2,
                 sequence_parallel=True,

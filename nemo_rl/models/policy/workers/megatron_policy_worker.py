@@ -71,6 +71,7 @@ from nemo_rl.models.megatron.data import (
     process_global_batch,
 )
 from nemo_rl.models.megatron.draft.diagnostics import (
+    DraftUpdateProbe,
     finalize_draft_update_probe,
     format_draft_update_probe,
     require_draft_update,
@@ -207,16 +208,23 @@ def _validate_draft_training_setup(
     display_method = "DFlash" if method == "dflash" else "DSpark"
 
     unsupported: list[str] = []
+    tensor_parallel_size = int(model_cfg.tensor_model_parallel_size)
     pipeline_parallel_size = int(model_cfg.pipeline_model_parallel_size)
     context_parallel_size = int(model_cfg.context_parallel_size)
     sequence_parallel = bool(model_cfg.sequence_parallel)
-    sequence_packing = bool(config.get("sequence_packing", {}).get("enabled", False))
+    sequence_packing_config = config.get("sequence_packing")
+    sequence_packing = bool(
+        sequence_packing_config is not None
+        and sequence_packing_config.get("enabled") is True
+    )
     virtual_pipeline_size = getattr(
         model_cfg,
         "virtual_pipeline_model_parallel_size",
         None,
     )
 
+    if tensor_parallel_size != 2:
+        unsupported.append("tensor_model_parallel_size must be 2")
     if pipeline_parallel_size != 1:
         unsupported.append("pipeline_model_parallel_size must be 1")
     if virtual_pipeline_size not in (None, 1):
@@ -238,7 +246,11 @@ def _validate_draft_training_setup(
         unsupported.append(
             "sequence_parallel requires sequence_packing.enabled=true for draft training"
         )
-    if config.get("megatron_cfg", {}).get("use_fused_linear_logprobs", False):
+    megatron_config = config.get("megatron_cfg")
+    if (
+        megatron_config is not None
+        and megatron_config.get("use_fused_linear_logprobs") is True
+    ):
         unsupported.append("use_fused_linear_logprobs must be disabled")
 
     invalid_taps = [
@@ -255,17 +267,35 @@ def _validate_draft_training_setup(
             "target_hidden_state_layer_ids exceed the target model: "
             + ", ".join(str(layer_id) for layer_id in invalid_taps)
         )
+    generation_config = config.get("generation")
+    vllm_config = (
+        generation_config.get("vllm_kwargs")
+        if generation_config is not None
+        else None
+    )
     speculative_config = (
-        (config.get("generation") or {}).get("vllm_kwargs") or {}
-    ).get("speculative_config")
+        vllm_config.get("speculative_config") if vllm_config is not None else None
+    )
     if speculative_config is not None and speculative_config.get("method") != method:
         unsupported.append(f"generation speculative method must be {method}")
-    mcore_generation_config = (config.get("generation") or {}).get(
-        "mcore_generation_config"
-    ) or {}
-    if int(mcore_generation_config.get("pipeline_model_parallel_size", 1)) != 1:
+    mcore_generation_config = (
+        generation_config.get("mcore_generation_config")
+        if generation_config is not None
+        else None
+    )
+    generation_pipeline_size = (
+        mcore_generation_config.get("pipeline_model_parallel_size")
+        if mcore_generation_config is not None
+        else None
+    )
+    if generation_pipeline_size is not None and int(generation_pipeline_size) != 1:
         unsupported.append("generation pipeline_model_parallel_size must be 1")
-    if int(mcore_generation_config.get("context_parallel_size", 1)) != 1:
+    generation_context_size = (
+        mcore_generation_config.get("context_parallel_size")
+        if mcore_generation_config is not None
+        else None
+    )
+    if generation_context_size is not None and int(generation_context_size) != 1:
         unsupported.append("generation context_parallel_size must be 1")
     if unsupported:
         raise ValueError(
@@ -926,6 +956,14 @@ class MegatronPolicyWorkerImpl(
             return
         self.model.load_state_dict(extra_state, strict=False)
 
+    def _maybe_start_draft_update_probe(self) -> DraftUpdateProbe | None:
+        draft_cfg = self.cfg.get("draft")
+        if self.draft_model is None or not getattr(
+            draft_cfg, "update_probe_enabled", False
+        ):
+            return None
+        return start_draft_update_probe(self.draft_model)
+
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -1144,13 +1182,7 @@ class MegatronPolicyWorkerImpl(
 
                 # Update parameters.
                 if not eval_mode:
-                    draft_update_probe = None
-                    draft_cfg = self.cfg["draft"]
-                    if (
-                        self.draft_model is not None
-                        and getattr(draft_cfg, "update_probe_enabled", False)
-                    ):
-                        draft_update_probe = start_draft_update_probe(self.draft_model)
+                    draft_update_probe = self._maybe_start_draft_update_probe()
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
@@ -1882,12 +1914,7 @@ class MegatronPolicyWorkerImpl(
 
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
-        draft_update_probe = None
-        draft_cfg = self.cfg["draft"]
-        if self.draft_model is not None and getattr(
-            draft_cfg, "update_probe_enabled", False
-        ):
-            draft_update_probe = start_draft_update_probe(self.draft_model)
+        draft_update_probe = self._maybe_start_draft_update_probe()
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
         if draft_update_probe is not None:
             draft_update_result = finalize_draft_update_probe(

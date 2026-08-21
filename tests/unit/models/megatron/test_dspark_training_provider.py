@@ -30,6 +30,8 @@ from nemo_rl.models.megatron.draft.training import (
 )
 from nemo_rl.models.policy.draft_config import DSparkDraftConfig
 
+pytestmark = pytest.mark.mcore
+
 
 def _config() -> DSparkDraftConfig:
     return DSparkDraftConfig(

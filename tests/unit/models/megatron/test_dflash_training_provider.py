@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import Tensor
 
@@ -28,6 +29,8 @@ from nemo_rl.models.megatron.draft.training import (
     resolve_draft_speculator,
 )
 from nemo_rl.models.policy.draft_config import DFlashDraftConfig
+
+pytestmark = pytest.mark.mcore
 
 
 class _Target(torch.nn.Module):
