@@ -115,21 +115,22 @@ def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch):
     processor = _Processor()
     calls = []
 
-    def fake_attach(message, *, images, processor):
-        calls.append((message, images, processor))
+    def fake_attach(message, *, images, processor, pad_dynamic_image_shapes=False):
+        calls.append((message, images, processor, pad_dynamic_image_shapes))
         message["pixel_values"] = attached
 
     monkeypatch.setattr(
         rollouts_mod, "attach_image_model_inputs_to_message", fake_attach
     )
 
-    rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, processor)
-    rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, processor)
+    rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, processor, env_config={})
+    rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, processor, env_config={})
 
     assert len(calls) == 1
     assert calls[0][0] is batch["message_log"][0][0]
     assert calls[0][1][0].size == (2, 3)
     assert calls[0][2] is processor
+    assert calls[0][3] is False
     assert batch["message_log"][0][0]["pixel_values"] is attached
 
 
@@ -140,7 +141,7 @@ def test_attach_initial_nemo_gym_image_payloads_requires_processor():
         ValueError,
         match="requires the multimodal processor",
     ):
-        rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, None)
+        rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, None, env_config={})
 
 
 def test_attach_initial_nemo_gym_image_payloads_requires_a_user_message():
@@ -155,7 +156,9 @@ def test_attach_initial_nemo_gym_image_payloads_requires_a_user_message():
         ValueError,
         match="no user message to attach to",
     ):
-        rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, _Processor())
+        rollouts_mod.attach_initial_nemo_gym_image_payloads(
+            batch, _Processor(), env_config={}
+        )
 
 
 def test_attach_image_model_inputs_keeps_rollout_tokens_and_packs_media():
