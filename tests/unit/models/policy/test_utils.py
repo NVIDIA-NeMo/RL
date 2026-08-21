@@ -32,7 +32,71 @@ from nemo_rl.models.policy.utils import (
     get_megatron_checkpoint_dir,
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
+    validate_sequence_length_divisibility,
 )
+
+
+@pytest.mark.parametrize(
+    (
+        "make_sequence_length_divisible_by",
+        "context_parallel_size",
+        "tensor_parallel_size",
+        "sequence_parallel",
+    ),
+    [
+        (1, 1, 1, False),
+        (4, 2, 1, False),
+        (4, 1, 4, True),
+        (16, 2, 4, True),
+    ],
+)
+def test_validate_sequence_length_divisibility_accepts_valid_multiples(
+    make_sequence_length_divisible_by,
+    context_parallel_size,
+    tensor_parallel_size,
+    sequence_parallel,
+):
+    validate_sequence_length_divisibility(
+        make_sequence_length_divisible_by,
+        context_parallel_size=context_parallel_size,
+        tensor_parallel_size=tensor_parallel_size,
+        sequence_parallel=sequence_parallel,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "make_sequence_length_divisible_by",
+        "context_parallel_size",
+        "tensor_parallel_size",
+        "sequence_parallel",
+        "minimum_pad_factor",
+    ),
+    [
+        (0, 1, 1, False, 1),
+        (2, 2, 1, False, 4),
+        (2, 1, 4, True, 4),
+        # This distinguishes the product requirement (16) from an LCM (4).
+        (8, 2, 4, True, 16),
+    ],
+)
+def test_validate_sequence_length_divisibility_rejects_invalid_multiples(
+    make_sequence_length_divisible_by,
+    context_parallel_size,
+    tensor_parallel_size,
+    sequence_parallel,
+    minimum_pad_factor,
+):
+    with pytest.raises(
+        ValueError,
+        match=rf"positive multiple of the minimum pad factor \({minimum_pad_factor}\)",
+    ):
+        validate_sequence_length_divisibility(
+            make_sequence_length_divisible_by,
+            context_parallel_size=context_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
+            sequence_parallel=sequence_parallel,
+        )
 
 
 class TestGetMegatronCheckpointDir:
