@@ -6,7 +6,7 @@
 import os
 
 from nemo_rl.telemetry.config import TelemetryConfig
-from nemo_rl.telemetry.setup import _config_to_env, _ENV_FIELD_MAP
+from nemo_rl.telemetry.setup import _ENV_FIELD_MAP, _config_to_env
 
 
 def test_defaults():

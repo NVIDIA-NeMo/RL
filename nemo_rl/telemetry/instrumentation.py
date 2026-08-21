@@ -31,9 +31,11 @@ from typing import Any, Iterator, Mapping, Optional
 
 from nemo_rl.telemetry._fallbacks import (
     is_span_group_enabled,
-    managed_span as _managed_span,
     safe_set_span_attributes,
     span_cm,
+)
+from nemo_rl.telemetry._fallbacks import (
+    managed_span as _managed_span,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 

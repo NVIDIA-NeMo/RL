@@ -47,17 +47,15 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
+from nemo_rl.telemetry.instrumentation import trace_fn
+from nemo_rl.telemetry.setup import get_telemetry
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     collect_sharded_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
-
-from nemo_rl.telemetry.instrumentation import trace_fn
-
-from nemo_rl.telemetry.setup import get_telemetry
-from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 logger = logging.getLogger(__name__)
 

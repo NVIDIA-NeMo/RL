@@ -68,10 +68,10 @@ def test_map_empty_for_unknown_keys():
 
 def test_tee_emits_only_for_train_prefix_when_exporting():
     pytest.importorskip("nemo.lens")
-    import nemo_rl.telemetry.setup as setup_mod
     from nemo.lens import NemoLensConfig, setup_telemetry
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
+    import nemo_rl.telemetry.setup as setup_mod
     from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
     from nemo_rl.telemetry.span_groups import RLSpanGroup
 
@@ -164,7 +164,6 @@ def test_efficiency_measurements_classifies_every_category():
     # classification would silently drop out of the OTel series.
     pytest.importorskip("nemo_rl.algorithms.utils")
     from nemo_rl.algorithms.utils import EFFICIENCY_CATEGORIES
-
     from nemo_rl.telemetry.metrics import (
         COLLECTOR_WALL_CLOCK_MEASUREMENT,
         THREAD_SECONDS_MEASUREMENT,
@@ -227,10 +226,10 @@ def _gauge_points(data, name):
 
 def _start_exporting_telemetry():
     """Install an exporting telemetry handle; returns its metric reader."""
-    import nemo_rl.telemetry.setup as setup_mod
     from nemo.lens import NemoLensConfig, setup_telemetry
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
+    import nemo_rl.telemetry.setup as setup_mod
     from nemo_rl.telemetry.span_groups import RLSpanGroup
 
     reader = InMemoryMetricReader()
