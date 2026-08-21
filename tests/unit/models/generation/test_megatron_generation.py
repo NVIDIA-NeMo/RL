@@ -117,6 +117,43 @@ def test_megatron_generation_forwards_m2n_refit_lifecycle() -> None:
     )
 
 
+def test_bridge_refit_refreshes_parameter_caches_before_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nemo_rl.models.generation.megatron.megatron_worker as worker_module
+    from megatron.core.transformer.module import MegatronModule
+
+    events = []
+
+    class _CacheAwareModule(MegatronModule):
+        def __init__(self) -> None:
+            super().__init__(config=MagicMock())
+
+        def refresh_cache(self) -> None:
+            events.append("refresh")
+
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    worker.model_update_group = object()
+    worker._generation_refit_state_dict_info = {}
+    worker._generation_refit_tasks = []
+    worker._generation_refit_dependency_counts = {}
+    worker._generation_refit_model_chunks = [torch.nn.Sequential(_CacheAwareModule())]
+    worker.megatron_bridge = MagicMock()
+    worker.megatron_bridge._model_bridge._broadcast_shared_embeddings.side_effect = (
+        lambda _model_chunks: events.append("embeddings")
+    )
+
+    monkeypatch.setattr(
+        worker_module,
+        "packed_broadcast_consumer",
+        lambda **_kwargs: events.append("receive"),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
+
+    assert worker.update_generation_weights_from_collective()
+    assert events == ["receive", "embeddings", "refresh", "sync"]
+
+
 basic_megatron_test_config: PolicyConfig = {
     "model_name": model_name,
     "tokenizer": {"name": model_name},

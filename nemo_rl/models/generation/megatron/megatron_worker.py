@@ -33,6 +33,7 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.utils import unwrap_model
 
@@ -108,6 +109,8 @@ def _refresh_generation_caches(model_chunks: list[torch.nn.Module]) -> None:
     """Refresh parameter-derived MCore caches after an in-place Bridge refit."""
     for model_chunk in model_chunks:
         for module in unwrap_model(model_chunk).modules():
+            if not isinstance(module, MegatronModule):
+                continue
             refresh_cache = getattr(module, "refresh_cache", None)
             if callable(refresh_cache):
                 refresh_cache()
