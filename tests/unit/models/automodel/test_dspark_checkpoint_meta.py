@@ -163,3 +163,52 @@ def test_dspark_draft_vocab_size_compared_only_when_recorded():
     saved = dict(_TRAINING_META, meta_version=1, algo="dspark", draft_vocab_size=8192)
     with pytest.raises(ValueError, match="draft_vocab_size"):
         validate_dspark_checkpoint_meta(saved, expected)
+
+
+def test_weights_only_load_does_not_enforce_optimizer_layout(monkeypatch):
+    """A weights-only load (no optimizer_path) must not put the live
+    optimizer's layout into the expected metadata: checkpoints saved without
+    a layout record, or with a different optimizer grouping, remain loadable
+    when optimizer state is not being restored."""
+    from unittest.mock import MagicMock
+
+    import torch
+    from torch import nn
+
+    from nemo_rl.models.automodel.draft import integration
+
+    captured = {}
+
+    def fake_load_draft_checkpoint(draft_model, weights_path, expected_meta):
+        captured["expected_meta"] = expected_meta
+
+    monkeypatch.setattr(
+        integration, "load_draft_checkpoint", fake_load_draft_checkpoint
+    )
+    draft = nn.Linear(4, 4, bias=False)
+    draft.config = type(
+        "Cfg", (), {"block_size": 7, "mask_token_id": 0, "target_layer_ids": [0]}
+    )()
+    optimizer = torch.optim.AdamW(
+        [
+            {"name": "policy", "params": [nn.Parameter(torch.zeros(1))]},
+            {"name": "draft", "params": list(draft.parameters()), "lr": 1e-4},
+        ]
+    )
+    common = dict(
+        checkpoint_manager=MagicMock(),
+        model=MagicMock(),
+        draft_model=draft,
+        composite_model=MagicMock(),
+        optimizer=optimizer,
+        scheduler=None,
+        weights_path="/ckpt/step_1/policy/weights",
+        model_name="test/draft",
+        algo="dspark",
+    )
+
+    integration.load_dspark_checkpoint(optimizer_path=None, **common)
+    assert captured["expected_meta"]["optimizer_layout"] is None
+
+    integration.load_dspark_checkpoint(optimizer_path="/ckpt/optim", **common)
+    assert captured["expected_meta"]["optimizer_layout"] is not None

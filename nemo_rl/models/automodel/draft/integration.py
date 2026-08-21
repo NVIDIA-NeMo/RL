@@ -1145,11 +1145,19 @@ def load_dspark_checkpoint(
     mid-run checkpoint loads.
     """
     checkpoint_manager.load_checkpoint(model=model, weights_path=weights_path)
+    # Enforce the optimizer-layout record only when optimizer state is actually
+    # restored: weights-only loads (no optimizer_path) must accept checkpoints
+    # saved without a layout record or with a different optimizer grouping.
+    restoring_optimizer = bool(optimizer_path) and optimizer is not None
     load_draft_checkpoint(
         draft_model,
         weights_path,
         expected_meta=draft_meta_record(
-            draft_model, model_name, optimizer, algo=algo, ttt_steps=ttt_steps
+            draft_model,
+            model_name,
+            optimizer if restoring_optimizer else None,
+            algo=algo,
+            ttt_steps=ttt_steps,
         ),
     )
     if optimizer_path and optimizer is not None:
