@@ -8,6 +8,15 @@ grpo:
   async_grpo: null
   val_period: 0
 
+# Reward-zeroing penalties applied to NeMo-Gym rollout results.
+reward_penalties:
+  penalize_duplicated_reasoning: false
+  penalize_empty_final_answer: false
+  penalize_unwanted_tokens: false
+  penalize_malformed_think_tag: false
+  # Optional model/tokenizer-specific IDs. Example:
+  # token_ids: {unwanted: [2], think_open: 12, think_close: 13}
+
 async_rl:
   sampler:
     name: in_order

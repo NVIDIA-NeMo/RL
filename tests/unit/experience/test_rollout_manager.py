@@ -518,6 +518,22 @@ def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
     assert impl._compute_reward_penalty_metrics(penalty_counts, 1) == {metric_name: 1.0}
 
 
+def test_nemo_gym_reward_penalty_metrics_compute_fractional_rate():
+    impl = _nemo_gym_impl(True, {"penalize_empty_final_answer": True})
+
+    metrics = impl._compute_reward_penalty_metrics(
+        {
+            "duplicated_reasoning": 0,
+            "empty_final_answer": 1,
+            "unwanted_token": 0,
+            "malformed_think_tag": 0,
+        },
+        3,
+    )
+
+    assert metrics == {"empty_final_answer_rate": 1 / 3}
+
+
 # ---------------------------------------------------------------------------
 # Tests for AsyncRolloutManager (native async path)
 # ---------------------------------------------------------------------------

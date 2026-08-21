@@ -34,7 +34,12 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     SamplerConfig,
     required_buffer_capacity_for_config,
 )
-from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig, RewardPenaltyConfig
+from nemo_rl.algorithms.grpo import (
+    _REWARD_PENALTY_FLAGS,
+    GRPOConfig,
+    GRPOLoggerConfig,
+    RewardPenaltyConfig,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
@@ -682,12 +687,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     num_prompts_per_step = master_config.grpo.num_prompts_per_step
 
     reward_penalties_enabled = any(
-        (
-            master_config.reward_penalties.penalize_duplicated_reasoning,
-            master_config.reward_penalties.penalize_empty_final_answer,
-            master_config.reward_penalties.penalize_unwanted_tokens,
-            master_config.reward_penalties.penalize_malformed_think_tag,
-        )
+        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
     )
     if reward_penalties_enabled and not master_config.env.get("should_use_nemo_gym"):
         raise ValueError(
