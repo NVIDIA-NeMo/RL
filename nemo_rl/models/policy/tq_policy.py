@@ -504,6 +504,7 @@ class TQPolicy(Policy):
         self,
         meta: KVBatchMeta,
         timer: Optional[Timer] = None,
+        train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
     ) -> None:
         """Dispatch one meta slice (DP-sharded) into an open train step.
 
@@ -518,13 +519,18 @@ class TQPolicy(Policy):
         ``.grad``. Returns nothing — per-microbatch metrics accumulate in
         the workers' open-step state and surface once via
         :meth:`finish_train_step`.
+
+        Args:
+            meta: Data-plane metadata for the samples in this chunk.
+            timer: Optional timer for nested policy-training measurements.
+            train_fields: Columns produced for this step and fetched by workers.
         """
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = replace(
             meta,
             fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                train_fields, enabled=self._router_replay_enabled
             ),
             task_name="train",
         )
