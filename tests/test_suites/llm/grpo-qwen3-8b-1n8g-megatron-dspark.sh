@@ -29,17 +29,23 @@ uv run examples/run_grpo.py \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
     logger.tensorboard_enabled=true \
-    checkpointing.enabled=false \
+    checkpointing.enabled=true \
+    checkpointing.save_period=1 \
+    checkpointing.save_optimizer=false \
     checkpointing.checkpoint_dir="$CKPT_DIR" \
     "$@" \
     2>&1 | tee "$RUN_LOG"
 
 grep -q "Draft Loss:" "$RUN_LOG"
 grep -q "draft_update_probe=complete" "$RUN_LOG"
+grep -q "draft_refit_manifest=draft_count=" "$RUN_LOG"
+grep -q "Saving checkpoint for step 1..." "$RUN_LOG"
+test -f "$CKPT_DIR/step_1/training_info.json"
+test -f "$CKPT_DIR/step_1/config.yaml"
+test -d "$CKPT_DIR/step_1/policy/weights"
 
 uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 uv run tests/check_metrics.py "$JSON_METRICS" \
     'min(data["train/draft_loss"]) > 0'
 
-# Reuse this allocation and its caches; the child keeps separate DSpark artifacts.
-bash "$SCRIPT_DIR/grpo-qwen3-8b-1n8g-megatron-dspark.sh" "$@"
+rm -rf "$CKPT_DIR"
