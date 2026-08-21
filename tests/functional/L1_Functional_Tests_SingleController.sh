@@ -111,6 +111,17 @@ run_test env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true uv run --no-syn
 # coverage RayWorkerGroup.recreate_worker has -- it cannot be reached without GPUs.
 run_test env RESTART_DEAD_SHARDS=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
+# The only variant that reaches the refit watchdog. The two above kill the victim, and a
+# killed actor produces ActorDiedError within milliseconds -- which recovers the run off
+# the pre-existing actor-death path and leaves the deadline unexercised. Job 6405953
+# passed both with RefitAborted appearing zero times.
+#
+# Freezing the victim with SIGSTOP instead leaves Ray seeing a healthy actor that has
+# simply stopped participating, which is the case the abort exists for and the one its
+# error message names. This variant asserts RefitAborted actually appears, so it cannot
+# quietly degrade into testing the same path as the two above.
+run_test env KILL_DURING_REFIT=true FREEZE_VICTIM=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
 # rather than between calls. Registered because pinning the victim state -- which is what
 # makes that test reproducible at all -- would otherwise silently drop a scenario the old,
