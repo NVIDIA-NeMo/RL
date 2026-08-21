@@ -19,7 +19,7 @@ from collections import Counter
 from collections.abc import AsyncGenerator
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, Optional, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
 
 import ray
 import torch
@@ -47,14 +47,14 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
-from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.models.generation.interfaces import should_use_async_rollouts
+from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
-# Kept local (not imported from models.generation) so the gym actor stays free of
-# generation-module imports. Must cover every name resolve_routed_experts_dtype
-# can produce.
+# Kept local so the Gym actor does not depend on model-config dtype resolution.
+# Must cover every name resolve_routed_experts_dtype can produce.
 _ROUTED_EXPERTS_DTYPES = {
     "int8": torch.int8,
     "int16": torch.int16,
@@ -68,6 +68,54 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+class NemoGymCompatibleConfig(Protocol):
+    """Configuration fields required to select the NeMo Gym rollout path."""
+
+    @property
+    def env(self) -> dict[str, Any]: ...
+
+    @property
+    def policy(self) -> PolicyConfig: ...
+
+
+def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
+    """Determine whether NeMo Gym should handle rollouts and validation."""
+    should_use_gym = bool(master_config.env.get("should_use_nemo_gym"))
+    if not should_use_gym:
+        return False
+
+    generation_config = master_config.policy["generation"]
+    assert should_use_async_rollouts(generation_config), (
+        "❌ Error: In order to use NeMo-Gym, you must use a generation "
+        "backend with `async_engine: true`!"
+    )
+
+    if generation_config["backend"] == "vllm":
+        should_expose_http_server = generation_config.get("vllm_cfg", {}).get(
+            "expose_http_server"
+        )
+    elif generation_config["backend"] == "megatron":
+        should_expose_http_server = generation_config.get(
+            "mcore_generation_config", {}
+        ).get("expose_http_server")
+    elif generation_config["backend"] == "trtllm":
+        should_expose_http_server = generation_config.get("trtllm_cfg", {}).get(
+            "expose_http_server"
+        )
+    elif generation_config["backend"] == "dynamo":
+        should_expose_http_server = generation_config.get("vllm_cfg", {}).get(
+            "expose_http_server"
+        )
+    else:
+        should_expose_http_server = False
+    assert should_expose_http_server, (
+        "In order to use NeMo-Gym, you must expose the generation server via "
+        "`expose_http_server: true`!"
+    )
+
+    return True
 
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
@@ -190,19 +238,24 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     )
     thinking_tags = thinking_tags or DEFAULT_THINKING_TAGS
 
+    content = output_item_dict.get("content")
     is_output_message = (
-        "content" in output_item_dict
-        and len(output_item_dict["content"]) > 0
-        and "text" in output_item_dict["content"][0]
+        isinstance(content, list)
+        and bool(content)
+        and isinstance(content[0], dict)
+        and isinstance(content[0].get("text"), str)
     )
     # NeMo-Gym only attaches generation_token_ids to the last output item of a
     # model call (see vllm_model/app.py postprocess_chat_response). So this item
     # is guaranteed to be the final thing the model produced for this turn.
     # If it's a reasoning item, the model output only reasoning (no content/tool calls).
+    summary = output_item_dict.get("summary")
     is_reasoning_message = (
         output_item_dict.get("type") == "reasoning"
-        and len(output_item_dict.get("summary", [])) > 0
-        and "text" in output_item_dict["summary"][0]
+        and isinstance(summary, list)
+        and bool(summary)
+        and isinstance(summary[0], dict)
+        and isinstance(summary[0].get("text"), str)
     )
 
     is_invalid_tool_call = False
@@ -604,9 +657,13 @@ Depending on your data shape, you may want to change these values."""
         timer = Timer()
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
-        # For multimodal runs, replace local filesystem image paths in the
-        # examples with base64 data URLs before shipping to vLLM. No-op when
-        # examples carry no `input_image` items (text-only case).
+        from nemo_rl.environments.nemo_gym_video import (
+            normalize_video_urls_in_examples,
+        )
+
+        # Normalize local media before shipping requests to vLLM. Both helpers
+        # are no-ops for text-only rows and already-qualified URLs.
+        normalize_video_urls_in_examples(nemo_gym_examples)
         encode_images_in_examples(nemo_gym_examples)
 
         timer.start("_run_rollouts_total")

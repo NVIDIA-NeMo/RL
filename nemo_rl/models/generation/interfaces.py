@@ -226,6 +226,41 @@ class GenerationConfig(TypedDict):
     _debug_payload_metrics: NotRequired[bool]
 
 
+def should_use_async_rollouts(
+    generation_config: GenerationConfig | None,
+) -> bool:
+    """Determine whether a generation backend uses asynchronous rollouts."""
+    if generation_config is None:
+        return False
+    backend = generation_config.get("backend", "")
+
+    if backend == "dynamo":
+        return True
+
+    if backend == "sglang":
+        return bool(generation_config.get("use_async_rollouts", False))
+
+    if backend == "vllm":
+        return bool(generation_config.get("vllm_cfg", {}).get("async_engine", False))
+
+    if backend == "trtllm":
+        assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
+            "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
+            "synchronous engine path (async_engine=false) is no longer supported."
+        )
+        return True
+
+    if backend == "megatron":
+        mcore_cfg = generation_config.get("mcore_generation_config", {})
+        assert mcore_cfg.get("async_engine") is None, (
+            "Megatron Inference always uses the async engine. The parameter "
+            "policy.generation.mcore_generation_config.async_engine was removed."
+        )
+        return True
+
+    return False
+
+
 @dataclass
 class GenerationSamplingParams:
     """Sampling profile threaded explicitly through rollout entry points.

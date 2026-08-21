@@ -34,8 +34,11 @@ from transformers.video_utils import load_video
 
 VLLM_MULTIMODAL_DATA_KEYS = frozenset({"vllm_images", "vllm_videos", "vllm_audios"})
 NATIVE_MULTIMODAL_KEYS = frozenset({"vllm_content", *VLLM_MULTIMODAL_DATA_KEYS})
+IMAGE_CONTENT_TYPES = frozenset({"input_image", "image", "image_url"})
+VIDEO_CONTENT_TYPES = frozenset({"input_video", "video", "video_url"})
+AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})
 MULTIMODAL_CONTENT_TYPES = frozenset(
-    {"input_image", "image", "image_url", "video", "audio"}
+    {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
 NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS = 8
 
@@ -786,7 +789,15 @@ def extract_multimodal_model_inputs(
 
     extracted: dict[str, PackedTensor | torch.Tensor] = {}
     multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    for key in ("imgs_sizes", "num_frames"):
+    # TODO(rohitrango): Let ProcessorInterface declare model-specific media inputs.
+    # Some remote-code processors omit these inputs from model_input_names even
+    # though their model forward requires them.
+    for key in (
+        "imgs_sizes",
+        "num_frames",
+        "pixel_values_flat",
+        "image_num_patches",
+    ):
         if key in processed and key not in multimodal_keys:
             multimodal_keys.append(key)
     for key in multimodal_keys:
@@ -1036,11 +1047,11 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
 
     Walks each example's ``responses_create_params.input[].content[]`` items,
     collects local image references, encodes each unique source once using a
-    bounded thread pool, and rewrites every corresponding ``input_image`` part
-    with the resulting base64 ``data:`` URL. Parts whose URL already starts
-    with ``http://``, ``https://``, or ``data:`` are left untouched. Malformed
-    items (non-dict entries, missing/empty URLs, non-list ``input``/``content``)
-    are skipped without raising.
+    bounded thread pool, and rewrites every corresponding image part with the
+    resulting base64 ``data:`` URL. Parts whose URL already starts with
+    ``http://``, ``https://``, or ``data:`` are left untouched. Malformed items
+    (non-dict entries, missing/empty URLs, non-list ``input``/``content``) are
+    skipped without raising.
 
     The examples are mutated in place; the same list is also returned for
     convenience so callers can chain the call.
@@ -1054,7 +1065,7 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
         The same ``nemo_gym_examples`` list, with local image references
         rewritten to base64 data URLs in place.
     """
-    parts_by_source: dict[str, list[dict]] = {}
+    targets_by_source: dict[str, list[tuple[dict, str]]] = {}
 
     for example in nemo_gym_examples:
         input_items = example.get("responses_create_params", {}).get("input", [])
@@ -1067,20 +1078,27 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
             if not isinstance(content, list):
                 continue
             for part in content:
-                # Preserve the existing NeMo Gym request wire format: only
-                # Responses API input_image parts with image_url are rewritten.
-                if not isinstance(part, dict) or part.get("type") != "input_image":
+                if (
+                    not isinstance(part, dict)
+                    or part.get("type") not in IMAGE_CONTENT_TYPES
+                ):
                     continue
-                url = part.get("image_url", "")
+                media_key = next(
+                    (key for key in ("image_url", "image", "url") if key in part),
+                    None,
+                )
+                if media_key is None:
+                    continue
+                url = part.get(media_key)
                 if isinstance(url, dict):
-                    url = url.get("url", "")
+                    url = url.get("url") or url.get("path") or ""
                 if not isinstance(url, str) or not url:
                     continue
                 if url.startswith(("http://", "https://", "data:")):
                     continue
-                parts_by_source.setdefault(url, []).append(part)
+                targets_by_source.setdefault(url, []).append((part, media_key))
 
-    sources = list(parts_by_source)
+    sources = list(targets_by_source)
     if sources:
         with ThreadPoolExecutor(
             max_workers=NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS
@@ -1095,10 +1113,10 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
 
         # Keep payload mutation on the caller thread after worker-owned images
         # have been closed and every unique source has been encoded.
-        for source, parts in parts_by_source.items():
+        for source, targets in targets_by_source.items():
             data_url = encoded_by_source[source]
-            for part in parts:
-                part["image_url"] = data_url
+            for part, media_key in targets:
+                part[media_key] = data_url
     return nemo_gym_examples
 
 

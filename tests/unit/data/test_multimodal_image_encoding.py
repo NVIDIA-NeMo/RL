@@ -110,7 +110,8 @@ def test_encode_images_deduplicates_sources_and_uses_a_bounded_thread_pool(
     examples = [
         _example(
             {"type": "input_image", "image_url": first},
-            {"type": "input_image", "image_url": second},
+            {"type": "image", "image": first},
+            {"type": "image_url", "url": second},
         )
         for _ in range(16)
     ]
@@ -139,7 +140,8 @@ def test_encode_images_deduplicates_sources_and_uses_a_bounded_thread_pool(
     for example in examples:
         parts = example["responses_create_params"]["input"][0]["content"]
         assert parts[0]["image_url"] == expected[first]
-        assert parts[1]["image_url"] == expected[second]
+        assert parts[1]["image"] == expected[first]
+        assert parts[2]["url"] == expected[second]
 
 
 def test_encode_images_does_not_partially_mutate_on_error(tmp_path):

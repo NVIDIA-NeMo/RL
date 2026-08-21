@@ -41,7 +41,7 @@ import os
 import time
 from collections import deque
 from functools import partial
-from typing import Any, Awaitable, Callable, Optional, Union, cast
+from typing import Any, Awaitable, Callable, Optional, Union
 
 import ray
 import torch
@@ -67,6 +67,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -1611,15 +1612,11 @@ class SingleControllerActor:
         """
         self._rollout_permitted.clear()
 
-        # TODO(#2625): abort unconditionally once gym-path abort is validated;
-        # for now only the native path aborts. Local import dodges the grpo.py
-        # circular dep (as in async_utils/trajectory_collector.py).
-        from nemo_rl.algorithms.grpo import MasterConfig as GrpoMasterConfig
-        from nemo_rl.algorithms.grpo import _should_use_nemo_gym
-
+        # TODO(#2625): Abort unconditionally once Gym-path abort is validated;
+        # for now only the native path aborts stale in-flight requests.
         aborted_stale_inflight_groups = (
             0
-            if _should_use_nemo_gym(cast(GrpoMasterConfig, self._master_config))
+            if should_use_nemo_gym(self._master_config)
             else await self._abort_stale_inflight()
         )
 

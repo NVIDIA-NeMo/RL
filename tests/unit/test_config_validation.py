@@ -169,9 +169,18 @@ def test_multimodal_dedup_grpo_config_keys_default_off():
     assert GRPOConfig.model_fields["debug_payload_metrics"].default is False
 
 
-def test_nemo_gym_launcher_forwards_processor_to_both_trainers():
-    """Keep sync and async Gym image processing wired to the selected processor."""
-    launcher = Path(__file__).parents[2] / "examples/nemo_gym/run_grpo_nemo_gym.py"
+@pytest.mark.parametrize(
+    "launcher_relpath",
+    [
+        "examples/run_vlm_grpo.py",
+        "examples/nemo_gym/run_grpo_nemo_gym.py",
+    ],
+)
+def test_multimodal_launchers_forward_processor_to_both_trainers(
+    launcher_relpath: str,
+):
+    """Keep sync and async multimodal processing wired to the processor."""
+    launcher = Path(__file__).parents[2] / launcher_relpath
     tree = ast.parse(launcher.read_text())
     trainer_calls = {
         node.func.id: node
@@ -193,6 +202,37 @@ def test_nemo_gym_launcher_forwards_processor_to_both_trainers():
         assert len(processor_keywords) == 1, (
             f"{trainer_name} must receive processor=processor"
         )
+
+
+def test_vlm_launcher_dispatches_on_async_grpo_enabled():
+    """Keep the VLM async recipe from silently using the synchronous trainer."""
+    launcher = Path(__file__).parents[2] / "examples/run_vlm_grpo.py"
+    tree = ast.parse(launcher.read_text())
+
+    async_branches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "config.grpo.async_grpo.enabled"
+    ]
+    assert len(async_branches) == 1
+
+    async_branch = async_branches[0]
+    async_calls = {
+        node.func.id
+        for statement in async_branch.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    sync_calls = {
+        node.func.id
+        for statement in async_branch.orelse
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+    assert "async_grpo_train" in async_calls
+    assert "grpo_train" in sync_calls
 
 
 def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
