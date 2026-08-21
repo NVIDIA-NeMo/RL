@@ -323,7 +323,22 @@ class DTensorPolicyWorkerV2Impl(
             },
         )
 
-        # Set up model and optimizer
+        # Set up model and optimizer.
+        # When a reference policy is needed on a resumed run, defer the NeMo RL
+        # checkpoint load: setup_model_and_optimizer restores `weights_path`
+        # internally, and capturing the reference from the restored model
+        # re-anchors the KL reference to the resumed step on every resume (a
+        # rolling anchor). Each resume then grants the policy a fresh drift
+        # budget, which defeats the anchor over multi-window runs. Instead,
+        # build the model from the pristine base weights, capture the
+        # reference, then load the checkpoint below.
+        defer_checkpoint_load = init_reference_model and bool(weights_path)
+        if defer_checkpoint_load:
+            print(
+                "Deferring NeMo RL checkpoint load until after the KL reference "
+                "is captured from base weights; the 'No weights path provided' "
+                "message from setup_model_and_optimizer is expected on this path."
+            )
         model_and_optimizer_state = setup_model_and_optimizer(
             config=config,
             tokenizer=self.tokenizer,
@@ -332,8 +347,8 @@ class DTensorPolicyWorkerV2Impl(
             checkpoint_manager=self.checkpoint_manager,
             is_vlm=self.is_vlm,
             init_optimizer=init_optimizer,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
+            weights_path=None if defer_checkpoint_load else weights_path,
+            optimizer_path=None if defer_checkpoint_load else optimizer_path,
         )
 
         # Set instance attributes from model and optimizer state (tuple unpacking)
@@ -350,10 +365,21 @@ class DTensorPolicyWorkerV2Impl(
             self.autocast_enabled,
         ) = model_and_optimizer_state
 
-        # Initialize reference model if requested
+        # Initialize reference model if requested. With deferred loading the
+        # model still holds the base (model_name) weights here, so the KL
+        # reference stays anchored to the same policy across resumes.
         self.reference_model_state_dict = None
         if init_reference_model:
             self.reference_model_state_dict = setup_reference_model_state(self.model)
+
+        if defer_checkpoint_load:
+            self.checkpoint_manager.load_checkpoint(
+                model=self.model,
+                weights_path=weights_path,
+                optimizer=self.optimizer,
+                optimizer_path=optimizer_path,
+                scheduler=self.scheduler,
+            )
 
         # Set instance attributes from runtime config (tuple unpacking)
         (
