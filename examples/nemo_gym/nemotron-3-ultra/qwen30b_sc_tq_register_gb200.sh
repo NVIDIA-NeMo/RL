@@ -35,7 +35,11 @@ else
 fi
 
 EXP_NAME="${EXP_NAME:-qwen30b-sc-tq-register}"
-CONFIG_PATH="${CONFIG_PATH:-${CODE_DIR}/examples/configs/recipes/llm/grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_register.yaml}"
+RECIPE="${RECIPE:-examples/configs/recipes/llm/grpo-qwen3-30ba3b-6n4g-gb200-single-controller-tq_register.yaml}"
+CONFIG_PATH="${CODE_DIR}/${RECIPE}"
+# Same file seen from inside the container, where the driver runs (MOUNTS
+# overlays this checkout's examples/ onto the image's).
+CONTAINER_CONFIG_PATH="/opt/nemo-rl/${RECIPE}"
 
 # --- cluster shape -----------------------------------------------------------
 # 4 train + 2 generation nodes; the split itself lives in the config's
@@ -72,8 +76,13 @@ export BASE_LOG_DIR="${BASE_LOG_DIR:-${CODE_DIR}/workspace/ray_logs/${EXP_NAME}}
 WANDB_ENABLED=False
 [[ -n "${WANDB_API_KEY:-}" ]] && WANDB_ENABLED=True
 
-export COMMAND="uv run examples/run_grpo_single_controller.py \
---config ${CONFIG_PATH} \
+# Run from the image's checkout, not this one: a git worktree has no submodule
+# content, so `uv run` here cannot resolve the nemo-gym workspace member and
+# fails before the driver starts. /opt/nemo-rl is complete and its venv is
+# prebuilt; MOUNTS overlays this branch's nemo_rl/ and examples/ onto it, so the
+# code that runs is still this branch's.
+export COMMAND="cd /opt/nemo-rl && uv run examples/run_grpo_single_controller.py \
+--config ${CONTAINER_CONFIG_PATH} \
 logger.log_dir=${RESULTS_DIR}/logs \
 logger.wandb_enabled=${WANDB_ENABLED} \
 logger.wandb.project=${WANDB_PROJ:-nemo-rl-data-plane} \

@@ -530,6 +530,8 @@ data_plane:
     # Register mode: put publishes the producer's buffer address, get pulls it
     # one-sided. No store, so none of mooncake_cpu's sizing applies.
     use_gdr: true                    # receive into HBM; sources register where they are
+    offload_source_to_host: false    # true: put copies to host and registers there,
+                                     # reads still land in HBM (one hop, no HBM held)
     rpc_port: 0                      # 0 = engine picks a free port
   # observability:                    # NotRequired
   #   enabled: false

@@ -441,6 +441,7 @@ data_plane:
     gdr_staging_buffer_mb: 1024        # persistent MiB per active GDR client
   transfer_engine:
     use_gdr: true                      # receive into HBM; sources register in place
+    offload_source_to_host: false      # true: register host copies, still read into HBM
     rpc_port: 0                        # 0 = engine picks a free port
   # observability:                     # NotRequired
   #   enabled: false

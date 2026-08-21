@@ -571,6 +571,7 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     "local_hostname": "",
                     "rpc_port": int(te_cfg.rpc_port),
                     "use_gdr": bool(te_cfg.use_gdr),
+                    "offload_source_to_host": bool(te_cfg.offload_source_to_host),
                     **_mooncake_transport_config(),
                 },
             },
@@ -769,18 +770,18 @@ class TQDataPlaneClient(DataPlaneClient):
         else:
             _connect_existing()
         # Register mode publishes addresses, so a producer should hand it the
-        # tensor where it already lives — but only where this process can
-        # actually receive into HBM too, which is the same condition the TQ
-        # client applies (see TransferEngineClient.__init__).
-        self._put_device = (
-            "cuda"
-            if (
-                cfg["backend"] == "transfer_engine"
-                and backend_config(cfg).use_gdr
+        # tensor where it already lives — unless this run deliberately offloads
+        # sources to host, or this process cannot register HBM at all. Same
+        # conditions the TQ client applies (see TransferEngineClient.__init__).
+        register_in_hbm = False
+        if cfg["backend"] == "transfer_engine":
+            te_cfg = backend_config(cfg)
+            register_in_hbm = (
+                te_cfg.use_gdr
+                and not te_cfg.offload_source_to_host
                 and torch.cuda.is_initialized()
             )
-            else "cpu"
-        )
+        self._put_device = "cuda" if register_in_hbm else "cpu"
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
         # Fields whose schema this process has already warmed, per partition.

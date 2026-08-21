@@ -114,6 +114,14 @@ class TransferEngineConfig(BaseModel, extra="allow"):
     Sources are never moved: a CUDA tensor is registered where the producer
     built it, so with GDR on both ends a tensor crosses the fabric HBM-to-HBM.
 
+    ``offload_source_to_host`` splits the two halves of that decision. With it
+    on, ``put`` copies a CUDA tensor to host and registers *there*, while reads
+    still land in HBM — the shape is then producer host memory straight into
+    consumer HBM in one hop, with no staging buffer and no store copy on the
+    way. It costs one D2H per put and buys back the HBM the producer would
+    otherwise hold registered until ``clear``, which is this backend's sharpest
+    cost. Leave it off to keep the payload in HBM end to end.
+
     ``rpc_port`` is this process's engine port; 0 lets it pick a free one,
     which is required when several clients share a node.
 
@@ -124,6 +132,7 @@ class TransferEngineConfig(BaseModel, extra="allow"):
     """
 
     use_gdr: bool = True
+    offload_source_to_host: bool = False
     rpc_port: int = 0
 
 

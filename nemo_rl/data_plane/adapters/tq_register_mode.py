@@ -239,6 +239,9 @@ class TransferEngineClient(StorageKVClient):
             if bool(config["use_gdr"]) and torch.cuda.is_initialized()
             else torch.device("cpu")
         )
+        # Independent of the receive side: a producer can hand its bytes to host
+        # memory and still have consumers pull them straight into HBM.
+        self._offload_source = bool(config["offload_source_to_host"])
 
         self._engine: Any = TransferEngine()
         status = self._engine.initialize(
@@ -262,11 +265,12 @@ class TransferEngineClient(StorageKVClient):
         # identical in the logs to one that did not.
         logger.info(
             "TransferQueue register mode ready: endpoint=%s protocol=%s "
-            "device_name=%s receive_device=%s",
+            "device_name=%s receive_device=%s source=%s",
             self._endpoint,
             self.protocol,
             self.device_name,
             self._device,
+            "host (offloaded)" if self._offload_source else "in place",
         )
 
     @property
@@ -309,7 +313,9 @@ class TransferEngineClient(StorageKVClient):
 
         custom_backend_meta: list[dict] = [{} for _ in keys]
 
-        tensors = {i: cast(Tensor, values[i]).contiguous() for i in tensor_indices}
+        tensors = {
+            i: self._prepare_source(cast(Tensor, values[i])) for i in tensor_indices
+        }
         # Publishing an address makes the buffer readable by a peer NIC, which
         # is not ordered against the stream that filled it. One sync per put
         # covers every CUDA source in the batch.
@@ -454,6 +460,18 @@ class TransferEngineClient(StorageKVClient):
         if self._engine is not None:
             self._pins.unpin_all()
             self._engine = None
+
+    def _prepare_source(self, tensor: Tensor) -> Tensor:
+        """Return the tensor whose allocation ``put`` will register.
+
+        ``offload_source_to_host`` trades one D2H per put for HBM the producer
+        would otherwise keep registered until ``clear``; consumers still pull
+        one-sided into their own HBM, since the receive side is chosen
+        independently.
+        """
+        if self._offload_source and tensor.is_cuda:
+            return tensor.to("cpu", copy=False).contiguous()
+        return tensor.contiguous()
 
     def _pin_and_describe(self, tensor: Tensor, size: int) -> dict:
         base, offset = self._pins.pin(tensor)

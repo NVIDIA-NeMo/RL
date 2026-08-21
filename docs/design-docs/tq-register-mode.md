@@ -313,6 +313,29 @@ docs claim the opposite default; the code is what runs.
 driver) keeps host receive buffers while GPU workers receive into HBM. A source
 is registered wherever it lives regardless, so a mixed pairing still works.
 
+### Host source, HBM destination
+
+The source and destination halves are configured separately, because the useful
+middle ground is host-resident sources with HBM landings:
+
+```
+offload_source_to_host: true, use_gdr: true
+    put:  D2H once, register the host buffer  (no HBM held until clear)
+    get:  producer HOST --RDMA--> consumer HBM   (still one hop)
+```
+
+Compare `mooncake_cpu` with GDR, where the same payload takes two RDMA hops
+through a host-resident store object and a D2D copy at each end:
+
+```
+put:  producer HBM --D2D--> GPU staging --RDMA--> store segment (host)
+get:  store segment --RDMA--> GPU staging --D2D--> consumer HBM
+```
+
+The offload variant costs one D2H per put and buys back the HBM a producer
+would otherwise keep registered for the whole step — the residency cost listed
+below. Leave it off to keep the payload in HBM end to end.
+
 Two call sites outside the client complete the no-copy contract:
 `DataPlaneClient.put_device` (default `"cpu"`, `"cuda"` under register+GDR) and
 `TQWorkerMixin._write_back_result_field`, which used to force `.to("cpu")` on

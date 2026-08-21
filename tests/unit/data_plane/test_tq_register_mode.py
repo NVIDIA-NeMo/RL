@@ -112,7 +112,9 @@ def _fake_engine(monkeypatch):
     monkeypatch.setattr(tq_register_mode, "TRANSFER_ENGINE_IMPORTED", True)
 
 
-def _make_client(*, use_gdr: bool = False) -> TransferEngineClient:
+def _make_client(
+    *, use_gdr: bool = False, offload_source_to_host: bool = False
+) -> TransferEngineClient:
     return TransferEngineClient(
         {
             "local_hostname": "127.0.0.1",
@@ -121,6 +123,7 @@ def _make_client(*, use_gdr: bool = False) -> TransferEngineClient:
             "device_name": "mlx5_0",
             "metadata_server": "P2PHANDSHAKE",
             "use_gdr": use_gdr,
+            "offload_source_to_host": offload_source_to_host,
         }
     )
 
@@ -305,6 +308,32 @@ def test_gdr_get_reads_device_to_device(monkeypatch):
         dst, size = transfers[row.data_ptr()]
         assert dst == value.data_ptr()
         assert size == row.nbytes
+
+
+@requires_cuda
+def test_offloading_the_source_registers_host_memory_but_still_receives_in_hbm():
+    """CPU-resident source, HBM destination: one hop, no producer HBM held.
+
+    This is the mixed shape — the producer hands its bytes to host memory and
+    consumers still pull straight into their own HBM, which is what makes the
+    HBM-residency cost avoidable without giving up the single-hop landing.
+    """
+    torch.cuda.init()
+    client = _make_client(use_gdr=True, offload_source_to_host=True)
+    _, rows = _batch_rows(device="cuda")
+    keys = [f"{i}@input_ids" for i in range(len(rows))]
+
+    meta = client.put(keys, rows)
+
+    # Published addresses are host addresses, not the CUDA tensors'.
+    for row, entry in zip(rows, meta, strict=True):
+        assert entry["base"] + entry["offset"] != row.data_ptr()
+    # ...while reads still land in device memory.
+    assert client.receive_device.type == "cuda"
+    values = client.get(keys, **_get_args(rows, meta))
+    for row, value in zip(rows, values, strict=True):
+        assert value.is_cuda
+        torch.testing.assert_close(value, row)
 
 
 @requires_cuda
