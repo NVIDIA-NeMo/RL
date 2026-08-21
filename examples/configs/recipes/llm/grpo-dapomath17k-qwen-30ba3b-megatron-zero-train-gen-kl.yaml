@@ -69,3 +69,4 @@ data:
 env:
   math:
     math_verify_impl: dapo_math_verify
+    truncate_solution_tail: false
