@@ -229,17 +229,35 @@ class SequencePackingFusionLossWrapper:
 
 
 class DraftLossWrapper:
-    """Combine policy loss with draft soft cross-entropy loss."""
+    """Combine policy loss with draft soft cross-entropy loss.
+
+    Two layouts are supported:
+
+    - Unpacked (default): ``prepare_fn`` (``prepare_loss_input`` with
+      ``LossInputType.DRAFT``) builds the shifted teacher logits and token mask
+      from the ``[B, S]`` batch, and the student logits come from
+      ``data["student_logits"]``.
+    - Packed (``cu_seqlens_q`` given): the draft cross-entropy is computed once
+      over the packed ``[1, T_packed]`` layout. The teacher logits are
+      left-shifted within each packed segment and restricted to the draft
+      vocabulary, and the token mask is packed with the same per-sequence
+      shift; ``student_logits`` must be passed explicitly (it is kept out of
+      the data dict so the packing loss wrappers never slice it).
+    """
 
     def __init__(
         self,
         loss_fn: Callable[..., tuple[torch.Tensor, dict[str, Any]]],
-        prepare_fn: Callable[Any, Any],
+        prepare_fn: Optional[Callable[Any, Any]],
         data_dict: BatchedDataDict[Any],
         loss_weight: float = 1.0,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_q_padded: Optional[torch.Tensor] = None,
+        d2t: Optional[torch.Tensor] = None,
+        student_logits: Optional[torch.Tensor] = None,
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
@@ -248,8 +266,59 @@ class DraftLossWrapper:
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
+        self.cu_seqlens_q = cu_seqlens_q
+        self.cu_seqlens_q_padded = (
+            cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
+        )
+        self.d2t = d2t
+        self.student_logits = student_logits
+        if cu_seqlens_q is not None and student_logits is None:
+            raise ValueError("student_logits must be passed explicitly in packed mode.")
+        if cu_seqlens_q is None and prepare_fn is None:
+            raise ValueError("prepare_fn is required in unpacked mode.")
         self.draft_loss_fn = DraftCrossEntropyLossFn(
             vocab_parallel_group=vocab_parallel_group,
+        )
+
+    def _packed_draft_loss(
+        self,
+        next_token_logits: torch.Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: torch.Tensor | None,
+        global_valid_toks: torch.Tensor,
+    ) -> torch.Tensor:
+        from nemo_rl.algorithms.loss.utils import (
+            map_teacher_logits_to_draft_vocab,
+            pack_rolled_draft_token_mask,
+            roll_packed_seq_dim,
+        )
+
+        teacher_logits = roll_packed_seq_dim(
+            next_token_logits.detach(), self.cu_seqlens_q_padded, seq_dim=1
+        )
+        teacher_logits = map_teacher_logits_to_draft_vocab(
+            teacher_logits,
+            self.d2t,
+            vocab_parallel_rank=self.vocab_parallel_rank,
+            vocab_parallel_group=self.vocab_parallel_group,
+        )
+        token_mask = pack_rolled_draft_token_mask(
+            data["token_mask"],
+            data["sample_mask"],
+            self.cu_seqlens_q,
+            self.cu_seqlens_q_padded,
+        )
+        # sample_mask is already folded into the packed token mask.
+        ones_sample_mask = torch.ones(
+            1, dtype=token_mask.dtype, device=token_mask.device
+        )
+        return self.draft_loss_fn(
+            teacher_logits=teacher_logits,
+            student_logits=self.student_logits,
+            token_mask=token_mask,
+            data=BatchedDataDict({"sample_mask": ones_sample_mask}),
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
         )
 
     def __call__(
@@ -270,20 +339,25 @@ class DraftLossWrapper:
             **kwargs,
         )
 
-        loss_input, data = self.prepare_fn(
-            logits=next_token_logits,
-            data=data,
-            loss_fn=self.draft_loss_fn,
-            vocab_parallel_rank=self.vocab_parallel_rank,
-            vocab_parallel_group=self.vocab_parallel_group,
-            context_parallel_group=self.context_parallel_group,
-        )
-        draft_loss = self.draft_loss_fn(
-            data=data,
-            global_valid_seqs=global_valid_seqs,
-            global_valid_toks=global_valid_toks,
-            **loss_input,
-        )
+        if self.cu_seqlens_q is not None:
+            draft_loss = self._packed_draft_loss(
+                next_token_logits, data, global_valid_seqs, global_valid_toks
+            )
+        else:
+            loss_input, data = self.prepare_fn(
+                logits=next_token_logits,
+                data=data,
+                loss_fn=self.draft_loss_fn,
+                vocab_parallel_rank=self.vocab_parallel_rank,
+                vocab_parallel_group=self.vocab_parallel_group,
+                context_parallel_group=self.context_parallel_group,
+            )
+            draft_loss = self.draft_loss_fn(
+                data=data,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                **loss_input,
+            )
         combined_loss = policy_loss + self.loss_weight * draft_loss
         metrics["draft_loss"] = float(draft_loss.detach().item())
         return combined_loss, metrics
