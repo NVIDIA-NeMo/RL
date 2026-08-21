@@ -17,12 +17,16 @@ policy:
       resources:
         gpus_per_node: 4
         num_nodes: 1
+data:
+  train:
+    data_path: ${oc.env:NRL_SWE_TRAIN_DATA}
+  validation:
+    data_path: ${oc.env:NRL_SWE_VAL_DATA}
 env:
   nemo_gym:
     is_trajectory_collection: true
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-thinking-swe1-2n4g-megatron-tp2pp2-rollout-only-specdec
-  tensorboard_enabled: false
   wandb:
     project: nemo-rl
     name: qwen3-30ba3b-thinking-swe1-rollout-only-specdec

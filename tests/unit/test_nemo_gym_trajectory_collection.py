@@ -19,7 +19,6 @@ from unittest.mock import Mock
 
 import pytest
 
-
 RUNNER = Path(__file__).resolve().parents[2] / "examples/nemo_gym/run_grpo_nemo_gym.py"
 
 

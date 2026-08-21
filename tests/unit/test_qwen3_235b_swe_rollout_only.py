@@ -22,7 +22,6 @@ from omegaconf import OmegaConf
 
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RECIPE = (
     REPO_ROOT

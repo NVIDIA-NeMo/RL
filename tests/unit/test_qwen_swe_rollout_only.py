@@ -46,6 +46,8 @@ def _launcher_env(
         "NRL_DRAFT_MODEL": str(tmp_path / "draft"),
         "NRL_RUNTIME": str(tmp_path / "runtime"),
         "NRL_OUTPUT_DIR": str(tmp_path / "output"),
+        "NRL_SWE_TRAIN_DATA": str(tmp_path / "train-split.jsonl"),
+        "NRL_SWE_VAL_DATA": str(tmp_path / "val-split.jsonl"),
         "NRL_SPEC_METHOD": method,
         "NRL_NUM_SPECULATIVE_TOKENS": num_speculative_tokens,
     }
@@ -58,6 +60,8 @@ def test_rollout_only_recipe_uses_two_gb200_nodes_and_required_spec_config(
     monkeypatch.setenv("NRL_SPEC_METHOD", "dflash")
     monkeypatch.setenv("NRL_DRAFT_MODEL", "/draft")
     monkeypatch.setenv("NRL_NUM_SPECULATIVE_TOKENS", "7")
+    monkeypatch.setenv("NRL_SWE_TRAIN_DATA", "/data/swe1/train-split.jsonl")
+    monkeypatch.setenv("NRL_SWE_VAL_DATA", "/data/swe1/val-split.jsonl")
     register_omegaconf_resolvers()
     config = OmegaConf.to_container(load_config(RECIPE), resolve=True)
 
@@ -83,6 +87,8 @@ def test_rollout_only_recipe_uses_two_gb200_nodes_and_required_spec_config(
         "num_speculative_tokens": 7,
         "draft_tensor_parallel_size": 1,
     }
+    assert config["data"]["train"]["data_path"] == "/data/swe1/train-split.jsonl"
+    assert config["data"]["validation"]["data_path"] == "/data/swe1/val-split.jsonl"
     assert config["env"]["nemo_gym"]["is_trajectory_collection"] is True
     assert config["cluster"]["gpus_per_node"] == 4
     assert config["cluster"]["num_nodes"] == 2
@@ -184,6 +190,28 @@ def test_launcher_rejects_unsupported_method_or_speculative_horizon(
 
     assert result.returncode != 0
     assert "unsupported" in result.stderr.lower()
+
+
+def test_launcher_rejects_missing_required_path(tmp_path: Path) -> None:
+    env = _launcher_env(tmp_path, "dflash", "7")
+    del env["DRY_RUN"]
+    (tmp_path / "hf-cache").mkdir()
+    (tmp_path / "target").mkdir()
+    (tmp_path / "draft").mkdir()
+    (tmp_path / "train-split.jsonl").touch()
+    (tmp_path / "val-split.jsonl").touch()
+    # NRL_RUNTIME/bin/python is intentionally left missing.
+
+    result = subprocess.run(
+        ["bash", str(LAUNCHER)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "required path does not exist" in result.stderr
 
 
 def test_system_executable_override_covers_every_registered_actor(

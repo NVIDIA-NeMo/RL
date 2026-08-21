@@ -24,10 +24,12 @@ recipe="${repo_root}/examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-swe
 : "${NRL_DRAFT_MODEL:?NRL_DRAFT_MODEL must point to the exported ModelOpt drafter}"
 : "${NRL_RUNTIME:?NRL_RUNTIME must point to one pre-created shared NeMo-RL environment}"
 : "${NRL_OUTPUT_DIR:?NRL_OUTPUT_DIR must be an absolute experiment output path}"
+: "${NRL_SWE_TRAIN_DATA:?NRL_SWE_TRAIN_DATA must point to the SWE training JSONL}"
+: "${NRL_SWE_VAL_DATA:?NRL_SWE_VAL_DATA must point to the SWE validation JSONL}"
 : "${NRL_SPEC_METHOD:?NRL_SPEC_METHOD must be dflash or dspark}"
 : "${NRL_NUM_SPECULATIVE_TOKENS:?NRL_NUM_SPECULATIVE_TOKENS must be between 1 and 64}"
 
-for path_name in HF_HOME NRL_TARGET_MODEL NRL_DRAFT_MODEL NRL_RUNTIME NRL_OUTPUT_DIR; do
+for path_name in HF_HOME NRL_TARGET_MODEL NRL_DRAFT_MODEL NRL_RUNTIME NRL_OUTPUT_DIR NRL_SWE_TRAIN_DATA NRL_SWE_VAL_DATA; do
   path_value=${!path_name}
   if [[ ${path_value} != /* ]]; then
     echo "${path_name} must be an absolute path" >&2
@@ -44,7 +46,7 @@ case "${NRL_SPEC_METHOD}" in
 esac
 
 if [[ ! ${NRL_NUM_SPECULATIVE_TOKENS} =~ ^[0-9]+$ ]] ||
-  ((NRL_NUM_SPECULATIVE_TOKENS < 1 || NRL_NUM_SPECULATIVE_TOKENS > 64)); then
+  ((10#${NRL_NUM_SPECULATIVE_TOKENS} < 1 || 10#${NRL_NUM_SPECULATIVE_TOKENS} > 64)); then
   echo "unsupported speculative horizon: ${NRL_NUM_SPECULATIVE_TOKENS}; expected 1..64" >&2
   exit 2
 fi
@@ -86,7 +88,9 @@ for required_path in \
   "${HF_HOME}" \
   "${NRL_TARGET_MODEL}" \
   "${NRL_DRAFT_MODEL}" \
-  "${NRL_RUNTIME}/bin/python"; do
+  "${NRL_RUNTIME}/bin/python" \
+  "${NRL_SWE_TRAIN_DATA}" \
+  "${NRL_SWE_VAL_DATA}"; do
   if [[ ! -e ${required_path} ]]; then
     echo "required path does not exist: ${required_path}" >&2
     exit 2

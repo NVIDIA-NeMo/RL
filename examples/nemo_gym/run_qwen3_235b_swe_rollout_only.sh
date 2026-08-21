@@ -66,7 +66,7 @@ case "${NRL_SPEC_METHOD}" in
 esac
 
 if [[ ! ${NRL_NUM_SPECULATIVE_TOKENS} =~ ^[0-9]+$ ]] ||
-  ((NRL_NUM_SPECULATIVE_TOKENS < 1 || NRL_NUM_SPECULATIVE_TOKENS > 64)); then
+  ((10#${NRL_NUM_SPECULATIVE_TOKENS} < 1 || 10#${NRL_NUM_SPECULATIVE_TOKENS} > 64)); then
   echo "unsupported speculative horizon: ${NRL_NUM_SPECULATIVE_TOKENS}; expected 1..64" >&2
   exit 2
 fi
