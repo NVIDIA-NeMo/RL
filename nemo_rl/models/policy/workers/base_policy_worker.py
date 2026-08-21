@@ -28,6 +28,8 @@ class AbstractPolicyWorker:
     # None until init_collective builds it. Declared so a rebuild can release the
     # previous group without probing for the attribute's existence.
     model_update_group: Optional[Any] = None
+    # Same, for the per-PP-stage group the nccl_reshard transport builds.
+    pp_comm_group: Optional[Any] = None
 
     def init_collective(
         self,
@@ -80,6 +82,13 @@ class AbstractPolicyWorker:
         Non-PP is simply ``pp_size == 1`` that contains all the train ranks.
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
+
+        # Released for the same reason init_collective releases model_update_group:
+        # _build re-runs both communicator families on every reconcile, so without this
+        # each recovery strands a NCCL communicator and a bound TCPStore per PP stage for
+        # the life of the worker.
+        if self.pp_comm_group is not None:
+            self.pp_comm_group.abort()
 
         self.pp_comm_group = StatelessProcessGroup(
             master_address=pp_ips[my_pp_stage],

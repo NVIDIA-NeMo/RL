@@ -386,7 +386,11 @@ if (( FINISHED == 0 )); then
     exit 1
 fi
 
-wait $TRAIN_PID; EXIT_CODE=$?
+# `wait` must not be a bare simple command: under the `set -eou pipefail` above, a
+# non-zero training exit terminates the script here and every FAIL diagnostic below
+# -- the job exit code, the error-pattern grep, the survivor assertion -- never runs,
+# on exactly the failure this test exists to report. Same form as the chaos harness.
+wait $TRAIN_PID && EXIT_CODE=0 || EXIT_CODE=$?
 echo "[recovery] job exited $EXIT_CODE, ${ELAPSED}s after the kill"
 
 if (( EXIT_CODE != 0 )); then

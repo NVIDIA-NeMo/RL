@@ -196,7 +196,7 @@ def test_init_collective_keeps_generation_ranks_after_the_training_ranks(
         rank_prefix=0, ip="10.0.0.1", port=5000, world_size=6, train_world_size=4
     )
 
-    assert recording_group.instances[0].kwargs["rank"] >= 4
+    assert recording_group.instances[0].kwargs["rank"] == 4
 
 
 @pytest.mark.vllm

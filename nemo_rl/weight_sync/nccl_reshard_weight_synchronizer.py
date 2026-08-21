@@ -259,7 +259,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         self._built_membership = membership
 
     def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
-        """Refuse the refit when either communicator family has lost a rank.
+        """Rebuild both communicator families and regenerate the refit plan.
 
         This transport is harder to recover than the plain broadcast, and the difference
         is worth stating rather than discovering. Two families must be reconciled: the
@@ -273,7 +273,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         number of receivers -- it orphans the slices that rank owned, and the survivors
         would come back holding weights that were never written. Resizing the
         communicators without regenerating the plan would corrupt the refit silently,
-        which is worse than stopping.
+        which is why the plan is regenerated rather than reused.
         """
         membership = desired_membership(
             absent_shards=absent_shards,

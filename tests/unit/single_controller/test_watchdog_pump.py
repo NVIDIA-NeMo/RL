@@ -345,6 +345,54 @@ class TestGenerationFleetProbe:
         with pytest.raises(GenerationFleetExhausted):
             asyncio.run(_main())
 
+    def test_a_tick_inside_a_recovery_does_not_end_the_run(self):
+        """Regression: the exhaustion check killed the recovery that was about to succeed.
+
+        _recover_from_failed_refit marks every serving shard partial, so the serving set
+        is empty by construction until the retry refit promotes them back -- across two
+        awaits that yield this loop. A watchdog tick landing in that window used to see
+        zero serving shards, raise GenerationFleetExhausted, and end the run while the
+        retry was still in flight, blaming an exhausted fleet for a recovery in progress.
+
+        The default tick is 30s and a rebuild plus a full refit can easily outlast it.
+        """
+        monitor = GenerationFleetHealth(
+            shard_count=1,
+            policy=FleetHealthPolicy(unhealthy_threshold=1, min_healthy_shards=1),
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[False])
+
+        async def _main():
+            await _run_probe_ticks(ctrl, 3)
+            with ctrl._recovery_window():
+                # _run_ticks, not the raw pump: the pump is `while True` and only ever
+                # returns by raising, so awaiting it directly here would hang forever --
+                # which is precisely what the fix makes it do, since the exhaustion check
+                # it used to raise from is now skipped inside this window.
+                await _run_ticks(ctrl, 3)
+
+        asyncio.run(_main())  # must not raise
+
+    def test_the_window_reopens_the_check_even_if_the_retry_raises(self):
+        """A leaked flag would disable the exhaustion check for the rest of the run."""
+        monitor = GenerationFleetHealth(
+            shard_count=1,
+            policy=FleetHealthPolicy(unhealthy_threshold=1, min_healthy_shards=1),
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[False])
+
+        with pytest.raises(RuntimeError, match="retry blew up"):
+            with ctrl._recovery_window():
+                raise RuntimeError("retry blew up")
+        assert ctrl._recovering_from_refit is False
+
+        async def _main():
+            await _run_probe_ticks(ctrl, 3)
+            await ctrl._stall_watchdog_pump()
+
+        with pytest.raises(GenerationFleetExhausted):
+            asyncio.run(_main())
+
     def test_no_monitor_means_no_probing(self):
         """Fleet health off must leave the watchdog exactly as it was."""
         ctrl = _make_controller(

@@ -1205,6 +1205,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 )
                 return False
             return True
+        except RefitAborted:
+            # Propagate, do not fold into `return False`; see the async variant. This is
+            # the only one of the four refit entrypoints that was missing the re-raise,
+            # and the broad handler below would otherwise report a deliberate abort as a
+            # generic failure -- ending the run instead of triggering the rebuild.
+            raise
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback

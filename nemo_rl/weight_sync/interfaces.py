@@ -122,7 +122,7 @@ class WeightSynchronizer(ABC):
         """
         pass
 
-    def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
+    def reconcile_communicator(self, absent_shards: Sequence[int]) -> Optional[bool]:
         """Bring the transport's communicator in line with the live generation fleet.
 
         Called immediately before every refit, rather than in response to a death event.
@@ -138,17 +138,23 @@ class WeightSynchronizer(ABC):
                 alive and able to refit.
 
         Returns:
-            True if the communicator was rebuilt.
+            True if the communicator was rebuilt, False if nothing needed rebuilding,
+            and None if this transport owns no membership to reconcile at all. The
+            caller reports a failed refit differently for the last case: "no shard was
+            absent" and "there was nothing to reconcile" point at different causes.
 
         Raises:
             NoSurvivingShards: if every generation shard is gone, so there is nothing
                 left to rebuild onto.
 
         The default is a no-op: transports that own no NCCL world of their own -- IPC,
-        HTTP, checkpoint-engine -- have no membership to reconcile.
+        HTTP, checkpoint-engine -- have no membership to reconcile. It returns None
+        rather than False so the controller does not report a refit failure on one of
+        them as "no shard could be identified as absent", which would send the reader
+        hunting for a silent rank that does not exist.
         """
         del absent_shards
-        return False
+        return None
 
     @abstractmethod
     def shutdown(self) -> None:
