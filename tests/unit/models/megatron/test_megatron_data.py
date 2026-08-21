@@ -1450,6 +1450,55 @@ class TestMakeProcessedMicrobatchIterator:
         assert call_kwargs["pad_packed_seq_to_multiple_of"] == 16
         assert call_kwargs["pad_full_seq_to"] == 1024
 
+    @pytest.mark.parametrize(
+        ("fuse_loss", "expected_materializations"),
+        [(False, 0), (True, 1)],
+    )
+    @patch("nemo_rl.models.megatron.data.process_microbatch")
+    @patch("nemo_rl.models.megatron.data.materialize_teacher_topk_microbatch")
+    def test_teacher_topk_materialization_is_deferred_only_for_non_fused_packing(
+        self,
+        mock_materialize,
+        mock_process,
+        fuse_loss,
+        expected_materializations,
+    ):
+        from nemo_rl.models.megatron.data import (
+            ProcessedInputs,
+            make_processed_microbatch_iterator,
+        )
+
+        mock_process.return_value = ProcessedInputs(
+            input_ids=MagicMock(),
+            input_ids_cp_sharded=MagicMock(),
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=MagicMock(),
+            cu_seqlens_padded=MagicMock(),
+        )
+        mock_data_dict = MagicMock()
+        mock_data_dict.to.return_value = mock_data_dict
+        cfg = {
+            "sequence_packing": {
+                "enabled": True,
+                "fuse_loss": fuse_loss,
+            }
+        }
+
+        iterator = make_processed_microbatch_iterator(
+            raw_iterator=iter([mock_data_dict]),
+            cfg=cfg,
+            seq_length_key="input_lengths",
+            pad_individual_seqs_to_multiple_of=8,
+            pad_packed_seq_to_multiple_of=16,
+            straggler_timer=MagicMock(),
+            pad_full_seq_to=None,
+            materialize_opd_teacher_topk=True,
+        )
+        next(iterator)
+
+        assert mock_materialize.call_count == expected_materializations
+
 
 PACK_SEQUENCES_TEST_ACTOR_FQN = (
     f"{PackSequencesTestActor.__module__}.PackSequencesTestActor"

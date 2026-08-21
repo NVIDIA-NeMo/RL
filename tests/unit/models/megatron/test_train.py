@@ -31,6 +31,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.loss import prepare_packed_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -1171,6 +1172,7 @@ class TestLossPostProcessor:
         mock_cp_grp.return_value = MagicMock()
 
         mock_loss_fn = MagicMock()
+        mock_loss_fn.input_type = LossInputType.LOGIT
         cfg = {"sequence_packing": {"enabled": True}}
 
         mock_packed_seq_params = MagicMock()
@@ -1183,6 +1185,41 @@ class TestLossPostProcessor:
 
         # Verify SequencePackingLossWrapper was called
         mock_wrapper.assert_called_once()
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
+    )
+    @patch("nemo_rl.models.megatron.train.SequencePackingLossWrapper")
+    def test_loss_post_processor_uses_per_sequence_packed_prep_for_topk_opd(
+        self, mock_wrapper, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
+    ):
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        mock_tp_grp.return_value = MagicMock()
+        mock_cp_grp.return_value = MagicMock()
+        mock_loss_fn = MagicMock()
+        mock_loss_fn.input_type = LossInputType.OPD_TOPK
+        cfg = {
+            "sequence_packing": {"enabled": True, "fuse_loss": False},
+            "logprob_chunk_size": 512,
+        }
+        packed_seq_params = MagicMock()
+        packed_seq_params.cu_seqlens_q = torch.tensor([0, 5, 10])
+        packed_seq_params.cu_seqlens_q_padded = torch.tensor([0, 8, 16])
+
+        processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg, cp_normalize=False)
+        processor(data_dict=MagicMock(), packed_seq_params=packed_seq_params)
+
+        prepare_fn = mock_wrapper.call_args.kwargs[
+            "per_sequence_packed_prepare_fn"
+        ]
+        assert prepare_fn.func is prepare_packed_loss_input
+        assert prepare_fn.keywords["chunk_size"] == 512
 
 
 class TestLogprobsPostProcessor:

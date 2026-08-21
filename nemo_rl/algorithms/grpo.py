@@ -451,10 +451,15 @@ def _validate_topk_opd_config(
                 "Teacher-top-k OPD requires sequence packing when context "
                 f"parallelism is enabled for: {cp_owners}."
             )
-        if packing_enabled and not policy_config["sequence_packing"].get("fuse_loss"):
-            raise NotImplementedError(
-                "Packed teacher-top-k OPD requires "
-                "policy.sequence_packing.fuse_loss=true."
+        if packing_enabled and policy_config["sequence_packing"].get("fuse_loss"):
+            warnings.warn(
+                "Teacher-top-k OPD with policy.sequence_packing.fuse_loss=true "
+                "expands support tensors to globally padded [B, S, K] shapes "
+                "during loss computation and can cause a GPU OOM. Prefer "
+                "fuse_loss=false, which materializes and scores one packed "
+                "sequence at a time.",
+                RuntimeWarning,
+                stacklevel=2,
             )
     if need_top_k_or_top_p_filtering(
         TrainingSamplingParams(

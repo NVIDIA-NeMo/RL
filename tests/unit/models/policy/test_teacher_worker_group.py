@@ -480,9 +480,9 @@ def test_get_topk_logprobs_packs_and_restores_original_order():
     data = MagicMock()
     data.size = 2
     data.__getitem__.side_effect = lambda key: (
-        torch.zeros(2, 2, dtype=torch.long)
+        torch.zeros(2, 2, dtype=torch.int64)
         if key == "input_ids"
-        else torch.ones(2, dtype=torch.long)
+        else torch.ones(2, dtype=torch.int64)
     )
     data.shard_by_batch_size.return_value = (["packed_shard"], [1, 0])
 

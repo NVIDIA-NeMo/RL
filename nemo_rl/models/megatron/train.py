@@ -46,7 +46,7 @@ from nemo_rl.algorithms.loss import (
     prepare_packed_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -530,6 +530,7 @@ class LossPostProcessor:
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
             fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
+            per_sequence_packed_prepare_fn = None
             if fuse_loss:
                 # The fused path prepares loss via prepare_packed_loss_input and
                 # cannot honor a custom prepare_fn (e.g. the value model's); guard
@@ -548,7 +549,16 @@ class LossPostProcessor:
             else:
                 wrapper_cls = SequencePackingLossWrapper
                 prepare_fn = prepare_loss_input_wrapped
+                if self.loss_fn.input_type == LossInputType.OPD_TOPK:
+                    per_sequence_packed_prepare_fn = partial(
+                        prepare_packed_loss_input,
+                        sampling_params=self.sampling_params,
+                        chunk_size=logprob_chunk_size,
+                    )
 
+            wrapper_kwargs = {}
+            if per_sequence_packed_prepare_fn is not None:
+                wrapper_kwargs["per_sequence_packed_prepare_fn"] = per_sequence_packed_prepare_fn
             loss_fn_wrapped = wrapper_cls(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_fn,
@@ -557,6 +567,7 @@ class LossPostProcessor:
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
+                **wrapper_kwargs,
             )
         else:
             loss_fn_wrapped = partial(

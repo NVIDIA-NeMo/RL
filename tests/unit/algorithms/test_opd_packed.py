@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from nemo_rl.algorithms.loss.wrapper import SequencePackingLossWrapper
 from nemo_rl.algorithms.opd_packed import (
     OPD_TEACHER_TOPK_PACKED_KEY,
     materialize_teacher_topk_microbatch,
@@ -58,7 +59,7 @@ def test_materialize_teacher_topk_builds_only_the_current_microbatch():
     ]
     data = BatchedDataDict(
         {
-            "input_ids": torch.zeros(2, 5, dtype=torch.long),
+            "input_ids": torch.zeros(2, 5, dtype=torch.int64),
             OPD_TEACHER_TOPK_PACKED_KEY: entries,
         }
     )
@@ -67,9 +68,11 @@ def test_materialize_teacher_topk_builds_only_the_current_microbatch():
 
     assert OPD_TEACHER_TOPK_PACKED_KEY not in data
     assert data["opd_support_indices"].shape == (2, 5, 2)
+    assert data["opd_support_indices"].dtype == torch.int64
     assert data["teacher_support_logprobs"].shape == (2, 5, 2)
     torch.testing.assert_close(
-        data["opd_support_indices"][0, :3], entries[0]["topk_indices"]
+        data["opd_support_indices"][0, :3],
+        entries[0]["topk_indices"].to(torch.int64),
     )
     torch.testing.assert_close(
         data["teacher_support_logprobs"][1, :1], entries[1]["topk_logprobs"]
@@ -92,11 +95,11 @@ def test_replay_collation_flattens_metadata_without_topk_materialization():
     combined = BatchedDataDict.from_batches(
         [
             {
-                "input_ids": torch.zeros(2, 3, dtype=torch.long),
+                "input_ids": torch.zeros(2, 3, dtype=torch.int64),
                 OPD_TEACHER_TOPK_PACKED_KEY: entries[:2],
             },
             {
-                "input_ids": torch.zeros(2, 5, dtype=torch.long),
+                "input_ids": torch.zeros(2, 5, dtype=torch.int64),
                 OPD_TEACHER_TOPK_PACKED_KEY: entries[2:],
             },
         ]
@@ -105,3 +108,81 @@ def test_replay_collation_flattens_metadata_without_topk_materialization():
     assert combined[OPD_TEACHER_TOPK_PACKED_KEY] == entries
     assert combined["input_ids"].shape == (4, 5)
     assert "opd_support_indices" not in combined
+
+
+def test_non_fused_packing_materializes_teacher_topk_one_sequence_at_a_time():
+    entries = [
+        {
+            "seq_len": 2,
+            "topk": 2,
+            "topk_indices": torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+            "topk_logprobs": torch.tensor([[-0.1, -0.2], [-0.3, -0.4]]),
+        },
+        {
+            "seq_len": 1,
+            "topk": 2,
+            "topk_indices": torch.tensor([[5, 6]], dtype=torch.int32),
+            "topk_logprobs": torch.tensor([[-0.5, -0.6]]),
+        },
+    ]
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[10, 11, 12], [20, 21, 0]], dtype=torch.int64),
+            "input_lengths": torch.tensor([3, 2], dtype=torch.int32),
+            OPD_TEACHER_TOPK_PACKED_KEY: entries,
+        }
+    )
+    standard_prepare = MagicMock(side_effect=AssertionError("unexpected dense prep"))
+    prepared_shapes = []
+
+    def per_sequence_packed_prepare_fn(**kwargs):
+        sequence_data = kwargs["data"]
+        sequence_length = sequence_data["input_ids"].shape[1]
+        prepared_shapes.append(
+            (
+                tuple(sequence_data["opd_support_indices"].shape),
+                tuple(sequence_data["teacher_support_logprobs"].shape),
+                kwargs["cu_seqlens_q"].tolist(),
+                kwargs["cu_seqlens_q_padded"].tolist(),
+            )
+        )
+        assert OPD_TEACHER_TOPK_PACKED_KEY not in sequence_data
+        return (
+            {
+                "next_token_logprobs": torch.zeros(1, sequence_length - 1),
+                "current_support_logprobs": torch.zeros(
+                    1, sequence_length - 1, 2
+                ),
+            },
+            sequence_data,
+        )
+
+    class RecordingLoss:
+        use_fused_linear_logprobs = False
+
+        def __call__(self, *, next_token_logprobs, **kwargs):
+            loss = next_token_logprobs.sum()
+            return loss, {"loss": loss.item()}
+
+    wrapper = SequencePackingLossWrapper(
+        loss_fn=RecordingLoss(),
+        prepare_fn=standard_prepare,
+        per_sequence_packed_prepare_fn=per_sequence_packed_prepare_fn,
+        cu_seqlens_q=torch.tensor([0, 3, 5], dtype=torch.int32),
+        cu_seqlens_q_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+
+    loss, metrics = wrapper(
+        next_token_logits=torch.zeros(1, 8, 16),
+        data=data,
+        global_valid_seqs=None,
+        global_valid_toks=None,
+    )
+
+    standard_prepare.assert_not_called()
+    assert prepared_shapes == [
+        ((1, 3, 2), (1, 3, 2), [0, 3], [0, 4]),
+        ((1, 2, 2), (1, 2, 2), [0, 2], [0, 4]),
+    ]
+    assert loss.item() == 0
+    assert metrics["loss"] == 0

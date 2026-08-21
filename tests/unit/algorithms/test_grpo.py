@@ -273,7 +273,55 @@ def test_validate_topk_opd_config_rejects_unsupported_settings(
         _validate_topk_opd_config(master_config, opd_topk=8, topk_source="student")
 
 
-def test_validate_teacher_topk_accepts_packing_and_context_parallelism(
+def test_validate_teacher_topk_accepts_non_fused_packing_and_context_parallelism(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    master_config.policy["sequence_packing"] = {
+        "enabled": True,
+        "fuse_loss": False,
+    }
+    master_config.on_policy_distillation.non_colocated_teachers.default_teacher_cfg.context_parallel_size = 2
+
+    _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
+
+
+@pytest.mark.parametrize(
+    ("packing_enabled", "teacher_cp_size", "message"),
+    [
+        (False, 2, "requires sequence packing"),
+    ],
+)
+def test_validate_teacher_topk_rejects_incomplete_packed_configuration(
+    mock_grpo_components,
+    packing_enabled,
+    teacher_cp_size,
+    message,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    master_config.policy["sequence_packing"] = {
+        "enabled": packing_enabled,
+        "fuse_loss": False,
+    }
+    master_config.on_policy_distillation.non_colocated_teachers.default_teacher_cfg.context_parallel_size = teacher_cp_size
+
+    with pytest.raises(NotImplementedError, match=message):
+        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
+
+
+def test_validate_teacher_topk_missing_fuse_loss_defaults_to_non_fused(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_valid_topk(master_config, "teacher")
+    master_config.policy["sequence_packing"] = {"enabled": True}
+
+    _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
+
+
+def test_validate_teacher_topk_warns_that_fused_loss_can_gpu_oom(
     mock_grpo_components,
 ):
     master_config = mock_grpo_components["master_config"]
@@ -282,45 +330,8 @@ def test_validate_teacher_topk_accepts_packing_and_context_parallelism(
         "enabled": True,
         "fuse_loss": True,
     }
-    master_config.on_policy_distillation.non_colocated_teachers.default_teacher_cfg.context_parallel_size = 2
 
-    _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
-
-
-@pytest.mark.parametrize(
-    ("packing_enabled", "fuse_loss", "teacher_cp_size", "message"),
-    [
-        (False, False, 2, "requires sequence packing"),
-        (True, False, 1, "fuse_loss=true"),
-    ],
-)
-def test_validate_teacher_topk_rejects_incomplete_packed_configuration(
-    mock_grpo_components,
-    packing_enabled,
-    fuse_loss,
-    teacher_cp_size,
-    message,
-):
-    master_config = mock_grpo_components["master_config"]
-    _enable_valid_topk(master_config, "teacher")
-    master_config.policy["sequence_packing"] = {
-        "enabled": packing_enabled,
-        "fuse_loss": fuse_loss,
-    }
-    master_config.on_policy_distillation.non_colocated_teachers.default_teacher_cfg.context_parallel_size = teacher_cp_size
-
-    with pytest.raises(NotImplementedError, match=message):
-        _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
-
-
-def test_validate_teacher_topk_missing_fuse_loss_is_an_unsupported_config(
-    mock_grpo_components,
-):
-    master_config = mock_grpo_components["master_config"]
-    _enable_valid_topk(master_config, "teacher")
-    master_config.policy["sequence_packing"] = {"enabled": True}
-
-    with pytest.raises(NotImplementedError, match="fuse_loss=true"):
+    with pytest.warns(RuntimeWarning, match=r"\[B, S, K\].*GPU OOM"):
         _validate_topk_opd_config(master_config, opd_topk=8, topk_source="teacher")
 
 

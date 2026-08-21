@@ -160,9 +160,16 @@ def materialize_teacher_topk_microbatch(
     # materialize the training input directly in the dtype consumed by the
     # loss. Otherwise ``prepare_*_loss_input`` would temporarily retain this
     # full int32 tensor while allocating a second int64 copy on the GPU.
-    dense_indices = torch.zeros((batch_size, sequence_length, topk), dtype=torch.int64)
+    device = data["input_ids"].device
+    dense_indices = torch.zeros(
+        (batch_size, sequence_length, topk),
+        dtype=torch.int64,
+        device=device,
+    )
     dense_logprobs = torch.zeros(
-        (batch_size, sequence_length, topk), dtype=first_logprobs.dtype
+        (batch_size, sequence_length, topk),
+        dtype=first_logprobs.dtype,
+        device=device,
     )
     max_next_token_length = max(sequence_length - 1, 0)
     for sample_idx, (entry, indices, logprobs) in enumerate(
@@ -190,8 +197,8 @@ def materialize_teacher_topk_microbatch(
                 f"Packed teacher top-k sample {sample_idx} disagrees on topk width."
             )
         if seq_len:
-            dense_indices[sample_idx, :seq_len].copy_(indices.to(dtype=torch.int64))
-            dense_logprobs[sample_idx, :seq_len].copy_(logprobs)
+            dense_indices[sample_idx, :seq_len].copy_(indices.to(device=device, dtype=torch.int64))
+            dense_logprobs[sample_idx, :seq_len].copy_(logprobs.to(device=device, dtype=dense_logprobs.dtype))
 
     del data[OPD_TEACHER_TOPK_PACKED_KEY]
     data["opd_support_indices"] = dense_indices

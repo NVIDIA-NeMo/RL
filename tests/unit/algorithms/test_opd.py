@@ -1093,7 +1093,7 @@ def test_attach_teacher_topk_from_replay_validates_pads_and_assigns_support():
         }
     ]
     packed_train_data = BatchedDataDict(
-        {"input_ids": torch.ones(1, 4, dtype=torch.long)}
+        {"input_ids": torch.ones(1, 4, dtype=torch.int64)}
     )
     _attach_teacher_topk_from_replay(
         train_data=packed_train_data,

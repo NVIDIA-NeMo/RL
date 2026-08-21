@@ -125,7 +125,14 @@ def make_processed_microbatch_iterator(
     pack_sequences = cfg["sequence_packing"]["enabled"]
 
     for data_dict in raw_iterator:
-        if materialize_opd_teacher_topk:
+        # The non-fused sequence-packing loss slices one sequence at a time and
+        # materializes its teacher support inside SequencePackingLossWrapper.
+        # Materializing here would recreate the globally padded [B, S, K]
+        # tensors that packed transport is intended to avoid.
+        materialize_before_packing = materialize_opd_teacher_topk and (
+            not pack_sequences or cfg["sequence_packing"].get("fuse_loss", False)
+        )
+        if materialize_before_packing:
             materialize_teacher_topk_microbatch(data_dict)
         # Move to GPU
         data_dict = data_dict.to("cuda")

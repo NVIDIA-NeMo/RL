@@ -20,6 +20,7 @@ import torch.distributed
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
+from nemo_rl.algorithms.opd_packed import materialize_teacher_topk_microbatch
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -35,6 +36,7 @@ class SequencePackingLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        per_sequence_packed_prepare_fn: Optional[Callable[..., Any]] = None,
     ):
         """Wrap a loss function to handle sequence packing.
 
@@ -46,6 +48,10 @@ class SequencePackingLossWrapper:
             vocab_parallel_rank: Vocab parallel rank.
             vocab_parallel_group: Vocab parallel group.
             context_parallel_group: Context parallel group.
+            per_sequence_packed_prepare_fn: Optional packed-input preparation
+                used after slicing one sequence. Teacher-top-k OPD uses this to
+                retain CP-aware packed logprob gathering without expanding the
+                entire packed bin to ``[B, S, K]``.
 
             vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
 
@@ -59,6 +65,7 @@ class SequencePackingLossWrapper:
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
+        self.per_sequence_packed_prepare_fn = per_sequence_packed_prepare_fn
 
     def __call__(
         self,
@@ -123,14 +130,41 @@ class SequencePackingLossWrapper:
                 next_token_logits_slice = next_token_logits.narrow(
                     1, logit_start, logit_length
                 )
-            loss_input, unpadded_seq_data = self.prepare_fn(
-                logits=next_token_logits_slice,
-                data=unpadded_seq_data,
-                loss_fn=self.loss_fn,
-                vocab_parallel_rank=self.vocab_parallel_rank,
-                vocab_parallel_group=self.vocab_parallel_group,
-                context_parallel_group=self.context_parallel_group,
-            )
+            if self.per_sequence_packed_prepare_fn is not None:
+                # Resolve only this sequence's deferred teacher support. The
+                # parent packed microbatch keeps compact per-sample refs.
+                materialize_teacher_topk_microbatch(unpadded_seq_data)
+                sequence_cu_seqlens = torch.cat(
+                    (
+                        unpadded_seq_lengths[seq_idx].new_zeros(1),
+                        unpadded_seq_lengths[seq_idx].reshape(1),
+                    )
+                )
+                sequence_cu_seqlens_padded = torch.cat(
+                    (
+                        padded_seq_lengths[seq_idx].new_zeros(1),
+                        padded_seq_lengths[seq_idx].reshape(1),
+                    )
+                )
+                loss_input, unpadded_seq_data = self.per_sequence_packed_prepare_fn(
+                    logits=next_token_logits_slice,
+                    data=unpadded_seq_data,
+                    loss_fn=self.loss_fn,
+                    cu_seqlens_q=sequence_cu_seqlens,
+                    cu_seqlens_q_padded=sequence_cu_seqlens_padded,
+                    vocab_parallel_rank=self.vocab_parallel_rank,
+                    vocab_parallel_group=self.vocab_parallel_group,
+                    context_parallel_group=self.context_parallel_group,
+                )
+            else:
+                loss_input, unpadded_seq_data = self.prepare_fn(
+                    logits=next_token_logits_slice,
+                    data=unpadded_seq_data,
+                    loss_fn=self.loss_fn,
+                    vocab_parallel_rank=self.vocab_parallel_rank,
+                    vocab_parallel_group=self.vocab_parallel_group,
+                    context_parallel_group=self.context_parallel_group,
+                )
 
             # call loss function
             loss, metrics = self.loss_fn(
