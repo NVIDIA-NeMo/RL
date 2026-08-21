@@ -60,6 +60,9 @@ from nemo_rl.models.generation.vllm.worker_utils import (
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.telemetry.instrumentation import trace_fn
+from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -334,6 +337,10 @@ class BaseVllmGenerationWorker:
         if bundle_indices is not None and len(bundle_indices) == 1:
             bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
 
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
+
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
@@ -399,6 +406,7 @@ class BaseVllmGenerationWorker:
         self.rank = 0
         self.world_size = 1
 
+    @trace_fn(RLSpanGroup.MODEL_INIT, "rl.vllm.load_model")
     def _load_model(self, bundle_indices, seed):
         """Perform the heavy model loading and engine creation.
 
@@ -1409,6 +1417,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+        finally:
+            # Flush buffered spans/metrics before the actor goes away.
+            shutdown_telemetry()
 
 
 @ray.remote(

@@ -74,43 +74,46 @@ def main():
     # by every worker. No-op unless nemo-lens is installed and telemetry is on.
     init_telemetry_driver(config, algorithm="dpo")
 
-    init_ray()
+    try:
+        init_ray()
 
-    # setup tokenizer
-    tokenizer = get_tokenizer(config.policy["tokenizer"])
+        # setup tokenizer
+        tokenizer = get_tokenizer(config.policy["tokenizer"])
 
-    # setup data
-    dataset, val_dataset = setup_preference_data(tokenizer, config.data)
+        # setup data
+        dataset, val_dataset = setup_preference_data(tokenizer, config.data)
 
-    (
-        policy,
-        cluster,
-        train_dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        dpo_save_state,
-        master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
-
-    # The checkpointer owns background async-checkpoint finalization threads;
-    # the context manager guarantees they are flushed (rename + delete) on exit.
-    with checkpointer:
-        dpo_train(
+        (
             policy,
+            cluster,
             train_dataloader,
             val_dataloader,
-            tokenizer,
             loss_fn,
-            master_config,
             logger,
             checkpointer,
             dpo_save_state,
-        )
+            master_config,
+        ) = setup(config, tokenizer, dataset, val_dataset)
 
-    # Flush and shut down telemetry (no-op when telemetry is inactive).
-    shutdown_telemetry()
+        # The checkpointer owns background async-checkpoint finalization threads;
+        # the context manager guarantees they are flushed (rename + delete) on exit.
+        with checkpointer:
+            dpo_train(
+                policy,
+                train_dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                master_config,
+                logger,
+                checkpointer,
+                dpo_save_state,
+            )
+    finally:
+        # Flush on the failure paths too, and before cluster teardown: the OTel
+        # SDK's own atexit hook is registered ahead of Ray's and so runs after
+        # it. No-op when telemetry is inactive.
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":

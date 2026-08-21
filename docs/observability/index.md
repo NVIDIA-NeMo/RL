@@ -56,7 +56,7 @@ You do not have to touch the config file: telemetry can be driven purely by env 
 
 ## What gets instrumented
 
-Each algorithm's `examples/run_<algo>.py` calls `init_telemetry_driver(config, algorithm="<algo>")` **before** `init_ray()` (so the resolved `NEMO_RL_OTEL_*` settings are snapshotted into the Ray `runtime_env` and inherited by every worker) and `shutdown_telemetry()` at the end of `main()`.
+Each algorithm's `examples/run_<algo>.py` calls `init_telemetry_driver(config, algorithm="<algo>")` **before** `init_ray()` (so the resolved `NEMO_RL_OTEL_*` settings are snapshotted into the Ray `runtime_env` and inherited by every worker) and `shutdown_telemetry()` from a `finally` block wrapping the whole run, so buffered spans are flushed even when the run fails.
 
 | Algorithm | Entry point | Representative spans |
 |---|---|---|
@@ -73,7 +73,7 @@ Each span belongs to a **span group** that controls whether it is emitted at run
 ## What gets exported
 
 - **Traces**: any OTLP-compatible backend (Jaeger, Grafana Tempo, an OpenTelemetry Collector, ...) via OTLP.
-- **Metrics**: the `rl.*` catalog (reward, loss, KL, grad norm, throughput, generation/rollout latency) teed from the driver's metrics logger — see [Metrics](metrics.md).
+- **Metrics**: the `rl.*` catalog (reward, loss, KL, grad norm, learning rate, throughput) teed from the driver's metrics logger — see [Metrics](metrics.md).
 - **Logs** (optional): via the OTel log bridge when `NEMO_RL_OTEL_LOGS_ENABLED=1` — correlates Python `logging` records with the active span's trace ID.
 
 By default, only **one rank** exports (`single_rank`, last rank). The driver always exports (it hosts the training loop and the metrics logger). See [Configuration — Export strategy](configuration.md#export-strategy).
