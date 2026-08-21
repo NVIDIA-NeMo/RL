@@ -6,6 +6,16 @@
 # so this is the pre-existing Qwen3.5 + Megatron + EP hang.
 tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.sh
 
+# The async video GRPO regression is self-contained, but its 16-node topology
+# is too large for nightly. Run it manually before changes to the async video
+# rollout/training path are merged.
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.sh
+
+# The synchronous video GRPO smoke test is self-contained, but its 2x8-GPU,
+# 240-minute allocation adds 64 GPU-hours and exceeds the nightly budget.
+# Run it manually until the nightly suite has room.
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-2n8g-megatron-tp4ep4-gym-video.v1.sh
+
 # First multimodal NeMo-Gym recipe (circle_click at the pinned Gym). Disabled on
 # landing for two reasons: the recipe has not been run end to end yet, so its
 # reward threshold is an unvalidated smoke bound; and nightly.txt is at 3755 of

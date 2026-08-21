@@ -407,10 +407,24 @@ class GenerationInterface(ABC):
 
     @abstractmethod
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
+        """Ready the engine for a generation phase (start or wake it).
+
+        Idempotent wake: calling this on an already-running engine must be safe and cheap.
+        """
         pass
 
     @abstractmethod
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+        """Wind down after a generation phase.
+
+        Callers may pass `release_gpu` (keyword-only, default True):
+        True means the caller needs the GPUs for itself (a training step or a checkpoint save),
+        so even a colocated engine must fully stand down;
+        False means the phase is merely over, and a colocated engine must keep serving
+        usable with no intervening prepare_for_generation.
+        Only the colocated Megatron backend honors the flag today; other backends
+        ignore it, as do engines on dedicated GPUs.
+        """
         pass
 
     @abstractmethod
@@ -471,6 +485,26 @@ class GenerationInterface(ABC):
     # Optional hook; backends may override to invalidate any reusable caches
     # (e.g., vLLM prefix/KV caches) after weight updates.
     def invalidate_kv_cache(self) -> bool:
+        return False
+
+    def blocks_training(self) -> bool:
+        """Whether this engine must stand down before a training step.
+
+        True when generation shares GPUs with training (colocated): the
+        training loop then pauses collection and winds the engine down
+        before training. Engines on dedicated GPUs never block training.
+        """
+        return False
+
+    def wake_carries_weight_updates(self) -> bool:
+        """Whether prepare_for_generation alone serves the latest weights.
+
+        True when waking the engine suffices for it to serve weights updated while it slept
+        (colocated Megatron: the wake reshards, or the engine shares the training tensors outright).
+        The async loop may then defer a wake past a checkpoint save and advance
+        the collector's weight version with no explicit transfer.
+        Backends whose wake does not reload weights must return False so the loop refits instead.
+        """
         return False
 
     def clear_logger_metrics(self) -> None:
