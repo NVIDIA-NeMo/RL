@@ -192,19 +192,39 @@ if [[ "$FREEZE_VICTIM" == "true" && "$KILL_DURING_REFIT" != "true" ]]; then
 fi
 
 if [[ "$FREEZE_VICTIM" == "true" ]]; then
-    # The deadline has to beat the probe, or the abort never happens.
+    # The deadline has to land in a window with a floor AND a ceiling.
     #
-    # A frozen shard stops answering is_alive, so the probe condemns it after
-    # unhealthy_threshold * probe_interval_s. Once it is DEAD, the reconcile that runs
-    # before every refit drops it from the membership, the collective never stalls, and
-    # the watchdog has nothing to fire on. Job 6408766 ran exactly that way and finished
-    # all 24 steps with zero RefitAborted: probe 15s, deadline 60s, probe wins by 45.
+    # Ceiling -- it must beat the probe. A frozen shard stops answering is_alive, so the
+    # probe condemns it after unhealthy_threshold * probe_interval_s. Once it is DEAD the
+    # reconcile before each refit drops it, the collective never stalls, and the watchdog
+    # has nothing to fire on. Job 6408766: probe 15s, deadline 60s, probe won by 45 and
+    # the run finished all 24 steps with zero RefitAborted.
     #
-    # One probe interval is the right default. Longer than a healthy refit -- 2.2-2.4s
-    # observed on 4xGB200 for this 1.5B model -- so it cannot fire on a merely slow one,
-    # and a third of the condemnation time, so the abort comfortably wins the race.
+    # Floor -- it must outlast the hold. The hold sits INSIDE the watchdog window by
+    # design (see test_the_hold_is_inside_the_watchdog_not_before_it), so the clock starts
+    # when the refit begins, not when the victim is frozen. The harness then spends a
+    # couple of seconds confirming every worker is parked, freezing one, and proving it
+    # reached state T. Job 6414909 set the deadline to 5s and the abort fired during that
+    # window: RefitAborted was raised correctly, but before any shard was frozen, so the
+    # recovery had nothing to exclude and the run died instead of carrying on.
+    #
+    # HOLD_BUDGET_S covers confirm + freeze + verify. 10s then sits ~7s after the freeze
+    # and ~8s before condemnation, and is still far above a healthy refit (2.2-2.4s
+    # observed on 4xGB200 for this 1.5B model) so it cannot fire on a merely slow one.
+    # 5, not a guess: job 6414909 ran with a 5s deadline and the abort fired before the
+    # freeze landed, so confirm+freeze+verify demonstrably takes at least that long. The
+    # `sleep 2` after SIGSTOP is 2s of it on its own.
+    HOLD_BUDGET_S=${HOLD_BUDGET_S:-5}
     if [[ -z "$REFIT_TIMEOUT_S_SET_BY_CALLER" ]]; then
-        REFIT_TIMEOUT_S=$PROBE_INTERVAL_S
+        REFIT_TIMEOUT_S=$(awk "BEGIN{printf \"%.1f\", $HOLD_BUDGET_S + $PROBE_CONDEMN_S / 2}")
+    fi
+    if ! awk "BEGIN{exit !($REFIT_TIMEOUT_S > $HOLD_BUDGET_S)}"; then
+        echo "[recovery] FATAL: refit_timeout_s=${REFIT_TIMEOUT_S}s does not outlast the"
+        echo "[recovery] ~${HOLD_BUDGET_S}s the harness needs to park every worker, freeze one and"
+        echo "[recovery] verify it stopped. The abort would fire before anything is frozen --"
+        echo "[recovery] correct behaviour, but it leaves no absent shard to recover onto and"
+        echo "[recovery] the run dies (job 6414909)."
+        exit 1
     fi
     if ! awk "BEGIN{exit !($REFIT_TIMEOUT_S < $PROBE_CONDEMN_S)}"; then
         echo "[recovery] FATAL: refit_timeout_s=${REFIT_TIMEOUT_S}s is not below the ${PROBE_CONDEMN_S}s"
@@ -213,7 +233,7 @@ if [[ "$FREEZE_VICTIM" == "true" ]]; then
         echo "[recovery] collective would never stall, and this variant would assert nothing."
         exit 1
     fi
-    echo "[recovery] frozen variant: deadline ${REFIT_TIMEOUT_S}s vs probe condemnation ${PROBE_CONDEMN_S}s"
+    echo "[recovery] frozen variant: deadline ${REFIT_TIMEOUT_S}s, between the ~${HOLD_BUDGET_S}s hold+freeze and the ${PROBE_CONDEMN_S}s probe condemnation"
 fi
 
 HOLD_FILE="$EXP_DIR/hold_refit"
