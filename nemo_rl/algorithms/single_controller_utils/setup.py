@@ -289,7 +289,8 @@ def _build_trainer(
         processor: Optional AutoProcessor for VLM paths.
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
-        reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym.
+        reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym;
+            set only when colocated Megatron generation serves from the trainer's rank 0.
 
     Returns:
         A tuple of (TQPolicy trainer, wall time spent in this call).
@@ -338,12 +339,23 @@ def _build_trainer_then_megatron_generation(
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
         reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym.
+            colocated: routed to the trainer's policy (rank 0 lives with the trainer);
+            non-colocated: routed to the dedicated generation.
 
     Returns:
         A tuple of (MegatronGeneration, TQPolicy trainer, per-phase wall
         times keyed as "gen_time" and "trainer_time").
     """
     time_metrics = {}
+
+    colocated = inference_cluster is None
+    # Rank 0 lives with the trainer when colocated, so the reserved port routes
+    # to whichever side serves: the trainer's policy or the dedicated engine.
+    trainer_port, gen_port = (
+        (reserved_http_server_port, None)
+        if colocated
+        else (None, reserved_http_server_port)
+    )
 
     trainer, time_metrics["trainer_time"] = _build_trainer(
         train_cluster,
@@ -352,9 +364,7 @@ def _build_trainer_then_megatron_generation(
         processor,
         weights_path=weights_path,
         optimizer_path=optimizer_path,
-        reserved_http_server_port=reserved_http_server_port
-        if inference_cluster is None
-        else None,
+        reserved_http_server_port=trainer_port,
     )
 
     t0 = time.perf_counter()
@@ -362,13 +372,11 @@ def _build_trainer_then_megatron_generation(
         config=master_config.policy,
         tokenizer=tokenizer,
         cluster=inference_cluster,
-        policy=trainer if inference_cluster is None else None,
+        policy=trainer if colocated else None,
         processor=processor,
         weights_path=weights_path,
-        skip_weight_load=inference_cluster is not None,
-        reserved_http_server_port=None
-        if inference_cluster is None
-        else reserved_http_server_port,
+        skip_weight_load=not colocated,
+        reserved_http_server_port=gen_port,
     )
     time_metrics["gen_time"] = time.perf_counter() - t0
 

@@ -599,7 +599,9 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(
+        calibration_data=None, defer_engine_wake=False
+    )
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["evicted_stale_prompt_groups"] == 2
     assert train_metrics["aborted_stale_inflight_groups"] == 1
@@ -694,4 +696,6 @@ def test_train_pump_chunked_step_by_engine_regime(
         assert calls == chunk * 2
         assert ctrl._rollout_permitted.is_set()
         assert select_bounds[0] == (1, 2)
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(
+        calibration_data=None, defer_engine_wake=False
+    )
