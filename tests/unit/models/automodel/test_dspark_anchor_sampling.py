@@ -72,3 +72,50 @@ def test_zero_valid_tokens_yield_no_anchors():
     )
     assert keep_mask.sum().item() == 0
     assert anchors.shape == (1, 4)
+
+
+def test_anchor_sampling_is_pure_function_of_generator_seed():
+    """The draft is replicated across TP peers; anchor draws must depend only
+    on the explicit generator seed, never on each rank's ambient RNG state."""
+    import torch
+
+    from nemo_rl.models.automodel.draft.common import sample_anchor_positions
+
+    loss_mask = torch.ones(2, 33)
+
+    def draw(seed, perturb_global_rng):
+        if perturb_global_rng:
+            torch.manual_seed(12345)
+            torch.rand(100)  # desynchronize the ambient RNG stream
+        else:
+            torch.manual_seed(999)
+        gen = torch.Generator().manual_seed(seed)
+        return sample_anchor_positions(
+            seq_len=33,
+            loss_mask=loss_mask,
+            num_anchors=8,
+            device=torch.device("cpu"),
+            generator=gen,
+        )
+
+    a1, k1 = draw(7, perturb_global_rng=False)
+    a2, k2 = draw(7, perturb_global_rng=True)
+    assert torch.equal(a1, a2) and torch.equal(k1, k2)
+
+    a3, _ = draw(8, perturb_global_rng=False)
+    assert not torch.equal(a1, a3)
+
+
+def test_anchor_sampling_seed_varies_over_rank_step_and_microbatch():
+    from nemo_rl.models.automodel.draft.integration import anchor_sampling_seed
+
+    base = anchor_sampling_seed(0, 1, 1)
+    assert anchor_sampling_seed(0, 1, 1) == base  # deterministic
+    seeds = {
+        anchor_sampling_seed(r, s, m)
+        for r in range(4)
+        for s in range(1, 4)
+        for m in range(1, 4)
+    }
+    assert len(seeds) == 4 * 3 * 3  # distinct across every counter
+    assert all(0 <= s < 2**63 for s in seeds)

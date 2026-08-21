@@ -534,6 +534,25 @@ class DSparkHiddenCapture:
         return torch.cat([self._captured[i] for i in self.target_layer_ids], dim=-1)
 
 
+def anchor_sampling_seed(
+    dp_rank: int, global_batch_index: int, microbatch_index: int
+) -> int:
+    """Deterministic seed for the draft's anchor sampling.
+
+    A pure function of the DP rank and the training progress counters: every
+    TP/CP peer of the same DP slice derives the identical seed (the draft is
+    replicated across them, so they must sample identical anchors or the
+    replicas drift apart), while DP ranks, global batches, and microbatches
+    all draw differently. Independent of each rank's ambient RNG state.
+    """
+    seed = 0x5EED_D5BA
+    for value in (dp_rank, global_batch_index, microbatch_index):
+        # Splitmix64-style mixing keeps nearby counter values decorrelated.
+        seed = (seed ^ (value + 0x9E3779B97F4A7C15)) * 0xBF58476D1CE4E5B9
+        seed &= (1 << 63) - 1
+    return seed
+
+
 class _DraftRuntimeBase:
     """Shared per-worker draft co-training state and distributed plumbing.
 
@@ -569,6 +588,9 @@ class _DraftRuntimeBase:
         self.capture: Optional[DSparkHiddenCapture] = None
         self._teacher_logits: Optional[torch.Tensor] = None
         self._num_microbatch_slots: int = 1
+        self._dp_rank: int = dist.get_rank(dp_group) if dp_group is not None else 0
+        self._global_batch_index: int = 0
+        self._microbatch_index: int = 0
 
     @property
     def _cp_size(self) -> int:
@@ -586,6 +608,8 @@ class _DraftRuntimeBase:
         each microbatch by the whole-global-batch token denominator instead.
         """
         self._num_microbatch_slots = max(int(num_microbatch_slots), 1)
+        self._global_batch_index += 1
+        self._microbatch_index = 0
 
     def _capture_layer_ids(self) -> list[int]:
         raise NotImplementedError
@@ -714,11 +738,19 @@ class DSparkRuntime(_DraftRuntimeBase):
                     f"loss_mask={loss_mask.size(1)}."
                 )
 
+        self._microbatch_index += 1
+        anchor_generator = torch.Generator(device=input_ids.device)
+        anchor_generator.manual_seed(
+            anchor_sampling_seed(
+                self._dp_rank, self._global_batch_index, self._microbatch_index
+            )
+        )
         outputs: DSparkForwardOutput = self.draft_model(
             input_ids=input_ids,
             target_hidden_states=target_hidden_states,
             loss_mask=loss_mask,
             teacher_logits=teacher_logits,
+            anchor_generator=anchor_generator,
         )
         loss, terms = compute_dspark_loss(
             outputs=outputs,

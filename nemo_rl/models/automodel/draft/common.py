@@ -111,6 +111,7 @@ def sample_anchor_positions(
     num_anchors: int,
     device: torch.device,
     doc_remaining: Optional[torch.Tensor] = None,
+    generator: Optional[torch.Generator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     valid = build_anchor_candidate_mask(
         seq_len=seq_len,
@@ -139,7 +140,11 @@ def sample_anchor_positions(
         indices,
         torch.full_like(indices, seq_len + 1),
     )
-    random_vals = torch.rand(bsz, num_candidates, device=device)
+    # An explicit generator makes the draw a pure function of its seed: the
+    # draft is replicated across TP peers (FSDP over dp_cp only), so every
+    # peer must sample identical anchors or the replicas drift apart and the
+    # refit exports rank-dependent draft weights.
+    random_vals = torch.rand(bsz, num_candidates, device=device, generator=generator)
     random_vals = torch.where(valid, random_vals, torch.full_like(random_vals, 2.0))
     _, sorted_idx = random_vals.sort(dim=1)
     gathered = torch.gather(masked_indices, 1, sorted_idx)

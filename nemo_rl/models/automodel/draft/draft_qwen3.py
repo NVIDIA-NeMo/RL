@@ -490,6 +490,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         seq_lens: Optional[torch.Tensor] = None,
         doc_remaining: Optional[torch.Tensor] = None,
         teacher_logits: Optional[torch.Tensor] = None,
+        anchor_generator: Optional[torch.Generator] = None,
     ) -> DSparkForwardOutput:
         """Run one DSpark training forward.
 
@@ -509,6 +510,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             num_anchors=self.num_anchors,
             device=device,
             doc_remaining=doc_remaining if packed else None,
+            generator=anchor_generator,
         )
         noise_embedding = create_noise_embed(
             self.embed_tokens,
