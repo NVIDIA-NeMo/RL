@@ -21,6 +21,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PERF_CONFIG_DIR = PROJECT_ROOT / "examples/configs/recipes/llm/performance"
 PERF_SUITE_DIR = PROJECT_ROOT / "tests/test_suites/llm/performance"
 GB200_SUITE = PROJECT_ROOT / "tests/test_suites/performance_gb200.txt"
+MXFP8_FUNCTIONAL_TEST = (
+    PROJECT_ROOT / "tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh"
+)
 
 MXFP8_CASES = {
     "grpo-deepseek-v3-64n4g-mxfp8-rollout": {
@@ -289,6 +292,14 @@ def test_mxfp8_rollout_backend_variant_recipes_are_not_kept() -> None:
             variant_name = f"{base_name}{suffix}"
             assert not (PERF_CONFIG_DIR / f"{variant_name}.yaml").exists()
             assert not (PERF_SUITE_DIR / f"{variant_name}.sh").exists()
+
+
+def test_mxfp8_functional_test_uses_ignore_patterns() -> None:
+    script_text = MXFP8_FUNCTIONAL_TEST.read_text(encoding="utf-8")
+
+    assert "quantization_ignored_layer_kws" not in script_text
+    assert "quantization_ignore_patterns=[model.layers.*.self_attn.*]" in script_text
+    assert "model\\.layers\\.\\*\\.self_attn\\.\\*" in script_text
 
 
 def test_qwen3_235b_scripts_append_distributed_timeout_override() -> None:

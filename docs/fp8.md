@@ -79,9 +79,11 @@ Models with MTP layers must list their MTP module names explicitly, for example
 `mtp.*` and `language_model.mtp.*`. External speculative-decoding drafts use a
 separate vLLM model configuration and must configure their precision separately.
 
-`quantization_ignored_layer_kws` is deprecated in NeMo RL 0.8. Existing
-configurations continue to work in this release, but new configurations should
-use `quantization_ignore_patterns`.
+`quantization_ignored_layer_kws` is deprecated for MXFP8 in NeMo RL 0.8; new
+MXFP8 configurations should use `quantization_ignore_patterns` instead.
+`quantization_ignore_patterns` requires `is_mx: true`. Non-MX FP8
+(`precision: "fp8"` without `is_mx`) has no pattern-based replacement yet and
+must continue to use `quantization_ignored_layer_kws`.
 
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
