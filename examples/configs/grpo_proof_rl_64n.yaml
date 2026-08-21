@@ -1,9 +1,9 @@
 # =============================================================================
-# Nemotron 3 Ultra — proof-generation and proof-verification GRPO
+# Nemotron 3 Ultra — proof-generation GRPO
 # =============================================================================
-# Proof-only config for the NeMo Gym proof judge, generation-selection, and
-# verification environments. The launch scripts override the model, data,
-# cluster shape, sequence length, and selected parallelism for each stage.
+# Proof-generation config for the NeMo Gym proof-judge environment. The launch
+# script overrides the model, data, cluster shape, sequence length, and selected
+# parallelism.
 #
 # Defaults to the proof RL large-batch recipe. Override at launch time with
 # NRL_MAX_STEPS for shorter smoke tests (e.g. NRL_MAX_STEPS=4).
@@ -367,8 +367,6 @@ env:
     config_paths:
       - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
       - resources_servers/proof_judge/configs/proof_judge.yaml
-      - resources_servers/proof_genselect/configs/proof_genselect.yaml
-      - resources_servers/proof_verification/configs/proof_verification.yaml
 
     # The proof policy reasons once per response. Keep thinking enabled in the
     # shared policy-model adapter without registering the unused reasoning-off
@@ -384,14 +382,6 @@ env:
     proof_judge:
       resources_servers:
         proof_judge:
-          judge_model_server:
-            type: responses_api_models
-            name: policy_model
-          max_tokens: 65536 # prompt length + max_tokens must be lower than max_length, otherwise the response returns 400
-
-    proof_verification:
-      resources_servers:
-        proof_verification:
           judge_model_server:
             type: responses_api_models
             name: policy_model

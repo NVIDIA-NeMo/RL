@@ -1,6 +1,6 @@
 #!/bin/bash
 # Dedicated heterogeneous Ray submission script for the Nemotron 3 Ultra
-# proof-generation and proof-verification recipes.
+# proof-generation recipe.
 #SBATCH --nodes=2
 #SBATCH --exclusive
 #SBATCH --mem=0
@@ -501,8 +501,6 @@ append_baked_export SLURM_MASTER_NODE
 for env_name in \
   JUDGE_SERVER_ARGS \
   PROOF_JUDGE_LOG_JSONL_PATH \
-  PROOF_VERIFICATION_LOG_JSONL_PATH \
-  PROOF_GENSELECT_LOG_JSONL_PATH \
   HF_HOME \
   WANDB_ENTITY \
   NRL_FORCE_REBUILD_VENVS \

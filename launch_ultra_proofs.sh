@@ -4,10 +4,9 @@
 
 set -euo pipefail
 
-# Public SLURM launcher for the Nemotron 3 Ultra proof-generation and
-# proof-verification recipes. It allocates one Ray component for training and
-# rollout workers plus optional heterogeneous components for external proof
-# judge servers.
+# Public SLURM launcher for the Nemotron 3 Ultra proof-generation recipe. It
+# allocates one Ray component for training and rollout workers plus optional
+# heterogeneous components for external proof judge servers.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=${SCRIPT_DIR}
@@ -135,8 +134,6 @@ export HF_HOME
 
 export BASE_LOG_DIR="${BASE_LOG_DIR:-${RESULTS_DIR}/ray_logs}"
 export PROOF_JUDGE_LOG_JSONL_PATH="${PROOF_JUDGE_LOG_JSONL_PATH:-${LOG_DIR}/proof_judge.jsonl}"
-export PROOF_VERIFICATION_LOG_JSONL_PATH="${PROOF_VERIFICATION_LOG_JSONL_PATH:-${LOG_DIR}/proof_verification.jsonl}"
-export PROOF_GENSELECT_LOG_JSONL_PATH="${PROOF_GENSELECT_LOG_JSONL_PATH:-${LOG_DIR}/proof_genselect.jsonl}"
 export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="${NRL_VLLM_ASYNC_TIMEOUT_SECONDS:-7200}"
 export RAY_LOG_SYNC_FREQUENCY="${RAY_LOG_SYNC_FREQUENCY:-60}"
 
@@ -167,11 +164,9 @@ if [[ "${USE_WORKTREE:-0}" == "1" ]]; then
   _append_mount "${PROJECT_ROOT}/nemo_rl/utils/checkpoint.py" "/opt/nemo-rl/nemo_rl/utils/checkpoint.py"
   _append_mount "${PROJECT_ROOT}/examples/configs/grpo_proof_rl_64n.yaml" "/opt/nemo-rl/examples/configs/grpo_proof_rl_64n.yaml"
   _append_mount "${PROJECT_ROOT}/examples/nemo_gym/run_grpo_nemo_gym.py" "/opt/nemo-rl/examples/nemo_gym/run_grpo_nemo_gym.py"
-  for proof_resource in proof_judge proof_genselect proof_verification; do
-    _append_mount \
-      "${PROJECT_ROOT}/3rdparty/Gym-workspace/Gym/resources_servers/${proof_resource}" \
-      "/opt/nemo-rl/3rdparty/Gym-workspace/Gym/resources_servers/${proof_resource}"
-  done
+  _append_mount \
+    "${PROJECT_ROOT}/3rdparty/Gym-workspace/Gym/resources_servers/proof_judge" \
+    "/opt/nemo-rl/3rdparty/Gym-workspace/Gym/resources_servers/proof_judge"
 fi
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
   if [[ -n "${MOUNTS}" ]]; then

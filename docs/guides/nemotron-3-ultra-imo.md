@@ -1,40 +1,32 @@
-# Nemotron 3 Ultra: Proof RL for IMO 2026
+# Nemotron 3 Ultra: Proof-Generation RL for IMO 2026
 
-This guide describes the proof-generation and proof-verification reinforcement
-learning stages used in our research effort toward gold-medal-level performance
-at the International Mathematical Olympiad (IMO) 2026. It builds on the
+This guide describes the proof-generation reinforcement learning stage used in
+our research effort toward gold-medal-level performance at the International
+Mathematical Olympiad (IMO) 2026. It builds on the
 [Nemotron 3 Ultra post-training guide](nemotron-3-ultra.md) and uses asynchronous
 GRPO with NeMo Gym proof environments.
 
-The release is intentionally proof-only. The recipe loads the shared policy
-model adapter and exactly three NeMo Gym resources:
+The release is intentionally proof-generation-only. The recipe loads the shared
+policy model adapter and exactly one NeMo Gym resource:
 
 - `proof_judge` for generating, self-evaluating, and externally judging proofs
-- `proof_genselect` for selecting between candidate proofs
-- `proof_verification` for training a verifier against labelled judgements
 
 No unrelated Gym environment is required by this recipe.
 
-## Pipeline
+## Recipe
 
-The two published stages use the same proof config and launcher but different
-models, data, context lengths, and cluster shapes:
+The published stage starts from the Ultra SFT checkpoint:
 
 ```text
 Ultra SFT checkpoint
         |
         v
   proof generation  -- run_proof_v1.sh
-        |
-        | exported Hugging Face checkpoint
-        v
- proof verification -- run_verif_v1.sh
 ```
 
 | Stage | Entry point | Ray nodes | Training / rollout nodes | Context | External judges |
 |---|---|---:|---:|---:|---:|
 | Proof generation | `run_proof_v1.sh` | 256 | 128 / 128 | 131,072 | 8 × 2-node services |
-| Proof verification | `run_verif_v1.sh` | 112 | 64 / 48 | 65,536 | 6 × 2-node services |
 
 The defaults assume four GPUs per GB200 node. Every value is an environment
 variable and can be overridden for another compatible SLURM cluster.
@@ -42,17 +34,15 @@ variable and can be overridden for another compatible SLURM cluster.
 ## Released artifacts
 
 - [`run_proof_v1.sh`](../../run_proof_v1.sh): proof-generation stage defaults
-- [`run_verif_v1.sh`](../../run_verif_v1.sh): proof-verification stage
-  defaults, including overlong reward shaping
 - [`launch_ultra_proofs.sh`](../../launch_ultra_proofs.sh): proof-specific SLURM and
   heterogeneous-judge orchestration
 - [`grpo_proof_rl_64n.yaml`](../../examples/configs/grpo_proof_rl_64n.yaml):
-  shared proof-only GRPO configuration
+  proof-generation GRPO configuration
 - [`ray_het.sub`](../../ray_het.sub): dedicated heterogeneous Ray launcher for
   the proof-policy workers and external judge services
 
-The proof resource implementations and preparation utilities live under
-`3rdparty/Gym-workspace/Gym/resources_servers/proof_*`.
+The proof resource implementation and preparation utility live under
+`3rdparty/Gym-workspace/Gym/resources_servers/proof_judge`.
 
 ## Prepare the code and containers
 
@@ -93,13 +83,10 @@ contains a private or machine-specific model path.
 
 ## Prepare proof data
 
-The proof RL data is published separately in
-[Nemotron-Math-Proofs-v3](https://huggingface.co/datasets/nvidia/Nemotron-Math-Proofs-v3):
-
-- use the `rl_proof` subset for proof generation
-- use the `rl_verification` subset for proof verification
-
-Export the required splits to JSONL for the launch scripts. Confirm that the
+The proof-generation RL data is published separately in
+[Nemotron-Math-Proofs-v3-RL](https://huggingface.co/datasets/nvidia/Nemotron-Math-Proofs-v3-RL).
+The repository contains only the proof-generation data, so no subset selection
+is needed. Export the dataset to JSONL for the launch script. Confirm that the
 dataset terms permit your intended use and redistribution.
 
 ### Proof generation
@@ -111,51 +98,23 @@ schema with the released prompt template:
 uv run python \
   3rdparty/Gym-workspace/Gym/resources_servers/proof_judge/prepare_data.py \
   --input /path/to/raw_problems.jsonl \
-  --output /path/to/proof_generation.train.jsonl
+  --output /path/to/proof_generation.jsonl
 ```
 
-Prepare a disjoint validation file the same way. Each converted row contains a
-`proof_simple_agent` reference, an OpenAI Responses-style input, and the
-original problem.
-
-The optional generation-selection resource accepts `problem`, `proof_1`,
-`proof_2`, and `correct_index`:
-
-```bash
-uv run python \
-  3rdparty/Gym-workspace/Gym/resources_servers/proof_genselect/prepare_data.py \
-  --input /path/to/raw_pairs.jsonl \
-  --output /path/to/proof_genselect.train.jsonl
-```
-
-### Proof verification
-
-Each raw verification row must provide:
-
-- `problem`
-- `proof`
-- `ground_truth_judgement`
-- `ground_truth_verify_score`, with a value in `{0, 0.5, 1}`
-
-Convert training and validation files separately:
-
-```bash
-uv run python \
-  3rdparty/Gym-workspace/Gym/resources_servers/proof_verification/prepare_data.py \
-  --input /path/to/raw_verification.jsonl \
-  --output /path/to/proof_verification.train.jsonl
-```
+Each converted row contains a `proof_simple_agent` reference, an OpenAI
+Responses-style input, and the original problem.
 
 ## Configure the cluster
 
-Both scripts use the same public variables:
+The script uses the following public variables:
 
 | Variable | Purpose |
 |---|---|
 | `CONTAINER` | NeMo RL image URI or squashfs path |
 | `HET_SERVER_CONTAINER` | SGLang judge image URI or squashfs path |
 | `MODEL_PATH` | Hugging Face model ID or mounted checkpoint path |
-| `TRAIN_PATH`, `VAL_PATH` | Converted Gym JSONL files |
+| `TRAIN_PATH` | Converted Gym JSONL file |
+| `VAL_PATH` | Optional validation JSONL; defaults to `TRAIN_PATH` |
 | `PERSISTENT_CACHE` | Shared cache directory visible to all Ray nodes |
 | `SLURM_ACCOUNT`, `SLURM_PARTITION` | Values for your SLURM cluster |
 | `EXTRA_MOUNTS` | Comma-separated `host:container` mounts for Ray-side data and models |
@@ -167,8 +126,8 @@ Both scripts use the same public variables:
 Published GB200 jobs use `SEGMENT_SIZE=16`, which sets NeMo RL's topology
 segment and adds `--segment=16` to the Ray component. Set `SEGMENT_SIZE=` to
 set `cluster.segment_size=null` and omit the SLURM option on clusters that do
-not support topology segments. The published 256- and 112-node Ray shapes and
-their training-node subsets are divisible by 16.
+not support topology segments. The published 256-node Ray shape and its
+training-node subset are divisible by 16.
 
 The launcher automatically mounts its results and persistent-cache directories
 at the same paths inside the Ray containers. Judge containers receive only the
@@ -193,8 +152,7 @@ Set paths for your cluster and inspect the fully resolved command first:
 export CONTAINER=/path/to/nemo-rl.sqsh
 export HET_SERVER_CONTAINER=/path/to/sglang.sqsh
 export MODEL_PATH=/path/to/ultra_sft_checkpoint_v4
-export TRAIN_PATH=/path/to/proof_generation.train.jsonl
-export VAL_PATH=/path/to/proof_generation.validation.jsonl
+export TRAIN_PATH=/path/to/proof_generation.jsonl
 export PERSISTENT_CACHE=/path/to/shared/cache/nemotron-3-ultra-imo
 export EXTRA_MOUNTS=/path/to/shared:/path/to/shared
 export SLURM_ACCOUNT=your_account
@@ -216,44 +174,15 @@ The stage enables MTP speculative decoding by default. Set
 `ENABLE_MTP_INFERENCE=0` if your vLLM build does not include the Ultra MTP
 support used by the base recipe.
 
-## Run proof verification
-
-Proof generation uses the Megatron backend with consolidated saves disabled,
-so each retained step contains distributed weights under
-`policy/weights/iter_*`; it does not produce a ready-to-load `policy/hf`
-directory. Verification therefore has an explicit Hugging Face export handoff.
-This release does not claim an Ultra-specific, end-to-end conversion workflow;
-use the general
-[Megatron checkpoint conversion instructions](../design-docs/checkpointing.md#converting-megatron-checkpoints-to-hugging-face-format)
-as a starting point, select the retained step's actual `iter_*` directory, and
-validate the exported model before launching verification.
-
-Point the verification stage at that exported model:
-
-```bash
-export MODEL_PATH=/path/to/exported-proof-policy
-export TRAIN_PATH=/path/to/proof_verification.train.jsonl
-export VAL_PATH=/path/to/proof_verification.validation.jsonl
-
-DRY_RUN=1 ./run_verif_v1.sh
-./run_verif_v1.sh
-```
-
-The verification wrapper reduces the context to 65,536 tokens, uses expert
-parallel size 32, caps simplified-sampling concurrency at 128 trajectories,
-enables an 8,192-token overlong reward-shaping buffer, and force-keeps every
-fifth step in addition to the normal checkpoint policy.
-
 ## Algorithm details
 
-The common YAML enables fully asynchronous GRPO and the simplified sampling
+The YAML enables fully asynchronous GRPO and the simplified sampling
 path. Its proof-specific stability settings include:
 
 - asymmetric PPO ratio clipping (`0.2`, `0.28`)
 - adaptive-position minimum-probability masking (`min_p_mask_type: ada-pos`)
 - a truncated importance-sampling ratio of 5
 - sequence packing for long proof trajectories
-- optional overlong reward shaping, enabled by the verification wrapper
 
 Judge services run as heterogeneous SLURM components. Component 0 is always the
 Ray cluster; components 1 onward are independent SGLang services. `ray_het.sub`
@@ -283,8 +212,7 @@ The default results directory contains:
 
 - `checkpoints/` for training and fine-tuning checkpoints
 - `logs/nemo_gym/` for Gym service logs
-- `logs/proof_judge.jsonl`, `proof_verification.jsonl`, and
-  `proof_genselect.jsonl` for reward diagnostics
+- `logs/proof_judge.jsonl` for reward diagnostics
 - `ray_logs/` for Ray head and worker logs
 - `slurm/` for the launcher-selected SLURM output location
 
