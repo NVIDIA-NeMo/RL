@@ -19,6 +19,11 @@ policy:
   make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
     ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
   megatron_cfg:
+    # HybridEP settings
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_hybridep_prepad_packed_inputs: true
     enabled: true
     empty_unused_memory_level: 1
     tensor_model_parallel_size: 4
@@ -35,6 +40,10 @@ policy:
       lr_warmup_init: 3.0e-08
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "8"
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+      NVLINK_DOMAIN_SIZE: "8"
+      USE_MNNVL: "0"
     activation_checkpointing: true
   generation:
     vllm_cfg:

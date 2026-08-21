@@ -872,6 +872,109 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         )
 
 
+def _configure_hybridep_environment(
+    model_cfg: Any, megatron_cfg: dict[str, Any]
+) -> None:
+    """Validate, configure, and report the effective HybridEP topology."""
+    ep_size = int(model_cfg.expert_model_parallel_size)
+
+    if "hybridep_num_ranks_per_nvlink_domain" in megatron_cfg:
+        ranks_text = str(megatron_cfg["hybridep_num_ranks_per_nvlink_domain"])
+        try:
+            ranks_per_domain = int(ranks_text)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="
+                f"{ranks_text!r} must be a positive integer"
+            ) from exc
+        os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = str(ranks_per_domain)
+        ranks_source = "megatron_cfg"
+    elif "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" in os.environ:
+        ranks_source = "environment"
+    else:
+        ranks_per_domain = min(ep_size, 64)
+        os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = str(ranks_per_domain)
+        ranks_source = "fallback"
+        warnings.warn(
+            "HybridEP: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN not "
+            f"configured. Auto-setting to {ranks_per_domain}.",
+            stacklevel=2,
+        )
+
+    ranks_text = os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"]
+    try:
+        ranks_per_domain = int(ranks_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="
+            f"{ranks_text!r} must be a positive integer"
+        ) from exc
+    if ranks_per_domain < 1:
+        raise ValueError(
+            f"NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN={ranks_text!r} must be positive"
+        )
+    if ep_size % ranks_per_domain != 0:
+        raise ValueError(
+            "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="
+            f"{ranks_text!r} must divide expert_model_parallel_size={ep_size}"
+        )
+
+    if "hybridep_use_mnnvl" in megatron_cfg:
+        os.environ["USE_MNNVL"] = str(int(megatron_cfg["hybridep_use_mnnvl"]))
+        mnnvl_source = "megatron_cfg"
+    elif "USE_MNNVL" in os.environ:
+        mnnvl_source = "environment"
+    else:
+        os.environ["USE_MNNVL"] = str(int(ep_size > 4))
+        mnnvl_source = "fallback"
+        warnings.warn(
+            "HybridEP: USE_MNNVL not configured. "
+            f"Auto-setting to {os.environ['USE_MNNVL']}.",
+            stacklevel=2,
+        )
+
+    def _optional_positive_environment_value(name: str) -> tuple[str, str]:
+        if name not in os.environ:
+            return "unset", "unset"
+        value_text = os.environ[name]
+        try:
+            value = int(value_text)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{name}={value_text!r} must be a positive integer"
+            ) from exc
+        if value < 1:
+            raise ValueError(f"{name}={value_text!r} must be positive")
+        return str(value), "environment"
+
+    domain_size_text, domain_source = _optional_positive_environment_value(
+        "NVLINK_DOMAIN_SIZE"
+    )
+    chunk_text, chunk_source = _optional_positive_environment_value(
+        "NUM_OF_TOKENS_PER_CHUNK_COMBINE_API"
+    )
+
+    use_mnnvl_text = os.environ["USE_MNNVL"]
+    normalized_mnnvl_values = {"0": "0", "1": "1", "false": "0", "true": "1"}
+    if use_mnnvl_text not in normalized_mnnvl_values:
+        raise ValueError(
+            f"USE_MNNVL={use_mnnvl_text!r} must be one of 0, 1, false, true"
+        )
+    use_mnnvl = normalized_mnnvl_values[use_mnnvl_text]
+    os.environ["USE_MNNVL"] = use_mnnvl
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if rank == 0:
+        print(
+            "[HybridEP topology] "
+            f"ep_size={ep_size} "
+            f"ranks_per_domain={ranks_per_domain} source={ranks_source} "
+            f"nvlink_domain_size={domain_size_text} source={domain_source} "
+            f"use_mnnvl={use_mnnvl} source={mnnvl_source} "
+            f"combine_chunk_tokens={chunk_text} source={chunk_source}"
+        )
+
+
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Mixture of Experts configuration."""
     model_cfg.expert_tensor_parallel_size = config["megatron_cfg"][
@@ -969,39 +1072,8 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         else:
             model_cfg.moe_hybridep_num_sms = num_sms
 
-    # HybridEP environment variables
-    # These are required by DeepEP's hybrid-ep branch for NVLink domain configuration.
-    # Users can set them explicitly via config, or they will be auto-computed with a warning.
     if config["megatron_cfg"].get("moe_flex_dispatcher_backend") == "hybridep":
-        ep_size = model_cfg.expert_model_parallel_size
-
-        # NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
-        if "hybridep_num_ranks_per_nvlink_domain" in config["megatron_cfg"]:
-            val = config["megatron_cfg"]["hybridep_num_ranks_per_nvlink_domain"]
-            os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = str(val)
-        elif "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" not in os.environ:
-            default_val = min(ep_size, 64)
-            os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = str(default_val)
-            warnings.warn(
-                f"HybridEP: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN not configured. "
-                f"Auto-setting to min(expert_model_parallel_size={ep_size}, 64) = {default_val}. "
-                f"Set 'hybridep_num_ranks_per_nvlink_domain' in megatron_cfg to override.",
-                stacklevel=2,
-            )
-
-        # USE_MNNVL
-        if "hybridep_use_mnnvl" in config["megatron_cfg"]:
-            val = config["megatron_cfg"]["hybridep_use_mnnvl"]
-            os.environ["USE_MNNVL"] = str(int(val))
-        elif "USE_MNNVL" not in os.environ:
-            default_val = int(ep_size > 4)
-            os.environ["USE_MNNVL"] = str(default_val)
-            warnings.warn(
-                f"HybridEP: USE_MNNVL not configured. "
-                f"Auto-setting to int(expert_model_parallel_size={ep_size} > 4) = {default_val}. "
-                f"Set 'hybridep_use_mnnvl' in megatron_cfg to override.",
-                stacklevel=2,
-            )
+        _configure_hybridep_environment(model_cfg, config["megatron_cfg"])
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
