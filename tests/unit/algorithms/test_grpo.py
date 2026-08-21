@@ -41,6 +41,7 @@ from nemo_rl.algorithms.grpo import (
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
+    _needs_initial_lookahead_barrier,
     _needs_hf_refit_handshake,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
@@ -112,6 +113,23 @@ def test_save_async_replay_buffer_checkpoint(tmp_path):
     assert count == 7
     replay_buffer.save_to_path.remote.assert_called_once_with(
         str(tmp_path / "replay_buffer.pt")
+    )
+
+
+def test_initial_lookahead_barrier_requires_restored_buffer() -> None:
+    args = {
+        "max_trajectory_age_steps": 1,
+        "step": 0,
+        "max_num_steps": 4,
+    }
+
+    assert not _needs_initial_lookahead_barrier(replay_buffer_restored=False, **args)
+    assert _needs_initial_lookahead_barrier(replay_buffer_restored=True, **args)
+    assert not _needs_initial_lookahead_barrier(
+        replay_buffer_restored=True,
+        max_trajectory_age_steps=1,
+        step=3,
+        max_num_steps=4,
     )
 
 
