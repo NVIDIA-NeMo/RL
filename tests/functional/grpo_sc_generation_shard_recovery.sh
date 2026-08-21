@@ -402,7 +402,11 @@ if [[ "$KILL_DURING_REFIT" == "true" ]]; then
     # rather than a fact. Counting the reports removes the race.
     HELD=false
     for _ in $(seq 1 1200); do
-        HOLDING=$(grep -c "refit: holding the receive open" "$RUN_LOG" 2>/dev/null || echo 0)
+        # NOT `$(grep -c ... || echo 0)`: with no match grep PRINTS 0 and EXITS 1, so the
+        # fallback runs too and HOLDING becomes the two-line string "0\n0", which (( ))
+        # then rejects. Harmless -- the failed test just retries the loop -- but it put
+        # 120 syntax errors into a 297-line log (job 6428488). Assign, then default.
+        HOLDING=$(grep -c "refit: holding the receive open" "$RUN_LOG" 2>/dev/null) || HOLDING=0
         (( HOLDING >= GEN_GPUS )) && { HELD=true; break; }
         kill -0 $TRAIN_PID 2>/dev/null || {
             echo "[recovery] FAIL: run ended before a refit could be held"
