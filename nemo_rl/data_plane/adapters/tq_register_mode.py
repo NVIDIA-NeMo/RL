@@ -43,6 +43,7 @@ See ``docs/design-docs/tq-register-mode.md``.
 
 from __future__ import annotations
 
+import logging
 import operator
 import threading
 from collections import defaultdict
@@ -64,6 +65,8 @@ from transfer_queue.utils.tensor_utils import (
     get_nbytes,
 )
 from transfer_queue.utils.zmq_utils import ZMQServerInfo, get_node_ip_address
+
+logger = logging.getLogger(__name__)
 
 TRANSFER_ENGINE_IMPORTED: bool = True
 try:
@@ -254,6 +257,17 @@ class TransferEngineClient(StorageKVClient):
         # every meta entry this client publishes.
         self._endpoint = f"{self.local_hostname}:{self._engine.get_rpc_port()}"
         self._pins = _PinTable(self._engine)
+        # The one line that says which path this process actually took: without
+        # it a GDR client that silently fell back to host receive buffers looks
+        # identical in the logs to one that did not.
+        logger.info(
+            "TransferQueue register mode ready: endpoint=%s protocol=%s "
+            "device_name=%s receive_device=%s",
+            self._endpoint,
+            self.protocol,
+            self.device_name,
+            self._device,
+        )
 
     @property
     def endpoint(self) -> str:
