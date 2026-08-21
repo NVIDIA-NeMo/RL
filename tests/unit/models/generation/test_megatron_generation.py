@@ -486,8 +486,7 @@ def test_megatron_generation_colocated(
         # The inference_optimized train leg pins cuda_graph_impl="none" above,
         # so it must stay at zero captures; the other legs must really capture.
         graphs_enabled = (
-            config["generation"]["mcore_generation_config"]["cuda_graph_impl"]
-            != "none"
+            config["generation"]["mcore_generation_config"]["cuda_graph_impl"] != "none"
         )
         capture_counts = ray.get(
             mg._policy.worker_group.run_all_workers_single_data(
