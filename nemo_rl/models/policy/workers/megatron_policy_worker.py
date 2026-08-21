@@ -686,27 +686,6 @@ class MegatronPolicyWorkerImpl(
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
 
-        ## SGLang weight-update state. Populated lazily by
-        ## ``connect_sglang_rollout_engines`` (colocate) or
-        ## ``connect_sglang_rollout_engines_distributed`` (broadcast).
-        generation_cfg = config.get("generation")
-        if generation_cfg is not None and generation_cfg.get("backend") == "sglang":
-            self._sglang_ipc_state: dict = {}
-            self._sglang_dist_group: Any = None
-            self._sglang_dist_group_name: str = "nemo_rl_sglang"
-            self._sglang_dist_engines: list = []
-            self._sglang_weight_version: int = 0
-
-            if generation_cfg["colocated"]["enabled"]:
-                # Colocate refit serializes CUDA-IPC tensor handles for SGLang;
-                # the torch reductions monkey patch must be in place before any
-                # tensor is serialized.
-                from nemo_rl.models.generation.sglang.utils.train_utils import (
-                    monkey_patch_torch_reductions,
-                )
-
-                monkey_patch_torch_reductions()
-
         self._init_inference_engine_state()
         self._setup_colocated_cuda_graph_managers()
 
@@ -2383,6 +2362,7 @@ class MegatronPolicyWorkerImpl(
         self,
         kv_scales: Optional[dict[str, float]] = None,
         conversion_tasks=None,
+        include_draft: bool = True,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
@@ -2392,6 +2372,10 @@ class MegatronPolicyWorkerImpl(
         ``conversion_tasks`` (optional) overrides ``self.refit_conversion_tasks``
         — used by the nccl_reshard_refit misc-refit path to pass a filtered subset so
         Bridge only does TP/EP all-gather for those tasks instead of the full model.
+
+        ``include_draft`` controls the ``draft.*`` EAGLE weights. SGLang refit
+        sets it False: the engine keeps draft weights via
+        ``enable_draft_weights_cpu_backup`` rather than receiving them.
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
             get_vllm_qkv_scale_names,
@@ -2411,7 +2395,7 @@ class MegatronPolicyWorkerImpl(
         for name, tensor in base_iter:
             yield name, tensor
 
-        if self.draft_model is not None:
+        if include_draft and self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
 
             draft_weights = export_eagle_weights_to_hf(
@@ -2528,15 +2512,22 @@ class MegatronPolicyWorkerImpl(
     # ------------------------------------------------------------------
     # SGLang weight update (colocate IPC + disaggregate broadcast)
     # ------------------------------------------------------------------
-    def _build_sglang_hf_iterator(
+    def _iter_sglang_hf_weight_buckets(
         self,
         *,
         target_precision: str,
         sglang_quantization_cfg: Optional[dict] = None,
-    ):
-        from nemo_rl.models.policy.workers.megatron_sglang_weight_iterator import (
-            MegatronSGLangHfWeightIterator,
-        )
+        buffer_size_bytes: int,
+    ) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        """Yield HF tensor buckets for SGLang refit.
+
+        Reuses the same two pieces as every other transport: the
+        ``export_hf_weights`` walk in ``_iter_params_with_optional_kv_scales``
+        (without vLLM KV/Q scales or draft weights — SGLang keeps drafts
+        engine-side via ``enable_draft_weights_cpu_backup``) and the shared
+        ``iter_named_tensor_buckets`` packing.
+        """
+        from nemo_rl.models.policy.utils import iter_named_tensor_buckets
 
         if sglang_quantization_cfg is None:
             raise ValueError("SGLang refit requires an explicit quantization config.")
@@ -2547,16 +2538,17 @@ class MegatronPolicyWorkerImpl(
                 f"config: target={target_precision!r}, "
                 f"configured={configured_precision!r}."
             )
+        if target_precision != "bf16":
+            raise ValueError(f"Unsupported SGLang target precision: {target_precision}")
 
         if self.refit_conversion_tasks is None:
             self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
                 [self.model]
             )
 
-        return MegatronSGLangHfWeightIterator(
-            megatron_bridge=self.megatron_bridge,
-            models=[self.model],
-            conversion_tasks=self.refit_conversion_tasks,
+        return iter_named_tensor_buckets(
+            self._iter_params_with_optional_kv_scales(include_draft=False),
+            buffer_size_bytes=buffer_size_bytes,
         )
 
     @torch.no_grad()
@@ -2577,20 +2569,17 @@ class MegatronPolicyWorkerImpl(
         has copied them and per-chunk engine failures surface immediately.
         Raises ``RuntimeError`` on any chunk failure.
         """
-        self._sglang_weight_version += 1
-        iterator = self._build_sglang_hf_iterator(
+        bucket_iter = self._iter_sglang_hf_weight_buckets(
             target_precision=target_precision,
             sglang_quantization_cfg=sglang_quantization_cfg,
-        )
-        bucket_iter = iterator.iter_hf_weight_buckets(
-            target_precision=target_precision,
             buffer_size_bytes=buffer_size_bytes,
         )
+        # ``send_hf_buckets_via_ipc_actor_impl`` tracks the weight version in
+        # ``worker_state``, same as the DTensor path.
         send_hf_buckets_via_ipc_actor_impl(
             bucket_iterator=bucket_iter,
             rollout_engines=list(rollout_engines),
-            worker_state=self._sglang_ipc_state,
-            weight_version=self._sglang_weight_version,
+            worker_state=self._refit_transport_state("sglang_ipc"),
         )
 
     @torch.no_grad()
@@ -2613,24 +2602,26 @@ class MegatronPolicyWorkerImpl(
         if self.rank != 0:
             return
 
+        state = self._refit_transport_state("sglang_dist")
         if group_name is not None:
-            self._sglang_dist_group_name = group_name
+            state["group_name"] = group_name
+        state.setdefault("group_name", "nemo_rl_sglang")
 
-        if self._sglang_dist_group is not None:
+        if state.get("group") is not None:
             disconnect_rollout_engines_from_distributed(
-                group_name=self._sglang_dist_group_name,
-                model_update_group=self._sglang_dist_group,
-                rollout_engines=self._sglang_dist_engines,
+                group_name=state["group_name"],
+                model_update_group=state["group"],
+                rollout_engines=state.get("engines", []),
             )
-            self._sglang_dist_group = None
-            self._sglang_dist_engines = []
+            state["group"] = None
+            state["engines"] = []
 
-        self._sglang_dist_group = connect_rollout_engines_from_distributed(
-            group_name=self._sglang_dist_group_name,
+        state["group"] = connect_rollout_engines_from_distributed(
+            group_name=state["group_name"],
             rollout_engines=list(rollout_engines),
             engine_gpu_counts=list(engine_gpu_counts),
         )
-        self._sglang_dist_engines = list(rollout_engines)
+        state["engines"] = list(rollout_engines)
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/update_weights_to_sglang_distributed")
@@ -2650,13 +2641,9 @@ class MegatronPolicyWorkerImpl(
         participate in the NCCL broadcast. This matches the design's "trainer
         rank 0 as the only source" decision.
         """
-        self._sglang_weight_version += 1
-        iterator = self._build_sglang_hf_iterator(
+        bucket_iter = self._iter_sglang_hf_weight_buckets(
             target_precision=target_precision,
             sglang_quantization_cfg=sglang_quantization_cfg,
-        )
-        bucket_iter = iterator.iter_hf_weight_buckets(
-            target_precision=target_precision,
             buffer_size_bytes=buffer_size_bytes,
         )
 
@@ -2667,19 +2654,21 @@ class MegatronPolicyWorkerImpl(
                 pass
             return
 
-        if self._sglang_dist_group is None:
+        state = self._refit_transport_state("sglang_dist")
+        if state.get("group") is None:
             raise RuntimeError(
                 "connect_sglang_rollout_engines_distributed must be called "
                 "before update_weights_to_sglang_distributed."
             )
+        state["weight_version"] = state.get("weight_version", 0) + 1
 
         broadcast_hf_buckets_via_distributed_impl(
             bucket_iterator=bucket_iter,
             rollout_engines=list(rollout_engines),
             rollout_engine_lock=rollout_engine_lock,
-            group_name=self._sglang_dist_group_name,
-            model_update_group=self._sglang_dist_group,
-            weight_version=self._sglang_weight_version,
+            group_name=state["group_name"],
+            model_update_group=state["group"],
+            weight_version=state["weight_version"],
         )
 
     @torch.no_grad()

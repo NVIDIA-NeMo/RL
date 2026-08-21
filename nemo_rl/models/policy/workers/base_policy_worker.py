@@ -105,6 +105,17 @@ class AbstractPolicyWorker:
             "nccl_reshard_refit is not implemented for this policy worker"
         )
 
+    def _refit_transport_state(self, key: str) -> dict:
+        """Mutable per-transport refit state, created on first use.
+
+        Keeps transport bookkeeping (gather groups, weight versions, engine
+        handles) out of worker constructors: no backend-conditional state, and
+        every transport initializes lazily at its first call — the same shape
+        as ``maybe_init_zmq`` on the ZMQ path.
+        """
+        states = self.__dict__.setdefault("_refit_state", {})
+        return states.setdefault(key, {})
+
     @torch.no_grad()
     @wrap_with_nvtx_name("policy_worker/connect_sglang_rollout_engines")
     def connect_sglang_rollout_engines(
@@ -119,14 +130,22 @@ class AbstractPolicyWorker:
         are added or recovered. Subsequent calls with the same layout are
         no-ops.
         """
+        from nemo_rl.models.generation.sglang.utils.train_utils import (
+            monkey_patch_torch_reductions,
+        )
         from nemo_rl.models.policy.utils import connect_colocate_topology
+
+        # Colocate refit serializes CUDA-IPC tensor handles for SGLang; the
+        # torch reductions monkey patch must be in place before any tensor is
+        # serialized. Idempotent, so installing on every connect is safe.
+        monkey_patch_torch_reductions()
 
         connect_colocate_topology(
             engine_gpu_counts=list(engine_gpu_counts),
             engine_gpu_offsets=(
                 list(engine_gpu_offsets) if engine_gpu_offsets is not None else None
             ),
-            worker_state=self._sglang_ipc_state,
+            worker_state=self._refit_transport_state("sglang_ipc"),
         )
 
     def is_alive(self) -> bool:

@@ -391,21 +391,6 @@ class DTensorPolicyWorkerV2Impl(
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
-        ## SGLang weight-update state. Populated lazily by
-        ## ``connect_sglang_rollout_engines`` on the first colocated refit.
-        generation_backend = config.get("generation", {}).get("backend")
-        if generation_backend == "sglang":
-            self._sglang_ipc_state: dict = {}
-            if self.is_generation_colocated:
-                # Colocate refit serializes CUDA-IPC tensor handles for
-                # SGLang; the torch reductions monkey patch must be in place
-                # before any tensor is serialized.
-                from nemo_rl.models.generation.sglang.utils.train_utils import (
-                    monkey_patch_torch_reductions,
-                )
-
-                monkey_patch_torch_reductions()
-
     def _update_moe_gate_bias_if_supported(self) -> None:
         """Update the non-gradient MoE routing bias after the optimizer step."""
         update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
@@ -1186,7 +1171,7 @@ class DTensorPolicyWorkerV2Impl(
         send_hf_buckets_via_ipc_actor_impl(
             bucket_iterator=bucket_iter,
             rollout_engines=list(rollout_engines),
-            worker_state=self._sglang_ipc_state,
+            worker_state=self._refit_transport_state("sglang_ipc"),
         )
 
     def _checkpoint_engine_params(
