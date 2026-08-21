@@ -127,8 +127,11 @@ class SingleControllerActor:
             master_config.loss_fn.force_on_policy_ratio
             and master_config.grpo.seq_logprob_error_threshold is None
         )
-        self._reference_logprobs_required = not bool(
-            master_config.grpo.skip_reference_policy_logprobs_calculation
+        # _build_trainer initializes the reference model only for a positive KL
+        # penalty, so the controller must use the same gate before requesting it.
+        self._reference_logprobs_required = bool(
+            master_config.loss_fn.reference_policy_kl_penalty > 0
+            and not master_config.grpo.skip_reference_policy_logprobs_calculation
         )
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
