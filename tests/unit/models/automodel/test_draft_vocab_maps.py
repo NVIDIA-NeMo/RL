@@ -125,3 +125,37 @@ def test_eagle3_d2t_offsets_match_dspark_convention():
     membership = torch.zeros(TARGET_VOCAB, dtype=torch.bool)
     membership[resolved] = True
     assert torch.equal(membership, t2d)
+
+
+def test_reduced_vocab_rejects_non_vanilla_markov_heads():
+    """Only the vanilla head has a validated split-vocab implementation:
+    gated/rnn heads embed and project over one vocabulary, so a reduced
+    draft vocab would crash at the first forward — reject at build time."""
+    import pytest
+
+    from nemo_rl.models.automodel.draft.markov_head import build_markov_head
+
+    class _Cfg:
+        vocab_size = 100
+        draft_vocab_size = 32
+        markov_rank = 4
+        markov_head_type = "gated"
+        hidden_size = 8
+
+    with pytest.raises(ValueError, match="reduced"):
+        build_markov_head(_Cfg())
+    _Cfg.markov_head_type = "rnn"
+    with pytest.raises(ValueError, match="reduced"):
+        build_markov_head(_Cfg())
+
+    # The vanilla head keeps the split: full-vocab prev-token embedding,
+    # draft-vocab bias output.
+    _Cfg.markov_head_type = "vanilla"
+    head = build_markov_head(_Cfg())
+    assert head.markov_w1.num_embeddings == 100
+    assert head.markov_w2.out_features == 32
+
+    # Full-vocab checkpoints keep working with every head type.
+    _Cfg.draft_vocab_size = None
+    _Cfg.markov_head_type = "gated"
+    assert build_markov_head(_Cfg()) is not None

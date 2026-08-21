@@ -54,12 +54,23 @@ def build_markov_head(config) -> nn.Module | None:
         return None
 
     markov_head_type = str(config.markov_head_type).lower()
-    if markov_head_type == "vanilla":
-        # Reduced-draft-vocab checkpoints: bias output over draft_vocab_size,
-        # prev-token embedding over the full target vocab.
-        output_vocab = int(
-            getattr(config, "draft_vocab_size", None) or config.vocab_size
+    # Reduced-draft-vocab checkpoints: bias output over draft_vocab_size,
+    # prev-token embedding over the full target vocab.
+    output_vocab = int(getattr(config, "draft_vocab_size", None) or config.vocab_size)
+    if output_vocab != config.vocab_size and markov_head_type != "vanilla":
+        # The upstream gated/rnn heads embed and project over one vocabulary:
+        # a reduced-vocab checkpoint would add a full-vocab bias to
+        # draft-vocab base logits and index target-space token ids into the
+        # smaller embedding — a guaranteed shape/indexing crash at the first
+        # draft forward. Only the vanilla head has a validated split-vocab
+        # implementation.
+        raise ValueError(
+            f"markov_head_type={markov_head_type!r} does not support a reduced "
+            f"draft vocabulary (draft_vocab_size={output_vocab} < "
+            f"vocab_size={config.vocab_size}); use a vanilla markov head or a "
+            "full-vocab checkpoint."
         )
+    if markov_head_type == "vanilla":
         return VanillaMarkov(
             vocab_size=output_vocab,
             markov_rank=markov_rank,
