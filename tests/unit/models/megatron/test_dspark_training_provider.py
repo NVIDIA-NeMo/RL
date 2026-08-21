@@ -36,10 +36,8 @@ pytestmark = pytest.mark.mcore
 def _config() -> DSparkDraftConfig:
     return DSparkDraftConfig(
         enabled=True,
-        model_name=(
-            "deepseek-ai/dspark_qwen3_8b_block7"
-            "@03326e5043815da1f81b109078b2889737c26017"
-        ),
+        model_name="deepseek-ai/dspark_qwen3_8b_block7",
+        model_revision="03326e5043815da1f81b109078b2889737c26017",
         block_size=7,
         anchors_per_sample=2,
         mask_token_id=151669,

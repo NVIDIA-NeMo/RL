@@ -18,6 +18,7 @@ import os
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -79,6 +80,25 @@ def test_qwen3_8b_defaults_are_pinned_and_frozen() -> None:
     assert config.rms_norm_eps == 1e-6
     with pytest.raises(FrozenInstanceError):
         config.hidden_size = 8  # type: ignore[misc]
+
+
+def test_hf_checkpoint_loader_forwards_an_explicit_revision(tmp_path: Path) -> None:
+    from nemo_rl.models.megatron.draft.utils import _load_checkpoint_state
+
+    repo_id = "deepseek-ai/dspark_qwen3_8b_block7"
+    revision = "03326e5043815da1f81b109078b2889737c26017"
+    with (
+        patch("huggingface_hub.snapshot_download", return_value=str(tmp_path)) as fetch,
+        patch(
+            "nemo_rl.models.megatron.draft.utils._load_checkpoint_from_directory",
+            return_value={},
+        ),
+    ):
+        state = _load_checkpoint_state(repo_id, revision=revision)
+
+    assert state == {}
+    assert fetch.call_args.kwargs["repo_id"] == repo_id
+    assert fetch.call_args.kwargs["revision"] == revision
 
 
 @pytest.mark.parametrize(
