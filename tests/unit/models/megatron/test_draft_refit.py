@@ -469,6 +469,61 @@ def test_tp2_pp2_cp2_worker_uses_exact_mcore_draft_lane(
     distributed_test_runner(_run_tp2_pp2_cp2_worker_draft_refit, world_size=8)
 
 
+def _run_tp2_pp2_cp2_worker_draft_failure_consensus(rank: int, world_size: int) -> None:
+    from megatron.core import parallel_state
+
+    import nemo_rl.models.megatron.draft as draft_module
+
+    assert world_size == 8
+    parallel_state.destroy_model_parallel()
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        context_parallel_size=2,
+    )
+
+    cp_rank = parallel_state.get_context_parallel_rank()
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    draft_model = object() if parallel_state.is_pipeline_last_stage() else None
+    worker = _draft_refit_worker(draft_model=draft_model)
+    original_export = draft_module.export_eagle_weights_to_hf
+
+    def export_lane(_model: object) -> list[tuple[str, torch.Tensor]]:
+        if cp_rank == 0 and tp_rank == 0:
+            raise RuntimeError("injected single-lane draft export failure")
+        return [
+            (
+                "model.layers.0.norm.weight",
+                torch.ones(
+                    2,
+                    dtype=torch.float32,
+                    device=torch.device("cuda", torch.cuda.current_device()),
+                ),
+            )
+        ]
+
+    draft_module.export_eagle_weights_to_hf = export_lane
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="injected single-lane draft export failure",
+        ):
+            list(worker._iter_draft_weights_for_refit(metadata_only=False))
+    finally:
+        draft_module.export_eagle_weights_to_hf = original_export
+        parallel_state.destroy_model_parallel()
+
+
+@pytest.mark.mcore
+def test_tp2_pp2_cp2_single_lane_draft_failure_reaches_every_rank(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(
+        _run_tp2_pp2_cp2_worker_draft_failure_consensus,
+        world_size=8,
+    )
+
+
 def _run_cp_lane_manifest_mismatch(rank: int, world_size: int) -> None:
     from megatron.core import parallel_state
 
