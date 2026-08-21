@@ -481,6 +481,9 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # Per-module Transformer Engine precision recipe. Loading is experimental
+    # and requires NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG=1.
+    te_precision_config_file: NotRequired[str]
 
 
 class DraftConfigDisabled(TypedDict):

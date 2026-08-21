@@ -63,6 +63,7 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.utils import load_quantization_recipe
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
@@ -73,6 +74,7 @@ from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_c
 
 _HF_CONFIG_PATCHED = False
 
+_NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG = "NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG"
 _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT = "expanded_sequence_v1"
 
 
@@ -1061,6 +1063,27 @@ def _apply_precision_config(
         "float16": torch.float16,
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
+
+    te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")
+    load_te_precision_config = (
+        os.environ.get(_NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG, "0") == "1"
+    )
+    if load_te_precision_config:
+        if te_precision_config_file is None:
+            raise ValueError(
+                f"{_NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG}=1 requires "
+                "megatron_cfg.te_precision_config_file to be set."
+            )
+
+        # NeMo-RL constructs TransformerConfig directly and therefore bypasses
+        # Megatron-LM's CLI path that normally turns this file into quant_recipe.
+        model_cfg.quant_recipe = load_quantization_recipe(te_precision_config_file)
+    elif te_precision_config_file is not None:
+        raise RuntimeError(
+            "megatron_cfg.te_precision_config_file is set, but NeMo-RL's "
+            "experimental TE precision-config loader is disabled. Set "
+            f"{_NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG}=1 to enable it."
+        )
 
 
 def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
