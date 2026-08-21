@@ -139,6 +139,69 @@ def prepare_loss_input(
             "teacher_topk_logprobs": teacher_topk_logprobs,
             "H_all": H_all,
         }
+        # SDPO's trust-region ref-KL needs grad-carrying current logprobs at
+        # the sampled tokens as its student side; detached tensors from the
+        # data dict would contribute no gradient. DistillationLossFn shares
+        # this input type but has no such penalty, hence the getattr.
+        if getattr(loss_fn, "reference_policy_kl_penalty", 0.0) > 0.0:
+            loss_input["next_token_logprobs"] = get_next_token_logprobs_from_logits(
+                input_ids=data["input_ids"],
+                next_token_logits=logits,
+                seq_index=data.get("seq_index", None),
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                sampling_params=None,  # unfiltered, consistent with ref logprobs
+                chunk_size=chunk_size,
+            )
+    elif loss_fn.input_type == LossInputType.DISTILLATION_AND_LOGPROB:
+        sdpo_loss = loss_fn.sdpo_loss
+        calculate_entropy = sdpo_loss.zero_outside_topk and sdpo_loss.kl_type != "forward"
+        student_topk_logprobs, teacher_topk_logprobs, H_all = get_distillation_topk_logprobs_from_logits(
+            student_logits=logits,
+            teacher_topk_logits=data["teacher_topk_logits"],
+            teacher_topk_indices=data["teacher_topk_indices"],
+            zero_outside_topk=sdpo_loss.zero_outside_topk,
+            calculate_entropy=calculate_entropy,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+
+        logprobs = get_next_token_logprobs_from_logits(
+            input_ids=data["input_ids"],
+            next_token_logits=logits,
+            seq_index=data.get("seq_index", None),
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            sampling_params=sampling_params,
+        )
+        if need_top_k_or_top_p_filtering(sampling_params):
+            mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+            logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+            # The GRPO and SDPO reference-policy KLs need unfiltered current
+            # logprobs (consistent with the unfiltered reference logprobs).
+            if (
+                loss_fn.grpo_loss.reference_policy_kl_penalty != 0
+                or loss_fn.sdpo_loss.reference_policy_kl_penalty > 0
+            ):
+                data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
+                    input_ids=data["input_ids"],
+                    next_token_logits=logits,
+                    seq_index=data.get("seq_index", None),
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    sampling_params=None,  # no filtering
+                )
+
+        loss_input = {
+            "student_topk_logprobs": student_topk_logprobs,
+            "teacher_topk_logprobs": teacher_topk_logprobs,
+            "H_all": H_all,
+            "next_token_logprobs": logprobs,
+        }
     elif loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
         # Rebuild each teacher's full-vocab logits from its per-rank CUDA IPC
         # handles and do the shared CP-resolution the loss needs; the loss fn

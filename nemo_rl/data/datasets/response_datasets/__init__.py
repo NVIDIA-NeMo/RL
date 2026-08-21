@@ -32,6 +32,9 @@ from nemo_rl.data.datasets.response_datasets.general_conversations_dataset impor
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.gsm8k import GSM8KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
+from nemo_rl.data.datasets.response_datasets.livecodebench import (
+    LiveCodeBenchDataset,
+)
 from nemo_rl.data.datasets.response_datasets.intent import (
     IntentBenchDataset,
     IntentTrainDataset,
@@ -77,6 +80,7 @@ DATASET_REGISTRY = {
     "geometry3k": Geometry3KDataset,
     "mmpr-tiny": MMPRTinyDataset,
     "HelpSteer3": HelpSteer3Dataset,
+    "livecodebench_v6": LiveCodeBenchDataset,
     "intent-train": IntentTrainDataset,
     "intent-bench": IntentBenchDataset,
     "open_assistant": OasstDataset,
@@ -155,6 +159,7 @@ __all__ = [
     "DeepScalerDataset",
     "Geometry3KDataset",
     "HelpSteer3Dataset",
+    "LiveCodeBenchDataset",
     "IntentBenchDataset",
     "IntentTrainDataset",
     "MMPRTinyDataset",

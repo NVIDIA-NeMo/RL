@@ -47,6 +47,9 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     "code_jaccard": {
         "actor_class_fqn": "nemo_rl.environments.code_jaccard_environment.CodeJaccardEnvironment",
     },
+    "livecodebench": {
+        "actor_class_fqn": "nemo_rl.environments.livecodebench_environment.LiveCodeBenchEnvironment",
+    },
     "vlm": {
         "actor_class_fqn": "nemo_rl.environments.vlm_environment.VLMEnvironment",
     },
