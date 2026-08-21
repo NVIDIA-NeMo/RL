@@ -71,6 +71,17 @@ def test_draft_checkpoint_dir_is_sibling_of_weights_tree():
     weights = "/ckpt/step_3/policy/weights"
     draft_dir = draft_checkpoint_dir(weights)
     assert draft_dir == "/ckpt/step_3/policy/draft"
+
+    # The Automodel loader also accepts the weights/model form directly; the
+    # draft sibling must resolve identically.
+    assert (
+        draft_checkpoint_dir("/ckpt/step_3/policy/weights/model")
+        == "/ckpt/step_3/policy/draft"
+    )
+    assert (
+        draft_checkpoint_dir("/ckpt/step_3/policy/weights/model/")
+        == "/ckpt/step_3/policy/draft"
+    )
     assert not (draft_dir + "/").startswith(weights + "/")
     # Trailing slashes must not change the derivation.
     assert draft_checkpoint_dir(weights + "/") == draft_dir

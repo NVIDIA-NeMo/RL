@@ -1031,9 +1031,14 @@ def draft_checkpoint_dir(weights_path: str) -> str:
     draft's ``.distcp`` files.
     """
     # abspath normalizes trailing slashes before dirname takes the parent.
-    return os.path.join(
-        os.path.dirname(os.path.abspath(weights_path)), DRAFT_CHECKPOINT_DIRNAME
-    )
+    normalized = os.path.abspath(weights_path)
+    # The Automodel checkpoint loader accepts a weights_path that points
+    # directly at the ``.../weights/model`` subdirectory; the draft sibling
+    # lives next to ``weights`` either way, so strip that trailing component
+    # before deriving the parent.
+    if os.path.basename(normalized) == "model":
+        normalized = os.path.dirname(normalized)
+    return os.path.join(os.path.dirname(normalized), DRAFT_CHECKPOINT_DIRNAME)
 
 
 def save_draft_checkpoint(
