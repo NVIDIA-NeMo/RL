@@ -58,6 +58,16 @@ class TestFixedOrderCombine:
         assert torch.allclose(train_out, torch.tensor([[3.0], [4.0]]))
         assert torch.allclose(decode_out, torch.tensor([[3.0], [4.0]]))
 
+    def test_patched_unpermute_accepts_megatron_only_kwargs(self):
+        out = _patched_unpermute(
+            torch.tensor([[3.0], [4.0]]),
+            torch.tensor([0, 1]),
+            torch.Size([2, 1]),
+            batch_invariant_inverse_map=torch.zeros(2, 2, 2, dtype=torch.long),
+            future_megatron_kwarg=None,
+        )
+        assert torch.allclose(out, torch.tensor([[3.0], [4.0]]))
+
 
 class TestApplyMoeDeterminismPatches:
     def setup_method(self):

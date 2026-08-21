@@ -1697,6 +1697,7 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
         apply_log_softmax_determinism_patch,
         apply_mamba_alignment_patch,
         apply_moe_determinism_patches,
+        apply_te_bik_attention_assert_skip_patch,
         apply_te_gemm_cublas_pinned_patch,
         policy_uses_mamba_layers,
     )
@@ -1719,6 +1720,7 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     apply_log_softmax_determinism_patch()
     apply_moe_determinism_patches()
     apply_mamba_alignment_patch(required=policy_uses_mamba_layers(config))
+    apply_te_bik_attention_assert_skip_patch()
     # Starve PyTorch's own cuBLAS workspace so non-TE aten::mm/addmm paths also
     # pick workspace-free (splitK=1, reduction=NONE) algorithms.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
