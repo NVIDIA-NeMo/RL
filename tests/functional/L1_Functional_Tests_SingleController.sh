@@ -116,6 +116,12 @@ run_test env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true uv run --no-syn
 # simply stopped participating, which is the case the abort exists for and the one its
 # error message names. This variant asserts RefitAborted actually appears, so it cannot
 # quietly degrade into testing the same path as the two above.
+#
+# It asserts the abort only, not recovery, and a NON-ZERO exit is its pass. A frozen rank
+# never becomes absent -- measured on 4xGB200 it reaches SUSPECT and stops there -- so the
+# reconcile correctly refuses to rebuild over a fleet that still holds a silent rank. The
+# gain being pinned is that the run ends attributably in seconds rather than wedging in
+# NCCL forever; abort-and-recover is what the two killed variants above cover.
 run_test env KILL_DURING_REFIT=true FREEZE_VICTIM=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
