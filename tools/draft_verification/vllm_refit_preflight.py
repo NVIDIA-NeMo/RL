@@ -13,7 +13,7 @@
 # limitations under the License.
 """End-to-end refit preflight for co-trained drafters inside the serving container.
 
-For each drafter (dflash and eagle3 by default) this script starts a real vLLM
+For each drafter (dspark, dflash, and eagle3 by default) this script starts a real vLLM
 engine (target + drafter, ``load_format="dummy"``) with the NeMo-RL worker
 extension, mirrors the module-sharing disable the production worker applies,
 and checks over ``collective_rpc``:
@@ -225,7 +225,7 @@ def check_positive(algo: str, spec: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--methods", nargs="+", default=["dflash", "eagle3"], choices=list(DRAFTERS)
+        "--methods", nargs="+", default=list(DRAFTERS), choices=list(DRAFTERS)
     )
     parser.add_argument(
         "--skip-negative",
