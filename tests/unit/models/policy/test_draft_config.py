@@ -326,3 +326,8 @@ def test_qwen3_8b_dflash_recipe_pairs_public_drafter_with_exact_target() -> None
         "num_speculative_tokens": 5,
         "draft_tensor_parallel_size": 1,
     }
+    assert config.policy["generation"]["vllm_cfg"]["enforce_eager"] is False
+    assert config.policy["generation"]["vllm_kwargs"]["compilation_config"] == {
+        "backend": "eager",
+        "cudagraph_mode": "PIECEWISE",
+    }
