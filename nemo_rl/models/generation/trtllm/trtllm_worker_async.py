@@ -26,8 +26,11 @@ Weight updates flow through ``NcclExtension`` inside TRT-LLM's internal
 """
 
 import asyncio
+import copy
 import gc
+import json
 import os
+import threading
 from typing import Any, Optional
 
 import ray
@@ -109,6 +112,19 @@ class TrtllmAsyncGenerationWorkerImpl:
         self._http_base_url: Optional[str] = None
         self._http_server = None
 
+        # In-flight batching telemetry (mirrors the vLLM metrics logger).
+        # Populated by a background asyncio task started in post_init_async
+        # when trtllm_cfg.enable_trtllm_metrics_logger is set.
+        self._trtllm_metrics_enabled = bool(
+            self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger")
+        )
+        self._trtllm_metrics_lock = threading.Lock()
+        self._stats_task: Optional[asyncio.Task] = None
+        self.inflight_batch_sizes: list[int] = []
+        self.num_pending_samples: list[int] = []
+        # KV-cache utilization as a 0-1 fraction (mirrors vLLM's
+        # kv_cache_usage_perc) so both backends' figures are comparable.
+        self.kv_cache_usage_perc: list[float] = []
         if not self.is_model_owner:
             return
 
@@ -125,6 +141,10 @@ class TrtllmAsyncGenerationWorkerImpl:
         )
 
         self.TrtSamplingParams = TrtSamplingParams
+
+        # Must run before AsyncLLM spawns RayGPUWorker processes.
+        if self._trtllm_metrics_enabled:
+            self._install_stats_patch()
 
         trtllm_cfg = self.cfg["trtllm_cfg"]
         tp_size = trtllm_cfg["tensor_parallel_size"]
@@ -218,6 +238,10 @@ class TrtllmAsyncGenerationWorkerImpl:
             )
             llm_kwargs["per_worker_gpu_share"] = self._fraction_of_gpus
 
+        # Set before extra-kwargs spread so the user can still override via trtllm_kwargs.
+        if self._trtllm_metrics_enabled:
+            llm_kwargs["enable_iter_perf_stats"] = True
+
         # Escape hatch: spread remaining user-provided TRT-LLM kwargs last so
         # they can override anything above for advanced tuning.
         llm_kwargs.update(extra_trtllm_kwargs)
@@ -256,7 +280,179 @@ class TrtllmAsyncGenerationWorkerImpl:
         if self.cfg["trtllm_cfg"].get("expose_http_server"):
             self.start_http_server()
 
+        if self._trtllm_metrics_enabled:
+            self._stats_task = asyncio.create_task(self._drain_stats_loop())
+            print(
+                "📋[TRT-LLM Metric Logger] stats drain task started",
+                flush=True,
+            )
+
+    # ------------------------------------------------------------------ #
+    #  In-flight batching telemetry
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _get_stat_field(obj: Any, *keys: str) -> Any:
+        """Read a nested field from dict-like or attribute-like stats; None if missing."""
+        cur = obj
+        for k in keys:
+            if cur is None:
+                return None
+            if isinstance(cur, dict):
+                cur = cur.get(k)
+            else:
+                cur = getattr(cur, k, None)
+        return cur
+
+    def _install_stats_patch(self) -> None:
+        """Expose a sync ``fetch_stats_serialized`` on TRT-LLM's BaseWorker.
+
+        Applied in-process and via base_worker.py source append for the
+        separate RayGPUWorker processes. See patches for rationale.
+        """
+        import logging
+
+        _logger = logging.getLogger(__name__)
+        from nemo_rl.models.generation.trtllm import patches
+
+        try:
+            patches.apply()
+        except Exception as e:  # pragma: no cover
+            print(
+                f"[TrtllmAsyncWorker] ifb in-process patch skipped: {e!r}",
+                flush=True,
+            )
+
+        try:
+            patches._patch_trtllm_fetch_stats_serialized(_logger)
+        except Exception as e:
+            print(
+                f"[TrtllmAsyncWorker] ifb base_worker append skipped: {e!r}",
+                flush=True,
+            )
+
+    async def _drain_stats_loop(self) -> None:
+        """Continuously drain per-iteration stats from the engine.
+
+        Records the in-flight batching size (context + generation requests
+        scheduled this iteration), the number of pending (queued) samples and
+        the KV-cache usage percentage.
+        """
+        assert self.llm is not None
+        assert "trtllm_metrics_logger_interval" in self.cfg["trtllm_cfg"], (
+            "trtllm_metrics_logger_interval must be set in trtllm_cfg if enable_trtllm_metrics_logger is True"
+        )
+        interval = float(self.cfg["trtllm_cfg"]["trtllm_metrics_logger_interval"])
+        assert interval > 0, (
+            f"trtllm_metrics_logger_interval must be a positive float, got {interval}"
+        )
+        _err_logged = 0
+        while True:
+            try:
+                # fetch_stats_serialized is a sync serializing method injected onto
+                # BaseWorker — see patches for why this RPC is needed.
+                try:
+                    rank_results = await self.llm.collective_rpc(
+                        "fetch_stats_serialized"
+                    )
+                except Exception as e:
+                    rank_results = None
+                    if _err_logged < 5:
+                        _err_logged += 1
+                        print(
+                            "⚠️[TRT-LLM Metric Logger] "
+                            f"collective_rpc(fetch_stats_serialized) error: {e!r}",
+                            flush=True,
+                        )
+                # All TP ranks carry identical stats; read only the first
+                # non-empty rank to avoid double-counting.
+                records: list[Any] = []
+                for _rank_res in rank_results or []:
+                    if _rank_res:
+                        records = _rank_res
+                        break
+                # One sample per interval: the plot's x-axis assumes index * interval.
+                # Take the last drained record; append 0 when idle so every
+                # interval yields a point (mirrors vLLM's gauge sampling).
+                ifb_sample = 0
+                ctx_sample = 0
+                kv_sample = 0.0
+                if records:
+                    stats = records[-1]
+                    if isinstance(stats, (str, bytes, bytearray)):
+                        try:
+                            stats = json.loads(stats)
+                        except (ValueError, TypeError):
+                            stats = None
+                    if stats is not None:
+                        ifb = self._get_stat_field(
+                            stats, "inflightBatchingStats", "numScheduledRequests"
+                        )
+                        queued = self._get_stat_field(stats, "numQueuedRequests")
+                        if queued is None:
+                            # Fallback for older engines: numContextRequests is prefill-only.
+                            queued = self._get_stat_field(
+                                stats, "inflightBatchingStats", "numContextRequests"
+                            )
+                        ifb_sample = int(ifb) if ifb is not None else 0
+                        ctx_sample = int(queued) if queued is not None else 0
+                        # kv = usedNumBlocks/maxNumBlocks (fallback: 1 - freeNumBlocks/maxNumBlocks),
+                        # guarded for maxNumBlocks == 0.
+                        kv_stats = self._get_stat_field(stats, "kvCacheStats")
+                        max_blocks = self._get_stat_field(kv_stats, "maxNumBlocks")
+                        used_blocks = self._get_stat_field(kv_stats, "usedNumBlocks")
+                        free_blocks = self._get_stat_field(kv_stats, "freeNumBlocks")
+                        try:
+                            max_blocks = (
+                                float(max_blocks) if max_blocks is not None else 0.0
+                            )
+                            if max_blocks > 0:
+                                if used_blocks is not None:
+                                    kv_sample = float(used_blocks) / max_blocks
+                                elif free_blocks is not None:
+                                    kv_sample = 1.0 - float(free_blocks) / max_blocks
+                                # Clamp into [0, 1] to match vLLM's fraction.
+                                kv_sample = min(1.0, max(0.0, kv_sample))
+                        except (TypeError, ValueError):
+                            kv_sample = 0.0
+                with self._trtllm_metrics_lock:
+                    self.inflight_batch_sizes.append(ifb_sample)
+                    self.num_pending_samples.append(ctx_sample)
+                    self.kv_cache_usage_perc.append(kv_sample)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if _err_logged < 5:
+                    _err_logged += 1
+                    print(
+                        f"⚠️[TRT-LLM Metric Logger] stats drain error: {e}",
+                        flush=True,
+                    )
+            # Back off between cycles to avoid busy-spinning when the engine returns immediately.
+            await asyncio.sleep(interval)
+
+    def get_trtllm_logger_metrics(self) -> dict[str, Any]:
+        if not self._trtllm_metrics_enabled:
+            return {}
+        with self._trtllm_metrics_lock:
+            return {
+                "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
+                "num_pending_samples": copy.deepcopy(self.num_pending_samples),
+                "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
+            }
+
+    def clear_trtllm_logger_metrics(self) -> None:
+        if not self._trtllm_metrics_enabled:
+            return
+        with self._trtllm_metrics_lock:
+            self.inflight_batch_sizes = []
+            self.num_pending_samples = []
+            self.kv_cache_usage_perc = []
+
     def shutdown(self) -> bool:
+        if self._stats_task is not None:
+            self._stats_task.cancel()
+            self._stats_task = None
         try:
             self.stop_http_server()
             if self.llm is not None:

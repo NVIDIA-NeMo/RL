@@ -62,6 +62,7 @@ from nemo_rl.algorithms.utils import (
     log_generation_metrics,
     print_efficiency_summary,
     print_performance_metrics,
+    resolve_generation_metrics_logger,
     set_seed,
 )
 from nemo_rl.data import DataConfig
@@ -3672,17 +3673,14 @@ def grpo_train(
                     name="train/token_mult_prob_error_plot_sample",
                 )
             del train_data
-            if (
+            _gen_metrics_interval = resolve_generation_metrics_logger(
                 master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("enable_vllm_metrics_logger", False)
-            ):
+            )
+            if _gen_metrics_interval is not None:
                 log_generation_metrics(
                     generation_logger_metrics,
                     total_steps + 1,
-                    master_config.policy["generation"]["vllm_cfg"][
-                        "vllm_metrics_logger_interval"
-                    ],
+                    _gen_metrics_interval,
                     logger,
                 )
 
@@ -4888,6 +4886,7 @@ def async_grpo_train(
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
+                generation_metrics_logged_early = False
                 if NEED_REFIT:
                     timer.start("idle/refit_bubble")
 
@@ -4896,12 +4895,27 @@ def async_grpo_train(
                     with timer.time("exposed_generation"):
                         ray.get(trajectory_collector.prepare_for_refit.remote())
 
-                    # Collect generation logger metrics for performance reporting
-                    # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:
                         generation_logger_metrics = (
                             policy_generation.get_logger_metrics()
                         )
+                        # Log before refit_policy_generation, which can OOM; ensures
+                        # metrics reach wandb even if refit fails. The post-step log
+                        # is skipped (generation_metrics_logged_early) to avoid duplicate.
+                        _early_gen_metrics_interval = resolve_generation_metrics_logger(
+                            master_config.policy["generation"]
+                        )
+                        if (
+                            _early_gen_metrics_interval is not None
+                            and generation_logger_metrics
+                        ):
+                            log_generation_metrics(
+                                generation_logger_metrics,
+                                step + 1,
+                                _early_gen_metrics_interval,
+                                logger,
+                            )
+                            generation_metrics_logged_early = True
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
@@ -5236,17 +5250,17 @@ def async_grpo_train(
             metrics["buffer_size"] = buffer_size_current
             metrics["avg_trajectory_age"] = avg_trajectory_age
 
-            if (
+            _gen_metrics_interval = resolve_generation_metrics_logger(
                 master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("enable_vllm_metrics_logger", False)
+            )
+            if (
+                _gen_metrics_interval is not None
+                and not generation_metrics_logged_early
             ):
                 log_generation_metrics(
                     generation_logger_metrics,
                     step + 1,
-                    master_config.policy["generation"]["vllm_cfg"][
-                        "vllm_metrics_logger_interval"
-                    ],
+                    _gen_metrics_interval,
                     logger,
                 )
 

@@ -196,6 +196,7 @@ project-includes = [
   "nemo_rl/models/generation/sglang/utils/ray_utils.py",
   "nemo_rl/models/generation/trtllm/__init__.py",
   "nemo_rl/models/generation/trtllm/config.py",
+  "nemo_rl/models/generation/trtllm/patches.py",
   "nemo_rl/models/generation/trtllm/trtllm_generation.py",
   "nemo_rl/models/generation/trtllm/trtllm_http_server.py",
   "nemo_rl/models/generation/vllm/__init__.py",

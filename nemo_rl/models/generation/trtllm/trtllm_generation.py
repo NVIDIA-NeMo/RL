@@ -435,6 +435,62 @@ class TrtllmGeneration(GenerationInterface):
             print(f"Error in finish_generation: {e}")
             return False
 
+    def get_logger_metrics(self) -> dict[str, Any]:
+        """Collect in-flight batching, pending-request and KV-cache telemetry from DP-leader workers.
+
+        Returns ``{metric_name: {dp_idx: list[...]}}`` for ``inflight_batch_sizes``,
+        ``num_pending_samples`` and ``kv_cache_usage_perc``; mirrors vLLM's
+        get_vllm_logger_metrics.
+        """
+        if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger"):
+            return {}
+        if not self.worker_group or not self.worker_group.workers:
+            return {}
+
+        futures: list[ray.ObjectRef] = []
+        dp_indices: list[int] = []
+        for dp_idx in range(self.worker_group.dp_size):
+            worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
+            futures.append(
+                self.worker_group.run_single_worker_single_data(
+                    "get_trtllm_logger_metrics",
+                    worker_idx=worker_idx,
+                )
+            )
+            dp_indices.append(dp_idx)
+
+        results = ray.get(futures)
+        logger_metrics: dict[str, dict[int, list[Any]]] = {
+            "inflight_batch_sizes": {},
+            "num_pending_samples": {},
+            "kv_cache_usage_perc": {},
+        }
+        for dp_idx, stats in zip(dp_indices, results):
+            if not stats:
+                continue
+            inflight = stats.get("inflight_batch_sizes")
+            if inflight:
+                logger_metrics["inflight_batch_sizes"][dp_idx] = inflight
+            pending = stats.get("num_pending_samples")
+            if pending:
+                logger_metrics["num_pending_samples"][dp_idx] = pending
+            kv = stats.get("kv_cache_usage_perc")
+            if kv:
+                logger_metrics["kv_cache_usage_perc"][dp_idx] = kv
+        return logger_metrics
+
+    def clear_logger_metrics(self) -> None:
+        """Clear logger metrics for performance reporting."""
+        if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger"):
+            return
+        if not self.worker_group or not self.worker_group.workers:
+            return
+        futures = self.worker_group.run_all_workers_single_data(
+            "clear_trtllm_logger_metrics",
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+        ray.get(futures)
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_refit_info_async",
@@ -448,7 +504,7 @@ class TrtllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             return
         futures = self.worker_group.run_all_workers_single_data(
-            "start_gpu_profiling_async" if self.async_engine else "start_gpu_profiling",
+            "start_gpu_profiling_async",
             run_rank_0_only_axes=["tensor_parallel"],
         )
         ray.get(futures)
@@ -458,7 +514,7 @@ class TrtllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             return
         futures = self.worker_group.run_all_workers_single_data(
-            "stop_gpu_profiling_async" if self.async_engine else "stop_gpu_profiling",
+            "stop_gpu_profiling_async",
             run_rank_0_only_axes=["tensor_parallel"],
         )
         ray.get(futures)
@@ -499,32 +555,6 @@ class TrtllmGeneration(GenerationInterface):
           * ``NcclExtension.update_weights_via_ipc_zmq`` (IPC-ZMQ path)
         """
         return True
-
-    def clear_logger_metrics(self) -> None:
-        """No-op: TRT-LLM rollout telemetry is not yet wired up.
-
-        vLLM overrides this (``vllm_generation.py``) to reset AsyncLLM
-        iteration stats (rollout throughput, KV-cache utilization, in-flight
-        batch counters). TRT-LLM has no equivalent plumbing yet, so this stays
-        a no-op rather than inheriting silently — making the gap explicit.
-
-        TODO: fetch AsyncLLM iteration stats from the TRT-LLM workers and
-        clear them here, mirroring ``clear_vllm_logger_metrics``.
-        """
-        return None
-
-    def get_logger_metrics(self) -> dict[str, Any]:
-        """Return empty metrics: TRT-LLM rollout telemetry is not yet wired up.
-
-        See :meth:`clear_logger_metrics`. Returning ``{}`` explicitly documents
-        that rollout observability metrics (present for vLLM) are absent for
-        TRT-LLM runs, rather than letting them silently disappear via the
-        inherited no-op default.
-
-        TODO: surface AsyncLLM iteration stats here, mirroring
-        ``get_vllm_logger_metrics``.
-        """
-        return {}
 
     def shutdown(self) -> bool:
         try:

@@ -664,13 +664,11 @@ def print_performance_metrics(
             else:
                 print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
 
-    is_vllm_metrics_logger_enabled = master_config.policy["generation"].get(
-        "vllm_cfg", {}
-    ).get("enable_vllm_metrics_logger", False) and master_config.policy[
-        "generation"
-    ].get("vllm_cfg", {}).get("async_engine", False)
+    metrics_logger_interval = resolve_generation_metrics_logger(
+        master_config.policy["generation"]
+    )
     generation_logger_metrics = metrics.get("generation_logger_metrics", {})
-    if is_vllm_metrics_logger_enabled and generation_logger_metrics:
+    if metrics_logger_interval is not None and generation_logger_metrics:
         vllm_logger_metrics = generation_logger_metrics
         # vllm_logger_metrics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
         # metric_name: "inflight_batch_sizes" or "num_pending_samples"
@@ -688,10 +686,8 @@ def print_performance_metrics(
             "num_pending_samples must be a dictionary"
         )
 
-        vllm_metrics_logger_interval = master_config.policy["generation"]["vllm_cfg"][
-            "vllm_metrics_logger_interval"
-        ]
-        print("  • vLLM Logger Metrics:")
+        vllm_metrics_logger_interval = metrics_logger_interval
+        print("  • Generation Logger Metrics:")
         # Visualize the inflight batch sizes timeline
         if len(vllm_logger_metrics["inflight_batch_sizes"].values()) > 0:
             visualize_per_worker_timeline(
@@ -913,6 +909,28 @@ def print_performance_metrics(
     )
 
     return performance_metrics
+
+
+def resolve_generation_metrics_logger(
+    generation_cfg: dict[str, Any],
+) -> Optional[float]:
+    """Return the metrics-logger poll interval for the active backend, or None if disabled."""
+    backend = generation_cfg.get("backend")
+
+    if backend == "vllm":
+        vllm_cfg = generation_cfg.get("vllm_cfg", {}) or {}
+        if vllm_cfg.get("enable_vllm_metrics_logger", False) and vllm_cfg.get(
+            "async_engine", False
+        ):
+            return vllm_cfg["vllm_metrics_logger_interval"]
+    elif backend == "trtllm":
+        trtllm_cfg = generation_cfg.get("trtllm_cfg", {}) or {}
+        if trtllm_cfg.get("enable_trtllm_metrics_logger", False) and trtllm_cfg.get(
+            "async_engine", False
+        ):
+            return trtllm_cfg["trtllm_metrics_logger_interval"]
+
+    return None
 
 
 def log_generation_metrics(

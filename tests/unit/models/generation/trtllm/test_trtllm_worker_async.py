@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -250,3 +253,69 @@ async def test_async_ipc_refit_returns_false_on_worker_exception():
     worker.llm.collective_rpc.side_effect = RuntimeError("refit failed")
 
     assert await worker.update_weights_via_ipc_zmq_async() is False
+
+
+def _metrics_worker():
+    """A worker with the in-flight batching telemetry state initialized."""
+    worker = _worker()
+    worker.cfg["trtllm_cfg"]["trtllm_metrics_logger_interval"] = 0.001
+    worker._trtllm_metrics_enabled = True
+    worker._trtllm_metrics_lock = threading.Lock()
+    worker.inflight_batch_sizes = []
+    worker.num_pending_samples = []
+    worker.kv_cache_usage_perc = []
+    return worker
+
+
+async def _drain_once(worker, stat):
+    """Run exactly one iteration of the (infinite) drain loop.
+
+    CancelledError derives from BaseException, so the loop's inner
+    `except Exception` cannot swallow it, and `await asyncio.sleep(interval)`
+    sits outside the try — so raising it on the second RPC stops the loop
+    cleanly after one recorded sample, with no production-code refactor.
+    """
+    # collective_rpc("fetch_stats_serialized") returns list[list[json_str]].
+    rank_results = [[json.dumps(stat)]]
+    worker.llm.collective_rpc.side_effect = [rank_results, asyncio.CancelledError()]
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker._drain_stats_loop()
+
+
+@pytest.mark.asyncio
+async def test_drain_stats_loop_prefers_num_queued_requests():
+    worker = _metrics_worker()
+
+    await _drain_once(
+        worker,
+        {
+            "numQueuedRequests": 7,
+            "inflightBatchingStats": {
+                "numScheduledRequests": 4,
+                "numContextRequests": 3,
+            },
+        },
+    )
+
+    assert worker.num_pending_samples == [7]
+    assert worker.inflight_batch_sizes == [4]
+
+
+@pytest.mark.asyncio
+async def test_drain_stats_loop_falls_back_to_num_context_requests():
+    worker = _metrics_worker()
+
+    # Older engines do not report numQueuedRequests.
+    await _drain_once(
+        worker,
+        {
+            "inflightBatchingStats": {
+                "numScheduledRequests": 6,
+                "numContextRequests": 5,
+            },
+        },
+    )
+
+    assert worker.num_pending_samples == [5]
+    assert worker.inflight_batch_sizes == [6]
