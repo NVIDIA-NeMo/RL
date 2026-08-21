@@ -27,6 +27,12 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
+from nemo_rl.models.generation.vllm.speculator_runtime import (
+    DraftRuntimeAdapter,
+    ModelUpdateCoverage,
+    ModelUpdateManifest,
+    SpeculatorRuntimeError,
+)
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -58,7 +64,7 @@ except ImportError:
 
 
 WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
-WeightUpdateFinalizer = Callable[[], None]
+WeightUpdateFinalizer = Callable[[bool], None]
 
 
 def _format_refit_key_error(label: str, keys: set[str]) -> str:
@@ -184,6 +190,9 @@ class VllmInternalWorkerExtension:
     # load_mtp_weights_from_disk); refit then leaves those static weights alone.
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
+    _draft_runtime_adapter: DraftRuntimeAdapter | None = None
+    _model_update_manifest: ModelUpdateManifest | None = None
+    _refit_unusable_reason: str | None = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
@@ -322,6 +331,36 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        pp_group = get_pp_group()
+        pp_rank = int(getattr(pp_group, "rank_in_group", 0))
+        pp_size = int(getattr(pp_group, "world_size", 1))
+        spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
+        speculator_type = getattr(spec_config, "method", None)
+        self._draft_runtime_adapter = None
+        if speculator_type in ("eagle3", "dflash", "dspark"):
+            self._draft_runtime_adapter = DraftRuntimeAdapter.resolve(
+                self.model_runner,
+                speculator_type=speculator_type,
+                vllm_version=vllm.__version__,
+                pp_rank=pp_rank,
+                pp_size=pp_size,
+            )
+        elif any(name.startswith("draft.") for name in state_dict_info):
+            raise SpeculatorRuntimeError(
+                f"draft weights require a supported speculator_type, got "
+                f"{speculator_type!r} with vLLM={vllm.__version__}"
+            )
+
+        draft_owner_ranks = (
+            self._draft_runtime_adapter.owner_ranks
+            if self._draft_runtime_adapter is not None
+            else ()
+        )
+        self._model_update_manifest = ModelUpdateManifest.from_state_dict_info(
+            state_dict_info,
+            target_owner_ranks=tuple(range(pp_size)),
+            draft_owner_ranks=draft_owner_ranks,
+        )
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
@@ -425,23 +464,38 @@ class VllmInternalWorkerExtension:
         because these are dynamic vLLM model classes whose ``load_weights`` /
         ``mtp_start_layer_idx`` members are not visible through ``nn.Module``.
         """
-        draft_owner = getattr(self.model_runner, "drafter", None)
-        return getattr(draft_owner, "model", None) if draft_owner else None
+        accessor = getattr(self.model_runner, "get_draft_model", None)
+        if callable(accessor):
+            return accessor()
+        for attribute in ("drafter", "speculator"):
+            draft_owner = getattr(self.model_runner, attribute, None)
+            if draft_owner is not None:
+                return getattr(draft_owner, "model", None)
+        return None
 
     def _load_draft_weights(
-        self, draft_weights: list[tuple[str, torch.Tensor]]
-    ) -> None:
+        self,
+        draft_weights: list[tuple[str, torch.Tensor]],
+        *,
+        runtime_adapter: DraftRuntimeAdapter | None = None,
+    ) -> bool:
         if not draft_weights:
-            return
+            return False
 
-        draft_model = self._get_drafter_model()
+        if runtime_adapter is not None:
+            if not runtime_adapter.is_owner:
+                return False
+            draft_model = runtime_adapter.model
+        else:
+            draft_model = self._get_drafter_model()
         if draft_model is None:
-            logger.warning(
-                "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
+            raise SpeculatorRuntimeError(
+                "received draft weights but the owning vLLM speculative model "
+                "is unavailable"
             )
-            return
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
+        return True
 
     def _mtp_drafter_refit_enabled(self) -> bool:
         """Whether MTP drafter weights should be refreshed from the refit stream.
@@ -571,13 +625,24 @@ class VllmInternalWorkerExtension:
         )
         return True
 
-    def _load_weights(self, weights):
+    def _load_weights(
+        self,
+        weights: list[tuple[str, torch.Tensor]],
+        *,
+        coverage: ModelUpdateCoverage | None = None,
+    ) -> None:
         """Load weights with Gemma3 vision-tower weight name fix, FP8, and draft-weight support.
 
         Applies Gemma3 vision-tower weight name fix if needed, splits policy/draft
         weights, dispatches policy weights through the configured refit loader,
         and loads draft weights into the drafter model.
         """
+        policy_input_names = tuple(
+            name for name, _ in weights if not name.startswith("draft.")
+        )
+        draft_input_names = tuple(
+            name for name, _ in weights if name.startswith("draft.")
+        )
         if (
             "Gemma3ForConditionalGeneration"
             in self.model_runner.vllm_config.model_config.architectures
@@ -587,8 +652,20 @@ class VllmInternalWorkerExtension:
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         self._load_hf_weights(policy_weights)
+        if coverage is not None:
+            coverage.record_loaded(policy_input_names)
         # Eagle3 draft weights are exported with the `draft.` prefix.
-        self._load_draft_weights(draft_weights)
+        if self._draft_runtime_adapter is None:
+            draft_loaded = self._load_draft_weights(draft_weights)
+        else:
+            draft_loaded = self._load_draft_weights(
+                draft_weights, runtime_adapter=self._draft_runtime_adapter
+            )
+        if coverage is not None and draft_input_names:
+            if draft_loaded:
+                coverage.record_loaded(draft_input_names)
+            else:
+                coverage.record_owner_skip(draft_input_names, component="draft")
         # MTP drafters co-trained with the policy receive their weights from the
         # policy stream (no `draft.` prefix), so feed it the policy weights too.
         self._maybe_refit_mtp_drafter(policy_weights)
@@ -617,17 +694,59 @@ class VllmInternalWorkerExtension:
             process_weights_after_loading,
         )
 
-        def finalize() -> None:
+        self._require_refit_usable()
+
+        def finalize(finalize_draft: bool) -> None:
             with set_current_vllm_config(self.model_runner.vllm_config):
                 process_weights_after_loading(
                     self.model_runner.model, self.model_config, self.device
                 )
+                if finalize_draft:
+                    self._maybe_process_draft_after_loading(
+                        process_weights_after_loading
+                    )
             self._maybe_process_mtp_drafter_after_loading()
 
-        yield finalize
+        try:
+            yield finalize
+        except BaseException as error:
+            self._mark_refit_unusable(error)
+            raise
         # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
         # this optional second pass, just as it was before lifecycle hooks.
         self._maybe_process_fp8_kv_cache()
+
+    def _new_model_update_coverage(self) -> ModelUpdateCoverage | None:
+        manifest = self._model_update_manifest
+        if manifest is None:
+            return None
+        pp_rank = int(getattr(get_pp_group(), "rank_in_group", 0))
+        return ModelUpdateCoverage(manifest, rank=pp_rank)
+
+    def _maybe_process_draft_after_loading(
+        self, process_weights_after_loading: Callable[[Any, Any, Any], None]
+    ) -> None:
+        manifest = self._model_update_manifest
+        adapter = self._draft_runtime_adapter
+        if manifest is None or manifest.draft is None or adapter is None:
+            return
+        if not adapter.is_owner:
+            return
+        draft_model_config = (
+            self.model_runner.vllm_config.speculative_config.draft_model_config
+        )
+        process_weights_after_loading(adapter.model, draft_model_config, self.device)
+
+    def _require_refit_usable(self) -> None:
+        if self._refit_unusable_reason is not None:
+            raise SpeculatorRuntimeError(
+                "generation worker is unusable after a partial refit: "
+                f"{self._refit_unusable_reason}"
+            )
+
+    def _mark_refit_unusable(self, error: BaseException) -> None:
+        reason = f"{type(error).__name__}: {error}"
+        self._refit_unusable_reason = reason
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
@@ -651,6 +770,7 @@ class VllmInternalWorkerExtension:
         try:
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
+            coverage = self._new_model_update_coverage()
             with self._weight_update_lifecycle("ipc") as finalize:
                 while True:
                     # Blocking receive with timeout (this is the main operation)
@@ -661,7 +781,12 @@ class VllmInternalWorkerExtension:
                         # fails, otherwise the sender remains blocked until timeout.
                         try:
                             manifest.require_complete()
-                            finalize()
+                            if coverage is not None:
+                                coverage.require_complete()
+                            if coverage is None:
+                                finalize(False)
+                            else:
+                                finalize(coverage.has_draft)
                         finally:
                             self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                         break
@@ -698,7 +823,7 @@ class VllmInternalWorkerExtension:
                             "inaccurate info like keys or cached dtype in "
                             "state_dict_info"
                         )
-                        self._load_weights(weights)
+                        self._load_weights(weights, coverage=coverage)
                     except Exception as error:
                         batch_error = error
                         # The manifest only keeps the exception message; log
@@ -756,14 +881,25 @@ class VllmInternalWorkerExtension:
         )
 
         try:
+            coverage = self._new_model_update_coverage()
             with self._weight_update_lifecycle("collective") as finalize:
+                load_weights = self._load_weights
+                if coverage is not None:
+                    load_weights = lambda weights: self._load_weights(
+                        weights, coverage=coverage
+                    )
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,
                     src=0,
-                    post_unpack_func=self._load_weights,
+                    post_unpack_func=load_weights,
                 )
-                finalize()
+                if coverage is not None:
+                    coverage.require_complete()
+                if coverage is None:
+                    finalize(False)
+                else:
+                    finalize(coverage.has_draft)
 
         except Exception as e:
             if self._weight_update_errors_are_fatal():
@@ -1185,7 +1321,7 @@ class VllmInternalWorkerExtension:
             # canonical [gate; up] bulk write above defers to here, and the MTP
             # drafter's mirror of the same. The FP8 KV-cache per-layer k/v scales
             # are finalized by the lifecycle on exit.
-            finalize()
+            finalize(False)
 
             torch.cuda.empty_cache()
         return True
