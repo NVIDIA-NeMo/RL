@@ -631,7 +631,7 @@ jobs:
           docker pull "${SRC}"
           CID=$(docker create "${SRC}" true)
           mkdir -p /tmp/uv-cache
-          docker cp "${CID}:/root/.cache/uv/." /tmp/uv-cache/
+          docker cp "${CID}:/opt/nemo_rl_cache/uv/." /tmp/uv-cache/
           docker rm "${CID}"
 
           printf 'FROM scratch\nCOPY uv-cache/ /\n' > /tmp/Dockerfile.uv-cache
@@ -664,7 +664,7 @@ jobs:
           docker pull "${SRC}"
           CID=$(docker create "${SRC}" true)
           mkdir -p /tmp/uv-cache
-          docker cp "${CID}:/root/.cache/uv/." /tmp/uv-cache/
+          docker cp "${CID}:/opt/nemo_rl_cache/uv/." /tmp/uv-cache/
           docker rm "${CID}"
 
           printf 'FROM scratch\nCOPY uv-cache/ /\n' > /tmp/Dockerfile.uv-cache
