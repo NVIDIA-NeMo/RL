@@ -46,17 +46,6 @@ def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
         raise ValueError(f"{field_name} must contain only integer token IDs.") from e
 
 
-def _coerce_logprob_list(value: Any, field_name: str) -> list[float]:
-    if not isinstance(value, list):
-        raise ValueError(f"{field_name} must be a list of numeric log probabilities.")
-    logprobs: list[float] = []
-    for index, logprob in enumerate(value):
-        if not isinstance(logprob, (int, float)) or isinstance(logprob, bool):
-            raise ValueError(f"{field_name}[{index}] must be numeric.")
-        logprobs.append(float(logprob))
-    return logprobs
-
-
 def _strip_gym_token_metadata(messages: list[Any]) -> list[Any]:
     stripped_messages = deepcopy(messages)
     for message in stripped_messages:
@@ -202,19 +191,6 @@ def _latest_tokenized_assistant_index(messages: list[Any]) -> Optional[int]:
     return None
 
 
-def _derive_required_prefix_token_ids(messages: list[Any]) -> list[int] | None:
-    """Return the exact prompt and generation IDs from the latest model turn."""
-    assistant_index = _latest_tokenized_assistant_index(messages)
-    if assistant_index is None:
-        return None
-    message = messages[assistant_index]
-    if not isinstance(message, dict):
-        return None
-    return _coerce_token_id_list(
-        message["prompt_token_ids"], "prompt_token_ids"
-    ) + _coerce_token_id_list(message["generation_token_ids"], "generation_token_ids")
-
-
 def _normalize_tool_arguments_for_template(
     messages: list[Any], *, before_index: int
 ) -> None:
@@ -249,56 +225,6 @@ def _normalize_tool_arguments_for_template(
             )
 
 
-def _validate_engine_data(
-    response_body: dict[str, Any],
-) -> tuple[list[int], list[int], list[float]]:
-    nvext = response_body.get("nvext")
-    engine_data = nvext.get("engine_data") if isinstance(nvext, dict) else None
-    if not isinstance(engine_data, dict):
-        raise ValueError("Dynamo response did not include nvext.engine_data.")
-
-    prompt_token_ids = _coerce_token_id_list(
-        engine_data.get("prompt_token_ids"),
-        "nvext.engine_data.prompt_token_ids",
-    )
-    completion_token_ids = _coerce_token_id_list(
-        engine_data.get("completion_token_ids"),
-        "nvext.engine_data.completion_token_ids",
-    )
-    completion_logprobs = _coerce_logprob_list(
-        engine_data.get("completion_logprobs"),
-        "nvext.engine_data.completion_logprobs",
-    )
-    if len(completion_logprobs) != len(completion_token_ids):
-        raise ValueError(
-            "Dynamo response returned "
-            f"{len(completion_logprobs)} generation log probabilities for "
-            f"{len(completion_token_ids)} generation token IDs."
-        )
-    return prompt_token_ids, completion_token_ids, completion_logprobs
-
-
-def _inject_gym_token_metadata(response_body: dict[str, Any]) -> None:
-    """Expose Dynamo engine metadata on the message fields consumed by Gym."""
-    (
-        prompt_token_ids,
-        generation_token_ids,
-        generation_logprobs,
-    ) = _validate_engine_data(response_body)
-    choices = response_body.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise ValueError("Dynamo response did not include choices[0].")
-    choice = choices[0]
-    if not isinstance(choice, dict):
-        raise ValueError("Dynamo response choices[0] must be a JSON object.")
-    message = choice.get("message")
-    if not isinstance(message, dict):
-        raise ValueError("Dynamo response choices[0].message must be a JSON object.")
-    message["prompt_token_ids"] = prompt_token_ids
-    message["generation_token_ids"] = generation_token_ids
-    message["generation_log_probs"] = generation_logprobs
-
-
 def prepare_dynamo_chat_completion_request(
     request_body: dict[str, Any],
     *,
@@ -321,18 +247,27 @@ def prepare_dynamo_chat_completion_request(
     prepared_body = deepcopy(request_body)
     stripped_messages = _strip_gym_token_metadata(messages)
     prepared_body["messages"] = stripped_messages
-    prepared_body.pop("required_prefix_token_ids", None)
+    required_prefix_value = prepared_body.pop("required_prefix_token_ids", None)
+    required_prefix_token_ids = (
+        _coerce_token_id_list(
+            required_prefix_value,
+            "required_prefix_token_ids",
+        )
+        if required_prefix_value is not None
+        else None
+    )
 
-    required_prefix_token_ids = _derive_required_prefix_token_ids(messages)
     add_generation_prompt = _request_add_generation_prompt(prepared_body)
     template_messages = deepcopy(stripped_messages)
-    assistant_index: int | None = None
-    if required_prefix_token_ids is not None:
-        assistant_index = _latest_tokenized_assistant_index(messages)
-        if assistant_index is None:
-            raise ValueError(
-                "Dynamo prefix token metadata must be attached to an assistant message."
-            )
+    assistant_index = _latest_tokenized_assistant_index(messages)
+    if assistant_index is not None and required_prefix_token_ids is None:
+        raise ValueError(
+            "A tokenized assistant message requires required_prefix_token_ids."
+        )
+    if assistant_index is None and required_prefix_token_ids is not None:
+        raise ValueError(
+            "required_prefix_token_ids requires a tokenized assistant message."
+        )
 
     try:
         (
@@ -475,14 +410,6 @@ class DynamoTokenWrapperServer:
                 prepared_body,
                 authorization=request.headers.get("authorization"),
             )
-            if 200 <= status_code < 300:
-                try:
-                    _inject_gym_token_metadata(response_body)
-                except ValueError as e:
-                    return JSONResponse(
-                        content={"error": {"message": str(e)}},
-                        status_code=502,
-                    )
             return JSONResponse(content=response_body, status_code=status_code)
 
         node_ip = _get_node_ip_local()

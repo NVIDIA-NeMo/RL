@@ -1120,6 +1120,23 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
 
+    if generation_config["backend"] == "dynamo":
+        env_cfg = config.env.setdefault("nemo_gym", {})
+        model_cfg = (
+            env_cfg.setdefault("policy_model", {})
+            .setdefault("responses_api_models", {})
+            .setdefault("vllm_model", {})
+        )
+        extra_body = model_cfg.setdefault("extra_body", {})
+        nvext = extra_body.setdefault("nvext", {})
+        extra_fields = nvext.setdefault("extra_fields", [])
+        if not isinstance(extra_fields, list):
+            raise ValueError(
+                "env.nemo_gym policy model nvext.extra_fields must be a list."
+            )
+        if "engine_data" not in extra_fields:
+            extra_fields.append("engine_data")
+
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for
     # multi-turn multimodal postprocessing).
