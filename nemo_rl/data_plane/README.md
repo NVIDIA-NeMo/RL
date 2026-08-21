@@ -478,7 +478,9 @@ Backend choice:
   no segment or pool sizing applies. The trade is that every read of a key is
   served by the producing process's NIC, and that a producer's tensors stay
   registered between `put` and `clear` (which is forwarded to whoever published
-  the key) — see `docs/design-docs/tq-register-mode.md`.
+  the key). Full guide with measurements in
+  `nemo_rl/data_plane/adapters/README_register_mode.md`; design and open work in
+  `docs/design-docs/tq-register-mode.md`.
 
 `gdr_staging_buffer_mb` is the persistent GPU staging capacity per active GDR
 client (default 1024 MiB). TransferQueue's pin requires it to fit the largest
@@ -515,7 +517,7 @@ fixture for the ABC contract tests.
 |---|---|
 | Stable boundary (ABC) | `nemo_rl/data_plane/interfaces.py` |
 | Adapter (TransferQueue impl) | `nemo_rl/data_plane/adapters/transfer_queue.py` |
-| Register-mode TQ backend | `nemo_rl/data_plane/adapters/tq_register_mode.py` |
+| Register-mode TQ backend | `nemo_rl/data_plane/adapters/tq_register_mode.py` (guide: `adapters/README_register_mode.md`) |
 | Adapter (NoOp, test only) | `nemo_rl/data_plane/adapters/noop.py` |
 | Codec (jagged pack / unpack) | `nemo_rl/data_plane/codec.py` |
 | Column-level helpers | `nemo_rl/data_plane/column_io.py` (`read_columns`, `write_columns`, `kv_first_write`) |

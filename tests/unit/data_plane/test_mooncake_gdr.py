@@ -56,7 +56,7 @@ def test_init_tq_forwards_nested_gdr_config_and_keeps_rdma(
     monkeypatch.setitem(sys.modules, "mooncake.store", ModuleType("mooncake.store"))
 
     monkeypatch.setattr(tq_adapter.os, "environ", dict(tq_adapter.os.environ))
-    monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
+    monkeypatch.setattr(tq_adapter, "local_node_ip", lambda: "10.0.0.1")
     monkeypatch.setattr(
         tq_adapter,
         "rdma_devices",
@@ -86,7 +86,7 @@ def test_cpu_only_client_may_attach_with_gdr_config(monkeypatch) -> None:
     """The CUDA guard is receiver-specific; a CPU-only producer remains valid."""
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
     monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
-    monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
+    monkeypatch.setattr(tq_adapter, "local_node_ip", lambda: "10.0.0.1")
     monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
     # Positional on this stack: the CPU-RDMA work passes staging_buffer_size,
     # where the first GDR integration passed n_slots/max_bytes as keywords.

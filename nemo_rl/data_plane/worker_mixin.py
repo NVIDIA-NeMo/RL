@@ -147,10 +147,11 @@ class TQWorkerMixin:
 
         # A GPU worker that attaches before CUDA is up silently falls back to
         # the host path for the rest of the run: mooncake_cpu to CPU staging,
-        # register mode to host receive buffers.
+        # register mode to host receive buffers. getattr, not a backend-name
+        # list: the question is whether this backend's config has the flag at
+        # all, which is what a new GDR-capable backend would also answer.
         if (
-            cfg["backend"] in ("mooncake_cpu", "transfer_engine")
-            and backend_config(cfg).use_gdr
+            getattr(backend_config(cfg), "use_gdr", False)
             and not torch.cuda.is_initialized()
         ):
             raise RuntimeError(
@@ -462,12 +463,12 @@ class TQWorkerMixin:
                 f"result[{result_key!r}] has batch dim {val.shape[0]} "
                 f"but meta.sample_ids has {len(meta.sample_ids)}."
             )
-        # Register mode publishes the address of this very tensor, so it asks
-        # for the device it is already on; every store-backed backend asks for
-        # host memory because it is about to copy the bytes out anyway.
-        self._write_back(
-            meta, {tq_field: val.detach().to(self._require_dp_client().put_device)}
-        )
+        # No .to("cpu") here: every backend's client already places the tensor
+        # where it needs it — TQ's mooncake client copies CUDA sources to host
+        # itself, and register mode registers them in place (or offloads, per
+        # its own config). Forcing host memory here made the D2H unavoidable
+        # for the one backend built to avoid it.
+        self._write_back(meta, {tq_field: val.detach()})
 
     @wrap_with_nvtx_name("policy_worker/train_presharded")
     def train_presharded(

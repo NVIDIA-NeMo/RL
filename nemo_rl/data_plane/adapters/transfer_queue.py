@@ -49,8 +49,13 @@ from tensordict import TensorDict
 # the processes that import this adapter. Safe to do here and nowhere earlier:
 # this module has already loaded transfer_queue above.
 import nemo_rl.data_plane.adapters.tq_register_mode  # noqa: F401
-from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
+from nemo_rl.data_plane.adapters.transfer_queue_env import (
+    local_node_ip,
+    rail_link_layers,
+)
 from nemo_rl.data_plane.interfaces import (
+    KV_MANAGER_BACKENDS,
+    MOONCAKE_ENGINE_BACKENDS,
     DataPlaneClient,
     DataPlaneConfig,
     KVBatchMeta,
@@ -61,31 +66,6 @@ from nemo_rl.data_plane.schema import PROMOTE_1D_FIELDS
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
 # ──────────────────────────────────────────────────────────────────────────
-
-
-def _get_local_node_ip() -> str:
-    """Return THIS process's host IP, not the cluster head's.
-
-    Each Ray actor process must use its own node's IP so Mooncake's
-    announce address (``MC_TCP_BIND_ADDRESS`` → ``desc.ip_or_host_name``
-    in ``transfer_engine_impl.cpp``) is routable cross-node.
-    Non-routable addresses are rejected:
-
-    * Link-local (169.254/16, fe80::/10) — ``gethostbyname`` can
-      resolve to APIPA on hosts where ``avahi-autoipd`` is active.
-    * Loopback (127.0.0.0/8, ::1) — hosts whose ``/etc/hosts`` maps
-      the hostname to 127.0.0.1 would otherwise announce an
-      unroutable address to Mooncake peers, causing cross-node
-      ``connection refused``.
-    """
-    try:
-        ip = socket.gethostbyname(socket.gethostname())
-        addr = ipaddress.ip_address(ip)
-        if addr.is_link_local or addr.is_loopback:
-            return ""
-        return ip
-    except Exception:
-        return ""
 
 
 def rdma_devices() -> str:
@@ -523,11 +503,11 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         # set by TQDataPlaneClient.__init__ (runs on every process,
         # including this driver). _init_tq only needs local_ip below
         # for the metadata/master server URLs (driver-bound).
-        local_ip = _get_local_node_ip()
+        local_ip = local_node_ip()
         if not local_ip:
             raise RuntimeError(
                 "Mooncake backend requires a local node IP; "
-                "_get_local_node_ip() returned empty."
+                "local_node_ip() returned empty."
             )
         # Sizes are per client process and RDMA-pinned — see MooncakeCpuConfig
         # in nemo_rl/data_plane/interfaces.py for the per-node arithmetic.
@@ -735,8 +715,8 @@ class TQDataPlaneClient(DataPlaneClient):
         # Both RDMA backends run on mooncake's engine.so and need (1);
         # transfer_engine registers its own buffers, so the store-client
         # patches below are mooncake_cpu's alone.
-        if cfg["backend"] in ("mooncake_cpu", "transfer_engine"):
-            local_ip = _get_local_node_ip()
+        if cfg["backend"] in MOONCAKE_ENGINE_BACKENDS:
+            local_ip = local_node_ip()
             if local_ip:
                 # Force-assign per-process: Ray actors inherit env vars
                 # from the driver, so a setdefault on the worker would
@@ -763,36 +743,18 @@ class TQDataPlaneClient(DataPlaneClient):
         # is unaffected). Writer unsqueezes 1D → (N, 1) on put; reader
         # squeezes the trailing 1 back on get. Drop when upstream TQ
         # unifies the schema/data shapes for 1D fields.
-        self._promote_1d = cfg["backend"] in ("mooncake_cpu", "transfer_engine")
+        self._promote_1d = cfg["backend"] in KV_MANAGER_BACKENDS
 
         if bootstrap:
             _init_tq(cfg)
         else:
             _connect_existing()
-        # Register mode publishes addresses, so a producer should hand it the
-        # tensor where it already lives — unless this run deliberately offloads
-        # sources to host, or this process cannot register HBM at all. Same
-        # conditions the TQ client applies (see TransferEngineClient.__init__).
-        register_in_hbm = False
-        if cfg["backend"] == "transfer_engine":
-            te_cfg = backend_config(cfg)
-            register_in_hbm = (
-                te_cfg.use_gdr
-                and not te_cfg.offload_source_to_host
-                and torch.cuda.is_initialized()
-            )
-        self._put_device = "cuda" if register_in_hbm else "cpu"
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
         # Fields whose schema this process has already warmed, per partition.
         # See register_partition: the controller's field map is append-only,
         # so a field only ever needs warming once.
         self._warmed_fields: dict[str, set[str]] = {}
-
-    @property
-    def put_device(self) -> str:
-        """Device producers should write back on — see :class:`DataPlaneClient`."""
-        return self._put_device
 
     # ── (A) task-mediated ───────────────────────────────────────────────
 
@@ -1033,6 +995,18 @@ class TQDataPlaneClient(DataPlaneClient):
         if self._closed:
             return
         self._closed = True
+        # TQ's KVStorageManager.close() only closes its own ZMQ sockets and
+        # never reaches the storage client, so a backend holding process-level
+        # resources (register mode's RDMA registrations, its release listener)
+        # would leak them until process exit. Close it here, before tq.close()
+        # tears the client down.
+        try:
+            manager = getattr(tq.get_client(), "storage_manager", None)
+            storage_client = getattr(manager, "storage_client", None)
+            if storage_client is not None and hasattr(storage_client, "close"):
+                storage_client.close()
+        except Exception:
+            pass
         try:
             tq.close()
         except Exception:

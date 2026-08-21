@@ -32,19 +32,44 @@ import sys
 
 import torch
 
-from nemo_rl.data_plane.adapters.transfer_queue import rdma_devices
-from nemo_rl.data_plane.adapters.tq_register_mode import TransferEngineClient
+from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+from nemo_rl.data_plane.interfaces import TransferEngineConfig
+
+# Deliberately no module-level import of the adapters: they load
+# transfer_queue, and mooncake snapshots its MC_* / WITH_NVIDIA_PEERMEM
+# configuration as its extension loads. Importing here would fix the engine's
+# settings before _engine_env() could choose them, which is how this tool used
+# to fail with ERR_CONTEXT (-202) when run standalone.
 
 
-def _client(use_gdr: bool, device_name: str) -> TransferEngineClient:
+def _engine_env() -> None:
+    """Apply the same engine configuration a real run gets, before any import."""
+    maybe_configure_data_plane_env(
+        {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "transfer_engine",
+            "claim_meta_poll_interval_s": 0.5,
+        }
+    )
+
+
+def _client(use_gdr: bool, device_name: str):
+    """Build a client from the config model, so new fields cannot be missed.
+
+    Hand-writing this dict is how the tool silently broke once already: the
+    client reads every key it declares, and a field added to
+    TransferEngineConfig left the literal short by one.
+    """
+    from nemo_rl.data_plane.adapters.tq_register_mode import TransferEngineClient
+
     return TransferEngineClient(
         {
+            **TransferEngineConfig(use_gdr=use_gdr).model_dump(),
             "local_hostname": "",  # resolved per process
-            "rpc_port": 0,
             "protocol": "rdma",
             "device_name": device_name,
             "metadata_server": "P2PHANDSHAKE",
-            "use_gdr": use_gdr,
         }
     )
 
@@ -58,6 +83,9 @@ def main() -> int:
         help="register host memory instead of HBM (isolates GDR from RDMA)",
     )
     args = parser.parse_args()
+
+    _engine_env()
+    from nemo_rl.data_plane.adapters.transfer_queue import rdma_devices
 
     devices = rdma_devices()
     print(f"rdma_devices: {devices or '(none)'}")

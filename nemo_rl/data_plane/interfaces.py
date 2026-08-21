@@ -191,6 +191,14 @@ class DataPlaneConfig(TypedDict):
 # recipe cannot silently disable GDR.
 _FIRST_GDR_FLAT_KEYS = ("use_gdr", "gdr_staging_buffer_mb")
 
+# Backends that run mooncake's engine (and so need its MC_* configuration and a
+# routable announce address), and those that reach TQ through KVStorageManager
+# (and so need the 1D-field promotion workaround). They coincide today; naming
+# them separately is what stops a future KV backend from being silently broken
+# by a tuple edited in an unrelated file.
+MOONCAKE_ENGINE_BACKENDS = ("mooncake_cpu", "transfer_engine")
+KV_MANAGER_BACKENDS = ("mooncake_cpu", "transfer_engine")
+
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {
     "simple": SimpleStorageConfig,
     "mooncake_cpu": MooncakeCpuConfig,
@@ -420,17 +428,6 @@ class DataPlaneClient(ABC):
     flips ``production_status[sample, field] = 1``. Downstream consumers
     waiting on that field only see those samples once produced.
     """
-
-    @property
-    def put_device(self) -> str:
-        """Device a producer should hand tensors to :meth:`put_samples` on.
-
-        ``"cpu"`` for every backend that copies the payload into a store, which
-        is why producers move results to host before writing back. Register
-        mode overrides it: it registers the tensor where it already is, so a
-        write-back that copies to host first would be pure loss.
-        """
-        return "cpu"
 
     # ── (A) task-mediated ───────────────────────────────────────────────
 

@@ -18,13 +18,17 @@ Cheap pre-flight for a multi-node submission: catches an unresolvable
 the allocation, and a data_plane block that silently resolves to the wrong
 backend — all without burning an allocation to find out.
 
-    python tools/check_register_mode_recipe.py <config.yaml>
+    python tools/check_sc_recipe.py <config.yaml>
 """
 
 import sys
 
 from omegaconf import OmegaConf
 
+from nemo_rl.algorithms.single_controller_utils.config import (
+    MasterConfig,
+    validate_single_controller_config,
+)
 from nemo_rl.data_plane.interfaces import backend_config
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
@@ -37,10 +41,13 @@ def main(path: str) -> int:
     cfg = load_config(path)
     resolved = OmegaConf.to_container(cfg, resolve=True)
 
-    from nemo_rl.algorithms.grpo import MasterConfig
-
-    MasterConfig(**resolved)
-    print("MasterConfig: OK")
+    # The SingleController schema, not grpo's: run_grpo_single_controller.py
+    # validates against this one, and validate_single_controller_config carries
+    # the cross-section rules (streaming-train groups, buffer capacity, sampler
+    # coupling) that a hand-rolled check here would only partly reproduce.
+    config = MasterConfig(**resolved)
+    validate_single_controller_config(config)
+    print("MasterConfig + SingleController constraints: OK")
 
     cluster = resolved["cluster"]
     gen = resolved["policy"]["generation"]["colocated"]
@@ -68,21 +75,12 @@ def main(path: str) -> int:
     print(f"data_plane: enabled={dp['enabled']} backend={dp['backend']}")
     print(f"  resolved block: {block}")
 
-    ok = True
+    # Mesh divisibility is the one thing MasterConfig cannot see: it depends on
+    # the allocation, not the config alone.
     if train_gpus % mesh:
         print(f"FAIL: mesh {mesh} does not divide {train_gpus} train GPUs")
-        ok = False
-    gbs = resolved["policy"]["train_global_batch_size"]
-    prompts = resolved["grpo"]["num_prompts_per_step"]
-    gens = resolved["grpo"]["num_generations_per_prompt"]
-    if prompts * gens != gbs:
-        print(
-            f"FAIL: SingleController needs num_prompts_per_step x "
-            f"num_generations_per_prompt ({prompts} x {gens} = {prompts * gens}) "
-            f"== train_global_batch_size ({gbs})"
-        )
-        ok = False
-    return 0 if ok else 1
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

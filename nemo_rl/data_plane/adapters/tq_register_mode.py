@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import operator
 import threading
 from collections import defaultdict
@@ -63,18 +64,15 @@ from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
 from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVClient
 from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
 from transfer_queue.utils import serial_utils
-from transfer_queue.utils.tensor_utils import (
-    allocate_empty_tensors,
-    compute_stride,
-    get_nbytes,
-)
+from transfer_queue.utils.tensor_utils import allocate_empty_tensors, compute_stride
 from transfer_queue.utils.zmq_utils import (
     ZMQServerInfo,
     create_zmq_socket,
     format_zmq_address,
     get_free_port,
-    get_node_ip_address,
 )
+
+from nemo_rl.data_plane.adapters.transfer_queue_env import local_node_ip
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +115,11 @@ class _PinTable:
         self._engine = engine
         self._lock = threading.Lock()
         self._pins: dict[int, _Pin] = {}
+        self._pending: SimpleQueue[list[tuple[int, Any]] | None] = SimpleQueue()
+        self._drainer = threading.Thread(
+            target=self._drain, name="tq-register-dereg", daemon=True
+        )
+        self._drainer.start()
 
     def pin(self, tensor: Tensor) -> tuple[int, int]:
         """Register ``tensor``'s allocation once; return ``(base, offset)``."""
@@ -138,19 +141,16 @@ class _PinTable:
             pin.refcount += 1
         return base, tensor.data_ptr() - base
 
-    def unpin(self, base: int) -> None:
-        """Drop one reference to ``base``; unregister and release it at zero."""
-        for dead in self.unpin_many([base]):
-            self._deregister([dead])
+    def unpin(self, bases: list[int]) -> None:
+        """Drop one reference to each base; deregister whatever reaches zero.
 
-    def unpin_many(self, bases: list[int]) -> list[tuple[int, Any]]:
-        """Drop one reference each; return the ``(base, storage)`` that hit zero.
-
-        Deliberately does *not* call the engine: ``ibv_dereg_mr`` is a syscall,
-        and doing it per base under this lock put it on ``clear``'s critical
-        path. The caller decides when to deregister — the storage rides along
-        because the allocation must stay alive until it does, or the allocator
-        could hand the address out while the NIC still maps it.
+        Accounting is synchronous, so ``pinned_keys`` is exact when this
+        returns. The ``ibv_dereg_mr`` it implies is not: nothing waits on a
+        deregistration — the data is dead the moment ``clear`` names it — and
+        paying the syscall inline put it on the step boundary, where it cost
+        27ms per clear. Each allocation's strong reference travels with the
+        deferred batch, so the caching allocator cannot reissue an address
+        while the NIC still maps it.
         """
         with self._lock:
             dead: list[tuple[int, Any]] = []
@@ -162,12 +162,23 @@ class _PinTable:
                 if pin.refcount == 0:
                     del self._pins[base]
                     dead.append((base, pin.storage))
-            return dead
+        if dead:
+            self._pending.put(dead)
+
+    def _drain(self) -> None:
+        while True:
+            dead = self._pending.get()
+            if dead is None:
+                return
+            try:
+                self._deregister(dead)
+            except Exception:
+                logger.exception(
+                    "deferred deregistration of %d regions failed", len(dead)
+                )
 
     def _deregister(self, dead: list[tuple[int, Any]]) -> None:
         """One batched ``ibv_dereg_mr`` for everything in ``dead``."""
-        if not dead:
-            return
         status = self._engine.batch_unregister_memory([base for base, _ in dead])
         if status is not None and status != 0:
             logger.error(
@@ -176,59 +187,20 @@ class _PinTable:
                 status,
             )
 
-    def unpin_all(self) -> None:
-        """Unregister every region regardless of refcount; used on shutdown."""
+    def close(self) -> None:
+        """Finish every deferred deregistration, then unregister what is left."""
+        self._pending.put(None)
+        self._drainer.join(timeout=10)
         with self._lock:
-            for base in self._pins:
-                self._engine.unregister_memory(base)
-            self._pins.clear()
+            if self._pins:
+                self._deregister([(base, pin.storage) for base, pin in self._pins.items()])
+                self._pins.clear()
 
     def storage_for(self, base: int) -> Any:
         """The registered allocation at ``base``, or None if this process has none."""
         with self._lock:
             pin = self._pins.get(base)
             return pin.storage if pin is not None else None
-
-
-class _Deregistrar:
-    """Runs ``ibv_dereg_mr`` off the caller's thread, in batches.
-
-    Nothing waits on a deregistration — the data is already dead by the time
-    ``clear`` names it — so paying the syscall inline only lengthened the step
-    boundary. Correctness still needs the ordering: each allocation's strong
-    reference is held here until its region is actually unregistered, so the
-    caching allocator cannot reissue an address the NIC still maps.
-    """
-
-    def __init__(self, deregister: Callable[[list[tuple[int, Any]]], None]) -> None:
-        self._deregister = deregister
-        self._pending: SimpleQueue[list[tuple[int, Any]] | None] = SimpleQueue()
-        self._thread = threading.Thread(
-            target=self._drain, name="tq-register-dereg", daemon=True
-        )
-        self._thread.start()
-
-    def submit(self, dead: list[tuple[int, Any]]) -> None:
-        """Hand over regions to unregister; returns immediately."""
-        if dead:
-            self._pending.put(dead)
-
-    def _drain(self) -> None:
-        while True:
-            batch = self._pending.get()
-            if batch is None:
-                return
-            try:
-                self._deregister(batch)
-            except Exception:
-                logger.exception(
-                    "deferred deregistration of %d regions failed", len(batch)
-                )
-
-    def close(self) -> None:
-        """Finish every outstanding deregistration, then stop."""
-        self._pending.put(None)
-        self._thread.join(timeout=10)
 
 
 class _ReleaseChannel:
@@ -272,9 +244,7 @@ class _ReleaseChannel:
             try:
                 if not poller.poll(timeout=200):
                     continue
-                payload = [
-                    (key, seq) for key, seq in json.loads(self._inbox.recv().decode())
-                ]
+                payload = json.loads(self._inbox.recv().decode())
             except (zmq.ZMQError, ValueError, UnicodeDecodeError) as e:
                 if self._closed.is_set():
                     return
@@ -398,7 +368,11 @@ class TransferEngineClient(StorageKVClient):
             )
 
         # Empty means "resolve here": the driver ships one config to every node.
-        self.local_hostname = config["local_hostname"] or get_node_ip_address()
+        # local_node_ip, not TransferQueue's Ray wrapper: this address is
+        # published to every peer, and the wrapper does not reject loopback or
+        # link-local, which peers cannot open. The engine's MC_TCP_BIND_ADDRESS
+        # comes from the same helper, so the two identities cannot disagree.
+        self.local_hostname = config["local_hostname"] or local_node_ip()
         # 0 lets the engine pick a free port, which co-located clients need.
         self.rpc_port = int(config["rpc_port"])
         self.protocol = config["protocol"]
@@ -446,7 +420,6 @@ class TransferEngineClient(StorageKVClient):
         self._published_seq = 0
         self._published_lock = threading.Lock()
         self._release = _ReleaseChannel(self.local_hostname, self._release_keys)
-        self._dereg = _Deregistrar(self._pins._deregister)
         # The one line that says which path this process actually took: without
         # it a GDR client that silently fell back to host receive buffers looks
         # identical in the logs to one that did not.
@@ -584,34 +557,45 @@ class TransferEngineClient(StorageKVClient):
                 "Lengths of keys, shapes, dtypes and custom_backend_meta must match"
             )
 
+        # One pass builds everything the fetch needs. Receive buffers: tensors
+        # keep their declared dtype/shape, non-tensor payloads land in uint8
+        # buffers sized by the producer's packed length. The size check uses
+        # ``dtype.itemsize`` rather than TQ's ``get_nbytes``, which allocates a
+        # throwaway tensor per key just to read the element size — ~400us per
+        # get at this key count, more than the registration it guards.
         metas: list[dict] = []
-        for key, meta in zip(keys, custom_backend_meta, strict=True):
+        dst_dtypes: list[torch.dtype] = []
+        dst_shapes: list[tuple] = []
+        sizes: list[int] = []
+        tensor_indices: list[int] = []
+        non_tensor_indices: list[int] = []
+        for i, (key, meta, dtype, shape) in enumerate(
+            zip(keys, custom_backend_meta, dtypes, shapes, strict=True)
+        ):
             if not meta:
                 raise ValueError(
                     f"Missing custom_backend_meta for key `{key}`; "
                     f"it was never published."
                 )
+            size = meta["size"]
+            if dtype is None:
+                non_tensor_indices.append(i)
+                dst_dtypes.append(torch.uint8)
+                dst_shapes.append((size,))
+            else:
+                tensor_indices.append(i)
+                dst_dtypes.append(dtype)
+                shape = tuple(shape)
+                dst_shapes.append(shape)
+                expected = dtype.itemsize * math.prod(shape)
+                if expected != size:
+                    raise ValueError(
+                        f"Key `{key}` was published as {size} bytes but its "
+                        f"metadata describes {expected}."
+                    )
             metas.append(meta)
+            sizes.append(size)
 
-        # Receive buffers: tensors keep their declared dtype/shape, non-tensor
-        # payloads land in uint8 buffers sized by the producer's packed length.
-        dst_dtypes = [dtype if dtype is not None else torch.uint8 for dtype in dtypes]
-        dst_shapes = [
-            tuple(shape) if dtype is not None else (meta["size"],)
-            for shape, dtype, meta in zip(shapes, dtypes, metas, strict=True)
-        ]
-        sizes = [meta["size"] for meta in metas]
-        for key, dtype, expected, size in zip(
-            keys, dtypes, get_nbytes(dst_dtypes, dst_shapes), sizes, strict=True
-        ):
-            if dtype is not None and expected != size:
-                raise ValueError(
-                    f"Key `{key}` was published as {size} bytes but its "
-                    f"metadata describes {expected}."
-                )
-
-        tensor_indices = [i for i, dtype in enumerate(dtypes) if dtype is not None]
-        non_tensor_indices = [i for i, dtype in enumerate(dtypes) if dtype is None]
         results: list[Any] = [None] * len(keys)
 
         # Non-tensor payloads are msgpack buffers that get decoded on the host,
@@ -694,8 +678,7 @@ class TransferEngineClient(StorageKVClient):
             self._release.close()
             # Drains first: unpin_all deregisters everything still held, and a
             # queued batch naming the same regions must not race it.
-            self._dereg.close()
-            self._pins.unpin_all()
+            self._pins.close()
             with self._published_lock:
                 self._published.clear()
             self._engine = None
@@ -733,7 +716,7 @@ class TransferEngineClient(StorageKVClient):
             # the put path. (When both publications share a base — the common
             # case, since the allocator reuses blocks — the refcount simply
             # goes 2 -> 1 and nothing is deregistered.)
-            self._dereg.submit(self._pins.unpin_many([superseded[0]]))
+            self._pins.unpin([superseded[0]])
         return {
             "endpoint": self._endpoint,
             "base": base,
@@ -759,7 +742,7 @@ class TransferEngineClient(StorageKVClient):
                 if published is not None and published[1] == seq:
                     bases.append(published[0])
                     del self._published[key]
-        self._dereg.submit(self._pins.unpin_many(bases))
+        self._pins.unpin(bases)
 
     def _fetch_group(
         self,

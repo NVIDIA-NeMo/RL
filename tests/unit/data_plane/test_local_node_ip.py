@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for _get_local_node_ip and the MC_TCP_BIND_ADDRESS env-var
+"""Unit tests for local_node_ip and the MC_TCP_BIND_ADDRESS env-var
 assignment in the mooncake_cpu adapter path.
 
 Covers P3: multi-node correctness of the per-process IP binding.
@@ -32,7 +32,7 @@ import pytest
 
 
 def _import_helper():
-    """Import _get_local_node_ip from the TQ adapter.
+    """Import local_node_ip from the engine-env module.
 
     Returns the function if importable, or None if transfer_queue is absent
     (the adapter can't be imported without TQ installed because it calls
@@ -41,9 +41,9 @@ def _import_helper():
     call time, so the import is always safe).
     """
     try:
-        from nemo_rl.data_plane.adapters.transfer_queue import _get_local_node_ip
+        from nemo_rl.data_plane.adapters.transfer_queue_env import local_node_ip
 
-        return _get_local_node_ip
+        return local_node_ip
     except ImportError:
         return None
 
@@ -150,7 +150,7 @@ def test_mc_tcp_bind_address_overwrites_existing(monkeypatch) -> None:
     """
     import socket
 
-    from nemo_rl.data_plane.adapters.transfer_queue import _get_local_node_ip
+    from nemo_rl.data_plane.adapters.transfer_queue_env import local_node_ip
 
     local_ip = "10.65.4.100"
 
@@ -160,7 +160,7 @@ def test_mc_tcp_bind_address_overwrites_existing(monkeypatch) -> None:
     # Simulate a stale driver IP inherited via Ray actor env inheritance.
     monkeypatch.setenv("MC_TCP_BIND_ADDRESS", "10.65.0.1")
 
-    ip = _get_local_node_ip()
+    ip = local_node_ip()
     if not ip:
         pytest.skip("gethostbyname returned empty in this environment")
 

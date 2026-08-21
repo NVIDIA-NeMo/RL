@@ -30,7 +30,9 @@ the ordering violation into an error rather than a silent misconfiguration.
 from __future__ import annotations
 
 import glob
+import ipaddress
 import os
+import socket
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -49,6 +51,36 @@ _ENGINE_MODULES = ("transfer_queue", "mooncake")
 def _engine_already_imported() -> str | None:
     """Return the first engine module already in ``sys.modules``, else None."""
     return next((m for m in _ENGINE_MODULES if m in sys.modules), None)
+
+
+def local_node_ip() -> str:
+    """Return THIS process's host IP, not the cluster head's.
+
+    Each Ray actor process must use its own node's IP so Mooncake's
+    announce address (``MC_TCP_BIND_ADDRESS`` → ``desc.ip_or_host_name``
+    in ``transfer_engine_impl.cpp``) is routable cross-node, and so that a
+    register-mode client publishes an endpoint its peers can open.
+    Non-routable addresses are rejected:
+
+    * Link-local (169.254/16, fe80::/10) — ``gethostbyname`` can
+      resolve to APIPA on hosts where ``avahi-autoipd`` is active.
+    * Loopback (127.0.0.0/8, ::1) — hosts whose ``/etc/hosts`` maps
+      the hostname to 127.0.0.1 would otherwise announce an
+      unroutable address to Mooncake peers, causing cross-node
+      ``connection refused``.
+
+    Lives here rather than in the adapter so both the engine env and the
+    register-mode client resolve one host identity; they disagreed when the
+    client used TransferQueue's unfiltered Ray wrapper instead.
+    """
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        addr = ipaddress.ip_address(ip)
+        if addr.is_link_local or addr.is_loopback:
+            return ""
+        return ip
+    except Exception:
+        return ""
 
 
 def rail_link_layers() -> dict[str, str]:
@@ -139,21 +171,23 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
             already imported, i.e. the value can no longer reach it. Fatal on
             purpose — the alternative is a run that looks configured and is not.
     """
-    # Both RDMA backends run on the same engine: register mode offers every
-    # rail too, so it needs the same peer-rail pinning. ``simple`` has no engine.
-    if cfg["backend"] not in ("mooncake_cpu", "transfer_engine"):
+    # Register mode offers every rail too, so it needs the same peer-rail
+    # pinning as mooncake_cpu. ``simple`` has no engine at all.
+    from nemo_rl.data_plane.interfaces import MOONCAKE_ENGINE_BACKENDS
+
+    if cfg["backend"] not in MOONCAKE_ENGINE_BACKENDS:
         return
 
-    # Read by hand rather than through interfaces.backend_config: this module
-    # keeps its import list empty on purpose (see the module docstring), and a
-    # convenience import is exactly how the engine would sneak in later.
-    # A GPU-less driver evaluates this too — the flag must be identical in
-    # every process, and the workers are where GPU registration happens.
-    nested = cfg.get(cfg["backend"]) or {}
-    if not isinstance(nested, dict):
-        nested = {"use_gdr": getattr(nested, "use_gdr", False)}
-    # Register mode puts GPU memory on the wire by default; mooncake_cpu opts in.
-    gdr = bool(nested.get("use_gdr", cfg["backend"] == "transfer_engine"))
+    # Function-local import: this module keeps its *module* imports free of
+    # anything that could load the engine (see the docstring), and interfaces
+    # pulls in only pydantic and tensordict. Reading through backend_config
+    # keeps one owner for the use_gdr default — a second hand-rolled reader
+    # here diverged silently the moment a model default changed.
+    from nemo_rl.data_plane.interfaces import backend_config
+
+    # A GPU-less driver evaluates this too: the flag must be identical in every
+    # process, and the workers are where GPU registration happens.
+    gdr = bool(getattr(backend_config(cfg), "use_gdr", False))
 
     missing = {k: v for k, v in _wanted_engine_env(gdr).items() if k not in os.environ}
     if not missing:
