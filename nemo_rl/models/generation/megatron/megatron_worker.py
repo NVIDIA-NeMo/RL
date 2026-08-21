@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+import logging
 import os
 import threading
 import time
@@ -23,6 +24,7 @@ from typing import AsyncGenerator, Optional
 import requests
 import torch
 from megatron.core.inference.config import (
+    CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
     PrefixCachingCoordinatorPolicy,
@@ -56,6 +58,11 @@ from nemo_rl.models.megatron.memory_saver import (
     resume_inference_weights,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
+logger = logging.getLogger(__name__)
+# NeMo-RL configures the root logger at WARNING (see nemo_rl/__init__.py), so opt
+# this module in to INFO explicitly; records still propagate to the root handler.
+logger.setLevel(logging.INFO)
 
 
 class MegatronGenerationMixin:
@@ -201,6 +208,13 @@ class MegatronGenerationMixin:
             max_requests=max_requests,
         )
 
+        if "cuda_graph_sizing_distribution" in mcore_generation_config:
+            inference_config.cuda_graph_sizing_distribution = (
+                CudaGraphSizingDistribution(
+                    mcore_generation_config["cuda_graph_sizing_distribution"]
+                )
+            )
+
         if "inference_cuda_graph_scope" in mcore_generation_config:
             gen_model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
                 mcore_generation_config["inference_cuda_graph_scope"]
@@ -253,6 +267,25 @@ class MegatronGenerationMixin:
         torch.distributed.barrier()
         self._inference_engine_asleep = True
         print(f"[Rank {self.rank}] paused inference engine")
+
+        # Surface mcore's prefix-cache effectiveness. The DynamicInferenceEngine
+        # only reports these counters via its own (wandb) metrics writer / a
+        # logging.info line that NeMo-RL does not configure to emit, so mirror the
+        # cumulative counters through this module's logger when prefix caching is
+        # on. Cheap (one line per generation phase) and lets callers / tests
+        # confirm the cache is actually being hit.
+        if self.cfg["generation"]["mcore_generation_config"].get(
+            "enable_prefix_caching"
+        ):
+            engine = self.dynamic_inference_engine
+            hits = int(getattr(engine, "_prefix_cache_hits", 0))
+            blocks = int(getattr(engine, "_prefix_cache_blocks_matched", 0))
+            logger.info(
+                "[Rank %d] mcore prefix cache (cumul): %d hits, %d blocks matched",
+                self.rank,
+                hits,
+                blocks,
+            )
 
     async def _sleep_engine(self):
         if torch.distributed.get_rank() == 0:
