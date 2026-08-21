@@ -329,6 +329,19 @@ def validate_and_set_config(
     weights_path,
     optimizer_path,
 ):
+    # inference_optimized layers hard-require SP with TP>1; fail here with the config key.
+    # This guards the training cfg; the inference cfg is guarded in
+    # merged_inference_megatron_cfg (the colocated build bypasses this function).
+    if (
+        config["megatron_cfg"].get("transformer_impl") == "inference_optimized"
+        and config["megatron_cfg"]["tensor_model_parallel_size"] > 1
+        and not config["megatron_cfg"]["sequence_parallel"]
+    ):
+        raise ValueError(
+            "transformer_impl=inference_optimized requires sequence parallelism "
+            "with TP>1: set policy.megatron_cfg.sequence_parallel=true."
+        )
+
     # Handle generation configuration
     is_generation_colocated = None
     sampling_params = None
@@ -1198,16 +1211,27 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
     """Validate optimizer configuration."""
-    optimizer_cpu_offload = config["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
-    optimizer_offload_fraction = config["megatron_cfg"]["optimizer"][
-        "optimizer_offload_fraction"
-    ]
+    optimizer_config = config["megatron_cfg"]["optimizer"]
+    optimizer_cpu_offload = optimizer_config["optimizer_cpu_offload"]
+    optimizer_offload_fraction = optimizer_config["optimizer_offload_fraction"]
 
-    if optimizer_cpu_offload:
-        # Currently, hybrid optimizer (partly on GPU and partly on CPU) is not supported because it conflicts with the way
-        # Nemo-rl handles the optimizer offload/onload between generation and training. So if using CPU optimizer the offload_fraction should be 1.0.
-        assert optimizer_offload_fraction == 1.0, (
-            "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
+    if optimizer_cpu_offload and not 0 < optimizer_offload_fraction <= 1:
+        raise ValueError(
+            "optimizer_cpu_offload=True requires 0 < optimizer_offload_fraction <= 1"
+        )
+    if optimizer_cpu_offload and not optimizer_config["use_distributed_optimizer"]:
+        raise ValueError(
+            "optimizer_cpu_offload=True requires use_distributed_optimizer=True"
+        )
+    if optimizer_cpu_offload and optimizer_config["optimizer"] not in {"adam", "sgd"}:
+        raise ValueError(
+            "optimizer_cpu_offload=True requires optimizer to be adam or sgd"
+        )
+    if not optimizer_cpu_offload and optimizer_config.get(
+        "overlap_cpu_optimizer_d2h_h2d"
+    ):
+        raise ValueError(
+            "overlap_cpu_optimizer_d2h_h2d=True requires optimizer_cpu_offload=True"
         )
 
 
