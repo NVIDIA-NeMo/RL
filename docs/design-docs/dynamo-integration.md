@@ -23,9 +23,12 @@ NATS, etcd, and temporary state independently.
 
 Both GRPO trainers use `DynamoGeneration.generate_async()` against the managed
 frontend. NeMo-Gym traffic passes through a process-local token wrapper. It
-uses the policy tokenizer, preserves caller `nvext.extra_fields`, adds Dynamo
-engine metadata, and translates rendered multi-turn prefixes back to the exact
-caller token IDs.
+uses the policy tokenizer, replaces rendered multi-turn prefixes with Gym's
+exact `required_prefix_token_ids`, and sends `nvext.token_data`. For the Dynamo
+backend, NeMo-RL configures Gym to request `nvext.engine_data`; this request
+also tells Gym when to derive the exact prefix. The wrapper returns Dynamo
+responses unchanged. NeMo-Gym validates the native engine data and creates the
+training token bundle.
 
 Serialized rollout copies contain only frontend URLs and immutable worker
 admin endpoints. They cannot own or stop services. Those endpoints are enough
