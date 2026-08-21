@@ -16,7 +16,9 @@ import json
 import time
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import ray
 import requests
@@ -25,7 +27,13 @@ from PIL import Image
 from yaml import safe_load
 
 from nemo_rl.algorithms.grpo import MasterConfig
-from nemo_rl.data.multimodal_utils import PackedTensor, image_to_data_url
+from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.multimodal_utils import (
+    MULTIMODAL_CONTENT_TYPES,
+    PackedTensor,
+    image_to_data_url,
+)
+from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
@@ -37,7 +45,21 @@ from nemo_rl.environments.nemo_gym import (
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
 )
-from nemo_rl.experience.rollouts import _reattach_original_multimodal_payloads
+from nemo_rl.environments.nemo_gym_video import (
+    _extract_static_video_messages,
+    _inject_vllm_mm_processor_kwargs,
+    _metadata_extra_body,
+    nemo_gym_example_to_video_datum_spec,
+    normalize_video_urls_in_examples,
+)
+from nemo_rl.environments.nemotron_utils import (
+    _expand_nemotron_video_placeholders,
+    _flatten_nemotron_video_frame_messages,
+)
+from nemo_rl.experience.rollouts import (
+    _reattach_original_multimodal_payloads,
+    attach_static_multimodal_payload,
+)
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -48,6 +70,802 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+def test_multimodal_content_types_cover_responses_media_aliases():
+    assert {
+        "input_image",
+        "image",
+        "image_url",
+        "input_video",
+        "video",
+        "video_url",
+        "input_audio",
+        "audio",
+        "audio_url",
+    } <= MULTIMODAL_CONTENT_TYPES
+
+
+def test_extract_static_video_message_resolves_local_file(tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"test")
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Describe the clip."},
+                        {
+                            "type": "input_video",
+                            "video_url": {"url": video_path.as_uri()},
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+
+    messages, resolved_path = _extract_static_video_messages(example)
+
+    assert resolved_path == str(video_path.resolve())
+    assert messages[0]["content"][0] == {
+        "type": "text",
+        "text": "Describe the clip.",
+    }
+    assert messages[0]["content"][1]["type"] == "video"
+
+
+def test_extract_static_video_message_accepts_cached_frames(tmp_path):
+    frame_paths = []
+    for index in range(2):
+        frame_path = tmp_path / f"frame_{index:04d}.png"
+        Image.new("RGB", (8, 8), color=(index, 0, 0)).save(frame_path)
+        frame_paths.append(frame_path)
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        *[
+                            {
+                                "type": "input_image",
+                                "image_url": str(frame_path),
+                                "_is_video_frame": True,
+                                "_video_source": "/videos/clip.mp4",
+                            }
+                            for frame_path in frame_paths
+                        ],
+                        {"type": "input_text", "text": "Describe the clip."},
+                    ],
+                }
+            ]
+        }
+    }
+
+    messages, resolved_path = _extract_static_video_messages(example)
+
+    assert resolved_path is None
+    assert [part["type"] for part in messages[0]["content"]] == [
+        "image",
+        "image",
+        "text",
+    ]
+    assert all(
+        isinstance(part["image"], Image.Image) for part in messages[0]["content"][:2]
+    )
+    assert all(part["_is_video_frame"] for part in messages[0]["content"][:2])
+    assert [part["_video_frame_index"] for part in messages[0]["content"][:2]] == [0, 1]
+    assert [part["_video_fps"] for part in messages[0]["content"][:2]] == [1.0, 1.0]
+
+    _, frames, frame_indices, fps = _flatten_nemotron_video_frame_messages(messages)
+
+    assert len(frames) == 2
+    assert frame_indices == [0, 1]
+    assert fps == 1.0
+
+
+def test_extract_static_video_message_ignores_still_image_only_row():
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": "/images/still.png"},
+                        {"type": "input_text", "text": "Describe the image."},
+                    ],
+                }
+            ]
+        }
+    }
+
+    assert _extract_static_video_messages(example) is None
+
+
+def test_gym_local_video_path_is_normalized_to_file_url(tmp_path):
+    video_path = tmp_path / "clip with spaces.mp4"
+    video_path.write_bytes(b"test")
+    examples = [
+        {
+            "responses_create_params": {
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_video",
+                                "video_url": {"url": str(video_path)},
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    ]
+
+    normalize_video_urls_in_examples(examples)
+
+    assert (
+        examples[0]["responses_create_params"]["input"][0]["content"][0]["video_url"][
+            "url"
+        ]
+        == video_path.resolve().as_uri()
+    )
+
+
+def test_extract_static_video_message_rejects_multiple_videos(tmp_path):
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.write_bytes(b"test")
+    second.write_bytes(b"test")
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_video", "video_url": str(first)},
+                        {"type": "video_url", "video_url": str(second)},
+                    ],
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(ValueError, match="exactly one video"):
+        _extract_static_video_messages(example)
+
+
+def test_extract_static_video_message_requires_cached_frame_source(tmp_path):
+    frame_path = tmp_path / "frame.png"
+    Image.new("RGB", (2, 2)).save(frame_path)
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": str(frame_path),
+                            "_is_video_frame": True,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(ValueError, match="exactly one video"):
+        _extract_static_video_messages(example)
+
+
+def test_extract_static_video_message_rejects_mixed_image_and_video(tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    image_path = tmp_path / "still.png"
+    Image.new("RGB", (2, 2)).save(image_path)
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_video", "video_url": str(video_path)},
+                        {"type": "input_image", "image_url": str(image_path)},
+                    ],
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(ValueError, match="mixing still images"):
+        _extract_static_video_messages(example)
+
+
+def test_extract_static_video_message_rejects_audio_and_unknown_parts(tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    base_content = [{"type": "input_video", "video_url": str(video_path)}]
+
+    for part, error in (
+        (
+            {"type": "input_audio", "audio_url": "/audio.wav"},
+            "does not support audio",
+        ),
+        ({"type": "output_text", "text": "answer"}, "Unsupported Gym"),
+    ):
+        example = {
+            "responses_create_params": {
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [*base_content, part],
+                    }
+                ]
+            }
+        }
+        with pytest.raises(ValueError, match=error):
+            _extract_static_video_messages(example)
+
+
+@pytest.mark.parametrize("extra_body", ["{", "[]", 3])
+def test_video_metadata_rejects_invalid_extra_body(extra_body):
+    example = {"responses_create_params": {"metadata": {"extra_body": extra_body}}}
+
+    with pytest.raises((TypeError, ValueError), match="extra_body"):
+        _metadata_extra_body(example)
+
+
+def test_video_metadata_canonicalizes_mapping_extra_body_to_json_string():
+    example = {
+        "responses_create_params": {
+            "metadata": {
+                "extra_body": {"chat_template_kwargs": {"enable_thinking": True}}
+            }
+        }
+    }
+
+    _inject_vllm_mm_processor_kwargs(example, {"video_as_images": True})
+
+    extra_body = example["responses_create_params"]["metadata"]["extra_body"]
+    assert isinstance(extra_body, str)
+    assert json.loads(extra_body) == {
+        "chat_template_kwargs": {"enable_thinking": True},
+        "mm_processor_kwargs": {"video_as_images": True},
+    }
+
+
+def test_reattach_static_multimodal_payload_to_rollout_user_message():
+    payload = PackedTensor([torch.ones(2, 3)], dim_to_pack=0)
+    source = [{"role": "user", "content": "", "pixel_values": payload}]
+    target = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+
+    attach_static_multimodal_payload(target, source)
+
+    assert target[1]["pixel_values"] is payload
+
+
+def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_video",
+                            "video_url": str(video_path),
+                            "_request_metadata": "keep",
+                        },
+                        {"type": "input_text", "text": "Describe the clip."},
+                    ],
+                }
+            ],
+            "metadata": {
+                "extra_body": json.dumps(
+                    {"chat_template_kwargs": {"enable_thinking": True}}
+                )
+            },
+        }
+    }
+
+    frames = np.zeros((4, 8, 8, 3), dtype=np.uint8)
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym_video.load_video_frames_with_metadata",
+        lambda *args, **kwargs: (
+            frames,
+            {"frames_indices": [0, 3, 6, 9], "fps": 3.0},
+        ),
+    )
+
+    class _Tokenizer:
+        model_input_names = ["input_ids"]
+
+        def __call__(self, text, **kwargs):
+            del text, kwargs
+            return {"input_ids": [1, 2, 3]}
+
+    class _Processor:
+        model_input_names = ["input_ids", "pixel_values", "imgs_sizes"]
+        tokenizer = _Tokenizer()
+
+        def apply_chat_template(self, messages, *, tokenize, **kwargs):
+            if not tokenize:
+                return "<image>\nDescribe the clip."
+            assert kwargs["video_flags"] == [True, True, True, True]
+            assert kwargs["video_temporal_patch_size"] == 2
+            assert kwargs["video_target_num_patches"] == 64
+            assert kwargs["video_maintain_aspect_ratio"] is True
+            assert kwargs["enable_thinking"] is True
+            assert all(part.get("type") != "video" for part in messages[0]["content"])
+            return {
+                "input_ids": torch.tensor([[7, 18, 18, 9]]),
+                "pixel_values": torch.ones(4, 3, 8, 8),
+                "imgs_sizes": torch.tensor([[8, 8]] * 4),
+            }
+
+    data_config = SimpleNamespace(
+        num_frames=4,
+        video_sampling_style="nemotron_vl",
+        video_temporal_patch_size=2,
+        video_target_num_patches=64,
+        video_maintain_aspect_ratio=True,
+        min_generation_tokens=16,
+    )
+    datum = nemo_gym_example_to_video_datum_spec(
+        example,
+        processor=_Processor(),
+        max_seq_length=128,
+        idx=3,
+        task_name="nemo_gym",
+        data_config=data_config,
+    )
+
+    assert datum is not None
+    user_message = datum["message_log"][0]
+    assert user_message["num_frames"].as_tensor().tolist() == [4]
+    assert user_message["imgs_sizes"].as_tensor().dtype == torch.int32
+    extra_env_info = datum["extra_env_info"]
+    outbound_content = extra_env_info["responses_create_params"]["input"][0]["content"]
+    assert outbound_content[0]["_request_metadata"] == "keep"
+    assert outbound_content[1]["text"] == "Describe the clip."
+    extra_body = json.loads(
+        extra_env_info["responses_create_params"]["metadata"]["extra_body"]
+    )
+    assert extra_body["mm_processor_kwargs"] == {
+        "video_as_images": True,
+        "max_num_tiles": 1,
+    }
+
+
+def test_video_datum_requires_explicit_video_data_config(tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_video", "video_url": str(video_path)},
+                    ],
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(ValueError, match=r"data\.num_frames"):
+        nemo_gym_example_to_video_datum_spec(
+            example,
+            processor=object(),
+            max_seq_length=128,
+            idx=0,
+            task_name="nemo_gym",
+            data_config=TaskDataSpec(task_name="nemo_gym"),
+        )
+
+
+def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_path):
+    data_path = tmp_path / "video-gym.jsonl"
+    data_path.write_text(json.dumps({"row": 1}) + "\n", encoding="utf-8")
+    expected_media_config = {
+        "num_frames": 32,
+        "video_sampling_style": "nemotron_vl",
+        "video_target_num_patches": 64,
+        "video_temporal_patch_size": 2,
+        "video_maintain_aspect_ratio": True,
+        "min_generation_tokens": 16,
+    }
+    data_config = {
+        "max_input_seq_length": 128,
+        "shuffle": False,
+        "train": {
+            "dataset_name": "NemoGymDataset",
+            "data_path": str(data_path),
+            "processor": "nemo_gym_data_processor",
+        },
+        "validation": None,
+        "default": dict(expected_media_config),
+    }
+    captured = {}
+
+    def fake_video_processor(
+        example, *, processor, max_seq_length, idx, task_name, data_config
+    ):
+        del example, processor, max_seq_length
+        captured["task_spec"] = data_config
+        return {
+            "message_log": [],
+            "length": 0,
+            "extra_env_info": {},
+            "loss_multiplier": 1.0,
+            "idx": idx,
+            "task_name": task_name,
+        }
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym_video.nemo_gym_example_to_video_datum_spec",
+        fake_video_processor,
+    )
+    processor = SimpleNamespace(
+        apply_chat_template=lambda *args: None,
+        tokenizer=object(),
+    )
+
+    train_dataset, _ = setup_response_data(
+        processor,
+        data_config,
+        env_configs=None,
+        is_vlm=True,
+    )
+
+    train_dataset[0]
+    task_spec = captured["task_spec"]
+    assert {
+        name: getattr(task_spec, name) for name in expected_media_config
+    } == expected_media_config
+
+
+def test_video_datum_uses_cached_frames_without_decoding_video(monkeypatch, tmp_path):
+    frame_paths = []
+    for index in range(4):
+        frame_path = tmp_path / f"frame_{index:04d}.png"
+        Image.new("RGB", (8, 8), color=(index, 0, 0)).save(frame_path)
+        frame_paths.append(frame_path)
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        *[
+                            {
+                                "type": "input_image",
+                                "image_url": str(frame_path),
+                                "_is_video_frame": True,
+                                "_video_source": "/videos/clip.mp4",
+                            }
+                            for frame_path in frame_paths
+                        ],
+                        {"type": "input_text", "text": "Describe the clip."},
+                    ],
+                }
+            ],
+            "metadata": {
+                "extra_body": json.dumps(
+                    {
+                        "chat_template_kwargs": {"enable_thinking": True},
+                        "mm_processor_kwargs": {
+                            "max_num_tiles": 1,
+                            "video_as_images": True,
+                        },
+                    }
+                )
+            },
+        }
+    }
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym_video._video_to_image_content",
+        lambda *args, **kwargs: pytest.fail("cached frames must not decode the video"),
+    )
+
+    class _Tokenizer:
+        model_input_names = ["input_ids"]
+
+    class _Processor:
+        model_input_names = ["input_ids", "pixel_values", "imgs_sizes"]
+        tokenizer = _Tokenizer()
+
+        def apply_chat_template(self, messages, *, tokenize, **kwargs):
+            assert tokenize is True
+            assert kwargs["video_flags"] == [True, True, True, True]
+            assert kwargs["video_temporal_patch_size"] == 2
+            assert kwargs["enable_thinking"] is True
+            assert all(
+                isinstance(part["image"], Image.Image)
+                for part in messages[0]["content"][:4]
+            )
+            return {
+                "input_ids": torch.tensor([[7, 18, 18, 9]]),
+                "pixel_values": torch.ones(4, 3, 8, 8),
+                "imgs_sizes": torch.tensor([[8, 8]] * 4),
+            }
+
+    datum = nemo_gym_example_to_video_datum_spec(
+        example,
+        processor=_Processor(),
+        max_seq_length=None,
+        idx=3,
+        task_name="nemo_gym",
+        data_config=SimpleNamespace(
+            num_frames=4,
+            video_sampling_style="nemotron_vl",
+            video_temporal_patch_size=2,
+            video_target_num_patches=64,
+            video_maintain_aspect_ratio=True,
+            min_generation_tokens=16,
+        ),
+    )
+
+    assert datum is not None
+    assert datum["message_log"][0]["num_frames"].as_tensor().tolist() == [4]
+    outbound_content = datum["extra_env_info"]["responses_create_params"]["input"][0][
+        "content"
+    ]
+    owned_metadata_keys = {
+        "_is_video_frame",
+        "_video_source",
+        "_video_frame_index",
+        "_video_fps",
+    }
+    assert all(
+        owned_metadata_keys.isdisjoint(part)
+        for part in outbound_content
+        if isinstance(part, dict)
+    )
+    assert outbound_content[-1]["text"] == "Describe the clip."
+
+
+def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_video",
+                            "video_url": str(video_path),
+                        },
+                        {"type": "input_text", "text": "Describe the clip."},
+                    ],
+                }
+            ],
+            "metadata": {
+                "extra_body": json.dumps(
+                    {"chat_template_kwargs": {"enable_thinking": False}}
+                )
+            },
+        }
+    }
+    frames = np.zeros((4, 8, 16, 3), dtype=np.uint8)
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym_video.load_video_frames_with_metadata",
+        lambda *args, **kwargs: (
+            frames,
+            {"frames_indices": [0, 3, 6, 9], "fps": 3.0},
+        ),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemotron_utils.load_nemotron_video_model_config",
+        lambda _model_name: SimpleNamespace(
+            patch_size=16,
+            downsample_ratio=0.5,
+            norm_mean=[0.0, 0.0, 0.0],
+            norm_std=[1.0, 1.0, 1.0],
+        ),
+    )
+
+    class _Tokenizer:
+        name_or_path = "nemotron-test"
+        model_input_names = ["input_ids", "attention_mask"]
+
+        def __init__(self):
+            self.rendered_messages = None
+            self.expanded_text = None
+
+        def apply_chat_template(
+            self, messages, *, tokenize, add_generation_prompt, **kwargs
+        ):
+            assert tokenize is False
+            assert add_generation_prompt is True
+            assert kwargs["enable_thinking"] is False
+            self.rendered_messages = messages
+            return messages[0]["content"] + "\nassistant"
+
+        def __call__(self, text, **kwargs):
+            assert kwargs == {
+                "add_special_tokens": False,
+                "return_tensors": "pt",
+            }
+            self.expanded_text = text
+            token_count = text.count("<image>") + 4
+            return {
+                "input_ids": torch.arange(token_count).unsqueeze(0),
+                "attention_mask": torch.ones(1, token_count, dtype=torch.long),
+            }
+
+    class NemotronNanoVLV2Processor:
+        model_input_names = [
+            "input_ids",
+            "attention_mask",
+            "pixel_values",
+            "imgs_sizes",
+        ]
+
+        def __init__(self):
+            self.tokenizer = _Tokenizer()
+
+    processor = NemotronNanoVLV2Processor()
+    datum = nemo_gym_example_to_video_datum_spec(
+        example,
+        processor=processor,
+        max_seq_length=256,
+        idx=3,
+        task_name="nemo_gym",
+        data_config=SimpleNamespace(
+            num_frames=4,
+            video_sampling_style="nemotron_vl",
+            video_temporal_patch_size=2,
+            video_target_num_patches=64,
+            video_maintain_aspect_ratio=True,
+            min_generation_tokens=16,
+        ),
+    )
+
+    assert datum is not None
+    assert processor.tokenizer.rendered_messages[0]["content"] == (
+        "<image>\n<image>\n<image>\n<image>\nDescribe the clip."
+    )
+    assert processor.tokenizer.expanded_text.count("<img>") == 2
+    assert processor.tokenizer.expanded_text.count("</img>") == 2
+    assert processor.tokenizer.expanded_text.count("<image>") == 30
+    assert processor.tokenizer.expanded_text.startswith(
+        "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 1.00 seconds: "
+    )
+    assert (
+        "\nFrame 3 sampled at 2.00 seconds and frame 4 sampled at 3.00 seconds: "
+        in processor.tokenizer.expanded_text
+    )
+
+    user_message = datum["message_log"][0]
+    assert user_message["pixel_values"].as_tensor().shape == (4, 3, 96, 160)
+    assert user_message["imgs_sizes"].as_tensor().tolist() == [[96, 160]] * 4
+    assert user_message["num_frames"].as_tensor().tolist() == [4]
+    extra_body = json.loads(
+        datum["extra_env_info"]["responses_create_params"]["metadata"]["extra_body"]
+    )
+    assert "mm_processor_kwargs" not in extra_body
+
+
+def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
+    expanded = _expand_nemotron_video_placeholders(
+        "<image>\n<image>\nquestion",
+        embeddings_per_tubelet=[2],
+        frame_indices=[0, 30],
+        fps=29.97,
+        temporal_patch_size=2,
+    )
+
+    assert expanded == (
+        "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 0.99 seconds: "
+        "<img><image><image></img>\nquestion"
+    )
+
+
+def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_path):
+    frame_paths = []
+    for index in range(4):
+        frame_path = tmp_path / f"frame_{index:04d}.png"
+        Image.new("RGB", (8, 8), color=(index, 0, 0)).save(frame_path)
+        frame_paths.append(frame_path)
+    example = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        *[
+                            {
+                                "type": "input_image",
+                                "image_url": str(frame_path),
+                                "_is_video_frame": True,
+                                "_video_source": "/videos/clip.mp4",
+                            }
+                            for frame_path in frame_paths
+                        ],
+                        {"type": "input_text", "text": "Describe the clip."},
+                    ],
+                }
+            ],
+            "metadata": {
+                "extra_body": json.dumps(
+                    {
+                        "chat_template_kwargs": {"enable_thinking": True},
+                        "mm_processor_kwargs": {
+                            "max_num_tiles": 1,
+                            "video_as_images": True,
+                        },
+                    }
+                )
+            },
+        }
+    }
+    manifest_calls = []
+
+    def fake_manifest_builder(paths):
+        manifest_calls.append(paths)
+        return "data:video/x-nemo-rl-cached-frames;base64,dGVzdA=="
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym_video.build_cached_video_frame_data_url",
+        fake_manifest_builder,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym_video.process_nemotron_video_frames",
+        lambda *args, **kwargs: {
+            "input_ids": torch.tensor([[7, 18, 18, 9]]),
+            "pixel_values": torch.ones(4, 3, 8, 8),
+            "imgs_sizes": torch.tensor([[8, 8]] * 4),
+        },
+    )
+
+    class _Tokenizer:
+        name_or_path = "nemotron-test"
+        model_input_names = ["input_ids"]
+
+    class NemotronNanoVLV2Processor:
+        model_input_names = ["input_ids", "pixel_values", "imgs_sizes"]
+        tokenizer = _Tokenizer()
+
+    datum = nemo_gym_example_to_video_datum_spec(
+        example,
+        processor=NemotronNanoVLV2Processor(),
+        max_seq_length=None,
+        idx=3,
+        task_name="nemo_gym",
+        data_config=SimpleNamespace(
+            num_frames=4,
+            video_temporal_patch_size=2,
+            video_target_num_patches=64,
+            video_maintain_aspect_ratio=True,
+            min_generation_tokens=16,
+        ),
+    )
+
+    assert datum is not None
+    assert manifest_calls == [[str(path) for path in frame_paths]]
+    outbound = datum["extra_env_info"]["responses_create_params"]
+    assert outbound["input"][0]["content"] == [
+        {
+            "type": "input_video",
+            "video_url": {"url": "data:video/x-nemo-rl-cached-frames;base64,dGVzdA=="},
+        },
+        {"type": "input_text", "text": "Describe the clip."},
+    ]
+    extra_body = json.loads(outbound["metadata"]["extra_body"])
+    assert extra_body == {"chat_template_kwargs": {"enable_thinking": True}}
 
 
 def test_extract_reward_components():
@@ -624,6 +1442,92 @@ def test_nemo_gym_dedup_keeps_authoritative_changed_seed_media(
         assert user_message["pixel_values"].as_tensor().flatten().tolist() == (
             expected_pixel_values
         )
+
+
+def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
+    video_path = tmp_path / "clip with spaces.mp4"
+    video_path.write_bytes(b"video")
+    image_path = tmp_path / "still.png"
+    Image.new("RGB", (2, 2)).save(image_path)
+
+    async def _run():
+        nemo_gym_row = {
+            "_rowidx": 7,
+            "agent_ref": {"name": "test_agent"},
+            "responses_create_params": {
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_video",
+                                "video_url": str(video_path),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": str(image_path)},
+                            },
+                        ],
+                    }
+                ]
+            },
+        }
+        nemo_gym_result = {"response": {"output": []}}
+        tokenizer = object()
+        postprocess_calls = []
+
+        class _RolloutCollectionHelper:
+            def run_examples(self, examples, head_server_config):
+                del head_server_config
+                content = examples[0]["responses_create_params"]["input"][0]["content"]
+                assert content[0]["video_url"] == video_path.resolve().as_uri()
+                assert content[1]["image_url"].startswith("data:image/png;base64,")
+
+                async def _completed_result():
+                    return nemo_gym_row, nemo_gym_result
+
+                return [_completed_result()]
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = object()
+
+            def _require_spinup(self):
+                pass
+
+            def _postprocess_nemo_gym_to_nemo_rl_result(
+                self,
+                row,
+                result,
+                result_tokenizer,
+                *,
+                include_initial_multimodal_data,
+            ):
+                del self
+                postprocess_calls.append(
+                    (
+                        row,
+                        result,
+                        result_tokenizer,
+                        include_initial_multimodal_data,
+                    )
+                )
+                return {"message_log": []}
+
+        mock_self = _MockSelf()
+        mock_self._tokenizer = tokenizer
+        streamed_results = []
+        async for result in NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            mock_self, [nemo_gym_row], "test"
+        ):
+            streamed_results.append(result)
+
+        assert postprocess_calls == [(nemo_gym_row, nemo_gym_result, tokenizer, True)]
+        assert streamed_results[0][0] == 7
+        assert streamed_results[0][1] == {"message_log": []}
+
+    asyncio.run(_run())
 
 
 def test_nemo_gym_postprocess_no_generation_data_raises():

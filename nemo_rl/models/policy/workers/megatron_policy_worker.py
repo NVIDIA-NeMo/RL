@@ -496,14 +496,6 @@ class MegatronPolicyWorkerImpl(
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Step 3: Setup model configuration
-        # Training workers cannot use inference_optimized transformer spec.
-        if init_optimizer:
-            assert (
-                config["megatron_cfg"].get("transformer_impl") != "inference_optimized"
-            ), (
-                "transformer_impl=inference_optimized must not be set on training workers. "
-                "Use policy.generation.mcore_generation_config.transformer_impl=inference_optimized instead."
-            )
         runtime_config = validate_and_set_config(
             config,
             self.rank,
