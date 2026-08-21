@@ -487,11 +487,24 @@ class VllmInternalWorkerExtension:
             and fp8.is_fp8_model(self.model_runner.vllm_config)
         ):
             return None
-        return [
+        fp8_names = [
             name
             for name in state_dict_info
             if fp8._is_fp8_weight(name, self.model_runner.model)
         ]
+        missing_scales = [
+            name
+            for name in fp8_names
+            if state_dict_info[name][1] == torch.float8_e4m3fn
+            and name + "_scale_from_checkpoint" not in state_dict_info
+        ]
+        if missing_scales:
+            name = missing_scales[0]
+            raise ValueError(
+                f"Prequantized MXFP8 weight {name!r} is missing "
+                f"{name + '_scale_from_checkpoint'!r}."
+            )
+        return fp8_names
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]

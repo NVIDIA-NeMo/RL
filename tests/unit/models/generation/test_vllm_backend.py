@@ -169,6 +169,68 @@ def test_prepare_refit_info_reports_only_fp8_weights(monkeypatch, enabled):
 
 
 @pytest.mark.vllm
+def test_prepare_refit_info_rejects_prequantized_mxfp8_without_scale(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    model = object()
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    state_dict_info = {
+        "model.linear.weight": ((2, 2), torch.float8_e4m3fn),
+    }
+    source_config = fp8.FP8Config(
+        is_mx=True,
+        refit_prequantize=True,
+        use_fp8_weights=True,
+    )
+    monkeypatch.setattr(fp8, "global_fp8_config", source_config)
+    serialized_config = fp8.serialize_fp8_config()
+    monkeypatch.setattr(fp8, "global_fp8_config", None)
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: True)
+
+    with pytest.raises(ValueError, match="missing.*scale_from_checkpoint"):
+        ext.prepare_refit_info(state_dict_info, serialized_config)
+
+
+@pytest.mark.vllm
+def test_prepare_refit_info_accepts_prequantized_mxfp8_with_scale(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    model = object()
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    state_dict_info = {
+        "model.linear.weight": ((2, 2), torch.float8_e4m3fn),
+        "model.linear.weight_scale_from_checkpoint": ((2, 1), torch.uint8),
+    }
+    source_config = fp8.FP8Config(
+        is_mx=True,
+        refit_prequantize=True,
+        use_fp8_weights=True,
+    )
+    monkeypatch.setattr(fp8, "global_fp8_config", source_config)
+    serialized_config = fp8.serialize_fp8_config()
+    monkeypatch.setattr(fp8, "global_fp8_config", None)
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+    monkeypatch.setattr(
+        fp8,
+        "_is_fp8_weight",
+        lambda name, _model: name == "model.linear.weight",
+    )
+
+    assert ext.prepare_refit_info(state_dict_info, serialized_config) == [
+        "model.linear.weight"
+    ]
+
+
+@pytest.mark.vllm
 def test_sync_prepare_refit_info_unions_worker_names(monkeypatch):
     from nemo_rl.models.generation.vllm.quantization import fp8
     from nemo_rl.models.generation.vllm.vllm_worker import (
