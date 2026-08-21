@@ -51,6 +51,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import reduce
+from time import perf_counter
 from typing import Any, Callable, cast
 
 import torch
@@ -411,6 +412,8 @@ class TransferEngineClient(StorageKVClient):
         if len(keys) != len(values):
             raise ValueError("Number of keys must match number of values")
 
+        started = perf_counter()
+
         tensor_indices: list[int] = []
         non_tensor_indices: list[int] = []
         for i, value in enumerate(values):
@@ -456,6 +459,18 @@ class TransferEngineClient(StorageKVClient):
                     keys[i], cast(Tensor, buffer), packed_size
                 )
 
+        # The counterpart of the get line: what register mode substitutes for a
+        # store write is this pin, so its cost is the other half of the ledger.
+        logger.info(
+            "register_mode put: total=%dus keys=%d (tensor=%d object=%d) "
+            "bytes=%d pinned_keys=%d",
+            (perf_counter() - started) * 1e6,
+            len(keys),
+            len(tensor_indices),
+            len(non_tensor_indices),
+            sum(entry["size"] for entry in custom_backend_meta),
+            self.pinned_keys,
+        )
         return custom_backend_meta
 
     def get(
@@ -648,10 +663,22 @@ class TransferEngineClient(StorageKVClient):
         metas: list[dict],
         device: torch.device,
     ) -> list[Tensor]:
-        """Allocate receive buffers on ``device`` and fill them from their producers."""
+        """Allocate receive buffers on ``device`` and fill them from their producers.
+
+        Emits one timing line per call, deliberately mirroring mooncake's own
+        ``batch_get_into: <n>us ... key count: <n>`` so a register-mode run and a
+        mooncake_cpu run can be compared on per-call latency rather than on step
+        time, where a data-plane difference of tens of milliseconds is invisible.
+        The registration leg is timed separately because registering receive
+        regions per get — rather than pooling them, which would reintroduce a
+        copy — is the cost most likely to make this backend slower.
+        """
+        started = perf_counter()
         buffers, dst_ptrs, region_ptrs, region_sizes = _allocate_receive_buffers(
             dtypes, shapes, device
         )
+        allocated_at = perf_counter()
+        register_s = 0.0
 
         groups: dict[str, list[int]] = defaultdict(list)
         for i, meta in enumerate(metas):
@@ -665,7 +692,9 @@ class TransferEngineClient(StorageKVClient):
             # regions are registered for the duration of the read. Registering
             # per get rather than pooling keeps the pull copy-free: a pooled
             # destination would need a second copy out of the pool.
+            register_started = perf_counter()
             status = self._engine.batch_register_memory(region_ptrs, region_sizes)
+            register_s = perf_counter() - register_started
             if status is not None and status != 0:
                 raise RuntimeError(
                     f"batch_register_memory of {len(region_ptrs)} receive "
@@ -698,6 +727,21 @@ class TransferEngineClient(StorageKVClient):
             if remote:
                 self._engine.batch_unregister_memory(region_ptrs)
 
+        finished = perf_counter()
+        logger.info(
+            "register_mode get: total=%dus alloc=%dus register=%dus move=%dus "
+            "keys=%d (local=%d remote=%d) bytes=%d peers=%d device=%s",
+            (finished - started) * 1e6,
+            (allocated_at - started) * 1e6,
+            register_s * 1e6,
+            (finished - allocated_at - register_s) * 1e6,
+            len(metas),
+            len(local),
+            len(metas) - len(local),
+            sum(sizes),
+            len(groups),
+            device,
+        )
         return buffers
 
     def _copy_local(self, dst: Tensor, meta: dict) -> None:

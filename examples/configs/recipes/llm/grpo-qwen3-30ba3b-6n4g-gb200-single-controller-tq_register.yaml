@@ -54,6 +54,13 @@ data_plane:
   backend: transfer_engine
   transfer_engine:
     use_gdr: true
+  # Per-op latency at the adapter boundary (one `data_plane_event` line per
+  # put/get/clear with n_keys, n_bytes, wall_ms). Paired with the client's own
+  # `register_mode get/put` lines and mooncake's `batch_get_into`, this is what
+  # makes the backends comparable per call — step time cannot resolve a
+  # data-plane difference measured in milliseconds.
+  observability:
+    enabled: true
 
 checkpointing:
   enabled: false
