@@ -16,7 +16,7 @@ import os
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
@@ -302,6 +302,24 @@ def _looks_like_image_src(src: str) -> bool:
     which treats it as a filesystem path and raises ``FileNotFoundError``.
     """
     return src.startswith(_IMAGE_SRC_PREFIXES)
+
+
+def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
+    """Return nemo_gym's pad_dynamic_image_shapes from an env config, or False.
+
+    Takes ``master_config.env`` rather than the whole config: interpreting
+    NeMo-Gym settings belongs with the environment, and callers outside it only
+    need the resolved boolean.
+
+    The NemoGym actor reads the same key from its own config for the per-turn
+    attach. The initial-payload attach runs in the driver instead, so it has to
+    be read here and passed down, or multi-image prompts would be processed
+    under different rules on the two paths.
+    """
+    nemo_gym_config = env_config.get("nemo_gym") if env_config else None
+    if not nemo_gym_config:
+        return False
+    return bool(nemo_gym_config.get("pad_dynamic_image_shapes"))
 
 
 def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
