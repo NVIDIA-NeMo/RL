@@ -144,6 +144,16 @@ REFIT_TRANSPORT=${REFIT_TRANSPORT:-null}
 # 60s against a healthy refit of ~1.9s for this model on GB200. Deliberately far above,
 # because firing early aborts a run that was merely slow, while firing late only means a
 # wedge lasts a little longer before it is broken.
+# The probe knobs are named here rather than inlined into the config overrides because
+# the refit deadline has to be chosen against them -- see the FREEZE_VICTIM block below.
+PROBE_INTERVAL_S=${PROBE_INTERVAL_S:-5.0}
+UNHEALTHY_THRESHOLD=${UNHEALTHY_THRESHOLD:-3}
+# How long a shard that stops answering survives before the probe condemns it to DEAD.
+PROBE_CONDEMN_S=$(awk "BEGIN{printf \"%.1f\", $PROBE_INTERVAL_S * $UNHEALTHY_THRESHOLD}")
+
+# Recorded before the default is applied: the frozen variant needs a much shorter
+# deadline, but must still honour an explicit one from the caller.
+REFIT_TIMEOUT_S_SET_BY_CALLER=${REFIT_TIMEOUT_S:+yes}
 REFIT_TIMEOUT_S=${REFIT_TIMEOUT_S:-60}
 
 # KILL_DURING_REFIT: kill while the refit collective is running, rather than at a step
@@ -178,6 +188,31 @@ if [[ "$FREEZE_VICTIM" == "true" && "$KILL_DURING_REFIT" != "true" ]]; then
     echo "[recovery] FATAL: FREEZE_VICTIM=true requires KILL_DURING_REFIT=true; freezing"
     echo "[recovery] a shard outside a refit never reaches the abort path."
     exit 1
+fi
+
+if [[ "$FREEZE_VICTIM" == "true" ]]; then
+    # The deadline has to beat the probe, or the abort never happens.
+    #
+    # A frozen shard stops answering is_alive, so the probe condemns it after
+    # unhealthy_threshold * probe_interval_s. Once it is DEAD, the reconcile that runs
+    # before every refit drops it from the membership, the collective never stalls, and
+    # the watchdog has nothing to fire on. Job 6408766 ran exactly that way and finished
+    # all 24 steps with zero RefitAborted: probe 15s, deadline 60s, probe wins by 45.
+    #
+    # One probe interval is the right default. Longer than a healthy refit -- 2.2-2.4s
+    # observed on 4xGB200 for this 1.5B model -- so it cannot fire on a merely slow one,
+    # and a third of the condemnation time, so the abort comfortably wins the race.
+    if [[ -z "$REFIT_TIMEOUT_S_SET_BY_CALLER" ]]; then
+        REFIT_TIMEOUT_S=$PROBE_INTERVAL_S
+    fi
+    if ! awk "BEGIN{exit !($REFIT_TIMEOUT_S < $PROBE_CONDEMN_S)}"; then
+        echo "[recovery] FATAL: refit_timeout_s=${REFIT_TIMEOUT_S}s is not below the ${PROBE_CONDEMN_S}s"
+        echo "[recovery] the probe takes to condemn a frozen shard (${UNHEALTHY_THRESHOLD} x ${PROBE_INTERVAL_S}s)."
+        echo "[recovery] The probe would drop the shard from the refit membership first, the"
+        echo "[recovery] collective would never stall, and this variant would assert nothing."
+        exit 1
+    fi
+    echo "[recovery] frozen variant: deadline ${REFIT_TIMEOUT_S}s vs probe condemnation ${PROBE_CONDEMN_S}s"
 fi
 
 HOLD_FILE="$EXP_DIR/hold_refit"
@@ -215,7 +250,8 @@ uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     logger.tensorboard_enabled=true \
     logger.monitor_gpus=false \
     ++async_rl.generation_fleet_health.enabled=true \
-    ++async_rl.generation_fleet_health.probe_interval_s=5.0 \
+    ++async_rl.generation_fleet_health.probe_interval_s=$PROBE_INTERVAL_S \
+    ++async_rl.generation_fleet_health.unhealthy_threshold=$UNHEALTHY_THRESHOLD \
     ++async_rl.generation_fleet_health.refit_timeout_s="$REFIT_TIMEOUT_S" \
     ++async_rl.stall_watchdog.interval_s=30.0 \
     ++async_rl.stall_watchdog.stall_timeout_s=300.0 \
