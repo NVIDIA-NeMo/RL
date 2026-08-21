@@ -491,6 +491,7 @@ def _run_tp2_pp2_cp2_worker_draft_failure_consensus(rank: int, world_size: int) 
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     draft_model = object() if parallel_state.is_pipeline_last_stage() else None
     worker = _draft_refit_worker(draft_model=draft_model)
+    worker._calculate_refit_param_info = lambda: []
     original_export = draft_module.export_eagle_weights_to_hf
 
     def export_lane(_model: object) -> list[tuple[str, torch.Tensor]]:
@@ -509,11 +510,36 @@ def _run_tp2_pp2_cp2_worker_draft_failure_consensus(rank: int, world_size: int) 
 
     draft_module.export_eagle_weights_to_hf = export_lane
     try:
-        with pytest.raises(
-            RuntimeError,
-            match="injected single-lane draft export failure",
-        ):
-            list(worker._iter_draft_weights_for_refit(metadata_only=False))
+        with pytest.raises(RuntimeError) as error_info:
+            worker.prepare_nccl_reshard_refit_info(
+                train_parallelism={
+                    "tp_size": 2,
+                    "ep_size": 1,
+                    "cp_size": 2,
+                    "pp_size": 2,
+                },
+                gen_parallelism={
+                    "tp_size": 2,
+                    "ep_size": 1,
+                    "cp_size": 1,
+                    "pp_size": 1,
+                },
+                train_world_size=8,
+                gen_world_size=2,
+            )
+        error_text = str(error_info.value)
+        assert "injected single-lane draft export failure" in error_text
+        encoded = error_text.encode("utf-8")
+        fingerprint = torch.tensor(
+            [len(encoded), sum(encoded)],
+            dtype=torch.int64,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        fingerprint_min = fingerprint.clone()
+        fingerprint_max = fingerprint.clone()
+        dist.all_reduce(fingerprint_min, op=dist.ReduceOp.MIN)
+        dist.all_reduce(fingerprint_max, op=dist.ReduceOp.MAX)
+        torch.testing.assert_close(fingerprint_min, fingerprint_max, rtol=0, atol=0)
     finally:
         draft_module.export_eagle_weights_to_hf = original_export
         parallel_state.destroy_model_parallel()

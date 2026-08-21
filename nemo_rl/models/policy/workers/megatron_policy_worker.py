@@ -2811,6 +2811,11 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.refit_param_info_mcore = self._calculate_refit_param_info()
+        draft_metadata, draft_preflight_error = self._preflight_draft_weights_for_refit(
+            metadata_only=True
+        )
+        if draft_preflight_error is not None:
+            raise draft_preflight_error
 
         # Single pass over Bridge's stream: classify each param as major
         # (xferdtensor) or misc (packed_broadcast), preserve yield order so
@@ -2878,7 +2883,8 @@ class MegatronPolicyWorkerImpl(
             control_broadcast_group=parallel_state.get_pipeline_model_parallel_group()
         ):
             for name, tensor in self._iter_params_with_optional_kv_scales(
-                draft_metadata_only=True
+                draft_metadata_only=True,
+                draft_weights=draft_metadata,
             ):
                 record_metadata(name, tensor)
 
