@@ -1,15 +1,12 @@
 # Configuration
 
-Telemetry can be configured two ways, which compose:
+Telemetry is configured by the `telemetry:` block of your run config. Keep it there: a run's telemetry settings should be recoverable from the file that describes the run, not from whatever happened to be in a shell.
 
-1. A `telemetry:` block in your run config (YAML).
-2. `NEMO_RL_OTEL_*` and standard `OTEL_*` environment variables.
-
-**Raw environment variables always win over the YAML block.** On the driver, the `telemetry:` block is translated into `NEMO_RL_OTEL_*` env vars with `os.environ.setdefault` *before* `init_ray()` — so anything already present in the environment is left untouched, and the resulting environment is snapshotted into the Ray `runtime_env` and inherited by every worker.
+Two things do belong in the environment, because they describe *where* you are running rather than *what* you are measuring: the standard [`OTEL_EXPORTER_OTLP_*`](#standard-otel-sdk-variables) endpoint/protocol/headers, and `OTEL_SERVICE_NAME`.
 
 ## The `telemetry:` config block
 
-`telemetry:` is an optional top-level field of every algorithm's `MasterConfig`. It is **documented here, not baked into the exemplar configs** — add it to your own run config, or configure purely via env vars.
+`telemetry:` is an optional top-level field of every algorithm's `MasterConfig`. It is **documented here, not baked into the exemplar configs** — add it to your own run config.
 
 ```yaml
 telemetry:
@@ -31,29 +28,22 @@ The defaults above are the field defaults of `TelemetryConfig` (`nemo_rl/telemet
 
 The driver always exports (it hosts the training loop and the metrics logger); `export_strategy` / `export_rank` govern the Ray **worker** ranks.
 
-## NeMo-RL environment variables
-
-Each `NEMO_RL_OTEL_*` variable maps onto a `NemoLensConfig` field. Lens reads `NEMO_RL_OTEL_<KEY>` first and falls back to `NEMO_LENS_<KEY>`, so you can set a shared `NEMO_LENS_*` default and override it per-run with the RL-scoped prefix.
-
-| Variable | Maps to | Default |
-|---|---|---|
-| `NEMO_RL_OTEL_ENABLED` | `enabled` | `0` |
-| `NEMO_RL_OTEL_SPAN_GROUPS` | `span_groups` | `default` |
-| `NEMO_RL_OTEL_EXPORT_STRATEGY` | `export_strategy` | `single_rank` |
-| `NEMO_RL_OTEL_EXPORT_RANK` | `export_rank` | `-1` |
-| `NEMO_RL_OTEL_EXPORT_SAMPLE_RATE` | `export_sample_rate` | `1.0` |
-| `NEMO_RL_OTEL_SAMPLER_ENABLED` | `sampler_enabled` | `0` |
-| `NEMO_RL_OTEL_TRACES_ENABLED` | `traces_enabled` | `1` |
-| `NEMO_RL_OTEL_METRICS_ENABLED` | `metrics_enabled` | `1` |
-| `NEMO_RL_OTEL_LOGS_ENABLED` | `logs_enabled` | `0` |
-| `NEMO_RL_OTEL_EXPORTER` | `exporter` | `otlp` |
-| `NEMO_RL_OTEL_VLLM_NATIVE_TRACING` | `vllm_native_tracing` | `0` |
-| `NEMO_RL_OTEL_RUN_ID` | run identifier | (auto) |
-| `NEMO_RL_OTEL_USER_ID` | optional user/team label | (empty) |
-
-`service_name` maps onto the standard `OTEL_SERVICE_NAME` (lens reads it unprefixed).
+`service_name` maps onto the standard `OTEL_SERVICE_NAME` (lens reads it unprefixed), so setting either works.
 
 For the full config model, field semantics, and validation rules, see [lens: configuration](https://github.com/NVIDIA-NeMo/Lens).
+
+### How the settings reach the workers
+
+Ray actors do not inherit the driver's Python objects, so on the driver `init_telemetry_driver` projects the block into `NEMO_RL_OTEL_*` environment variables *before* `init_ray()`; the resulting environment is snapshotted into the Ray `runtime_env` and every worker rebuilds the same config from it.
+
+These variables are a transport, not a second configuration interface. They are listed here so that a `NEMO_RL_OTEL_*` name in a log or a `ps` output is recognisable, and because two of them have no `telemetry:` equivalent:
+
+| Variable | Meaning |
+|---|---|
+| `NEMO_RL_OTEL_RUN_ID` | Correlates the driver and every worker to one run. Generated from `SLURM_JOB_ID` or a random hex string when unset. |
+| `NEMO_RL_OTEL_USER_ID` | Optional user/team label, read by lens. |
+
+The projection uses `os.environ.setdefault`, so a variable already present in the environment wins over the YAML value. That is deliberate for the two above, but setting the others by hand splits a run's configuration between a file and a shell with nothing recording which half came from where — the resolved settings are logged once at init for exactly this reason.
 
 ## Standard OTel SDK variables
 

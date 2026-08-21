@@ -11,11 +11,10 @@ Telemetry is **optional**: it activates only when `enabled` is true *and* nemo-l
 ```
 nemo_rl/telemetry/
 ├── config.py       — TelemetryConfig: the telemetry: config block
-├── setup.py        — init_telemetry_driver / init_telemetry_worker / get_telemetry / shutdown_telemetry
+├── setup.py        — init_telemetry_driver / init_telemetry_worker / get_telemetry_handle / shutdown_telemetry
 ├── span_groups.py  — RLSpanGroup: RL-specific span groups + presets
 ├── instrumentation.py — managed_span/trace_fn wrappers + phase/group → rl.bucket map (monitor derives goodput)
 ├── metrics.py      — tees Logger.log_metrics scalars into the rl.* instruments
-├── _fallbacks.py   — no-op shims for when nemo-lens is not installed
 └── __init__.py
 ```
 
@@ -23,7 +22,7 @@ Metric instruments, resource detection, and the instrumentation primitives thems
 
 ## Wiring
 
-Each `examples/run_<algo>.py` calls `init_telemetry_driver(config, algorithm="<algo>")` **before** `init_ray()` (so `NEMO_RL_OTEL_*` is snapshotted into the Ray `runtime_env` and inherited by workers) and `shutdown_telemetry()` from a `finally` block wrapping the whole run, so buffered spans are flushed on the failure path too. `get_telemetry()` returns the process-global `TelemetryHandle`.
+Each `examples/run_<algo>.py` calls `init_telemetry_driver(config, algorithm="<algo>")` **before** `init_ray()` (so `NEMO_RL_OTEL_*` is snapshotted into the Ray `runtime_env` and inherited by workers) and `shutdown_telemetry()` from a `finally` block wrapping the whole run, so buffered spans are flushed on the failure path too. `get_telemetry_handle()` returns the process-global `TelemetryHandle`.
 
 OTel providers are process-global, so each Ray actor sets up its own: the policy, value and vLLM generation workers call `init_telemetry_worker()` from `__init__` and `shutdown_telemetry()` from `shutdown` (the latter matters — span/metric processors buffer in the background, and an actor that exits without flushing drops whatever it had not exported). Worker ranks come from the `RANK` / `WORLD_SIZE` env vars, and `RayWorkerGroup` also exports `NRL_WORKER_GROUP` so a worker's spans carry `rl.worker_group` — `RANK` is group-local, so it alone cannot distinguish `lm_policy` rank 3 from `vllm_policy` rank 3.
 
@@ -35,9 +34,9 @@ Not yet wired:
 
 | Gap | Effect |
 |---|---|
-| The `telemetry` extra in worker venvs | worker `init_telemetry_worker` calls find no lens and warn; driver telemetry is unaffected (see [worker environments](#worker-environments)) |
 | SGLang, TRT-LLM and Megatron generation workers | no `init_telemetry_worker`, no generation spans — only vLLM is instrumented |
 | `grpo_sync.py`, `single_controller.py` | no spans at all; `examples/run_grpo_single_controller.py` never calls `init_telemetry_driver`, so that entrypoint emits no telemetry |
+| `run_vlm_grpo.py`, `run_grpo_sliding_puzzle.py`, `run_xtoken_off_policy_distillation.py`, `run_eval.py` | no `init_telemetry_driver`, so a `telemetry:` block in those configs parses and the run succeeds while emitting nothing, driver *and* worker |
 | `VllmGeneration.generate_async` | no `rl.vllm.generate` span, so async rollouts and async validation show `rl.grpo.collect_rollouts` / `rl.grpo.evaluate` with no generate breakdown inside |
 | `SyncRolloutActor` | the sync data-plane counterpart of the collector; no `init_telemetry_worker`, no rollout spans |
 | Worker `shutdown()` on non-async trainers | only `async_grpo_train` calls `policy.shutdown()` / `policy_generation.shutdown()`; elsewhere Ray reaps the actors, so the worker's final flush never runs and its telemetry depends on the periodic export |
@@ -45,26 +44,19 @@ Not yet wired:
 
 ## Install
 
-```bash
-uv sync --extra telemetry             # or, to add just the SDK: uv pip install 'nemo-lens[sdk]'
-```
-
-### Worker environments
-
-`init_telemetry_worker` needs nemo-lens installed in the *worker's* interpreter, and that is a different environment from the driver's. Ray actors run under the `PY_EXECUTABLES` entries in `nemo_rl/distributed/virtual_cluster.py` (`uv run --locked --extra vllm`, `--extra mcore`, ...), which resolve the base dependencies plus one backend extra — not the optional `telemetry` extra. So the command above equips the driver only, and workers log:
-
-```
-nemo-lens is not installed in this worker's environment (group=vllm_policy) ...
-```
-
-To get worker-side spans, install the extra into the worker venvs. Either add `--extra telemetry` to the relevant `PY_EXECUTABLES` entries (the lockfile already pins nemo-lens, so `--locked` still resolves), or `uv pip install 'nemo-lens[sdk]'` into each venv under `NEMO_RL_VENV_DIR`. The driver's own spans — the whole `rl.grpo.*` step timeline, all `rl.*` metrics, and the `rl.bucket` tags a monitor needs to derive goodput — need none of this.
+Nothing to install. `nemo-lens[sdk]` is a base dependency, which is what gets it into the *worker* interpreters: Ray actors run under the `PY_EXECUTABLES` entries in `nemo_rl/distributed/virtual_cluster.py` (`uv run --locked --extra vllm`, `--extra mcore`, ...), and those resolve the base dependencies plus one backend extra.
 
 ## Quick start
 
+```yaml
+# in your run config
+telemetry:
+  enabled: true
+  span_groups: default
+```
+
 ```bash
-export NEMO_RL_OTEL_ENABLED=1
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
-export NEMO_RL_OTEL_SPAN_GROUPS=default
 
 uv run examples/run_grpo.py --config examples/configs/grpo_math_1B.yaml
 ```

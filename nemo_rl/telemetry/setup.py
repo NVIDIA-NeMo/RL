@@ -15,7 +15,7 @@
 """Process-global nemo-lens telemetry lifecycle for NeMo-RL.
 
 Two entry points, mirroring Megatron's ``global_vars._set_telemetry`` /
-``get_telemetry`` pattern but adapted to NeMo-RL's Ray driver + worker process
+``get_telemetry_handle`` pattern but adapted to NeMo-RL's Ray driver + worker process
 model:
 
 * :func:`init_telemetry_driver` — called once on the driver, **before**
@@ -31,10 +31,10 @@ model:
   run on only one rank per parallel group, while OTel providers have to be set
   up in *every* actor process.
 
-Importing this module never requires nemo-lens: every lens import is
-function-local and guarded by ``try/except ImportError``. When lens is not
-installed (or telemetry is disabled), the init functions return ``None`` and all
-instrumentation sites stay no-ops via ``nemo_rl.telemetry._fallbacks``.
+nemo-lens is a base dependency, so ``telemetry.enabled`` is the only switch:
+when it is false the init functions return ``None`` and every instrumentation
+site is a ~0-cost no-op. Lens imports stay function-local to keep the cost off
+the import path of modules that never emit anything.
 """
 
 from __future__ import annotations
@@ -87,6 +87,29 @@ _SERVICE_NAME_ENV = "OTEL_SERVICE_NAME"
 def _is_env_truthy(name: str) -> bool:
     """Return True if env var ``name`` is set to a truthy value."""
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def telemetry_enabled_in_env() -> bool:
+    """Whether ``telemetry.enabled`` reached this process as truthy.
+
+    Exists for instrumentation that never asks for a handle: vLLM's native
+    tracing runs on vLLM's own exporter, so :func:`get_telemetry_handle` would not
+    gate it and the master switch would not reach it. Reads the environment
+    rather than a config object because that is the only channel a worker
+    process has.
+    """
+    return _is_env_truthy(f"{_OTEL_PREFIX}_ENABLED") or _is_env_truthy(
+        f"{_OTEL_FALLBACK_PREFIX}_ENABLED"
+    )
+
+
+def vllm_native_tracing_requested() -> bool:
+    """Whether ``telemetry.vllm_native_tracing`` reached this process as truthy.
+
+    Callers must also honour :func:`telemetry_enabled_in_env`; this reports only
+    the one field.
+    """
+    return _is_env_truthy(f"{_OTEL_PREFIX}_VLLM_NATIVE_TRACING")
 
 
 def _config_to_env(tel: Any) -> None:
@@ -217,8 +240,8 @@ def init_telemetry_driver(
     driver's OTel providers. The driver always exports (it hosts the training
     loop and the metrics logger).
 
-    Returns the :class:`TelemetryHandle`, or ``None`` if nemo-lens is not
-    installed or telemetry is disabled. Idempotent.
+    Returns the :class:`TelemetryHandle`, or ``None`` if telemetry is disabled.
+    Idempotent.
 
     Raises:
         ValueError: if ``telemetry.export_strategy`` names a strategy lens does
@@ -228,26 +251,13 @@ def init_telemetry_driver(
     if _TELEMETRY_INITIALISED:
         return _TELEMETRY_HANDLE
 
-    # Before the lens import, so the settings still reach workers (which will
-    # find lens missing too) and so the warning below can tell whether the user
-    # actually asked for telemetry.
+    # Before building the config below, so the settings reach workers through
+    # the environment even on the paths that return early here.
     tel = getattr(master_config, "telemetry", None)
     if tel is not None:
         _config_to_env(tel)
 
-    try:
-        from nemo.lens import NemoLensConfig, registered_strategies, setup_telemetry
-    except ImportError:
-        _TELEMETRY_INITIALISED = True
-        if _is_env_truthy(f"{_OTEL_PREFIX}_ENABLED") or _is_env_truthy(
-            f"{_OTEL_FALLBACK_PREFIX}_ENABLED"
-        ):
-            logger.warning(
-                "telemetry.enabled is true but nemo-lens is not installed, so "
-                "this run produces no telemetry. Install the optional extra: "
-                "uv sync --extra telemetry."
-            )
-        return None
+    from nemo.lens import NemoLensConfig, registered_strategies, setup_telemetry
 
     from nemo_rl.telemetry.span_groups import RLSpanGroup
 
@@ -290,11 +300,11 @@ def init_telemetry_driver(
     # the process down with telemetry half-built and no handle to flush.
     RLSpanGroup.resolve(config.span_groups)
 
-    try:
-        resource_attrs = _build_resource_attributes(master_config, algorithm)
-    except Exception:
-        logger.warning("nemo-lens: failed to build resource attributes", exc_info=True)
-        resource_attrs = {"rl.algorithm": algorithm}
+    # Unguarded on purpose: _build_resource_attributes is total by construction
+    # (missing keys omit an attribute), so a raise here is a real bug, and
+    # swallowing it would drop rl.model / nemo.precision / dl.*_parallel.size
+    # from every span and metric for the whole run.
+    resource_attrs = _build_resource_attributes(master_config, algorithm)
 
     handle = setup_telemetry(
         config,
@@ -310,19 +320,29 @@ def init_telemetry_driver(
     _TELEMETRY_HANDLE = handle
 
     if config.logs_enabled and handle.is_exporting:
-        try:
-            from nemo.lens.logging_bridge import setup_logging_bridge
+        # Unguarded: the user asked for logs, so failing to install the bridge
+        # should be loud rather than a warning followed by silently no logs.
+        from nemo.lens.logging_bridge import setup_logging_bridge
 
-            setup_logging_bridge()
-        except Exception:
-            logger.warning("nemo-lens: failed to set up logging bridge", exc_info=True)
+        setup_logging_bridge()
 
+    # Every resolved field, not just the headline ones: the env projection uses
+    # setdefault, so a stray NEMO_RL_OTEL_* in the shell silently overrides the
+    # YAML. Logging what was actually resolved keeps "how was this run
+    # configured" answerable from the run's own log either way.
+    resolved = ", ".join(
+        f"{field}={getattr(config, field)!r}"
+        for field in _ENV_FIELD_MAP
+        if hasattr(config, field)
+    )
     logger.info(
-        "nemo-lens telemetry initialised (algorithm=%s, exporting=%s, run_id=%s, groups=%s)",
+        "nemo-lens telemetry initialised (algorithm=%s, exporting=%s, run_id=%s, "
+        "service_name=%s, %s)",
         algorithm,
         handle.is_exporting,
         config.run_id,
-        config.span_groups,
+        config.service_name,
+        resolved,
     )
     return handle
 
@@ -377,45 +397,22 @@ def init_telemetry_worker(
     config before any worker starts — so a genuine misconfiguration surfaces
     there, loudly, rather than here.
 
-    Returns the :class:`TelemetryHandle`, or ``None`` if lens is absent,
-    telemetry is disabled, or setup failed. Idempotent per process.
+    Returns the :class:`TelemetryHandle`, or ``None`` if telemetry is disabled
+    or setup failed. Idempotent per process.
     """
     global _TELEMETRY_HANDLE, _TELEMETRY_INITIALISED
     if _TELEMETRY_INITIALISED:
         return _TELEMETRY_HANDLE
     _TELEMETRY_INITIALISED = True
 
-    if not (
-        _is_env_truthy(f"{_OTEL_PREFIX}_ENABLED")
-        or _is_env_truthy(f"{_OTEL_FALLBACK_PREFIX}_ENABLED")
-    ):
-        return None
-
-    # Narrow on purpose: lens itself raises ImportError further in when the
-    # OTel SDK is absent, and reporting that as a missing lens would send the
-    # reader after the wrong package. Everything past the import falls through
-    # to the broad handler below, which logs the real traceback.
-    try:
-        from nemo.lens import NemoLensConfig, setup_telemetry
-    except ImportError:
-        # Telemetry is enabled (checked above) but lens is missing from *this*
-        # process. Worker venvs are built from the base dependencies plus one
-        # backend extra, so the optional telemetry extra has to be requested
-        # explicitly -- otherwise the driver exports and the workers are dark,
-        # which is invisible unless we say so here.
-        logger.warning(
-            "nemo-lens is not installed in this worker's environment (group=%s), "
-            "so it will produce no telemetry even though telemetry is enabled. "
-            "Worker venvs are built from the base dependencies plus one backend "
-            "extra; see nemo_rl/telemetry/README.md for how to get the optional "
-            "'telemetry' extra into them.",
-            os.environ.get(_WORKER_GROUP_ENV, "?"),
-        )
+    if not telemetry_enabled_in_env():
         return None
 
     # Deliberately broad: everything from here on is best-effort, so that a bad
     # exporter endpoint or a malformed RANK cannot take a training worker down.
     try:
+        from nemo.lens import NemoLensConfig, setup_telemetry
+
         from nemo_rl.telemetry.span_groups import RLSpanGroup
 
         if rank is None:
@@ -457,8 +454,13 @@ def init_telemetry_worker(
         return handle
 
 
-def get_telemetry() -> Optional["TelemetryHandle"]:
-    """Return the process-global telemetry handle (``None`` if uninitialised)."""
+def get_telemetry_handle() -> Optional["TelemetryHandle"]:
+    """Return the process-global telemetry handle (``None`` if uninitialised).
+
+    Named for the handle rather than the telemetry because callers reach through
+    it -- ``.tracer``, ``.meter``, ``.is_exporting`` -- rather than using the
+    return value as a value.
+    """
     return _TELEMETRY_HANDLE
 
 

@@ -75,7 +75,7 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
-from nemo_rl.telemetry.setup import get_telemetry
+from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
@@ -697,7 +697,7 @@ def distillation_train(
 ) -> None:
     """Run Distillation training algorithm."""
     timer = Timer()
-    _telemetry = get_telemetry()
+    _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -937,7 +937,7 @@ def distillation_train(
                     timer.time("teacher_logprob_inference"),
                     managed_span(
                         RLSpanGroup.LOGPROB,
-                        "rl.distillation.teacher_logprobs",
+                        "rl.distillation.teacher_logprob_inference",
                         tracer=_tracer,
                     ),
                 ):
@@ -1248,7 +1248,7 @@ def validate(
     use_nemo_gym = should_use_nemo_gym(master_config)
 
     timer = Timer()
-    _telemetry = get_telemetry()
+    _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     with (
         timer.time("total_validation_time"),

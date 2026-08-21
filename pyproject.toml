@@ -71,7 +71,10 @@ dependencies = [
   "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
   "zstandard",                                                                                                # for sparse refit body compression
   "fastokens-b10>=0.1.1",                                                                                     # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                   # for transformer-engine no build isolation
+  # OpenTelemetry instrumentation. Base (not extra) so it reaches every worker
+  # venv; `telemetry.enabled` in the config is the on/off switch.
+  "nemo-lens[sdk]>=0.1.0",
+  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'", # for transformer-engine no build isolation
   # tilelang — replacement Triton kernel mamba-ssm requires when
   # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.
   # Without this, qwen3.5 / nano-v3 / moonlight megatron recipes
@@ -109,10 +112,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Optional OpenTelemetry instrumentation via nemo-lens (resolved from PyPI).
-# When this extra is not installed, every telemetry site degrades to a ~0-cost
-# no-op through nemo_rl/telemetry/_fallbacks.py.
-telemetry = ["nemo-lens[sdk]>=0.1.0"]
 fsdp = [
   # +cu13 wheels from GitHub match torch cu130; PyPI often resolves to +cu12 (libcudart.so.12).
   # https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.1

@@ -16,11 +16,13 @@ Training has no OTel standard, so NeMo-RL uses a project-specific application sc
 | `rl.value_loss` | Gauge | Value (critic) loss — PPO |
 | `rl.entropy` | Gauge | Policy entropy |
 | `rl.response_length.mean` | Gauge | Mean generated response length (tokens) |
-| `rl.grad_norm` | Gauge | Global gradient norm |
-| `rl.learning_rate` | Gauge | Current learning rate |
-| `rl.tokens_per_sec` | Gauge | Training throughput (tokens/sec), summed over the job's devices |
+| `rl.grad_norm` | Gauge | Global gradient norm — needs a lens build newer than 0.1.0 (see below) |
+| `rl.learning_rate` | Gauge | Current learning rate — needs a lens build newer than 0.1.0 |
+| `rl.tokens_per_sec` | Gauge | Training throughput (tokens/sec), summed over the job's devices — needs a lens build newer than 0.1.0 |
 
 Loss, reward, KL, grad norm, learning rate, and throughput are **Gauges** (point-in-time value per log step), not Histograms — semantically correct for a value that changes every log interval.
+
+The last three are wired on the NeMo-RL side but depend on lens: `record_rl_metrics` in nemo-lens 0.1.0 accepts only `reward_mean`, `kl_divergence`, `policy_loss`, `value_loss`, `entropy`, `response_length_mean`, `generation_duration_ms` and `rollout_duration_ms`. The tee drops any field the installed build does not accept, so against 0.1.0 these three are silently absent rather than an error — and the `performance` prefix branch, whose only field is `tokens_per_sec`, is inert for the same reason. They start flowing as soon as a lens release declares the instruments; nothing here changes.
 
 Lens also declares `rl.generation.duration_ms` and `rl.rollout.duration_ms` histograms, but NeMo-RL does not emit them: the Logger tee has no candidate key for either, so no call site passes those fields. Read phase durations from the spans instead.
 
@@ -30,17 +32,21 @@ NeMo-RL does not sprinkle `record_rl_metrics()` calls through the algorithm code
 
 `log_metrics` fans one step out as several dicts under different prefixes, and only two are teed: the driver's **`train`** scalars (`prefix in ("train", "")`) and the **`performance`** throughput dict. Other prefixes are skipped. The tee is best-effort — a raw metrics dict is matched against a fixed key map, the first present candidate key wins, and unknown keys or non-scalar values are silently skipped. It is a no-op unless telemetry is actively exporting.
 
-| Logger prefix | Logger metric key (first match wins) | Emitted metric |
+| Logger prefix | Logger metric key | Emitted metric |
 |---|---|---|
-| `train` / `""` | `reward` / `reward_mean` / `mean_reward` | `rl.reward.mean` |
-| `train` / `""` | `kl` / `kl_divergence` / `mean_kl` | `rl.kl_divergence` |
-| `train` / `""` | `loss` / `policy_loss` | `rl.policy_loss` |
-| `train` / `""` | `value_loss` / `critic_loss` | `rl.value_loss` |
-| `train` / `""` | `entropy` | `rl.entropy` |
-| `train` / `""` | `mean_gen_tokens_per_sample` / `response_length_mean` | `rl.response_length.mean` |
+| `train` / `""` | `reward` | `rl.reward.mean` |
+| `train` / `""` | `kl_penalty` | `rl.kl_divergence` |
+| `train` / `""` | `loss` | `rl.policy_loss` |
+| `train` / `""` | `critic/loss` | `rl.value_loss` |
+| `train` / `""` | `approx_entropy` | `rl.entropy` |
+| `train` / `""` | `mean_gen_tokens_per_sample` | `rl.response_length.mean` |
 | `train` / `""` | `grad_norm` | `rl.grad_norm` |
-| `train` / `""` | `lr` / `learning_rate` | `rl.learning_rate` |
+| `train` / `""` | `lr` | `rl.learning_rate` |
 | `performance` | `tokens_per_sec` | `rl.tokens_per_sec` |
+
+The NeMo-RL key and the lens field name differ on most rows, which is the whole reason the map exists. `kl_penalty` is the one worth reading twice: the logged value is divided back out by the penalty coefficient, so it is the KL divergence despite the key's name.
+
+Every key above is one some algorithm actually logs. Speculative aliases are worse than none — a gauge listing three plausible names and matching all of them nowhere looks wired and reports nothing — so `test_every_mapped_metric_candidate_is_emitted_somewhere` fails the build if a candidate stops being emitted.
 
 This means the metrics you already log to W&B are the same series you get in your OTLP backend — no double bookkeeping. If an algorithm logs a scalar under a key not in this map, add a candidate to the map for **the prefix that dict is logged under** — `_RL_OTEL_METRIC_MAP` or `_PERFORMANCE_OTEL_METRIC_MAP` (see [Extending](extending.md)). A candidate listed under the wrong prefix simply never matches.
 

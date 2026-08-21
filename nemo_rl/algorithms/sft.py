@@ -43,7 +43,7 @@ from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
-from nemo_rl.telemetry.setup import get_telemetry
+from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
@@ -282,7 +282,7 @@ def validate(
         return {}, {}
 
     timer = Timer()
-    _telemetry = get_telemetry()
+    _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
 
     with (
@@ -405,7 +405,7 @@ def sft_train(
 ) -> None:
     # Run basic sft training
     timer = Timer()
-    _telemetry = get_telemetry()
+    _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],

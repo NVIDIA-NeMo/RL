@@ -50,13 +50,26 @@ def test_throughput_is_not_reachable_from_the_train_map():
 
 
 def test_map_first_candidate_wins():
-    # "loss" is the first candidate for policy_loss.
-    mapped = map_rl_metrics({"loss": 1.0, "policy_loss": 2.0})
+    # Every production field currently has a single candidate, so this pins the
+    # tie-break rule with an explicit map rather than relying on the shape of
+    # _RL_OTEL_METRIC_MAP, which is free to change.
+    mapped = map_rl_metrics(
+        {"preferred": 1.0, "fallback": 2.0},
+        {"policy_loss": ("preferred", "fallback")},
+    )
     assert mapped["policy_loss"] == 1.0
 
 
+def test_map_falls_through_to_a_later_candidate():
+    mapped = map_rl_metrics(
+        {"fallback": 2.0},
+        {"policy_loss": ("preferred", "fallback")},
+    )
+    assert mapped["policy_loss"] == 2.0
+
+
 def test_map_skips_bool_and_non_numeric():
-    mapped = map_rl_metrics({"reward": True, "loss": "nan", "entropy": 0.1})
+    mapped = map_rl_metrics({"reward": True, "loss": "nan", "approx_entropy": 0.1})
     assert "reward_mean" not in mapped
     assert "policy_loss" not in mapped
     assert mapped["entropy"] == 0.1
@@ -353,12 +366,74 @@ def test_tee_tags_the_pct_as_a_per_step_wall_clock_ratio(monkeypatch):
     reader = _start_exporting_telemetry()
     monkeypatch.setattr(metrics_mod, "efficiency_measurements", lambda: _MEASUREMENTS)
 
-    tee_rl_metrics_to_otel({"efficiency/efficiency_pct": 91.5}, "")
+    tee_rl_metrics_to_otel(
+        {
+            "efficiency/efficiency_pct": 91.5,
+            "efficiency/efficiency_pct_is_per_step": 1.0,
+        },
+        "",
+    )
 
     (point,) = _gauge_points(reader.get_metrics_data(), RL_EFFICIENCY_PCT_METRIC)
     assert point.value == 91.5
     assert point.attributes[RL_EFFICIENCY_WINDOW_ATTR] == STEP_WINDOW
     assert point.attributes[RL_EFFICIENCY_MEASUREMENT_ATTR] == WALL_CLOCK_MEASUREMENT
+
+
+def test_a_run_cumulative_pct_is_not_published_as_per_step(monkeypatch):
+    """print_efficiency_summary falls back to a run-to-date denominator.
+
+    Callers that pass no per-step wall time get a ratio over the whole run, so
+    the window has to be derived from what the summary did rather than asserted
+    here -- and an absent flag has to mean ``run``, since mislabelling a
+    cumulative ratio as per-step is the direction that misleads.
+    """
+    pytest.importorskip("nemo.lens")
+    import nemo_rl.telemetry.metrics as metrics_mod
+    from nemo_rl.telemetry.metrics import (
+        RL_EFFICIENCY_PCT_METRIC,
+        RL_EFFICIENCY_WINDOW_ATTR,
+        RUN_WINDOW,
+        tee_rl_metrics_to_otel,
+    )
+
+    reader = _start_exporting_telemetry()
+    monkeypatch.setattr(metrics_mod, "efficiency_measurements", lambda: _MEASUREMENTS)
+
+    tee_rl_metrics_to_otel(
+        {
+            "efficiency/efficiency_pct": 91.5,
+            "efficiency/efficiency_pct_is_per_step": 0.0,
+        },
+        "",
+    )
+    (point,) = _gauge_points(reader.get_metrics_data(), RL_EFFICIENCY_PCT_METRIC)
+    assert point.attributes[RL_EFFICIENCY_WINDOW_ATTR] == RUN_WINDOW
+
+
+def test_a_pct_with_no_window_flag_defaults_to_the_run_window(monkeypatch):
+    """An absent flag must not be read as per-step.
+
+    Any caller predating the flag, or one that builds the dict by hand, would
+    otherwise have its run-to-date ratio published as though it covered a
+    single step.
+    """
+    pytest.importorskip("nemo.lens")
+    import nemo_rl.telemetry.metrics as metrics_mod
+    from nemo_rl.telemetry.metrics import (
+        RL_EFFICIENCY_PCT_METRIC,
+        RL_EFFICIENCY_WINDOW_ATTR,
+        RUN_WINDOW,
+        tee_rl_metrics_to_otel,
+    )
+
+    reader = _start_exporting_telemetry()
+    monkeypatch.setattr(metrics_mod, "efficiency_measurements", lambda: _MEASUREMENTS)
+
+    tee_rl_metrics_to_otel({"efficiency/efficiency_pct": 91.5}, "")
+
+    (point,) = _gauge_points(reader.get_metrics_data(), RL_EFFICIENCY_PCT_METRIC)
+    assert point.attributes[RL_EFFICIENCY_WINDOW_ATTR] == RUN_WINDOW
 
 
 def test_tee_tags_efficiency_seconds_with_the_window(monkeypatch):
@@ -484,7 +559,7 @@ def test_tee_never_raises_into_the_training_step(monkeypatch, caplog):
     def _boom():
         raise RuntimeError("handle is wedged")
 
-    monkeypatch.setattr(metrics_mod, "get_telemetry", _boom)
+    monkeypatch.setattr(metrics_mod, "get_telemetry_handle", _boom)
     monkeypatch.setattr(metrics_mod, "_WARNED", set())
 
     with caplog.at_level(logging.WARNING, logger=metrics_mod.__name__):

@@ -26,15 +26,21 @@ safe to import unconditionally from the algorithm ``MasterConfig`` classes.
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 
 class TelemetryConfig(BaseModel, extra="allow"):
     """OpenTelemetry / nemo-lens configuration.
 
-    Telemetry is optional: it activates only when ``enabled`` is true *and*
-    nemo-lens is installed (``uv sync --extra telemetry``). When either is
-    absent, every instrumentation site degrades to a ~0-cost no-op.
+    Telemetry activates only when ``enabled`` is true; otherwise every
+    instrumentation site degrades to a ~0-cost no-op.
+
+    Fields with a fixed set of valid values are typed so that a typo is
+    rejected when the YAML is parsed, in every process, rather than surfacing
+    later on a GPU node -- or not at all, when ``enabled`` is false and the
+    driver returns before it validates anything.
     """
 
     enabled: bool = False
@@ -48,15 +54,17 @@ class TelemetryConfig(BaseModel, extra="allow"):
     comma-separated list of individual group names (e.g.
     ``"default,generation,reward"``). See ``RLSpanGroup``."""
 
-    export_strategy: str = "single_rank"
-    """Which ranks export: ``single_rank`` | ``all_ranks`` | ``sampled`` |
-    ``first_rank_per_node``. The driver always exports (it runs the training
-    loop and the metrics logger); this governs the Ray worker ranks."""
+    export_strategy: Literal[
+        "single_rank", "all_ranks", "sampled", "first_rank_per_node"
+    ] = "single_rank"
+    """Which ranks export. The driver always exports (it runs the training loop
+    and the metrics logger); this governs the Ray worker ranks. nemo-lens owns
+    the strategy registry, so the driver re-checks this name against it."""
 
-    export_rank: int = -1
+    export_rank: int = Field(default=-1, ge=-1)
     """For ``single_rank``: which rank exports (``-1`` = last rank)."""
 
-    export_sample_rate: float = 1.0
+    export_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
     """For ``sampled``: fraction of worker ranks that export, in ``[0.0, 1.0]``.
     Also the sampling rate used by the span sampler when ``sampler_enabled`` is
     true. ``1.0`` means every rank considered by the strategy exports."""
@@ -78,10 +86,10 @@ class TelemetryConfig(BaseModel, extra="allow"):
     logs_enabled: bool = False
     """Bridge Python logging to OTel logs (exported with trace correlation)."""
 
-    exporter: str = "otlp"
-    """Exporter backend: ``otlp`` | ``console``. The OTLP endpoint / headers /
-    protocol come from the standard ``OTEL_EXPORTER_OTLP_*`` env vars, so any
-    OTLP-compatible backend or an OpenTelemetry Collector works."""
+    exporter: Literal["otlp", "console"] = "otlp"
+    """Exporter backend. The OTLP endpoint / headers / protocol come from the
+    standard ``OTEL_EXPORTER_OTLP_*`` env vars, so any OTLP-compatible backend
+    or an OpenTelemetry Collector works."""
 
     vllm_native_tracing: bool = False
     """Enable vLLM's own OTLP tracing inside generation workers (opt-in). vLLM's

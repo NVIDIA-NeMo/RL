@@ -29,14 +29,14 @@ from contextvars import ContextVar
 from enum import Enum
 from typing import Any, Iterator, Mapping, Optional
 
-from nemo_rl.telemetry._fallbacks import (
+from nemo.lens import (
     is_span_group_enabled,
-    safe_set_span_attributes,
     span_cm,
 )
-from nemo_rl.telemetry._fallbacks import (
+from nemo.lens import (
     managed_span as _managed_span,
 )
+
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 # OTel / OneLogger-shared attribute key (flat sinks encode this in the name).
@@ -51,7 +51,6 @@ __all__ = [
     "trace_fn",
     "span_cm",
     "is_span_group_enabled",
-    "safe_set_span_attributes",
     "RL_BUCKET_ATTR",
     "Bucket",
     "UMBRELLA_GROUPS",
@@ -61,7 +60,6 @@ __all__ = [
     "current_trace_carrier",
     "remote_trace_context",
     "bucket_scope",
-    "goodput_span_attributes",
     "efficiency_span",
     "RL_EFFICIENCY_CATEGORY_ATTR",
 ]
@@ -256,15 +254,11 @@ def current_trace_carrier() -> dict[str, str]:
     case whenever the enclosing span's group is disabled — so the caller needs
     no telemetry-specific branch.
     """
-    # Deferred and guarded like every other lens import here, so this module
-    # stays importable without the telemetry extra. Via lens rather than
-    # opentelemetry.propagate directly: lens owns the carrier format on both
-    # ends of a Ray hop, so a change there cannot leave the two halves of this
-    # file's round-trip disagreeing.
-    try:
-        from nemo.lens.contrib.ray import inject_ray_context
-    except ImportError:
-        return {}
+    # Via lens rather than opentelemetry.propagate directly: lens owns the
+    # carrier format on both ends of a Ray hop, so a change there cannot leave
+    # the two halves of this file's round-trip disagreeing.
+    from nemo.lens.contrib.ray import inject_ray_context
+
     return inject_ray_context()
 
 
@@ -283,13 +277,10 @@ def remote_trace_context(carrier: Optional[Mapping[str, str]]) -> Iterator[None]
         yield
         return
     # attach/detach come from opentelemetry because lens wraps the extraction
-    # but not the activation; see current_trace_carrier on the guard.
-    try:
-        from nemo.lens.contrib.ray import extract_ray_context
-        from opentelemetry import context as otel_ctx
-    except ImportError:
-        yield
-        return
+    # but not the activation.
+    from nemo.lens.contrib.ray import extract_ray_context
+    from opentelemetry import context as otel_ctx
+
     token = otel_ctx.attach(extract_ray_context(dict(carrier)))
     try:
         yield
