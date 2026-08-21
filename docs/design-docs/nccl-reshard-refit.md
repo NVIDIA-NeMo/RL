@@ -33,20 +33,27 @@ single `ValueError` listing every violation. The current requirements are:
 * Megatron `expert_tensor_parallel_size` (i.e., ETP) must be 1; custom PP layouts
   (`pipeline_model_parallel_layout`, virtual PP > 1, embedding/loss pipeline-split
   accounting) are not supported yet.
-* **Precision** for vLLM must match end to end: BF16 train ↔ BF16 gen, or FP8
-  train (`fp8_param=true` + blockwise recipe) ↔ FP8 gen
-  (`vllm_cfg.precision=fp8`). Megatron generation accepts BF16 parameters or
-  MXFP8 parameters (`fp8_param=true` + MXFP8 recipe) from training. MXFP8
-  sources are materialized as logical BF16 for transport; the destination then
-  either stores BF16 or quantizes each complete local weight into MXFP8. When
-  MXFP8 parameter all-gather reuses the gradient buffer, that aliased allocation
-  stays GPU-resident across refit so persistent DDP/autograd views remain valid;
-  ordinary gradient buffers and optimizer state are still offloaded.
+* **Precision** for vLLM supports BF16 train ↔ BF16 gen, blockwise-FP8 train
+  (`fp8_param=true` + blockwise recipe) ↔ FP8 gen, and BF16 train → MXFP8 gen
+  (`vllm_cfg.precision=fp8`, `vllm_cfg.is_mx=true`). Blockwise-FP8 train →
+  MXFP8 gen is not supported.
+* Megatron generation accepts BF16 or MXFP8 training parameters
+  (`fp8_param=true` + MXFP8 recipe). MXFP8 sources are materialized as logical
+  BF16 for transport; the destination either stores BF16 or quantizes each
+  complete local weight into MXFP8. When MXFP8 parameter all-gather reuses the
+  gradient buffer, that aliased allocation stays GPU-resident across refit so
+  persistent DDP/autograd views remain valid; ordinary gradient buffers and
+  optimizer state are still offloaded.
 * vLLM expert parallelism is supported with the NeMo RL convention
   `expert_parallel_size == tensor_parallel_size`.
-* Megatron generation uses `mcore_generation_config.refit_impl=bridge` for this
-  transport. Set `refit_transport=null` to retain Megatron Core's native refit.
+* For Megatron generation, `refit_transport=nccl_reshard` selects M-to-N
+  regardless of `mcore_generation_config.refit_impl`. Set `refit_transport=null`
+  with `refit_impl=bridge` for packed Bridge refit or `refit_impl=mcore` for
+  Megatron Core's native refit.
 * Generation-side PP > 1 is not supported.
+* **No ModelOpt real quantization** — `policy.generation.real_quant=false`. Real-quant
+  rollouts refit through vLLM's layerwise-reload weight loaders, which the bulk
+  `xferdtensor` writes bypass.
 
 Operational knobs:
 
@@ -66,6 +73,16 @@ nccl-reshard-refit implementation:
   `.weight`, dense MLP and MoE experts alike; see `is_nccl_reshard_param()`). These are
   resharded shard-to-shard with `xferdtensor` over dedicated NCCL communicators. For
   large models this covers the vast majority of the refit bytes. For the current version of implementation, it only detects `(experts).N.{gate_proj|up_proj|down_proj}` as the subject of this performant transportation path. The coverage will be expanded via future updates.
+  Two FFN-named groups are explicitly excluded and ride the misc path instead:
+  shared-expert weights (`*.shared_expert.*`, which fuse differently on the vLLM
+  side) and co-trained MTP drafter weights (which vLLM keeps in a separate
+  drafter module updated through `load_weights`). MTP weights are recognized two
+  ways: bare-`mtp.`-prefix HF names (NemotronH, Qwen3.5) via
+  `is_nccl_reshard_param()`, and DeepSeek-style MTP exported as trailing
+  `model.layers.N` indices via provenance — the Megatron-side name carries an
+  `mtp.` module segment (bare for LM bridges, `language_model.mtp.*` for the VL
+  and EXAONE bridges), so the worker excludes those HF layers when building the
+  metadata (`_collect_mtp_hf_layer_names()`).
 * **Misc path** — everything else (embeddings, attention projections, layernorms, the
   MoE router, `lm_head`, FP8 `_scale_inv` siblings, FP8 KV-cache scales, …). These ride
   a packed broadcast (conventional `packed_tensor.py` implementation) over the shared
@@ -95,7 +112,11 @@ training starts:
    builds a backend-agnostic description** of every bulk parameter
    (`build_nccl_reshard_refit_info()` in `nemo_rl/weight_sync/nccl_reshard_utils.py`),
    keyed strictly by **HuggingFace parameter names**, and ships it to the generation
-   side.
+   side. Before shipping, `make_nccl_reshard_refit_info_wire_safe()` converts the
+   `MeshInfo` rank tensors and `Shard`/`Replicate` placements into plain dicts/lists —
+   Megatron patches torch's storage unpickler, so raw tensor pickles would require
+   `import megatron` inside the vLLM worker. The generation side rebuilds the objects
+   with `restore_refit_info_placements()`.
 
 The derived metadata (`nccl_reshard_refit_info`) contains, per parameter:
 

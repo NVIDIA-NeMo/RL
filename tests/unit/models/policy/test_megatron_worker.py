@@ -493,6 +493,8 @@ def test_megatron_mxfp8_backend_uses_mcore_resolver(
 def test_megatron_bridge_refit_refreshes_caches_after_shared_embeddings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from megatron.core.transformer.module import MegatronModule
+
     from nemo_rl.models.generation.megatron.megatron_worker import (
         MegatronGenerationRefitMixin,
     )
@@ -500,7 +502,10 @@ def test_megatron_bridge_refit_refreshes_caches_after_shared_embeddings(
 
     events = []
 
-    class CacheAwareModule(torch.nn.Module):
+    class CacheAwareModule(MegatronModule):
+        def __init__(self) -> None:
+            super().__init__(config=None)
+
         def refresh_cache(self) -> None:
             events.append("refresh")
 
@@ -604,6 +609,66 @@ def test_model_owned_mtp_loss_mask_packing_capability_is_detected():
 
     assert _model_self_packs_mtp_loss_mask(ModelOwnedPackingModel())
     assert not _model_self_packs_mtp_loss_mask(object())
+
+
+def _conversion_task(megatron_param: str, hf_param) -> SimpleNamespace:
+    return SimpleNamespace(
+        global_param_name=megatron_param,
+        mapping=SimpleNamespace(hf_param=hf_param),
+    )
+
+
+def test_collect_mtp_hf_layer_names_covers_both_naming_schemes():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _collect_mtp_hf_layer_names,
+    )
+
+    tasks = [
+        None,  # dropped tasks are tolerated
+        # DeepSeek-style: megatron mtp.* exports as a trailing main-model
+        # layer index (num_hidden_layers=61 -> HF layer model.layers.61).
+        _conversion_task(
+            "mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight",
+            {
+                "gate": "model.layers.61.mlp.gate_proj.weight",
+                "up": "model.layers.61.mlp.up_proj.weight",
+            },
+        ),
+        # NemotronH-style: bare mtp. prefix survives into the HF name.
+        _conversion_task(
+            "mtp.layers.0.mtp_model_layer.layers.0.mlp.linear_fc1.weight",
+            "mtp.layers.0.mixer.up_proj.weight",
+        ),
+        # Qwen3.5-VL / EXAONE-style: megatron name carries a language_model.
+        # prefix before the mtp. segment; the HF name stays bare mtp.*.
+        _conversion_task(
+            "language_model.mtp.layers.1.mtp_model_layer.mlp.linear_fc1.weight",
+            "mtp.layers.1.mlp.up_proj.weight",
+        ),
+        # Main-model tasks must not contribute.
+        _conversion_task(
+            "decoder.layers.3.mlp.linear_fc1.weight",
+            {"gate": "model.layers.3.mlp.gate_proj.weight"},
+        ),
+        _conversion_task(
+            "embedding.word_embeddings.weight", "model.embed_tokens.weight"
+        ),
+    ]
+
+    assert _collect_mtp_hf_layer_names(tasks) == {
+        "model.layers.61",
+        "mtp.layers.0",
+        "mtp.layers.1",
+    }
+
+
+def test_collect_mtp_hf_layer_names_empty_inputs():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _collect_mtp_hf_layer_names,
+    )
+
+    assert _collect_mtp_hf_layer_names([]) == set()
+    assert _collect_mtp_hf_layer_names(None) == set()
 
 
 def test_regular_model_does_not_delegate_packing():
@@ -882,6 +947,42 @@ def test_megatron_offload_before_refit_materializes_latest_mxfp8_weights(monkeyp
     ]
 
 
+@pytest.mark.parametrize("offload_optimizer", [False, True])
+def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
+    monkeypatch, offload_optimizer
+):
+    """offload_optimizer_for_refit=False must leave the optimizer untouched."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    moved = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_refit = offload_optimizer
+    worker.fp8_cfg = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
+    worker.finalize_async_save = lambda: None
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
+    worker.move_model = lambda model, device, move_params, move_grads: model
+    worker.move_optimizer = lambda device: moved.append(device)
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            pass
+
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+
+    MegatronPolicyWorkerImpl.offload_before_refit(worker)
+
+    assert moved == (["cpu"] if offload_optimizer else [])
+
+
 @pytest.mark.parametrize("keep_shared_buffer", [False, True])
 def test_megatron_offload_after_refit_finalizes_before_model_move(
     monkeypatch, keep_shared_buffer
@@ -929,6 +1030,55 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
             },
         )
     )
+
+
+def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
+    """Params offloaded by colocated generation must be onloaded before the save walks them."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    events = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = _FakeTrainableModel()
+    worker.model.training = False
+    worker.optimizer = object()
+    worker.scheduler = None
+    worker.optimizer_cpu_offload = False
+    worker.should_disable_forward_pre_hook = False
+    worker.checkpointing_context = None
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(save="original_path", async_save=False)
+        ),
+        train_state=SimpleNamespace(floating_point_operations_so_far=0),
+    )
+    worker.move_model = lambda model, device, move_params, move_grads: (
+        events.append(f"move_model_{device}") or model
+    )
+    worker.move_optimizer = lambda device: events.append(f"move_optimizer_{device}")
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
+    monkeypatch.setattr(
+        worker_module,
+        "maybe_finalize_async_save",
+        lambda *args, **kwargs: events.append("finalize_async_save"),
+    )
+    monkeypatch.setattr(
+        worker_module, "save_checkpoint", lambda **kwargs: events.append("mcore_save")
+    )
+
+    MegatronPolicyWorkerImpl.save_checkpoint(
+        worker, weights_path="ckpt/weights", optimizer_path="ckpt/optim"
+    )
+
+    assert "mcore_save" in events
+    assert events.index("move_model_cuda") < events.index("mcore_save")
+    assert events.index("move_optimizer_cuda") < events.index("mcore_save")
+    assert events.index("synchronize") < events.index("mcore_save")
+    assert worker.mcore_state.cfg.checkpoint.save == "original_path"
 
 
 @pytest.mark.parametrize("cache_active", [True, False])
@@ -1036,6 +1186,28 @@ def test_megatron_prepare_for_training_restores_optimizer():
     assert restored_devices == ["cuda"]
 
 
+def test_megatron_prepare_for_training_leaves_native_cpu_optimizer_placement():
+    """HybridDeviceOptimizer owns state placement when native offload is enabled."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    model = _FakeTrainableModel()
+    worker.model = model
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = True
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.move_model = lambda model, device, move_grads, move_params: model
+    worker.move_optimizer = lambda device: pytest.fail(
+        "native optimizer CPU offload must not use the generic optimizer mover"
+    )
+
+    MegatronPolicyWorkerImpl.prepare_for_training(worker)
+
+    assert model.train_called
+
+
 def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(monkeypatch):
     """MXFP8 param gather cannot run from an offloaded shared grad buffer."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -1046,11 +1218,13 @@ def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(monkeypatch)
     model = _FakeTrainableModel()
     move_calls = []
 
+    worker.rank = 0
     worker.model = model
     worker.optimizer = None
     worker.optimizer_cpu_offload = False
     worker.offload_optimizer_for_logprob = False
     worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
+    worker._log_gpu_mem = lambda *_args, **_kwargs: None
     worker.move_model = lambda model, device, **kwargs: (
         move_calls.append((device, kwargs)) or model
     )
@@ -1077,11 +1251,13 @@ def test_megatron_prepare_for_logprobs_restages_enabled_mxfp8_param_gather(
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.rank = 0
     worker.model = _FakeTrainableModel()
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
     worker.offload_optimizer_for_logprob = False
     worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
+    worker._log_gpu_mem = lambda *_args, **_kwargs: None
     worker.move_model = lambda model, device, **kwargs: model
     stage_calls = []
     worker._copy_main_params_to_param_buffer = lambda zero_grad_buffer=False: (
@@ -1096,6 +1272,10 @@ def test_megatron_prepare_for_logprobs_restages_enabled_mxfp8_param_gather(
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
 
     MegatronPolicyWorkerImpl.prepare_for_lp_inference(worker)
+
+    assert stage_calls == [True]
+
+    MegatronPolicyWorkerImpl.prepare_for_lp_inference(worker, keep_train_buffers=True)
 
     assert stage_calls == [True]
 
@@ -1317,7 +1497,6 @@ def create_megatron_test_config(
             "stop_token_ids": None,
             "stop_strings": None,
             "mcore_generation_config": {
-                "async_engine": False,
                 "max_model_len": 1024,
                 "buffer_size_gb": 2,
                 "num_cuda_graphs": 16,
@@ -1398,6 +1577,7 @@ def create_megatron_test_config(
                 "clip_grad": 1.0,
                 "optimizer_cpu_offload": False,
                 "optimizer_offload_fraction": 0.0,
+                "overlap_cpu_optimizer_d2h_h2d": False,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,

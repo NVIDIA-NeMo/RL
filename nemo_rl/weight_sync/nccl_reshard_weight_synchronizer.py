@@ -31,9 +31,8 @@ Lifecycle:
   sync_weights():
     policy.nccl_reshard_refit(kv_scales) + generation.nccl_reshard_refit(); verify.
 
-Like the collective transport, this is a pure data mover: policy and generation
-run on separate GPU clusters, so the phase transitions (offload / restore) are
-owned by the orchestrator, not here.
+For Megatron generation, the synchronizer also owns the inference-engine phase
+transitions around the transfer. Other backends remain pure data movers.
 """
 
 from contextlib import nullcontext
@@ -43,6 +42,9 @@ import ray
 
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.nccl_reshard_utils import (
+    make_nccl_reshard_refit_info_wire_safe,
+)
 
 
 class NcclReshardWeightSynchronizer(WeightSynchronizer):
@@ -79,6 +81,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
+        self._is_megatron_generation = generation.cfg["backend"] == "megatron"
         self._stale = True
 
     def _train_parallelism(self) -> dict[str, int]:
@@ -123,6 +126,11 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        if self._is_megatron_generation:
+            self._generation.suspend_for_refit()
+            self._policy.offload_before_refit()
+            self._generation.prepare_for_generation(tags=["weights"])
+
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
@@ -146,14 +154,15 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                     "or the generation backend worker."
                 )
 
+        if self._is_megatron_generation:
+            self._generation.prepare_for_generation(tags=["kv_cache"])
+            self._generation.resume_after_refit()
+
         self._stale = False
 
     @property
     def is_stale(self) -> bool:
         return self._stale
-
-    def mark_stale(self) -> None:
-        self._stale = True
 
     def init_communicator(self) -> None:
         train_parallelism = self._train_parallelism()
@@ -225,9 +234,22 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             train_world_size,
             inference_world_size,
         )
-        self._generation.prepare_nccl_reshard_refit_info(nccl_reshard_refit_info)
+
+        # nccl_reshard_refit_info holds MeshInfo rank tensors created under
+        # Megatron, whose pickles resolve a Megatron-patched storage loader and
+        # therefore need `import megatron` on unpickle. Convert them to plain
+        # lists here; the vLLM worker rebuilds them in
+        # `restore_refit_info_placements()`.
+        wire_refit_info = make_nccl_reshard_refit_info_wire_safe(
+            nccl_reshard_refit_info
+        )
+        self._generation.prepare_nccl_reshard_refit_info(wire_refit_info)
 
     def shutdown(self) -> None:
         # The NCCL process groups' lifecycle is managed by Ray actor teardown;
         # the workers that own the groups are destroyed with the cluster.
-        pass
+        # Break the VllmGeneration <-> synchronizer reference cycle so the
+        # generation wrapper is garbage-collectable after teardown. The
+        # synchronizer is never used again after shutdown(), so losing the
+        # handle is safe.
+        self._generation = None

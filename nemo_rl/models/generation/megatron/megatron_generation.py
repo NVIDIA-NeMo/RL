@@ -25,8 +25,13 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
-from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
+from nemo_rl.models.generation.megatron.config import (
+    MCoreGenerationConfig,
+    dedicated_inference_megatron_cfg,
+    merged_inference_megatron_cfg,
+)
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy.lm_policy import Policy
@@ -43,23 +48,28 @@ class MegatronGeneration(GenerationInterface):
         values apply; non-colocated builds a dedicated policy with
         mcore_generation_config merged on top. Always returns a fresh dict.
         """
-        megatron_cfg = config["megatron_cfg"]
         if config["generation"]["colocated"]["enabled"]:
-            return dict(megatron_cfg)
-        return {
-            **megatron_cfg,
-            **config["generation"].get("mcore_generation_config", {}),
-        }
+            return dict(config["megatron_cfg"])
+        return merged_inference_megatron_cfg(config)
 
     @classmethod
     def nvlink_domain_span(cls, config: PolicyConfig) -> int:
-        """Largest GPU group requiring full NVLink connectivity."""
-        megatron_cfg = cls.effective_megatron_cfg(config)
+        """Largest GPU group requiring full NVLink connectivity.
+
+        Colocated reshard hosts a second, inference-layout model on the same ranks.
+        """
+        layouts = [cls.effective_megatron_cfg(config)]
+        if config["generation"]["colocated"]["enabled"]:
+            inference_mcfg = dedicated_inference_megatron_cfg(config)
+            if inference_mcfg is not None:
+                layouts.append(inference_mcfg)
         return max(
-            megatron_cfg["tensor_model_parallel_size"]
-            * megatron_cfg["context_parallel_size"],
-            megatron_cfg.get("expert_tensor_parallel_size", 1)
-            * megatron_cfg.get("expert_model_parallel_size", 1),
+            max(
+                mcfg["tensor_model_parallel_size"] * mcfg["context_parallel_size"],
+                mcfg.get("expert_tensor_parallel_size", 1)
+                * mcfg.get("expert_model_parallel_size", 1),
+            )
+            for mcfg in layouts
         )
 
     @classmethod
@@ -138,6 +148,8 @@ class MegatronGeneration(GenerationInterface):
                 )
         # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
+        # Installed by setup via create_weight_synchronizer.
+        self.weight_synchronizer: Optional["WeightSynchronizer"] = None
 
         if policy is not None:
             # Reuse the existing training policy.
@@ -154,8 +166,6 @@ class MegatronGeneration(GenerationInterface):
             **config,
             "megatron_cfg": self.effective_megatron_cfg(config),
         }
-        # Activation checkpointing is not compatible or useful in inference.
-        self._policy_config["megatron_cfg"]["activation_checkpointing"] = False
         # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.
         self.init_cluster_placement_groups(cluster, self._policy_config)
         self._policy = Policy(
@@ -182,7 +192,10 @@ class MegatronGeneration(GenerationInterface):
     @property
     def uses_native_refit(self) -> bool:
         """Whether non-colocated refit uses Megatron Core's native mechanism."""
-        return self.refit_impl == "mcore"
+        return (
+            self.refit_impl == "mcore"
+            and self.cfg.get("refit_transport") != "nccl_reshard"
+        )
 
     def init_collective(
         self,
@@ -191,6 +204,7 @@ class MegatronGeneration(GenerationInterface):
         world_size: int,
         *,
         train_world_size: int,
+        refit_backend: Optional[str] = None,
     ) -> list[ray.ObjectRef]:
         """Join the configured refit collective after the training ranks.
 
@@ -199,17 +213,22 @@ class MegatronGeneration(GenerationInterface):
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             train_world_size: Number of training workers (used to offset ranks).
+            refit_backend: Optional override for the native MCore copy-service
+                backend. Ignored by Bridge packed refit.
 
         Returns:
             List of Ray ObjectRefs for the collective init futures.
         """
         if self.uses_native_refit:
+            backend = (
+                refit_backend or self.cfg["mcore_generation_config"]["refit_backend"]
+            )
             return self._policy.init_collective_mcore_generation(
                 ip,
                 port,
                 world_size,
                 rank_offset=train_world_size,
-                refit_backend=self.cfg["mcore_generation_config"]["refit_backend"],
+                refit_backend=backend,
             )
         return self._policy.init_collective(
             ip,
@@ -229,6 +248,7 @@ class MegatronGeneration(GenerationInterface):
 
     def init_nccl_reshard_comm_group(
         self,
+        *,
         pp_ips: list[str],
         pp_ports: list[int],
         pp_size: int,
@@ -245,7 +265,7 @@ class MegatronGeneration(GenerationInterface):
             sub_world_size=sub_world_size,
         )
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict[str, Any]) -> None:
         """Build each inference worker's HF-to-Megatron M-to-N receive map."""
         futures = self._policy.worker_group.run_all_workers_single_data(
             "prepare_nccl_reshard_generation_refit_info", refit_info=refit_info

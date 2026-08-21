@@ -14,10 +14,9 @@
 
 import gc
 from copy import deepcopy
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
-import ray
 import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -27,6 +26,9 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.weight_sync.megatron_weight_synchronizer import (
+    MegatronWeightSynchronizer,
+)
 
 model_name = "Qwen/Qwen3-0.6B"
 
@@ -73,6 +75,32 @@ def test_megatron_generation_dispatches_refit_implementation(refit_impl):
         generation._policy.init_collective_mcore_generation.assert_not_called()
 
 
+def test_megatron_generation_m2n_transport_overrides_native_refit() -> None:
+    generation = object.__new__(MegatronGeneration)
+    generation.refit_impl = "mcore"
+    generation.cfg = {
+        "refit_transport": "nccl_reshard",
+        "mcore_generation_config": {
+            "refit_impl": "mcore",
+            "refit_backend": "nccl",
+        },
+    }
+    generation._policy = MagicMock()
+    generation._owns_policy = False
+
+    generation.init_collective("127.0.0.1", 1234, 4, train_world_size=2)
+
+    assert not generation.uses_native_refit
+    generation._policy.init_collective.assert_called_once_with(
+        "127.0.0.1",
+        1234,
+        4,
+        train_world_size=2,
+        rank_offset=2,
+    )
+    generation._policy.init_collective_mcore_generation.assert_not_called()
+
+
 def test_megatron_generation_forwards_m2n_refit_lifecycle() -> None:
     generation = object.__new__(MegatronGeneration)
     generation._policy = MagicMock()
@@ -90,9 +118,10 @@ def test_megatron_generation_forwards_m2n_refit_lifecycle() -> None:
         train_ranks_per_stage=2,
         sub_world_size=4,
     ) == ["init"]
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        get = MagicMock(return_value=["prepare"])
-        monkeypatch.setattr(ray, "get", get)
+    with patch(
+        "nemo_rl.models.generation.megatron.megatron_generation.ray.get",
+        return_value=["prepare"],
+    ) as get:
         generation.prepare_nccl_reshard_refit_info({"layer_names": []})
         get.assert_called_once_with(["prepare"])
     assert generation.nccl_reshard_refit() == ["refit"]
@@ -212,6 +241,7 @@ basic_megatron_test_config: PolicyConfig = {
             "clip_grad": 1.0,
             "optimizer_cpu_offload": False,
             "optimizer_offload_fraction": 0.0,
+            "overlap_cpu_optimizer_d2h_h2d": False,
         },
         "scheduler": {
             "start_weight_decay": 0.01,
@@ -247,7 +277,6 @@ basic_megatron_test_config: PolicyConfig = {
             "resources": {"gpus_per_node": None, "num_nodes": None},
         },
         "mcore_generation_config": {
-            "async_engine": False,
             "max_model_len": 1024,
             "cuda_graph_impl": "local",
             "inference_cuda_graph_scope": "block",
@@ -488,7 +517,6 @@ def test_megatron_policy_generation(
 async def test_megatron_policy_generation_async(cluster, test_input_data, tokenizer):
     """Standalone Megatron async generation."""
     config = deepcopy(basic_megatron_test_config)
-    config["generation"]["mcore_generation_config"]["async_engine"] = True
     mg = None
     try:
         mg = MegatronGeneration(config=config, tokenizer=tokenizer, cluster=cluster)
@@ -611,34 +639,16 @@ def test_megatron_generation_non_colocated_refit(
             skip_weight_load=skip_weight_load,
         )
 
-        # init the refit collective on both sides.
-        ip, port = policy_cluster_separate.get_master_address_and_port()
-        train_world_size = policy_cluster_separate.world_size()
-        world_size = train_world_size + generation_cluster.world_size()
-        if refit_impl == "mcore":
-            futures_train = policy.init_collective_mcore_generation(
-                ip,
-                port,
-                world_size,
-                rank_offset=0,
-                refit_backend=config["generation"]["mcore_generation_config"][
-                    "refit_backend"
-                ],
-            )
-        else:
-            futures_train = policy.init_collective(
-                ip, port, world_size, train_world_size=train_world_size
-            )
-        futures_inference = mg.init_collective(
-            ip,
-            port,
-            world_size,
-            train_world_size=train_world_size,
+        # Wire the refit collective the way grpo.setup does: through the
+        # weight synchronizer, which refit_policy_generation dispatches to.
+        mg.weight_synchronizer = MegatronWeightSynchronizer(
+            policy,
+            mg,
+            colocated=False,
+            train_cluster=policy_cluster_separate,
+            inference_cluster=generation_cluster,
         )
-        ray.get(futures_train + futures_inference)
-        if refit_impl == "bridge":
-            state_dict_info = policy.prepare_refit_info()
-            mg.prepare_refit_info(state_dict_info)
+        mg.weight_synchronizer.init_communicator()
 
         # refit the inference engine from the training weights, then generate
         refit_policy_generation(policy, mg, False)

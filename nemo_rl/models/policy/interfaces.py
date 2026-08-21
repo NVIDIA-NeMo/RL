@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -173,6 +173,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         *,
         train_world_size: int,
         rank_offset: int = 0,
+        nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -226,7 +227,11 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -247,5 +252,12 @@ class ColocatablePolicyInterface(PolicyInterface):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_for_lp_inference(self) -> None:
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put the policy in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave grad buffers and optimizer state on CUDA
+                because a train step is already open and its accumulated
+                gradients must survive this call.
+        """
         pass
