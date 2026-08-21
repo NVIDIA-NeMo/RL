@@ -297,6 +297,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     class ReasoningParserManager:
         import_reasoning_parser = MagicMock()
 
+    # The server resolves the chat template through vLLM's own loader, so the
+    # stub tree needs this leaf even though the test does not assert on it.
+    make_module(
+        "vllm.entrypoints.chat_utils",
+        load_chat_template=MagicMock(return_value=None),
+    )
     make_module(
         "vllm.entrypoints.openai.chat_completion.protocol",
         ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
@@ -734,6 +740,7 @@ def get_basic_megatron_test_config(
                 "clip_grad": 1.0,
                 "optimizer_cpu_offload": False,
                 "optimizer_offload_fraction": 0.0,
+                "overlap_cpu_optimizer_d2h_h2d": False,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -1696,7 +1703,6 @@ def test_vllm_http_server(cluster, tokenizer):
         top_p=generation_config["top_p"],
         # We want to test the actual train flow and how this is used. So we need to get logprobs here.
         logprobs=True,
-        return_tokens_as_token_ids=True,
         max_tokens=1,
     )
 
@@ -1705,6 +1711,21 @@ def test_vllm_http_server(cluster, tokenizer):
     # Generate and check result
     response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body)
     actual_result = response.json()
+
+    expected_prompt_token_ids = [
+        151644,
+        872,
+        198,
+        1830,
+        311,
+        220,
+        20,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+    ]
 
     # This result assumes this exact model. The expected result here is what the full result looks like before we standardize.
     expected_result = {
@@ -1725,6 +1746,8 @@ def test_vllm_http_server(cluster, tokenizer):
                     # vLLM 0.25 omits tool_calls when empty and dropped
                     # reasoning_content in favor of reasoning.
                     "reasoning": None,
+                    "prompt_token_ids": expected_prompt_token_ids,
+                    "generation_token_ids": [151667],
                 },
                 "logprobs": {
                     "content": [
@@ -1771,10 +1794,25 @@ def test_vllm_http_server(cluster, tokenizer):
         message = d["choices"][0]["message"]
         for key in ("reasoning", "reasoning_content"):
             message.pop(key, None)
+        message.pop("generation_log_probs", None)
 
         return d
 
+    assert actual_result["choices"][0]["message"]["generation_log_probs"] == [
+        actual_result["choices"][0]["logprobs"]["content"][0]["logprob"]
+    ]
     assert _standardize(expected_result) == _standardize(actual_result)
+
+    # The server default requests token IDs, so top_logprobs=None cannot provide
+    # the log probabilities required by the training response contract.
+    response = requests.post(
+        url=f"{base_urls[0]}/chat/completions",
+        json=body | {"top_logprobs": None},
+    )
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == 400
+    assert "top_logprobs" in error["message"]
 
     # Check that tokenization route works
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
@@ -1782,20 +1820,7 @@ def test_vllm_http_server(cluster, tokenizer):
     expected_result = {
         "count": 12,
         "max_model_len": 1024,
-        "tokens": [
-            151644,
-            872,
-            198,
-            1830,
-            311,
-            220,
-            20,
-            151645,
-            198,
-            151644,
-            77091,
-            198,
-        ],
+        "tokens": expected_prompt_token_ids,
         "token_strs": None,
     }
     assert expected_result == actual_result
@@ -2101,6 +2126,10 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
         url=f"{base_urls[0]}/chat/completions", json=body_with_reference_token_ids
     )
     vllm_http_server_result = response.json()
+    assert (
+        vllm_http_server_result["choices"][0]["message"]["prompt_token_ids"]
+        == initial_tokenized_query_ids
+    )
     vllm_http_server_generated_token = vllm_http_server_result["choices"][0][
         "logprobs"
     ]["content"][0]

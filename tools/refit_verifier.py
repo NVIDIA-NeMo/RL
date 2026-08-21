@@ -255,6 +255,7 @@ def setup_configs(args, tokenizer):
                 # Optimizer CPU offload settings
                 "optimizer_cpu_offload": False,
                 "optimizer_offload_fraction": 0.0,
+                "overlap_cpu_optimizer_d2h_h2d": False,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -651,7 +652,7 @@ def initialize_generation_with_policy(
         worker_init_timing_metrics[init_time_key] = generation_time
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
         worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
-        worker_init_timing_metrics["parallel_init_enabled"] = True
+        worker_init_timing_metrics["parallel_init_enabled"] = 1.0
     else:
         print(
             "  ⚙️  Using sequential worker initialization (colocated mode)",
