@@ -76,7 +76,6 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
-from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
@@ -132,6 +131,17 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.instrumentation import (
+    Bucket,
+    bucket_scope,
+    current_trace_carrier,
+    efficiency_span,
+    managed_span,
+    trace_fn,
+)
+from nemo_rl.telemetry.setup import get_telemetry
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
     Logger,
@@ -153,18 +163,6 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
-
-from nemo_rl.telemetry.instrumentation import (
-    Bucket,
-    bucket_scope,
-    current_trace_carrier,
-    efficiency_span,
-    managed_span,
-    trace_fn,
-)
-
-from nemo_rl.telemetry.setup import get_telemetry
-from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 # ===============================================================================
 # Configuration

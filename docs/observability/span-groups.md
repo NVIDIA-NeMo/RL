@@ -307,7 +307,7 @@ blanks today, so an empty trace is not read as a broken exporter:
 
 | Area | State |
 |---|---|
-| The `telemetry` extra in worker venvs | Ray actors run under `uv run --locked --extra <backend>`, which does not include nemo-lens, so `init_telemetry_worker` finds it missing and logs a warning. Driver spans and metrics are unaffected. See [worker environments](../../nemo_rl/telemetry/README.md#worker-environments) |
+| The `telemetry` extra in worker venvs | Ray actors run under `uv run --locked --extra <backend>`, which does not include nemo-lens, so `init_telemetry_worker` finds it missing and logs a warning. Driver spans and metrics are unaffected. See [worker environments](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/telemetry/README.md#worker-environments) |
 | SGLang / TRT-LLM / Megatron generation workers | uninstrumented — no `init_telemetry_worker` and no generation spans; only vLLM emits `rl.vllm.*`. (Policy and value workers do initialise telemetry, so their metrics and any future spans are wired.) |
 | `VllmGeneration.generate_async` | no span, so async rollouts and async validation have no generate breakdown under `rl.grpo.collect_rollouts` / `rl.grpo.evaluate` |
 | `SyncRolloutActor` | the sync data-plane counterpart of the async collector — uninstrumented, so its rollouts produce no spans |
