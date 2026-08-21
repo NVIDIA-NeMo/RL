@@ -47,6 +47,7 @@ from nemo_rl.environments.nemo_gym import (
 )
 from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -144,6 +145,7 @@ def main() -> None:
 
         config = OmegaConf.to_container(config, resolve=True)
         config = MasterConfig(**config)
+        materialize_vllm_video_config(config.policy, config.data)
         print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
