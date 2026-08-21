@@ -1333,6 +1333,51 @@ class TestAsyncTrajectoryCollector:
         assert status["errored"] is False
         assert status["running"] is False
 
+    def test_collection_loop_drains_final_worker_before_exhaustion(self):
+        """Natural exhaustion keeps final-batch workers alive until they drain."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        collector.dataloader = [{"b": 0}]
+
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        accepted_outputs = []
+
+        def _process_batch(batch):
+            def _worker():
+                worker_started.set()
+                release_worker.wait()
+                if collector.running:
+                    accepted_outputs.append(batch)
+                with collector._threads_lock:
+                    collector._inflight_threads.discard(threading.current_thread())
+
+            worker = threading.Thread(target=_worker)
+            with collector._threads_lock:
+                collector._inflight_threads.add(worker)
+            worker.start()
+
+        collector._process_batch = _process_batch
+        collection_thread = threading.Thread(target=collector._collection_loop)
+        collection_thread.start()
+
+        assert worker_started.wait(timeout=1)
+        assert collection_thread.is_alive()
+        status = collector.get_status()
+        assert status["running"] is True
+        assert status["data_exhausted"] is False
+        assert status["inflight_workers"] == 1
+
+        release_worker.set()
+        collection_thread.join(timeout=1)
+
+        assert not collection_thread.is_alive()
+        assert accepted_outputs == [{"b": 0}]
+        status = collector.get_status()
+        assert status["running"] is False
+        assert status["data_exhausted"] is True
+        assert status["inflight_workers"] == 0
+
     @pytest.mark.asyncio
     async def test_drain_payload_metrics_returns_collector_interval(self, monkeypatch):
         collector = self.create_local_collector()

@@ -426,6 +426,14 @@ class AsyncTrajectoryCollector:
             traceback.print_exc()
             self._mark_collection_failed(e)
         finally:
+            if dataloader_exhausted:
+                # Workers use ``running`` to decide whether replay-buffer writes
+                # may continue, so natural exhaustion must drain before clearing it.
+                print(
+                    "⏳ Dataloader exhausted; waiting for in-flight generation "
+                    "workers to finish..."
+                )
+                self.wait_for_pending_generations()
             self.running = False
             if dataloader_exhausted:
                 self.data_exhausted = True
