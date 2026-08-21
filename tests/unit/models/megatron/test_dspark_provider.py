@@ -100,6 +100,9 @@ class _CheckpointIdentity(nn.Identity):
 
 def _provider_inputs() -> dict[str, object]:
     generator = torch.Generator().manual_seed(271828)
+    target_logits = torch.randn(
+        2, 3, 9, generator=generator, dtype=torch.float64, requires_grad=True
+    )
     return {
         "draft_hidden": torch.randn(
             2, 3, 5, generator=generator, dtype=torch.float64, requires_grad=True
@@ -107,9 +110,8 @@ def _provider_inputs() -> dict[str, object]:
         "target_output_weight": torch.randn(
             9, 5, generator=generator, dtype=torch.float64, requires_grad=True
         ),
-        "target_logits": torch.randn(
-            2, 3, 9, generator=generator, dtype=torch.float64, requires_grad=True
-        ),
+        "target_logits": target_logits,
+        "hard_labels": target_logits.detach().argmax(dim=-1),
         "previous_token_ids": torch.tensor([[2, 2, 4], [2, 6, 2]]),
         "valid_mask": torch.tensor([[True, True, False], [True, False, True]]),
         "slot_bins": torch.tensor([[0, 1, 2], [0, 1, 2]]),

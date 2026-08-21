@@ -61,6 +61,7 @@ def _dense_loss(
     hidden: torch.Tensor,
     output_weight: torch.Tensor,
     target_logits: torch.Tensor,
+    hard_labels: torch.Tensor,
     previous_token_ids: torch.Tensor,
     valid_mask: torch.Tensor,
     slot_bins: torch.Tensor,
@@ -74,10 +75,9 @@ def _dense_loss(
     corrected_logits = hidden @ output_weight.T + F.linear(embeddings, markov_w2)
     target_probs = torch.softmax(target_logits.detach().float(), dim=-1)
     draft_probs = torch.softmax(corrected_logits.float(), dim=-1)
-    teacher_labels = target_logits.detach().argmax(dim=-1)
     ce_rows = (
         -torch.log_softmax(corrected_logits.float(), dim=-1)
-        .gather(-1, teacher_labels.unsqueeze(-1))
+        .gather(-1, hard_labels.unsqueeze(-1))
         .squeeze(-1)
     )
     tv_rows = 0.5 * (target_probs - draft_probs).abs().sum(dim=-1)
@@ -161,6 +161,7 @@ def _run_tp2_provider_objective(rank: int, world_size: int) -> None:
         1, generator=generator, device=device, dtype=torch.bfloat16
     )
     previous_token_ids = torch.tensor([[2, 2, 4], [2, 7, 2]], device=device)
+    hard_labels = torch.tensor([[1, 3, 5], [7, 9, 11]], device=device)
     valid_mask = torch.tensor([[True, True, False], [True, False, True]], device=device)
     slot_bins = torch.tensor([[0, 1, 2], [0, 1, 2]], device=device)
     loss_weights = (1.5, 0.375, 2.25)
@@ -174,6 +175,7 @@ def _run_tp2_provider_objective(rank: int, world_size: int) -> None:
         hidden=reference_hidden,
         output_weight=output_weight,
         target_logits=target_logits,
+        hard_labels=hard_labels,
         previous_token_ids=previous_token_ids,
         valid_mask=valid_mask,
         slot_bins=slot_bins,
@@ -214,6 +216,7 @@ def _run_tp2_provider_objective(rank: int, world_size: int) -> None:
         draft_hidden=actual_hidden,
         target_output_weight=local_output_weight,
         target_logits=local_target_logits,
+        hard_labels=hard_labels,
         previous_token_ids=previous_token_ids,
         valid_mask=valid_mask,
         slot_bins=slot_bins,
@@ -285,6 +288,7 @@ def _run_dp2_raw_additive_stats(rank: int, world_size: int) -> None:
         target_output_weight=torch.randn((8, 4), generator=generator, device=device),
         markov_w1=torch.randn((8, 2), generator=generator, device=device),
         markov_w2=torch.randn((8, 2), generator=generator, device=device),
+        hard_labels=torch.tensor([[0, 1, 2]], device=device),
         previous_token_ids=torch.tensor([[1, 3, 5]], device=device),
         confidence_logits=torch.randn((1, 3), generator=generator, device=device),
         valid_mask=valid_mask,
@@ -396,6 +400,7 @@ def _run_tp2_tv_only_gradient(rank: int, world_size: int) -> None:
         draft_hidden=actual_hidden,
         target_output_weight=full_output_weight[vocab_start:vocab_end],
         target_logits=full_target_logits[..., vocab_start:vocab_end],
+        hard_labels=torch.zeros((1, 1), device=device, dtype=torch.long),
         previous_token_ids=torch.zeros((1, 1), device=device, dtype=torch.long),
         valid_mask=torch.ones((1, 1), device=device, dtype=torch.bool),
         slot_bins=torch.zeros((1, 1), device=device, dtype=torch.long),
@@ -418,6 +423,7 @@ def _run_tp2_tv_only_gradient(rank: int, world_size: int) -> None:
         draft_hidden=empty_hidden,
         target_output_weight=full_output_weight[vocab_start:vocab_end],
         target_logits=full_target_logits[..., vocab_start:vocab_end],
+        hard_labels=torch.full((1, 1), -1, device=device, dtype=torch.long),
         previous_token_ids=torch.full((1, 1), -1, device=device, dtype=torch.long),
         valid_mask=torch.zeros((1, 1), device=device, dtype=torch.bool),
         slot_bins=torch.zeros((1, 1), device=device, dtype=torch.long),
@@ -451,6 +457,7 @@ def _run_tp2_global_acceptance_overlap(rank: int, world_size: int) -> None:
         target_output_weight=output_weight,
         markov_w1=torch.zeros(4, 1, device=device, requires_grad=True),
         markov_w2=torch.zeros(local_vocab_size, 1, device=device, requires_grad=True),
+        hard_labels=torch.zeros(1, 1, dtype=torch.long, device=device),
         previous_token_ids=torch.zeros(1, 1, dtype=torch.long, device=device),
         confidence_logits=confidence_logits,
         valid_mask=torch.ones(1, 1, dtype=torch.bool, device=device),
@@ -512,6 +519,7 @@ def _run_tp2_split_vocab_mapping_and_bounds(rank: int, world_size: int) -> None:
         "draft_hidden": torch.randn(1, 2, 3, generator=generator, device=device),
         "target_output_weight": mapped_target_weight[draft_vocab_start:draft_vocab_end],
         "target_logits": mapped_target_logits[..., draft_vocab_start:draft_vocab_end],
+        "hard_labels": torch.tensor([[0, 1]], device=device),
         "previous_token_ids": torch.tensor([[10, 0]], device=device),
         "valid_mask": torch.ones(1, 2, dtype=torch.bool, device=device),
         "slot_bins": torch.tensor([[0, 1]], device=device),
@@ -529,6 +537,13 @@ def _run_tp2_split_vocab_mapping_and_bounds(rank: int, world_size: int) -> None:
                 "previous_token_ids": torch.tensor(
                     [[target_vocab_size, 0]], device=device
                 ),
+            }
+        )
+    with pytest.raises(ValueError, match="hard_labels"):
+        provider.objective_stats(
+            **{
+                **common,
+                "hard_labels": torch.tensor([[draft_vocab_size, 0]], device=device),
             }
         )
 
@@ -641,7 +656,7 @@ def _run_tp2_provider_checkpoint(
         )
 
 
-def _run_tp2_teacher_argmax_tie(rank: int, world_size: int) -> None:
+def _run_tp2_explicit_sampled_label(rank: int, world_size: int) -> None:
     tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
     full_target_logits = torch.tensor(
@@ -667,6 +682,7 @@ def _run_tp2_teacher_argmax_tie(rank: int, world_size: int) -> None:
             device=device,
             requires_grad=True,
         ),
+        hard_labels=torch.tensor([[1]], dtype=torch.long, device=device),
         previous_token_ids=torch.zeros(1, 1, dtype=torch.long, device=device),
         confidence_logits=None,
         valid_mask=torch.ones(1, 1, dtype=torch.bool, device=device),
@@ -725,6 +741,7 @@ def _run_tp2_provider_preflight(rank: int, world_size: int, case: str) -> None:
             draft_hidden=torch.ones(1, 2, hidden_size, device=device),
             target_output_weight=target_output_weight,
             target_logits=torch.ones(1, 2, local_vocab_size, device=device),
+            hard_labels=torch.zeros(1, 2, dtype=torch.long, device=device),
             previous_token_ids=torch.zeros(1, 2, dtype=torch.long, device=device),
             valid_mask=torch.ones(1, 2, dtype=torch.bool, device=device),
             slot_bins=torch.tensor([[0, 1]], device=device),
@@ -760,6 +777,7 @@ def _run_tp2_provider_group_drift(rank: int, world_size: int) -> None:
                 device=device,
             ),
             target_logits=torch.ones(1, 2, vocab_size, device=device),
+            hard_labels=torch.zeros(1, 2, dtype=torch.long, device=device),
             previous_token_ids=torch.zeros(1, 2, dtype=torch.long, device=device),
             valid_mask=torch.ones(1, 2, dtype=torch.bool, device=device),
             slot_bins=torch.tensor([[0, 1]], device=device),
@@ -797,10 +815,10 @@ def test_dp2_normalized_gradient_uses_global_counts(distributed_test_runner) -> 
     distributed_test_runner(_run_dp2_global_normalization_gradient, world_size=2)
 
 
-def test_tp2_teacher_argmax_tie_uses_lowest_selected_vocab_id(
+def test_tp2_hard_ce_uses_explicit_sampled_label(
     distributed_test_runner,
 ) -> None:
-    distributed_test_runner(_run_tp2_teacher_argmax_tie, world_size=2)
+    distributed_test_runner(_run_tp2_explicit_sampled_label, world_size=2)
 
 
 @pytest.mark.parametrize("case", ["shape", "dtype", "device"])
