@@ -301,6 +301,7 @@ def test_qwen3_8b_dflash_recipe_pairs_public_drafter_with_exact_target() -> None
     config = MasterConfig(**raw)
 
     assert config.policy["model_name"] == "Qwen/Qwen3-8B"
+    assert config.policy["megatron_cfg"]["tensor_model_parallel_size"] == 2
     assert isinstance(config.policy["draft"], DFlashDraftConfig)
     assert config.policy["draft"].model_name == "z-lab/Qwen3-8B-DFlash-b16"
     assert config.policy["draft"].target_hidden_state_layer_ids == [1, 9, 17, 25, 33]

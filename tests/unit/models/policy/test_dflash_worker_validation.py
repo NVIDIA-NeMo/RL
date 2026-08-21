@@ -20,12 +20,21 @@ import pytest
 from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
 from nemo_rl.models.policy.draft_config import DFlashDraftConfig, DSparkDraftConfig
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
+    MegatronPolicyWorkerImpl,
     _all_reduce_draft_normalization_counts,
     _validate_draft_training_entrypoint,
     _validate_draft_training_setup,
 )
 
 pytestmark = pytest.mark.mcore
+
+
+def test_optional_draft_config_does_not_start_update_probe() -> None:
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {}
+    worker.draft_model = None
+
+    assert worker._maybe_start_draft_update_probe() is None
 
 
 def _provider():
@@ -94,6 +103,24 @@ def test_dflash_setup_allows_training_without_generation() -> None:
             num_layers=4,
         ),
     )
+
+
+def test_dflash_setup_rejects_unsupported_target_tp() -> None:
+    with pytest.raises(
+        ValueError,
+        match="tensor_model_parallel_size must be 2",
+    ):
+        _validate_draft_training_setup(
+            draft_provider=_provider(),
+            config={"sequence_packing": {"enabled": False}, "generation": None},
+            model_cfg=SimpleNamespace(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                context_parallel_size=1,
+                sequence_parallel=False,
+                num_layers=4,
+            ),
+        )
 
 
 def test_dflash_normalization_counts_move_to_nccl_device_before_reduce() -> None:
