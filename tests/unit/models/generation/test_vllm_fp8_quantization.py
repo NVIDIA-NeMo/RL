@@ -519,6 +519,56 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
 
+def test_multi_gpu_fp8_patches_ray_v2_worker_before_model_load(
+    fp8_module, monkeypatch
+):
+    """RayExecutorV2 workers must receive the FP8 patches before initialization."""
+    from vllm import envs
+    from vllm.v1.executor.abstract import Executor
+    from vllm.v1.executor.ray_executor import RayDistributedExecutor
+    from vllm.v1.executor.ray_executor_v2 import RayExecutorV2, RayWorkerProc
+
+    fp8 = fp8_module
+    events = []
+    fp8_config = fp8.FP8Config(model_parallel_size=2)
+    vllm_config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(distributed_executor_backend="ray")
+    )
+
+    monkeypatch.delenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", raising=False)
+    assert envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND is True
+    assert Executor.get_class(vllm_config) is RayExecutorV2
+
+    def fake_apply_fp8_patches(_worker, config):
+        events.append(("apply_fp8_patches", config))
+        fp8.fp8_patches_applied = True
+
+    def fake_initialize_worker(_worker, *_args, **_kwargs):
+        events.append(("initialize_worker", None))
+        assert fp8.fp8_patches_applied, (
+            "RayExecutorV2 started worker/model initialization before NeMo-RL "
+            "installed its FP8 patches"
+        )
+
+    monkeypatch.setattr(fp8, "apply_fp8_patches", fake_apply_fp8_patches)
+    monkeypatch.setattr(RayWorkerProc, "initialize_worker", fake_initialize_worker)
+    # Record the V1 method with monkeypatch so the direct class assignment made by
+    # monkey_patch_vllm_ray_executor() is undone even when this regression test fails.
+    monkeypatch.setattr(
+        RayDistributedExecutor,
+        "collective_rpc",
+        RayDistributedExecutor.collective_rpc,
+    )
+
+    fp8.monkey_patch_vllm_ray_executor(fp8_config)
+    RayWorkerProc.initialize_worker(object(), 0, {})
+
+    assert events == [
+        ("apply_fp8_patches", fp8_config),
+        ("initialize_worker", None),
+    ]
+
+
 def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     """Refit runs this every step; rebinding .data each time fragments memory.
 
