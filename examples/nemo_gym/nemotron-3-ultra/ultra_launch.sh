@@ -60,6 +60,12 @@ set -euo pipefail
 #   NUM_SPECULATIVE_TOKENS=5               MTP speculative tokens
 #   MAX_NUM_BATCHED_TOKENS=8480            vLLM max batched tokens (MTP)
 #   NRL_MAX_STEPS=                         Override grpo.max_num_steps
+#   NRL_ENTRYPOINT=                        Driver script to `uv run`; defaults to
+#                                          ./examples/nemo_gym/run_grpo_nemo_gym.py.
+#                                          Set to an ABSOLUTE path under the
+#                                          mounted checkout for entrypoints the
+#                                          container image does not carry, e.g.
+#                                          run_grpo_single_controller.py.
 #   EXTRA_MOUNTS=                          Comma-separated host:container pairs
 #   USE_SNAPSHOT=1                         Snapshot source tree at submission
 #   DRY_RUN=0                              1 to print TRAIN_CMD and exit
@@ -875,7 +881,7 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+uv run ${NRL_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \

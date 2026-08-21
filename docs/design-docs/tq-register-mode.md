@@ -294,6 +294,20 @@ so a CUDA allocation registers as `cuda:N` and inherits that GPU's affine rail
 from the topology every other transfer already uses — no separate GDR transport
 configuration.
 
+**One knob is not optional.** Mooncake chooses between two GPU-registration
+routes by environment variable rather than by probing, and `WITH_NVIDIA_PEERMEM`
+(no `MC_` prefix) defaults to **true** in the pinned wheel
+(`mooncake-common/src/environ.cpp:216`) — that route calls `ibv_reg_mr()` on the
+GPU pointer and needs the `nvidia_peermem` kernel module. These GB200/GB300
+nodes have no such module (`/proc/modules` has no `nvidia_peermem`), so every
+CUDA registration fails with `ERR_CONTEXT` (-202) at
+`rdma_transport.cpp:257`. Setting it to `0` selects the DMA-BUF route
+(`cuMemGetHandleForAddressRange`), which is the supported path on this
+generation and works. `transfer_queue_env` therefore sets
+`WITH_NVIDIA_PEERMEM=0` when a run registers GPU memory *and* the module is
+absent, leaving hosts that do have it on upstream's behaviour. Note the upstream
+docs claim the opposite default; the code is what runs.
+
 `use_gdr` is resolved **per process**, not per cluster: it takes effect where
 `torch.cuda.is_initialized()`, so a CPU-only client (the SingleController
 driver) keeps host receive buffers while GPU workers receive into HBM. A source
@@ -325,11 +339,25 @@ every write-back — under register mode that copy was pure loss.
   the sharpest cost of this design and the first thing to fix if the
   measurement below says proceed.
 
+### Measured
+
 Coverage is in `tests/unit/data_plane/test_tq_register_mode.py`, which fakes the
 Transfer Engine (`memmove` for a one-sided read) so the publish / group / pull /
 release paths run without an RDMA NIC; the GDR cases assert on the transfer
 descriptors — source and destination both HBM addresses — since a real transfer
-needs a real NIC.
+needs a real NIC. `tools/smoke_register_mode_gdr.py` is the real-NIC counterpart:
+two live engines in one process, distinct segments, byte comparison after the
+pull.
+
+On a GB300 node (RoCE, `mlx5_8`; `mlx5_17` present but with no active port):
+
+| Path | Result |
+|---|---|
+| unit tests, CPU node | 43 passed |
+| unit tests incl. the 3 CUDA cases, GPU node | 13 passed |
+| real engine, host-resident sources | PASS — 4 tensor keys + a non-tensor payload, byte-exact |
+| real engine, GDR, mooncake defaults | FAIL, `ERR_CONTEXT` (-202) — the peermem route above |
+| real engine, GDR, DMA-BUF route | PASS — published base is a CUDA VA, every key returns `device=cuda` and byte-exact |
 
 ## Effort estimate (original, pre-implementation)
 

@@ -158,6 +158,7 @@ def clean_env(monkeypatch):
     monkeypatch.setattr(os, "environ", dict(os.environ))
     monkeypatch.delenv("MC_ENABLE_DEST_DEVICE_AFFINITY", raising=False)
     monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
+    monkeypatch.delenv("WITH_NVIDIA_PEERMEM", raising=False)
     monkeypatch.setattr(tq_env, "_engine_already_imported", lambda: None)
 
 
@@ -204,6 +205,56 @@ def test_not_applied_to_simple_backend(clean_env, fake_fabric):
     fake_fabric({"mlx5_0": "Ethernet"})
     tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "simple"})
     assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
+
+
+# ── GPU-memory registration route ────────────────────────────────────────────
+#
+# Mooncake picks between ibv_reg_mr()-on-GPU-memory (needs the nvidia_peermem
+# module) and DMA-BUF by env var, not by probing. Its default is the peermem
+# route; on a host without that module every CUDA registration then fails with
+# ERR_CONTEXT (-202), which is what these nodes do.
+
+
+def _register_mode_cfg(**block) -> dict:
+    return {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "transfer_engine",
+        "claim_meta_poll_interval_s": 0.5,
+        "transfer_engine": block,
+    }
+
+
+def test_dmabuf_selected_for_gdr_when_peermem_is_absent(
+    clean_env, fake_fabric, monkeypatch
+):
+    """Register mode puts GPU memory on the wire, so the route must be viable."""
+    fake_fabric({"mlx5_0": "Ethernet"})
+    monkeypatch.setattr(tq_env, "nvidia_peermem_loaded", lambda: False)
+    tq_env.configure_engine_env(_register_mode_cfg())
+    assert os.environ["WITH_NVIDIA_PEERMEM"] == "0"
+
+
+def test_peermem_left_alone_when_the_module_is_present(
+    clean_env, fake_fabric, monkeypatch
+):
+    """A host that has the module keeps upstream's behaviour."""
+    fake_fabric({"mlx5_0": "Ethernet"})
+    monkeypatch.setattr(tq_env, "nvidia_peermem_loaded", lambda: True)
+    tq_env.configure_engine_env(_register_mode_cfg())
+    assert "WITH_NVIDIA_PEERMEM" not in os.environ
+
+
+def test_no_gpu_registration_leaves_the_route_untouched(
+    clean_env, fake_fabric, monkeypatch
+):
+    """CPU-only runs never register GPU memory, so the default cannot bite."""
+    fake_fabric({"mlx5_0": "Ethernet"})
+    monkeypatch.setattr(tq_env, "nvidia_peermem_loaded", lambda: False)
+    tq_env.configure_engine_env(_register_mode_cfg(use_gdr=False))
+    assert "WITH_NVIDIA_PEERMEM" not in os.environ
+    tq_env.configure_engine_env(_mooncake_cfg())  # mooncake_cpu: GDR is opt-in
+    assert "WITH_NVIDIA_PEERMEM" not in os.environ
 
 
 def test_raises_when_the_engine_was_already_imported(engine_imported, fake_fabric):

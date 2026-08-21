@@ -1,0 +1,66 @@
+# =============================================================================
+# Nemotron 3 NANO v3 (30B-A3B) — SWE Teacher — Qwen3-MoE parallelism (GB200)
+# =============================================================================
+# Same Nano SWE smoke as nano_swe_teacher.yaml, but with the TRAIN/GEN mesh
+# mirrored from the tuned Qwen3-30B-A3B MoE SWE recipe (both are ~30B MoE, async
+# GRPO, non-colocated), adapted to GB200 NVL72 (4 GPUs/node).
+#
+# Reference: examples/nemo_gym/grpo_qwen3_30ba3b_thinking_swe1.yaml (16n×8g H100)
+#   Train:  TP2 · PP2 · CP4  (no expert-parallel), MoE router frozen
+#   Gen:    vLLM TP2, non-colocated
+#
+# GB200 adaptation (minimal, DP1):
+#   Train 4 nodes (16 GPUs) = TP2·PP2·CP4·DP1
+#   Gen   2 nodes ( 8 GPUs) = vLLM TP2  -> 4 engines
+#   Total 6 nodes            (set SEGMENT_SIZE=6 so sbatch keeps it on one rack)
+# =============================================================================
+
+defaults:
+  - nano_swe_teacher.yaml
+
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 2     # Qwen3: 2
+    pipeline_model_parallel_size: 2   # Qwen3: 2  (nano .inc had 1)
+    context_parallel_size: 4          # Qwen3: 4
+    expert_model_parallel_size: 1     # Qwen3: no EP  (nano .inc had 8)
+    # swe_teacher.yaml uses flex/hybridep, whose deep_ep kernel REQUIRES EP>=2
+    # (AssertionError "hybrid-ep kernel ... at least 2 ranks, but got 1"). With EP1
+    # use the proven Nano alltoall dispatcher.
+    moe_token_dispatcher_type: "alltoall"
+
+    # MoE router settings from the Qwen3 reference
+    freeze_moe_router: true
+    moe_router_bias_update_rate: 0.001
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2         # Qwen3: 2  (nano .inc had 4)
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 2                  # overridden by launcher (NUM_GEN_NODES)
+
+# TransferQueue data plane. Defined here so the children can inherit it, but
+# note WHICH entrypoint actually honours it:
+#   run_grpo_nemo_gym.py + async_grpo.enabled=true  -> IGNORES this block. The
+#     async trainer builds the in-memory ReplayBuffer, not the TQ-backed
+#     TQReplayBuffer (nemo_rl/algorithms/async_utils/replay_buffer.py).
+#   run_grpo_nemo_gym.py + async_grpo.enabled=false -> honoured by grpo_train_sync.
+#   run_grpo_single_controller.py                   -> honoured, and REQUIRED
+#     (the entrypoint raises when data_plane.enabled is false). This is the
+#     async + TQ combination — see nano_swe_teacher_sc.yaml.
+# Leaving it enabled on this async config is a harmless no-op; it is kept so the
+# child configs get the same storage settings.
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "simple"
+  storage_capacity: 1000000
+  num_storage_units: 2
+  claim_meta_poll_interval_s: 0.5
+  global_segment_size: 549755813888   # 512 GiB (only used by mooncake_cpu backend)
+  local_buffer_size:   68719476736    # 64 GiB  (only used by mooncake_cpu backend)

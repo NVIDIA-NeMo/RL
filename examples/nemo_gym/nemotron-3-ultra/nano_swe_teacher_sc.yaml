@@ -1,0 +1,60 @@
+# =============================================================================
+# Nano v3 30B-A3B SWE — SingleController async GRPO + HONOURED TransferQueue
+# =============================================================================
+# THE path that gives all three: SWE (NeMo-Gym) + async + real TQ mediation.
+# Runs via examples/run_grpo_single_controller.py (NOT run_grpo_nemo_gym.py) →
+# SingleControllerActor, which drives async rollout↔train through TQReplayBuffer
+# (dp_client.put_samples → TransferQueue). run_grpo_nemo_gym.py's async path
+# (async_grpo_train) uses an in-memory ReplayBuffer and does NOT honour TQ.
+#
+#   uv run ./examples/run_grpo_single_controller.py --config <this file> <overrides>
+#
+# data_plane.enabled=true is MANDATORY for this launcher (it raises otherwise);
+# inherited from nano_swe_teacher_qwen3mesh.yaml (impl: transfer_queue).
+#
+# Launch with nano_swe_sc.sh / nano_swe_sc_interactive.sh in this directory; see
+# docs/guides/nano-swe-transferqueue.md.
+# =============================================================================
+
+defaults:
+  - nano_swe_teacher_qwen3mesh.yaml   # SWE env + Nano mesh (TP2·PP2·CP4, alltoall, EP1) + data_plane:transfer_queue
+
+# SingleController's own async config (SC uses this, not grpo.async_grpo). Mirrors
+# examples/configs/grpo_math_1B_megatron_single_controller.yaml.
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1        # how far generation may run ahead of the trainer
+  recompute_kv_cache_after_weight_updates: false
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: 64          # DataPlane backpressure cap
+  diagnostics: false
+
+grpo:
+  # SC reads async_rl instead; run_grpo_single_controller.py raises unless the
+  # legacy block inherited from swe_teacher.yaml is nulled out.
+  async_grpo: null
+  val_period: 0                      # SC does not support validation yet
+
+checkpointing:
+  enabled: false                     # SC does not support checkpointing yet
+
+policy:
+  # run_grpo_single_controller.py reads policy.draft.enabled (speculative draft
+  # weights) unconditionally. The Ultra/SWE chain has no draft block; add it,
+  # disabled, or the run dies with KeyError: 'draft'.
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+loss_fn:
+  # SC initializes the reference model only when kl_penalty>0 (single_controller_utils/
+  # setup.py:277: init_reference_model = reference_policy_kl_penalty > 0), and its refit
+  # unconditionally swaps in reference_state_dict. The SWE base sets kl_penalty=0 →
+  # no reference model → AttributeError 'reference_state_dict'. Enable a small KL
+  # (matches grpo_math_1B_megatron_single_controller.yaml).
+  reference_policy_kl_penalty: 0.01

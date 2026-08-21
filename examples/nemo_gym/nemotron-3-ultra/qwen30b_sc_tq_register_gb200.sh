@@ -54,6 +54,10 @@ export HF_HOME="${HF_HOME:-/lustre/fsw/portfolios/nemotron/users/zhiyul/hf_cache
 export PERSISTENT_CACHE="${PERSISTENT_CACHE:-/scratch/fsw/portfolios/nemotron/users/zhiyul/persistent_cache}"
 export NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${PERSISTENT_CACHE}/megatron_ckpt_cache}"
 export NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
+# The mounted checkout is ahead of the image's fingerprint by construction (that
+# is the point of mounting it). This branch adds no dependencies, so the venvs
+# the image already built are still correct.
+export NRL_IGNORE_VERSION_MISMATCH="${NRL_IGNORE_VERSION_MISMATCH:-1}"
 
 # Ray actors import nemo_rl from the image, so overlay this checkout's copy —
 # the driver itself runs from ${CODE_DIR} (ray.sub sets --container-workdir to

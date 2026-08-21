@@ -72,12 +72,40 @@ def fabric_is_roce_only() -> bool:
     return "Ethernet" in layers and "InfiniBand" not in layers
 
 
-def _wanted_engine_env() -> dict[str, str]:
-    """The ``MC_*`` values this backend needs, for this host's fabric."""
+def nvidia_peermem_loaded() -> bool:
+    """True when the ``nvidia_peermem`` kernel module is present.
+
+    Mooncake's GPU-memory registration takes one of two routes and picks by env
+    var, not by probing, so this is what decides whether its default can work.
+    """
+    try:
+        with open("/proc/modules") as f:
+            return any(line.startswith("nvidia_peermem") for line in f)
+    except OSError:
+        return False
+
+
+def _wanted_engine_env(gdr: bool = False) -> dict[str, str]:
+    """The engine values this backend needs, for this host's fabric.
+
+    Args:
+        gdr: whether any client in this run registers GPU memory.
+    """
     # LOCAL_MEMCPY reinterpret_casts cross-process pointers and segfaults
     # MemcpyWorkerPool; upstream PR #1995 fixes it but is not in a published
     # wheel. Drop once the pinned wheel includes it.
     wanted = {"MC_STORE_MEMCPY": "0"}
+    if gdr and not nvidia_peermem_loaded():
+        # WITH_NVIDIA_PEERMEM (no MC_ prefix) defaults to *true* in the pinned
+        # wheel (mooncake-common/src/environ.cpp:216), which registers GPU
+        # memory with a plain ibv_reg_mr() and so needs the nvidia_peermem
+        # module. Without that module every CUDA registration fails with
+        # ERR_CONTEXT (-202) — measured on these GB200/GB300 nodes, where
+        # /proc/modules has no nvidia_peermem. Zero selects the DMA-BUF route
+        # (cuMemGetHandleForAddressRange), which is the supported path on this
+        # generation. Only set when the module is absent, so a host that does
+        # have it keeps upstream's behaviour.
+        wanted["WITH_NVIDIA_PEERMEM"] = "0"
     if fabric_is_roce_only():
         # Pin each transfer's peer rail to the local one by name. Mooncake
         # otherwise picks the peer independently (Topology::selectDevice), and
@@ -93,11 +121,14 @@ def _wanted_engine_env() -> dict[str, str]:
 def configure_engine_env(cfg: DataPlaneConfig) -> None:
     """Set the mooncake knobs that must be identical in every process.
 
-    No-op unless the backend is ``mooncake_cpu``; ``simple`` has no engine.
-    Values already present in the environment are left alone, so a launcher can
-    override any of them — except ``MC_ENABLE_DEST_DEVICE_AFFINITY``, which
-    mooncake reads presence-only, so a launcher trying to override it to
-    ``"0"`` enables it instead; unsetting it is the only way to disable it.
+    No-op unless the backend runs the engine (``mooncake_cpu`` or
+    ``transfer_engine``); ``simple`` has none. Which knobs are wanted depends on
+    the fabric and on whether the run registers GPU memory — see
+    :func:`_wanted_engine_env`. Values already present in the environment are
+    left alone, so a launcher can override any of them — except
+    ``MC_ENABLE_DEST_DEVICE_AFFINITY``, which mooncake reads presence-only, so a
+    launcher trying to override it to ``"0"`` enables it instead; unsetting it
+    is the only way to disable it.
 
     Call this before anything imports ``transfer_queue`` or ``mooncake``.
     :func:`nemo_rl.data_plane.factory.maybe_configure_data_plane_env` does, on
@@ -113,7 +144,18 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
     if cfg["backend"] not in ("mooncake_cpu", "transfer_engine"):
         return
 
-    missing = {k: v for k, v in _wanted_engine_env().items() if k not in os.environ}
+    # Read by hand rather than through interfaces.backend_config: this module
+    # keeps its import list empty on purpose (see the module docstring), and a
+    # convenience import is exactly how the engine would sneak in later.
+    # A GPU-less driver evaluates this too — the flag must be identical in
+    # every process, and the workers are where GPU registration happens.
+    nested = cfg.get(cfg["backend"]) or {}
+    if not isinstance(nested, dict):
+        nested = {"use_gdr": getattr(nested, "use_gdr", False)}
+    # Register mode puts GPU memory on the wire by default; mooncake_cpu opts in.
+    gdr = bool(nested.get("use_gdr", cfg["backend"] == "transfer_engine"))
+
+    missing = {k: v for k, v in _wanted_engine_env(gdr).items() if k not in os.environ}
     if not missing:
         # Already set by the launcher, or by an earlier call in this process.
         return
