@@ -202,6 +202,48 @@ class TestDeathInsideTheCollective:
         assert 0 not in monitor.serving_shards()
         assert sync.reconciled_with[-1] == [0]
 
+    def test_a_recovery_does_not_clear_a_survivor_s_reported_failures(self):
+        """Regression: the recovery laundered a SUSPECT survivor back to HEALTHY.
+
+        consecutive_reported_failures is the only counter that can condemn a wedged
+        engine, and report_failure keeps it separate from the probe streak precisely
+        because such an engine still answers is_alive -- so an ok-probe must not clear
+        it. A refit used to.
+
+        The path: serving_shards() includes SUSPECT, so mark_weights_partial moves the
+        suspect survivor to STALE, and _promote_refit_shards then promotes every STALE
+        shard through report_refit, which zeroes the counters. Net effect, a shard
+        failing real generations could never reach unhealthy_threshold for as long as
+        refits kept happening.
+
+        Driven through the whole recovery on purpose: asserting against
+        _promote_refit_shards alone passes even with the bug present, because it is
+        mark_weights_partial -- in the other function -- that relabels SUSPECT to STALE.
+        """
+        ctrl, monitor, _ = _make_controller(ABORTED, shard_count=3, dead_shards=(0,))
+        # shard 2 is a survivor that was already failing generations
+        monitor.report_failure(2, RuntimeError("router: failed generation"))
+        monitor.report_failure(2, RuntimeError("router: failed generation"))
+        assert monitor.state_of(2) is ShardState.SUSPECT
+        before = monitor.snapshot()[2].consecutive_reported_failures
+        assert before == 2
+
+        asyncio.run(ctrl._sync_weights())
+
+        assert monitor.snapshot()[2].consecutive_reported_failures == before, (
+            "the refit cleared the streak that was about to condemn this shard"
+        )
+        assert monitor.state_of(2) is ShardState.SUSPECT
+        # the untroubled survivor is still promoted normally
+        assert monitor.state_of(1) is ShardState.HEALTHY
+
+    def test_an_untroubled_survivor_is_still_promoted_to_healthy(self):
+        """The restore must not become a blanket refusal to promote."""
+        ctrl, monitor, _ = _make_controller(ABORTED)
+        asyncio.run(ctrl._sync_weights())
+        assert monitor.state_of(1) is ShardState.HEALTHY
+        assert monitor.snapshot()[1].consecutive_reported_failures == 0
+
 
 class TestDeathAfterTheCollective:
     """RayActorError: the broadcast completed and the shard died in the epilogue.

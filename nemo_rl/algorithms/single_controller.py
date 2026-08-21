@@ -35,9 +35,11 @@ Data flow:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
+from collections.abc import Iterator
 from functools import partial
 from typing import Any, Optional, Union, cast
 
@@ -102,6 +104,15 @@ class SingleControllerActor:
 
     All other actors are passive — they expose methods and wait to be called.
     """
+
+    # True from the moment a failed refit pulls every shard out of service until the
+    # retry puts them back; the exhaustion check stands down for that window. See
+    # _recovery_window.
+    #
+    # Declared on the class, not assigned in __init__, for the same reason
+    # AbstractPolicyWorker.model_update_group is: the stall watchdog reads it on every
+    # tick, and it must exist on any instance the watchdog can reach.
+    _recovering_from_refit: bool = False
 
     def __init__(
         self,
@@ -867,9 +878,12 @@ class SingleControllerActor:
                         )
                     print(f"WARNING: environment health -- {detail}", flush=True)
 
-            if self._gen_fleet is not None:
+            if self._gen_fleet is not None and not self._recovering_from_refit:
                 # Raises once too few shards remain for the run to be worth continuing.
                 # Checked after publishing so the final state is on record.
+                #
+                # Skipped mid-recovery: the serving set is empty by construction there,
+                # not because the fleet is gone. See _recovery_window.
                 self._gen_fleet.raise_if_exhausted()
 
             work_remains = self._train_steps < max_num_steps
@@ -1022,16 +1036,18 @@ class SingleControllerActor:
                     RuntimeError(f"router: {count} failed request(s) to {url}"),
                 )
 
-    async def _reconcile_refit_membership(self) -> bool:
+    async def _reconcile_refit_membership(self) -> Optional[bool]:
         """Ask the weight transport to match the live fleet before the refit runs.
 
         A no-op without fleet health: with no monitor there is no notion of a shard being
         gone, so the transport keeps the membership it was built with -- which is the
         pre-existing behaviour, and why this is inert by default.
 
-        Returns whether the communicator was actually rebuilt. The recovery path needs
-        that answer: after an abort the old communicator is gone, so "nothing to
-        reconcile" means there is nothing to retry with either.
+        Returns whether the communicator was actually rebuilt, or None when the
+        transport owns no membership at all. The recovery path needs all three: after an
+        abort the old communicator is gone, so "nothing to reconcile" means there is
+        nothing to retry with either -- but "this transport has no membership" is a
+        different refusal and deserves a different message.
         """
         if self._gen_fleet is None:
             return False
@@ -1055,6 +1071,33 @@ class SingleControllerActor:
             flush=True,
         )
         return rebuilt
+
+    @contextlib.contextmanager
+    def _recovery_window(self) -> Iterator[None]:
+        """Mark the span where the serving set is deliberately empty.
+
+        _recover_from_failed_refit marks every serving shard partial, so they all go
+        STALE and serving_shards() is empty until _promote_refit_shards runs -- after a
+        rebuild and a full retry refit, both of which await and yield the event loop.
+
+        _stall_watchdog_pump is a task on that same loop and calls raise_if_exhausted()
+        on every tick, defaulting to one every 30s. With min_healthy_shards=1 and zero
+        serving, any tick landing in this window ends the run over an exhausted fleet
+        while the retry that would have refilled it is still in flight -- killing the
+        recovery that was about to succeed, and blaming the wrong thing in the log.
+
+        A flag rather than deferring mark_weights_partial until after the rebuild: that
+        would also close the window, but it would leave shards holding a mix of old and
+        new weights in the serving set while it did.
+        """
+        self._recovering_from_refit = True
+        try:
+            yield
+        finally:
+            # finally, not a trailing assignment: the retry refit inside this window is
+            # expected to raise sometimes, and a leaked flag would disable the
+            # exhaustion check for the rest of the run.
+            self._recovering_from_refit = False
 
     async def _recover_from_failed_refit(self, failure: BaseException) -> None:
         """Drop whatever stopped participating, rebuild the communicator, allow a retry.
@@ -1095,6 +1138,15 @@ class SingleControllerActor:
 
         # 3. Rebuild without the dead.
         rebuilt = await self._reconcile_refit_membership()
+        if rebuilt is None:
+            # This transport owns no NCCL world -- IPC, HTTP, checkpoint-engine. There is
+            # nothing to rebuild, and saying "no shard was absent" here would be a wrong
+            # diagnosis of a right refusal.
+            raise RuntimeError(
+                "refit failed on a transport that owns no communicator membership, so "
+                "there is nothing to rebuild over and the run cannot continue. Only the "
+                "NCCL transports (collective, nccl_reshard) can recover this way."
+            ) from failure
         if not rebuilt:
             # Nothing was identified as absent, so there is no smaller membership to
             # rebuild over. Retrying would either die on the aborted communicator or --
@@ -1356,16 +1408,24 @@ class SingleControllerActor:
                 kv_scales=kv_scales,
             )
         except (RefitAborted, RayActorError) as failure:
-            await self._recover_from_failed_refit(failure)
-            # Once only: a second failure is a real fault, not a membership problem, and
-            # retrying forever would recreate the wedge this exists to remove.
-            await asyncio.to_thread(
-                self._weight_synchronizer.sync_weights,
-                kv_scales=kv_scales,
-            )
-        # A completed refit is what makes an engine's weights current, so this is where a
-        # shard pulled out of service for holding partial ones earns its way back.
-        self._promote_refit_shards()
+            with self._recovery_window():
+                await self._recover_from_failed_refit(failure)
+                # Once only: a second failure is a real fault, not a membership problem,
+                # and retrying forever would recreate the wedge this exists to remove.
+                await asyncio.to_thread(
+                    self._weight_synchronizer.sync_weights,
+                    kv_scales=kv_scales,
+                )
+                # Inside the window: this is what refills the serving set, so releasing
+                # the flag before it runs would reopen the gap it exists to close.
+                self._promote_refit_shards()
+        else:
+            # A completed refit is what makes an engine's weights current, so this is
+            # where a shard pulled out of service for holding partial ones earns its way
+            # back. else, not a trailing statement: the recovery path above already
+            # promoted inside its window, and everything below this must still run on
+            # both paths.
+            self._promote_refit_shards()
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would

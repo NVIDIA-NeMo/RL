@@ -85,6 +85,10 @@ class ShardHealth:
     # reaches unhealthy_threshold. Only report_success (or a refit) clears this.
     consecutive_reported_failures: int = 0
     restart_attempts: int = 0
+    # What this shard was before an aborted refit pulled it out of service, so the
+    # promotion afterwards can put it back where it was instead of laundering it to
+    # HEALTHY. None whenever the shard is not mid-recovery.
+    state_before_partial: Optional["ShardState"] = None
     # Trainer weight version this shard was last refit to.
     weight_version: int = 0
     last_ok_at: float = 0.0
@@ -374,6 +378,14 @@ class GenerationFleetHealth:
         shard = self._shards[shard_idx]
         if shard.state in _ABSENT_STATES:
             return
+        if shard.state is not ShardState.STALE:
+            # Remembered so report_refit can put a SUSPECT shard back where it was.
+            # Without this the recovery launders it: SUSPECT -> STALE here, STALE ->
+            # HEALTHY there, and consecutive_reported_failures is zeroed by a refit that
+            # had nothing to do with why the shard was suspect. That counter is the only
+            # one that can condemn a wedged engine -- it is kept separate from the probe
+            # streak precisely because such an engine still answers is_alive.
+            shard.state_before_partial = shard.state
         self._transition(shard, ShardState.STALE)
 
     def report_refit(self, shard_idx: int, *, weight_version: int) -> None:
@@ -381,9 +393,21 @@ class GenerationFleetHealth:
         shard = self._shards[shard_idx]
         if shard.state is ShardState.RETIRED:
             return
+        was_before_partial, shard.state_before_partial = (
+            shard.state_before_partial,
+            None,
+        )
         shard.weight_version = weight_version
         shard.consecutive_probe_failures = 0
         shard.consecutive_probe_successes = 0
+        if was_before_partial is ShardState.SUSPECT:
+            # Already failing generations before the refit pulled it out of service, for
+            # reasons the refit did not address. It goes back to SUSPECT with its
+            # reported streak intact, still on its way to DEAD. Promoting it to HEALTHY
+            # here would reset that streak and leave a wedged engine unable to reach
+            # unhealthy_threshold for as long as refits keep happening.
+            self._transition(shard, ShardState.SUSPECT)
+            return
         # A refit means a fresh engine holding current weights; whatever it failed at
         # before is not evidence against what it is now.
         shard.consecutive_reported_failures = 0

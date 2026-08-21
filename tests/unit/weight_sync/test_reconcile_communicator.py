@@ -55,7 +55,8 @@ def _reshard() -> NcclReshardWeightSynchronizer:
 @pytest.fixture(params=["collective", "nccl_reshard"])
 def synchronizer(request):
     """Both NCCL transports. They diverge once a shard is gone -- collective rebuilds,
-    reshard still refuses -- but the no-op path must be identical for both."""
+    reshard rebuilds too and additionally regenerates its refit plan -- but the
+    no-op path must be identical for both."""
     return _collective() if request.param == "collective" else _reshard()
 
 
@@ -233,7 +234,11 @@ class TestOtherTransportsAreUnaffected:
             def shutdown(self):
                 pass
 
-        assert _Transport().reconcile_communicator([0, 1]) is False
+        # None, not False: False means "nothing was absent", which the controller
+        # reports as a silent non-participating rank. For a transport that owns no
+        # membership at all that diagnosis is simply wrong, and it sends the reader
+        # hunting for a rank that does not exist.
+        assert _Transport().reconcile_communicator([0, 1]) is None
 
 
 def _monitor(shard_count: int = 3) -> GenerationFleetHealth:

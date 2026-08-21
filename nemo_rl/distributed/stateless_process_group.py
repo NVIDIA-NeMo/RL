@@ -24,6 +24,8 @@ from nccl.core import SUM
 from nccl.core.communicator import Communicator
 from nccl.core.utils import UniqueId, get_unique_id
 
+from nemo_rl.distributed.refit_watchdog import RefitAborted
+
 _NEMO_UNIQUE_ID_KEY = "nccl_unique_id"
 _VLLM_UNIQUE_ID_KEY = "broadcast_from/0/0"
 _VLLM_NCCL_MODULE = "vllm.distributed.device_communicators.pynccl_wrapper"
@@ -95,6 +97,10 @@ class StatelessProcessGroup:
         # Declared here rather than sprung into existence by init_nccl_communicator, so
         # abort() can tell "never initialized" from "initialized" without hasattr.
         self.nccl_communicator: Optional[Communicator] = None
+        # Whether this group was aborted, as opposed to never built. Both leave
+        # nccl_communicator None, but they are different failures and the collectives
+        # below have to report them differently -- see broadcast().
+        self._aborted = False
         # Optional because abort() releases it: a run that recovers repeatedly would
         # otherwise hold a bound store per recovery for the life of the worker.
         self.tcp_store: Optional[torch.distributed.TCPStore] = (
@@ -126,6 +132,7 @@ class StatelessProcessGroup:
         """
         communicator, self.nccl_communicator = self.nccl_communicator, None
         self.tcp_store = None
+        self._aborted = True
         if communicator is not None:
             communicator.abort()
 
@@ -201,13 +208,34 @@ class StatelessProcessGroup:
     def broadcast(
         self, tensor: torch.Tensor, src: int, stream: Optional[torch.cuda.Stream] = None
     ):
-        if self.nccl_communicator is None:
+        # Snapshotted, not read twice. The watchdog thread nulls this field from under
+        # us, so a check-then-call on the attribute can pass the check and then raise
+        # AttributeError: 'NoneType' has no attribute 'broadcast'.
+        communicator = self.nccl_communicator
+        if communicator is None:
+            if self._aborted:
+                # A refit is many broadcasts, not one. The watchdog aborts the collective
+                # that is in flight -- that one returns cleanly, by NCCL's contract, and
+                # the caller learns about it from ``guard.fired``. But the *next* buffer
+                # in the same refit arrives here, and if it raised a bare RuntimeError it
+                # would escape the caller's ``with`` block before ``guard.fired`` is ever
+                # read: no RefitAborted, no recovery, and the run dies reporting a
+                # missing communicator instead of the abort that caused it.
+                #
+                # Naming the real cause here fixes every guarded site at once, which is
+                # why it lives in the group rather than in a try/except around each of
+                # the four callers.
+                raise RefitAborted(
+                    "the refit process group was aborted mid-collective, so this and "
+                    "every later operation on it fails; the abort is the cause, not "
+                    "this call"
+                )
             raise RuntimeError(
-                "StatelessProcessGroup has no communicator: init_nccl_communicator() "
-                "was never called, or the group was aborted and not rebuilt."
+                "StatelessProcessGroup has no communicator: "
+                "init_nccl_communicator() was never called."
             )
         if stream is None:
             stream = torch.cuda.current_stream()
-        self.nccl_communicator.broadcast(
+        communicator.broadcast(
             sendbuf=tensor, recvbuf=tensor, root=src, stream=int(stream.cuda_stream)
         )

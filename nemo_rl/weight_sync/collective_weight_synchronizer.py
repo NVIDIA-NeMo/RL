@@ -150,10 +150,15 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         excluded, so the root is stable across a rebuild and each receiver still slices
         the same byte stream locally.
 
-        Rebuild rather than ``shrink``: the pinned NCCL runtime exports
-        ``ncclCommShrink`` but not ``ncclCommGrow``, so a shrunk world could never take a
-        recovered engine back. One mechanism that works in both directions beats two that
-        each work in one.
+        Rebuild rather than ``shrink``/``grow``. The pinned NCCL exports both -- checked
+        against ``nccl.core.communicator.Communicator``, which also exports ``revoke``,
+        ``suspend``, ``resume`` and ``split`` (2.28.9 exported only ``shrink``; uv.lock
+        pins 2.30.7 and 2.30.4 in the dev image already has them). So this is a choice
+        rather than a limitation: the
+        nccl_reshard transport has to regenerate its refit plan on any membership change
+        whatever NCCL supports, restore is dominated by the minutes an engine takes to
+        reload, and one path shared with ``init_communicator`` is exercised by every
+        normal run instead of only after a failure.
         """
         if not absent_shards:
             return False

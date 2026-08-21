@@ -17,7 +17,7 @@ import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import torch
 import zmq
@@ -179,6 +179,11 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
+    # Per-PP-stage refit groups, None until init_nccl_reshard_comm_group builds them.
+    # Declared rather than sprung into existence so a rebuild can release the previous
+    # ones without probing, matching AbstractPolicyWorker.model_update_group. None and
+    # not {} because a mutable class-level default is shared by every instance.
+    pp_comm_groups: Optional[dict[int, Any]] = None
     # True once the MTP drafter has been served by a one-time disk load (see
     # load_mtp_weights_from_disk); refit then leaves those static weights alone.
     _mtp_drafter_from_disk: bool = False
@@ -281,7 +286,12 @@ class VllmInternalWorkerExtension:
 
         # Free cached blocks so NCCL P2P buffers have headroom (see init_collective).
         torch.cuda.empty_cache()
-        self.pp_comm_groups = {}  # pyrefly: ignore[implicitly-defined-attribute]
+        # Aborted before the dict is dropped, not just dereferenced: garbage collecting
+        # the handle does not release the NCCL communicator or unbind the TCPStore, so
+        # a reshard run would strand one of each per PP stage per recovery.
+        for previous in (self.pp_comm_groups or {}).values():
+            previous.abort()
+        self.pp_comm_groups = {}
         for stage in range(pp_size):
             group = StatelessProcessGroup(
                 master_address=pp_ips[stage],
@@ -1047,7 +1057,7 @@ class VllmInternalWorkerExtension:
         )
 
         groups = [
-            *getattr(self, "pp_comm_groups", {}).values(),
+            *(self.pp_comm_groups or {}).values(),
             self.model_update_group,
         ]
         with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
@@ -1107,6 +1117,15 @@ class VllmInternalWorkerExtension:
             min(int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")), len(stage_params)),
         )
 
+        # Narrowed once here rather than at each use: reaching this without the groups
+        # built is a wiring error, and a named failure beats a TypeError on a subscript.
+        pp_comm_groups = self.pp_comm_groups
+        if pp_comm_groups is None:
+            raise RuntimeError(
+                "nccl_reshard refit reached before init_nccl_reshard_comm_group built "
+                "the per-PP-stage groups"
+            )
+
         streams = [torch.cuda.Stream() for _ in range(num_streams)]
         events = {}
         for idx, (stage, params) in enumerate(stage_params.items()):
@@ -1115,7 +1134,7 @@ class VllmInternalWorkerExtension:
                 events[idx - num_streams].synchronize()
             stage_stream = streams[idx % num_streams]
             with torch.cuda.stream(stage_stream):
-                group = self.pp_comm_groups[stage]
+                group = pp_comm_groups[stage]
                 for p in params:
                     _recv_one_param(p, group, stage_stream)
                 ev = torch.cuda.Event()

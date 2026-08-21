@@ -38,6 +38,7 @@ import pytest
 import torch
 
 from nemo_rl.distributed import stateless_process_group as spg
+from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
 
@@ -227,7 +228,17 @@ def _group(communicator: Optional[_FakeCommunicator] = None) -> StatelessProcess
     group.world_size = 2
     group.nccl_communicator = communicator
     group.tcp_store = object()
+    # Set here because object.__new__ skips __init__. A fixture that stands in for a
+    # constructed group has to carry every field the methods under test read, or it
+    # tests a shape the product never has.
+    group._aborted = False
     return group
+
+
+class _Stub:
+    """A stream stub. object() is enough until a test actually reaches the broadcast."""
+
+    cuda_stream = 0
 
 
 class TestAbort:
@@ -245,6 +256,7 @@ class TestAbort:
 
         assert communicator.aborts == 1
         assert group.nccl_communicator is None
+        assert group.tcp_store is None, "the rendezvous store must be dropped too"
 
     def test_abort_is_idempotent(self):
         """Reconciliation may abort a group that a previous pass already released."""
@@ -276,19 +288,57 @@ class TestAbort:
 
 
 class TestBroadcastGuard:
-    def test_broadcast_without_a_communicator_names_the_cause(self):
+    def test_a_group_that_was_never_built_says_so(self):
+        """Never initialized is a different failure from aborted, and stays a RuntimeError.
+
+        Collapsing the two would make an ordinary setup mistake look like a mid-refit
+        abort and send the reader to the watchdog.
+        """
         group = _group(None)
 
-        with pytest.raises(RuntimeError, match="aborted and not rebuilt"):
-            group.broadcast(tensor=object(), src=0, stream=object())
+        with pytest.raises(RuntimeError, match="never called") as raised:
+            group.broadcast(tensor=object(), src=0, stream=_Stub())
+        assert not isinstance(raised.value, RefitAborted)
 
-    def test_broadcast_after_abort_raises_rather_than_crashing(self):
-        """The failure a rebuild bug would produce: using a released group."""
+    def test_every_broadcast_after_an_abort_reports_the_abort(self):
+        """The whole point: a refit is many broadcasts, not one.
+
+        The watchdog aborts the collective in flight; that one returns cleanly and the
+        caller reads guard.fired. The NEXT buffer lands here. If it raised a bare
+        RuntimeError it would escape the caller's ``with`` block before guard.fired is
+        read -- no RefitAborted, no recovery, and the run dies blaming a missing
+        communicator instead of the abort that caused it.
+        """
         group = _group(_FakeCommunicator())
         group.abort()
 
-        with pytest.raises(RuntimeError, match="no communicator"):
-            group.broadcast(tensor=object(), src=0, stream=object())
+        for _ in range(3):  # every subsequent buffer, not just the first
+            with pytest.raises(RefitAborted, match="aborted mid-collective"):
+                group.broadcast(tensor=object(), src=0, stream=_Stub())
+
+    def test_the_abort_survives_the_watchdog_nulling_the_field_mid_call(self):
+        """broadcast() must not read self.nccl_communicator twice.
+
+        The watchdog thread nulls it from under the caller, so a check-then-call on the
+        attribute can pass the check and then raise AttributeError: 'NoneType'.
+        """
+        group = _group(_FakeCommunicator())
+
+        class _NullsOnUse(_FakeCommunicator):
+            def broadcast(self, **kwargs):
+                group.abort()  # the watchdog firing between the check and the call
+                super().broadcast(**kwargs)
+
+        nulling = _NullsOnUse()
+        group.nccl_communicator = nulling
+
+        group.broadcast(
+            tensor=object(), src=0, stream=_Stub()
+        )  # must not AttributeError
+
+        assert nulling.broadcasts == 1, (
+            "the snapshot must survive the field being nulled"
+        )
 
 
 class _RecordingGroup:
