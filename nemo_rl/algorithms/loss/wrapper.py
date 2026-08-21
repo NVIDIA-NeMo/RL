@@ -304,10 +304,19 @@ class DraftRuntimeLossWrapper:
         loss_fn: Callable[..., tuple[torch.Tensor, dict[str, Any]]],
         prepare_fn: Callable[..., Any],
         draft_runtime: Any,
+        draft_loss_scale: float = 1.0,
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
         self.draft_runtime = draft_runtime
+        # Restores the draft's gradient scale under context parallelism: the
+        # trainer backprops (dp*cp/cp_gradient_fanout) * combined_loss, where
+        # the fanout division compensates the policy loss's CP gather fan-out.
+        # The draft loss is replicated across CP ranks (teacher/hiddens are
+        # allgathered) and its FSDP grads average over dp*cp, so it needs the
+        # full dp*cp multiplier; the caller passes cp_gradient_fanout here to
+        # cancel the division for the draft term only (1.0 when cp == 1).
+        self.draft_loss_scale = float(draft_loss_scale)
 
     def __call__(
         self,
@@ -329,7 +338,10 @@ class DraftRuntimeLossWrapper:
         )
 
         draft_loss, draft_metrics = self.draft_runtime.compute_loss(prepared_data)
-        combined_loss = policy_loss + self.draft_runtime.loss_weight * draft_loss
+        combined_loss = (
+            policy_loss
+            + self.draft_runtime.loss_weight * self.draft_loss_scale * draft_loss
+        )
         metrics.update(draft_metrics)
         return combined_loss, metrics
 

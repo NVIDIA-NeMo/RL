@@ -71,6 +71,14 @@ os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
 TARGET_MODEL = "Qwen/Qwen3-8B"
 DRAFTERS = {
+    # dflash is dspark minus the markov/confidence heads, so dspark must be
+    # preflighted in its own right: its checkpoint carries head keys and
+    # skip-list entries the other two never exercise.
+    "dspark": {
+        "model": "deepseek-ai/dspark_qwen3_8b_block7",
+        "method": "dspark",
+        "num_speculative_tokens": 7,
+    },
     "dflash": {
         "model": "RedHatAI/Qwen3-8B-speculator.dflash",
         "method": "dflash",
@@ -176,9 +184,14 @@ def check_positive(algo: str, spec: dict) -> None:
 
     manifest = trainer_stream_manifest(algo, spec["model"])
     d2t_key, t2d_key = "draft.d2t", "draft.t2d"
-    assert manifest[d2t_key][1] == torch.int64, manifest[d2t_key]
-    assert manifest[t2d_key][1] == torch.bool, manifest[t2d_key]
-    print(f"[ok] {algo}: trainer manifest keeps integer/bool buffer dtypes")
+    # Full-vocab checkpoints (e.g. deepseek-ai/dspark_qwen3_8b_block7) carry no
+    # vocab-map buffers; the dtype invariant applies wherever they exist.
+    if d2t_key in manifest or t2d_key in manifest:
+        assert manifest[d2t_key][1] == torch.int64, manifest[d2t_key]
+        assert manifest[t2d_key][1] == torch.bool, manifest[t2d_key]
+        print(f"[ok] {algo}: trainer manifest keeps integer/bool buffer dtypes")
+    else:
+        print(f"[ok] {algo}: full-vocab checkpoint (no d2t/t2d buffers to check)")
 
     llm = make_engine(spec)
     try:

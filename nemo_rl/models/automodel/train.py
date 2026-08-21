@@ -694,6 +694,7 @@ class LossPostProcessor:
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_loss_input_wrapped,
                 draft_runtime=self.draft_runtime,
+                draft_loss_scale=self.cp_gradient_fanout,
             )
             loss, loss_metrics = draft_wrapper(
                 logits,
