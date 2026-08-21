@@ -57,6 +57,7 @@ basic_env_config: RewardModelEnvironmentConfig = {
     "dynamic_batching": {"enabled": False},
     "sequence_packing": {"enabled": False},
     "max_grad_norm": None,
+    "make_sequence_length_divisible_by": 1,
 }
 
 

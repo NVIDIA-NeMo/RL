@@ -33,6 +33,106 @@ from nemo_rl.models.policy.utils import (
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
 )
+from nemo_rl.models.sequence_length import (
+    get_sequence_length_divisibility,
+    validate_sequence_length_divisibility,
+)
+
+
+@pytest.mark.parametrize(
+    (
+        "context_parallel_size",
+        "tensor_parallel_size",
+        "sequence_parallel",
+        "expected",
+    ),
+    [
+        (1, 1, False, 1),
+        (2, 1, False, 4),
+        (1, 4, True, 4),
+        (2, 4, True, 8),
+        (2, 3, True, 12),
+    ],
+)
+def test_get_sequence_length_divisibility(
+    context_parallel_size,
+    tensor_parallel_size,
+    sequence_parallel,
+    expected,
+):
+    assert (
+        get_sequence_length_divisibility(
+            context_parallel_size=context_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
+            sequence_parallel=sequence_parallel,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "make_sequence_length_divisible_by",
+        "context_parallel_size",
+        "tensor_parallel_size",
+        "sequence_parallel",
+    ),
+    [
+        (1, 1, 1, False),
+        (4, 2, 1, False),
+        (4, 1, 4, True),
+        # CP=2 and TP=4 requires lcm(4, 8) = 8, not their product (16).
+        (8, 2, 4, True),
+        (16, 2, 4, True),
+    ],
+)
+def test_validate_sequence_length_divisibility_accepts_valid_multiples(
+    make_sequence_length_divisible_by,
+    context_parallel_size,
+    tensor_parallel_size,
+    sequence_parallel,
+):
+    validate_sequence_length_divisibility(
+        make_sequence_length_divisible_by,
+        context_parallel_size=context_parallel_size,
+        tensor_parallel_size=tensor_parallel_size,
+        sequence_parallel=sequence_parallel,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "make_sequence_length_divisible_by",
+        "context_parallel_size",
+        "tensor_parallel_size",
+        "sequence_parallel",
+        "minimum_pad_factor",
+    ),
+    [
+        (0, 1, 1, False, 1),
+        (2, 2, 1, False, 4),
+        (2, 1, 4, True, 4),
+        # lcm(2*CP, TP) would accept 4, but SP sees the CP-local length.
+        (4, 2, 4, True, 8),
+    ],
+)
+def test_validate_sequence_length_divisibility_rejects_invalid_multiples(
+    make_sequence_length_divisible_by,
+    context_parallel_size,
+    tensor_parallel_size,
+    sequence_parallel,
+    minimum_pad_factor,
+):
+    with pytest.raises(
+        ValueError,
+        match=rf"positive multiple of the minimum pad factor \({minimum_pad_factor}\)",
+    ):
+        validate_sequence_length_divisibility(
+            make_sequence_length_divisible_by,
+            context_parallel_size=context_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
+            sequence_parallel=sequence_parallel,
+        )
 
 
 class TestGetMegatronCheckpointDir:

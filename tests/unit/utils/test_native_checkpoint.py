@@ -69,6 +69,7 @@ simple_policy_config = {
         "enabled": False,
     },
     "max_grad_norm": 1.0,
+    "make_sequence_length_divisible_by": 1,
     "generation": {
         "temperature": 1.0,
         "top_p": 1.0,

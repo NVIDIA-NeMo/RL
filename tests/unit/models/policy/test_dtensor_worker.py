@@ -195,6 +195,9 @@ def create_test_config(
             },
         },
         "max_grad_norm": 1.0,
+        "make_sequence_length_divisible_by": (
+            (2 * cp if cp > 1 else 1) * (tp if tp > 1 and sp else 1)
+        ),
     }
 
 
