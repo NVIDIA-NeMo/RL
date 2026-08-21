@@ -32,6 +32,9 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.mx_collective_weight_synchronizer import (
+    MX_COLLECTIVE_TRANSPORT,
+)
 
 
 def create_weight_synchronizer(
@@ -125,6 +128,19 @@ def create_weight_synchronizer(
             raise ValueError(
                 "train_cluster and inference_cluster are required "
                 "for non-colocated weight synchronization."
+            )
+
+        if generation.cfg.get("refit_transport") == MX_COLLECTIVE_TRANSPORT:
+            from nemo_rl.weight_sync.mx_collective_weight_synchronizer import (
+                MxCollectiveWeightSynchronizer,
+            )
+
+            return MxCollectiveWeightSynchronizer(
+                policy=policy,
+                generation=generation,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
+                mx_server_url=generation.cfg.get("mx_server_url"),
             )
 
         if generation.cfg.get("refit_transport") == "nccl_reshard":

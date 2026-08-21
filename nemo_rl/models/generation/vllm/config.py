@@ -265,13 +265,16 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     transport = config.get("refit_transport")
     if transport is None:
         return None
-    if transport == "nccl_reshard":
-        # nccl_reshard doesn't takes refit_cfg.
+    if transport in ("nccl_reshard", "mx_nccl_reshard"):
+        # Neither takes refit_cfg. mx_nccl_reshard is the same wire path with
+        # the communicator bootstrap brokered by ModelExpress, so it carries no
+        # transport-scoped config of its own either.
         return None
     if transport not in get_args(VllmRefitSelector) and ":" not in transport:
         raise ValueError(
             f"Unknown vLLM refit transport {transport!r}: expected null, "
-            "'nccl_reshard', 'vllm_s3_sparse', 'vllm_zmq_sparse', 'nixl', or a "
+            "'nccl_reshard', 'mx_nccl_reshard', 'vllm_s3_sparse', 'vllm_zmq_sparse', "
+            "'nixl', or a "
             "'module:ClassName' checkpoint-engine path."
         )
     # The encoder-cache reset is implemented only on the collective/IPC and
