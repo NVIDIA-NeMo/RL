@@ -251,6 +251,7 @@ def compute_score(
     ground_truth: str,
     strict_box_verify: bool = False,
     pause_tokens_index: Optional[list[int]] = None,
+    truncate_solution_tail: bool = True,
 ) -> float:
     """Compute the reward score for a solution.
 
@@ -259,14 +260,16 @@ def compute_score(
         ground_truth: The ground truth answer
         strict_box_verify: Whether to use strict box verification
         pause_tokens_index: Indices of pause tokens
+        truncate_solution_tail: When True (default), keep only the last 300
+            characters before grading.
 
     Returns:
         Reward score (1.0 for correct, 0.0 for incorrect)
     """
-    # Limit solution length for efficiency
-    solution_str = solution_str[
-        -300:
-    ]  # The longest answer in MATH-500 has 159 characters
+    if truncate_solution_tail:
+        solution_str = solution_str[
+            -300:
+        ]  # The longest answer in MATH-500 has 159 characters
 
     # Verify the solution
     correct, pred = verify(

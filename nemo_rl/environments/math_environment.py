@@ -46,7 +46,7 @@ class MathEnvConfig(TypedDict):
     # The verifier type. None defaults to "math".
     verifier_type: NotRequired[str | None]
     math_verify_impl: NotRequired[str | None]
-
+    truncate_solution_tail: NotRequired[bool | None]
 
 @contextlib.contextmanager
 def _mute_output():
@@ -127,7 +127,13 @@ class HFVerifyWorker:
                     math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
                     if kwargs.get("math_verify_impl") == "dapo_math_verify":
                         # This compute_score is from the DAPO Math Verifier from Verl
-                        reward_dict = dapo_math_verify(response, ground_truth)
+                        reward_dict = dapo_math_verify(
+                            response,
+                            ground_truth,
+                            truncate_solution_tail=bool(
+                                kwargs.get("truncate_solution_tail", True)
+                            ),
+                        )
                         ret_score = reward_dict["score"]
                         extracted_answer = reward_dict["pred"]
                     elif kwargs.get("math_verify_impl") == "hf_math_verify":
@@ -503,6 +509,7 @@ class MathEnvironment(BaseMathEnvironment):
                 ground_truth_chunk,
                 return_extracted_answer,
                 math_verify_impl=self.cfg.get("math_verify_impl", "hf_math_verify"),
+                truncate_solution_tail=self.cfg.get("truncate_solution_tail", True),
             )
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)
