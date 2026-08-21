@@ -42,6 +42,30 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # caught by nothing, because a wedged job produces no exception and no failing assertion
 # anywhere else.
 run_test uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
+# Full mode only: the same Gym run, but with NeMo-Gym pointed at the NeMo-RL-owned router.
+# Without this the router has no functional coverage at all -- the default Gym run above
+# leaves it disabled, so a regression in the proxy would ship silently.
+#
+# gen_kl_error is the assertion that earns its keep here: it compares vLLM's logprobs
+# against the trainer's recomputation, so a proxy that corrupts or truncates a response
+# blows it up. A run that merely completes would not prove the payload survived the hop.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh \
+    ++async_rl.generation_router.enabled=true \
+    ++async_rl.generation_fleet_health.enabled=true
+
+# ...and the property that run CANNOT prove. It is dp_size=1, so _pick_backend has one
+# choice, the serving set never shrinks, and the no-healthy-backend path never fires: it
+# demonstrates pass-through, not failover. This one runs two generation shards, kills one
+# mid-run, and asserts the serving set shrinks so NeMo-Gym stops being handed the corpse.
+#
+# EXPECT defaults to quarantine deliberately. Surviving the loss needs the communicator
+# rebuild that lands later in this stack -- without it the next refit broadcasts to the
+# dead rank and hangs in NCCL (job 6258553 sat there for 33 minutes). Asserting survival
+# here would assert a property this part does not implement.
+#
+# Needs >= 3 GPUs (2 generation + 1 trainer) and self-skips below that, so it is inert on
+# the 2-GPU L1 runners and only does its job on a larger box.
+run_test uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
 
 # grpo_dp_single_controller_chaos.sh again, this time killing a worker that is mid-rollout
 # rather than between calls. Registered because pinning the victim state -- which is what
