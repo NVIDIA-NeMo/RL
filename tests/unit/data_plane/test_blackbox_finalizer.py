@@ -201,6 +201,9 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         tq_client, "worked_example", rollout_id=f"{group_id}_g0"
     )
     receipt["rollout_id"] = f"{group_id}_g0"
+    # Mark this receipt's terminal as heuristically selected so the group
+    # metric sees a mixed declared/heuristic population.
+    receipt["terminal_selection"] = "heuristic"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
 
     finalizer = _finalizer(tq_client)
@@ -217,6 +220,8 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
     assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5
+    assert finalized.metrics["finalize/heuristic_terminal_count"] == 1.0
+    assert finalized.metrics["finalize/heuristic_terminal_fraction"] == 0.5
 
     rows = _fetch_rows(tq_client, rollout_ids)
     sample_mask = torch.as_tensor(rows["sample_mask"]).flatten()

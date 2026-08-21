@@ -557,6 +557,19 @@ class BlackboxFinalizer:
                 if isinstance(receipt, dict) and receipt.get("capture_poisoned")
             )
         )
+        # Heuristic terminal selection is a fallback for harnesses that do not
+        # declare the response they kept; a nonzero fraction on a declaring
+        # harness is a regression signal.
+        heuristic_receipts = sum(
+            1
+            for receipt in receipts
+            if isinstance(receipt, dict)
+            and receipt.get("terminal_selection") == "heuristic"
+        )
+        metrics["finalize/heuristic_terminal_count"] = float(heuristic_receipts)
+        metrics["finalize/heuristic_terminal_fraction"] = heuristic_receipts / len(
+            receipts
+        )
         for row in rows:
             if not row.valid:
                 print(

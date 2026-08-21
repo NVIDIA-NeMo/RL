@@ -95,6 +95,18 @@ NeMo RL fetches the manifest at rollout end and assembles the receipt locally:
 - `capture_poisoned` = any failure row present, or no row for the terminal
   request.
 
+Terminal selection has a strict precedence: **declared > heuristic > mask**. A
+harness-declared terminal is authoritative — a declared id that matches no
+committed row masks the rollout and never falls back. When the harness reports
+no terminal at all, Gym's `select_terminal_call` infers one from the
+manifest's explicit parent links (earliest-admitted root by `admitted_at`, an
+extended sibling beating an abandoned childless retry); any ambiguous shape —
+a retry of the final call, divergent extended branches — masks with the
+selection reason. The heuristic only chooses *among* digest-verified rows:
+`verify_and_linearize` still verifies the chosen chain. The receipt records
+the path in `terminal_selection` and the finalizer emits
+`finalize/heuristic_terminal_fraction` per group.
+
 `verify_and_linearize(receipt, snapshots)` runs unchanged. Retry duplicates
 appear as dead-branch sibling rows in the manifest: their staged rows are
 fetched, verified, and cleaned like any other, but they never join the

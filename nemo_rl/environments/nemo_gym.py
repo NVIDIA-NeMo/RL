@@ -704,23 +704,28 @@ Depending on your data shape, you may want to change these values."""
         )
         rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
         terminal_logical_request_id = nemo_gym_result.get("terminal_logical_request_id")
+        if not (
+            isinstance(terminal_logical_request_id, str) and terminal_logical_request_id
+        ):
+            # A harness that reports no terminal id still gets its manifest
+            # fetched; receipt assembly falls back to heuristic selection.
+            terminal_logical_request_id = None
         receipt = None
-        if isinstance(terminal_logical_request_id, str) and terminal_logical_request_id:
-            try:
-                manifest = await self._control(
-                    "GET",
-                    f"{_TOKEN_CAPTURE_CONTROL_PREFIX}"
-                    f"/rollouts/{rollout_id}/manifest",
-                )
-                receipt = self._assemble_receipt(
-                    rollout_id,
-                    manifest,
-                    terminal_logical_request_id=terminal_logical_request_id,
-                    reward=float(nemo_gym_result.get("reward") or 0.0),
-                )
-            except (RuntimeError, OSError) as error:
-                # An unfetchable manifest finalizes as a placeholder row.
-                print(f"manifest({rollout_id}) fetch failed: {error}", flush=True)
+        try:
+            manifest = await self._control(
+                "GET",
+                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}"
+                f"/rollouts/{rollout_id}/manifest",
+            )
+            receipt = self._assemble_receipt(
+                rollout_id,
+                manifest,
+                terminal_logical_request_id=terminal_logical_request_id,
+                reward=float(nemo_gym_result.get("reward") or 0.0),
+            )
+        except (RuntimeError, OSError) as error:
+            # An unfetchable manifest finalizes as a placeholder row.
+            print(f"manifest({rollout_id}) fetch failed: {error}", flush=True)
         return {
             "message_log": [],
             "input_message_log": [],
@@ -734,14 +739,19 @@ Depending on your data shape, you may want to change these values."""
         rollout_id: str,
         manifest: dict,
         *,
-        terminal_logical_request_id: str,
+        terminal_logical_request_id: Optional[str],
         reward: float,
     ) -> dict:
         """Build the token-free RolloutReceipt payload from a ledger manifest.
 
-        The terminal row is the manifest row whose ``logical_request_id``
-        equals the response id the agent actually kept. Retry duplicates are
-        dead-branch rows: they stay in the manifest (their staged rows are
+        With a declared terminal (``terminal_logical_request_id``), the
+        terminal row is the manifest row whose ``logical_request_id`` equals
+        the response id the agent actually kept; a declared id that matches no
+        row masks the rollout and never falls back. Without a declaration,
+        Gym's ``select_terminal_call`` infers the terminal from the manifest's
+        parent links (fail-closed: ambiguity masks). The receipt records which
+        path chose the terminal in ``terminal_selection``. Retry duplicates
+        are dead-branch rows: they stay in the manifest (their staged rows are
         fetched, verified, and cleaned) but never join the terminal chain —
         ``verify_and_linearize`` tolerates rows unreferenced by the terminal
         chain.
@@ -764,14 +774,40 @@ Depending on your data shape, you may want to change these values."""
         deduped: dict[str, dict] = {}
         for record in records:
             deduped.setdefault(str(record.get("model_call_id")), record)
-        terminal_record = next(
-            (
-                record
-                for record in deduped.values()
-                if record.get("logical_request_id") == terminal_logical_request_id
-            ),
-            None,
-        )
+        terminal_record = None
+        selection_reason = None
+        if terminal_logical_request_id is not None:
+            terminal_selection = "declared"
+            terminal_record = next(
+                (
+                    record
+                    for record in deduped.values()
+                    if record.get("logical_request_id") == terminal_logical_request_id
+                ),
+                None,
+            )
+        else:
+            terminal_selection = "heuristic"
+            # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+            from nemo_gym.token_id_capture.staging.records import CallRecord
+            from nemo_gym.token_id_capture.staging.terminal import (
+                select_terminal_call,
+            )
+
+            try:
+                selection = select_terminal_call(
+                    [
+                        CallRecord.model_validate(record)
+                        for record in deduped.values()
+                    ]
+                )
+            except ValueError:
+                selection_reason = "invalid_manifest_row"
+            else:
+                if selection.terminal_model_call_id is not None:
+                    terminal_record = deduped[selection.terminal_model_call_id]
+                else:
+                    selection_reason = selection.reason
         poisoning_failures = [
             failure
             for failure in failures
@@ -781,7 +817,7 @@ Depending on your data shape, you may want to change these values."""
         if poisoning_failures:
             failure_reason = str(poisoning_failures[0].get("reason") or "capture_failed")
         elif terminal_record is None:
-            failure_reason = "missing_terminal_row"
+            failure_reason = selection_reason or "missing_terminal_row"
         return {
             "rollout_id": rollout_id,
             "reward": reward,
@@ -793,6 +829,7 @@ Depending on your data shape, you may want to change these values."""
             "manifest": list(deduped.values()),
             "capture_poisoned": failure_reason is not None,
             "failure_reason": failure_reason,
+            "terminal_selection": terminal_selection,
         }
 
     def _postprocess_nemo_gym_to_nemo_rl_result(

@@ -90,6 +90,11 @@ The call flow for a single SWE rollout, end to end:
    staging keys, digests, weight versions), a `terminal_model_call_id`
    selected by the terminal logical request id, and fail-closed poisoning
    (any failure row, or a missing terminal row, masks the rollout).
+   Harnesses that report no terminal id (declared > heuristic > mask
+   precedence) fall back to Gym's `select_terminal_call`, which infers the
+   terminal from the manifest's parent links and masks on any ambiguity; the
+   per-group `finalize/heuristic_terminal_fraction` metric meters that
+   fallback and should stay 0 on the SWE recipe, whose harness declares.
 7. **Finalize.** The controller constructs a metadata-only
    `FinalizationRequest`, releases the rollout concurrency permit, and submits
    it to a fixed pool of CPU Ray actors. Each actor owns a connect-only TQ

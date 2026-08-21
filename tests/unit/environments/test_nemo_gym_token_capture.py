@@ -42,9 +42,15 @@ def _manifest_record(call_id: str, *, logical_request_id: str, parent: str | Non
     }
 
 
-def test_receipt_postprocess_fails_closed_without_a_terminal_logical_id() -> None:
+def test_receipt_postprocess_without_a_terminal_logical_id_uses_the_heuristic() -> None:
     env = _capture_env()
-    env._control = AsyncMock()
+    records = [
+        _manifest_record("c1", logical_request_id="lr-1"),
+        _manifest_record("c2", logical_request_id="lr-2", parent="c1"),
+    ]
+    env._control = AsyncMock(
+        return_value={"rollout_id": "r0", "records": records, "failures": []}
+    )
 
     result = asyncio.run(
         env._postprocess_receipt_mode(
@@ -53,8 +59,11 @@ def test_receipt_postprocess_fails_closed_without_a_terminal_logical_id() -> Non
         )
     )
 
-    env._control.assert_not_awaited()
-    assert result["receipt"] is None
+    env._control.assert_awaited()
+    receipt = result["receipt"]
+    assert receipt["terminal_model_call_id"] == "c2"
+    assert receipt["terminal_selection"] == "heuristic"
+    assert receipt["capture_poisoned"] is False
 
 
 def test_receipt_postprocess_fetches_manifest_and_selects_terminal_row() -> None:
@@ -82,6 +91,7 @@ def test_receipt_postprocess_fetches_manifest_and_selects_terminal_row() -> None
     receipt = result["receipt"]
     assert receipt["rollout_id"] == "r0"
     assert receipt["terminal_model_call_id"] == "c2"
+    assert receipt["terminal_selection"] == "declared"
     assert receipt["capture_poisoned"] is False
     assert receipt["failure_reason"] is None
     assert receipt["reward"] == 1.0
@@ -163,6 +173,66 @@ def test_receipt_assembly_poisons_when_the_terminal_row_is_missing() -> None:
     assert receipt["capture_poisoned"] is True
     assert receipt["failure_reason"] == "missing_terminal_row"
     assert receipt["terminal_model_call_id"] is None
+    # A declared id is authoritative: a miss never falls back to the heuristic
+    # even when the manifest holds an unambiguous chain.
+    assert receipt["terminal_selection"] == "declared"
+
+
+def test_receipt_assembly_heuristic_eliminates_abandoned_retry() -> None:
+    env = _capture_env()
+    records = [
+        _manifest_record("c1", logical_request_id="lr-1"),
+        _manifest_record("c2", logical_request_id="lr-2", parent="c1"),
+        _manifest_record("c2r", logical_request_id="lr-2r", parent="c1"),
+        _manifest_record("c3", logical_request_id="lr-3", parent="c2"),
+    ]
+    manifest = {"rollout_id": "r0", "records": records, "failures": []}
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_logical_request_id=None, reward=1.0
+    )
+    assert receipt["terminal_model_call_id"] == "c3"
+    assert receipt["terminal_selection"] == "heuristic"
+    assert receipt["capture_poisoned"] is False
+
+
+def test_receipt_assembly_heuristic_masks_a_final_call_retry() -> None:
+    env = _capture_env()
+    records = [
+        _manifest_record("c1", logical_request_id="lr-1"),
+        _manifest_record("c2", logical_request_id="lr-2", parent="c1"),
+        _manifest_record("c2r", logical_request_id="lr-2r", parent="c1"),
+    ]
+    manifest = {"rollout_id": "r0", "records": records, "failures": []}
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_logical_request_id=None, reward=0.0
+    )
+    assert receipt["terminal_model_call_id"] is None
+    assert receipt["capture_poisoned"] is True
+    assert receipt["failure_reason"] == "ambiguous_terminal"
+
+
+def test_receipt_assembly_heuristic_masks_an_empty_manifest() -> None:
+    env = _capture_env()
+    manifest = {"rollout_id": "r0", "records": [], "failures": []}
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_logical_request_id=None, reward=0.0
+    )
+    assert receipt["terminal_model_call_id"] is None
+    assert receipt["capture_poisoned"] is True
+    assert receipt["failure_reason"] == "no_records"
+
+
+def test_receipt_assembly_heuristic_masks_invalid_manifest_rows() -> None:
+    env = _capture_env()
+    bad = _manifest_record("c1", logical_request_id="lr-1")
+    bad["delta_len"] = 0  # violates the CallRecord length contract
+    manifest = {"rollout_id": "r0", "records": [bad], "failures": []}
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_logical_request_id=None, reward=0.0
+    )
+    assert receipt["terminal_model_call_id"] is None
+    assert receipt["capture_poisoned"] is True
+    assert receipt["failure_reason"] == "invalid_manifest_row"
 
 
 def test_receipt_assembly_keeps_dead_branch_siblings_in_the_manifest() -> None:
