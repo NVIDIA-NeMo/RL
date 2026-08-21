@@ -144,6 +144,7 @@ def test_weighted_split_gradient_and_metric_match_synchronous_normalization() ->
     state.correct_main_grads(
         [split_parameter],
         policy_normalization_count=policy_count,
+        context_parallel_size=1,
     )
 
     torch.testing.assert_close(split_parameter.main_grad, sync_parameter.grad)
@@ -176,7 +177,9 @@ def test_corrects_only_draft_main_grads_relative_to_policy_scaling() -> None:
     policy_param.main_grad = torch.tensor(5.0)
 
     state.correct_main_grads(
-        [draft_param, policy_param], policy_normalization_count=torch.tensor(16.0)
+        [draft_param, policy_param],
+        policy_normalization_count=torch.tensor(16.0),
+        context_parallel_size=1,
     )
 
     assert draft_param.main_grad.item() == pytest.approx(6.0)
@@ -192,7 +195,9 @@ def test_zero_draft_count_has_zero_scale_and_finite_metrics() -> None:
     draft_param.main_grad = torch.tensor(3.0)
 
     state.correct_main_grads(
-        [draft_param], policy_normalization_count=torch.tensor(16.0)
+        [draft_param],
+        policy_normalization_count=torch.tensor(16.0),
+        context_parallel_size=1,
     )
 
     assert draft_param.main_grad.item() == 0.0
@@ -209,7 +214,9 @@ def test_zero_policy_count_zeroes_draft_gradient(dtype: torch.dtype) -> None:
     draft_param.main_grad = torch.tensor(3.0, dtype=dtype)
 
     state.correct_main_grads(
-        [draft_param], policy_normalization_count=torch.tensor(0.0)
+        [draft_param],
+        policy_normalization_count=torch.tensor(0.0),
+        context_parallel_size=1,
     )
 
     assert draft_param.main_grad.item() == 0.0

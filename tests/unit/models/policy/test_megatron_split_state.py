@@ -595,7 +595,7 @@ class TestFinish:
         metrics = w.finish_train_step()
 
         reduce_calls = mock_module_symbols["all_reduce"].call_args_list
-        assert len(reduce_calls) == 2
+        assert len(reduce_calls) == 3
         policy_counts = reduce_calls[0].args[0]
         draft_counts = reduce_calls[1].args[0]
         assert torch.equal(policy_counts, policy_counts.new_tensor([8.0, 2048.0]))
@@ -752,15 +752,15 @@ class TestFinish:
         w.finish_train_step()
 
         reduce_calls = mock_module_symbols["all_reduce"].call_args_list
-        assert len(reduce_calls) == 2
+        assert len(reduce_calls) == 3
         policy_counts = reduce_calls[0].args[0]
         draft_counts = reduce_calls[1].args[0]
         assert torch.equal(policy_counts, policy_counts.new_tensor([16.0, 4096.0]))
         assert torch.equal(draft_counts, draft_counts.new_tensor([20.0]))
         assert draft_param.main_grad.item() == pytest.approx(614.4)
         metrics = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"]
-        assert metrics[0]["draft_loss"].item() == pytest.approx(1.0)
-        assert metrics[1]["draft_loss"].item() == pytest.approx(3.0)
+        assert metrics[0]["draft_loss"].item() == pytest.approx(4.0)
+        assert metrics[1]["draft_loss"].item() == pytest.approx(0.0)
 
     def test_zero_draft_count_zeroes_gradient_at_finish(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.draft import DraftLossStats

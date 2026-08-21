@@ -124,16 +124,35 @@ class DraftStepState:
             return value.detach() * scale
         return value * scale
 
+    def weighted_numerator_for_reduction(
+        self, reference: torch.Tensor
+    ) -> torch.Tensor:
+        """Return this CP rank's weighted numerator on a collective-safe device."""
+        if self._local_numerators is None or self._weights is None:
+            return reference.new_zeros(())
+        numerators = self._local_numerators.to(
+            device=reference.device, dtype=reference.dtype
+        )
+        weights = self._weights.to(device=reference.device, dtype=reference.dtype)
+        return (numerators * weights).sum()
+
     def correct_main_grads(
         self,
         parameters: Iterable[Any],
         *,
         policy_normalization_count: torch.Tensor,
+        context_parallel_size: int,
     ) -> None:
         """Correct draft-tagged main grads after policy normalization."""
+        if context_parallel_size < 1:
+            raise ValueError("context_parallel_size must be positive")
         policy_count = float(policy_normalization_count.detach().item())
         draft_scale = self._normalization_scale()
-        correction = policy_count * draft_scale if policy_count > 0 else 0.0
+        correction = (
+            policy_count * draft_scale * context_parallel_size
+            if policy_count > 0
+            else 0.0
+        )
         for param in parameters:
             if getattr(param, "grad_norm_group", None) != "draft":
                 continue

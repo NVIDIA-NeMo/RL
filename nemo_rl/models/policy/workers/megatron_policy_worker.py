@@ -1843,6 +1843,14 @@ class MegatronPolicyWorkerImpl(
                 ),
             )
         draft_step_state.set_global_counts(draft_counts)
+        draft_metric_numerator = draft_step_state.weighted_numerator_for_reduction(
+            policy_counts
+        )
+        if draft_step_state.active:
+            torch.distributed.all_reduce(
+                draft_metric_numerator,
+                group=parallel_state.get_context_parallel_group(),
+            )
 
         if state["loss_type"] == LossType.TOKEN_LEVEL:
             n_true = global_valid_toks
@@ -1860,6 +1868,7 @@ class MegatronPolicyWorkerImpl(
             draft_step_state.correct_main_grads(
                 self.model.parameters(),
                 policy_normalization_count=n_true,
+                context_parallel_size=self.cp_size,
             )
 
         # End-of-step gradient finalization, exactly once per optimizer step.
@@ -2026,6 +2035,12 @@ class MegatronPolicyWorkerImpl(
             )
 
         rescaled_metrics: list[dict[str, Any]] = []
+        normalized_draft_metric = (
+            draft_step_state.normalize_metric(draft_metric_numerator)
+            if draft_step_state.active
+            else None
+        )
+        emitted_draft_metric = False
         # curr_lr/curr_wd captured pre-scheduler.step above.
         global_valid_seqs_f = float(global_valid_seqs.item())
         global_valid_toks_f = float(global_valid_toks.item())
@@ -2036,7 +2051,13 @@ class MegatronPolicyWorkerImpl(
                 if k == DRAFT_STEP_PAYLOAD_KEY:
                     continue
                 if k == "draft_loss" and draft_step_state.active:
-                    out[k] = draft_step_state.normalize_metric(v)
+                    assert normalized_draft_metric is not None
+                    out[k] = (
+                        normalized_draft_metric
+                        if not emitted_draft_metric
+                        else torch.zeros_like(normalized_draft_metric)
+                    )
+                    emitted_draft_metric = True
                 elif "_min" in k or "_max" in k:
                     out[k] = v
                 else:
