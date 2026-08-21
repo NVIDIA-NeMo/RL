@@ -20,7 +20,6 @@ from typing import Any, Literal, Mapping, Sequence
 
 import torch
 
-
 SpeculatorType = Literal["eagle3", "dflash", "dspark"]
 
 
