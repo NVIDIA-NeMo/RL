@@ -111,6 +111,15 @@ class RefitAbortWatchdog:
         if self._done.wait(self._timeout_s):
             return
         self._fired = True
+        # Printed because the abort is otherwise invisible until something happens to
+        # raise RefitAborted, and "the deadline never fired" and "it fired but the
+        # verdict was lost" are different bugs that look identical in a log. Three
+        # hardware runs were spent unable to tell them apart.
+        print(
+            f"  refit: deadline exceeded after {self._timeout_s}s; "
+            f"aborting {len(self._groups)} communicator group(s)",
+            flush=True,
+        )
         for group in self._groups:
             try:
                 group.abort()
@@ -126,10 +135,28 @@ class RefitAbortWatchdog:
 
     def __enter__(self) -> "RefitAbortWatchdog":
         if self.armed:
+            print(
+                f"  refit: watchdog armed, deadline {self._timeout_s}s over "
+                f"{len(self._groups)} communicator group(s)",
+                flush=True,
+            )
             self._thread = threading.Thread(
                 target=self._watch, name="refit-abort-watchdog", daemon=True
             )
             self._thread.start()
+        else:
+            # Says which of the two reasons, because they need opposite fixes: no
+            # deadline configured is a config question, no groups is a plumbing one.
+            print(
+                "  refit: watchdog NOT armed ("
+                + (
+                    f"no deadline configured, timeout={self._timeout_s}"
+                    if not (self._timeout_s and self._timeout_s > 0)
+                    else "no communicator groups were passed"
+                )
+                + ")",
+                flush=True,
+            )
         return self
 
     def __exit__(
