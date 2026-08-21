@@ -372,6 +372,7 @@ design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
 design-docs/nccl-reshard-refit.md
 design-docs/media-token-validity-mask.md
+design-docs/tq-register-mode.md
 ```
 
 ```{toctree}

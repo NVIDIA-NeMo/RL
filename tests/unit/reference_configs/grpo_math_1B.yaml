@@ -526,6 +526,11 @@ data_plane:
     staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
     use_gdr: false                   # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024      # persistent MiB per active GDR client
+  transfer_engine:
+    # Register mode: put publishes the producer's buffer address, get pulls it
+    # one-sided. No store, so none of mooncake_cpu's sizing applies.
+    use_gdr: true                    # receive into HBM; sources register where they are
+    rpc_port: 0                      # 0 = engine picks a free port
   # observability:                    # NotRequired
   #   enabled: false
 

@@ -427,7 +427,7 @@ all of it via `defaults:`.
 data_plane:
   enabled: false                       # flip to true to engage grpo_train_sync
   impl: transfer_queue                 # only one impl today
-  backend: "simple"                    # "simple" or "mooncake_cpu"
+  backend: "simple"                    # "simple", "mooncake_cpu", "transfer_engine"
   claim_meta_poll_interval_s: 0.5      # blocking-claim poll cadence
   simple:
     storage_capacity: 1000000          # max samples retained per partition
@@ -439,6 +439,9 @@ data_plane:
     staging_buffer_size:  268435456    # 256 MiB/pool slot
     use_gdr: false                     # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024        # persistent MiB per active GDR client
+  transfer_engine:
+    use_gdr: true                      # receive into HBM; sources register in place
+    rpc_port: 0                        # 0 = engine picks a free port
   # observability:                     # NotRequired
   #   enabled: false
 ```
@@ -465,9 +468,20 @@ Backend choice:
   CPU-only clients, such as a SingleController producer, keep CPU RDMA. Both
   paths use the same all-rail transport selection.
 
+- **`transfer_engine`** — register mode (experimental). `put` copies nothing:
+  the producer registers the buffer it already holds — in HBM if that is where
+  it built it — and publishes its address; the bytes move once, when a consumer
+  reads them one-sided. With `use_gdr: true` (the default, and per process:
+  active only where CUDA is initialized) a tensor goes producer HBM to consumer
+  HBM in a single hop, with no host staging on either end. There is no store, so
+  no segment or pool sizing applies. The trade is that every read of a key is
+  served by the producing process's NIC, and that a producer's tensors stay
+  resident until `clear` — see `docs/design-docs/tq-register-mode.md`.
+
 `gdr_staging_buffer_mb` is the persistent GPU staging capacity per active GDR
 client (default 1024 MiB). TransferQueue's pin requires it to fit the largest
-individual tensor.
+individual tensor. It applies to `mooncake_cpu` only; register mode has no
+staging buffer to size.
 
 Capacity rule of thumb (any backend):
 
@@ -499,6 +513,7 @@ fixture for the ABC contract tests.
 |---|---|
 | Stable boundary (ABC) | `nemo_rl/data_plane/interfaces.py` |
 | Adapter (TransferQueue impl) | `nemo_rl/data_plane/adapters/transfer_queue.py` |
+| Register-mode TQ backend | `nemo_rl/data_plane/adapters/tq_register_mode.py` |
 | Adapter (NoOp, test only) | `nemo_rl/data_plane/adapters/noop.py` |
 | Codec (jagged pack / unpack) | `nemo_rl/data_plane/codec.py` |
 | Column-level helpers | `nemo_rl/data_plane/column_io.py` (`read_columns`, `write_columns`, `kv_first_write`) |

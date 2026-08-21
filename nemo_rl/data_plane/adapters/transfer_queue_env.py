@@ -108,7 +108,9 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
             already imported, i.e. the value can no longer reach it. Fatal on
             purpose — the alternative is a run that looks configured and is not.
     """
-    if cfg["backend"] != "mooncake_cpu":
+    # Both RDMA backends run on the same engine: register mode offers every
+    # rail too, so it needs the same peer-rail pinning. ``simple`` has no engine.
+    if cfg["backend"] not in ("mooncake_cpu", "transfer_engine"):
         return
 
     missing = {k: v for k, v in _wanted_engine_env().items() if k not in os.environ}

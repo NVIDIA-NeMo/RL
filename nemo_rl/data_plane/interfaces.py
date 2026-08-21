@@ -98,6 +98,35 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     gdr_staging_buffer_mb: PositiveInt = 1024
 
 
+class TransferEngineConfig(BaseModel, extra="allow"):
+    """Knobs for ``backend="transfer_engine"`` (register mode). Ignored otherwise.
+
+    Register mode has no store, so none of mooncake_cpu's sizing applies: there
+    is no segment to pre-pin and no staging pool. ``put`` registers the
+    producer's own allocation and publishes its address; the bytes move once,
+    when a consumer reads.
+
+    ``use_gdr`` decides where a *read* lands in the process that issues it —
+    this GPU under GDR, host memory otherwise. It is per process, not per
+    cluster: a CPU-only client (the SingleController driver) resolves to host
+    either way and still reads a GPU-resident key correctly, because the
+    producer's side of the pairing is chosen by probing the registered pointer.
+    Sources are never moved: a CUDA tensor is registered where the producer
+    built it, so with GDR on both ends a tensor crosses the fabric HBM-to-HBM.
+
+    ``rpc_port`` is this process's engine port; 0 lets it pick a free one,
+    which is required when several clients share a node.
+
+    The producer must outlive every key it publishes and must not mutate a
+    registered buffer until ``clear``. See
+    ``docs/design-docs/tq-register-mode.md`` for the read fan-out and HBM
+    residency this trades against.
+    """
+
+    use_gdr: bool = True
+    rpc_port: int = 0
+
+
 class DataPlaneConfig(TypedDict):
     """Feature-gated config; defaults to disabled.
 
@@ -131,10 +160,11 @@ class DataPlaneConfig(TypedDict):
 
     enabled: bool
     impl: Literal["transfer_queue"]
-    backend: Literal["simple", "mooncake_cpu"]
+    backend: Literal["simple", "mooncake_cpu", "transfer_engine"]
     claim_meta_poll_interval_s: float
     simple: NotRequired[SimpleStorageConfig]
     mooncake_cpu: NotRequired[MooncakeCpuConfig]
+    transfer_engine: NotRequired[TransferEngineConfig]
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
@@ -155,6 +185,7 @@ _FIRST_GDR_FLAT_KEYS = ("use_gdr", "gdr_staging_buffer_mb")
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {
     "simple": SimpleStorageConfig,
     "mooncake_cpu": MooncakeCpuConfig,
+    "transfer_engine": TransferEngineConfig,
 }
 
 
@@ -175,8 +206,9 @@ def backend_config(cfg: DataPlaneConfig) -> Any:
     if stale_gdr:
         raise ValueError(
             f"data_plane.{{{','.join(stale_gdr)}}} moved under "
-            "data_plane.mooncake_cpu. Update the first GDR integration's "
-            "top-level spelling before running this stack."
+            f"data_plane.mooncake_cpu (or data_plane.transfer_engine for "
+            f"register mode). Update the first GDR integration's top-level "
+            f"spelling before running this stack."
         )
 
     nested = cfg.get(backend) or {}
@@ -379,6 +411,17 @@ class DataPlaneClient(ABC):
     flips ``production_status[sample, field] = 1``. Downstream consumers
     waiting on that field only see those samples once produced.
     """
+
+    @property
+    def put_device(self) -> str:
+        """Device a producer should hand tensors to :meth:`put_samples` on.
+
+        ``"cpu"`` for every backend that copies the payload into a store, which
+        is why producers move results to host before writing back. Register
+        mode overrides it: it registers the tensor where it already is, so a
+        write-back that copies to host first would be pure loss.
+        """
+        return "cpu"
 
     # ── (A) task-mediated ───────────────────────────────────────────────
 

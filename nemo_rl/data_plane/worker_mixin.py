@@ -145,8 +145,11 @@ class TQWorkerMixin:
             return
         from nemo_rl.data_plane import build_data_plane_client
 
+        # A GPU worker that attaches before CUDA is up silently falls back to
+        # the host path for the rest of the run: mooncake_cpu to CPU staging,
+        # register mode to host receive buffers.
         if (
-            cfg["backend"] == "mooncake_cpu"
+            cfg["backend"] in ("mooncake_cpu", "transfer_engine")
             and backend_config(cfg).use_gdr
             and not torch.cuda.is_initialized()
         ):
@@ -459,7 +462,12 @@ class TQWorkerMixin:
                 f"result[{result_key!r}] has batch dim {val.shape[0]} "
                 f"but meta.sample_ids has {len(meta.sample_ids)}."
             )
-        self._write_back(meta, {tq_field: val.detach().to("cpu")})
+        # Register mode publishes the address of this very tensor, so it asks
+        # for the device it is already on; every store-backed backend asks for
+        # host memory because it is about to copy the bytes out anyway.
+        self._write_back(
+            meta, {tq_field: val.detach().to(self._require_dp_client().put_device)}
+        )
 
     @wrap_with_nvtx_name("policy_worker/train_presharded")
     def train_presharded(

@@ -43,6 +43,12 @@ import torch
 import transfer_queue as tq
 from tensordict import TensorDict
 
+# Importing registers register mode's client / manager / bootstrap provider with
+# TQ's factories, which is what makes backend="transfer_engine" resolvable. It
+# must happen in every process that builds a TQ storage manager — i.e. exactly
+# the processes that import this adapter. Safe to do here and nowhere earlier:
+# this module has already loaded transfer_queue above.
+import nemo_rl.data_plane.adapters.tq_register_mode  # noqa: F401
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
@@ -127,7 +133,7 @@ def _mooncake_transport_config() -> dict:
     devices = rdma_devices()
     if not devices:
         raise RuntimeError(
-            "data_plane.backend='mooncake_cpu' requires RDMA, but no usable "
+            "This data_plane backend requires RDMA, but no usable "
             "mlx5 device was found. Check that /dev/infiniband/uverbs* exists "
             "(a container does not inherit it from the host even though it "
             "does see /sys/class/infiniband) — name a device with "
@@ -544,6 +550,31 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                 },
             },
         }
+    elif backend == "transfer_engine":
+        # Register mode — see nemo_rl/data_plane/adapters/tq_register_mode.py.
+        # No master and no metadata server (P2PHANDSHAKE), so unlike
+        # mooncake_cpu nothing here is bound to the driver's IP:
+        # local_hostname="" makes every client resolve its own, and rpc_port=0
+        # lets co-located engines pick free ports.
+        #
+        # TQ's client masks any underlying ImportError as "please install
+        # mooncake-transfer-engine"; import here so the real cause surfaces.
+        import mooncake.engine  # type: ignore[import-not-found]  # noqa: F401
+
+        te_cfg = backend_config(cfg)
+        overlay = {
+            **controller_overlay,
+            "backend": {
+                "storage_backend": "TransferEngine",
+                "TransferEngine": {
+                    "metadata_server": "P2PHANDSHAKE",
+                    "local_hostname": "",
+                    "rpc_port": int(te_cfg.rpc_port),
+                    "use_gdr": bool(te_cfg.use_gdr),
+                    **_mooncake_transport_config(),
+                },
+            },
+        }
     else:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
@@ -700,7 +731,10 @@ class TQDataPlaneClient(DataPlaneClient):
         # The cluster-wide MC_* knobs are NOT among them; they are set
         # once on the driver, before this module is importable — see
         # nemo_rl.data_plane.adapters.transfer_queue_env.
-        if cfg["backend"] == "mooncake_cpu":
+        # Both RDMA backends run on mooncake's engine.so and need (1);
+        # transfer_engine registers its own buffers, so the store-client
+        # patches below are mooncake_cpu's alone.
+        if cfg["backend"] in ("mooncake_cpu", "transfer_engine"):
             local_ip = _get_local_node_ip()
             if local_ip:
                 # Force-assign per-process: Ray actors inherit env vars
@@ -708,6 +742,7 @@ class TQDataPlaneClient(DataPlaneClient):
                 # be a no-op and the actor would announce the driver's
                 # IP — peers fail with "connection refused".
                 os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
+        if cfg["backend"] == "mooncake_cpu":
             # Do not add MC_* setup here — mooncake snapshotted its config when
             # this module imported, so a write now is silently ignored.
             # Both must run before the first get, in every process with a TQ
@@ -723,22 +758,40 @@ class TQDataPlaneClient(DataPlaneClient):
                 _patch_mooncake_staging_buffers(mooncake_cfg.staging_buffer_size)
 
         # Workaround for TQ KVStorageManager's 1D-field schema/data
-        # mismatch (only `mooncake_cpu` goes through that path; `simple`
+        # mismatch (both KV backends go through that path; `simple`
         # is unaffected). Writer unsqueezes 1D → (N, 1) on put; reader
         # squeezes the trailing 1 back on get. Drop when upstream TQ
         # unifies the schema/data shapes for 1D fields.
-        self._promote_1d = cfg["backend"] == "mooncake_cpu"
+        self._promote_1d = cfg["backend"] in ("mooncake_cpu", "transfer_engine")
 
         if bootstrap:
             _init_tq(cfg)
         else:
             _connect_existing()
+        # Register mode publishes addresses, so a producer should hand it the
+        # tensor where it already lives — but only where this process can
+        # actually receive into HBM too, which is the same condition the TQ
+        # client applies (see TransferEngineClient.__init__).
+        self._put_device = (
+            "cuda"
+            if (
+                cfg["backend"] == "transfer_engine"
+                and backend_config(cfg).use_gdr
+                and torch.cuda.is_initialized()
+            )
+            else "cpu"
+        )
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
         # Fields whose schema this process has already warmed, per partition.
         # See register_partition: the controller's field map is append-only,
         # so a field only ever needs warming once.
         self._warmed_fields: dict[str, set[str]] = {}
+
+    @property
+    def put_device(self) -> str:
+        """Device producers should write back on — see :class:`DataPlaneClient`."""
+        return self._put_device
 
     # ── (A) task-mediated ───────────────────────────────────────────────
 

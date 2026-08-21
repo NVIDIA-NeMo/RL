@@ -99,6 +99,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # Bounded by the live key population, not cumulative traffic.
         self._bytes_by_partition: dict[str, dict[str, int]] = {}
 
+    @property
+    def put_device(self) -> str:
+        """Forward the wrapped client's write-back device, not the ABC default."""
+        return self._inner.put_device
+
     def snapshot(self) -> dict[str, Any]:
         """Return cumulative totals plus live byte / key outstanding counts."""
         out = asdict(self._stats)
