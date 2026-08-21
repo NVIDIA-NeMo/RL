@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 from pathlib import Path
 from types import ModuleType
 
@@ -48,19 +49,26 @@ def _load_heads() -> tuple[type[nn.Module], type[nn.Module]]:
 
 DSparkMarkovHead, DSparkConfidenceHead = _load_heads()
 
+_PUBLIC_DSPARK_MANIFEST = json.loads(
+    (
+        Path(__file__).with_name("fixtures") / "dspark_qwen3_8b_block7_03326e50.json"
+    ).read_text()
+)
 _PUBLIC_DSPARK_ARTIFACT = (
-    "mgoin/Qwen3-8B-speculator.dspark@737765aa0ff9f5dbda65839a6e010f03b66bc506"
+    f"{_PUBLIC_DSPARK_MANIFEST['repository']}@{_PUBLIC_DSPARK_MANIFEST['revision']}"
 )
 _PUBLIC_DSPARK_CONFIG = {
-    "vocab_size": 151936,
-    "draft_vocab_size": 32000,
-    "markov_rank": 256,
+    "vocab_size": _PUBLIC_DSPARK_MANIFEST["config"]["vocab_size"],
+    "draft_vocab_size": _PUBLIC_DSPARK_MANIFEST["config"]["vocab_size"],
+    "markov_rank": _PUBLIC_DSPARK_MANIFEST["config"]["markov_rank"],
 }
 _PUBLIC_DSPARK_HEAD_SHAPES = {
-    "markov_head.markov_w1.weight": (151936, 256),
-    "markov_head.markov_w2.weight": (32000, 256),
-    "confidence_head.proj.weight": (1, 4352),
-    "confidence_head.proj.bias": (1,),
+    name: tuple(shape)
+    for name, shape in _PUBLIC_DSPARK_MANIFEST["head_tensor_shapes"].items()
+}
+_PUBLIC_DSPARK_BORROWED_SHAPES = {
+    name: tuple(shape)
+    for name, shape in _PUBLIC_DSPARK_MANIFEST["borrowed_tensor_shapes"].items()
 }
 
 
@@ -437,8 +445,14 @@ def test_markov_head_has_explicit_tp_local_vocab_contract() -> None:
         )
 
 
-def test_markov_head_loads_pinned_public_dspark_checkpoint_schema() -> None:
-    assert _PUBLIC_DSPARK_ARTIFACT.startswith("mgoin/Qwen3-8B-speculator.dspark@")
+def test_heads_load_pinned_official_deepseek_dspark_checkpoint_schema() -> None:
+    assert _PUBLIC_DSPARK_ARTIFACT == (
+        "deepseek-ai/dspark_qwen3_8b_block7@03326e5043815da1f81b109078b2889737c26017"
+    )
+    assert _PUBLIC_DSPARK_MANIFEST["config"]["architectures"] == ["Qwen3DSparkModel"]
+    assert "draft_vocab_size" not in _PUBLIC_DSPARK_MANIFEST["config"]
+    assert len(_PUBLIC_DSPARK_MANIFEST["config_sha256"]) == 64
+    assert len(_PUBLIC_DSPARK_MANIFEST["safetensors_header_sha256"]) == 64
     heads = nn.ModuleDict(
         {
             "markov_head": DSparkMarkovHead(
@@ -461,6 +475,10 @@ def test_markov_head_loads_pinned_public_dspark_checkpoint_schema() -> None:
     assert {
         name: tuple(tensor.shape) for name, tensor in state.items()
     } == _PUBLIC_DSPARK_HEAD_SHAPES
+    assert _PUBLIC_DSPARK_BORROWED_SHAPES == {
+        "embed_tokens.weight": (151936, 4096),
+        "lm_head.weight": (151936, 4096),
+    }
     pinned_checkpoint = {
         name: torch.empty(shape, dtype=torch.bfloat16, device="meta")
         for name, shape in _PUBLIC_DSPARK_HEAD_SHAPES.items()
