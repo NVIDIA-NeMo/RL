@@ -1049,8 +1049,28 @@ class Logger(LoggerInterface):
             step_metric: Optional name of a field in metrics to use as step instead
                          of the provided step value (currently only needed for wandb)
         """
+        histogram_metrics = {
+            name: value
+            for name, value in metrics.items()
+            if "histogram" in name.split("/")
+        }
+        metrics_to_log = {
+            name: value
+            for name, value in metrics.items()
+            if name not in histogram_metrics
+        }
+
+        for name, values in histogram_metrics.items():
+            # Preserve the established namespace for per-turn generation
+            # histograms; other distributions inherit the caller's prefix.
+            if name.startswith("histogram/"):
+                histogram_name = f"generation_metrics/{name}"
+            else:
+                histogram_name = f"{prefix}/{name}" if prefix else name
+            self.log_histogram(values, step, histogram_name)
+
         for logger in self.loggers:
-            logger.log_metrics(metrics, step, prefix, step_metric, step_finished)
+            logger.log_metrics(metrics_to_log, step, prefix, step_metric, step_finished)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to all enabled backends.

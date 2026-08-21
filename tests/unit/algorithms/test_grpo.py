@@ -5089,6 +5089,17 @@ class TestAggregateRolloutMetrics:
         result = aggregate_rollout_metrics(metrics)
         assert result["some_list_metric"] == [["a", "b"], ["c", "d"]]
 
+    def test_histogram_observations_are_flattened(self):
+        """Per-group observations become one bounded step-level distribution."""
+        metrics = {
+            "agent/reward/histogram": [[0.1], [0.2, 0.3]],
+            "histogram/gen_tokens_length": [[10, 20], [30]],
+        }
+        result = aggregate_rollout_metrics(metrics)
+
+        assert result["agent/reward/histogram"] == [0.1, 0.2, 0.3]
+        assert result["histogram/gen_tokens_length"] == [10, 20, 30]
+
     def test_mixed_metrics(self):
         """Full integration test with a realistic mix of metric types."""
         metrics = {

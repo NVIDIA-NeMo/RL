@@ -18,8 +18,6 @@ import math
 import statistics
 from collections.abc import Sequence
 
-from wandb import Histogram
-
 
 def calculate_single_metric(
     values: Sequence[float | int], batch_size: int, key_name: str
@@ -32,7 +30,9 @@ def calculate_single_metric(
         key_name: Prefix for the returned metric keys (e.g. "total_reward").
 
     Returns:
-        Dict mapping "{key_name}/{stat}" to its value for stat in mean, max, min, median, stddev (nan for a single value), and histogram (a wandb.Histogram).
+        Dict mapping "{key_name}/{stat}" to its value for stat in mean, max, min,
+        median, stddev (nan for a single value), and histogram. Histogram values
+        remain backend-agnostic raw observations until the logger serializes them.
     """
     return {
         f"{key_name}/mean": sum(values) / batch_size,
@@ -40,7 +40,7 @@ def calculate_single_metric(
         f"{key_name}/min": min(values),
         f"{key_name}/median": statistics.median(values),
         f"{key_name}/stddev": statistics.stdev(values) if len(values) > 1 else math.nan,
-        f"{key_name}/histogram": Histogram(values),
+        f"{key_name}/histogram": list(values),
     }
 
 

@@ -1712,6 +1712,81 @@ class TestLogger:
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_log_metrics_routes_histograms(
+        self,
+        mock_tb_logger,
+        mock_wandb_logger,
+        temp_dir,
+    ):
+        """Histogram metrics use the typed logger API."""
+        cfg = {
+            "wandb_enabled": True,
+            "tensorboard_enabled": True,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "wandb": {"project": "test-project"},
+            "tensorboard": {"log_dir": "test_logs"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        metrics = {
+            "loss": 0.5,
+            "agent/reward/histogram": [0.1, 0.2],
+            "histogram/gen_tokens_length": [10, 20],
+        }
+        logger.log_metrics(metrics, step=10)
+
+        mock_wandb_logger.return_value.log_metrics.assert_called_once_with(
+            {"loss": 0.5}, 10, "", None, False
+        )
+        mock_tb_logger.return_value.log_metrics.assert_called_once_with(
+            {"loss": 0.5}, 10, "", None, False
+        )
+        for backend in (
+            mock_wandb_logger.return_value,
+            mock_tb_logger.return_value,
+        ):
+            assert backend.log_histogram.call_args_list == [
+                call([0.1, 0.2], 10, "agent/reward/histogram"),
+                call(
+                    [10, 20],
+                    10,
+                    "generation_metrics/histogram/gen_tokens_length",
+                ),
+            ]
+        assert metrics == {
+            "loss": 0.5,
+            "agent/reward/histogram": [0.1, 0.2],
+            "histogram/gen_tokens_length": [10, 20],
+        }
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    def test_log_metrics_prefixes_non_generation_histograms(
+        self, mock_wandb_logger, temp_dir
+    ):
+        cfg = {
+            "wandb_enabled": True,
+            "tensorboard_enabled": False,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "wandb": {"project": "test-project"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        logger.log_metrics(
+            {"agent/reward/histogram": [0.1, 0.2]}, step=10, prefix="train"
+        )
+
+        mock_wandb_logger.return_value.log_histogram.assert_called_once_with(
+            [0.1, 0.2], 10, "train/agent/reward/histogram"
+        )
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
     def test_log_hyperparams(self, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test logging hyperparameters to all enabled loggers."""
         cfg = {
