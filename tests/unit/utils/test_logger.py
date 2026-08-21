@@ -1712,6 +1712,96 @@ class TestLogger:
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_log_metrics_relogs_core_metrics(
+        self, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
+        """Test that core metrics are additionally logged under a core/<prefix> namespace."""
+        cfg = {
+            "wandb_enabled": True,
+            "tensorboard_enabled": True,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "wandb": {"project": "test-project"},
+            "tensorboard": {"log_dir": "test_logs"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        mock_wandb_instance = mock_wandb_logger.return_value
+        mock_tb_instance = mock_tb_logger.return_value
+
+        metrics = {"loss": 0.5, "kl_penalty": 0.02, "total_reward/mean": 1.5}
+        step = 10
+        logger.log_metrics(metrics, step, prefix="train")
+
+        expected_core = {"kl_penalty": 0.02, "total_reward/mean": 1.5}
+        for mock_instance in (mock_wandb_instance, mock_tb_instance):
+            assert mock_instance.log_metrics.call_args_list == [
+                call(metrics, step, "train", None, False),
+                call(expected_core, step, "core/train", None, False),
+            ]
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_log_metrics_core_namespace_separates_train_and_validation(
+        self, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
+        """Test that train and validation core metrics land under distinct core/ names."""
+        cfg = {
+            "wandb_enabled": True,
+            "tensorboard_enabled": True,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "wandb": {"project": "test-project"},
+            "tensorboard": {"log_dir": "test_logs"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        mock_wandb_instance = mock_wandb_logger.return_value
+
+        logger.log_metrics({"total_reward/mean": 1.0}, 10, prefix="train")
+        logger.log_metrics({"total_reward/mean": 2.0}, 10, prefix="validation")
+
+        assert mock_wandb_instance.log_metrics.call_args_list == [
+            call({"total_reward/mean": 1.0}, 10, "train", None, False),
+            call({"total_reward/mean": 1.0}, 10, "core/train", None, False),
+            call({"total_reward/mean": 2.0}, 10, "validation", None, False),
+            call({"total_reward/mean": 2.0}, 10, "core/validation", None, False),
+        ]
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_log_metrics_without_core_metrics_logs_once(
+        self, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
+        """Test that no extra core/ dispatch happens when no core metric is present."""
+        cfg = {
+            "wandb_enabled": True,
+            "tensorboard_enabled": True,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "wandb": {"project": "test-project"},
+            "tensorboard": {"log_dir": "test_logs"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        metrics = {"loss": 0.5, "accuracy": 0.8}
+        logger.log_metrics(metrics, 10, prefix="train")
+
+        mock_wandb_logger.return_value.log_metrics.assert_called_once_with(
+            metrics, 10, "train", None, False
+        )
+        mock_tb_logger.return_value.log_metrics.assert_called_once_with(
+            metrics, 10, "train", None, False
+        )
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
     def test_log_hyperparams(self, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test logging hyperparameters to all enabled loggers."""
         cfg = {
