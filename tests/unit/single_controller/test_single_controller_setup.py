@@ -311,6 +311,22 @@ class TestSetup:
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["_build_trainer"].assert_not_called()
 
+    def test_reward_kl_rejects_skipping_policy_logprobs(self, patched_factories):
+        mc = _make_master_config(
+            loss_cfg=ClippedPGLossConfig(
+                reference_policy_kl_penalty=0.01,
+                use_kl_in_reward=True,
+                force_on_policy_ratio=True,
+            )
+        )
+
+        with pytest.raises(ValueError, match="requires policy logprobs"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_trainer"].assert_not_called()
+
     @pytest.mark.parametrize(
         ("loss_overrides", "match"),
         [
