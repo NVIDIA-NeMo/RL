@@ -39,7 +39,10 @@ from nemo_rl.models.policy.utils import (
     rebuild_cuda_tensor_from_ipc,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+from nemo_rl.utils.packed_tensor import (
+    packed_broadcast_consumer,
+    packed_broadcast_preflight_consumer,
+)
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     _STR_TO_DTYPE,
     HFToLocalParamMap,
@@ -1239,6 +1242,8 @@ class VllmInternalWorkerExtension:
         ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
         slice back into the live merged param.
         """
+        packed_broadcast_preflight_consumer(self.model_update_group, 0)
+
         import os
         from collections import OrderedDict
 
@@ -1342,6 +1347,7 @@ class VllmInternalWorkerExtension:
             group=self.model_update_group,
             src=0,
             post_unpack_func=self._load_weights,
+            preflight_checked=True,
         )
 
     def cleanup(self) -> None:

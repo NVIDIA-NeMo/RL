@@ -389,7 +389,7 @@ def test_iter_params_with_optional_kv_scales_uses_real_quant_export(monkeypatch)
     monkeypatch.setattr(
         worker,
         "_iter_real_quant_refit_params",
-        lambda kv_scales=None: iter([("real.weight", torch.ones(1))]),
+        lambda kv_scales=None, **_kwargs: iter([("real.weight", torch.ones(1))]),
     )
 
     output = list(worker._iter_params_with_optional_kv_scales({"scale": 1.0}))
@@ -438,7 +438,7 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
     monkeypatch.setattr(
         MegatronPolicyWorkerImpl,
         "_iter_params_with_optional_kv_scales",
-        lambda self, kv_scales=None, *, draft_metadata_only=False: iter(
+        lambda self, kv_scales=None, **_kwargs: iter(
             [("model.layers.0.mlp.down_proj.weight", torch.ones(2, 2))]
         ),
     )
@@ -477,6 +477,7 @@ def test_iter_params_with_optional_kv_scales_forwards_draft_metadata_only(
         kv_scales=None,
         *,
         draft_metadata_only=False,
+        draft_weights=None,
     ):
         if not draft_metadata_only:
             raise AssertionError("quant override dropped draft metadata mode")
@@ -534,6 +535,7 @@ def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
         kv_scales=None,
         *,
         draft_metadata_only=False,
+        draft_weights=None,
     ):
         for refit_task in self.refit_conversion_tasks:
             yield refit_task.param_name, refit_task.param_weight
@@ -611,7 +613,7 @@ def test_stream_weights_via_ipc_zmq_does_not_move_without_real_quant(monkeypatch
     monkeypatch.setattr(
         worker,
         "_iter_params_with_optional_kv_scales",
-        lambda kv_scales=None: iter([("model.weight", torch.ones(1))]),
+        lambda kv_scales=None, **_kwargs: iter([("model.weight", torch.ones(1))]),
     )
 
     def fake_stream_weights_via_ipc_zmq_impl(**kwargs):

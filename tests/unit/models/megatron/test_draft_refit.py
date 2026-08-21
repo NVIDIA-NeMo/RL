@@ -423,7 +423,12 @@ def _run_tp2_pp2_cp2_worker_draft_refit(rank: int, world_size: int) -> None:
         group: dist.ProcessGroup | None = None,
         **kwargs,
     ):
-        assert group is pp_group
+        if group is dist.group.WORLD:
+            assert tensor.shape == ()
+            assert tensor.dtype == torch.int64
+            assert op == dist.ReduceOp.MIN
+        else:
+            assert group is pp_group
         return original_all_reduce(tensor, op=op, group=group, **kwargs)
 
     def reject_object_collective(*_args, **_kwargs):
@@ -602,9 +607,12 @@ def _run_cp_lane_manifest_mismatch(rank: int, world_size: int) -> None:
     ):
         nonlocal descriptor_reductions
         if group is dist.group.WORLD:
-            descriptor_reductions += 1
-            assert tensor.shape == (6,)
             assert tensor.dtype == torch.int64
+            if tensor.shape == (6,):
+                descriptor_reductions += 1
+            else:
+                assert tensor.shape == ()
+                assert op == dist.ReduceOp.MIN
         else:
             assert group is pp_group
         return original_all_reduce(tensor, op=op, group=group, **kwargs)

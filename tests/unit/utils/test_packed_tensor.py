@@ -164,12 +164,13 @@ def test_packed_broadcast_single_large_tensor():
         )
 
     # Should still broadcast the tensor
-    assert mock_group.broadcast_count == 1
-    assert len(mock_group.broadcasted_tensors) == 1
+    assert mock_group.broadcast_count == 2
+    assert len(mock_group.broadcasted_tensors) == 2
+    assert mock_group.broadcasted_tensors[0].item() == 0
 
     # Verify the size matches the large tensor
     expected_size = large_tensor.numel() * large_tensor.element_size()
-    assert mock_group.broadcasted_tensors[0].numel() == expected_size
+    assert mock_group.broadcasted_tensors[1].numel() == expected_size
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -199,7 +200,8 @@ def test_packed_broadcast_multiple_batches():
     assert mock_group.broadcast_count > 1
 
     # Total size should match sum of all tensors
-    total_broadcasted_size = sum(t.numel() for t in mock_group.broadcasted_tensors)
+    assert mock_group.broadcasted_tensors[0].item() == 0
+    total_broadcasted_size = sum(t.numel() for t in mock_group.broadcasted_tensors[1:])
     expected_total_size = sum(t.numel() * t.element_size() for _, t in params)
     assert total_broadcasted_size == expected_total_size
 

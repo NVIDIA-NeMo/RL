@@ -481,6 +481,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def _iter_real_quant_refit_params(
         self,
         kv_scales: dict[str, float] | None = None,
+        *,
+        draft_metadata_only: bool = False,
+        draft_weights: tuple[tuple[str, torch.Tensor], ...] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Export packed NVFP4 weights and scales for real-quant vLLM rollout."""
         from nemo_rl.modelopt.utils import DEFAULT_NVFP4_IGNORE
@@ -501,11 +504,12 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             ignore_patterns=ignore,
         )
 
-        if self.draft_model is not None:
-            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
-
-            for name, tensor in export_eagle_weights_to_hf(self.draft_model):
-                yield f"draft.{name}", tensor
+        if draft_weights is None:
+            yield from self._iter_draft_weights_for_refit(
+                metadata_only=draft_metadata_only
+            )
+        else:
+            yield from draft_weights
 
         if not vllm_cfg["kv_cache_dtype"].startswith("fp8"):
             return
@@ -608,6 +612,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         kv_scales=None,
         *,
         draft_metadata_only: bool = False,
+        draft_weights: tuple[tuple[str, torch.Tensor], ...] | None = None,
     ):
         """Pre-fold weights on-the-fly via lazy proxy tasks.
 
@@ -624,7 +629,11 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 with context about which parameter caused the failure.
         """
         if self._use_real_quant_refit():
-            yield from self._iter_real_quant_refit_params(kv_scales)
+            yield from self._iter_real_quant_refit_params(
+                kv_scales,
+                draft_metadata_only=draft_metadata_only,
+                draft_weights=draft_weights,
+            )
             return
 
         class _FoldedTask:
@@ -681,6 +690,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             for name, tensor in super()._iter_params_with_optional_kv_scales(
                 kv_scales,
                 draft_metadata_only=draft_metadata_only,
+                draft_weights=draft_weights,
             ):
                 if "weight_quantizer" in name:
                     continue
