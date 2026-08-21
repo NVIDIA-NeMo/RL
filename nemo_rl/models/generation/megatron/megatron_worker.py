@@ -23,6 +23,7 @@ from typing import AsyncGenerator, Optional
 import requests
 import torch
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     KVCacheManagementMode,
     PrefixCachingCoordinatorPolicy,
@@ -200,6 +201,11 @@ class MegatronGenerationMixin:
             logprobs_mode="processed_logprobs",
             max_requests=max_requests,
         )
+
+        if "async_sched_mode" in mcore_generation_config:
+            inference_config.async_sched_mode = AsyncScheduleMode(
+                mcore_generation_config["async_sched_mode"]
+            )
 
         if "inference_cuda_graph_scope" in mcore_generation_config:
             gen_model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
@@ -384,6 +390,21 @@ class MegatronGenerationMixin:
         if self.is_generation_colocated and not release_gpu:
             return
         print(f"[Rank {self.rank}] finishing generation", flush=True)
+
+        # mcore silently falls back to legacy ordering for any step it cannot
+        # overlap, so report its cumulative overlap-step counter. Without this
+        # the only observable difference between the two modes is throughput.
+        if (
+            self.cfg["generation"]["mcore_generation_config"].get("async_sched_mode")
+            == "async"
+            and self._inference_engine_initialized
+        ):
+            print(
+                f"[Rank {self.rank}] mcore async scheduling steps (cumul): "
+                f"{self.inference_context.async_sched_step_count}",
+                flush=True,
+            )
+
         log_gpu_memory("finish_generation START")
 
         lang_module = unwrap_model(self._gen_model())
