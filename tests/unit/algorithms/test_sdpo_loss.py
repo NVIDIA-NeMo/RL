@@ -447,3 +447,102 @@ def test_sdpo_loss_js_bounded_by_log2():
     assert loss.item() <= math.log(2) + 1e-3
     assert metrics["sdpo/per_pos_kl"] <= math.log(2) + 1e-3
     assert loss.item() > 0  # disjoint supports → strictly positive
+
+
+def _is_clip_loss_fn(clip):
+    return SDPOLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,  # top-k-only KL; no tail correction
+            "success_reward_threshold": 1.0,
+            "rollout_importance_sampling_clip": clip,
+        }
+    )
+
+
+def test_sdpo_rollout_is_noop_when_on_policy():
+    """ratio = pi_theta/pi_rollout = 1 everywhere → loss identical to no-clip."""
+    s, t, H, data, gvt = _build_inputs()
+    batch_size, seq_len = data["token_mask"].shape
+    next_token_logprobs = -torch.rand(batch_size, seq_len - 1)  # arbitrary logprobs
+    # generation_logprobs is [B, S]; the loss compares its [:, 1:] slice.
+    data["generation_logprobs"] = torch.cat(
+        [torch.zeros(batch_size, 1), next_token_logprobs], dim=1
+    )
+
+    base_fn = SDPOLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+            "success_reward_threshold": 1.0,
+        }
+    )
+    base_loss, _ = base_fn(s, t, H, data, torch.tensor(4.0), gvt)
+
+    loss_fn = _is_clip_loss_fn(2.0)
+    loss, metrics = loss_fn(
+        s, t, H, data, torch.tensor(4.0), gvt, next_token_logprobs=next_token_logprobs
+    )
+    assert torch.allclose(loss, base_loss, atol=1e-6)
+    assert metrics["sdpo/rollout_is_ratio_mean"] == pytest.approx(1.0, abs=1e-6)
+    assert metrics["sdpo/rollout_is_clip_frac"] == 0.0
+
+
+def test_sdpo_rollout_is_clips_large_ratios():
+    """When pi_theta >> pi_rollout everywhere, every token clips and the loss
+    is scaled by exactly the clip value."""
+    s, t, H, data, gvt = _build_inputs()
+    batch_size, seq_len = data["token_mask"].shape
+    next_token_logprobs = -torch.rand(batch_size, seq_len - 1)
+    # rollout logprobs 10 nats lower → raw ratio e^10 >> clip
+    data["generation_logprobs"] = torch.cat(
+        [torch.zeros(batch_size, 1), next_token_logprobs - 10.0], dim=1
+    )
+
+    base_fn = SDPOLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+            "success_reward_threshold": 1.0,
+        }
+    )
+    base_loss, _ = base_fn(s, t, H, data, torch.tensor(4.0), gvt)
+
+    clip = 2.0
+    loss_fn = _is_clip_loss_fn(clip)
+    loss, metrics = loss_fn(
+        s, t, H, data, torch.tensor(4.0), gvt, next_token_logprobs=next_token_logprobs
+    )
+    assert torch.allclose(loss, clip * base_loss, atol=1e-5)
+    assert metrics["sdpo/rollout_is_clip_frac"] == pytest.approx(1.0)
+    assert metrics["sdpo/rollout_is_ratio_mean"] == pytest.approx(math.exp(10.0), rel=1e-4)
+
+
+def test_sdpo_rollout_is_requires_inputs():
+    """Missing next_token_logprobs or generation_logprobs must fail loudly."""
+    s, t, H, data, gvt = _build_inputs()
+    loss_fn = _is_clip_loss_fn(2.0)
+    with pytest.raises(AssertionError, match="next_token_logprobs"):
+        loss_fn(s, t, H, data, torch.tensor(4.0), gvt)
+
+    batch_size, seq_len = data["token_mask"].shape
+    with pytest.raises(AssertionError, match="generation_logprobs"):
+        loss_fn(
+            s,
+            t,
+            H,
+            data,
+            torch.tensor(4.0),
+            gvt,
+            next_token_logprobs=-torch.rand(batch_size, seq_len - 1),
+        )
+
+
+def test_sdpo_rollout_is_invalid_clip_raises():
+    with pytest.raises(ValueError, match="rollout_importance_sampling_clip"):
+        _is_clip_loss_fn(0.0)
+    with pytest.raises(ValueError, match="rollout_importance_sampling_clip"):
+        _is_clip_loss_fn(-1.0)

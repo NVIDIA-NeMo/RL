@@ -1131,6 +1131,26 @@ class VllmGeneration(GenerationInterface):
         """
         self.shutdown()
 
+    def update_sampling_params(self, **sampling_params: Any) -> bool:
+        """Update the sampling profile (temperature/top_p/top_k) on all workers.
+
+        Used to switch between the train and validation sampling profiles
+        without rebuilding the engine. Covers both sync and async engines:
+        both build SamplingParams from the worker cfg at request time. Keys
+        that are absent stay unchanged (top_k=None is a valid explicit value).
+        Returns True if all workers report success.
+        """
+        try:
+            futures = self.worker_group.run_all_workers_single_data(
+                "update_sampling_params",
+                **sampling_params,
+            )
+            results = ray.get(futures)
+            return all(result for result in results if result is not None)
+        except Exception as e:
+            print(f"Error updating vLLM sampling params: {e}")
+            return False
+
     def invalidate_kv_cache(self) -> bool:
         """Invalidate reusable caches in vLLM (e.g., prefix/KV cache) after weight updates.
 

@@ -409,27 +409,28 @@ def setup(
     if generation_config["backend"] == "vllm":
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
 
-    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
-    # path; everywhere else validation must sample exactly like training.
+    # Validation-only sampling is honored on vLLM rollout paths: the NeMo-Gym
+    # path stamps val params per request; the standard rollout path swaps the
+    # worker sampling profile around validation (see validate()). Non-vLLM
+    # backends would silently ignore the override, so reject them here.
     val_sampling_overridden = (
         generation_config["val_temperature"] != generation_config["temperature"]
         or generation_config["val_top_p"] != generation_config["top_p"]
         or generation_config["val_top_k"] != generation_config["top_k"]
     )
     if val_sampling_overridden:
-        assert generation_config["backend"] == "vllm" and _should_use_nemo_gym(
-            master_config
-        ), (
+        assert generation_config["backend"] == "vllm", (
             "generation.val_temperature/val_top_p/val_top_k differing from the "
-            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
+            "train sampling params is only supported for the vLLM backend."
         )
-        # The NeMo-Gym path only stamps temperature/top_p onto requests and
-        # rejects any top_k at rollout time, so a val_top_k override can never
-        # be honored — fail here instead of at the first validation step.
-        assert not generation_config["val_top_k"], (
-            "generation.val_top_k is not supported: the NeMo-Gym rollout path "
-            "only honors val_temperature/val_top_p. Leave val_top_k null."
-        )
+        if _should_use_nemo_gym(master_config):
+            # The NeMo-Gym path only stamps temperature/top_p onto requests and
+            # rejects any top_k at rollout time, so a val_top_k override can never
+            # be honored — fail here instead of at the first validation step.
+            assert not generation_config["val_top_k"], (
+                "generation.val_top_k is not supported: the NeMo-Gym rollout path "
+                "only honors val_temperature/val_top_p. Leave val_top_k null."
+            )
     assert grpo_config.val_num_generations_per_prompt >= 1, (
         "grpo.val_num_generations_per_prompt must be >= 1"
     )
@@ -3733,6 +3734,31 @@ def validate(
         max_batches = (
             master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
         )
+
+        # Standard (non-NeMo-Gym) rollout paths build SamplingParams from the
+        # worker cfg, so a validation-only sampling profile is applied by
+        # swapping the workers' params around the rollout loop (the NeMo-Gym
+        # path instead stamps val params per request). setup() guarantees the
+        # backend is vLLM whenever the val profile differs from train. No
+        # try/finally: an exception here aborts the training run anyway.
+        _val_generation_config = master_config.policy["generation"]
+        _val_sampling_swapped = not _should_use_nemo_gym(master_config) and (
+            _val_generation_config["val_temperature"]
+            != _val_generation_config["temperature"]
+            or _val_generation_config["val_top_p"] != _val_generation_config["top_p"]
+            or _val_generation_config["val_top_k"] != _val_generation_config["top_k"]
+        )
+        if _val_sampling_swapped:
+            assert hasattr(policy_generation, "update_sampling_params"), (
+                "Validation sampling params differ from train, but the "
+                "generation backend does not support update_sampling_params."
+            )
+            policy_generation.update_sampling_params(
+                temperature=_val_generation_config["val_temperature"],
+                top_p=_val_generation_config["val_top_p"],
+                top_k=_val_generation_config["val_top_k"],
+            )
+
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
@@ -3811,6 +3837,14 @@ def validate(
             ]
 
             all_message_logs.extend(to_env)
+
+        if _val_sampling_swapped:
+            # Restore the train sampling profile for subsequent rollouts.
+            policy_generation.update_sampling_params(
+                temperature=_val_generation_config["temperature"],
+                top_p=_val_generation_config["top_p"],
+                top_k=_val_generation_config["top_k"],
+            )
 
         # Calculate validation metrics. accuracy is the mean reward over all
         # rollouts; grouped validation (val_num_generations_per_prompt > 1)

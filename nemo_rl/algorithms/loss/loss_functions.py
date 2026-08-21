@@ -1227,6 +1227,12 @@ class SDPOLossConfig(BaseModel, extra="allow"):
                                         Setting False omits the tail and keeps only the top-k sum
                                         (cheaper, less accurate).
         success_reward_threshold: 1.0 - minimum reward to count as "successful" (used by orchestration)
+        rollout_importance_sampling_clip: None
+                                      - when set (paper Table 12 uses 2), weight each token's
+                                        distillation loss by min(pi_theta/pi_rollout, clip), detached.
+                                        Corrects for prefixes sampled from the rollout policy when
+                                        training takes multiple off-policy mini-batch updates per
+                                        rollout step. Requires data["generation_logprobs"].
     """
 
     # success_reward_threshold is intentionally REQUIRED (no default): it is the
@@ -1243,6 +1249,10 @@ class SDPOLossConfig(BaseModel, extra="allow"):
     # k1/k2/k3 estimators at the sampled tokens.
     reference_policy_kl_penalty: float = 0.0
     reference_policy_kl_type: str = "k3"
+    # Truncated importance-sampling correction for off-policy mini-batch
+    # updates (paper Table 12: "Rollout importance sampling clip" = 2).
+    # None disables (no extra logprob computation in the training forward).
+    rollout_importance_sampling_clip: Optional[float] = None
 
 
 class SDPOLossDataDict(TypedDict):
@@ -1254,6 +1264,7 @@ class SDPOLossDataDict(TypedDict):
     sdpo_mask: torch.Tensor  # [B]         1 = sample has a demonstration
     teacher_topk_logits: torch.Tensor  # [B, S, K]   aligned to student positions
     teacher_topk_indices: torch.Tensor  # [B, S, K]
+    generation_logprobs: NotRequired[torch.Tensor]  # [B, S]  rollout-policy logprobs; required when rollout_importance_sampling_clip is set
 
 
 class SDPOLossFn(LossFunction):
@@ -1292,6 +1303,7 @@ class SDPOLossFn(LossFunction):
         self.log_infinitesimal: float = -100.0
         self.reference_policy_kl_penalty: float = cfg.reference_policy_kl_penalty
         self.reference_policy_kl_type: str = cfg.reference_policy_kl_type
+        self.rollout_importance_sampling_clip: Optional[float] = cfg.rollout_importance_sampling_clip
 
         if self.kl_type not in {"forward", "reverse", "mixed", "js"}:
             raise ValueError(f"SDPOLossFn: kl_type must be one of forward/reverse/mixed/js, got {self.kl_type}")
@@ -1304,6 +1316,11 @@ class SDPOLossFn(LossFunction):
         if self.reference_policy_kl_type not in {"k1", "k2", "k3"}:
             raise ValueError(
                 f"SDPOLossFn: reference_policy_kl_type must be one of k1/k2/k3, got {self.reference_policy_kl_type}"
+            )
+        if self.rollout_importance_sampling_clip is not None and self.rollout_importance_sampling_clip <= 0.0:
+            raise ValueError(
+                f"SDPOLossFn: rollout_importance_sampling_clip must be > 0 (or None to disable), "
+                f"got {self.rollout_importance_sampling_clip}"
             )
 
     def __call__(
@@ -1375,6 +1392,32 @@ class SDPOLossFn(LossFunction):
                 tail = tail * (1.0 - self.mixed_kl_weight)
             per_token_kl = per_token_kl + tail
 
+        # Truncated rollout importance sampling (paper Table 12: clip = 2).
+        # With multiple off-policy mini-batch updates per rollout step, the
+        # prefixes y_<t were sampled from the rollout policy, not the current
+        # one; reweighting each token by min(pi_theta/pi_rollout, clip),
+        # detached, corrects the prefix distribution. Applied to the
+        # distillation term only — the ref-KL below carries its own
+        # score-function correction.
+        rollout_is_ratio: Optional[torch.Tensor] = None
+        if self.rollout_importance_sampling_clip is not None:
+            assert next_token_logprobs is not None, (
+                "SDPOLossFn: rollout_importance_sampling_clip requires the "
+                "current-policy logprobs (next_token_logprobs) from the "
+                "training forward; prepare_loss_input supplies them."
+            )
+            assert "generation_logprobs" in data, (
+                "SDPOLossFn: rollout_importance_sampling_clip requires "
+                "data['generation_logprobs'] (rollout-policy logprobs)."
+            )
+            is_max_len = per_token_kl.shape[1]
+            # Prefer unfiltered logprobs when top-k/top-p training filtering is
+            # active, consistent with the ref-KL path below.
+            curr_lp_is = data.get("curr_logprobs_unfiltered", next_token_logprobs).detach()[:, :is_max_len]
+            rollout_lp = data["generation_logprobs"][:, 1:][:, :is_max_len]
+            rollout_is_ratio = torch.exp(curr_lp_is - rollout_lp)
+            per_token_kl = per_token_kl * rollout_is_ratio.clamp(max=self.rollout_importance_sampling_clip)
+
         # Trust-region anchor to a frozen-init reference policy. The student
         # side must be the grad-carrying logprobs from this training forward:
         # building the KL from two detached data-dict tensors (as an earlier
@@ -1441,6 +1484,12 @@ class SDPOLossFn(LossFunction):
             # sample regardless of whether a teacher demonstration is available.
             ref_mask = token_mask * sample_mask.unsqueeze(-1)
             metrics["sdpo/ref_kl"] = masked_mean(ref_kl_per_token, ref_mask).item()
+        if rollout_is_ratio is not None:
+            metrics["sdpo/rollout_is_ratio_mean"] = masked_mean(rollout_is_ratio, effective_mask).item()
+            metrics["sdpo/rollout_is_clip_frac"] = masked_mean(
+                (rollout_is_ratio > self.rollout_importance_sampling_clip).float(),
+                effective_mask,
+            ).item()
 
         return loss, metrics
 

@@ -657,6 +657,25 @@ class BaseVllmGenerationWorker:
             ignore_eos=self.cfg.get("ignore_eos", False),
         )
 
+    def update_sampling_params(self, **sampling_params: Any) -> bool:
+        """Override the sampling profile read by _build_sampling_params.
+
+        Lets the driver switch between the train and validation sampling
+        profiles (generation.val_temperature / val_top_p / val_top_k) on
+        rollout paths that build SamplingParams from the worker cfg rather
+        than stamping them per request. Only temperature/top_p/top_k may be
+        overridden; a key that is absent stays unchanged (top_k=None is a
+        valid explicit value, so absence — not None — means "keep").
+        """
+        allowed = {"temperature", "top_p", "top_k"}
+        unknown = set(sampling_params) - allowed
+        if unknown:
+            raise ValueError(
+                f"update_sampling_params only accepts {sorted(allowed)}, got unknown keys {sorted(unknown)}"
+            )
+        self.cfg.update(sampling_params)
+        return True
+
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
         torch.cuda.profiler.start()

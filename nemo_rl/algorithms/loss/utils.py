@@ -141,9 +141,14 @@ def prepare_loss_input(
         }
         # SDPO's trust-region ref-KL needs grad-carrying current logprobs at
         # the sampled tokens as its student side; detached tensors from the
-        # data dict would contribute no gradient. DistillationLossFn shares
-        # this input type but has no such penalty, hence the getattr.
-        if getattr(loss_fn, "reference_policy_kl_penalty", 0.0) > 0.0:
+        # data dict would contribute no gradient. The rollout IS clip also
+        # needs current logprobs (detached inside the loss) to form the
+        # pi_theta/pi_rollout ratio. DistillationLossFn shares this input
+        # type but has neither knob, hence the getattrs.
+        if (
+            getattr(loss_fn, "reference_policy_kl_penalty", 0.0) > 0.0
+            or getattr(loss_fn, "rollout_importance_sampling_clip", None) is not None
+        ):
             loss_input["next_token_logprobs"] = get_next_token_logprobs_from_logits(
                 input_ids=data["input_ids"],
                 next_token_logits=logits,

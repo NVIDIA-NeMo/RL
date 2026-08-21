@@ -131,6 +131,9 @@ class SDPOConfig(TypedDict):
     val_at_end: bool
     max_val_samples: int
     seed: int
+    # Rollouts per validation prompt (paper Table 12 §4 uses 4); val:accuracy
+    # averages over all of them. Default 1.
+    val_num_generations_per_prompt: NotRequired[int]
     # SDPO-specific
     success_reward_threshold: float  # reward >= this counts as "successful"
     max_reprompt_len: int  # max tokens in teacher prompt
@@ -748,6 +751,7 @@ def setup(
         "val_at_start": sdpo_config["val_at_start"],
         "val_at_end": sdpo_config["val_at_end"],
         "max_val_samples": sdpo_config["max_val_samples"],
+        "val_num_generations_per_prompt": sdpo_config.get("val_num_generations_per_prompt", 1),
         "seed": sdpo_config["seed"],
         # GRPO-specific flags that SDPO doesn't use — set safe defaults
         "normalize_rewards": False,
@@ -994,6 +998,7 @@ def sdpo_train(
                     max_val_samples=sdpo_cfg["max_val_samples"],
                     val_batch_size=sdpo_cfg["val_batch_size"],
                     max_rollout_turns=sdpo_cfg["max_rollout_turns"],
+                    val_num_generations_per_prompt=sdpo_cfg.get("val_num_generations_per_prompt", 1),
                 ),
             }
         )
@@ -1005,7 +1010,10 @@ def sdpo_train(
             total_steps,
             _validate_cfg,
         )
-        logger.log_metrics(val_metrics, step=total_steps)
+        # validate() returns bare keys ("accuracy", "pass_k", ...) since the
+        # main merge; log them under the val: prefix that dashboards and
+        # checkpointing.metric_name ("val:accuracy") reference.
+        logger.log_metrics({f"val:{k}": v for k, v in val_metrics.items()}, step=total_steps)
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
@@ -1266,16 +1274,37 @@ def sdpo_train(
                     )
 
                 # ── Metrics & logging ────────────────────────────────────────
-                metrics["train/loss"] = train_results.get("loss", float("nan"))
-                metrics["train/grad_norm"] = train_results.get("grad_norm", float("nan"))
+                # train_results["loss"] / ["grad_norm"] are per-GLOBAL-BATCH
+                # tensors (one entry per optimizer step; 32 entries with
+                # train_global_batch_size=8). W&B renders a list-valued metric
+                # as NaN in charts, so reduce to the mean scalar.
+                def _to_scalar(v: Any) -> float:
+                    if v is None:
+                        return float("nan")
+                    t = torch.as_tensor(v, dtype=torch.float32)
+                    return t.float().mean().item()
+
+                metrics["train/loss"] = _to_scalar(train_results.get("loss"))
+                metrics["train/grad_norm"] = _to_scalar(train_results.get("grad_norm"))
                 metrics["train/mean_reward"] = rewards.mean().item()
                 metrics["train/success_fraction"] = (rewards >= success_threshold).float().mean().item()
 
                 # Aggregate SDPO-specific (and, for the hybrid, GRPO/hybrid)
-                # metrics from the loss function.
+                # metrics from the loss function. The worker pre-divides every
+                # per-microbatch metric by num_global_batches (a sum-style
+                # aggregation contract meant for loss shares); these keys are
+                # per-microbatch MEANS, so averaging them here would leave the
+                # result num_global_batches× too small — multiply it back.
+                # (With the old full-batch config num_global_batches was 1 and
+                # this was invisible; with gbs=8 it shrank everything 32×.)
+                num_global_batches = max(1, repeated_batch.size // policy_cfg["train_global_batch_size"])
                 for k, v in train_results.get("all_mb_metrics", {}).items():
                     if "sdpo" in k or "hybrid" in k or k.startswith("grpo/"):
-                        metrics[k] = sum(v) / len(v) if isinstance(v, list) else v
+                        val = sum(v) / len(v) if isinstance(v, list) else v
+                        if "_min" not in k and "_max" not in k:
+                            # _min/_max keys skip the worker's pre-division.
+                            val = val * num_global_batches
+                        metrics[k] = val
 
                 num_valid_tokens = int(
                     (train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)).sum().item()
@@ -1305,6 +1334,7 @@ def sdpo_train(
                                 max_val_samples=sdpo_cfg["max_val_samples"],
                                 val_batch_size=sdpo_cfg["val_batch_size"],
                                 max_rollout_turns=sdpo_cfg["max_rollout_turns"],
+                                val_num_generations_per_prompt=sdpo_cfg.get("val_num_generations_per_prompt", 1),
                             ),
                         }
                     )
@@ -1316,14 +1346,18 @@ def sdpo_train(
                         total_steps,
                         _validate_cfg,
                     )
-                    metrics.update(val_metrics)
+                    # validate() returns bare keys ("accuracy", "pass_k", ...)
+                    # since the main merge; keep val_metrics bare for the
+                    # checkpoint metric lookup below (it splits "val:accuracy"
+                    # and looks up "accuracy"), but log under the val: prefix
+                    # that dashboards reference.
+                    metrics.update({f"val:{k}": v for k, v in val_metrics.items()})
 
                     # Update best val reward in save state
-                    val_reward_key = "val:accuracy"
-                    if val_reward_key in val_metrics:
+                    if "accuracy" in val_metrics:
                         sdpo_save_state["val_reward"] = max(
                             sdpo_save_state.get("val_reward", -1e9),
-                            val_metrics[val_reward_key],
+                            val_metrics["accuracy"],
                         )
 
                 # Log
