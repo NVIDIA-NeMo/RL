@@ -2482,10 +2482,13 @@ class MegatronPolicyWorkerImpl(
             "utf-8",
             errors="replace",
         )
-        raise RuntimeError(
+        synchronized_error = RuntimeError(
             f"Draft refit preflight failed on train rank {source_rank}: "
             f"{received_message}"
-        ) from local_error
+        )
+        if local_error is not None:
+            raise synchronized_error from local_error
+        raise synchronized_error
 
     def _preflight_draft_weights_for_refit(
         self,
