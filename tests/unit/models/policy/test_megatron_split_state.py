@@ -616,6 +616,95 @@ class TestFinish:
         assert mock_module_symbols["agg"].call_args.kwargs["losses"] == [1.0]
         assert metrics["draft_grad_norm"].item() == pytest.approx(0.25)
 
+    @pytest.mark.parametrize(
+        ("cp_numerators", "cp_counts"),
+        [
+            ([40.0], [10.0]),
+            ([0.0, 40.0], [0.0, 10.0]),
+            ([0.0, 10.0, 0.0, 30.0], [0.0, 2.0, 0.0, 8.0]),
+        ],
+        ids=["cp1", "cp2_zero_owner", "cp4_uneven_zero_owners"],
+    )
+    def test_draft_metric_is_cp_invariant_before_replica_leader_filtering(
+        self,
+        mock_module_symbols,
+        cp_numerators,
+        cp_counts,
+    ):
+        """CP0 must report the full replica numerator before TQ drops CP twins."""
+        from nemo_rl.algorithms.loss.draft import DraftLossStats
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.models.megatron.draft.step_state import (
+            DRAFT_STEP_PAYLOAD_KEY,
+            DraftStepState,
+        )
+        from nemo_rl.models.policy.tq_policy import _aggregate_train_results
+
+        local_numerator = cp_numerators[0]
+        local_count = cp_counts[0]
+        global_numerator = sum(cp_numerators)
+        global_count = sum(cp_counts)
+        payload = DraftStepState.metric_payload(
+            DraftLossStats(
+                numerators=torch.tensor([local_numerator]),
+                counts=torch.tensor([local_count]),
+                weights=torch.ones(1),
+            )
+        )
+        mock_module_symbols["mfb"].return_value = [
+            {
+                "loss": 2048.0,
+                "draft_loss": torch.tensor(local_numerator),
+                DRAFT_STEP_PAYLOAD_KEY: payload,
+            }
+        ]
+
+        def emulate_collectives(value, *, group=None):
+            if value.numel() != 1:
+                return
+            if group is mock_module_symbols["pstate"].get_context_parallel_group():
+                value.fill_(global_numerator)
+            else:
+                value.fill_(global_count)
+
+        mock_module_symbols["all_reduce"].side_effect = emulate_collectives
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.cp_size = len(cp_numerators)
+        draft_param = torch.nn.Parameter(torch.tensor(1.0))
+        draft_param.grad_norm_group = "draft"
+        draft_param.main_grad = torch.tensor(3.0)
+        w.model.parameters.return_value = iter([draft_param])
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.model.parameters.return_value = iter([draft_param])
+        w.finish_train_step()
+
+        cp0_metrics = mock_module_symbols["agg"].call_args.kwargs[
+            "all_mb_metrics"
+        ]
+        leader_result = {
+            "global_loss": 1.0,
+            "grad_norm": 0.5,
+            "all_mb_metrics": {"draft_loss": [cp0_metrics[0]["draft_loss"]]},
+            "is_replica_leader": True,
+        }
+        cp_twin_results = [
+            {**leader_result, "is_replica_leader": False}
+            for _ in range(len(cp_numerators) - 1)
+        ]
+        filtered = [
+            result
+            for result in [leader_result, *cp_twin_results]
+            if result["is_replica_leader"]
+        ]
+        aggregated = _aggregate_train_results(filtered)
+
+        assert len(mock_module_symbols["all_reduce"].call_args_list) == 3
+        assert aggregated["all_mb_metrics"]["draft_loss"] == pytest.approx(
+            [global_numerator / global_count]
+        )
+
     def test_accumulates_draft_counts_across_streamed_chunks(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.draft import DraftLossStats
         from nemo_rl.algorithms.loss.interfaces import LossType
