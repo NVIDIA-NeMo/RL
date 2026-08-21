@@ -82,6 +82,7 @@ from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -312,6 +313,7 @@ class SingleControllerActor:
             "masked_advantages": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
+            **{key: [] for key in VIOLATION_TAG_KEYS},
         }
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
@@ -1960,6 +1962,10 @@ class SingleControllerActor:
             The updated batch metadata and whether the batch contains at least
             one valid training token.
         """
+        for tag in meta.tags or []:
+            for key in VIOLATION_TAG_KEYS:
+                self._step_log_dict[key].append(int(tag.get(key, 0)))
+
         if self._advantage_estimator is None:
             return meta, True
         adv_cfg = self._advantage_cfg
