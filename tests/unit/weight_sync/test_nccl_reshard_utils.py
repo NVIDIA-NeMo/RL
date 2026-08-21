@@ -66,7 +66,9 @@ def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
     check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
 
 
-def test_check_nccl_reshard_refit_support_rejects_generation_context_parallelism() -> None:
+def test_check_nccl_reshard_refit_support_rejects_generation_context_parallelism() -> (
+    None
+):
     config = _valid_nccl_reshard_config()
     config.policy["generation"]["vllm_cfg"]["context_parallel_size"] = 2
 
