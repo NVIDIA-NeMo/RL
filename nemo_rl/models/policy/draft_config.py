@@ -50,6 +50,7 @@ class DFlashDraftConfig(BaseModel, extra="forbid"):
     speculator_type: Literal["dflash"] = "dflash"
     enabled: bool = False
     model_name: str | None = None
+    model_revision: str | None = None
     loss_weight: Annotated[float, Field(gt=0)] = 0.1
     gamma: Annotated[int, Field(gt=0)]
     anchors_per_sample: Annotated[int, Field(gt=0)]
@@ -84,6 +85,7 @@ class DSparkDraftConfig(BaseModel, extra="forbid"):
     speculator_type: Literal["dspark"] = "dspark"
     enabled: bool = False
     model_name: str | None = None
+    model_revision: str | None = None
     loss_weight: Annotated[float, Field(gt=0)] = 0.1
     aux_layer_indices: None = Field(default=None, exclude=True, repr=False)
     block_size: Annotated[int, Field(gt=1)]

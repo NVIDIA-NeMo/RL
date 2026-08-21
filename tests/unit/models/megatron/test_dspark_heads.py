@@ -49,7 +49,9 @@ def _load_heads() -> tuple[type[nn.Module], type[nn.Module]]:
 DSparkMarkovHead, DSparkConfidenceHead = _load_heads()
 
 _PUBLIC_DSPARK_REPO = "deepseek-ai/dspark_qwen3_8b_block7"
-_PUBLIC_DSPARK_REVISION = "03326e5043815da1f81b109078b2889737c26017"
+_PUBLIC_DSPARK_REVISION = (  # pragma: allowlist secret
+    "03326e5043815da1f81b109078b2889737c26017"
+)
 _PUBLIC_DSPARK_CONFIG = {
     "vocab_size": 151936,
     "draft_vocab_size": 151936,

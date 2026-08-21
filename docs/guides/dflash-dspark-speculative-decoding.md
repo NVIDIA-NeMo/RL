@@ -101,7 +101,8 @@ policy:
   draft:
     speculator_type: dspark
     enabled: true
-    model_name: deepseek-ai/dspark_qwen3_8b_block7@03326e5043815da1f81b109078b2889737c26017
+    model_name: deepseek-ai/dspark_qwen3_8b_block7
+    model_revision: 03326e5043815da1f81b109078b2889737c26017
     loss_weight: 1.0
     block_size: 7
     anchors_per_sample: 2
@@ -122,6 +123,7 @@ policy:
       speculative_config:
         method: dspark
         model: ${policy.draft.model_name}
+        revision: ${policy.draft.model_revision}
         num_speculative_tokens: ${policy.draft.block_size}
         draft_tensor_parallel_size: 1
 ```

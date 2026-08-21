@@ -1354,7 +1354,11 @@ def _load_checkpoint_from_directory(checkpoint_dir: Path) -> StateDict:
     )
 
 
-def _load_checkpoint_state(checkpoint_source: str) -> StateDict:
+def _load_checkpoint_state(
+    checkpoint_source: str,
+    *,
+    revision: str | None = None,
+) -> StateDict:
     source_path = Path(checkpoint_source)
     if source_path.is_file():
         return _load_checkpoint_file(source_path)
@@ -1367,6 +1371,7 @@ def _load_checkpoint_state(checkpoint_source: str) -> StateDict:
         source_path = Path(
             snapshot_download(
                 repo_id=checkpoint_source,
+                revision=revision,
                 allow_patterns=_HF_SNAPSHOT_ALLOW_PATTERNS,
                 ignore_patterns=_HF_SNAPSHOT_IGNORE_PATTERNS,
             )
@@ -1895,13 +1900,15 @@ def export_dflash_weights_to_hf(
 def load_hf_weights_to_dflash(
     model: torch.nn.Module,
     model_name: str,
+    *,
+    model_revision: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Load an exact-schema public DFlash body checkpoint into local TP shards."""
     if not model_name or not model_name.strip():
         raise ValueError(
             "load_hf_weights_to_dflash requires a non-empty model name or path."
         )
-    raw_state = _load_checkpoint_state(model_name)
+    raw_state = _load_checkpoint_state(model_name, revision=model_revision)
     normalized_state = _normalize_draft_state_dict(raw_state)
     return _load_normalized_hf_weights_to_dflash(model, normalized_state)
 
@@ -1955,6 +1962,8 @@ def _load_normalized_hf_weights_to_dflash(
 def load_hf_weights_to_dspark(
     model: torch.nn.Module,
     model_name: str,
+    *,
+    model_revision: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Load an exact DSpark body/head checkpoint while excluding target weights."""
     if not model_name or not model_name.strip():
@@ -1963,7 +1972,9 @@ def load_hf_weights_to_dspark(
         )
     adapter = unwrap_model(model)
     body = adapter.body
-    normalized = _normalize_draft_state_dict(_load_checkpoint_state(model_name))
+    normalized = _normalize_draft_state_dict(
+        _load_checkpoint_state(model_name, revision=model_revision)
+    )
     body_names = set(body.state_dict())
     body_state = {name: tensor for name, tensor in normalized.items() if name in body_names}
     missing, _ = _load_normalized_hf_weights_to_dflash(body, body_state)

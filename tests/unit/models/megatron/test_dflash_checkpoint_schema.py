@@ -86,7 +86,7 @@ def test_hf_checkpoint_loader_forwards_an_explicit_revision(tmp_path: Path) -> N
     from nemo_rl.models.megatron.draft.utils import _load_checkpoint_state
 
     repo_id = "deepseek-ai/dspark_qwen3_8b_block7"
-    revision = "03326e5043815da1f81b109078b2889737c26017"
+    revision = "03326e5043815da1f81b109078b2889737c26017"  # pragma: allowlist secret
     with (
         patch("huggingface_hub.snapshot_download", return_value=str(tmp_path)) as fetch,
         patch(

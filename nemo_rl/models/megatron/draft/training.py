@@ -336,6 +336,7 @@ class DFlashSpeculator:
             missing_keys, unexpected_keys = load_hf_weights_to_dflash(
                 body,
                 self.config.model_name,
+                model_revision=self.config.model_revision,
             )
             if missing_keys or unexpected_keys:
                 raise RuntimeError(
@@ -679,6 +680,7 @@ class DSparkSpeculator:
             missing_keys, unexpected_keys = load_hf_weights_to_dspark(
                 adapter,
                 self.config.model_name,
+                model_revision=self.config.model_revision,
             )
             if missing_keys or unexpected_keys:
                 raise RuntimeError(
