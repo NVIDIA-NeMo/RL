@@ -79,6 +79,7 @@ def _make_vllm_config(
             "skip_tokenizer_init": False,
             "load_format": "auto",
             "enforce_eager": "False",
+            "refit_with_reload_api": False,
         },
         "colocated": {
             "enabled": True,

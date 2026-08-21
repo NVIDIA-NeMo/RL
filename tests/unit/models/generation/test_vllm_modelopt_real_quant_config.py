@@ -39,6 +39,10 @@ from nemo_rl.modelopt.utils import (
 )
 
 
+def _vllm_config():
+    return types.SimpleNamespace(additional_config={})
+
+
 @pytest.fixture(autouse=True)
 def _install_optional_modelopt_config_api(monkeypatch):
     """Provide ModelOpt's config APIs when the optional dependency is absent."""
@@ -1721,7 +1725,7 @@ def test_real_quant_collective_reload_uses_vllm_layerwise_lifecycle(monkeypatch)
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(
         model=model,
-        vllm_config=object(),
+        vllm_config=_vllm_config(),
     )
     extension.model_config = model_config
     extension.device = torch.device("cpu")
@@ -1755,7 +1759,7 @@ def test_real_quant_collective_reload_uses_vllm_layerwise_lifecycle(monkeypatch)
         lambda: calls.append("sync"),
     )
 
-    assert extension.update_weights_from_collective() is True
+    assert extension.update_weights_from_collective(refit_with_reload_api=False) is True
     assert calls == [
         ("initialize", model),
         ("consume", "_load_weights"),
@@ -1773,7 +1777,7 @@ def test_real_quant_collective_reload_raises_on_failure(monkeypatch):
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(
         model=model,
-        vllm_config=object(),
+        vllm_config=_vllm_config(),
     )
     extension.model_config = object()
     extension.device = torch.device("cpu")
@@ -1805,7 +1809,7 @@ def test_real_quant_collective_reload_raises_on_failure(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="collective refit failed"):
-        extension.update_weights_from_collective()
+        extension.update_weights_from_collective(refit_with_reload_api=False)
     assert calls == [("initialize", model)]
 
 
@@ -1821,10 +1825,13 @@ def test_non_real_quant_collective_reload_delegates(monkeypatch):
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
         "update_weights_from_collective",
-        lambda self: "delegated",
+        lambda self, refit_with_reload_api: "delegated",
     )
 
-    assert extension.update_weights_from_collective() == "delegated"
+    assert (
+        extension.update_weights_from_collective(refit_with_reload_api=False)
+        == "delegated"
+    )
 
 
 def test_real_quant_ipc_complete_finalizes_vllm_layerwise_reload_and_acks(
@@ -1850,7 +1857,7 @@ def test_real_quant_ipc_complete_finalizes_vllm_layerwise_reload_and_acks(
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(
         model=model,
-        vllm_config=object(),
+        vllm_config=_vllm_config(),
     )
     extension.model_config = model_config
     extension.device = torch.device("cpu")
@@ -1906,7 +1913,7 @@ def test_real_quant_ipc_finalize_failure_acks_complete(monkeypatch):
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(
         model=_mark_as_modelopt_layer(torch.nn.Linear(1, 1)),
-        vllm_config=object(),
+        vllm_config=_vllm_config(),
     )
     extension.model_config = object()
     extension.device = torch.device("cpu")
@@ -1991,7 +1998,7 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(
         model=torch.nn.Linear(1, 1),
-        vllm_config=object(),
+        vllm_config=_vllm_config(),
     )
     extension.model_config = object()
     extension.device = torch.device("cuda:0")
@@ -2068,7 +2075,8 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     extension.model_runner = types.SimpleNamespace(
         model=model,
         vllm_config=types.SimpleNamespace(
-            model_config=types.SimpleNamespace(architectures=["GptOssForCausalLM"])
+            model_config=types.SimpleNamespace(architectures=["GptOssForCausalLM"]),
+            additional_config={},
         ),
     )
     extension.model_config = model_config

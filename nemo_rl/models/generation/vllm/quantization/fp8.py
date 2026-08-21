@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import os
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
+from typing import Any
 from unittest.mock import patch
 
 import ray
@@ -241,14 +243,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
         os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
-    if vllm_cfg["async_engine"]:
-        # for async engine, vllm spawns a process for each DP, so we patch
-        # vllm so that upon spawning the thread it applies our FP8 patches
-        EngineCoreProc.run_engine_core = my_run_engine_core
-        CoreEngineProcManager.__init__ = my_init
-    else:
-        # if not async, just directly monkey patch the ray executor
-        monkey_patch_vllm_ray_executor(global_fp8_config)
+    if not vllm_cfg["refit_with_reload_api"]:
+        if vllm_cfg["async_engine"]:
+            EngineCoreProc.run_engine_core = my_run_engine_core
+            CoreEngineProcManager.__init__ = my_init
+        else:
+            monkey_patch_vllm_ray_executor(global_fp8_config)
 
     # create fp8 kwargs for vllm's LLM(...)
     num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
@@ -462,17 +462,22 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return value, scale
 
 
-def load_weights(weights, model_runner):
-    global global_fp8_config
-    weights_quantized = []
+def get_quantized_weight_iterator(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    model_runner: Any,
+    *,
+    refit_with_reload_api: bool,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Convert trainer weights to the checkpoint tensors expected by vLLM."""
     model = model_runner.model
+    is_mx = global_fp8_config.is_mx
 
     for k, v in weights:
         if not _is_fp8_weight(k, model):
-            weights_quantized.append((k, v))
+            yield k, v
             continue
         # Cast the weight into fp8 and its scale factor
-        if global_fp8_config.is_mx:
+        if is_mx:
             param_lp, param_scale = quantize_mxfp8_weight(v)
         else:
             param_lp, param_scale = cast_tensor_to_fp8_blockwise(
@@ -480,14 +485,36 @@ def load_weights(weights, model_runner):
                 weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
             )
         param_scale = torch.squeeze(param_scale, dim=-1)
-        if global_fp8_config.is_mx:
-            weights_quantized.append([k, param_lp])
-            weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
+        if is_mx:
+            if refit_with_reload_api:
+                yield k, param_lp
+                yield k + "_scale", param_scale
+            else:
+                module = _get_module_from_param_name(model, k)
+                if isinstance(module, RoutedExperts) and k.endswith(
+                    ("w13_weight", "w2_weight")
+                ):
+                    yield k + "_from_checkpoint", param_lp
+                else:
+                    yield k, param_lp
+                yield k + "_scale_from_checkpoint", param_scale
         else:
-            weights_quantized.append([k, param_lp])
-            weights_quantized.append([k + "_scale_inv", param_scale])
+            yield k, param_lp
+            yield k + "_scale_inv", param_scale
+
+
+def load_weights(
+    weights: Iterable[tuple[str, torch.Tensor]], model_runner: Any
+) -> None:
+    """Quantize weights for the legacy direct model-loading path."""
     # Finally load the weights into vllm
-    model.load_weights(weights_quantized)
+    model_runner.model.load_weights(
+        get_quantized_weight_iterator(
+            weights,
+            model_runner,
+            refit_with_reload_api=False,
+        )
+    )
 
 
 def cast_tensor_to_fp8_blockwise(

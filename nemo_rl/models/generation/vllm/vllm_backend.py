@@ -206,6 +206,37 @@ class VllmInternalWorkerExtension:
             return
         self._load_full_hf_weights(policy_weights)
 
+    def _prepare_reload_weight_iterator(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Prepare checkpoint-format weights for vLLM's native reload API."""
+        if (
+            "Gemma3ForConditionalGeneration"
+            in self.model_runner.vllm_config.model_config.architectures
+        ):
+            weights = (
+                (fix_gemma3_vision_weight_name(name), weight)
+                for name, weight in weights
+            )
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            return fp8.get_quantized_weight_iterator(
+                weights,
+                self.model_runner,
+                refit_with_reload_api=True,
+            )
+        return weights
+
+    def _collective_requires_batched_loading(self) -> bool:
+        """Return whether a speculative drafter also consumes the refit stream."""
+        if any(name.startswith("draft.") for name in self.state_dict_info):
+            return True
+        if self._get_drafter_model() is None:
+            return False
+        return self._mtp_drafter_refit_enabled()
+
     def bind_numa(self) -> bool:
         """Pin this TP worker to its GPU's NUMA-local CPUs/memory.
 
@@ -651,6 +682,7 @@ class VllmInternalWorkerExtension:
         try:
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
+
             with self._weight_update_lifecycle("ipc") as finalize:
                 while True:
                     # Blocking receive with timeout (this is the main operation)
@@ -748,22 +780,50 @@ class VllmInternalWorkerExtension:
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
-        """Update the model weights from collective communication."""
+    def update_weights_from_collective(self, refit_with_reload_api: bool) -> bool:
+        """Update the model weights from collective communication.
+
+        Args:
+            refit_with_reload_api: Whether to use vLLM's native reload API.
+        """
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
         )
 
         try:
-            with self._weight_update_lifecycle("collective") as finalize:
-                packed_broadcast_consumer(
+            requires_batched_loading = self._collective_requires_batched_loading()
+            if refit_with_reload_api and requires_batched_loading:
+                raise RuntimeError(
+                    "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+                    "supported when vLLM refit also updates draft weights. Set it "
+                    "to false for Eagle/MTP speculative decoding."
+                )
+            if not refit_with_reload_api:
+                # Preserve the existing NeMo-RL loader and its explicit
+                # finalization path unless native reload is requested.
+                with self._weight_update_lifecycle("collective") as finalize:
+                    packed_broadcast_consumer(
+                        iterator=iter(self.state_dict_info.items()),
+                        group=self.model_update_group,
+                        src=0,
+                        post_unpack_func=self._load_weights,
+                    )
+                    finalize()
+            else:
+                weight_iterator = packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,
                     src=0,
-                    post_unpack_func=self._load_weights,
+                    post_unpack_func=None,
+                    return_iterator=True,
                 )
-                finalize()
+                assert weight_iterator is not None
+                self.model_runner.reload_weights(
+                    weights_iterator=self._prepare_reload_weight_iterator(
+                        weight_iterator
+                    )
+                )
 
         except Exception as e:
             if self._weight_update_errors_are_fatal():

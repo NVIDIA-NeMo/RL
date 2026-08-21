@@ -313,6 +313,14 @@ class BaseVllmGenerationWorker:
     ):
         """Lightweight config setup. No model loading, no heavy imports."""
         self.cfg = config
+        assert not (
+            self.cfg["vllm_cfg"]["refit_with_reload_api"]
+            and self.cfg["colocated"]["enabled"]
+        ), (
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+            "supported with colocated vLLM refit. Disable colocated refit or "
+            "set refit_with_reload_api=false."
+        )
         self.model_name = self.cfg["model_name"]
         # Refined from the model's expert count in _load_model.
         self.routed_experts_dtype = ROUTED_EXPERTS_FALLBACK_DTYPE
@@ -1202,7 +1210,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective",
+                args=(self.cfg["vllm_cfg"]["refit_with_reload_api"],),
             )
             worker_results = cast(list[bool], result_or_coro)
 

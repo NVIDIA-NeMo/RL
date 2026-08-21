@@ -54,7 +54,7 @@ def _valid_nccl_reshard_config() -> SimpleNamespace:
             "generation": {
                 "backend": "vllm",
                 "colocated": {"enabled": False},
-                "vllm_cfg": {},
+                "vllm_cfg": {"refit_with_reload_api": False},
             },
             "megatron_cfg": {"enabled": True},
             "dtensor_cfg": {"enabled": False},
@@ -64,6 +64,14 @@ def _valid_nccl_reshard_config() -> SimpleNamespace:
 
 def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
     check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
+
+
+def test_check_nccl_reshard_refit_support_rejects_reload_api() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["refit_with_reload_api"] = True
+
+    with pytest.raises(ValueError, match="refit_with_reload_api"):
+        check_nccl_reshard_refit_support(config)
 
 
 def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:

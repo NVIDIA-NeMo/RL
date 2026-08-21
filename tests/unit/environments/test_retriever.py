@@ -61,6 +61,7 @@ basic_vllm_test_config: VllmConfig = {
         "disable_log_requests": True,
         "gpu_memory_utilization": 0.6,
         "enforce_eager": "False",
+        "refit_with_reload_api": False,
     },
     "colocated": {
         "enabled": True,

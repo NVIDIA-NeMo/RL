@@ -84,6 +84,7 @@ basic_vllm_test_config: VllmConfig = {
         "load_format": "auto",
         "enforce_eager": "False",
         "kv_cache_dtype": "auto",
+        "refit_with_reload_api": False,
     },
     "colocated": {
         "enabled": True,
