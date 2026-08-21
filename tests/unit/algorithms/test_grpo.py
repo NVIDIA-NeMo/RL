@@ -2997,7 +2997,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         "dp_size": 1,
         "pp_size": 1,
         "ep_size": 1,
-        "sglang_server_config": {"weight_transfer_mode": "ipc"},
+        "sglang_server_config": {},
     }
     master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
     master_config.grpo.val_period = 0

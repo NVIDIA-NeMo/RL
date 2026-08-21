@@ -57,10 +57,6 @@ class SGLangServerConfig(TypedDict):
     pause_generation_mode: Literal["abort", "retract", "in_place"]
     # Total number of GPUs allocated to inference across all engines.
     num_gpus: NotRequired[int]
-    # "ipc" -> CUDA-IPC to the colocated SGLang HTTP server (default for
-    # colocated inference). "broadcast" -> NCCL broadcast over a shared
-    # weight-update group (used when SGLang engines run on disaggregate GPUs).
-    weight_transfer_mode: NotRequired[Literal["ipc", "broadcast"]]
     # GPUs per SGLang engine
     # num_gpus_per_engine = tp_size * pp_size; set ep, dp-attn are not orthgonal to those
     # nodes_per_engine: max(1, num_gpus_per_engine // num_gpus_per_node)

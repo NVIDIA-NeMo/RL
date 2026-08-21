@@ -390,6 +390,27 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    @patch.dict(os.environ, {}, clear=True)
+    def test_no_generation_leaves_nccl_cumem_unset(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        del mock_config["generation"]
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert result.is_generation_colocated is None
+        assert "NCCL_CUMEM_ENABLE" not in os.environ
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
     def test_allow_flash_attn_args_nemotron_nas(
         self,
         mock_dynamo,
