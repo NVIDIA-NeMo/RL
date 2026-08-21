@@ -55,6 +55,7 @@ _INPUT_ERROR_MESSAGES = (
     "DFlash inputs must share a dtype",
     "DFlash inputs must use a floating dtype",
     "DFlash query positions must use torch.int64",
+    "DFlash plan and input shapes must match across tensor-parallel ranks",
 )
 _INPUT_TYPE_ERROR_CODES = frozenset({4, 5, 6})
 
@@ -533,15 +534,52 @@ class DFlashBody(_ShardedModule):
         if self.tensor_parallel_size > 1:
             if self.tp_group is None:
                 raise RuntimeError("DFlash tensor parallel group is unavailable")
-            synchronized_error = torch.tensor(
-                error_code,
+            target_shape = tuple(target_taps.shape[:4])
+            block_shape = tuple(block_embeddings.shape[:3])
+            local_metadata = torch.tensor(
+                (
+                    error_code,
+                    plan.batch_size,
+                    plan.sequence_length,
+                    plan.anchors_per_sample,
+                    plan.gamma,
+                    plan.block_size,
+                    target_taps.ndim,
+                    *target_shape,
+                    *(-1 for _ in range(4 - len(target_shape))),
+                    block_embeddings.ndim,
+                    *block_shape,
+                    *(-1 for _ in range(3 - len(block_shape))),
+                ),
                 dtype=torch.int64,
                 device=self.fc.weight.device,
             )
-            torch.distributed.all_reduce(
-                synchronized_error,
-                op=torch.distributed.ReduceOp.MIN,
+            gathered_metadata = torch.empty(
+                self.tensor_parallel_size * local_metadata.numel(),
+                dtype=local_metadata.dtype,
+                device=local_metadata.device,
+            )
+            torch.distributed.all_gather_into_tensor(
+                gathered_metadata,
+                local_metadata,
                 group=self.tp_group,
+            )
+            gathered_metadata = gathered_metadata.view(
+                self.tensor_parallel_size,
+                local_metadata.numel(),
+            )
+            synchronized_error = gathered_metadata[:, 0].amin()
+            shapes_match = torch.all(
+                gathered_metadata[:, 1:] == gathered_metadata[0, 1:]
+            )
+            synchronized_error = torch.where(
+                synchronized_error < len(_INPUT_ERROR_MESSAGES),
+                synchronized_error,
+                torch.where(
+                    shapes_match,
+                    synchronized_error,
+                    synchronized_error.new_tensor(len(_INPUT_ERROR_MESSAGES) - 1),
+                ),
             )
             error_code = int(synchronized_error.item())
 
