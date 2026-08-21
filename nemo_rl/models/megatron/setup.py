@@ -329,6 +329,19 @@ def validate_and_set_config(
     weights_path,
     optimizer_path,
 ):
+    # inference_optimized layers hard-require SP with TP>1; fail here with the config key.
+    # This guards the training cfg; the inference cfg is guarded in
+    # merged_inference_megatron_cfg (the colocated build bypasses this function).
+    if (
+        config["megatron_cfg"].get("transformer_impl") == "inference_optimized"
+        and config["megatron_cfg"]["tensor_model_parallel_size"] > 1
+        and not config["megatron_cfg"]["sequence_parallel"]
+    ):
+        raise ValueError(
+            "transformer_impl=inference_optimized requires sequence parallelism "
+            "with TP>1: set policy.megatron_cfg.sequence_parallel=true."
+        )
+
     # Handle generation configuration
     is_generation_colocated = None
     sampling_params = None

@@ -123,35 +123,15 @@ def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch):
         rollouts_mod, "attach_image_model_inputs_to_message", fake_attach
     )
 
-    rollouts_mod.attach_initial_nemo_gym_image_payloads(
-        batch, processor, pad_dynamic_image_shapes=True
-    )
-    rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, processor)
+    rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, processor, env_config={})
+    rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, processor, env_config={})
 
     assert len(calls) == 1
     assert calls[0][0] is batch["message_log"][0][0]
     assert calls[0][1][0].size == (2, 3)
     assert calls[0][2] is processor
-    assert calls[0][3] is True
+    assert calls[0][3] is False
     assert batch["message_log"][0][0]["pixel_values"] is attached
-
-    default_batch = _initial_gym_image_batch()
-    rollouts_mod.attach_initial_nemo_gym_image_payloads(default_batch, processor)
-    assert len(calls) == 2
-    assert calls[1][3] is False
-
-
-@pytest.mark.parametrize(
-    ("env_config", "expected"),
-    [
-        ({}, False),
-        ({"nemo_gym": {}}, False),
-        ({"nemo_gym": {"pad_dynamic_image_shapes": False}}, False),
-        ({"nemo_gym": {"pad_dynamic_image_shapes": True}}, True),
-    ],
-)
-def test_get_nemo_gym_pad_dynamic_image_shapes(env_config, expected):
-    assert rollouts_mod.get_nemo_gym_pad_dynamic_image_shapes(env_config) is expected
 
 
 def test_attach_initial_nemo_gym_image_payloads_requires_processor():
@@ -161,7 +141,7 @@ def test_attach_initial_nemo_gym_image_payloads_requires_processor():
         ValueError,
         match="requires the multimodal processor",
     ):
-        rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, None)
+        rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, None, env_config={})
 
 
 def test_attach_initial_nemo_gym_image_payloads_requires_a_user_message():
@@ -176,7 +156,9 @@ def test_attach_initial_nemo_gym_image_payloads_requires_a_user_message():
         ValueError,
         match="no user message to attach to",
     ):
-        rollouts_mod.attach_initial_nemo_gym_image_payloads(batch, _Processor())
+        rollouts_mod.attach_initial_nemo_gym_image_payloads(
+            batch, _Processor(), env_config={}
+        )
 
 
 def test_attach_image_model_inputs_keeps_rollout_tokens_and_packs_media():
@@ -1876,6 +1858,10 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                     "message_log": [
                         {"role": "user", "token_ids": [rowidx]},
                         {
+                            "role": "user",
+                            "token_ids": [rowidx],
+                        },
+                        {
                             "role": "assistant",
                             "token_ids": [rowidx],
                             "generation_logprobs": [0.0],
@@ -1902,6 +1888,9 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
         PackedTensor(torch.tensor([[float(index)]]), dim_to_pack=0)
         for index in range(4)
     ]
+    video_payloads = [
+        PackedTensor([torch.tensor([rowidx])], dim_to_pack=0) for rowidx in range(4)
+    ]
     input_batch = BatchedDataDict(
         {
             "extra_env_info": rows,
@@ -1911,6 +1900,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                         "role": "user",
                         "content": "prompt",
                         "pixel_values": original_media[index],
+                        "video": video_payloads[index],
                     }
                 ]
                 for index in range(4)
@@ -1919,6 +1909,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
         }
     )
     captured_groups = []
+    captured_video_payloads = {}
 
     def _postprocess_group(**kwargs):
         assert kwargs["log_full_result_tables"] is False
@@ -1931,6 +1922,10 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                     message for message in result[log_key] if message["role"] == "user"
                 )
                 assert restored_user["pixel_values"] is original_log[0]["pixel_values"]
+                assert restored_user["video"] is original_log[0]["video"]
+            captured_video_payloads[result["rowidx"]] = result["message_log"][0][
+                "video"
+            ]
             assert "_initial_multimodal_data_omitted" not in result
         captured_groups.append(
             (task_index, [result["rowidx"] for result in kwargs["results"]])
@@ -2012,6 +2007,9 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
         assert enabled is True
         assert payload[0] == expected_rowidx
         assert payload[1]["rowidx"] == expected_rowidx
+    assert all(
+        captured_video_payloads[rowidx] is video_payloads[rowidx] for rowidx in range(4)
+    )
     assert rollout_results[-1].rollout_metrics["timing/remote"] == 1.0
     assert rollout_results[-1].rollout_metrics["timing/rollout/run_rollouts"] == 4.0
     assert rollout_results[-1].rollout_metrics["timing/rollout/total"] == 4.0

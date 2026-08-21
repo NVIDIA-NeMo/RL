@@ -80,7 +80,6 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
-from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.logger import Logger, print_message_log_samples
@@ -380,7 +379,7 @@ def _compute_seq_logprob_error_metrics(
 
 def grpo_train_sync(
     policy: ColocatablePolicyInterface,
-    policy_generation: Optional[GenerationInterface],
+    policy_generation: GenerationInterface,
     wrapped_dataloader,
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer,
@@ -415,14 +414,6 @@ def grpo_train_sync(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
-    NEED_REFIT = not (
-        isinstance(policy_generation, MegatronGeneration)
-        and master_config.policy["generation"]["colocated"]["enabled"]
-    )
-    # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
-    if policy_generation is None:
-        policy_generation = policy  # type: ignore
-        NEED_REFIT = False
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 
@@ -511,7 +502,7 @@ def grpo_train_sync(
         print("\n🔍 Running initial validation...", flush=True)
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
-        if NEED_REFIT and POLICY_GENERATION_STALE:
+        if POLICY_GENERATION_STALE:
             refit_policy_generation(policy, policy_generation, colocated_inference)
             POLICY_GENERATION_STALE = False
         else:
@@ -580,8 +571,7 @@ def grpo_train_sync(
                 )
 
             maybe_gpu_profile_step(policy, total_steps + 1)
-            if policy != policy_generation:
-                maybe_gpu_profile_step(policy_generation, total_steps + 1)
+            maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
             with timer.time("total_step_time"):
@@ -599,7 +589,7 @@ def grpo_train_sync(
                     flush=True,
                 )
                 with timer.time("prepare_for_generation/total"):
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                    if POLICY_GENERATION_STALE:
                         if sync_kv_scales and kv_scales_cache is None:
                             # KV-scale calibration uses message_log of the
                             # current step's PROMPTS (pre-generation), which
@@ -1011,7 +1001,7 @@ def grpo_train_sync(
                     and (total_steps + 1) % val_period == 0
                 ) or (val_at_end and is_last_step):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                    if POLICY_GENERATION_STALE:
                         refit_policy_generation(
                             policy,
                             policy_generation,

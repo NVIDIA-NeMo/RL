@@ -45,6 +45,7 @@ from nemo_rl.experience.rollouts import (
     _dummy_routed_experts_for_tokens,
     _find_routed_experts_template,
     _tensorize_by_key,
+    attach_static_multimodal_payload,
     calculate_rewards,
 )
 from nemo_rl.models.generation.interfaces import (
@@ -784,6 +785,10 @@ class AsyncNemoGymRolloutImpl:
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs, timer, timer_prefix
         )
+        source_message_log = input_sample["message_log"]
+        attach_static_multimodal_payload(prompt_message_log, source_message_log)
+        for completion in completions:
+            attach_static_multimodal_payload(completion.message_log, source_message_log)
 
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
@@ -889,7 +894,10 @@ class AsyncNemoGymRolloutImpl:
         return env_timing_metrics
 
     async def _run_rollouts(
-        self, inputs: list[dict], timer: Timer, timer_prefix: str
+        self,
+        inputs: list[dict],
+        timer: Timer,
+        timer_prefix: str,
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics.
 
@@ -1003,7 +1011,6 @@ class AsyncNemoGymRolloutImpl:
             [m for m in result["message_log"] if m["role"] == "assistant"],
             "generation_logprobs",
         )
-
         # Calculate truncation.
         truncated = (
             sum(len(m["token_ids"]) for m in result["message_log"]) == self._max_seq_len

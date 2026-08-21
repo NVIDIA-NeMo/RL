@@ -91,6 +91,11 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation = MagicMock(spec=MegatronGeneration)
     policy_generation.requires_kv_scale_sync = False
     policy_generation.get_logger_metrics.return_value = {}
+    policy_generation.blocks_training.return_value = False
+    policy_generation.wake_carries_weight_updates.return_value = False
+    policy_generation.weight_synchronizer = MagicMock()
+    policy_generation.weight_synchronizer.is_stale = True
+    policy_generation.weight_synchronizer.sync_weights.return_value = {}
     return policy_generation
 
 
@@ -2982,6 +2987,11 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
             "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
             return_value=_mock_seq_logprob_error_result(),
         ),
+        # Refit runs unconditionally when generation is stale.
+        patch(
+            "nemo_rl.algorithms.grpo.refit_policy_generation",
+            return_value={},
+        ),
         patch("nemo_rl.algorithms.grpo.torch.save"),
     ):
         grpo_mod.grpo_train(
@@ -3092,6 +3102,106 @@ def test_grpo_ft_save_period_triggers_periodic_saves(
     # step (5). Each save calls init_tmp_checkpoint(step, ...).
     saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
     assert saved_steps == [2, 4, 5]
+
+
+def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
+    mock_grpo_components, tmp_path
+):
+    """Colocated save steps keep the engine asleep through the checkpoint.
+
+    With a backend that blocks training and whose wake carries the weight
+    updates (colocated Megatron), a save-bound step must version-stamp the
+    weights with the engine still asleep, save, and only then wake the engine
+    and resume collection. The final step skips the wake (the loop exits).
+    """
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    checkpointer = mock_grpo_components["checkpointer"]
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 3
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.checkpointing["enabled"] = True
+    # Step 2 saves via save_period; step 3 saves as the last step.
+    master_config.checkpointing["save_period"] = 2
+    master_config.checkpointing["metric_name"] = None
+    master_config.policy["generation"]["colocated"]["enabled"] = True
+
+    events = []
+    policy_generation = _mock_policy_generation()
+    policy_generation.blocks_training.return_value = True
+    policy_generation.wake_carries_weight_updates.return_value = True
+    policy_generation.finish_generation.side_effect = lambda *a, **k: events.append(
+        ("finish_generation", k.get("release_gpu", True))
+    )
+    policy_generation.prepare_for_generation.side_effect = (
+        lambda *a, **k: events.append("wake_engine")
+    )
+    policy.offload_before_refit.side_effect = lambda *a, **k: events.append(
+        "offload_before_refit"
+    )
+    policy.offload_after_refit.side_effect = lambda *a, **k: events.append(
+        "offload_after_refit"
+    )
+
+    def record_save(step, *args, **kwargs):
+        events.append(("save", step))
+        return "/tmp/checkpoint"
+
+    checkpointer.init_tmp_checkpoint.side_effect = record_save
+    checkpointer.checkpoint_dir = tmp_path
+
+    with (
+        mock_async_grpo_infrastructure(
+            mock_batch, mock_rollout_metrics, collector_events=events
+        ),
+        _patched_logprob_phase(policy),
+        patch("nemo_rl.algorithms.grpo.torch.save"),
+    ):
+        async_grpo_train(
+            policy,
+            policy_generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert events == [
+        # Startup: the initial refit is patched out; the collector still gets
+        # the version stamp before collection starts.
+        "set_weight_version",
+        "start_collection",
+        # Step 1 (no save): stand down for training, then refit-arm stamp + resume.
+        ("finish_generation", True),
+        "set_weight_version",
+        "resume_after_refit",
+        # Step 2 (save-bound): version-stamp with the engine asleep, save,
+        # then wake and resume.
+        ("finish_generation", True),
+        "offload_before_refit",
+        "set_weight_version",
+        ("save", 2),
+        "offload_after_refit",
+        "wake_engine",
+        "resume_after_refit",
+        # Step 3 (last step saves): same deferral, but no wake — the loop exits.
+        ("finish_generation", True),
+        "offload_before_refit",
+        "set_weight_version",
+        ("save", 3),
+    ]
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
