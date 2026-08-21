@@ -285,7 +285,9 @@ class DraftLossWrapper:
             **loss_input,
         )
         combined_loss = policy_loss + self.loss_weight * draft_loss
-        metrics["draft_loss"] = float(draft_loss.detach().item())
+        draft_loss_value = float(draft_loss.detach().item())
+        metrics["loss"] += self.loss_weight * draft_loss_value
+        metrics["draft_loss"] = draft_loss_value
         return combined_loss, metrics
 
 

@@ -533,7 +533,10 @@ class DTensorPolicyWorkerV2Impl(
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
 
                         if num_valid_samples > 0:
-                            mb_losses.append(loss.item())
+                            # ClippedPGLossFn already materializes the loss
+                            # metric with the other scalars; avoid a second
+                            # GPU-to-CPU synchronization here.
+                            mb_losses.append(loss_metrics["loss"])
                             all_mb_metrics.append(loss_metrics)
 
                 grad_norm: Optional[float | torch.Tensor] = None
