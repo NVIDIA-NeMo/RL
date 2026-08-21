@@ -28,6 +28,10 @@ ppo:
     max_trajectory_age_steps: 1
     # Requires policy_training_start_step > 0. null uses max_trajectory_age_steps.
     warmup_generation_lead_steps: null
+    # Number of generation-worker failures tolerated before aborting.
+    # 0 (default) = fail on the first worker exception. Increase only
+    # when transient generation errors are expected and acceptable to drop.
+    max_generation_failures: 0
     in_flight_weight_updates: false
     recompute_kv_cache_after_weight_updates: false
     # true discards partial restored rows and fills from subsequent prompts.
