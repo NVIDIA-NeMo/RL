@@ -43,8 +43,8 @@ from nemo_rl.algorithms.grpo import (
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
     _maybe_restore_async_replay_buffer_checkpoint,
-    _needs_initial_lookahead_barrier,
     _needs_hf_refit_handshake,
+    _needs_initial_lookahead_barrier,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
@@ -189,20 +189,37 @@ def test_restore_async_replay_buffer_checkpoint_missing_file(tmp_path):
     replay_buffer.load_from_path.remote.assert_not_called()
 
 
-def test_initial_lookahead_barrier_requires_restored_buffer() -> None:
-    args = {
-        "max_trajectory_age_steps": 1,
-        "step": 0,
-        "max_num_steps": 4,
-    }
-
-    assert not _needs_initial_lookahead_barrier(replay_buffer_restored=False, **args)
-    assert _needs_initial_lookahead_barrier(replay_buffer_restored=True, **args)
-    assert not _needs_initial_lookahead_barrier(
-        replay_buffer_restored=True,
-        max_trajectory_age_steps=1,
-        step=3,
-        max_num_steps=4,
+@pytest.mark.parametrize(
+    "replay_buffer_restored, max_trajectory_age_steps, step, max_num_steps, expected",
+    [
+        # A fresh collector owns both `step` and `step + 1`, so startup can
+        # enter training without waiting for the lookahead to fill.
+        (False, 1, 0, 4, False),
+        (True, 1, 0, 4, True),
+        # max_age 0 requires a trajectory's weight version to equal its target,
+        # so `step + 1` can only be generated after the first refit -- blocking
+        # on it would create the deadlock instead of preventing one.
+        (True, 0, 0, 4, False),
+        # The lookahead only exists while `step + 1` is still a training step.
+        (True, 1, 2, 4, True),
+        (True, 1, 3, 4, False),
+    ],
+)
+def test_needs_initial_lookahead_barrier(
+    replay_buffer_restored: bool,
+    max_trajectory_age_steps: int,
+    step: int,
+    max_num_steps: int,
+    expected: bool,
+) -> None:
+    assert (
+        _needs_initial_lookahead_barrier(
+            replay_buffer_restored=replay_buffer_restored,
+            max_trajectory_age_steps=max_trajectory_age_steps,
+            step=step,
+            max_num_steps=max_num_steps,
+        )
+        is expected
     )
 
 
