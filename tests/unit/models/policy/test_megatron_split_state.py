@@ -600,11 +600,15 @@ class TestFinish:
         draft_counts = reduce_calls[1].args[0]
         assert torch.equal(policy_counts, policy_counts.new_tensor([8.0, 2048.0]))
         assert torch.equal(draft_counts, draft_counts.new_tensor([1024.0]))
+        dp_group_calls = mock_module_symbols[
+            "pstate"
+        ].get_data_parallel_group.call_args_list
         assert (
-            mock_module_symbols["pstate"]
-            .get_data_parallel_group.call_args_list[-1]
-            .kwargs["with_context_parallel"]
-            is True
+            sum(
+                call.kwargs.get("with_context_parallel") is True
+                for call in dp_group_calls
+            )
+            == 1
         )
         # policy scale 1/2048 followed by relative draft correction 2048/1024
         assert draft_param.main_grad.item() == pytest.approx(6.0)
@@ -680,9 +684,7 @@ class TestFinish:
         w.model.parameters.return_value = iter([draft_param])
         w.finish_train_step()
 
-        cp0_metrics = mock_module_symbols["agg"].call_args.kwargs[
-            "all_mb_metrics"
-        ]
+        cp0_metrics = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"]
         leader_result = {
             "global_loss": 1.0,
             "grad_norm": 0.5,
