@@ -28,6 +28,7 @@ available, and through the config plumbing everywhere else.
 from __future__ import annotations
 
 import ctypes
+import time
 from typing import Any
 
 import pytest
@@ -218,17 +219,99 @@ def test_clear_releases_the_registration_once_every_key_is_gone():
     assert client._engine.registered == {}
 
 
-def test_clear_ignores_keys_published_by_another_process():
-    client = _make_client()
+def _wait_until(predicate, timeout: float = 5.0) -> bool:
+    """Poll ``predicate`` — releases cross a socket, so they are not synchronous."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_clear_by_a_consumer_releases_the_producers_registration():
+    """The leak fix: only the owner can unpin, so ``clear`` must reach it.
+
+    ``clear`` runs on the driver in both trainers, so without this a producer's
+    registrations accumulate for the life of the process — every step, forever.
+    """
+    producer = _make_client()
+    consumer = _make_client()
     _, rows = _batch_rows()
     keys = [f"{i}@input_ids" for i in range(len(rows))]
 
-    meta = client.put(keys, rows)
-    foreign = [dict(entry, endpoint="10.0.0.9:20001") for entry in meta]
-    client.clear(keys, custom_backend_meta=foreign)
+    meta = producer.put(keys, rows)
+    assert len(producer._engine.registered) == 1
+    assert producer.pinned_keys == len(keys)
 
-    # Only the producer may unregister its own memory.
-    assert len(client._engine.registered) == 1
+    # A different client clears — exactly what the driver does at step end.
+    consumer.clear(keys, custom_backend_meta=meta)
+
+    assert _wait_until(lambda: producer._engine.registered == {})
+    assert producer.pinned_keys == 0
+
+
+def test_a_replayed_clear_cannot_release_a_republished_key():
+    """The sharp edge: TQ recycles ``<global_idx>@<field>`` keys across steps.
+
+    A stale clear naming keys that have since been republished must not unpin
+    the new registration — that would be a use-after-unregister, with consumers
+    reading an address the NIC no longer maps. Matching on the key alone does
+    not catch it, and neither does matching on the address: the caching
+    allocator commonly hands back the same block.
+    """
+    producer = _make_client()
+    consumer = _make_client()
+    _, rows = _batch_rows()
+    keys = [f"{i}@input_ids" for i in range(len(rows))]
+
+    stale_meta = producer.put(keys, rows)
+    consumer.clear(keys, custom_backend_meta=stale_meta)
+    assert _wait_until(lambda: producer.pinned_keys == 0)
+
+    # Same keys, same rows — so the same base address comes back.
+    fresh_meta = producer.put(keys, rows)
+    assert fresh_meta[0]["base"] == stale_meta[0]["base"]
+    assert fresh_meta[0]["seq"] != stale_meta[0]["seq"]
+
+    consumer.clear(keys, custom_backend_meta=stale_meta)  # replay
+    time.sleep(0.3)
+    assert producer.pinned_keys == len(keys), "replay released a live publication"
+    assert len(producer._engine.registered) == 1
+
+    consumer.clear(keys, custom_backend_meta=fresh_meta)
+    assert _wait_until(lambda: producer._engine.registered == {})
+
+
+def test_republishing_a_key_releases_the_value_it_replaced():
+    """An upsert TQ never cleared must not strand the old registration."""
+    producer = _make_client()
+    keys = ["0@input_ids"]
+
+    first = torch.arange(8, dtype=torch.float32)
+    second = torch.arange(8, dtype=torch.float32) + 100
+    producer.put(keys, [first])
+    assert len(producer._engine.registered) == 1
+    producer.put(keys, [second])
+
+    # One live publication, so one registration — not two.
+    assert producer.pinned_keys == 1
+    assert len(producer._engine.registered) == 1
+    assert list(producer._engine.registered) == [second.untyped_storage().data_ptr()]
+
+
+def test_release_to_a_departed_owner_does_not_block():
+    """A producer that already exited must not stall the caller of clear."""
+    producer = _make_client()
+    consumer = _make_client()
+    _, rows = _batch_rows()
+    keys = [f"{i}@input_ids" for i in range(len(rows))]
+    meta = producer.put(keys, rows)
+    producer.close()
+
+    started = time.monotonic()
+    consumer.clear(keys, custom_backend_meta=meta)
+    assert time.monotonic() - started < 3.0
 
 
 def test_get_rejects_a_key_that_was_never_published():

@@ -332,9 +332,9 @@ put:  producer HBM --D2D--> GPU staging --RDMA--> store segment (host)
 get:  store segment --RDMA--> GPU staging --D2D--> consumer HBM
 ```
 
-The offload variant costs one D2H per put and buys back the HBM a producer
-would otherwise keep registered for the whole step — the residency cost listed
-below. Leave it off to keep the payload in HBM end to end.
+The offload variant costs one D2H per put and moves what a producer holds
+registered between `put` and `clear` out of HBM into host memory. Leave it off
+to keep the payload in HBM end to end.
 
 Two call sites outside the client complete the no-copy contract:
 `DataPlaneClient.put_device` (default `"cpu"`, `"cuda"` under register+GDR) and
@@ -354,13 +354,29 @@ every write-back — under register mode that copy was pure loss.
   that is the first thing to revisit.
 - **No re-seeding.** Consumers do not register what they pulled, so the read
   fan-out concern is live exactly as described above.
-- **Release is producer-local.** `clear` only unregisters entries whose
-  `endpoint` is the calling process. A `clear` issued from the driver is a no-op
-  for the rollout actor's pins; they are released when that actor's client
-  closes. Under GDR that means a long-lived producer holds the step's tensors
-  resident in HBM — the caching allocator cannot reuse those blocks — which is
-  the sharpest cost of this design and the first thing to fix if the
-  measurement below says proceed.
+- **Release travels to the owner.** Only the owner can `unregister_memory` its
+  own address space, but the moment a key becomes releasable is known centrally:
+  it is TQ's `clear`, which runs on the driver in both trainers. Each client
+  therefore serves a small ZMQ `PULL` socket (its `release_port` rides in the
+  meta beside `endpoint`), and `clear` forwards each foreign key to whoever
+  published it. Without this a producer's registrations accumulate every step
+  for the life of the process — pinned memory that the caching allocator cannot
+  reclaim, and, sooner, an `ibv_reg_mr` per publication against a finite NIC MR
+  table.
+
+  Two hazards shape the message format. Releases carry `(key, seq)`, not
+  addresses: TQ recycles `<global_idx>@<field>` keys across steps, so a replayed
+  `clear` naming a since-republished key would otherwise unpin live data, and
+  matching on the address cannot distinguish them either — the caching allocator
+  routinely returns the same block, so old and new publications commonly share a
+  base. A per-client sequence number makes a replay or a duplicate a no-op.
+  Re-publishing a key TQ never cleared drops the superseded pin as the new one
+  lands, so an upsert cannot strand a registration.
+
+  Sends are fire-and-forget with `IMMEDIATE` and a send timeout: a producer that
+  has already exited must not block the caller of `clear`, and its registrations
+  died with it anyway. `TransferEngineClient.pinned_keys` exposes the live count
+  if it ever regrows.
 
 ### Measured
 

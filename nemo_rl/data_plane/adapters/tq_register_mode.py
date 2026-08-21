@@ -43,6 +43,7 @@ See ``docs/design-docs/tq-register-mode.md``.
 
 from __future__ import annotations
 
+import json
 import logging
 import operator
 import threading
@@ -50,9 +51,10 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import reduce
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import torch
+import zmq
 from omegaconf import DictConfig
 from torch import Tensor
 from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
@@ -64,7 +66,13 @@ from transfer_queue.utils.tensor_utils import (
     compute_stride,
     get_nbytes,
 )
-from transfer_queue.utils.zmq_utils import ZMQServerInfo, get_node_ip_address
+from transfer_queue.utils.zmq_utils import (
+    ZMQServerInfo,
+    create_zmq_socket,
+    format_zmq_address,
+    get_free_port,
+    get_node_ip_address,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +159,94 @@ class _PinTable:
         with self._lock:
             pin = self._pins.get(base)
             return pin.storage if pin is not None else None
+
+
+class _ReleaseChannel:
+    """Delivers "you may unpin these keys" to the process that published them.
+
+    Only the owner can ``unregister_memory`` its own address space, but the
+    moment a key becomes releasable is known centrally — it is exactly TQ's
+    ``clear``, which runs in whichever process calls it (the driver, in both
+    trainers). Without a way to reach the owner, a producer's registrations
+    accumulate for the life of the process.
+
+    PUSH/PULL rather than REQ/REP: a release is fire-and-forget, and a producer
+    that has already exited must not be able to block the caller of ``clear``.
+    ``IMMEDIATE`` plus a send timeout turns "nobody is listening" into a logged
+    ``zmq.Again`` instead of a queued message that never lands.
+    """
+
+    _SEND_TIMEOUT_MS = 1000
+
+    def __init__(
+        self, ip: str, on_release: Callable[[list[tuple[str, int]]], None]
+    ) -> None:
+        self._ip = ip
+        self._on_release = on_release
+        self._ctx = zmq.Context(io_threads=1)
+        self._inbox = create_zmq_socket(self._ctx, zmq.PULL, ip)
+        self.port = get_free_port(ip)
+        self._inbox.bind(format_zmq_address(ip, self.port))
+        self._senders: dict[str, zmq.Socket] = {}
+        self._senders_lock = threading.Lock()
+        self._closed = threading.Event()
+        self._thread = threading.Thread(
+            target=self._serve, name="tq-register-release", daemon=True
+        )
+        self._thread.start()
+
+    def _serve(self) -> None:
+        poller = zmq.Poller()
+        poller.register(self._inbox, zmq.POLLIN)
+        while not self._closed.is_set():
+            try:
+                if not poller.poll(timeout=200):
+                    continue
+                payload = [
+                    (key, seq) for key, seq in json.loads(self._inbox.recv().decode())
+                ]
+            except (zmq.ZMQError, ValueError, UnicodeDecodeError) as e:
+                if self._closed.is_set():
+                    return
+                logger.warning("register-mode release listener: %s", e)
+                continue
+            try:
+                self._on_release(payload)
+            except Exception:
+                # A failed release leaks one region; killing the listener would
+                # leak every future one.
+                logger.exception(
+                    "register-mode release of %d keys failed", len(payload)
+                )
+
+    def send(self, ip: str, port: int, keys: list[tuple[str, int]]) -> None:
+        """Ask the client at ``ip:port`` to release ``keys``. Never blocks."""
+        address = format_zmq_address(ip, port)
+        with self._senders_lock:
+            sender = self._senders.get(address)
+            if sender is None:
+                sender = create_zmq_socket(self._ctx, zmq.PUSH, ip)
+                sender.setsockopt(zmq.IMMEDIATE, 1)
+                sender.setsockopt(zmq.SNDTIMEO, self._SEND_TIMEOUT_MS)
+                sender.setsockopt(zmq.LINGER, 0)
+                sender.connect(address)
+                self._senders[address] = sender
+        try:
+            sender.send(json.dumps(keys).encode())
+        except zmq.ZMQError as e:
+            # The producer is gone, so its registrations died with it.
+            logger.debug("release to %s dropped (%s); owner is gone", address, e)
+
+    def close(self) -> None:
+        """Stop serving and drop every socket."""
+        self._closed.set()
+        self._thread.join(timeout=2)
+        with self._senders_lock:
+            for sender in self._senders.values():
+                sender.close(linger=0)
+            self._senders.clear()
+        self._inbox.close(linger=0)
+        self._ctx.term()
 
 
 def _allocate_receive_buffers(
@@ -260,17 +356,29 @@ class TransferEngineClient(StorageKVClient):
         # every meta entry this client publishes.
         self._endpoint = f"{self.local_hostname}:{self._engine.get_rpc_port()}"
         self._pins = _PinTable(self._engine)
+        # key -> (base, seq) for every key this process still has registered.
+        # The sequence number is what makes a replayed release safe: TQ recycles
+        # `<global_idx>@<field>` keys across steps, so a stale clear naming a key
+        # that has since been republished must not unpin the new registration.
+        # Matching on (key, seq) rejects it; matching on the key alone would not,
+        # and matching on the address alone would not either — the caching
+        # allocator hands back the same block all the time.
+        self._published: dict[str, tuple[int, int]] = {}
+        self._published_seq = 0
+        self._published_lock = threading.Lock()
+        self._release = _ReleaseChannel(self.local_hostname, self._release_keys)
         # The one line that says which path this process actually took: without
         # it a GDR client that silently fell back to host receive buffers looks
         # identical in the logs to one that did not.
         logger.info(
             "TransferQueue register mode ready: endpoint=%s protocol=%s "
-            "device_name=%s receive_device=%s source=%s",
+            "device_name=%s receive_device=%s source=%s release_port=%d",
             self._endpoint,
             self.protocol,
             self.device_name,
             self._device,
             "host (offloaded)" if self._offload_source else "in place",
+            self._release.port,
         )
 
     @property
@@ -322,7 +430,9 @@ class TransferEngineClient(StorageKVClient):
         if any(t.is_cuda for t in tensors.values()):
             torch.cuda.synchronize()
         for i, tensor in tensors.items():
-            custom_backend_meta[i] = self._pin_and_describe(tensor, tensor.nbytes)
+            custom_backend_meta[i] = self._pin_and_describe(
+                keys[i], tensor, tensor.nbytes
+            )
 
         if non_tensor_indices:
             # Python objects have no stable buffer, so they are serialized into
@@ -343,7 +453,7 @@ class TransferEngineClient(StorageKVClient):
                 non_tensor_indices, buffers, packed_sizes, strict=True
             ):
                 custom_backend_meta[i] = self._pin_and_describe(
-                    cast(Tensor, buffer), packed_size
+                    keys[i], cast(Tensor, buffer), packed_size
                 )
 
         return custom_backend_meta
@@ -439,11 +549,13 @@ class TransferEngineClient(StorageKVClient):
     def clear(
         self, keys: list[str], custom_backend_meta: list[dict | None] | None = None
     ) -> None:
-        """Release the registrations this process published for ``keys``.
+        """Release the registrations backing ``keys``, wherever they live.
 
-        Entries published elsewhere are skipped: only the producer can
-        unregister its own memory, so that producer's ``clear`` (or ``close``)
-        is what frees them.
+        Only the owner can unregister its own memory, and ``clear`` runs in
+        whichever process called it — the driver, in both trainers. Keys this
+        process published are unpinned here; the rest are forwarded to the
+        client that published them, which is why a producer's registrations do
+        not outlive the data (see :class:`_ReleaseChannel`).
         """
         if custom_backend_meta is None:
             raise ValueError(
@@ -451,15 +563,35 @@ class TransferEngineClient(StorageKVClient):
                 "registrations to release."
             )
 
-        for meta in custom_backend_meta:
-            if meta and meta["endpoint"] == self._endpoint:
-                self._pins.unpin(meta["base"])
+        mine: list[tuple[str, int]] = []
+        remote: dict[tuple[str, int], list[tuple[str, int]]] = defaultdict(list)
+        for key, meta in zip(keys, custom_backend_meta, strict=True):
+            if not meta:
+                continue
+            if meta["endpoint"] == self._endpoint:
+                mine.append((key, meta["seq"]))
+            else:
+                host = meta["endpoint"].rsplit(":", 1)[0]
+                remote[(host, meta["release_port"])].append((key, meta["seq"]))
+
+        self._release_keys(mine)
+        for (host, port), owned in remote.items():
+            self._release.send(host, port, owned)
 
     def close(self) -> None:
-        """Unregister every published region and drop the engine."""
+        """Stop serving releases, unregister every published region, drop the engine."""
         if self._engine is not None:
+            self._release.close()
             self._pins.unpin_all()
+            with self._published_lock:
+                self._published.clear()
             self._engine = None
+
+    @property
+    def pinned_keys(self) -> int:
+        """Keys this process still has registered — the leak metric, if it regrows."""
+        with self._published_lock:
+            return len(self._published)
 
     def _prepare_source(self, tensor: Tensor) -> Tensor:
         """Return the tensor whose allocation ``put`` will register.
@@ -473,14 +605,40 @@ class TransferEngineClient(StorageKVClient):
             return tensor.to("cpu", copy=False).contiguous()
         return tensor.contiguous()
 
-    def _pin_and_describe(self, tensor: Tensor, size: int) -> dict:
+    def _pin_and_describe(self, key: str, tensor: Tensor, size: int) -> dict:
         base, offset = self._pins.pin(tensor)
+        with self._published_lock:
+            self._published_seq += 1
+            seq = self._published_seq
+            superseded = self._published.get(key)
+            self._published[key] = (base, seq)
+        if superseded is not None:
+            # Re-publishing a key TQ never cleared: the old value is dead the
+            # moment the new one lands, and dropping its reference here is what
+            # keeps an upsert from leaking a registration.
+            self._pins.unpin(superseded[0])
         return {
             "endpoint": self._endpoint,
             "base": base,
             "offset": offset,
             "size": size,
+            # Where to send this key's release, and which publication it refers
+            # to. The host comes from ``endpoint``, so only the port is carried.
+            "release_port": self._release.port,
+            "seq": seq,
         }
+
+    def _release_keys(self, versioned_keys: list[tuple[str, int]]) -> None:
+        """Unpin the named publications. A replay or a duplicate is a no-op."""
+        bases: list[int] = []
+        with self._published_lock:
+            for key, seq in versioned_keys:
+                published = self._published.get(key)
+                if published is not None and published[1] == seq:
+                    bases.append(published[0])
+                    del self._published[key]
+        for base in bases:
+            self._pins.unpin(base)
 
     def _fetch_group(
         self,

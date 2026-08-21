@@ -118,9 +118,9 @@ class TransferEngineConfig(BaseModel, extra="allow"):
     on, ``put`` copies a CUDA tensor to host and registers *there*, while reads
     still land in HBM — the shape is then producer host memory straight into
     consumer HBM in one hop, with no staging buffer and no store copy on the
-    way. It costs one D2H per put and buys back the HBM the producer would
-    otherwise hold registered until ``clear``, which is this backend's sharpest
-    cost. Leave it off to keep the payload in HBM end to end.
+    way. It costs one D2H per put and moves what a producer holds registered
+    between ``put`` and ``clear`` out of HBM and into host memory. Leave it off
+    to keep the payload in HBM end to end.
 
     ``rpc_port`` is this process's engine port; 0 lets it pick a free one,
     which is required when several clients share a node.

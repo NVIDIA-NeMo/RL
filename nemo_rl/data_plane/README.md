@@ -477,7 +477,8 @@ Backend choice:
   HBM in a single hop, with no host staging on either end. There is no store, so
   no segment or pool sizing applies. The trade is that every read of a key is
   served by the producing process's NIC, and that a producer's tensors stay
-  resident until `clear` — see `docs/design-docs/tq-register-mode.md`.
+  registered between `put` and `clear` (which is forwarded to whoever published
+  the key) — see `docs/design-docs/tq-register-mode.md`.
 
 `gdr_staging_buffer_mb` is the persistent GPU staging capacity per active GDR
 client (default 1024 MiB). TransferQueue's pin requires it to fit the largest
