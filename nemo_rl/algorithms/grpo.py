@@ -89,6 +89,7 @@ from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_a
 from nemo_rl.experience.interfaces import (
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
+from nemo_rl.experience.metric_utils import is_histogram_metric
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
@@ -4033,7 +4034,7 @@ def aggregate_rollout_metrics(
     """
     aggregated = {}
     for k, v in per_group_metrics.items():
-        if "histogram" in k.split("/"):
+        if is_histogram_metric(k):
             aggregated[k] = [observation for group in v for observation in group]
         elif not isinstance(v[0], (int, float)):
             aggregated[k] = v

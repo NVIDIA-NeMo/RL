@@ -5100,6 +5100,34 @@ class TestAggregateRolloutMetrics:
         assert result["agent/reward/histogram"] == [0.1, 0.2, 0.3]
         assert result["histogram/gen_tokens_length"] == [10, 20, 30]
 
+    def test_histogram_substring_keys_still_average(self):
+        """Histogram-like substrings do not identify distributions."""
+        metrics = {
+            "histogram_bucket_count": [8, 10],
+            "reward/histogram_p95": [1.0, 3.0],
+        }
+        result = aggregate_rollout_metrics(metrics)
+
+        assert result["histogram_bucket_count"] == 9
+        assert result["reward/histogram_p95"] == 2.0
+
+    def test_per_agent_histogram_stats_are_not_flattened(self):
+        """An env field named histogram still produces scalar stat keys."""
+        metrics = {
+            "myagent/histogram/mean": [1.0, 2.0],
+            "myagent/histogram/histogram": [[1.0], [2.0]],
+        }
+        result = aggregate_rollout_metrics(metrics)
+
+        assert result["myagent/histogram/mean"] == 1.5
+        assert result["myagent/histogram/histogram"] == [1.0, 2.0]
+
+    def test_empty_histogram_groups_flatten_to_empty(self):
+        """Groups without observations produce an empty, loggable histogram."""
+        result = aggregate_rollout_metrics({"histogram/gen_tokens_length": [[], []]})
+
+        assert result["histogram/gen_tokens_length"] == []
+
     def test_mixed_metrics(self):
         """Full integration test with a realistic mix of metric types."""
         metrics = {

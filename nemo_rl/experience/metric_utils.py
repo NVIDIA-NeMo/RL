@@ -19,6 +19,11 @@ import statistics
 from collections.abc import Sequence
 
 
+def is_histogram_metric(name: str) -> bool:
+    """Return whether a metric key represents raw histogram observations."""
+    return name.startswith("histogram/") or name.endswith("/histogram")
+
+
 def calculate_single_metric(
     values: Sequence[float | int], batch_size: int, key_name: str
 ) -> dict:
