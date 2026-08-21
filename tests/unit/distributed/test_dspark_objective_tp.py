@@ -567,13 +567,13 @@ def _run_dp2_global_normalization_gradient(rank: int, world_size: int) -> None:
     local_loss = bins.normalized(normalization_counts=global_count)
     global_loss = local_loss.detach().clone()
     torch.distributed.all_reduce(global_loss, group=dp_group)
-    torch.testing.assert_close(global_loss, torch.tensor(0.625, device=device))
+    torch.testing.assert_close(global_loss, torch.tensor(1.0, device=device))
     local_loss.backward()
     torch.testing.assert_close(
         numerator_source.grad,
         torch.zeros(2, device=device)
         if rank == 0
-        else torch.tensor([0.5, 0.125], device=device),
+        else torch.tensor([0.8, 0.2], device=device),
     )
     assert slot_weights.grad is None
 

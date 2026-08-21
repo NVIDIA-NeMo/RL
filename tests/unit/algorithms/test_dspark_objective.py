@@ -712,8 +712,8 @@ def test_normalized_requires_externally_reduced_counts() -> None:
     torch.testing.assert_close(local_numerator.grad, torch.tensor([1.0 / 3.0]))
 
 
-def test_slot_weights_are_detached_and_keep_global_count_unweighted() -> None:
-    """Per-slot schedules scale numerators, not the global valid-token count."""
+def test_slot_weights_normalize_weighted_numerators_by_weighted_global_count() -> None:
+    """Position decay applies to both the numerator and global denominator."""
     local_numerators = torch.tensor([1.0, 1.0], requires_grad=True)
     slot_weights = torch.tensor([1.0, 0.25], requires_grad=True)
     stats = DSparkLossBins(
@@ -724,14 +724,14 @@ def test_slot_weights_are_detached_and_keep_global_count_unweighted() -> None:
     global_counts = torch.tensor([1.0, 1.0])
 
     loss = stats.normalized(normalization_counts=global_counts)
-    torch.testing.assert_close(loss, torch.tensor(0.625))
+    torch.testing.assert_close(loss, torch.tensor(1.0))
     loss.backward()
 
     assert not stats.weights.requires_grad
     assert slot_weights.grad is None
     torch.testing.assert_close(
         local_numerators.grad,
-        torch.tensor([0.5, 0.125]),
+        torch.tensor([0.8, 0.2]),
     )
 
 

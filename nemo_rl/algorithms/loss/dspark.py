@@ -244,13 +244,12 @@ class DSparkLossBins:
             dtype=self.numerators.dtype,
         )
         denominator = (
-            normalization_counts.detach()
-            .to(
+            normalization_counts.detach().to(
                 device=self.weights.device,
                 dtype=torch.float32,
             )
-            .sum()
-        )
+            * self.weights
+        ).sum()
         return (self.numerators * weights).sum() / (denominator + 1e-8)
 
     def __add__(self, other: object) -> DSparkLossBins:
@@ -832,9 +831,9 @@ def dspark_tiled_objective(
 
     The returned numerators and counts remain additive across data-parallel
     ranks. Reduce counts externally before calling ``normalized``. Detached
-    ``slot_weights`` scale numerator contributions only; normalization uses the
-    unweighted global valid-slot count. This supports fixed per-slot schedules
-    but not example-dependent reweighting.
+    ``slot_weights`` scale both numerator contributions and the global valid-slot
+    denominator. This supports fixed per-slot schedules but not example-dependent
+    reweighting.
     """
     _validate_inputs(
         target_logits=target_logits,
