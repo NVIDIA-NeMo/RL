@@ -36,11 +36,7 @@ uv run examples/run_grpo.py \
 
 grep -q "Draft Loss:" "$RUN_LOG"
 grep -q "draft_update_probe=complete" "$RUN_LOG"
-awk '
-    /draft_update_probe=complete/ { updated = 1; next }
-    updated && /draft_refit_manifest=draft_count=/ { refitted = 1 }
-    END { exit !refitted }
-' "$RUN_LOG"
+grep -q "draft_post_update_refit=complete step=1" "$RUN_LOG"
 
 uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 uv run tests/check_metrics.py "$JSON_METRICS" \

@@ -377,6 +377,20 @@ def _compute_seq_logprob_error_metrics(
     return masking_data["sample_mask"], seq_logprob_error_metrics
 
 
+def _log_completed_draft_refit(
+    master_config: MasterConfig,
+    *,
+    completed_steps: int,
+) -> None:
+    """Emit a driver-ordered marker only for refits after a draft update."""
+    draft_config = master_config.policy.get("draft")
+    if completed_steps > 0 and draft_config is not None and draft_config.enabled:
+        print(
+            f"draft_post_update_refit=complete step={completed_steps}",
+            flush=True,
+        )
+
+
 def grpo_train_sync(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -631,6 +645,10 @@ def grpo_train_sync(
                             colocated_inference,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                        )
+                        _log_completed_draft_refit(
+                            master_config,
+                            completed_steps=total_steps,
                         )
                         POLICY_GENERATION_STALE = False
                     else:

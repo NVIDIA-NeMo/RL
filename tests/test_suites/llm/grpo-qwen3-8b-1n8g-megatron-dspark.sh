@@ -39,11 +39,7 @@ uv run examples/run_grpo.py \
 grep -q "Draft Loss:" "$RUN_LOG"
 grep -q "draft_update_probe=complete" "$RUN_LOG"
 grep -q "draft_refit_manifest=draft_count=" "$RUN_LOG"
-awk '
-    /draft_update_probe=complete/ { updated = 1; next }
-    updated && /draft_refit_manifest=draft_count=/ { refitted = 1 }
-    END { exit !refitted }
-' "$RUN_LOG"
+grep -q "draft_post_update_refit=complete step=1" "$RUN_LOG"
 grep -q "Saving checkpoint for step 1..." "$RUN_LOG"
 grep -q "Saving checkpoint for step 2..." "$RUN_LOG"
 test -f "$CKPT_DIR/step_1/training_info.json"

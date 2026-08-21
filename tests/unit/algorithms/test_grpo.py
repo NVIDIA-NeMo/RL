@@ -59,7 +59,11 @@ from nemo_rl.algorithms.grpo import (
     shutdown_environments,
     validate,
 )
-from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
+from nemo_rl.algorithms.grpo_sync import (
+    _log_completed_draft_refit,
+    _train_fields_for_step,
+    grpo_train_sync,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -775,6 +779,26 @@ def test_raise_if_message_level_advantage_penalties_enabled_raises_when_set(
     master_config.grpo.invalid_tool_call_advantage = -5.0
     with pytest.raises(NotImplementedError, match="data_plane.enabled=true"):
         _raise_if_message_level_advantage_penalties_enabled(master_config)
+
+
+def test_log_completed_draft_refit_marks_only_post_update_refits(capsys) -> None:
+    master_config = MagicMock()
+    master_config.policy = {"draft": MagicMock(enabled=True)}
+
+    _log_completed_draft_refit(master_config, completed_steps=0)
+    assert capsys.readouterr().out == ""
+
+    _log_completed_draft_refit(master_config, completed_steps=1)
+    assert capsys.readouterr().out == "draft_post_update_refit=complete step=1\n"
+
+
+def test_log_completed_draft_refit_skips_non_draft_training(capsys) -> None:
+    master_config = MagicMock()
+    master_config.policy = {}
+
+    _log_completed_draft_refit(master_config, completed_steps=1)
+
+    assert capsys.readouterr().out == ""
 
 
 def test_multimodal_dedup_rejects_unqualified_transfer_paths(
@@ -3164,8 +3188,8 @@ def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
     policy_generation.finish_generation.side_effect = lambda *a, **k: events.append(
         ("finish_generation", k.get("release_gpu", True))
     )
-    policy_generation.prepare_for_generation.side_effect = (
-        lambda *a, **k: events.append("wake_engine")
+    policy_generation.prepare_for_generation.side_effect = lambda *a, **k: (
+        events.append("wake_engine")
     )
     policy.offload_before_refit.side_effect = lambda *a, **k: events.append(
         "offload_before_refit"
