@@ -150,9 +150,7 @@ def test_non_fused_packing_materializes_teacher_topk_one_sequence_at_a_time():
         return (
             {
                 "next_token_logprobs": torch.zeros(1, sequence_length - 1),
-                "current_support_logprobs": torch.zeros(
-                    1, sequence_length - 1, 2
-                ),
+                "current_support_logprobs": torch.zeros(1, sequence_length - 1, 2),
             },
             sequence_data,
         )

@@ -1215,9 +1215,7 @@ class TestLossPostProcessor:
         processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg, cp_normalize=False)
         processor(data_dict=MagicMock(), packed_seq_params=packed_seq_params)
 
-        prepare_fn = mock_wrapper.call_args.kwargs[
-            "per_sequence_packed_prepare_fn"
-        ]
+        prepare_fn = mock_wrapper.call_args.kwargs["per_sequence_packed_prepare_fn"]
         assert prepare_fn.func is prepare_packed_loss_input
         assert prepare_fn.keywords["chunk_size"] == 512
 
