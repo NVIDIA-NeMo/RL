@@ -3682,3 +3682,35 @@ def test_zero_train_gen_mismatch_skips_mamba_patch_for_non_mamba_models():
         _apply_zero_train_gen_mismatch(config)
 
     apply_mamba_patch.assert_called_once_with(required=False)
+    assert config["megatron_cfg"]["batch_invariant_mode"] is True
+    assert "use_mamba_mem_eff_path" not in config["megatron_cfg"]
+
+
+def test_zero_train_gen_mismatch_enables_batch_invariant_for_mamba_models():
+    """Hybrid Mamba models need batch_invariant_mode for Megatron Mamba BIK."""
+    from nemo_rl.models.megatron.setup import _apply_zero_train_gen_mismatch
+
+    config = {
+        "model_name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16",
+        "megatron_cfg": {"zero_train_gen_mismatch": True},
+        "generation": {"mcore_generation_config": {}},
+    }
+
+    with (
+        patch(
+            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
+            "apply_mamba_alignment_patch"
+        ),
+        patch(
+            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
+            "apply_moe_determinism_patches"
+        ),
+        patch(
+            "nemo_rl.models.generation.megatron.zero_train_gen_kl_patches."
+            "apply_te_gemm_cublas_pinned_patch"
+        ),
+    ):
+        _apply_zero_train_gen_mismatch(config)
+
+    assert config["megatron_cfg"]["batch_invariant_mode"] is True
+    assert config["megatron_cfg"]["use_mamba_mem_eff_path"] is False

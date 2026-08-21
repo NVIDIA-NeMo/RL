@@ -23,7 +23,9 @@ import torch
 
 _TE_CUBLAS_WS_SIZE_FN_ORIG: Optional[Callable[[], int]] = None
 _DISTRIBUTED_LOG_SOFTMAX_ORIG: Optional[Callable[..., torch.Tensor]] = None
+_TE_BIK_ATTENTION_ASSERT_ORIG: Optional[Callable[[], None]] = None
 _LOG_SOFTMAX_PATCHED = False
+_TE_BIK_ATTENTION_ASSERT_PATCHED = False
 
 # Minimum workspace that satisfies TE's NVFP4 alpha-scratch guard in cublaslt_gemm.cu.
 _TE_CUBLAS_WS_PINNED_BYTES: int = 4
@@ -144,3 +146,53 @@ def restore_log_softmax_determinism_patch() -> None:
     )
     _DISTRIBUTED_LOG_SOFTMAX_ORIG = None
     _LOG_SOFTMAX_PATCHED = False
+
+
+def apply_te_bik_attention_assert_skip_patch() -> None:
+    """Skip Megatron's TE>=2.18 batch-invariant attention gate for zero-KL on TE 2.15.
+
+    ``zero_train_gen_mismatch`` sets ``config.batch_invariant_mode=True`` (MoE
+    DeepGEMM validation) but does not call global ``enable_batch_invariant_mode()``.
+    Determinism comes from ``apply_te_gemm_cublas_pinned_patch`` and MoE fixed-order
+    combine instead of Megatron's TE FA version pinning.
+    """
+    global _TE_BIK_ATTENTION_ASSERT_ORIG, _TE_BIK_ATTENTION_ASSERT_PATCHED
+    if _TE_BIK_ATTENTION_ASSERT_PATCHED:
+        return
+    try:
+        bik_mod = importlib.import_module(
+            "megatron.core.transformer.custom_layers.batch_invariant_kernels"
+        )
+    except ImportError:
+        print(
+            "te_bik_attention_assert_skip: Megatron batch_invariant_kernels is not "
+            "importable; skipping TE attention assert bypass."
+        )
+        return
+
+    _TE_BIK_ATTENTION_ASSERT_ORIG = bik_mod.assert_te_supports_batch_invariant_attention
+    bik_mod.assert_te_supports_batch_invariant_attention = lambda: None
+    _TE_BIK_ATTENTION_ASSERT_PATCHED = True
+    print(
+        "[zero_train_gen_mismatch] skipped Megatron TE batch-invariant attention "
+        "assert (using core_patches on TE 2.15; not enable_batch_invariant_mode)",
+        flush=True,
+    )
+
+
+def restore_te_bik_attention_assert_skip_patch() -> None:
+    """Restore Megatron's TE batch-invariant attention assert (for tests)."""
+    global _TE_BIK_ATTENTION_ASSERT_ORIG, _TE_BIK_ATTENTION_ASSERT_PATCHED
+    if not _TE_BIK_ATTENTION_ASSERT_PATCHED or _TE_BIK_ATTENTION_ASSERT_ORIG is None:
+        return
+    try:
+        bik_mod = importlib.import_module(
+            "megatron.core.transformer.custom_layers.batch_invariant_kernels"
+        )
+    except ImportError:
+        _TE_BIK_ATTENTION_ASSERT_ORIG = None
+        _TE_BIK_ATTENTION_ASSERT_PATCHED = False
+        return
+    bik_mod.assert_te_supports_batch_invariant_attention = _TE_BIK_ATTENTION_ASSERT_ORIG
+    _TE_BIK_ATTENTION_ASSERT_ORIG = None
+    _TE_BIK_ATTENTION_ASSERT_PATCHED = False

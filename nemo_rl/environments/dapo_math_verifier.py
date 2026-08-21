@@ -195,7 +195,10 @@ def is_correct_minerva(
 
 
 def is_correct_strict_box(
-    pred: str, gt: str, pause_tokens_index: Optional[list[int]] = None
+    pred: str,
+    gt: str,
+    pause_tokens_index: Optional[list[int]] = None,
+    search_full_cot: bool = False,
 ) -> tuple[int, Optional[str]]:
     """Check if the prediction is correct using strict boxed answer criteria.
 
@@ -203,6 +206,8 @@ def is_correct_strict_box(
         pred: The prediction string
         gt: The ground truth answer
         pause_tokens_index: Indices of pause tokens
+        search_full_cot: When True, search the full CoT for ``\\boxed{}`` instead
+            of only the last 100 characters (unless ``pause_tokens_index`` is set).
 
     Returns:
         Tuple of (score, extracted_prediction)
@@ -211,7 +216,7 @@ def is_correct_strict_box(
     if pause_tokens_index is not None:
         assert len(pause_tokens_index) == 4
         pred = pred[pause_tokens_index[-1] - 100 :]
-    else:
+    elif not search_full_cot:
         pred = pred[-100:]
 
     # Extract and check the boxed answer
@@ -226,6 +231,7 @@ def verify(
     answer: str,
     strict_box_verify: bool = False,
     pause_tokens_index: Optional[list[int]] = None,
+    search_full_cot: bool = False,
 ) -> bool:
     """Verify if the solution is correct.
 
@@ -234,16 +240,39 @@ def verify(
         answer: The ground truth answer
         strict_box_verify: Whether to use strict box verification
         pause_tokens_index: Indices of pause tokens
+        search_full_cot: When strict box verification is enabled, search the
+            full CoT for ``\\boxed{}`` instead of only the last 100 characters.
 
     Returns:
         True if the solution is correct, False otherwise
     """
     if strict_box_verify:
-        correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
+        correct, pred = is_correct_strict_box(
+            solution_str, answer, pause_tokens_index, search_full_cot
+        )
         return correct == 1, pred
 
     correct, pred = is_correct_minerva(solution_str, answer)
     return correct, pred
+
+
+def dapo_grading_kwargs(*, dapo_long_cot: bool = False) -> dict[str, bool]:
+    """Map the single ``dapo_long_cot`` env flag to verifier options.
+
+    Long CoT responses need strict ``\\boxed{}`` grading over the full solution
+    without tail truncation; short MATH-style responses keep legacy defaults.
+    """
+    if dapo_long_cot:
+        return {
+            "truncate_solution_tail": False,
+            "strict_box_verify": True,
+            "search_full_cot": True,
+        }
+    return {
+        "truncate_solution_tail": True,
+        "strict_box_verify": False,
+        "search_full_cot": False,
+    }
 
 
 def compute_score(
@@ -252,6 +281,7 @@ def compute_score(
     strict_box_verify: bool = False,
     pause_tokens_index: Optional[list[int]] = None,
     truncate_solution_tail: bool = True,
+    search_full_cot: bool = False,
 ) -> float:
     """Compute the reward score for a solution.
 
@@ -262,6 +292,8 @@ def compute_score(
         pause_tokens_index: Indices of pause tokens
         truncate_solution_tail: When True (default), keep only the last 300
             characters before grading.
+        search_full_cot: When strict box verification is enabled, search the
+            full CoT for ``\\boxed{}`` instead of only the last 100 characters.
 
     Returns:
         Reward score (1.0 for correct, 0.0 for incorrect)
@@ -273,7 +305,11 @@ def compute_score(
 
     # Verify the solution
     correct, pred = verify(
-        solution_str, ground_truth, strict_box_verify, pause_tokens_index
+        solution_str,
+        ground_truth,
+        strict_box_verify,
+        pause_tokens_index,
+        search_full_cot,
     )
 
     reward = 1.0 if correct else 0.0

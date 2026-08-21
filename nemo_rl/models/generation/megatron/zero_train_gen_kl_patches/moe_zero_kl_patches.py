@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MoE deterministic unpermute patch for Megatron colocated zero train/gen KL."""
+"""MoE deterministic unpermute patch for Megatron colocated zero train/gen KL.
+
+Megatron builds ``batch_invariant_inverse_permutation_mapping`` when
+``config.batch_invariant_mode=True``, but only consumes it when global
+``enable_batch_invariant_mode()`` is on (TE>=2.18 BIK stack). Zero-KL keeps
+global BIK off and replaces ``moe_utils.unpermute`` with fixed-order combine
+via ``sorted_indices`` so train and generation share the same deterministic
+accumulation (including ``drop_and_pad`` decode paths BIK unpermute rejects).
+"""
 
 from __future__ import annotations
 
@@ -93,10 +101,15 @@ def _patched_unpermute(
     fused: bool = False,
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
+    **unused_kwargs: object,
 ) -> torch.Tensor:
-    """``moe_utils.unpermute`` with fixed-order deterministic combine."""
+    """``moe_utils.unpermute`` with fixed-order deterministic combine.
+
+    Accepts Megatron-only kwargs such as ``batch_invariant_inverse_map`` but
+    always combines via ``sorted_indices`` (see module docstring).
+    """
     global _NRL_DET_COMBINE_BANNER
-    del pad_offsets  # unused; same combine for train and generation
+    del pad_offsets, unused_kwargs
     if fused:
         raise ValueError(_ZERO_KL_EAGER_MOE_MSG)
 

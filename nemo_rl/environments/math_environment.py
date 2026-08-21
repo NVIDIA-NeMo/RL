@@ -28,7 +28,10 @@ from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
-from nemo_rl.environments.dapo_math_verifier import compute_score as dapo_math_verify
+from nemo_rl.environments.dapo_math_verifier import (
+    compute_score as dapo_math_verify,
+    dapo_grading_kwargs,
+)
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
@@ -46,7 +49,7 @@ class MathEnvConfig(TypedDict):
     # The verifier type. None defaults to "math".
     verifier_type: NotRequired[str | None]
     math_verify_impl: NotRequired[str | None]
-    truncate_solution_tail: NotRequired[bool | None]
+    dapo_long_cot: NotRequired[bool | None]
 
 @contextlib.contextmanager
 def _mute_output():
@@ -127,12 +130,13 @@ class HFVerifyWorker:
                     math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
                     if kwargs.get("math_verify_impl") == "dapo_math_verify":
                         # This compute_score is from the DAPO Math Verifier from Verl
+                        dapo_kwargs = dapo_grading_kwargs(
+                            dapo_long_cot=bool(kwargs.get("dapo_long_cot", False))
+                        )
                         reward_dict = dapo_math_verify(
                             response,
                             ground_truth,
-                            truncate_solution_tail=bool(
-                                kwargs.get("truncate_solution_tail", True)
-                            ),
+                            **dapo_kwargs,
                         )
                         ret_score = reward_dict["score"]
                         extracted_answer = reward_dict["pred"]
@@ -503,13 +507,17 @@ class MathEnvironment(BaseMathEnvironment):
         worker_index = next(self._worker_counter) % self.num_workers
 
         # Process each chunk in parallel
+        verify_kwargs: dict[str, Any] = {
+            "math_verify_impl": self.cfg.get("math_verify_impl", "hf_math_verify"),
+            "dapo_long_cot": bool(self.cfg.get("dapo_long_cot", False)),
+        }
+
         futures = [
             self.workers[(worker_index + i) % self.num_workers].verify.remote(
                 chunk,
                 ground_truth_chunk,
                 return_extracted_answer,
-                math_verify_impl=self.cfg.get("math_verify_impl", "hf_math_verify"),
-                truncate_solution_tail=self.cfg.get("truncate_solution_tail", True),
+                **verify_kwargs,
             )
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)

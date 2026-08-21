@@ -24,7 +24,6 @@ policy:
     colocated:
       enabled: true
     mcore_generation_config:
-      async_engine: false
       transformer_impl: transformer_engine
       tensor_model_parallel_size: 1
       buffer_size_gb: 16

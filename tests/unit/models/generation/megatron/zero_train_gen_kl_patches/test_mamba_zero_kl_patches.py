@@ -6,6 +6,7 @@ import torch
 
 from nemo_rl.models.generation.megatron.zero_train_gen_kl_patches import (
     mamba_zero_kl_patches as patches,
+    mamba_zero_kl_patches_legacy as legacy_patches,
 )
 
 
@@ -89,6 +90,61 @@ def fake_mamba_module(monkeypatch):
     patches.restore_mamba_alignment_patch()
 
 
+def test_apply_patches_new_api_train_kernel_decode(
+    fake_mamba_module, monkeypatch, capsys
+):
+    """Public ssm_prefill API: swap batch_invariant_decode scan to train kernel only."""
+    module, import_module = fake_mamba_module
+
+    class UpstreamMambaMixer:
+        mamba_chunk_scan_combined = MagicMock()
+
+        def ssm_prefill(self, *args, **kwargs):
+            return "upstream-prefill"
+
+        def ssm_decode(self, *args, **kwargs):
+            return "upstream-decode"
+
+    bid_mod = SimpleNamespace(
+        batch_invariant_decode_buffered_scan=MagicMock(return_value="orig-scan"),
+        BatchInvariantDecodeBuffers=SimpleNamespace(seed=MagicMock()),
+    )
+    utils_module = SimpleNamespace(
+        get_mamba_version=lambda: (_ for _ in ()).throw(
+            AssertionError("original get_mamba_version imported mamba_ssm")
+        ),
+        _mamba_ssm_version=None,
+    )
+
+    def _import_module(name, *args, **kwargs):
+        if name == "megatron.core.ssm.mamba_mixer":
+            return module
+        if name == "megatron.core.ssm.ops.batch_invariant_decode":
+            return bid_mod
+        if name == "megatron.core.utils":
+            return utils_module
+        raise AssertionError(name)
+
+    monkeypatch.setattr(patches.importlib, "import_module", _import_module)
+    module.MambaMixer = UpstreamMambaMixer
+    module.mamba_chunk_scan_combined = UpstreamMambaMixer.mamba_chunk_scan_combined
+    patches.restore_mamba_alignment_patch()
+
+    patches.apply_mamba_alignment_patch(required=True)
+
+    mixer = UpstreamMambaMixer()
+    assert mixer.ssm_prefill(None, None, None, None) == "upstream-prefill"
+    assert not hasattr(UpstreamMambaMixer, "_bik_decode_buffered_scan")
+    assert (
+        bid_mod.batch_invariant_decode_buffered_scan
+        is patches._nrl_batch_invariant_decode_buffered_scan
+    )
+    output = capsys.readouterr().out
+    assert "mamba_chunk_scan_combined (train kernel)" in output
+    import_module.assert_any_call("megatron.core.ssm.mamba_mixer")
+    import_module.assert_any_call("megatron.core.ssm.ops.batch_invariant_decode")
+
+
 def test_patch_is_idempotent_and_restorable(fake_mamba_module, capsys):
     module, import_module = fake_mamba_module
     original_prefill = module.MambaMixer._ssm_prefill
@@ -97,12 +153,12 @@ def test_patch_is_idempotent_and_restorable(fake_mamba_module, capsys):
     patches.apply_mamba_alignment_patch()
     patches.apply_mamba_alignment_patch()
 
-    assert module.MambaMixer._ssm_prefill is patches._nrl_patched_ssm_prefill
-    assert module.MambaMixer._ssm_decode is patches._nrl_patched_ssm_decode
+    assert module.MambaMixer._ssm_prefill is legacy_patches._nrl_patched_ssm_prefill
+    assert module.MambaMixer._ssm_decode is legacy_patches._nrl_patched_ssm_decode
     assert hasattr(module.MambaMixer, "_bik_decode_buffered_scan")
     import_module.assert_any_call("megatron.core.ssm.mamba_mixer")
     import_module.assert_any_call("megatron.core.utils")
-    assert capsys.readouterr().out.count("installed Mamba train/prefill/decode") == 1
+    assert capsys.readouterr().out.count("installed legacy Mamba train/prefill/decode") == 1
 
     patches.restore_mamba_alignment_patch()
 
