@@ -1178,6 +1178,28 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         return futures
 
+    def init_mx_reshard_publisher(
+        self, *, train_world_size: int
+    ) -> list[ray.ObjectRef]:
+        """Initialize one ModelExpress publisher per Megatron rank."""
+        return self.worker_group.run_all_workers_single_data(
+            "init_mx_reshard_publisher",
+            train_world_size=train_world_size,
+        )
+
+    def publish_mx_reshard_weights(self, *, version: int) -> list[ray.ObjectRef]:
+        """Publish all trainer ranks at one stamped version."""
+        return self.worker_group.run_all_workers_single_data(
+            "publish_mx_reshard_weights",
+            version=version,
+        )
+
+    def shutdown_mx_reshard_publisher(self) -> list[ray.ObjectRef]:
+        """Stop every trainer publisher and stale its MX publication."""
+        return self.worker_group.run_all_workers_single_data(
+            "shutdown_mx_reshard_publisher"
+        )
+
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""
         futures = self.worker_group.run_all_workers_single_data("offload_before_refit")
@@ -1242,9 +1264,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def shutdown(self) -> bool:
         """Shut down all HF workers and clean up resources."""
+        if getattr(self, "_shutdown_complete", False):
+            return True
+        self._shutdown_complete = True
         if not hasattr(self, "worker_group"):
             return True
         try:
+            if self.cfg["generation"].get("refit_transport") == "mx_reshard":
+                ray.get(
+                    self.worker_group.run_all_workers_single_data(
+                        "shutdown_mx_reshard_publisher"
+                    )
+                )
             # Use the worker group's shutdown method with the worker's cleanup method
             return self.worker_group.shutdown(cleanup_method="shutdown")
         except ray.exceptions.RayActorError:

@@ -84,6 +84,18 @@ def test_configure_nixl_worker_uses_vllm_extension_points():
     }
 
 
+def test_configure_nixl_worker_enables_early_init_for_mx_reshard():
+    vllm_kwargs = {"additional_config": {"existing": True}}
+
+    configure_nixl_worker({"refit_transport": "mx_reshard"}, vllm_kwargs)
+
+    assert vllm_kwargs["worker_cls"] == NIXL_VLLM_WORKER
+    assert vllm_kwargs["additional_config"] == {
+        "existing": True,
+        "nemo_rl_mx_reshard_nixl": True,
+    }
+
+
 def test_configure_nixl_worker_rejects_incompatible_worker_class():
     with pytest.raises(ValueError, match="worker_cls to be unset"):
         configure_nixl_worker(
@@ -119,6 +131,22 @@ def test_preinit_nixl_from_vllm_config_is_disabled_without_nixl_config():
     config = SimpleNamespace(additional_config={})
 
     assert preinit_nixl_from_vllm_config(config) is None
+
+
+def test_preinit_nixl_from_vllm_config_uses_default_backend_for_mx(monkeypatch):
+    from nemo_rl.utils.checkpoint_engines import nixl
+
+    calls = []
+    agent = object()
+    monkeypatch.setattr(
+        nixl,
+        "preinit_nixl_agent",
+        lambda **kwargs: calls.append(kwargs) or agent,
+    )
+    config = SimpleNamespace(additional_config={"nemo_rl_mx_reshard_nixl": True})
+
+    assert preinit_nixl_from_vllm_config(config) is agent
+    assert calls == [{}]
 
 
 @pytest.mark.vllm

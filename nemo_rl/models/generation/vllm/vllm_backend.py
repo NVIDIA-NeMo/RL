@@ -184,6 +184,7 @@ class VllmInternalWorkerExtension:
     # load_mtp_weights_from_disk); refit then leaves those static weights alone.
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
+    _mx_reshard_receiver: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
@@ -249,6 +250,56 @@ class VllmInternalWorkerExtension:
         # on memory-tight shapes (mirror the train side).
         torch.cuda.empty_cache()
         self.model_update_group.init_nccl_communicator(device=self.device)
+
+    def init_mx_reshard_receiver(
+        self,
+        rank_prefix: int,
+        inference_world_size: int,
+        train_world_size: int,
+        model_name: str,
+        server_url: str,
+        timeout_s: float,
+        receiver_listen_port_base: int,
+    ) -> bool:
+        """Create the ModelExpress receiver around this live vLLM model."""
+        if self._mx_reshard_receiver is not None:
+            return True
+
+        from nemo_rl.distributed.mx_vllm_reshard_receiver import (
+            MxVllmReshardReceiver,
+        )
+
+        local_rank = torch.cuda.current_device()
+        rollout_rank = resolve_rollout_rank(rank_prefix, inference_world_size)
+        self._mx_reshard_receiver = MxVllmReshardReceiver(
+            model=self.model_runner.model,
+            vllm_config=self.model_runner.vllm_config,
+            model_config=self.model_runner.model_config,
+            model_name=model_name,
+            server_url=server_url,
+            agent_name=f"nemo-rl-vllm-{rollout_rank}",
+            local_rank=local_rank,
+            global_rank=rollout_rank,
+            num_trainer_sources=train_world_size,
+            device=self.device,
+            listen_port=int(receiver_listen_port_base) + rollout_rank,
+            timeout=float(timeout_s),
+        )
+        return True
+
+    def update_weights_from_mx_reshard(self, version: int) -> bool:
+        """Pull and atomically install one stamped ModelExpress version."""
+        if self._mx_reshard_receiver is None:
+            raise RuntimeError("ModelExpress receiver is not initialized")
+        self._mx_reshard_receiver.update_weights(version)
+        return True
+
+    def shutdown_mx_reshard_receiver(self) -> bool:
+        """Release this vLLM rank's ModelExpress receiver resources."""
+        if self._mx_reshard_receiver is not None:
+            self._mx_reshard_receiver.shutdown()
+            self._mx_reshard_receiver = None
+        return True
 
     def init_nccl_reshard_comm_group(
         self,
@@ -1210,6 +1261,9 @@ class VllmInternalWorkerExtension:
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""
+        if self._mx_reshard_receiver is not None:
+            self._mx_reshard_receiver.shutdown()
+            self._mx_reshard_receiver = None
         # Close ZMQ socket and context if they exist
         if hasattr(self, "zmq_socket"):
             self.zmq_socket.close()

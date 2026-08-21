@@ -1,0 +1,95 @@
+# Dense counterpart of grpo_moe_qwen3_30b_tp2ep4dp2_tp4dp4_mx_reshard.yaml.
+#
+#   Qwen3-4B-Thinking-2507 (dense)
+#   trainer TP2 x PP1 x DP8 (16 GPUs)
+#     -> 4 independent vLLM replicas, each TP4 (16 GPUs)
+#
+# Why dense: a dense model has no grouped-expert tensors, so it exercises the
+# same TP2 -> TP4 reshard across 16 publishers and 16 receivers without also
+# exercising vLLM's fused expert layout. That separates transport and lifecycle
+# regressions from expert-capture regressions.
+#
+# The parallel geometry is deliberately identical to the MoE recipe so the
+# transport shape -- rank counts, resharding factor, agent fan-out -- carries
+# over. Only the model differs, and it is smaller, so these numbers bound scale
+# and lifecycle rather than the MoE recipe's byte volume.
+
+defaults: ../../../../../examples/configs/grpo_math_1B_megatron.yaml
+
+grpo:
+  # One cold/warm-up cycle followed by ten measured warm refits.
+  max_num_steps: 11
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 2
+  max_rollout_turns: 1
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  model_name: Qwen/Qwen3-4B-Thinking-2507
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 1024
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    empty_unused_memory_level: 1
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      # Each node holds an address on all four RDMA rails (10.0.32/48/64/80.x),
+      # and NCCL was pairing its local rail-0 HCA against a peer's rail-3
+      # address. Those are different subnets, so RoCE never connects and the
+      # QP dies with IBV_WC_RETRY_EXC_ERR. Forbid rail crossing so each ring
+      # stays on one rail. Set here rather than on the RayCluster because an
+      # env change there restarts the pods and would release eight scarce
+      # whole nodes.
+      NCCL_CROSS_NIC: "0"
+
+  generation:
+    backend: vllm
+    max_new_tokens: 8
+    temperature: 1.0
+    top_p: 1.0
+    refit_transport: mx_reshard
+    vllm_cfg:
+      async_engine: false
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 4
+
+data:
+  max_input_seq_length: 1024
+
+logger:
+  # Node-local so the run does not depend on a shared volume having free space.
+  # Copy the evidence off the pod after the run.
+  log_dir: /tmp/mx-reshard-dense
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+
+checkpointing:
+  enabled: false

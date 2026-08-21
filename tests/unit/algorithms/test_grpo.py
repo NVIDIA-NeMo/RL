@@ -5168,22 +5168,29 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 
 
 @pytest.mark.parametrize(
-    "backend, nccl_reshard, colocated, expected",
+    "backend, nccl_reshard, mx_reshard, colocated, expected",
     [
         # MInf refits through mcore's swap_model_weights and never touches HF
         # names; a revert here is silent (setup time + peak memory only), so
         # every megatron combination must stay False.
-        ("megatron", False, True, False),
-        ("megatron", False, False, False),
-        ("megatron", True, False, False),
-        ("megatron", True, True, False),
-        # vLLM keeps the handshake, except NCCL-reshard non-colocated, which
-        # builds its own refit info.
-        ("vllm", False, True, True),
-        ("vllm", False, False, True),
-        ("vllm", True, False, False),
-        ("vllm", True, True, True),
+        ("megatron", False, False, True, False),
+        ("megatron", False, False, False, False),
+        ("megatron", True, False, False, False),
+        ("megatron", True, False, True, False),
+        # vLLM keeps the handshake except for non-colocated reshard transports,
+        # which build their own refit metadata.
+        ("vllm", False, False, True, True),
+        ("vllm", False, False, False, True),
+        ("vllm", True, False, False, False),
+        ("vllm", True, False, True, True),
+        ("vllm", False, True, False, False),
+        ("vllm", False, True, True, True),
     ],
 )
-def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
-    assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+def test_needs_hf_refit_handshake(
+    backend, nccl_reshard, mx_reshard, colocated, expected
+):
+    assert (
+        _needs_hf_refit_handshake(backend, nccl_reshard, mx_reshard, colocated)
+        is expected
+    )

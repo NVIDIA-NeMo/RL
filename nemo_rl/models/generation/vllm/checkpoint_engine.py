@@ -33,12 +33,17 @@ if TYPE_CHECKING:
 
 NIXL_VLLM_WORKER = "nemo_rl.models.generation.vllm.vllm_backend.NixlVllmWorker"
 _NIXL_CONFIG_KEY = "nemo_rl_checkpoint_engine"
+_MX_RESHARD_NIXL_KEY = "nemo_rl_mx_reshard_nixl"
 
 
 def configure_nixl_worker(config: VllmConfig, vllm_kwargs: dict[str, Any]) -> None:
     """Configure vLLM's worker hook for early NIXL initialization."""
     checkpoint_config = checkpoint_engine_refit_config(config)
-    if checkpoint_config is None or checkpoint_config["backend"] != "nixl":
+    checkpoint_nixl = (
+        checkpoint_config is not None and checkpoint_config["backend"] == "nixl"
+    )
+    mx_reshard = config.get("refit_transport") == "mx_reshard"
+    if not checkpoint_nixl and not mx_reshard:
         return
 
     worker_cls = vllm_kwargs.setdefault("worker_cls", NIXL_VLLM_WORKER)
@@ -49,20 +54,26 @@ def configure_nixl_worker(config: VllmConfig, vllm_kwargs: dict[str, Any]) -> No
         )
 
     additional_config = dict(vllm_kwargs.get("additional_config") or {})
-    additional_config[_NIXL_CONFIG_KEY] = checkpoint_config
+    if checkpoint_nixl:
+        additional_config[_NIXL_CONFIG_KEY] = checkpoint_config
+    if mx_reshard:
+        additional_config[_MX_RESHARD_NIXL_KEY] = True
     vllm_kwargs["additional_config"] = additional_config
 
 
 def preinit_nixl_from_vllm_config(vllm_config: Any) -> Any:
     """Create the NIXL preinit agent carried by a vLLM internal worker."""
     checkpoint_config = vllm_config.additional_config.get(_NIXL_CONFIG_KEY)
-    if checkpoint_config is None:
+    mx_reshard = vllm_config.additional_config.get(_MX_RESHARD_NIXL_KEY, False)
+    if checkpoint_config is None and not mx_reshard:
         return None
 
-    from nemo_rl.utils.checkpoint_engines.nixl import (
-        preinit_nixl_agent,
-        resolve_nixl_backend_kwargs,
-    )
+    from nemo_rl.utils.checkpoint_engines.nixl import preinit_nixl_agent
+
+    if checkpoint_config is None:
+        return preinit_nixl_agent()
+
+    from nemo_rl.utils.checkpoint_engines.nixl import resolve_nixl_backend_kwargs
 
     backend_name, backend_init_params = resolve_nixl_backend_kwargs(
         checkpoint_config["engine_kwargs"]["nixl"]
