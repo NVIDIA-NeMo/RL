@@ -1,0 +1,18 @@
+defaults: vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  async_grpo:
+    enabled: false
+    in_flight_weight_updates: false
+loss_fn:
+  use_importance_sampling_correction: false
+policy:
+  train_global_batch_size: 4
+  max_total_sequence_length: 16384
+  refit_buffer_size_gb: 5
+  generation:
+    colocated:
+      enabled: true
+cluster:
+  num_nodes: 2

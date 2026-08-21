@@ -238,19 +238,24 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     )
     thinking_tags = thinking_tags or DEFAULT_THINKING_TAGS
 
+    content = output_item_dict.get("content")
     is_output_message = (
-        "content" in output_item_dict
-        and len(output_item_dict["content"]) > 0
-        and "text" in output_item_dict["content"][0]
+        isinstance(content, list)
+        and bool(content)
+        and isinstance(content[0], dict)
+        and isinstance(content[0].get("text"), str)
     )
     # NeMo-Gym only attaches generation_token_ids to the last output item of a
     # model call (see vllm_model/app.py postprocess_chat_response). So this item
     # is guaranteed to be the final thing the model produced for this turn.
     # If it's a reasoning item, the model output only reasoning (no content/tool calls).
+    summary = output_item_dict.get("summary")
     is_reasoning_message = (
         output_item_dict.get("type") == "reasoning"
-        and len(output_item_dict.get("summary", [])) > 0
-        and "text" in output_item_dict["summary"][0]
+        and isinstance(summary, list)
+        and bool(summary)
+        and isinstance(summary[0], dict)
+        and isinstance(summary[0].get("text"), str)
     )
 
     is_invalid_tool_call = False
@@ -652,9 +657,13 @@ Depending on your data shape, you may want to change these values."""
         timer = Timer()
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
-        # For multimodal runs, replace local filesystem image paths in the
-        # examples with base64 data URLs before shipping to vLLM. No-op when
-        # examples carry no `input_image` items (text-only case).
+        from nemo_rl.environments.nemo_gym_video import (
+            normalize_video_urls_in_examples,
+        )
+
+        # Normalize local media before shipping requests to vLLM. Both helpers
+        # are no-ops for text-only rows and already-qualified URLs.
+        normalize_video_urls_in_examples(nemo_gym_examples)
         encode_images_in_examples(nemo_gym_examples)
 
         timer.start("_run_rollouts_total")
