@@ -2210,7 +2210,11 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     }
     manager._tokenizer = None
     manager._effort_config = None
-    manager._result_to_completion = lambda result: result["value"]
+    manager._results_to_completions = lambda results: (
+        [result["value"] for result in results],
+        {},
+    )
+    manager._compute_reward_penalty_metrics = lambda counts, num_results: {}
     manager._compute_rollout_metrics = lambda completions, agent: {
         "completion_count": len(completions),
         "agent": agent,

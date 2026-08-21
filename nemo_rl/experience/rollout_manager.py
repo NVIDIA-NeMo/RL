@@ -56,8 +56,8 @@ from nemo_rl.experience.rollouts import (
     _effort_shaping_metrics,
     _find_routed_experts_template,
     _tensorize_by_key,
-    attach_static_multimodal_payload,
     apply_reward_penalties,
+    attach_static_multimodal_payload,
     calculate_rewards,
     compute_reward_penalty_metrics,
 )
@@ -1085,7 +1085,9 @@ class AsyncNemoGymRolloutImpl:
     ) -> dict[str, float]:
         """Return enabled penalty rates using the legacy Gym metric names."""
         return compute_reward_penalty_metrics(
-            penalty_counts, num_results, self._reward_penalty_config
+            penalty_counts,
+            num_results,
+            self._reward_penalty_config,
         )
 
     def _compute_rollout_metrics(

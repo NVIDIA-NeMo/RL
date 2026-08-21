@@ -612,12 +612,16 @@ def _mask_gate_result():
 
 
 def test_result_to_completion_keeps_mask_flag_when_gate_on():
-    completion = _nemo_gym_impl(True)._results_to_completions([_mask_gate_result()])[0][0]
+    completion = _nemo_gym_impl(True)._results_to_completions([_mask_gate_result()])[0][
+        0
+    ]
     assert completion.env_extras["instance_config"]["mask_sample"] is True
 
 
 def test_result_to_completion_drops_mask_flag_when_gate_off():
-    completion = _nemo_gym_impl(False)._results_to_completions([_mask_gate_result()])[0][0]
+    completion = _nemo_gym_impl(False)._results_to_completions([_mask_gate_result()])[
+        0
+    ][0]
     assert "mask_sample" not in completion.env_extras["instance_config"]
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
@@ -712,6 +716,22 @@ def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
     assert penalty_counts[count_key] == 1
     assert sum(penalty_counts.values()) == 1
     assert impl._compute_reward_penalty_metrics(penalty_counts, 1) == {metric_name: 1.0}
+
+
+def test_nemo_gym_reward_penalty_metrics_compute_fractional_rate():
+    impl = _nemo_gym_impl(True, {"penalize_empty_final_answer": True})
+
+    metrics = impl._compute_reward_penalty_metrics(
+        {
+            "duplicated_reasoning": 0,
+            "empty_final_answer": 1,
+            "unwanted_token": 0,
+            "malformed_think_tag": 0,
+        },
+        3,
+    )
+
+    assert metrics == {"empty_final_answer_rate": 1 / 3}
 
 
 # ---------------------------------------------------------------------------
