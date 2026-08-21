@@ -331,6 +331,29 @@ def test_shutdown_clears_initializer_pool(
     assert worker_group._initializer_pool == {}
 
 
+def test_shutdown_is_a_noop_once_ray_is_gone(monkeypatch):
+    """shutdown() must not touch the Ray API after Ray has torn down.
+
+    The __del__ safety net can run during interpreter finalization, i.e. after
+    Ray's atexit teardown, and any Ray call from there aborts the process on a
+    fatal core_worker_process.cc CHECK instead of raising. Actors die with Ray,
+    so there is nothing left to clean up.
+    """
+    worker_group = RayWorkerGroup.__new__(RayWorkerGroup)
+    worker_group._workers = ["not-a-real-actor"]
+    worker_group._worker_metadata = [{}]
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: False)
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("shutdown() called into Ray after teardown")
+
+    monkeypatch.setattr(ray, "kill", _fail)
+    monkeypatch.setattr(ray, "get", _fail)
+
+    assert worker_group.shutdown() is True
+
+
 def test_actor_initialization_with_args_kwargs(register_test_actor, virtual_cluster):
     actor_fqn = register_test_actor
     init_args = ("arg1", 123)
