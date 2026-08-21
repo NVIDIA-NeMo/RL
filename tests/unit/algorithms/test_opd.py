@@ -15,6 +15,7 @@
 import pytest
 import torch
 
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 # ---------------------------------------------------------------------------
@@ -110,6 +111,131 @@ def test_compute_teacher_logprobs_dp_padding(batch_size, dp_size):
 
     assert result.shape == (batch_size, S)
     assert torch.allclose(result, torch.tensor(2.0))
+
+
+class _RecordingTeacherWorkerGroup(_MockTeacherWorkerGroup):
+    """Capture the batch passed to a teacher for row-alignment assertions."""
+
+    def __init__(self, fill_value=1.0, dp_size=4):
+        super().__init__(fill_value=fill_value, dp_size=dp_size)
+        self.received: BatchedDataDict | None = None
+
+    def get_logprobs(self, data):
+        self.received = data
+        return super().get_logprobs(data)
+
+
+def _row_marked_packed_tensor(markers):
+    return PackedTensor(
+        [
+            None
+            if marker is None
+            else torch.full((1, 2), float(marker), dtype=torch.float32)
+            for marker in markers
+        ],
+        dim_to_pack=0,
+    ).enable_deduplication()
+
+
+def _received_row_markers(packed):
+    return [
+        None if tensor is None else float(tensor[0, 0])
+        for tensor in packed.iter_logical_segments()
+    ]
+
+
+def test_compute_teacher_logprobs_selects_multimodal_rows_per_teacher():
+    """Each teacher receives media rows aligned with its selected token rows."""
+    vision_twg = _RecordingTeacherWorkerGroup(fill_value=1.0, dp_size=1)
+    text_twg = _RecordingTeacherWorkerGroup(fill_value=2.0, dp_size=1)
+    collector = _make_collector(
+        teacher_worker_groups={"vision": vision_twg, "text": text_twg},
+        alias_to_group_alias={"vision_agent": "vision", "text_agent": "text"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {
+                "vision_agent": "/ckpt/vision",
+                "text_agent": "/ckpt/text",
+            },
+        },
+        _has_distillation_teachers=True,
+    )
+
+    collector._compute_teacher_logprobs(
+        torch.randint(0, 100, (4, 8)),
+        [
+            {"name": "vision_agent"},
+            {"name": "text_agent"},
+            {"name": "vision_agent"},
+            {"name": "text_agent"},
+        ],
+        multimodal_data={
+            "pixel_values": _row_marked_packed_tensor([0, None, 2, None]),
+            "imgs_sizes": _row_marked_packed_tensor([10, None, 12, None]),
+        },
+    )
+
+    assert vision_twg.received is not None
+    assert text_twg.received is not None
+    assert _received_row_markers(vision_twg.received["pixel_values"]) == [0.0, 2.0]
+    assert _received_row_markers(vision_twg.received["imgs_sizes"]) == [10.0, 12.0]
+    assert "pixel_values" not in text_twg.received
+    assert "imgs_sizes" not in text_twg.received
+
+
+def test_compute_teacher_logprobs_dp_padding_repeats_multimodal_row():
+    """DP padding repeats the media row paired with the repeated token row."""
+    twg = _RecordingTeacherWorkerGroup(fill_value=3.0, dp_size=4)
+    collector = _make_collector(
+        teacher_worker_groups={"vision": twg},
+        alias_to_group_alias={"vision_agent": "vision"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"vision_agent": "/ckpt/vision"},
+        },
+        _has_distillation_teachers=True,
+    )
+
+    result, _ = collector._compute_teacher_logprobs(
+        torch.randint(0, 100, (1, 8)),
+        [{"name": "vision_agent"}],
+        multimodal_data={
+            "pixel_values": _row_marked_packed_tensor([7]),
+            "num_frames": _row_marked_packed_tensor([1]),
+        },
+    )
+
+    assert twg.received is not None
+    assert twg.received["input_ids"].shape[0] == 4
+    assert _received_row_markers(twg.received["pixel_values"]) == [7.0] * 4
+    assert _received_row_markers(twg.received["num_frames"]) == [1.0] * 4
+    assert result.shape == (1, 8)
+
+
+def test_compute_teacher_logprobs_mixed_media_and_text_rows_per_teacher():
+    """Mixed image and text-only rows in one group keep the empty rows aligned."""
+    twg = _RecordingTeacherWorkerGroup(fill_value=4.0, dp_size=1)
+    collector = _make_collector(
+        teacher_worker_groups={"mixed": twg},
+        alias_to_group_alias={"mixed_agent": "mixed"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"mixed_agent": "/ckpt/mixed"},
+        },
+        _has_distillation_teachers=True,
+    )
+
+    result, _ = collector._compute_teacher_logprobs(
+        torch.randint(0, 100, (3, 8)),
+        [{"name": "mixed_agent"}] * 3,
+        multimodal_data={
+            "pixel_values": _row_marked_packed_tensor([5, None, 6]),
+            "imgs_sizes": _row_marked_packed_tensor([15, None, 16]),
+        },
+    )
+
+    assert twg.received is not None
+    # The text-only row keeps its slot so media rows stay paired with token rows.
+    assert _received_row_markers(twg.received["pixel_values"]) == [5.0, None, 6.0]
+    assert _received_row_markers(twg.received["imgs_sizes"]) == [15.0, None, 16.0]
+    assert result.shape == (3, 8)
 
 
 def test_compute_teacher_logprobs_routes_to_correct_teacher():

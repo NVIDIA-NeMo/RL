@@ -42,6 +42,8 @@ from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutManager,
+    RolloutRetryPolicy,
+    RolloutStats,
 )
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
@@ -125,32 +127,87 @@ class _FakeImpl:
         return self._record
 
 
-def _make_manager(buffer: _FakeBuffer, impl: _FakeImpl) -> RolloutManager:
-    """Build a RolloutManager without firing the real __init__."""
+def _make_manager(
+    buffer: _FakeBuffer, impl: _FakeImpl, retry_policy: RolloutRetryPolicy | None = None
+) -> RolloutManager:
+    """Build a RolloutManager without firing the real __init__.
+
+    The default policy is single-attempt, matching RolloutRetryPolicy's own default, so
+    these tests keep exercising the no-retry path unless they ask for otherwise.
+    """
     mgr = object.__new__(RolloutManager)
     mgr._impl = impl
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = 1
     mgr._tq_buffer = buffer
     mgr._weight_version = 0
+    mgr._retry_policy = (
+        retry_policy
+        if retry_policy is not None
+        else RolloutRetryPolicy.single_attempt()
+    )
+    mgr._stats = RolloutStats()
+    mgr._skipped_prompts = 0
+    mgr._consecutive_infra_drops = 0
     return mgr
 
 
 class TestGenerateAndPushFlow:
+    def test_explicit_registry_tracks_only_inflight_generation(self):
+        registry: dict[str, tuple[asyncio.Task[None], int]] = {}
+        buf = _FakeBuffer()
+
+        async def _assert_registered(_sample):
+            assert len(registry) == 1
+            task, start_version = next(iter(registry.values()))
+            assert task is asyncio.current_task()
+            assert start_version == 3
+
+        mgr = _make_manager(buf, _FakeImpl(on_run=_assert_registered))
+        mgr.set_weight_version(3)
+
+        _run(
+            mgr.generate_and_push(
+                {"prompt": "p"},
+                inflight_registry=registry,
+            )
+        )
+
+        assert registry == {}
+
     def test_rollout_failure_removes_reserved_group(self):
         async def _fail_rollout(_sample):
             raise RuntimeError("injected rollout failure")
 
+        registry: dict[str, tuple[asyncio.Task[None], int]] = {}
         buf = _FakeBuffer()
         mgr = _make_manager(buf, _FakeImpl(on_run=_fail_rollout))
 
         with pytest.raises(RuntimeError, match="injected rollout failure"):
-            _run(mgr.generate_and_push({"prompt": "p"}))
+            _run(mgr.generate_and_push({"prompt": "p"}, inflight_registry=registry))
 
         assert len(buf.reserve_calls) == 1
         assert len(buf.remove_calls) == 1
         assert buf._slots == []
         assert buf.commit_calls == []
+        assert registry == {}
+
+    def test_cleanup_failure_does_not_mask_original_exception(self):
+        class _RaisingBuffer(_FakeBuffer):
+            async def remove_group(self, group_id, *, remove_in_dp=False):
+                raise RuntimeError("remove_group cleanup boom")
+
+        class _OriginalError(Exception):
+            pass
+
+        async def _raise_original(_sample):
+            raise _OriginalError("original rollout failure")
+
+        buf = _RaisingBuffer()
+        mgr = _make_manager(buf, _FakeImpl(on_run=_raise_original))
+
+        with pytest.raises(_OriginalError):
+            _run(mgr.generate_and_push({"prompt": "p"}))
 
     def test_reserves_then_runs_then_commits(self):
         events: list[str] = []
@@ -248,12 +305,9 @@ class TestGenerateAndPushFlow:
 
         first_mgr = _make_manager(buf, first_impl)
         # Share buffer across two managers (mimics two dispatches from one pump).
-        second_mgr = object.__new__(RolloutManager)
-        second_mgr._impl = second_impl
-        second_mgr._tokenizer = None
-        second_mgr._num_generations_per_prompt = 1
-        second_mgr._tq_buffer = buf
-        second_mgr._weight_version = 0
+        # Built through the shared helper so new RolloutManager attributes only have to
+        # be added in one place.
+        second_mgr = _make_manager(buf, second_impl)
 
         async def _drive():
             t1 = asyncio.create_task(first_mgr.generate_and_push({"prompt": "p1"}))

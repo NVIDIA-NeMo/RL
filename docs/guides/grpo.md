@@ -430,6 +430,90 @@ where:
 - c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is usually set to 3 empirically.
 - $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has changed.
 
+### Loss Normalization (`token_level_loss`)
+
+The formulas above are written with a bare expectation $E_t[\cdot]$, which leaves one detail unspecified: the loss is computed per token, but the optimizer needs a single number, so those per-token values have to be averaged. The `token_level_loss` parameter chooses how that average is taken. It does not change the per-token objective itself — only how the per-token values are combined into the scalar that is differentiated.
+
+There are two choices:
+
+- **`token_level_loss: true`** — average over every token in the batch. Every token counts the same, so a response contributes to the update in proportion to how many tokens it has.
+- **`token_level_loss: false`** — average within each response first, then average those per-response values. Every *response* counts the same regardless of length.
+
+Writing $\ell_{i,t}$ for the per-token objective of token $t$ in response $o_i$ — the quantity inside the expectation in the formula above — $|o_i|$ for the number of unmasked tokens in that response, and $N$ for the number of valid responses:
+
+$$
+L_{\text{token}}(\theta) = \frac{1}{\sum_{i=1}^{N} |o_i|} \sum_{i=1}^{N} \sum_{t=1}^{|o_i|} \ell_{i,t}
+\qquad\qquad
+L_{\text{seq}}(\theta) = \frac{1}{N} \sum_{i=1}^{N} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \ell_{i,t}
+$$
+
+Both denominators — $\sum_i |o_i|$ and $N$ — are counts over the whole global batch, not over a single microbatch. Each microbatch divides by the global count and contributes a partial sum, so the microbatch losses can simply be summed to recover the global-batch loss. See [Loss Functions](../design-docs/loss-functions.md) for how that normalization factor is computed and passed in.
+
+The same choice also normalizes the KL penalty term, so `reference_policy_kl_penalty` is applied on whichever scale you select.
+
+#### An example of what this changes
+
+Consider a batch of two responses — one 10 tokens long, one 1000 tokens long — where every token happens to have the same per-token value:
+
+- Under `token_level_loss: true`, the denominator is $10 + 1000 = 1010$, so the long response accounts for about 99% of the update and the short one about 1%.
+- Under `token_level_loss: false`, each response is averaged over its own length first, so the two contribute 50% each. Per token, that means each token of the short response carries roughly 100× the weight of each token of the long response.
+
+That is arithmetic, not a recommendation — which weighting is preferable depends on the algorithm and the workload. See [Choosing a setting](#choosing-a-setting) below.
+
+#### Objectives under each setting
+
+`token_level_loss` lives on `ClippedPGLossFn`, the loss shared by the policy-gradient algorithms. The table below writes out the full objective for each one under both settings. To keep the expressions readable they show the base objective only; optional terms — the KL penalty, dual clipping (`ratio_clip_c`), and the importance-sampling correction (`use_importance_sampling_correction`) — are applied on top of it and are documented in the sections that follow.
+
+Throughout, $r_{i,t} = \frac{\pi_\theta(o_{i,t})}{\pi_{\theta_{\text{old}}}(o_{i,t})}$ is the per-token probability ratio, $A_i$ is the advantage for response $i$, $\text{sg}(\cdot)$ is the stop-gradient operator, and $\varepsilon_{\text{low}}$, $\varepsilon_{\text{high}}$ are `ratio_clip_min`/`ratio_clip_max`.
+
+| Algorithm | `token_level_loss: true` | `token_level_loss: false` |
+| --- | --- | --- |
+| **GRPO / PPO / DAPO** | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ |
+| **CISPO** (`use_cispo: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \text{sg}\big(\text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\big) A_i \log \pi_\theta(o_{i,t})$ | Not available — rejected at construction time, because CISPO is defined per token. |
+| **GSPO** (`sequence_level_importance_ratios: true`) | Not available — rejected at construction time, because the sequence-level ratio is mutually exclusive with token-level reduction. | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(s_i A_i,\ \text{clip}(s_i, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$, where $s_i = \Big(\frac{\pi_\theta(o_i)}{\pi_{\theta_{\text{old}}}(o_i)}\Big)^{1/\lvert o_i\rvert}$ |
+| **REINFORCE / RLOO** (`disable_ppo_ratio: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t A_i \log \pi_\theta(o_{i,t})$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t A_i \log \pi_\theta(o_{i,t})$ |
+
+Two notes on the table:
+
+- The "not available" cells are enforced by assertions in `ClippedPGLossFn.__init__`, so an incompatible config fails immediately rather than training with a silently different objective.
+- In the GSPO row, $s_i$ does not depend on $t$, so the inner $\frac{1}{\lvert o_i\rvert} \sum_t$ collapses and the objective reduces to one clipped term per response.
+
+#### Losses that do not expose this parameter
+
+`token_level_loss` is a field of `ClippedPGLossConfig` only. Every other loss fixes its normalization as a class attribute, so setting `token_level_loss` in, say, an SFT config has no effect:
+
+| Loss function | Used by | Normalization |
+| --- | --- | --- |
+| `NLLLossFn` | SFT | Token-level |
+| `PreferenceLossFn` / `DPOLossFn` | DPO, RM | Sequence-level |
+| `DistillationLossFn` | On-policy distillation | Token-level |
+| `MseValueLossFn` | PPO critic | Token-level |
+| `CrossTokenizerDistillationLossFn` | Cross-tokenizer distillation | Token-level |
+| `DraftCrossEntropyLossFn` | Eagle3 draft training | Token-level |
+
+#### How metrics are normalized
+
+Some of the metrics logged during training follow `token_level_loss`, and some do not. This matters when comparing runs: switching `token_level_loss` changes the scale of `loss` and `kl_penalty`, but leaves the token-normalized diagnostics directly comparable.
+
+The table below covers the metrics reported by `ClippedPGLossFn` (the GRPO/PPO family). Other algorithms report a different, generally smaller set.
+
+| Behavior | Metrics |
+| --- | --- |
+| **Follows `token_level_loss`** — token-normalized when `true`, sequence-normalized when `false` | `loss`, `kl_penalty` |
+| **Always token-normalized**, regardless of the setting | `probs_ratio`, `probs_ratio_clamped`, `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error`, `approx_entropy` |
+| **Keyed on a different parameter** | `sampling_importance_ratio` follows `sequence_level_importance_ratios`; `is_oob_ratio` is sequence-normalized only for `truncated_importance_sampling_type: seq-mask-tis` |
+| **Not normalized** — raw counts, per-microbatch means, or extrema combined with min/max | `num_valid_samples`, `positive_nll_loss`, `probs_ratio_min`, `probs_ratio_max`, `probs_ratio_clamped_min`, `probs_ratio_clamped_max` |
+
+The authoritative list is the [`metric_normalizations` table in `ClippedPGLossFn`](https://github.com/NVIDIA-NeMo/RL/blob/4a1454bf430624786251d14ba0197169c8e68a5c/nemo_rl/algorithms/loss/loss_functions.py#L335-L371), which is kept in sync with the metrics the loss returns.
+
+#### Choosing a setting
+
+For CISPO and GSPO there is nothing to choose — each admits only one setting, as shown above. For vanilla GRPO (and PPO) both are available, and the tradeoff is the weighting described in the example above.
+
+The argument most often made for token-level normalization comes from the [DAPO paper](https://arxiv.org/abs/2503.14476) (§3.3, "Token-Level Policy Gradient Loss"), in the context of long chain-of-thought training. Their reasoning is that under sequence-level normalization, "since all samples are assigned the same weight in the loss calculation, tokens within longer responses (which contain more tokens) may have a disproportionately lower contribution to the overall loss." They argue this cuts both ways: for high-quality long responses, "this effect can impede the model's ability to learn reasoning-relevant patterns within them." For low-quality ones, "excessively long samples often exhibit low-quality patterns such as gibberish and repetitive words. Thus, sample-level loss calculation, due to its inability to effectively penalize those undesirable patterns in long samples, leads to an unhealthy increase in entropy and response length."
+
+This is one reported result on one class of workloads, not a settled rule. The original [GRPO paper](https://arxiv.org/abs/2402.03300) formulates the loss at the sequence level. If response lengths in your workload are fairly uniform, the two settings differ little; the gap widens as the length distribution spreads out. Treat it as a hyperparameter worth sweeping rather than a setting with a known-correct value, and if you change it mid-project, expect the absolute scale of `loss` and `kl_penalty` to shift even when nothing else has.
+
 ### Improvements to the GRPO Loss Formulation for Stability and Accuracy
 
 #### On-Policy KL Approximation

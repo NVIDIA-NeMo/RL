@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from copy import deepcopy
+
 import pytest
+import ray.cloudpickle as cloudpickle
 import torch
 
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
@@ -480,3 +483,160 @@ def test_slice_preserves_pad_to_max_shape_flag():
 
     assert sliced.pad_to_max_shape is True
     assert sliced.as_tensor().shape == (2, 3, 4, 4)
+
+
+def test_packedtensor_dedup_uses_provenance_not_prompt_position():
+    """Only segments descended from the same physical media are compacted."""
+    shared = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    shared.enable_deduplication()
+    shared_copy = deepcopy(shared)
+    same_prompt_but_different_media = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    same_prompt_but_different_media.enable_deduplication()
+
+    packed = PackedTensor.concat([shared, shared_copy, same_prompt_but_different_media])
+
+    assert len(packed) == 3
+    assert sum(packed.logical_segment_counts_by_row()) == 3
+    assert len(packed.tensors) == 2
+    torch.testing.assert_close(packed.as_tensor(), torch.tensor([[1.0], [1.0], [1.0]]))
+
+
+def test_packedtensor_multiturn_csr_preserves_shared_seed_and_unique_media():
+    """Diverged rows retain one seed segment plus their own later segment."""
+    seed = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    seed.enable_deduplication()
+    row_1 = PackedTensor.merge_segments(
+        [deepcopy(seed), PackedTensor(torch.tensor([[2.0]]), dim_to_pack=0)]
+    )
+    row_2 = PackedTensor.merge_segments(
+        [deepcopy(seed), PackedTensor(torch.tensor([[3.0]]), dim_to_pack=0)]
+    )
+
+    packed = PackedTensor.flattened_concat([row_1, row_2])
+
+    assert len(packed) == 2
+    assert sum(packed.logical_segment_counts_by_row()) == 4
+    assert len(packed.tensors) == 3
+    torch.testing.assert_close(
+        packed.as_tensor(), torch.tensor([[1.0], [2.0], [1.0], [3.0]])
+    )
+
+    second_row = packed.slice([1])
+    assert len(second_row) == 1
+    assert len(second_row.tensors) == 2
+    torch.testing.assert_close(second_row.as_tensor(), torch.tensor([[1.0], [3.0]]))
+
+
+def test_packedtensor_dedup_expands_before_dynamic_shape_padding():
+    """Logical order is restored before non-packing dimensions are padded."""
+    first = PackedTensor(
+        torch.ones(1, 1, 2),
+        dim_to_pack=0,
+        pad_to_max_shape=True,
+    ).enable_deduplication()
+    second = PackedTensor(
+        2 * torch.ones(1, 2, 1),
+        dim_to_pack=0,
+        pad_to_max_shape=True,
+    ).enable_deduplication()
+
+    packed = PackedTensor.concat([first, deepcopy(first), second])
+    materialized = packed.as_tensor()
+
+    assert materialized.shape == (3, 2, 2)
+    torch.testing.assert_close(materialized[0], materialized[1])
+    torch.testing.assert_close(materialized[2, :, 0], 2 * torch.ones(2))
+
+
+def test_packedtensor_to_dtype_returns_independent_wrapper_when_dtype_matches():
+    packed = PackedTensor(
+        torch.ones(1, 2, dtype=torch.bfloat16), dim_to_pack=0
+    ).enable_deduplication()
+    compact = PackedTensor.concat([packed] * 2)
+
+    unchanged = compact.to_dtype(torch.bfloat16)
+
+    assert unchanged is not compact
+    assert unchanged.tensors is not compact.tensors
+    assert unchanged.tensors[0] is compact.tensors[0]
+    assert unchanged._row_offsets == compact._row_offsets
+    assert unchanged._row_offsets is not compact._row_offsets
+    assert unchanged._segment_indices == compact._segment_indices
+    assert unchanged._segment_indices is not compact._segment_indices
+    assert unchanged._segment_provenance == compact._segment_provenance
+    assert unchanged._segment_provenance is not compact._segment_provenance
+
+
+def test_packedtensor_compact_dim_one_slice_empty_and_cloudpickle_roundtrip():
+    first = torch.tensor([[1.0], [2.0]])
+    second = torch.tensor([[3.0, 4.0], [5.0, 6.0]])
+    packed = PackedTensor(
+        [first, second],
+        dim_to_pack=1,
+    ).enable_deduplication()
+    repeated = PackedTensor.concat(
+        [packed.slice([row]) for row in range(len(packed)) for _ in range(2)]
+    )
+
+    assert len(repeated) == 4
+    assert len(repeated.tensors) == 2
+    torch.testing.assert_close(
+        repeated.as_tensor(),
+        torch.cat([first, first, second, second], dim=1),
+    )
+
+    selected = repeated.slice([3, 0, -1])
+    assert len(selected) == 3
+    assert len(selected.tensors) == 2
+    torch.testing.assert_close(
+        selected.as_tensor(),
+        torch.cat([second, first, second], dim=1),
+    )
+
+    restored = cloudpickle.loads(cloudpickle.dumps(selected, protocol=5))
+    assert restored.deduplication_enabled
+    assert len(restored) == 3
+    assert len(restored.tensors) == 2
+    torch.testing.assert_close(restored.as_tensor(), selected.as_tensor())
+
+    empty = PackedTensor.empty_rows_like(packed, 0)
+    assert len(empty) == 0
+    assert sum(empty.logical_segment_counts_by_row()) == 0
+    assert empty.as_tensor() is None
+
+
+def test_packedtensor_unpickles_pre_deduplication_state():
+    tensor = torch.tensor([[1.0], [2.0]])
+    legacy = PackedTensor.__new__(PackedTensor)
+    legacy.__dict__ = {
+        "tensors": [tensor],
+        "dim_to_pack": 0,
+        "pad_to_max_shape": False,
+    }
+
+    restored = cloudpickle.loads(cloudpickle.dumps(legacy, protocol=5))
+
+    assert not restored.deduplication_enabled
+    assert len(restored) == 1
+    assert sum(restored.logical_segment_counts_by_row()) == 1
+    torch.testing.assert_close(restored.as_tensor(), tensor)
+    restored.enable_deduplication()
+    assert restored.deduplication_enabled
+
+
+def test_packedtensor_empty_legacy_rows_survive_copy_pickle_and_slice():
+    legacy = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    empty = PackedTensor.empty_rows_like(legacy, 0)
+
+    assert len(empty) == 0
+    assert not empty.deduplication_enabled
+    assert empty.as_tensor() is None
+
+    copied = deepcopy(empty)
+    restored = cloudpickle.loads(cloudpickle.dumps(empty, protocol=5))
+    sliced = empty.slice([])
+    for value in (copied, restored, sliced):
+        assert len(value) == 0
+        assert sum(value.logical_segment_counts_by_row()) == 0
+        assert not value.deduplication_enabled
+        assert value.as_tensor() is None

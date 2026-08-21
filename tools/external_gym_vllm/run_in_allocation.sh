@@ -282,8 +282,6 @@ declare -a service_step_pids=()
 declare -a service_step_labels=()
 declare -a lb_step_pids=()
 declare -a lb_step_labels=()
-declare -a preflight_pids=()
-declare -a preflight_labels=()
 ray_sub_pid=""
 
 cleanup() {
@@ -294,7 +292,7 @@ cleanup() {
   if [[ -n "${ray_sub_pid}" ]] && kill -0 "${ray_sub_pid}" 2>/dev/null; then
     kill "${ray_sub_pid}" 2>/dev/null || true
   fi
-  for pid in "${lb_step_pids[@]}" "${service_step_pids[@]}" "${preflight_pids[@]}"; do
+  for pid in "${lb_step_pids[@]}" "${service_step_pids[@]}"; do
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
       kill "${pid}" 2>/dev/null || true
     fi
@@ -515,65 +513,6 @@ external_service_mount="${EXTERNAL_VLLM_SHARED_ROOT}:${EXTERNAL_VLLM_SHARED_ROOT
 for pool in "${pool_names[@]}"; do
   lb_mounts+=",${state_dirs[${pool}]}:${lb_state_dirs[${pool}]}"
 done
-
-for pool in "${pool_names[@]}"; do
-  offset="${node_offsets[${pool}]}"
-  first_pool_node="${external_nodes[${offset}]}"
-  echo "[INFO] Validating the ${display_names[${pool}]} container and Python environment"
-  srun \
-    --het-group=1 \
-    --no-container-mount-home \
-    --container-image="${containers[${pool}]}" \
-    --container-mounts="${external_service_mount}" \
-    --mpi=pmix \
-    --gres="gpu:${GPUS_PER_NODE}" \
-    --overlap \
-    --kill-on-bad-exit=1 \
-    --nodelist="${first_pool_node}" \
-    --nodes=1 \
-    --ntasks=1 \
-    bash -lc \
-    "command -v ray >/dev/null && '${vllm_pythons[${pool}]}' -c 'import ray, vllm; from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches'" \
-    >/dev/null &
-  preflight_pids+=("$!")
-  preflight_labels+=("${display_names[${pool}]} container")
-done
-
-echo "[INFO] Validating the load-balancer container and Python environment"
-srun \
-  --het-group=0 \
-  --no-container-mount-home \
-  --container-image="${CONTAINER}" \
-  --container-mounts="${lb_mounts}" \
-  --container-workdir="${SLURM_SUBMIT_DIR}" \
-  --mpi=pmix \
-  -A "${SLURM_JOB_ACCOUNT}" \
-  -p "${SLURM_JOB_PARTITION}" \
-  --overlap \
-  --kill-on-bad-exit=1 \
-  --nodelist="${ray_head_node}" \
-  --nodes=1 \
-  --ntasks=1 \
-  --cpus-per-task=1 \
-  bash -lc \
-  "test -x /opt/external-vllm-tools/lb_watchdog.sh && '${EXTERNAL_VLLM_LB_PYTHON}' -c 'import aiohttp'" \
-  >/dev/null &
-preflight_pids+=("$!")
-preflight_labels+=("load balancer container")
-
-preflight_failed=0
-for preflight_index in "${!preflight_pids[@]}"; do
-  preflight_pid="${preflight_pids[${preflight_index}]}"
-  if ! wait "${preflight_pid}"; then
-    echo "[FATAL] External-vLLM preflight failed: ${preflight_labels[${preflight_index}]} (pid=${preflight_pid})" >&2
-    preflight_failed=1
-  fi
-done
-preflight_pids=()
-preflight_labels=()
-if (( preflight_failed != 0 )); then
-  exit 1
-fi
 
 for pool in "${pool_names[@]}"; do
   echo "[INFO] Launching ${display_names[${pool}]} replicas"

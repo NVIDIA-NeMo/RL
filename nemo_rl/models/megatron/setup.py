@@ -12,17 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import hashlib
 import json
 import os
 import threading
 import time
 import warnings
+from collections.abc import Mapping
+from dataclasses import fields, is_dataclass, replace
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
 from megatron.bridge import AutoBridge
-from megatron.bridge.models.model_provider import get_model
+from megatron.bridge.models.model_provider import ModelProviderMixin, get_model
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
@@ -55,8 +58,10 @@ from megatron.bridge.training.setup import (
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
+from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
+from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
@@ -220,19 +225,30 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.megatron.community_import import import_model_from_hf_name
-from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
+from nemo_rl.models.generation.megatron.config import (
+    dedicated_inference_megatron_cfg,
+)
+from nemo_rl.models.megatron.community_import import (
+    import_model_from_hf_name,
+    iter_vlm_config_overrides,
+)
+from nemo_rl.models.megatron.config import (
+    ColocatedReshardPlan,
+    ModelAndOptimizerState,
+    RuntimeConfig,
+)
 from nemo_rl.models.megatron.draft.utils import (
     build_draft_model,
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
+from nemo_rl.models.megatron.memory_saver import inference_model_alloc_region
 from nemo_rl.models.megatron.router_replay import (
     clear_global_router_replay_instances,
     router_replay_enabled,
     validate_router_replay_config,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_megatron_checkpoint_dir,
@@ -313,6 +329,19 @@ def validate_and_set_config(
     weights_path,
     optimizer_path,
 ):
+    # inference_optimized layers hard-require SP with TP>1; fail here with the config key.
+    # This guards the training cfg; the inference cfg is guarded in
+    # merged_inference_megatron_cfg (the colocated build bypasses this function).
+    if (
+        config["megatron_cfg"].get("transformer_impl") == "inference_optimized"
+        and config["megatron_cfg"]["tensor_model_parallel_size"] > 1
+        and not config["megatron_cfg"]["sequence_parallel"]
+    ):
+        raise ValueError(
+            "transformer_impl=inference_optimized requires sequence parallelism "
+            "with TP>1: set policy.megatron_cfg.sequence_parallel=true."
+        )
+
     # Handle generation configuration
     is_generation_colocated = None
     sampling_params = None
@@ -343,6 +372,7 @@ def validate_and_set_config(
     # Optimizer configuration
     optimizer_cpu_offload = config["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
     offload_optimizer_for_logprob = config["offload_optimizer_for_logprob"]
+    offload_optimizer_for_refit = bool(config.get("offload_optimizer_for_refit", True))
 
     # Reward models are not yet supported with Megatron.
     if "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]:
@@ -393,6 +423,7 @@ def validate_and_set_config(
         dtype,
         optimizer_cpu_offload,
         offload_optimizer_for_logprob,
+        offload_optimizer_for_refit,
         is_generation_colocated,
         sampling_params,
         final_padded_vocab_size,
@@ -625,6 +656,19 @@ def setup_model_config(
             )
             raise
 
+    # Construct the final provider with model-only overrides before applying
+    # NeMo-RL's first-class Megatron settings. Conflicts are rejected so the
+    # provider and the user-facing config cannot disagree about the same field.
+    model_overrides = config["megatron_cfg"].get("model_overrides")
+    if model_overrides:
+        _validate_model_override_conflicts(config["megatron_cfg"], model_overrides)
+        if not is_dataclass(model_cfg):
+            raise TypeError(
+                "model_overrides requires a dataclass-backed Megatron Bridge "
+                f"model config, got {type(model_cfg).__name__}."
+            )
+        model_cfg = _merge_model_overrides(model_cfg, model_overrides)
+
     # Apply parallelism settings
     _apply_parallelism_config(model_cfg, config)
 
@@ -647,13 +691,25 @@ def setup_model_config(
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
 
+    # Provider objects loaded from checkpoint metadata otherwise retain the
+    # serialized defaults. Apply explicit recipe controls before model
+    # construction so RADIO positional encoding and frozen towers are stable
+    # and consistent between logprob and training passes.
+    for vlm_key, vlm_value in iter_vlm_config_overrides(config["megatron_cfg"]):
+        if not hasattr(model_cfg, vlm_key):
+            raise ValueError(
+                f"megatron_cfg set '{vlm_key}' but {type(model_cfg).__name__} has no "
+                "such field; this provider does not support that tower control."
+            )
+        setattr(model_cfg, vlm_key, vlm_value)
+
     # Validate chunking configuration
     _validate_chunking_config(config)
 
-    # For megatron_lm, finalize the model config after all settings have been applied.
-    # (For megatron_bridge/hf, the provider was already finalized before the checkpoint
-    # was saved to run_config.yaml, so finalize() is not called here for those paths.)
-    if fmt == "megatron_lm":
+    # Reconstructed providers must be finalized so derived fields reflect the
+    # merged config. Without overrides, preserve the existing checkpoint-load
+    # behavior: only megatron_lm providers need finalization here.
+    if fmt == "megatron_lm" or model_overrides:
         model_cfg.finalize()
 
     model_cfg.__post_init__()
@@ -695,6 +751,108 @@ def setup_model_config(
     _validate_dtype_config(dtype, megatron_cfg.model, megatron_cfg.optimizer)
 
     return megatron_cfg, model_cfg
+
+
+def _validate_model_override_conflicts(
+    megatron_cfg: Mapping[str, Any], overrides: dict[str, Any]
+) -> None:
+    """Reject overrides that duplicate first-class NeMo-RL Megatron settings."""
+    first_class_fields = (set(MegatronConfig.__annotations__) | set(megatron_cfg)) - {
+        "model_overrides"
+    }
+    conflicts = sorted(set(overrides) & first_class_fields)
+    if not conflicts:
+        return
+
+    conflict_paths = ", ".join(
+        f"policy.megatron_cfg.model_overrides.{name} conflicts with "
+        f"policy.megatron_cfg.{name}"
+        for name in conflicts
+    )
+    raise ValueError(
+        "model_overrides is only for Megatron Bridge model fields without a "
+        f"first-class NeMo-RL setting; {conflict_paths}. Set the first-class "
+        "field directly instead."
+    )
+
+
+def _merge_model_overrides(
+    target: Any,
+    overrides: dict[str, Any],
+    path: str = "policy.megatron_cfg.model_overrides",
+) -> Any:
+    """Construct a model config with recursively merged user overrides.
+
+    Dataclass-backed config objects are reconstructed with ``dataclasses.replace``
+    so the returned provider is the canonical object later stored and serialized
+    by Megatron Bridge's ``ConfigContainer``. Nested mappings and config objects
+    are copied before updates; the input provider is never mutated.
+
+    Args:
+        target: Model provider, nested config object, or mapping to merge.
+        overrides: YAML-derived override hierarchy.
+        path: User-facing config path used in error messages.
+
+    Returns:
+        A new config object or mapping containing the merged values.
+
+    Raises:
+        AttributeError: If an override does not match an object attribute.
+    """
+    if isinstance(target, Mapping):
+        merged_mapping = dict(target)
+        for name, value in overrides.items():
+            override_path = f"{path}.{name}"
+            current_value = target.get(name)
+            merged_mapping[name] = _merge_model_override_value(
+                current_value, value, override_path
+            )
+        return merged_mapping
+
+    # Explicitly collect the allowed fields so we can trace a potential
+    # error back to the config / override path that triggered it.
+    dataclass_init_fields = None
+    if is_dataclass(target):
+        dataclass_init_fields = {field.name for field in fields(target) if field.init}
+
+    updates = {}
+    for name, value in overrides.items():
+        override_path = f"{path}.{name}"
+        if dataclass_init_fields is not None:
+            attribute_exists = name in dataclass_init_fields
+        else:
+            attribute_exists = hasattr(target, name)
+        if not attribute_exists:
+            raise AttributeError(
+                f"{override_path} does not match a configurable field on "
+                f"Megatron Bridge config {type(target).__name__}."
+            )
+
+        current_value = getattr(target, name)
+        updates[name] = _merge_model_override_value(current_value, value, override_path)
+
+    if dataclass_init_fields is not None:
+        return replace(target, **updates)
+
+    merged_object = copy.copy(target)
+    for name, value in updates.items():
+        setattr(merged_object, name, value)
+    return merged_object
+
+
+def _merge_model_override_value(
+    current_value: Any, override_value: Any, path: str
+) -> Any:
+    """Merge one override value, descending into config hierarchies as needed."""
+    if not isinstance(override_value, dict):
+        return override_value
+    if (
+        isinstance(current_value, Mapping)
+        or is_dataclass(current_value)
+        or hasattr(current_value, "__dict__")
+    ):
+        return _merge_model_overrides(current_value, override_value, path)
+    return override_value
 
 
 def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -775,10 +933,38 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.moe_router_group_topk = config["megatron_cfg"][
             "moe_router_group_topk"
         ]
+    if (
+        config["megatron_cfg"].get("transformer_impl") == "inference_optimized"
+        and getattr(model_cfg, "moe_router_num_groups", None) == 1
+    ):
+        model_cfg.moe_router_num_groups = None
+        model_cfg.moe_router_group_topk = None
     if "moe_pad_experts_for_cuda_graph_inference" in config["megatron_cfg"]:
         model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
             "moe_pad_experts_for_cuda_graph_inference"
         ]
+    generation_cfg = config.get("generation")
+    mcore_gen_cfg = (
+        (generation_cfg.get("mcore_generation_config") or {})
+        if generation_cfg is not None and generation_cfg.get("backend") == "megatron"
+        else {}
+    )
+    if (
+        mcore_gen_cfg.get("cuda_graph_impl") == "local"
+        and mcore_gen_cfg.get(
+            "transformer_impl", config["megatron_cfg"].get("transformer_impl")
+        )
+        != "inference_optimized"
+        and model_cfg.expert_model_parallel_size > 1
+        and "moe_pad_experts_for_cuda_graph_inference" not in config["megatron_cfg"]
+        and "moe_pad_experts_for_cuda_graph_inference" not in mcore_gen_cfg
+    ):
+        print(
+            "[_apply_moe_config] Setting "
+            "moe_pad_experts_for_cuda_graph_inference=True: CUDA-graph "
+            "inference with expert parallelism requires padded experts."
+        )
+        model_cfg.moe_pad_experts_for_cuda_graph_inference = True
     model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
         "moe_shared_expert_overlap"
     ]
@@ -964,6 +1150,12 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             model_cfg.inference_cuda_graph_scope = InferenceCudaGraphScope[
                 config["megatron_cfg"]["inference_cuda_graph_scope"]
             ]
+    if "cuda_graph_modules" in config["megatron_cfg"]:
+        set_cuda_graph_modules(model_cfg, config["megatron_cfg"]["cuda_graph_modules"])
+    if "cuda_graph_warmup_steps" in config["megatron_cfg"]:
+        model_cfg.cuda_graph_warmup_steps = config["megatron_cfg"][
+            "cuda_graph_warmup_steps"
+        ]
 
     # Use the graph-safe TE RNG tracker for either training graphs or inference graphs.
     if "generation" in config and config["generation"] is not None:
@@ -985,19 +1177,61 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
 
+    megatron_cfg = config["megatron_cfg"]
+    fine_grained_activation_offloading = megatron_cfg.get(
+        "fine_grained_activation_offloading"
+    )
+
+    if fine_grained_activation_offloading is False:
+        # Preserve the legacy exemplar's disabled/null semantics and clear any
+        # enabled state carried by a provider or checkpoint.
+        model_cfg.fine_grained_activation_offloading = False
+        model_cfg.offload_modules = []
+    elif fine_grained_activation_offloading:
+        offload_modules = megatron_cfg.get("offload_modules")
+        if not isinstance(offload_modules, list) or not offload_modules:
+            raise ValueError(
+                "offload_modules must be a non-empty list when "
+                "fine_grained_activation_offloading is True."
+            )
+        moe_only_modules = {"expert_fc1", "moe_act", "fused_group_mlp"}
+        invalid_dense_modules = moe_only_modules.intersection(offload_modules)
+        if (
+            invalid_dense_modules
+            and getattr(model_cfg, "num_moe_experts", None) is None
+        ):
+            raise ValueError(
+                "A MoE-only offload module requires a MoE model "
+                "(num_moe_experts must not be None): "
+                f"{sorted(invalid_dense_modules)}."
+            )
+        model_cfg.fine_grained_activation_offloading = True
+        model_cfg.offload_modules = offload_modules
+
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
     """Validate optimizer configuration."""
-    optimizer_cpu_offload = config["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
-    optimizer_offload_fraction = config["megatron_cfg"]["optimizer"][
-        "optimizer_offload_fraction"
-    ]
+    optimizer_config = config["megatron_cfg"]["optimizer"]
+    optimizer_cpu_offload = optimizer_config["optimizer_cpu_offload"]
+    optimizer_offload_fraction = optimizer_config["optimizer_offload_fraction"]
 
-    if optimizer_cpu_offload:
-        # Currently, hybrid optimizer (partly on GPU and partly on CPU) is not supported because it conflicts with the way
-        # Nemo-rl handles the optimizer offload/onload between generation and training. So if using CPU optimizer the offload_fraction should be 1.0.
-        assert optimizer_offload_fraction == 1.0, (
-            "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
+    if optimizer_cpu_offload and not 0 < optimizer_offload_fraction <= 1:
+        raise ValueError(
+            "optimizer_cpu_offload=True requires 0 < optimizer_offload_fraction <= 1"
+        )
+    if optimizer_cpu_offload and not optimizer_config["use_distributed_optimizer"]:
+        raise ValueError(
+            "optimizer_cpu_offload=True requires use_distributed_optimizer=True"
+        )
+    if optimizer_cpu_offload and optimizer_config["optimizer"] not in {"adam", "sgd"}:
+        raise ValueError(
+            "optimizer_cpu_offload=True requires optimizer to be adam or sgd"
+        )
+    if not optimizer_cpu_offload and optimizer_config.get(
+        "overlap_cpu_optimizer_d2h_h2d"
+    ):
+        raise ValueError(
+            "overlap_cpu_optimizer_d2h_h2d=True requires optimizer_cpu_offload=True"
         )
 
 
@@ -1306,6 +1540,89 @@ def _patch_bridge_signal_handler_for_worker_threads() -> None:
     _BRIDGE_SIGNAL_HANDLER_PATCHED = True
 
 
+def build_inference_model(
+    policy_cfg: PolicyConfig,
+    megatron_cfg: ConfigContainer,
+    initial_model_provider: ModelProviderMixin,
+) -> MegatronModule:
+    """Build a second, inference-layout model for colocated Megatron refit.
+
+    The returned model is resident on GPU; its weights are uninitialized until the first reshard.
+
+    Args:
+        policy_cfg: The inference config
+        megatron_cfg: The training config
+        initial_model_provider: Pre-wrap provider snapshot taken by `setup_model_and_optimizer`.
+
+    Returns:
+        The inference model module (single element; not DDP-wrapped, no optimizer).
+    """
+    inference_provider = initial_model_provider
+    train_pipeline_model_parallel_size = inference_provider.pipeline_model_parallel_size
+    _apply_parallelism_config(inference_provider, policy_cfg)
+    _apply_moe_config(inference_provider, policy_cfg)
+    if "transformer_impl" in policy_cfg["megatron_cfg"]:
+        inference_provider.transformer_impl = policy_cfg["megatron_cfg"][
+            "transformer_impl"
+        ]
+    # A custom (uneven) pipeline split is tuned for the training PP; reset to an even split
+    # when inference uses a different PP (the reshard maps params across stages by name).
+    if (
+        inference_provider.pipeline_model_parallel_size
+        != train_pipeline_model_parallel_size
+    ):
+        inference_provider.num_layers_in_first_pipeline_stage = None
+        inference_provider.num_layers_in_last_pipeline_stage = None
+    # Sequence parallelism requires TP > 1; force it off otherwise (Megatron asserts this).
+    inference_provider.sequence_parallel = (
+        inference_provider.sequence_parallel
+        and inference_provider.tensor_model_parallel_size > 1
+    )
+    # Inference never trains: disable recompute.
+    inference_provider.recompute_granularity = None
+    inference_provider.recompute_method = None
+    inference_provider.recompute_num_layers = None
+    if inference_provider.transformer_impl == "inference_optimized":
+        inference_provider.moe_pad_experts_for_cuda_graph_inference = False
+    # Re-run the deferred MCore post-init (virtual, idempotent).
+    inference_provider.finalize()
+
+    world_size = torch.distributed.get_world_size()
+    inference_pg_collection = build_inference_pg_collection(
+        world_size,
+        tp_size=inference_provider.tensor_model_parallel_size,
+        pp_size=inference_provider.pipeline_model_parallel_size,
+        cp_size=inference_provider.context_parallel_size,
+        ep_size=inference_provider.expert_model_parallel_size,
+        expt_tp_size=inference_provider.expert_tensor_parallel_size,
+        use_tp_pp_dp_mapping=megatron_cfg.dist.use_tp_pp_dp_mapping,
+        rank_offset=0,  # colocated: the same ranks hold both the training and inference models
+    )
+    setattr(inference_provider, "_pg_collection", inference_pg_collection)
+
+    # Match the training mixed-precision wrapper.
+    mixed_precision_wrapper = (
+        MoEFloat16Module
+        if policy_cfg["megatron_cfg"]["freeze_moe_router"]
+        else Float16Module
+    )
+
+    # Only one model's weights stay resident at a time; swap weights in and out at the same address.
+    with inference_model_alloc_region():
+        inference_model = get_model(
+            inference_provider,
+            megatron_cfg.ddp,
+            use_torch_fsdp2=False,  # the inference model is never trained
+            data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+            mixed_precision_wrapper=mixed_precision_wrapper,
+            pg_collection=inference_pg_collection,
+            wrap_with_ddp=False,  # never trained: no DDP, no grad buffers, no optimizer
+        )
+    inference_model = inference_model[0]
+    inference_model.eval()
+    return inference_model
+
+
 def setup_model_and_optimizer(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -1451,6 +1768,44 @@ def setup_model_and_optimizer(
 
     megatron_cfg.peft = peft
 
+    # Snapshot the provider before any runtime state is added onto it.
+    colocated_reshard_plan: Optional[ColocatedReshardPlan] = None
+    generation_cfg = policy_cfg.get("generation")
+    if (
+        load_optimizer
+        and generation_cfg is not None
+        and generation_cfg.get("backend") == "megatron"
+        and generation_cfg.get("colocated", {}).get("enabled", False)
+    ):
+        inference_megatron_cfg = dedicated_inference_megatron_cfg(policy_cfg)
+    else:
+        inference_megatron_cfg = None
+    if inference_megatron_cfg is not None:
+        if megatron_cfg.dist.use_torch_fsdp2:
+            raise ValueError(
+                "MCore colocated reshard is not supported with use_torch_fsdp2 training: "
+                "DP inference disables the training model's forward pre-hooks, "
+                "which requires Megatron-core DistributedDataParallel."
+            )
+        vpp_size = megatron_cfg.model.virtual_pipeline_model_parallel_size
+        if vpp_size not in (None, 1):
+            raise NotImplementedError(
+                "MCore colocated reshard is not supported with virtual pipeline parallelism > 1. "
+                f"(virtual_pipeline_model_parallel_size={vpp_size})"
+            )
+        if peft is not None:
+            raise NotImplementedError(
+                "MCore colocated reshard is not supported with PEFT."
+            )
+        if draft_enabled:
+            raise NotImplementedError(
+                "MCore colocated reshard is not supported with draft models."
+            )
+        colocated_reshard_plan = ColocatedReshardPlan(
+            initial_model_provider=copy.deepcopy(megatron_cfg.model),
+            inference_megatron_cfg=copy.deepcopy(inference_megatron_cfg),
+        )
+
     if megatron_cfg.peft is not None:
         pre_peft_hook = _create_peft_pre_wrap_hook(megatron_cfg, state)
         megatron_cfg.model.register_pre_wrap_hook(pre_peft_hook)
@@ -1573,6 +1928,7 @@ def setup_model_and_optimizer(
         checkpointing_context,
         param_sync_func,
         draft_model=draft_model,
+        colocated_reshard_plan=colocated_reshard_plan,
     )
 
 

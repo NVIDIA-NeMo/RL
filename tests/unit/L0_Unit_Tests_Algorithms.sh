@@ -15,7 +15,7 @@
 #!/bin/bash
 # Shard: Algorithm tests not covered by mcore/automodel shards
 # mcore-marked tests (e.g., test_sequence_packing_gradients) are picked up
-# by L0_Unit_Tests_Mcore shard via conftest.py filtering.
+# by the L0_Unit_Tests_Megatron shard via conftest.py filtering.
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
