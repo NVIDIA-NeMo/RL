@@ -6,8 +6,7 @@
 Resets global OpenTelemetry providers, the nemo-lens init guard, span-group
 state, the process-global telemetry handle, and the ``NEMO_RL_OTEL_*`` /
 ``OTEL_SERVICE_NAME`` / ``NRL_WORKER_GROUP`` env vars before and after each test
-so nothing leaks. The nemo-lens resets are guarded so this suite still imports
-when lens is absent.
+so nothing leaks.
 """
 
 import ast
@@ -15,6 +14,15 @@ import os
 from pathlib import Path
 
 import pytest
+
+
+def string_constants(node: ast.AST | None) -> set[str]:
+    """The string literals in a list/set/tuple display, ignoring anything else."""
+    return {
+        elt.value
+        for elt in getattr(node, "elts", [])
+        if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+    }
 
 
 def algorithms_utils_categories(*names: str) -> dict[str, set[str]]:
@@ -41,11 +49,7 @@ def algorithms_utils_categories(*names: str) -> dict[str, set[str]]:
             # frozenset({...}) / set([...]) wrap the literal in a call.
             if isinstance(value, ast.Call) and value.args:
                 value = value.args[0]
-            found[target.id] = {
-                elt.value
-                for elt in getattr(value, "elts", [])
-                if isinstance(elt, ast.Constant)
-            }
+            found[target.id] = string_constants(value)
     assert wanted == set(found), f"could not locate {wanted - set(found)} in {source}"
     return found
 
@@ -87,14 +91,11 @@ def _reset_otel_and_lens() -> None:
         _metrics_mod._METER_PROVIDER_SET_ONCE = Once()
     except Exception:
         pass
-    try:
-        import nemo.lens.handle as _handle_mod
-        from nemo.lens.state import set_enabled_span_groups
+    import nemo.lens.handle as _handle_mod
+    from nemo.lens.state import set_enabled_span_groups
 
-        _handle_mod._INITIALIZED = False
-        set_enabled_span_groups(frozenset())
-    except ImportError:
-        pass
+    _handle_mod._INITIALIZED = False
+    set_enabled_span_groups(frozenset())
 
 
 @pytest.fixture(autouse=True)

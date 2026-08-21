@@ -1018,6 +1018,9 @@ def print_efficiency_summary(
         Dict of metrics suitable for logging to WandB/TensorBoard, including
         per-category seconds and percentages, total waste, and efficiency_pct.
     """
+    # Captured before the fallback below, because it decides which window the
+    # efficiency percentage actually covers.
+    pct_is_per_step = step_wall_time_s is not None
     if step_wall_time_s is None:
         step_wall_time_s = total_wall_time_s
     print(f"\n📊 Efficiency Summary (Step {step}):")
@@ -1074,5 +1077,11 @@ def print_efficiency_summary(
     loggable["efficiency/productive_time_s"] = productive
     loggable["efficiency/efficiency_pct"] = efficiency_pct
     loggable["efficiency/total_wall_time_s"] = total_wall_time_s
+    # Carries the window of the ratio above to the OTel tee, which tags it. A
+    # caller that supplies no per-step denominator gets a run-cumulative ratio,
+    # and publishing that as per-step would state the opposite of what it is.
+    # A float, not the string it represents, because everything in this dict is
+    # also logged to WandB/TensorBoard as a scalar.
+    loggable["efficiency/efficiency_pct_is_per_step"] = float(pct_is_per_step)
 
     return loggable

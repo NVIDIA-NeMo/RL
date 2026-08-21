@@ -232,7 +232,7 @@ fi
 uv sync --link-mode symlink --frozen --extra mcore --no-install-project
 uv sync --link-mode symlink --frozen --extra automodel --no-install-project
 uv sync --link-mode symlink --frozen --extra modelopt --no-install-project
-uv sync --link-mode symlink --frozen --all-groups --extra telemetry --no-install-project
+uv sync --link-mode symlink --frozen --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
@@ -306,7 +306,7 @@ du -sh /root/.cache/uv /root/.cache/trtllm-wheels
 
 # Restore the intended default environment in the same layer so the transient
 # TRT-LLM installation does not add a large intermediate venv layer.
-uv sync --link-mode symlink --locked --all-groups --extra telemetry --no-install-project
+uv sync --link-mode symlink --locked --all-groups --no-install-project
 
 # The final sync can repopulate the shared uv cache, so repeat the security
 # cleanup performed in the preceding dependency layer.

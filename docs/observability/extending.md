@@ -2,20 +2,20 @@
 
 To add new spans or metrics to NeMo-RL code, use the instrumentation primitives from nemo-lens (`managed_span`, `trace_fn`, `span_cm`). The primitives themselves are documented in [lens: instrumentation](https://github.com/NVIDIA-NeMo/Lens); this page covers NeMo-RL conventions.
 
-## The import / fallback pattern
+## The import pattern
 
 Every algorithm instrumentation import should go through
-`nemo_rl.telemetry.instrumentation` so leaf spans get the
-``rl.bucket`` attribute automatically. That module wraps the no-op-safe
-fallbacks in `_fallbacks.py` (which re-exports nemo-lens when installed):
+`nemo_rl.telemetry.instrumentation`, which re-exports the lens primitives with
+`rl.bucket` tagging applied to leaf spans:
 
 ```python
 from nemo_rl.telemetry.instrumentation import Bucket, bucket_scope, managed_span, trace_fn
-from nemo_rl.telemetry.setup import get_telemetry
+from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 ```
 
-Never import from `nemo.lens.*` directly in algorithm code. See [lens: optional dependency](https://github.com/NVIDIA-NeMo/Lens).
+Never import from `nemo.lens.*` directly in algorithm code — that is how a span
+ends up with no bucket and invisible to the goodput rollup.
 
 ### Goodput tagging
 
@@ -106,7 +106,7 @@ with managed_span(RLSpanGroup.ROLLOUT, "rl.grpo.collect_rollouts",
 `span_cm` always creates a span when telemetry is active (no group gate) — for cold, top-level paths only:
 
 ```python
-telemetry = get_telemetry()
+telemetry = get_telemetry_handle()
 if telemetry is not None:
     with span_cm("rl.grpo.job", tracer=telemetry.tracer):
         ...

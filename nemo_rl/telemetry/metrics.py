@@ -44,7 +44,7 @@ from nemo_rl.telemetry.instrumentation import (
     RL_EFFICIENCY_CATEGORY_ATTR,
     bucket_for_efficiency_category,
 )
-from nemo_rl.telemetry.setup import get_telemetry
+from nemo_rl.telemetry.setup import get_telemetry_handle
 
 if TYPE_CHECKING:
     from opentelemetry.metrics import Meter
@@ -63,15 +63,26 @@ _PERFORMANCE_PREFIX = "performance"
 # Best-effort: unmatched keys and non-scalar values are silently skipped.
 # Fields not yet accepted by the installed nemo-lens ``record_rl_metrics``
 # are dropped at tee time so one unknown kwarg cannot abort the whole batch.
+#
+# Every candidate here is a key some algorithm actually logs -- speculative
+# aliases are worse than no alias, because a gauge that lists three plausible
+# names and matches none looks wired and reports nothing. The lens field name
+# and the NeMo-RL key differ for most rows, which is why this map exists at all;
+# renaming the keys instead would break every existing WandB/TensorBoard
+# dashboard, since these are the same names those sinks receive.
+# ``test_every_mapped_metric_candidate_is_emitted_somewhere`` guards the drift.
 _RL_OTEL_METRIC_MAP: dict[str, tuple[str, ...]] = {
-    "reward_mean": ("reward", "reward_mean", "mean_reward"),
-    "kl_divergence": ("kl", "kl_divergence", "mean_kl"),
-    "policy_loss": ("loss", "policy_loss"),
-    "value_loss": ("value_loss", "critic_loss"),
-    "entropy": ("entropy",),
-    "response_length_mean": ("mean_gen_tokens_per_sample", "response_length_mean"),
+    "reward_mean": ("reward",),
+    # NeMo-RL logs the raw KL under a key named for the penalty: the value is
+    # divided back out by the coefficient (see GRPO's loss metrics), so it is
+    # the divergence, not the penalty term.
+    "kl_divergence": ("kl_penalty",),
+    "policy_loss": ("loss",),
+    "value_loss": ("critic/loss",),
+    "entropy": ("approx_entropy",),
+    "response_length_mean": ("mean_gen_tokens_per_sample",),
     "grad_norm": ("grad_norm",),
-    "learning_rate": ("lr", "learning_rate"),
+    "learning_rate": ("lr",),
 }
 
 # Same shape, for the dict ``print_performance_metrics`` returns. Throughput is
@@ -168,21 +179,23 @@ _RUN_WINDOW_WALL_CLOCK_CATEGORIES: frozenset[str] = frozenset({"init/total"})
 _EFFICIENCY_KEY_PREFIX = "efficiency/"
 _EFFICIENCY_SECONDS_SUFFIX = "_s"
 _EFFICIENCY_PCT_KEY = "efficiency/efficiency_pct"
+_EFFICIENCY_PCT_PER_STEP_KEY = "efficiency/efficiency_pct_is_per_step"
 
 _EFFICIENCY_INSTRUMENTS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 _WARNED: set[str] = set()
 
 
-def _warn_once(key: str, message: str) -> None:
+def warn_once(key: str, message: str) -> None:
     """Warn with a traceback the first time *key* fails, then stay quiet.
 
-    Both tee failure modes are per-step and deterministic -- a broken instrument
-    or a lens signature mismatch fails identically on every step -- so warning
-    each time would put thousands of identical tracebacks in a run's log while
-    telling the reader nothing the first one did not. Warning level once, so a
-    permanently dead tee is visible at default verbosity; debug afterwards, so
-    the repetition is still recoverable when someone is looking for it.
+    Telemetry failures are typically per-step and deterministic -- a broken
+    instrument or a lens signature mismatch fails identically on every step --
+    so warning each time would put thousands of identical tracebacks in a run's
+    log while telling the reader nothing the first one did not. Warning level
+    once, so a permanently dead sink is visible at default verbosity; debug
+    afterwards, so the repetition is still recoverable when someone is looking
+    for it.
     """
     if key in _WARNED:
         logger.debug(message, exc_info=True)
@@ -273,7 +286,10 @@ def _get_efficiency_instruments(meter: Meter) -> dict[str, Any]:
             "pct": meter.create_gauge(
                 name=RL_EFFICIENCY_PCT_METRIC,
                 unit="%",
-                description=("Productive share of one step's driver-side wall clock."),
+                description=(
+                    "Productive share of driver-side wall clock, over the "
+                    "window named by the rl.efficiency.window attribute."
+                ),
             ),
         }
         _EFFICIENCY_INSTRUMENTS[meter] = instruments
@@ -304,12 +320,17 @@ def _tee_efficiency_metrics(meter: Meter, metrics: dict[str, Any]) -> None:
         # Tagged like the per-category points even though it is a single series:
         # a ratio needs its window stated more than a duration does, since a
         # reader cannot tell a per-step percentage from a run-to-date one by
-        # looking at it.
+        # looking at it. Derived rather than asserted -- print_efficiency_summary
+        # falls back to a run-cumulative denominator when a caller passes no
+        # per-step one -- and defaulting to the run window when the flag is
+        # absent, since mislabelling a run ratio as per-step is the harmful
+        # direction.
+        is_per_step = _scalar(metrics.get(_EFFICIENCY_PCT_PER_STEP_KEY))
         instruments["pct"].set(
             pct,
             attributes={
                 RL_EFFICIENCY_MEASUREMENT_ATTR: WALL_CLOCK_MEASUREMENT,
-                RL_EFFICIENCY_WINDOW_ATTR: STEP_WINDOW,
+                RL_EFFICIENCY_WINDOW_ATTR: STEP_WINDOW if is_per_step else RUN_WINDOW,
             },
         )
 
@@ -333,7 +354,7 @@ def tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> No
     try:
         _tee_rl_metrics_to_otel(metrics, prefix)
     except Exception:
-        _warn_once("tee", "failed to tee RL metrics to OTel")
+        warn_once("tee", "failed to tee RL metrics to OTel")
 
 
 def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> None:
@@ -345,7 +366,7 @@ def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> N
         field_map = _PERFORMANCE_OTEL_METRIC_MAP
     else:
         return
-    telemetry = get_telemetry()
+    telemetry = get_telemetry_handle()
     if telemetry is None or not telemetry.is_exporting:
         return
 
@@ -357,12 +378,9 @@ def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> N
             _tee_efficiency_metrics(telemetry.meter, metrics)
         except Exception:
             # Broad by intent: observability must not break a training step.
-            _warn_once("efficiency", "failed to tee efficiency metrics")
+            warn_once("efficiency", "failed to tee efficiency metrics")
 
-    try:
-        from nemo.lens.instruments.rl import record_rl_metrics
-    except ImportError:
-        return
+    from nemo.lens.instruments.rl import record_rl_metrics
 
     kwargs = map_rl_metrics(metrics, field_map)
     if not kwargs:
@@ -378,4 +396,4 @@ def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> N
         record_rl_metrics(telemetry.meter, **kwargs)
     except Exception:
         # See the efficiency handler above on breadth.
-        _warn_once("record_rl_metrics", "nemo-lens: failed to tee RL metrics")
+        warn_once("record_rl_metrics", "nemo-lens: failed to tee RL metrics")

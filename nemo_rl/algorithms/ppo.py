@@ -102,7 +102,7 @@ from nemo_rl.telemetry.instrumentation import (
     managed_span,
     trace_fn,
 )
-from nemo_rl.telemetry.setup import get_telemetry
+from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
@@ -1228,7 +1228,7 @@ def ppo_train(
     - Configurable policy training start epoch
     """
     timer = Timer()
-    _telemetry = get_telemetry()
+    _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -3122,7 +3122,7 @@ def validate(
         return {}, {}
 
     timer = Timer()
-    _telemetry = get_telemetry()
+    _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     with (
         timer.time("total_validation_time"),

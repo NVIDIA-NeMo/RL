@@ -48,7 +48,8 @@ from nemo_rl.models.generation.vllm.utils import (
     resolve_generation_worker_cls,
 )
 from nemo_rl.telemetry.instrumentation import trace_fn
-from nemo_rl.telemetry.setup import get_telemetry
+from nemo_rl.telemetry.metrics import warn_once
+from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
@@ -66,12 +67,15 @@ def _record_vllm_generation_metrics(
     combined: BatchedDataDict,
 ) -> None:
     """Record vLLM token-usage metrics to nemo-lens (no-op unless exporting)."""
-    telemetry = get_telemetry()
+    telemetry = get_telemetry_handle()
     if telemetry is None or not telemetry.is_exporting:
         return
-    try:
-        from nemo.lens.instruments.inference import record_inference_metrics
+    from nemo.lens.instruments.inference import record_inference_metrics
 
+    # Guards only the recording: this runs per generation call, so it must not
+    # break generation, but a permanently dead metric should still be visible
+    # once at default verbosity rather than only under debug.
+    try:
         input_tokens = (
             int(data["input_lengths"].sum()) if "input_lengths" in data else None
         )
@@ -88,7 +92,7 @@ def _record_vllm_generation_metrics(
             provider_name="vllm",
         )
     except Exception:
-        logger.debug("nemo-lens: failed to record vLLM metrics", exc_info=True)
+        warn_once("vllm_inference_metrics", "nemo-lens: failed to record vLLM metrics")
 
 
 class VllmGeneration(GenerationInterface):

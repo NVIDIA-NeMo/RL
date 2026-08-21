@@ -61,7 +61,12 @@ from nemo_rl.models.generation.vllm.worker_utils import (
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.telemetry.instrumentation import trace_fn
-from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    shutdown_telemetry,
+    telemetry_enabled_in_env,
+    vllm_native_tracing_requested,
+)
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -88,18 +93,17 @@ def _context_capped_max_new_tokens(
 def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
     """Optionally enable vLLM's native OpenTelemetry tracing on the engine.
 
-    Opt-in via ``NEMO_RL_OTEL_VLLM_NATIVE_TRACING`` (plus an OTLP endpoint).
-    vLLM's OTLP span exporter is gRPC-only, so the endpoint must speak OTLP/gRPC
-    (e.g. a collector on ``:4317`` or a gRPC-capable backend) — it will not reach
-    an ``http/protobuf`` OTLP endpoint. Degrades to a no-op if the installed vLLM
-    lacks these engine args.
+    Requires both ``telemetry.enabled`` and ``telemetry.vllm_native_tracing``
+    (plus an OTLP endpoint). vLLM's OTLP span exporter is gRPC-only, so the
+    endpoint must speak OTLP/gRPC (e.g. a collector on ``:4317`` or a
+    gRPC-capable backend) — it will not reach an ``http/protobuf`` OTLP
+    endpoint. Degrades to a no-op if the installed vLLM lacks these engine args.
     """
-    if os.environ.get("NEMO_RL_OTEL_VLLM_NATIVE_TRACING", "").strip().lower() not in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
+    # The master switch is re-checked here because _config_to_env() exports
+    # every field before init_telemetry_driver's `enabled` check, so
+    # vllm_native_tracing would otherwise survive enabled=false and turn on
+    # per-request tracing on exactly the runs that disabled telemetry.
+    if not (telemetry_enabled_in_env() and vllm_native_tracing_requested()):
         return
     endpoint = (
         os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
@@ -111,13 +115,16 @@ def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
             "endpoint is configured; skipping native vLLM tracing."
         )
         return
+    # Narrow: this introspects a third-party surface that moves across vLLM
+    # versions, which justifies tolerating a missing attribute or a moved
+    # module -- but not swallowing every failure inside a vLLM worker.
     try:
         from vllm.engine.arg_utils import EngineArgs
 
         supported = set(getattr(EngineArgs, "__dataclass_fields__", {})) | set(
             inspect.signature(EngineArgs.__init__).parameters
         )
-    except Exception:
+    except (ImportError, AttributeError, ValueError, TypeError):
         logger.warning(
             "nemo-lens: could not introspect vLLM EngineArgs; skipping native "
             "vLLM tracing.",

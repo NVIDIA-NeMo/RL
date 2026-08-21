@@ -71,7 +71,7 @@ Span names follow `rl.<algorithm>.<operation>`. The controlling group is shown f
 | **SFT** | `rl.sft.job`, `rl.sft.step`, `rl.sft.data_processing`, `rl.sft.policy_update`, `rl.sft.save_checkpoint`, `rl.sft.evaluate` |
 | **DPO** | `rl.dpo.job`, `rl.dpo.step`, `rl.dpo.policy_update`, `rl.dpo.save_checkpoint`, `rl.dpo.evaluate` |
 | **RM** | `rl.rm.job`, `rl.rm.step`, `rl.rm.save_checkpoint`, `rl.rm.evaluate` |
-| **Distillation** | `rl.distillation.job`, `rl.distillation.step`, `rl.distillation.data_processing`, `rl.distillation.collect_rollouts`, `rl.distillation.teacher_logprobs`, `rl.distillation.policy_update`, `rl.distillation.save_checkpoint`, `rl.distillation.evaluate` |
+| **Distillation** | `rl.distillation.job`, `rl.distillation.step`, `rl.distillation.data_processing`, `rl.distillation.collect_rollouts`, `rl.distillation.teacher_logprob_inference`, `rl.distillation.policy_update`, `rl.distillation.save_checkpoint`, `rl.distillation.evaluate` |
 | **vLLM** (driver-side) | `rl.vllm.generate`, `rl.vllm.generate_text` — `generation` group; nested under the active rollout span |
 | **vLLM** (worker-side) | `rl.vllm.load_model` — `model_init` group; a root span in the generation worker's process, since Ray carries no trace context into `__init__` |
 
@@ -307,13 +307,13 @@ blanks today, so an empty trace is not read as a broken exporter:
 
 | Area | State |
 |---|---|
-| The `telemetry` extra in worker venvs | Ray actors run under `uv run --locked --extra <backend>`, which does not include nemo-lens, so `init_telemetry_worker` finds it missing and logs a warning. Driver spans and metrics are unaffected. See [worker environments](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/telemetry/README.md#worker-environments) |
 | SGLang / TRT-LLM / Megatron generation workers | uninstrumented — no `init_telemetry_worker` and no generation spans; only vLLM emits `rl.vllm.*`. (Policy and value workers do initialise telemetry, so their metrics and any future spans are wired.) |
 | `VllmGeneration.generate_async` | no span, so async rollouts and async validation have no generate breakdown under `rl.grpo.collect_rollouts` / `rl.grpo.evaluate` |
 | `SyncRolloutActor` | the sync data-plane counterpart of the async collector — uninstrumented, so its rollouts produce no spans |
 | Worker flush outside async GRPO | only `async_grpo_train` calls `policy.shutdown()` / `policy_generation.shutdown()`, so on other trainers a worker's last spans depend on the periodic export rather than a flush |
 | `load_checkpoint`, `forward_backward`, `optimizer`, `reference_policy` | the groups are defined and bucketed, but no site emits them, so enabling them adds no spans |
 | `grpo_sync.py`, `single_controller.py` | no spans; `examples/run_grpo_single_controller.py` also never initialises telemetry, so that entrypoint emits nothing at all |
+| `run_vlm_grpo.py`, `run_grpo_sliding_puzzle.py`, `run_xtoken_off_policy_distillation.py`, `run_eval.py` | these call the instrumented loops but never `init_telemetry_driver`, so a `telemetry:` block in their configs parses, the run succeeds, and nothing is emitted — driver or worker |
 | Ranked worker spans | separate traces, correlated by `run_id` — only the async collector's context is propagated |
 
 ## Resource attributes (process tags)

@@ -8,15 +8,19 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.setup import (
     _build_resource_attributes,
     _dig,
     _worker_resource_attributes,
-    get_telemetry,
+    get_telemetry_handle,
     init_telemetry_driver,
     init_telemetry_worker,
+    shutdown_telemetry,
+    telemetry_enabled_in_env,
+    vllm_native_tracing_requested,
 )
 
 
@@ -71,7 +75,7 @@ def test_init_driver_returns_none_when_disabled():
         _FakeMasterConfig(TelemetryConfig(enabled=False)), "grpo"
     )
     assert handle is None
-    assert get_telemetry() is None
+    assert get_telemetry_handle() is None
 
 
 def test_init_driver_returns_none_when_no_telemetry_block():
@@ -83,23 +87,44 @@ def test_init_worker_returns_none_when_disabled():
     # No NEMO_RL_OTEL_ENABLED / NEMO_LENS_ENABLED — every actor takes this path.
     handle = init_telemetry_worker()
     assert handle is None
-    assert get_telemetry() is None
+    assert get_telemetry_handle() is None
 
 
-def test_init_driver_rejects_unknown_export_strategy():
-    # The driver overrides the strategy with _always_export, which bypasses
-    # lens's registry lookup — so this check is the only thing standing between
-    # a typo and silently disabled worker telemetry.
+def test_config_rejects_an_unknown_export_strategy_at_parse_time():
+    # The Literal is what a user actually hits: it fires wherever the YAML is
+    # read, in every process, and regardless of `enabled` -- so a typo cannot
+    # sit dormant in a disabled block until someone switches telemetry on.
+    with pytest.raises(ValidationError):
+        TelemetryConfig(enabled=True, export_strategy="single_ranks")
+
+
+def test_init_driver_rejects_a_strategy_lens_does_not_register():
+    # Second line of defence, for drift between the Literal above and lens's
+    # registry rather than for user typos. It matters because the driver
+    # overrides the strategy with _always_export, which bypasses the registry
+    # lookup that would otherwise reject an unknown name. model_construct skips
+    # validation, standing in for a Literal that has gained a value lens
+    # dropped.
     pytest.importorskip("nemo.lens")
-    config = SimpleNamespace(
-        telemetry=TelemetryConfig(enabled=True, export_strategy="single_ranks")
-    )
+    tel = TelemetryConfig.model_construct(enabled=True, export_strategy="single_ranks")
+    config = SimpleNamespace(telemetry=tel)
     with pytest.raises(ValueError, match="Unknown telemetry.export_strategy"):
         init_telemetry_driver(config, algorithm="grpo")
     # Again, because the init guard must not be set by a path that raised:
     # otherwise the second call reports success-with-nothing instead of the bug.
     with pytest.raises(ValueError, match="Unknown telemetry.export_strategy"):
         init_telemetry_driver(config, algorithm="grpo")
+
+
+def test_config_rejects_out_of_range_export_bounds():
+    # export_rank had no check anywhere before, and setup.py documents the
+    # failure it causes: a rank that never matches silently mutes the actor.
+    with pytest.raises(ValidationError):
+        TelemetryConfig(export_rank=-2)
+    with pytest.raises(ValidationError):
+        TelemetryConfig(export_sample_rate=1.5)
+    with pytest.raises(ValidationError):
+        TelemetryConfig(exporter="consoel")
 
 
 def test_init_driver_rejects_unknown_span_group():
@@ -163,30 +188,33 @@ def test_init_driver_keeps_user_service_name(monkeypatch):
     assert os.environ["OTEL_SERVICE_NAME"] == "my-service"
 
 
-def test_init_driver_warns_and_still_exports_env_without_lens(monkeypatch, caplog):
-    """Two things have to happen when the driver cannot import lens.
+def test_init_driver_publishes_env_even_when_telemetry_is_disabled():
+    """``_config_to_env`` runs before the ``enabled`` early return.
 
-    Say so -- an enabled-but-silent run is otherwise indistinguishable from a
-    broken exporter. And still publish the ``NEMO_RL_OTEL_*`` env, so the
-    settings a worker reads do not depend on whether the *driver* had lens.
+    Deliberate -- the env is the only channel to a Ray worker, so it must not
+    depend on which branch the driver took. It is also why anything reading
+    these variables has to check the master switch itself; see
+    :func:`telemetry_enabled_in_env`.
     """
-    import builtins
+    cfg = TelemetryConfig(enabled=False, span_groups="per_step")
 
-    real_import = builtins.__import__
+    assert init_telemetry_driver(_FakeMasterConfig(cfg), "grpo") is None
 
-    def _no_lens(name, *args, **kwargs):
-        if name == "nemo.lens" or name.startswith("nemo.lens."):
-            raise ImportError("No module named 'nemo.lens'")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", _no_lens)
-    cfg = TelemetryConfig(enabled=True, span_groups="per_step", exporter="console")
-
-    with caplog.at_level(logging.WARNING):
-        assert init_telemetry_driver(_FakeMasterConfig(cfg), "grpo") is None
-
-    assert "nemo-lens is not installed" in caplog.text
     assert os.environ["NEMO_RL_OTEL_SPAN_GROUPS"] == "per_step"
+    assert not telemetry_enabled_in_env()
+
+
+def test_vllm_native_tracing_needs_the_master_switch(monkeypatch):
+    # The field is exported regardless of `enabled`, so reading it alone would
+    # leave per-request vLLM tracing on for a run that turned telemetry off.
+    monkeypatch.setenv("NEMO_RL_OTEL_VLLM_NATIVE_TRACING", "1")
+    monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "0")
+
+    assert vllm_native_tracing_requested()
+    assert not telemetry_enabled_in_env()
+
+    monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
+    assert telemetry_enabled_in_env()
 
 
 def test_init_driver_disables_the_rank_sampler(monkeypatch):
@@ -364,46 +392,19 @@ def test_init_worker_leaves_the_rank_sampler_alone_for_ranked_workers(monkeypatc
     assert captured["sampler_enabled"] is True
 
 
-def test_init_worker_warns_when_lens_is_missing(monkeypatch, caplog):
-    """Worker venvs do not carry the telemetry extra, so this is the common case.
-
-    Returning None quietly is indistinguishable from telemetry being off, which
-    is how a run ends up with driver spans and no worker spans at all.
-    """
-    import builtins
-
-    real_import = builtins.__import__
-
-    def _no_lens(name, *args, **kwargs):
-        if name == "nemo.lens" or name.startswith("nemo.lens."):
-            raise ImportError("No module named 'nemo.lens'")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", _no_lens)
-    monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
-    monkeypatch.setenv("NRL_WORKER_GROUP", "vllm_policy")
-
-    with caplog.at_level(logging.WARNING):
-        assert init_telemetry_worker() is None
-    assert "nemo-lens is not installed" in caplog.text
-    assert "vllm_policy" in caplog.text
-
-
-def test_init_worker_does_not_blame_lens_for_a_missing_otel_sdk(monkeypatch, caplog):
-    # Lens raises ImportError of its own when the OTel SDK is absent, which is
-    # just as likely in a worker venv. Pointing the reader at the wrong package
-    # is worse than saying nothing.
+def test_init_worker_survives_a_failing_setup(monkeypatch, caplog):
+    # A worker must not take a training run down over optional observability,
+    # but the reason has to reach the log or the run is silently half-traced.
     pytest.importorskip("nemo.lens")
 
-    def _no_sdk(config, **kwargs):
+    def _boom(config, **kwargs):
         raise ImportError("OpenTelemetry SDK is required for telemetry export")
 
-    monkeypatch.setattr("nemo.lens.setup_telemetry", _no_sdk)
+    monkeypatch.setattr("nemo.lens.setup_telemetry", _boom)
     monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
 
     with caplog.at_level(logging.WARNING):
         assert init_telemetry_worker() is None
-    assert "nemo-lens is not installed" not in caplog.text
     assert "OpenTelemetry SDK is required" in caplog.text
 
 
@@ -429,7 +430,7 @@ def test_init_worker_never_raises_on_setup_failure(monkeypatch):
     monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
 
     assert init_telemetry_worker() is None
-    assert get_telemetry() is None
+    assert get_telemetry_handle() is None
 
 
 def test_init_driver_enabled_is_idempotent():
@@ -438,7 +439,7 @@ def test_init_driver_enabled_is_idempotent():
     handle1 = init_telemetry_driver(_FakeMasterConfig(cfg), "grpo")
     assert handle1 is not None
     assert handle1.is_exporting
-    assert get_telemetry() is handle1
+    assert get_telemetry_handle() is handle1
     # Second call must not re-init or raise; returns the same handle.
     handle2 = init_telemetry_driver(
         _FakeMasterConfig(TelemetryConfig(enabled=True)), "grpo"
@@ -470,3 +471,44 @@ def test_init_driver_exports_under_sampled_strategy(monkeypatch):
     handle = init_telemetry_driver(_FakeMasterConfig(cfg), "grpo")
     assert handle is not None
     assert handle.is_exporting
+
+
+def test_shutdown_is_a_noop_without_telemetry():
+    # The common case by far: every run with no `telemetry:` block reaches the
+    # driver's `finally` and each actor's shutdown hook with no handle.
+    import nemo_rl.telemetry.setup as setup_mod
+
+    setup_mod._TELEMETRY_HANDLE = None
+    shutdown_telemetry()
+
+
+def test_shutdown_clears_the_handle_so_a_second_call_cannot_reach_a_dead_provider():
+    # Both the driver's `finally` and the worker shutdown hooks call this, and
+    # flushing an already-shut-down provider is what logs "Already shutdown".
+    import nemo_rl.telemetry.setup as setup_mod
+
+    calls = []
+    setup_mod._TELEMETRY_HANDLE = SimpleNamespace(
+        shutdown=lambda timeout_ms: calls.append(timeout_ms)
+    )
+
+    shutdown_telemetry(timeout_ms=1234)
+    shutdown_telemetry(timeout_ms=1234)
+
+    assert calls == [1234]
+    assert get_telemetry_handle() is None
+
+
+def test_shutdown_swallows_a_failing_flush():
+    # It runs in a `finally`, so raising here would replace whatever exception
+    # actually ended the run -- and still has to clear the handle.
+    import nemo_rl.telemetry.setup as setup_mod
+
+    def _boom(timeout_ms):
+        raise RuntimeError("exporter is gone")
+
+    setup_mod._TELEMETRY_HANDLE = SimpleNamespace(shutdown=_boom)
+
+    shutdown_telemetry()
+
+    assert get_telemetry_handle() is None

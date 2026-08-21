@@ -140,7 +140,7 @@ from nemo_rl.telemetry.instrumentation import (
     managed_span,
     trace_fn,
 )
-from nemo_rl.telemetry.setup import get_telemetry
+from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
@@ -2831,7 +2831,7 @@ def grpo_train(
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer(context={"worker": "driver"})
-    _telemetry = get_telemetry()
+    _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -4025,7 +4025,7 @@ def validate(
         return {}, {}
 
     timer = Timer(context={"worker": "validator"})
-    _telemetry = get_telemetry()
+    _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     with (
         timer.time("total_validation_time"),
@@ -4362,7 +4362,7 @@ def async_grpo_train(
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
     timer = Timer(context={"worker": "driver"})
-    _telemetry = get_telemetry()
+    _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(

@@ -231,7 +231,6 @@ project-includes = [
   "nemo_rl/models/value/config.py",
   "nemo_rl/models/value/workers/__init__.py",
   "nemo_rl/telemetry/__init__.py",
-  "nemo_rl/telemetry/_fallbacks.py",
   "nemo_rl/telemetry/config.py",
   "nemo_rl/telemetry/instrumentation.py",
   "nemo_rl/telemetry/metrics.py",
