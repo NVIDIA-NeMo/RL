@@ -38,8 +38,8 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
 )
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import (
-    _HeldPortReservation,
+from nemo_rl.distributed.held_port import (
+    HeldPortReservation,
     receive_held_socket,
 )
 from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -177,11 +177,17 @@ def test_http_server_port_reservation(monkeypatch):
     through the fd handoff — the port is never released in between — and the
     server falls back to a fresh port only when nothing was reserved.
     """
+    # The holder resolves the node IP via held_port; the server resolves it via
+    # virtual_cluster (megatron_worker imports it at call time). Patch both.
+    monkeypatch.setattr(
+        "nemo_rl.distributed.held_port._get_node_ip_local",
+        lambda: "10.0.0.5",
+    )
     monkeypatch.setattr(
         "nemo_rl.distributed.virtual_cluster._get_node_ip_local",
         lambda: "10.0.0.5",
     )
-    holder = _HeldPortReservation()
+    holder = HeldPortReservation()
     node_ip, port = holder.address()
     assert node_ip == "10.0.0.5"
 

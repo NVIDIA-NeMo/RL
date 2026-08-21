@@ -20,10 +20,8 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import (
-    PortHolder,
-    RayVirtualCluster,
-)
+from nemo_rl.distributed.held_port import RemoteHeldPortReservation
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -102,6 +100,9 @@ class MegatronGeneration(GenerationInterface):
     ) -> tuple[str, int, ray.actor.ActorHandle]:
         """Reserve the OpenAI server address before any generation worker exists.
 
+        This is megatron's substitute for vLLM's `defer_model_load` overlap.
+        See https://github.com/NVIDIA-NeMo/RL/issues/3752
+
         Args:
             cluster: The cluster the generation workers will run on.
             config: The full `PolicyConfig`.
@@ -111,11 +112,9 @@ class MegatronGeneration(GenerationInterface):
             The caller must keep the handle referenced until rank 0 has adopted
             the socket (worker init complete), then `ray.kill` it.
         """
-        if config["generation"]["colocated"]["enabled"]:
-            # Colocated generation shares the training policy's cluster; trigger
-            # the same (idempotent) default placement-group init Policy would.
-            cluster.get_placement_groups()
-        else:
+        # Colocated generation shares the training policy's cluster and uses the
+        # default placement-group init, triggered lazily by the read below.
+        if not config["generation"]["colocated"]["enabled"]:
             cls.init_cluster_placement_groups(cluster, config)
 
         # Distributed rank 0 lands on the first bundle handed to the worker
@@ -131,7 +130,7 @@ class MegatronGeneration(GenerationInterface):
         # HOLDS the socket (num_cpus=0, so it schedules even on a full bundle);
         # rank 0 later adopts the live fd via receive_held_socket, so the port
         # can never be stolen in between and any free port is safe.
-        holder = PortHolder.options(
+        holder = RemoteHeldPortReservation.options(
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=placement_groups[0],
                 placement_group_bundle_index=rank0_bundle_index,

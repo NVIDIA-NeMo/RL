@@ -1282,9 +1282,7 @@ def setup(
 
     # Handle generation-specific setup
     if backend == "megatron":
-        mcore_generation_config = generation_config["mcore_generation_config"]
-
-        if enable_nemo_gym and mcore_generation_config["expose_http_server"]:
+        if enable_nemo_gym:
             print(
                 "  ⚡ Reserving the Megatron server address for overlapped NeMo Gym init",
                 flush=True,
@@ -1296,9 +1294,8 @@ def setup(
                     policy_config,
                 )
             )
-            setup_timing_metrics.generation_init_reserve_time_s = (
-                time.perf_counter() - reserve_t0
-            )
+            reserve_time = time.perf_counter() - reserve_t0
+            setup_timing_metrics.generation_init_reserve_time_s = reserve_time
             print(f"  ✓ Reserved Megatron server URL: {reserved_url}", flush=True)
 
             def init_megatron_stack():
@@ -1338,6 +1335,9 @@ def setup(
             nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
+            setup_timing_metrics.generation_init_time_s = (
+                reserve_time + megatron_gen_time
+            )
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
             served_urls = policy_generation.dp_openai_server_base_urls
@@ -1354,15 +1354,6 @@ def setup(
             # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
             policy_generation, megatron_gen_time = init_megatron_generation(policy)
             setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
-
-            if enable_nemo_gym:
-                # Without a reserved port the server URLs only exist once the
-                # inference engine is up, so NeMo Gym spinup runs serially here.
-                nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
-                    policy_generation.dp_openai_server_base_urls,
-                    generation_config["model_name"],
-                )
-                setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
