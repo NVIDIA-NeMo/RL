@@ -102,37 +102,8 @@ def _unwrap_model_config(model: Any) -> Optional[Any]:
     return None
 
 
-def _hybrid_moe_layer_numbers(hybrid_layer_pattern: str, num_layers: int) -> list[int]:
-    # Deferred import: megatron.core is only available inside the Megatron worker venv.
-    from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols,
-        parse_hybrid_pattern,
-    )
-
-    main_pattern = parse_hybrid_pattern(hybrid_layer_pattern).main_pattern or ""
-    # '|' marks a pipeline-stage boundary, not a layer; every other symbol occupies one slot.
-    layer_symbols = [symbol for symbol in main_pattern if symbol != Symbols.PIPE]
-    if len(layer_symbols) != num_layers:
-        raise ValueError(
-            f"hybrid_layer_pattern main segment has {len(layer_symbols)} layers "
-            f"but num_layers={num_layers} (pattern={hybrid_layer_pattern!r})"
-        )
-    return [
-        layer_idx + 1
-        for layer_idx, symbol in enumerate(layer_symbols)
-        if symbol == Symbols.MOE
-    ]
-
-
 def _global_moe_layer_numbers(model_config: Any) -> list[int]:
     num_layers = int(getattr(model_config, "num_layers"))
-
-    # Hybrid Mamba/attention models place MoE layers via 'E' symbols of hybrid_layer_pattern
-    # and leave moe_layer_freq at its default of 1, which would wrongly claim every layer is MoE.
-    hybrid_layer_pattern = getattr(model_config, "hybrid_layer_pattern", None)
-    if hybrid_layer_pattern:
-        return _hybrid_moe_layer_numbers(hybrid_layer_pattern, num_layers)
-
     moe_layer_freq = getattr(model_config, "moe_layer_freq", 1)
 
     if isinstance(moe_layer_freq, int):
@@ -559,25 +530,3 @@ def clear_global_router_replay_instances() -> None:
     from megatron.core.transformer.moe.router_replay import RouterReplay
 
     RouterReplay.clear_global_router_replay_instances()
-
-
-def rebuild_global_router_replay_registry(model: Any) -> None:
-    """Re-register policy RouterReplay instances after a temporary model build.
-
-    Reference-model setup builds a throwaway Megatron model whose RouterReplay
-    objects register globally, then clears the global list. Restore the live
-    policy model's instances so downstream Megatron MoE paths see the correct
-    registry even when router replay is disabled.
-    """
-    from megatron.core.transformer.moe.router_replay import RouterReplay
-    from megatron.core.utils import unwrap_model
-
-    instances = _router_replay_instances_for_model(unwrap_model(model))
-    if not instances:
-        return
-
-    RouterReplay.clear_global_router_replay_instances()
-    # Preserve module-walk order to match RouterReplay() instantiation order.
-    RouterReplay.global_router_replay_instances.extend(
-        replay_instance for replay_instance, _ in instances
-    )
