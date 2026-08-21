@@ -80,6 +80,8 @@ from nemo_rl.models.generation.generation_router import (
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
 )
+from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
+from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -153,10 +155,6 @@ def _build_clusters(
         return cluster, cluster
 
     # Non-colocated: split node into train + inference clusters.
-    assert backend != "megatron", (
-        "The Megatron generation backend does not support non-colocated inference "
-        "in SingleController."
-    )
     inference_resources = generation_config["colocated"]["resources"]
     inference_gpus_per_node = inference_resources["gpus_per_node"]
     if inference_gpus_per_node is None:
@@ -280,6 +278,7 @@ def _build_trainer(
     *,
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
+    reserved_http_server_port: Optional[int] = None,
 ) -> tuple[Any, float]:
     """Build the TQ-mediated trainer (driver-side TQPolicy).
 
@@ -290,6 +289,8 @@ def _build_trainer(
         processor: Optional AutoProcessor for VLM paths.
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
+        reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym;
+            set only when colocated Megatron generation serves from the trainer's rank 0.
 
     Returns:
         A tuple of (TQPolicy trainer, wall time spent in this call).
@@ -307,8 +308,79 @@ def _build_trainer(
         init_optimizer=True,
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
+        reserved_http_server_port=reserved_http_server_port,
     )
     return trainer, time.perf_counter() - t0
+
+
+def _build_trainer_then_megatron_generation(
+    train_cluster: RayVirtualCluster,
+    master_config: MasterConfig,
+    tokenizer,
+    processor,
+    *,
+    inference_cluster: Optional[RayVirtualCluster],
+    weights_path: Optional[Path],
+    optimizer_path: Optional[Path],
+    reserved_http_server_port: Optional[int] = None,
+) -> tuple[Any, Any, dict[str, float]]:
+    """Build the trainer, then Megatron generation, serially in that order.
+
+    Colocated (`inference_cluster` None) wraps the trainer's policy (shared worker group).
+    Non-colocated builds a dedicated inference policy on `inference_cluster` with the weight
+    load skipped; the first weight sync transfers the real weights over the refit collective.
+
+    Args:
+        train_cluster: Ray virtual cluster the trainer workers run on.
+        master_config: SC MasterConfig.
+        tokenizer: Tokenizer used by the policy.
+        processor: Optional AutoProcessor for VLM paths.
+        inference_cluster: Dedicated generation cluster for non-colocated, or None when colocated.
+        weights_path: Checkpointed policy weights to resume from, or None.
+        optimizer_path: Checkpointed optimizer state to resume from, or None.
+        reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym.
+            colocated: routed to the trainer's policy (rank 0 lives with the trainer);
+            non-colocated: routed to the dedicated generation.
+
+    Returns:
+        A tuple of (MegatronGeneration, TQPolicy trainer, per-phase wall
+        times keyed as "gen_time" and "trainer_time").
+    """
+    time_metrics = {}
+
+    colocated = inference_cluster is None
+    # Rank 0 lives with the trainer when colocated, so the reserved port routes
+    # to whichever side serves: the trainer's policy or the dedicated engine.
+    trainer_port, gen_port = (
+        (reserved_http_server_port, None)
+        if colocated
+        else (None, reserved_http_server_port)
+    )
+
+    trainer, time_metrics["trainer_time"] = _build_trainer(
+        train_cluster,
+        master_config,
+        tokenizer,
+        processor,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
+        reserved_http_server_port=trainer_port,
+    )
+
+    t0 = time.perf_counter()
+    generation = MegatronGeneration(
+        config=master_config.policy,
+        tokenizer=tokenizer,
+        cluster=inference_cluster,
+        policy=trainer if colocated else None,
+        processor=processor,
+        weights_path=weights_path,
+        skip_weight_load=not colocated,
+        reserved_http_server_port=gen_port,
+    )
+    time_metrics["gen_time"] = time.perf_counter() - t0
+
+    return generation, trainer, time_metrics
 
 
 def _spinup_gym(
@@ -388,6 +460,60 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     policy_config["megatron_cfg"]["train_iters"] = grpo_config.max_num_steps
 
 
+def _maybe_apply_megatron_generation_overrides(
+    master_config: MasterConfig, *, use_nemo_gym: bool
+) -> None:
+    """Validate and adapt the config for the Megatron generation backend."""
+    policy_config = master_config.policy
+    generation_config = policy_config["generation"]
+    if generation_config["backend"] != "megatron":
+        return
+
+    if not (
+        "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
+    ):
+        raise ValueError(
+            "policy.generation.backend='megatron' requires the Megatron trainer "
+            "(policy.megatron_cfg.enabled=true): refit transfers weights via Megatron's reshard; "
+            "colocated generation shares the training policy's worker group."
+        )
+
+    mcore_cfg = cast(MCoreGenerationConfig, generation_config)[
+        "mcore_generation_config"
+    ]
+    if use_nemo_gym and not mcore_cfg["expose_http_server"]:
+        raise ValueError(
+            "NeMo Gym usage requires "
+            "policy.generation.mcore_generation_config.expose_http_server=true"
+        )
+
+    async_config = master_config.async_rl
+    if async_config.recompute_kv_cache_after_weight_updates:
+        # As in grpo.py, recompute-after-refit is expressed engine-side for Megatron.
+        # Unlike grpo.py, SC also clears the flag so the actor skips its loop-level
+        # invalidate_kv_cache (a base-class no-op for MegatronGeneration).
+        prior_mode = mcore_cfg.get("kv_cache_management_mode", "persist")
+        if prior_mode != "recompute":
+            print(
+                f"kv_cache_management_mode overridden '{prior_mode}' -> 'recompute' by "
+                f"async_rl.recompute_kv_cache_after_weight_updates=True."
+            )
+        # pyrefly: ignore[typed-dict-key-error]
+        mcore_cfg["kv_cache_management_mode"] = "recompute"
+        async_config.recompute_kv_cache_after_weight_updates = False
+
+    if generation_config["colocated"]["enabled"]:
+        num_prompts_per_step = master_config.grpo.num_prompts_per_step
+        if async_config.max_buffered_rollouts < num_prompts_per_step:
+            raise ValueError(
+                f"async_rl.max_buffered_rollouts "
+                f"({async_config.max_buffered_rollouts}) must be >= "
+                f"grpo.num_prompts_per_step ({num_prompts_per_step}) for "
+                "colocated megatron generation: the buffer must be able to "
+                "hold a full step before the trainer takes the GPUs."
+            )
+
+
 def _maybe_attach_fleet_health(
     generation: Any, master_config: MasterConfig
 ) -> Optional[GenerationFleetHealth]:
@@ -429,8 +555,14 @@ def _shard_base_urls(generation: Any) -> Optional[list[Optional[str]]]:
     return urls
 
 
-def _maybe_start_generation_router(generation: Any, master_config: MasterConfig) -> Any:
+def _maybe_start_generation_router(
+    base_urls: list[Optional[str]], master_config: MasterConfig
+) -> Any:
     """Start the NeMo-Gym-facing router, if enabled.
+
+    Args:
+        base_urls: OpenAI server URLs for the router.
+        master_config: SingleController MasterConfig.
 
     Returns:
         The router actor handle, or None when the router is disabled.
@@ -451,7 +583,7 @@ def _maybe_start_generation_router(generation: Any, master_config: MasterConfig)
             flush=True,
         )
 
-    backend_urls = [url for url in (generation.dp_openai_server_base_urls or []) if url]
+    backend_urls = [url for url in (base_urls or []) if url]
     if not backend_urls:
         raise ValueError(
             "async_rl.generation_router.enabled=true requires generation backends that "
@@ -574,11 +706,13 @@ def setup_single_controller(
     # ==========================
     # TODO: add validate dataset wiring.
     use_nemo_gym = should_use_nemo_gym(master_config)
-    if use_nemo_gym and generation_config["backend"] != "vllm":
+    if use_nemo_gym and generation_config["backend"] not in ("vllm", "megatron"):
         raise NotImplementedError(
-            "SC NeMo-Gym integration currently supports the vllm backend "
-            f"only; got {generation_config['backend']!r}"
+            "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
+            f"{generation_config['backend']!r}"
         )
+    # Megatron-generation checks are pure config: run them before the dataset download.
+    _maybe_apply_megatron_generation_overrides(master_config, use_nemo_gym=use_nemo_gym)
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
@@ -627,6 +761,13 @@ def setup_single_controller(
     # live generation to front. None is also the correct value whenever the router
     # is disabled or NeMo-Gym is not in play -- it is Gym that needs one stable URL.
     generation_router = None
+    megatron_backend = generation_config["backend"] == "megatron"
+    megatron_reserved_url = None
+    megatron_port_holder = None
+    reserved_http_server_port = None
+    if megatron_backend:
+        # Normally set inside _build_generation, which megatron skips.
+        generation_config["model_name"] = master_config.policy["model_name"]
 
     def _build_generation_then_trainer(
         defer_generation_model_load: bool, generation=None
@@ -677,30 +818,76 @@ def setup_single_controller(
         )
 
     if use_nemo_gym:
-        # defer generation, only get base_urls for nemo_gym spinup
-        generation, gen_reserve_time = _build_generation(
-            inference_cluster,
-            master_config=master_config,
-            defer_model_load=True,
-        )
-        defer_generation_model_load = True
+        if megatron_backend:
+            # Megatron serves from rank 0 of the generation workers; pre-publish that address
+            # so Gym spinup can overlap the trainer + engine init.
+            t0 = time.perf_counter()
+            (
+                megatron_reserved_url,
+                reserved_http_server_port,
+                megatron_port_holder,
+            ) = MegatronGeneration.reserve_http_server_address(
+                train_cluster if colocated else inference_cluster,
+                master_config.policy,
+            )
+            gen_reserve_time = time.perf_counter() - t0
+            print(
+                f"  ✓ Reserved Megatron server URL: {megatron_reserved_url}",
+                flush=True,
+            )
+            gym_base_urls: list[Optional[str]] = [megatron_reserved_url]
+        else:
+            # defer generation, only get base_urls for nemo_gym spinup
+            generation, gen_reserve_time = _build_generation(
+                inference_cluster,
+                master_config=master_config,
+                defer_model_load=True,
+            )
+            defer_generation_model_load = True
+            gym_base_urls = generation.dp_openai_server_base_urls
         # Before the Gym task is built, so Gym can be handed the router's single URL.
-        generation_router = _maybe_start_generation_router(generation, master_config)
+        # These two statements are the only failable ones between the port holder's
+        # creation and the executor try/finally that reaps it, so they reap it on the
+        # way out; keep anything else that can raise out of that window.
+        try:
+            generation_router = _maybe_start_generation_router(
+                gym_base_urls, master_config
+            )
+            # The whole point of the router: Gym holds one NeMo-RL-owned URL and
+            # never has to fail over, which is the thing it cannot do.
+            gym_spinup_base_urls = (
+                [ray.get(generation_router.base_url.remote())]
+                if generation_router is not None
+                else gym_base_urls
+            )
+        except BaseException:
+            if megatron_port_holder is not None:
+                ray.kill(megatron_port_holder)
+            raise
         # add nemo_gym spinup task
         build_tasks["nemo_gym"] = partial(
             _spinup_gym,
             master_config=master_config,
-            # The whole point of the router: Gym holds one NeMo-RL-owned URL and
-            # never has to fail over, which is the thing it cannot do.
-            base_urls=(
-                [ray.get(generation_router.base_url.remote())]
-                if generation_router is not None
-                else generation.dp_openai_server_base_urls
-            ),
+            base_urls=gym_spinup_base_urls,
             tokenizer=tokenizer,
         )
 
-    if colocated:
+    if megatron_backend:
+        # Serial trainer-first in both modes:
+        # colocated generation is constructed from the trainer's policy;
+        # non-colocated waits for the trainer's checkpoint conversion.
+        build_tasks["generation_trainer"] = partial(
+            _build_trainer_then_megatron_generation,
+            train_cluster,
+            master_config,
+            tokenizer,
+            processor,
+            inference_cluster=None if colocated else inference_cluster,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+            reserved_http_server_port=reserved_http_server_port,
+        )
+    elif colocated:
         # Colocated: vLLM prefers a clean GPU at load time, so generation comes up before the trainer.
         build_tasks["generation_trainer"] = partial(
             _build_generation_then_trainer,
@@ -731,11 +918,16 @@ def setup_single_controller(
         )
 
     # Submit build tasks and get results
-    with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
-        submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
-        results = {k: f.result() for k, f in submitted.items()}
+    try:
+        with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
+            submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
+            results = {k: f.result() for k, f in submitted.items()}
+    finally:
+        if megatron_port_holder is not None:
+            # Rank 0 adopted (or will never adopt) the held socket; drop the holder.
+            ray.kill(megatron_port_holder)
 
-    if colocated:
+    if "generation_trainer" in results:
         generation, trainer, time_metrics = results["generation_trainer"]
         gen_load_time = time_metrics["gen_time"]
         setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
@@ -751,6 +943,11 @@ def setup_single_controller(
         # the two fields are only meaningful when use_nemo_gym enabled
         setup_timing_metrics.generation_init_reserve_time_s = gen_reserve_time
         setup_timing_metrics.generation_init_load_time_s = gen_load_time
+
+    if megatron_reserved_url is not None:
+        MegatronGeneration.verify_served_address(
+            generation.dp_openai_server_base_urls, megatron_reserved_url
+        )
 
     worker_setup_time = time.perf_counter() - setup_start_time
     setup_timing_metrics.worker_setup_time_s = worker_setup_time

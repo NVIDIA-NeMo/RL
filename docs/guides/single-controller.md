@@ -25,7 +25,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       enabled: true
     ```
 
-2. **Enable vLLM async engine** and **disable colocated inference** (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine):
+2. **Pick a generation backend** and **disable colocated inference** (Megatron specifically can leave colocated inference enabled). With vLLM, enable the async engine (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine):
 
     ```yaml
     policy:
@@ -38,6 +38,19 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
           resources:
             num_nodes: 1
             gpus_per_node: 4  # inference GPUs; remainder go to training
+    ```
+
+    Megatron generation is also supported, colocated or non-colocated. It requires the Megatron trainer (`policy.megatron_cfg.enabled: true`) and NeMo-Gym rollouts additionally require `policy.generation.mcore_generation_config.expose_http_server: true`. Colocated (`colocated.enabled: true`) additionally requires `async_rl.max_buffered_rollouts >= grpo.num_prompts_per_step`, to avoid switching from generation to training when a full batch is not available.
+    The non-colocated exemplar — a NeMo-Gym run with the OpenAI server exposed — lives at [examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml](../../examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml); the colocated exemplar at [examples/configs/grpo_math_1B_megatron_generation_colocated_single_controller.yaml](../../examples/configs/grpo_math_1B_megatron_generation_colocated_single_controller.yaml):
+
+    ```yaml
+    policy:
+      megatron_cfg:
+        enabled: true
+      generation:
+        backend: "megatron"
+        colocated:
+          enabled: true
     ```
 
 3. **One RL step = one optimizer step.** The SC train pump does not support multi-mini-step inside a single RL step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)):
@@ -171,7 +184,7 @@ SC reads its async knobs from `async_rl:` and **requires `grpo.async_grpo: null`
 The SC path is still under active development. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:
 
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
-- Generation backend: only vLLM is supported and validated; Megatron generation, SGLang, and TRT-LLM have not been tested on SC.
+- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes); SGLang and TRT-LLM have not been tested on SC.
 - Checkpointing and validation are not yet supported (setup raises if enabled).
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported.
