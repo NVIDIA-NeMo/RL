@@ -1432,19 +1432,6 @@ def setup(
         if "model_path" not in generation_config["sglang_cfg"]:
             generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
 
-        expected_weight_transfer_mode = "ipc" if colocated_inference else "broadcast"
-        weight_transfer_mode = (
-            generation_config["sglang_cfg"]
-            .get("sglang_server_config", {})
-            .get("weight_transfer_mode", expected_weight_transfer_mode)
-        )
-        if weight_transfer_mode != expected_weight_transfer_mode:
-            raise ValueError(
-                f"sglang_server_config.weight_transfer_mode={weight_transfer_mode!r} "
-                f"is inconsistent with colocated.enabled={colocated_inference}: "
-                f"expected {expected_weight_transfer_mode!r}."
-            )
-
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_sglang,
             colocated_inference=colocated_inference,

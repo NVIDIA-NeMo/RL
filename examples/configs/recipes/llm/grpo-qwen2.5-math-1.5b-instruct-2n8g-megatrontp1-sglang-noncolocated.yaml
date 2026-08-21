@@ -30,7 +30,6 @@ policy:
       tp_size: 2
       sglang_server_config:
         num_gpus: 8
-        weight_transfer_mode: broadcast
       sglang_router_config:
         use_distributed_post: true
 data:

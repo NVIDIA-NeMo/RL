@@ -18,7 +18,7 @@ import traceback
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -772,12 +772,18 @@ def send_hf_buckets_via_ipc_actor_impl(
                     "metadata": bkt.get_metadata(),
                 }
                 long_lived_tensors.append(payload)
-                serialized.append(
-                    MultiprocessingSerializer.serialize(payload, output_str=True)
+                serialized_payload = MultiprocessingSerializer.serialize(
+                    payload, output_str=True
                 )
+                if not isinstance(serialized_payload, str):
+                    raise TypeError("SGLang IPC serialization did not return text")
+                serialized.append(serialized_payload)
 
             group_world = dist.get_world_size(gather_group)
-            gathered = [None] * group_world if my_rank == gather_src else None
+            gathered = cast(
+                Optional[list[Optional[list[str]]]],
+                [None] * group_world if my_rank == gather_src else None,
+            )
             dist.gather_object(
                 serialized,
                 object_gather_list=gathered,
@@ -787,11 +793,16 @@ def send_hf_buckets_via_ipc_actor_impl(
 
             refs: list = []
             if my_rank == gather_src:
-                num_dtypes = len(gathered[0])
+                if gathered is None or any(payload is None for payload in gathered):
+                    raise RuntimeError("SGLang IPC gather returned incomplete payloads")
+                gathered_payloads = cast(list[list[str]], gathered)
+                num_dtypes = len(gathered_payloads[0])
                 for i in range(num_dtypes):
                     refs.append(
                         ipc_engine.update_weights_from_tensor.remote(
-                            serialized_named_tensors=[g[i] for g in gathered],
+                            serialized_named_tensors=[
+                                payload[i] for payload in gathered_payloads
+                            ],
                             load_format="flattened_bucket",
                             weight_version=str(weight_version),
                         )
@@ -880,11 +891,14 @@ def init_process_group(
         timeout = default_pg_timeout
 
     if store is None:
+        assert init_method is not None
         rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
         store, rank, world_size = next(rendezvous_iterator)
         store.set_timeout(timeout)
         # PrefixStore so multiple co-tenant groups don't trample each other's keys.
         store = PrefixStore(group_name or "", store)
+
+    group_name = group_name or ""
 
     # ``pg_options`` was renamed to ``backend_options`` in PyTorch 2.6:
     #   https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
@@ -914,6 +928,9 @@ def init_process_group(
     finally:
         if saved_bound_device_id is not None:
             default_pg.bound_device_id = saved_bound_device_id
+
+    if not isinstance(pg, dist.ProcessGroup):
+        raise RuntimeError("Torch returned an invalid custom process group")
 
     # Map identity ranks so collective ops can resolve member ranks for ``pg``.
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}

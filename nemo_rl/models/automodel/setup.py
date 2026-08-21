@@ -275,7 +275,7 @@ def validate_and_prepare_config(
             temperature=generation_cfg["temperature"],
         )
 
-    if not is_generation_colocated:
+    if is_generation_colocated is False:
         # SGLang uses CUMEM=0; other non-colocated refit communicators require 1.
         os.environ["NCCL_CUMEM_ENABLE"] = "0" if rollout_backend == "sglang" else "1"
 

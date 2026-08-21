@@ -23,14 +23,14 @@ begin/end weight-update session around the bucket transfer, then continue —
 is shared; the subclasses supply the transport-specific connect and transfer
 and own the GPU phase transitions around them.
 
-Colocated (``weight_transfer_mode="ipc"``):
+Colocated:
   1. policy.offload_before_refit()                        -- free GPU for staging
   2. generation.prepare_for_generation(tags=["weights"])   -- allocate buffers
   3. _refit()                                              -- Ray CUDA-IPC transfer
   4. policy.offload_after_refit()                          -- restore optimizer state
   5. generation.prepare_for_generation(tags=["kv_cache"])  -- rebuild KV cache
 
-Disaggregated (``weight_transfer_mode="broadcast"``):
+Disaggregated:
   1. generation.prepare_for_generation(tags=["weights"])
   2. _refit()                                              -- NCCL broadcast
   3. generation.prepare_for_generation(tags=["kv_cache"])
@@ -304,8 +304,8 @@ class SGLangDisaggregatedWeightSynchronizer(_SGLangWeightSynchronizer):
             # Only Megatron implements the broadcast path; it depends on
             # AutoBridge restoring full HF tensors on trainer rank 0.
             raise NotImplementedError(
-                "SGLang weight_transfer_mode='broadcast' is currently only "
-                "supported for the Megatron policy backend."
+                "Disaggregated SGLang weight synchronization is currently "
+                "supported only for the Megatron policy backend."
             )
         self._generation.prepare_for_generation(tags=["weights"])
 
