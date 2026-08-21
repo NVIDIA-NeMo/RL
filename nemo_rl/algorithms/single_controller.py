@@ -2794,6 +2794,33 @@ class SingleControllerActor:
                     if step > version_during_step
                 }
 
+                is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
+                    self._rollout_exhausted.is_set() and len(self._buffer) == 0
+                )
+                ft_save_period = self._master_config.checkpointing.get("ft_save_period")
+                should_save_by_step = (
+                    is_last_step
+                    or self._train_steps
+                    % self._master_config.checkpointing["save_period"]
+                    == 0
+                    or (
+                        ft_save_period is not None
+                        and self._train_steps % ft_save_period == 0
+                    )
+                )
+                # Latched by TimeoutChecker; call once per step and reuse the result.
+                should_save_by_timeout = self._timeout.check_save()
+                will_save_checkpoint = self._master_config.checkpointing[
+                    "enabled"
+                ] and (should_save_by_step or should_save_by_timeout)
+                # Colocated Megatron's wake applies the updated weights. Keep it asleep
+                # until a save-bound step has finished checkpointing.
+                defer_wake_for_save = (
+                    will_save_checkpoint
+                    and self._gen.blocks_training()
+                    and self._gen.wake_carries_weight_updates()
+                )
+
                 # ---- 6. Refit the model ----
                 with self._timer.time("weight_sync"):
                     calibration_data = (
@@ -2805,7 +2832,8 @@ class SingleControllerActor:
                     aborted_stale_inflight_groups = 0
                     if is_policy_training_step:
                         aborted_stale_inflight_groups = await self._sync_weights(
-                            calibration_data=calibration_data
+                            calibration_data=calibration_data,
+                            defer_engine_wake=defer_wake_for_save,
                         )
                     self._retune_lookahead_versions()
                     self._rollout_manager.set_weight_version(self._trainer_version)
@@ -2841,32 +2869,30 @@ class SingleControllerActor:
                 self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
                 self._timeout.mark_iteration()
 
-                is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
-                    self._rollout_exhausted.is_set() and len(self._buffer) == 0
-                )
-                ft_save_period = self._master_config.checkpointing.get("ft_save_period")
-                # _train_steps was already incremented above, so it equals
-                # the legacy loop's 1-indexed `step + 1`.
-                should_save_by_step = (
-                    is_last_step
-                    or self._train_steps
-                    % self._master_config.checkpointing["save_period"]
-                    == 0
-                    or (
-                        ft_save_period is not None
-                        and self._train_steps % ft_save_period == 0
-                    )
-                )
-                should_save_by_timeout = self._timeout.check_save()
-
-                if self._master_config.checkpointing["enabled"] and (
-                    should_save_by_step or should_save_by_timeout
-                ):
+                if will_save_checkpoint:
                     with self._timer.time("checkpointing"):
                         await self._save_checkpoint(
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,
                         )
+                    if defer_wake_for_save:
+                        loop_will_exit = (
+                            self._train_steps >= self._algo_cfg.max_num_steps
+                            or should_save_by_timeout
+                            or (
+                                self._rollout_exhausted.is_set()
+                                and len(self._buffer) == 0
+                            )
+                        )
+                        if not loop_will_exit:
+                            with self._timer.time("weight_sync"):
+                                await asyncio.to_thread(
+                                    self._trainer.offload_after_refit
+                                )
+                                await asyncio.to_thread(
+                                    self._gen.prepare_for_generation
+                                )
+                                self._rollout_permitted.set()
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
@@ -4271,6 +4297,7 @@ class SingleControllerActor:
         self,
         *,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
+        defer_engine_wake: bool = False,
     ) -> int:
         """Pause new rollout dispatches, synchronize weights, resume.
 
@@ -4287,6 +4314,8 @@ class SingleControllerActor:
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
                 scales before synchronizing weights.
+            defer_engine_wake: Keep a blocking engine asleep through an imminent
+                checkpoint save instead of refitting and waking it immediately.
 
         Returns:
             The number of stale in-flight rollout groups aborted before the
@@ -4301,6 +4330,17 @@ class SingleControllerActor:
             if should_use_nemo_gym(self._master_config)
             else await self._abort_stale_inflight()
         )
+
+        if defer_engine_wake:
+            await asyncio.to_thread(self._trainer.offload_before_refit)
+            if self._async_cfg.recompute_kv_cache_after_weight_updates:
+                await asyncio.to_thread(self._gen.invalidate_kv_cache)
+            self._rollout_manager.set_weight_version(self._trainer_version)
+            if self._master_config.token_capture.enabled:
+                await asyncio.to_thread(
+                    self._gen.set_rollout_weight_version, self._trainer_version
+                )
+            return aborted_stale_inflight_groups
 
         # TODO(#2625): Add drain-gate support during refit.
 

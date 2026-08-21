@@ -1377,7 +1377,9 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(
+        calibration_data=None, defer_engine_wake=False
+    )
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["evicted_stale_prompt_groups"] == 2
     assert train_metrics["aborted_stale_inflight_groups"] == 1
@@ -1484,7 +1486,9 @@ def test_train_pump_chunked_step_by_engine_regime(
         assert calls == chunk * 2
         assert ctrl._rollout_permitted.is_set()
         assert select_bounds[0] == (1, 2)
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(
+        calibration_data=None, defer_engine_wake=False
+    )
 
 
 def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> None:
@@ -1751,7 +1755,9 @@ def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch, capsys) -
 
     trainer.begin_train_step.assert_called_once()
     trainer.finish_train_step.assert_called_once_with()
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(
+        calibration_data=None, defer_engine_wake=False
+    )
     # Announced exactly once, on the step that crosses the boundary.
     assert capsys.readouterr().out.count("Critic warmup complete") == 1
 
@@ -1799,7 +1805,9 @@ def test_train_pump_offloads_the_policy_between_ppo_epochs(monkeypatch) -> None:
         "policy.finish_train_step",
     ]
     # Still one RL step, so one refit and one version bump.
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(
+        calibration_data=None, defer_engine_wake=False
+    )
     assert ctrl._trainer_version == 1
 
 
