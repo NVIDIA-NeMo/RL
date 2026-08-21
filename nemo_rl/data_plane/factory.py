@@ -63,5 +63,9 @@ def build_data_plane_client(
 
         on_event = obs.get("callback") or log_event
         # pyrefly: obs.get returns Any, can't narrow to the expected callback type.
-        client = MetricsDataPlaneClient(client, on_event=on_event)  # type: ignore[bad-argument-type]
+        client = MetricsDataPlaneClient(  # type: ignore[bad-argument-type]
+            client,
+            on_event=on_event,
+            verify_tensor_hash=bool(obs.get("verify_tensor_hash")),
+        )
     return client

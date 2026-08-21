@@ -23,11 +23,27 @@ Plug wandb / file logging / debug print at the call site by passing
 totals **plus** live memory consumption: ``bytes_outstanding`` (sum of
 bytes currently held in TQ, i.e. put minus cleared) and
 ``peak_bytes_outstanding`` (high-water mark over the run lifetime).
+
+Everything here sits on the hot path of every transfer, so the cost is a
+design constraint rather than an afterthought: measured against a no-op
+inner client at 256 keys and an 18 MB payload, the wrapper adds ~54 us per
+put and ~33 us per get — under 0.1% of a 59 ms operation. What that budget
+buys is spelled out where it is spent (``_td_bytes``, ``_record_put``,
+``_emit``); the short version is that no traversal happens twice, no
+allocation happens for a payload nobody reads, and no estimate walks a
+structure whose size it can extrapolate.
+
+``verify_tensor_hash=True`` adds an opt-in correctness check on top:
+per-row ``torch.hash_tensor`` fingerprints recorded at put and re-checked
+at get, so a tensor that changes between wire-in and wire-out is reported
+rather than trained on. It reads every tensor byte again on both sides, so
+it is a debugging tool, not a metric.
 """
 
 from __future__ import annotations
 
 import logging
+import zlib
 from bisect import bisect_left
 from dataclasses import asdict, dataclass, field
 from time import monotonic
@@ -46,7 +62,7 @@ class DataPlaneEvent(TypedDict):
 
 
 import torch
-from tensordict import TensorDict
+from tensordict import NonTensorData, NonTensorStack, TensorDict, TensorDictBase
 
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 
@@ -58,13 +74,36 @@ logger = logging.getLogger(__name__)
 # *additive*: the 256 per-rank histograms sum into one cluster-wide
 # distribution, which a mean or a per-rank percentile cannot do.
 LATENCY_BUCKETS_MS: tuple[float, ...] = (
-    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0,
-    50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    25.0,
+    50.0,
+    100.0,
+    250.0,
+    500.0,
+    1000.0,
+    2500.0,
+    5000.0,
 )
 
 # Ops that move payload, split by direction, for communication volume.
 _WRITE_OPS = frozenset({"put"})
 _READ_OPS = frozenset({"get", "get_data"})
+
+# A corrupted wire usually corrupts every row of a batch, so the log is
+# capped: the counter in ``HashStats`` carries the magnitude, and the first
+# few lines carry the identity of what broke.
+_MAX_HASH_MISMATCH_LOGS = 20
+
+# Odd 64-bit constant (golden-ratio derived) used to decorrelate the two
+# reductions in a row fingerprint before they are combined. Multiplying by
+# an odd constant is a bijection mod 2^64, so it mixes without collapsing.
+_MIX64 = 0x9E3779B97F4A7C15
 
 
 def percentile_from_hist(hist: list[int], q: float) -> float:
@@ -90,6 +129,82 @@ def percentile_from_hist(hist: list[int], q: float) -> float:
     return LATENCY_BUCKETS_MS[-1]
 
 
+def _enc_const1(obj: Any, budget: list[int]) -> int:
+    return 1
+
+
+def _enc_float(obj: float, budget: list[int]) -> int:
+    return 9
+
+
+def _enc_int(obj: int, budget: list[int]) -> int:
+    # msgpack packs small ints in a single byte; only wide values cost 9.
+    if -32 <= obj < 128:
+        return 1
+    if -(2**15) <= obj < 2**16:
+        return 3
+    if -(2**31) <= obj < 2**32:
+        return 5
+    return 9
+
+
+def _enc_str(obj: str, budget: list[int]) -> int:
+    n = len(obj) if obj.isascii() else len(obj.encode("utf-8"))
+    return n + (1 if n < 32 else 2 if n < 256 else 3 if n < 65536 else 5)
+
+
+def _enc_bytes(obj: Any, budget: list[int]) -> int:
+    n = len(obj)
+    return n + (2 if n < 256 else 3 if n < 65536 else 5)
+
+
+def _enc_dict(obj: dict[Any, Any], budget: list[int]) -> int:
+    n = len(obj)
+    total = 1 if n < 16 else 3 if n < 65536 else 5
+    for k, v in obj.items():
+        if budget[0] <= 0:
+            break
+        budget[0] -= 1
+        total += _estimate_encoded_bytes(k, budget)
+        total += _estimate_encoded_bytes(v, budget)
+    return total
+
+
+def _enc_seq(obj: Any, budget: list[int]) -> int:
+    n = len(obj)
+    total = 1 if n < 16 else 3 if n < 65536 else 5
+    for v in obj:
+        if budget[0] <= 0:
+            break
+        budget[0] -= 1
+        total += _estimate_encoded_bytes(v, budget)
+    return total
+
+
+def _enc_tensor(obj: torch.Tensor, budget: list[int]) -> int:
+    return obj.numel() * obj.element_size()
+
+
+# Exact-type dispatch, tried before any isinstance chain. The common leaves
+# come first because insertion order is also the order of the subclass
+# fallback below, which only runs for types that miss the exact lookup.
+_ENCODERS: dict[type, Callable[[Any, list[int]], int]] = {
+    str: _enc_str,
+    int: _enc_int,
+    bool: _enc_const1,
+    float: _enc_float,
+    dict: _enc_dict,
+    list: _enc_seq,
+    tuple: _enc_seq,
+    set: _enc_seq,
+    bytes: _enc_bytes,
+    bytearray: _enc_bytes,
+    memoryview: _enc_bytes,
+    torch.Tensor: _enc_tensor,
+    type(None): _enc_const1,
+}
+
+
 def _estimate_encoded_bytes(obj: Any, budget: list[int]) -> int:
     """Approximate msgpack-encoded size of a non-tensor object.
 
@@ -100,56 +215,59 @@ def _estimate_encoded_bytes(obj: Any, budget: list[int]) -> int:
     approximates instead. Container framing (1-5 bytes per element) is not
     modelled, so treat the result as a lower bound.
 
+    Dispatch is an exact-type dict lookup rather than an ``isinstance``
+    chain: on the hot path the common leaves (``str``, ``int``) sat 5-7
+    branches deep, and the chain cost more than the arithmetic it guarded.
+
     ``budget`` is a single-element list used as a mutable counter that bounds
-    the walk to ``max_nodes`` visited nodes. Containers stop iterating once it
-    is exhausted -- summing a generator would otherwise keep walking every
-    element while each recursive call returned 0, making the cost O(size)
-    despite the budget.
+    the walk to ``max_nodes`` container elements. It is decremented only by
+    the container encoders -- a leaf cannot itself expand the walk, so
+    charging leaves bought nothing but two list index ops each. Containers
+    stop iterating once it is exhausted; summing a generator would otherwise
+    keep walking every element while each recursive call returned 0, making
+    the cost O(size) despite the budget.
     """
-    if budget[0] <= 0:
-        return 0
-    budget[0] -= 1
-    if obj is None or isinstance(obj, bool):
-        return 1
-    if isinstance(obj, int):
-        # msgpack packs small ints in a single byte; only wide values cost 9.
-        if -32 <= obj < 128:
-            return 1
-        if -(2**15) <= obj < 2**16:
-            return 3
-        if -(2**31) <= obj < 2**32:
-            return 5
-        return 9
-    if isinstance(obj, float):
-        return 9
-    if isinstance(obj, str):
-        n = len(obj) if obj.isascii() else len(obj.encode("utf-8"))
-        return n + (1 if n < 32 else 2 if n < 256 else 3 if n < 65536 else 5)
-    if isinstance(obj, (bytes, bytearray, memoryview)):
-        n = len(obj)
-        return n + (2 if n < 256 else 3 if n < 65536 else 5)
-    if isinstance(obj, dict):
-        n = len(obj)
-        total = 1 if n < 16 else 3 if n < 65536 else 5
-        for k, v in obj.items():
-            if budget[0] <= 0:
-                break
-            total += _estimate_encoded_bytes(k, budget)
-            total += _estimate_encoded_bytes(v, budget)
-        return total
-    if isinstance(obj, (list, tuple, set)):
-        n = len(obj)
-        total = 1 if n < 16 else 3 if n < 65536 else 5
-        for v in obj:
-            if budget[0] <= 0:
-                break
-            total += _estimate_encoded_bytes(v, budget)
-        return total
-    if isinstance(obj, torch.Tensor):
-        return obj.numel() * obj.element_size()
+    encoder = _ENCODERS.get(obj.__class__)
+    if encoder is not None:
+        return encoder(obj, budget)
+    for typ, encoder in _ENCODERS.items():
+        if isinstance(obj, typ):
+            return encoder(obj, budget)
     # Unknown type -> pickle/cloudpickle Ext. Cheap proxy; the real size
     # would need an actual dumps(), which is what we are avoiding.
     return 64
+
+
+# Rows sampled from a NonTensorStack to estimate its payload. The stack
+# holds one Python object per batch element, so materialising it (``tolist``)
+# and walking every row is O(batch) *per put* -- ~1 ms for a 256-row
+# message_log stack. Rows in one stack share a schema, so a strided sample
+# extrapolates to within a few percent for a figure that is already
+# documented as a lower-bound estimate.
+_NONTENSOR_STACK_SAMPLES = 4
+
+
+def _nontensor_stack_bytes(stack: NonTensorStack, budget: list[int]) -> int:
+    """Extrapolate a ``NonTensorStack``'s payload from a strided row sample."""
+    rows = getattr(stack, "tensordicts", None)
+    if not rows:
+        return _estimate_encoded_bytes(stack.tolist(), budget)
+    n = len(rows)
+    step = max(1, n // _NONTENSOR_STACK_SAMPLES)
+    sampled = rows[::step][:_NONTENSOR_STACK_SAMPLES]
+    sampled_bytes = 0
+    for row in sampled:
+        # Matched by type rather than ``getattr(row, "data", row)``: every
+        # TensorDictBase carries a ``.data`` property of its own, so the
+        # duck-typed form would silently hand a nested stack's tensor view to
+        # the msgpack estimator instead of recursing into its payload.
+        if isinstance(row, NonTensorData):
+            sampled_bytes += _estimate_encoded_bytes(row.data, budget)
+        elif isinstance(row, NonTensorStack):
+            sampled_bytes += _nontensor_stack_bytes(row, budget)
+        else:
+            sampled_bytes += _estimate_encoded_bytes(row, budget)
+    return sampled_bytes * n // len(sampled)
 
 
 def _td_bytes(td: TensorDict | None, max_nodes: int = 10_000) -> int:
@@ -169,7 +287,17 @@ def _td_bytes(td: TensorDict | None, max_nodes: int = 10_000) -> int:
 
     ``leaves_only=True`` would hide the non-tensor entries entirely
     (``NonTensorData`` is not treated as a leaf), so this walks with
-    ``leaves_only=False`` and skips container ``TensorDict`` nodes itself.
+    ``leaves_only=False`` and skips container nodes itself. It walks with
+    ``items()`` rather than ``keys()`` + ``get()``: ``get()`` re-resolves
+    each nested key from the root, which measured 2.7x the cost of the
+    single traversal ``items()`` already performs.
+
+    ``NonTensorData`` and ``NonTensorStack`` are matched by type, not by
+    ``hasattr``: both are tensorclasses whose attribute misses fall through
+    a ``__getattr__`` that costs ~2.8 us per probe. The distinction matters
+    beyond speed -- ``NonTensorData`` exposes BOTH ``.data`` and
+    ``.tolist()``, and its ``.tolist()`` broadcasts the single stored object
+    across the batch dim (a 64-row batch reported 20x the real payload).
 
     Aliased storage is counted per field: two keys viewing one buffer count
     twice, which is right for volume (both are serialised) and is what lets
@@ -179,29 +307,22 @@ def _td_bytes(td: TensorDict | None, max_nodes: int = 10_000) -> int:
         return 0
     budget = [max_nodes]
     total = 0
-    for k in td.keys(include_nested=True, leaves_only=False):
-        v = td.get(k)
-        if isinstance(v, TensorDict):
+    for _, v in td.items(include_nested=True, leaves_only=False):
+        if isinstance(v, torch.Tensor):
+            t = v.values() if v.is_nested else v
+            total += t.numel() * t.element_size()
+        elif isinstance(v, NonTensorData):
+            total += _estimate_encoded_bytes(v.data, budget)
+        elif isinstance(v, NonTensorStack):
+            # Checked before TensorDictBase: NonTensorStack subclasses
+            # LazyStackedTensorDict but carries payload, so skipping it as a
+            # container would drop those bytes entirely.
+            total += _nontensor_stack_bytes(v, budget)
+        elif isinstance(v, TensorDictBase):
             continue  # container; its leaves are visited separately
-        if not isinstance(v, torch.Tensor):
-            # Order matters: NonTensorData exposes BOTH .data and .tolist(),
-            # and .tolist() broadcasts the stored object across the batch dim
-            # (a 64-row batch reported 20x the real payload). .data is the
-            # object as stored, so it wins; .tolist() is for NonTensorStack,
-            # which genuinely holds one value per batch element.
-            if hasattr(v, "data"):
-                v = v.data
-            elif hasattr(v, "tolist"):
-                v = v.tolist()
+        else:
             total += _estimate_encoded_bytes(v, budget)
-            continue
-        total += _td_tensor_bytes(v)
     return total
-
-
-def _td_tensor_bytes(v: torch.Tensor) -> int:
-    t = v.values() if v.is_nested else v
-    return t.numel() * t.element_size()
 
 
 def fit_latency_bandwidth(s: dict[str, Any]) -> dict[str, Any]:
@@ -309,6 +430,26 @@ class OpStats:
 
 
 @dataclass
+class HashStats:
+    """Wire-in / wire-out fingerprint reconciliation. All zero unless enabled.
+
+    ``rows_unverified`` is as important as ``mismatches``: a run that reads
+    back rows this process never wrote (the normal case for a consumer-side
+    client, which sees only wire-out) verifies nothing, and a mismatch count
+    of 0 would otherwise read as "checked and clean".
+    """
+
+    rows_recorded: int = 0
+    rows_checked: int = 0
+    rows_unverified: int = 0
+    mismatches: int = 0
+    # Leaves that carry no comparable row fingerprint: nested tensors (no
+    # uniform row shape) and leaves whose leading dim doesn't match the
+    # sample count, so a row cannot be attributed to a sample id.
+    fields_skipped: int = 0
+
+
+@dataclass
 class DataPlaneStats:
     total_bytes: int = 0
     total_keys: int = 0
@@ -324,6 +465,7 @@ class DataPlaneStats:
     # sudden spike in ``max_bytes_per_key_seen``.
     max_bytes_per_key_seen: int = 0
     last_put_bytes_per_key: int = 0
+    hash_verify: HashStats = field(default_factory=HashStats)
 
 
 class MetricsDataPlaneClient(DataPlaneClient):
@@ -333,14 +475,33 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self,
         inner: DataPlaneClient,
         on_event: Callable[[DataPlaneEvent], None] | None = None,
+        verify_tensor_hash: bool = False,
     ) -> None:
+        """Wrap ``inner``, accumulating per-op timing and volume.
+
+        Args:
+            inner: The client whose calls are measured.
+            on_event: Per-op callback. ``None`` (the default) skips
+                building the event dict entirely — with metrics enabled but
+                no sink, nothing is paid for a payload nobody reads.
+            verify_tensor_hash: Record a per-row ``torch.hash_tensor``
+                fingerprint on put and re-check it on get. Debug aid, not a
+                metric: it reads every tensor byte again (~1.2 ms per 18 MB
+                put), so it is off unless the config asks for it.
+        """
         self._inner = inner
-        self._on_event = on_event or (lambda _: None)
+        self._on_event = on_event
+        self._verify_tensor_hash = verify_tensor_hash
         self._stats = DataPlaneStats()
         # Nested per-partition / per-key live byte counts. Populated on
         # successful ``put_samples``; popped on successful ``clear_samples``.
         # Bounded by the live key population, not cumulative traffic.
         self._bytes_by_partition: dict[str, dict[str, int]] = {}
+        # partition -> sample_id -> field -> wire-in fingerprint. Same
+        # lifetime as ``_bytes_by_partition``: cleared by ``clear_samples``,
+        # so it is bounded by the live key population.
+        self._hash_by_partition: dict[str, dict[str, dict[str, int]]] = {}
+        self._hash_mismatches_logged = 0
         # Previous snapshot, for per-step deltas. Owned here rather than by a
         # caller: it is this client's prior reading, and keeping it here lets
         # every trainer use get_step_metrics() without copying the
@@ -383,9 +544,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # truth for bytes. Distinct from ``bytes_outstanding``, which is
         # occupancy (what is held) rather than traffic (what moved).
         by = out["by_op"]
-        out["bytes_written"] = sum(
-            by[o]["n_bytes"] for o in _WRITE_OPS if o in by
-        )
+        out["bytes_written"] = sum(by[o]["n_bytes"] for o in _WRITE_OPS if o in by)
         out["bytes_read"] = sum(by[o]["n_bytes"] for o in _READ_OPS if o in by)
         out["comm_volume_bytes"] = out["bytes_written"] + out["bytes_read"]
         return out
@@ -411,12 +570,20 @@ class MetricsDataPlaneClient(DataPlaneClient):
             "wall_s": wall_ms / 1e3,
             "frac_of_step": (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0,
             "comm_volume_gb": vol / 1e9,
-            "bytes_written_gb": (
-                snap["bytes_written"] - prev.get("bytes_written", 0)
-            ) / 1e9,
+            "bytes_written_gb": (snap["bytes_written"] - prev.get("bytes_written", 0))
+            / 1e9,
             "bytes_read_gb": (snap["bytes_read"] - prev.get("bytes_read", 0)) / 1e9,
             "bytes_outstanding_gb": snap["bytes_outstanding"] / 1e9,
         }
+        if self._verify_tensor_hash:
+            hv, prev_hv = snap["hash_verify"], prev.get("hash_verify", {})
+            metrics["hash/rows_checked"] = hv["rows_checked"] - prev_hv.get(
+                "rows_checked", 0
+            )
+            metrics["hash/rows_unverified"] = hv["rows_unverified"] - prev_hv.get(
+                "rows_unverified", 0
+            )
+            metrics["hash/mismatches"] = hv["mismatches"] - prev_hv.get("mismatches", 0)
         prev_ops = prev.get("by_op", {})
         for op, st in snap["by_op"].items():
             prev_op = prev_ops.get(op, {})
@@ -448,6 +615,13 @@ class MetricsDataPlaneClient(DataPlaneClient):
         Called after the underlying RPC succeeds so a failed put never
         leaves the accounting inflated.
 
+        The even split is what makes the loop cheap, and it is not a
+        simplification: ``n_bytes`` is a whole-batch figure, so there is no
+        per-key truth to preserve. The division remainder therefore lands on
+        the first key rather than being spread one-byte-at-a-time across the
+        batch — spreading it cost an ``enumerate`` and a compare per key
+        (~40% of this method at 256 keys) to move at most one byte each.
+
         Args:
             partition_id: Partition the keys were written to.
             keys: Per-sample uids that were written.
@@ -457,9 +631,10 @@ class MetricsDataPlaneClient(DataPlaneClient):
             return
         per_key, remainder = divmod(n_bytes, len(keys))
         partition_dict = self._bytes_by_partition.setdefault(partition_id, {})
-        for i, key in enumerate(keys):
-            share = per_key + (1 if i < remainder else 0)
-            partition_dict[key] = partition_dict.get(key, 0) + share
+        get_held = partition_dict.get
+        for key in keys:
+            partition_dict[key] = get_held(key, 0) + per_key
+        partition_dict[keys[0]] += remainder
         self._stats.bytes_outstanding += n_bytes
         if self._stats.bytes_outstanding > self._stats.peak_bytes_outstanding:
             self._stats.peak_bytes_outstanding = self._stats.bytes_outstanding
@@ -474,6 +649,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
             partition_id: Partition the keys were dropped from.
             keys: Uids dropped; ``None`` means the whole partition was cleared.
         """
+        if self._verify_tensor_hash:
+            self._drop_hashes(partition_id, keys)
         partition_dict = self._bytes_by_partition.get(partition_id)
         if partition_dict is None:
             return
@@ -487,6 +664,127 @@ class MetricsDataPlaneClient(DataPlaneClient):
             if not partition_dict:
                 del self._bytes_by_partition[partition_id]
         self._stats.bytes_outstanding -= freed
+
+    # ── wire-in / wire-out fingerprinting (opt-in) ─────────────────────
+
+    def _row_fingerprints(
+        self, td: TensorDict | None, sample_ids: list[str]
+    ) -> dict[str, list[int]]:
+        """Per-row ``torch.hash_tensor`` fingerprints, keyed by field name.
+
+        Each tensor leaf is flattened to ``[n_rows, -1]`` and reduced along
+        the trailing dims, giving one ``uint64`` per sample id — the
+        granularity the wire actually needs, since a batch put of 256 rows
+        is routinely read back as eight shards of 32 and a whole-tensor hash
+        would be incomparable.
+
+        ``hash_tensor`` reduces by XOR, which is commutative — on its own it
+        is blind to *any* rearrangement of a row's 64-bit words, so a
+        mis-sharded read that swaps two rows of ``arange``-shaped data hashes
+        identically. Two things narrow that: the dtype and per-row shape go
+        in as a salt, and a second reduction over the row's even-index
+        sub-multiset breaks the permutation symmetry (verified to catch both
+        row swaps and within-row reversal, which the single reduction
+        misses). What survives is data whose even-index multiset is also
+        preserved — a boolean mask, where XOR sees only parity, is the case
+        this check still cannot see, and is the documented limit.
+
+        Row *i* is attributed to ``sample_ids[i]``, which is the ordering
+        :meth:`DataPlaneClient.get_samples` already promises ("batched along
+        ``sample_ids``"). An adapter that reordered rows would show up here
+        as a mismatch — which is the correct verdict, since a reordered read
+        is exactly the bug this check exists to catch.
+
+        Leaves that cannot be attributed per row (nested tensors, or a
+        leading dim that isn't ``len(sample_ids)``) are counted in
+        ``fields_skipped`` rather than silently dropped.
+        """
+        if td is None:
+            return {}
+        n_rows = len(sample_ids)
+        stats = self._stats.hash_verify
+        out: dict[str, list[int]] = {}
+        for key, v in td.items(include_nested=True, leaves_only=True):
+            if not isinstance(v, torch.Tensor) or v.is_nested or v.ndim < 1:
+                stats.fields_skipped += 1
+                continue
+            if v.shape[0] != n_rows:
+                stats.fields_skipped += 1
+                continue
+            # crc32, not the builtin hash(): hash() of a str is salted per
+            # process, so the fingerprint would not survive being compared
+            # across ranks — a property this is cheap to keep and expensive
+            # to rediscover the day someone reduces these across a cluster.
+            salt = zlib.crc32(f"{v.dtype}|{tuple(v.shape[1:])}".encode())
+            flat = v.reshape(n_rows, -1)
+            digest = torch.hash_tensor(flat, dim=1) ^ salt
+            if flat.shape[1] > 1:
+                strided = torch.hash_tensor(flat[:, ::2], dim=1)
+                digest = digest ^ (strided * _MIX64)
+            name = key if isinstance(key, str) else ".".join(key)
+            out[name] = digest.tolist()
+        return out
+
+    def _record_hashes(
+        self, partition_id: str, sample_ids: list[str], fields: TensorDict | None
+    ) -> None:
+        """Store wire-in fingerprints for a successful put."""
+        digests = self._row_fingerprints(fields, sample_ids)
+        if not digests:
+            return
+        partition_hashes = self._hash_by_partition.setdefault(partition_id, {})
+        for row, sample_id in enumerate(sample_ids):
+            per_field = partition_hashes.setdefault(sample_id, {})
+            for name, column in digests.items():
+                per_field[name] = column[row]
+        self._stats.hash_verify.rows_recorded += len(sample_ids)
+
+    def _check_hashes(self, partition_id: str, sample_ids: list[str], out: Any) -> None:
+        """Compare wire-out fingerprints against what was written."""
+        if not isinstance(out, TensorDict):
+            return
+        digests = self._row_fingerprints(out, sample_ids)
+        if not digests:
+            return
+        partition_hashes = self._hash_by_partition.get(partition_id, {})
+        stats = self._stats.hash_verify
+        for row, sample_id in enumerate(sample_ids):
+            per_field = partition_hashes.get(sample_id)
+            if not per_field:
+                # Written by another process (rollout actor, policy worker):
+                # this client has no wire-in reading to compare against.
+                stats.rows_unverified += 1
+                continue
+            stats.rows_checked += 1
+            for name, column in digests.items():
+                expected = per_field.get(name)
+                if expected is None or expected == column[row]:
+                    continue
+                stats.mismatches += 1
+                if self._hash_mismatches_logged < _MAX_HASH_MISMATCH_LOGS:
+                    self._hash_mismatches_logged += 1
+                    logger.error(
+                        "data-plane hash mismatch: partition=%s sample=%s "
+                        "field=%s wire_in=%d wire_out=%d",
+                        partition_id,
+                        sample_id,
+                        name,
+                        expected,
+                        column[row],
+                    )
+
+    def _drop_hashes(self, partition_id: str, keys: list[str] | None) -> None:
+        """Release fingerprints alongside the bytes accounting."""
+        if keys is None:
+            self._hash_by_partition.pop(partition_id, None)
+            return
+        partition_hashes = self._hash_by_partition.get(partition_id)
+        if partition_hashes is None:
+            return
+        for key in keys:
+            partition_hashes.pop(key, None)
+        if not partition_hashes:
+            del self._hash_by_partition[partition_id]
 
     def _run(
         self,
@@ -539,43 +837,49 @@ class MetricsDataPlaneClient(DataPlaneClient):
         status: EventStatus,
     ) -> None:
         wall_ms = (monotonic() - t0) * 1000.0
-        event: DataPlaneEvent = {
-            "op": op,
-            "partition_id": partition_id,
-            "n_keys": int(n_keys),
-            "n_bytes": int(n_bytes),
-            "wall_ms": wall_ms,
-            "status": status,
-        }
-        self._on_event(event)
+        on_event = self._on_event
+        if on_event is not None:
+            # Built lazily: with no sink registered this dict was the single
+            # most frequent allocation in the wrapper, and nothing read it.
+            event: DataPlaneEvent = {
+                "op": op,
+                "partition_id": partition_id,
+                "n_keys": n_keys,
+                "n_bytes": n_bytes,
+                "wall_ms": wall_ms,
+                "status": status,
+            }
+            on_event(event)
         # Time is charged for every status: a timeout is often the single
         # largest contributor, so dropping it would understate the cost.
-        self._stats.total_wall_ms += wall_ms
-        bucket = self._stats.by_op.get(op)
+        stats = self._stats
+        stats.total_wall_ms += wall_ms
+        bucket = stats.by_op.get(op)
         if bucket is None:
             # Not setdefault(): its default is evaluated eagerly, building a
             # throwaway OpStats (and its 16-bucket histogram) on every op.
-            bucket = self._stats.by_op[op] = OpStats()
+            bucket = stats.by_op[op] = OpStats()
         bucket.calls += 1
         bucket.wall_ms += wall_ms
         bucket.latency_hist[bisect_left(LATENCY_BUCKETS_MS, wall_ms)] += 1
         if status != "ok":
             bucket.errors += 1
-        if status == "ok":
-            self._stats.total_bytes += n_bytes
-            self._stats.total_keys += n_keys
-            self._stats.total_ops += 1
-            bucket.n_bytes += n_bytes
-            bucket.n_keys += n_keys
-            bucket.ok_wall_ms += wall_ms
-            bucket.sum_bytes_sq += float(n_bytes) * float(n_bytes)
-            bucket.sum_bytes_ms += float(n_bytes) * wall_ms
-            bucket.sum_ms_sq += wall_ms * wall_ms
-            if op == "put" and n_keys:
-                per_key = n_bytes // n_keys
-                self._stats.last_put_bytes_per_key = per_key
-                if per_key > self._stats.max_bytes_per_key_seen:
-                    self._stats.max_bytes_per_key_seen = per_key
+            return
+        stats.total_bytes += n_bytes
+        stats.total_keys += n_keys
+        stats.total_ops += 1
+        bucket.n_bytes += n_bytes
+        bucket.n_keys += n_keys
+        bucket.ok_wall_ms += wall_ms
+        bytes_f = float(n_bytes)
+        bucket.sum_bytes_sq += bytes_f * bytes_f
+        bucket.sum_bytes_ms += bytes_f * wall_ms
+        bucket.sum_ms_sq += wall_ms * wall_ms
+        if op == "put" and n_keys:
+            per_key = n_bytes // n_keys
+            stats.last_put_bytes_per_key = per_key
+            if per_key > stats.max_bytes_per_key_seen:
+                stats.max_bytes_per_key_seen = per_key
 
     def register_partition(
         self,
@@ -625,12 +929,15 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
 
     def get_data(self, meta, select_fields=None):
-        return self._run(
+        out = self._run(
             "get_data",
             meta.partition_id,
             lambda: self._inner.get_data(meta, select_fields=select_fields),
             n_keys=len(meta.sample_ids),
         )
+        if self._verify_tensor_hash:
+            self._check_hashes(meta.partition_id, meta.sample_ids, out)
+        return out
 
     def check_consumption_status(self, partition_id, task_names):
         return self._run(
@@ -659,19 +966,30 @@ class MetricsDataPlaneClient(DataPlaneClient):
             n_bytes=n_bytes,
         )
         self._record_put(partition_id, sample_ids_list, n_bytes)
+        # Fingerprinted after ``_run`` rather than inside it: ``fields`` is
+        # the caller's TensorDict and the RPC does not mutate it, so hashing
+        # here keeps the check's own cost out of the op's ``wall_ms``.
+        if self._verify_tensor_hash:
+            self._record_hashes(partition_id, sample_ids_list, fields)
         return out
 
     def get_samples(self, sample_ids, partition_id, select_fields):
-        return self._run(
+        sample_ids_list = (
+            sample_ids if isinstance(sample_ids, list) else list(sample_ids)
+        )
+        out = self._run(
             "get",
             partition_id,
             lambda: self._inner.get_samples(
-                sample_ids,
+                sample_ids_list,
                 partition_id,
                 select_fields=select_fields,
             ),
-            n_keys=len(sample_ids),
+            n_keys=len(sample_ids_list),
         )
+        if self._verify_tensor_hash:
+            self._check_hashes(partition_id, sample_ids_list, out)
+        return out
 
     def clear_samples(self, sample_ids, partition_id):
         sample_ids_list = (

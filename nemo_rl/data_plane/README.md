@@ -428,9 +428,40 @@ data_plane:
   claim_meta_poll_interval_s: 0.5      # blocking-claim poll cadence
   global_segment_size: 549755813888    # 512 GiB — used when backend == "mooncake_cpu"
   local_buffer_size:   68719476736     # 64 GiB  — used when backend == "mooncake_cpu"
-  # observability:                     # NotRequired
-  #   enabled: false
+  observability:                       # NotRequired
+    enabled: false                     # per-op timing / latency percentiles / volume
+    verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check
 ```
+
+### Observability
+
+`enabled: true` wraps the adapter in `MetricsDataPlaneClient`, which records
+per-op wall time, latency percentiles (fixed-bucket histogram, so per-rank
+counts sum into one cluster-wide distribution) and byte volume. `snapshot()`
+returns the cumulative view; `get_step_metrics(step_time_s)` returns the
+per-step delta already flattened for the logger.
+
+The wrapper is measured against a no-op inner client at 256 keys and an
+18 MB payload: **~54 µs per put, ~33 µs per get** — under 0.1% of a 59 ms
+operation. Most of that is the byte walk over the `TensorDict`; the rest is
+the per-key attribution `clear_samples` needs to undo. `on_event` defaults to
+`None` when unset, in which case the per-op event dict is never built.
+
+`verify_tensor_hash: true` additionally records a per-row
+`torch.hash_tensor` fingerprint on every put and re-checks it on every get,
+so a tensor that changes between wire-in and wire-out is reported
+(`hash/mismatches`) instead of being trained on silently. Fingerprints are
+per row, so a 256-row put read back as eight shards of 32 still reconciles.
+Two things to know before turning it on:
+
+- It reads every tensor byte again on both sides — measured at ~1.2 ms
+  per 18 MB on put and the same on get, i.e. ~2% of the 59 ms operation it
+  is guarding. Keep it to debugging runs.
+- `hash_tensor` reduces by XOR, so it cannot see a permutation of elements
+  *within* a row. Dtype and per-row shape are folded into the fingerprint;
+  element order within a row is not covered.
+- Only rows this process wrote can be checked. A consumer-side client
+  reports them under `hash/rows_unverified` rather than counting them clean.
 
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
