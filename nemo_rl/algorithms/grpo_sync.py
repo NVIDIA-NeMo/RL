@@ -380,13 +380,13 @@ def _compute_seq_logprob_error_metrics(
 def _log_completed_draft_refit(
     master_config: MasterConfig,
     *,
-    completed_steps: int,
+    pending_step: Optional[int],
 ) -> None:
     """Emit a driver-ordered marker only for refits after a draft update."""
     draft_config = master_config.policy.get("draft")
-    if completed_steps > 0 and draft_config is not None and draft_config.enabled:
+    if pending_step is not None and draft_config is not None and draft_config.enabled:
         print(
-            f"draft_post_update_refit=complete step={completed_steps}",
+            f"draft_post_update_refit=complete step={pending_step}",
             flush=True,
         )
 
@@ -429,6 +429,7 @@ def grpo_train_sync(
     kv_scales_cache = None  # Cache reused for computed kv scales
 
     POLICY_GENERATION_STALE = True
+    pending_draft_refit_step: Optional[int] = None
     assert policy_generation is not None
 
     if master_config.grpo.skip_reference_policy_logprobs_calculation:
@@ -648,8 +649,9 @@ def grpo_train_sync(
                         )
                         _log_completed_draft_refit(
                             master_config,
-                            completed_steps=total_steps,
+                            pending_step=pending_draft_refit_step,
                         )
+                        pending_draft_refit_step = None
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
@@ -956,6 +958,9 @@ def grpo_train_sync(
                         timer=timer,
                         train_fields=train_fields,
                     )
+                    draft_config = master_config.policy.get("draft")
+                    if draft_config is not None and draft_config.enabled:
+                        pending_draft_refit_step = total_steps + 1
 
                 if sync_kv_scales:
                     with timer.time("recompute_kv_scales"):
@@ -1026,6 +1031,11 @@ def grpo_train_sync(
                             colocated_inference,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
+                        _log_completed_draft_refit(
+                            master_config,
+                            pending_step=pending_draft_refit_step,
+                        )
+                        pending_draft_refit_step = None
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:

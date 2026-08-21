@@ -785,10 +785,10 @@ def test_log_completed_draft_refit_marks_only_post_update_refits(capsys) -> None
     master_config = MagicMock()
     master_config.policy = {"draft": MagicMock(enabled=True)}
 
-    _log_completed_draft_refit(master_config, completed_steps=0)
+    _log_completed_draft_refit(master_config, pending_step=None)
     assert capsys.readouterr().out == ""
 
-    _log_completed_draft_refit(master_config, completed_steps=1)
+    _log_completed_draft_refit(master_config, pending_step=1)
     assert capsys.readouterr().out == "draft_post_update_refit=complete step=1\n"
 
 
@@ -796,7 +796,7 @@ def test_log_completed_draft_refit_skips_non_draft_training(capsys) -> None:
     master_config = MagicMock()
     master_config.policy = {}
 
-    _log_completed_draft_refit(master_config, completed_steps=1)
+    _log_completed_draft_refit(master_config, pending_step=1)
 
     assert capsys.readouterr().out == ""
 

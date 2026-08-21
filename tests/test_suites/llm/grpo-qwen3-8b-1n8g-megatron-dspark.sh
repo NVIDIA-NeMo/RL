@@ -12,6 +12,7 @@ NUM_MINUTES=45
 # ===== END CONFIG =====
 
 cd "$PROJECT_ROOT"
+rm -rf "$CKPT_DIR"
 uv run examples/run_grpo.py \
     --config "$CONFIG_PATH" \
     data_plane.enabled=true \
