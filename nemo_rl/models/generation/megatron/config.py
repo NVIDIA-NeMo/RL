@@ -37,6 +37,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     num_cuda_graphs: int
     use_cuda_graphs_for_non_decode_steps: bool
     cuda_graph_impl: str
+    # Layer spec used by Megatron generation.
+    # Options are "transformer_engine" and "inference_optimized".
+    transformer_impl: NotRequired[Literal["transformer_engine", "inference_optimized"]]
     # Inference CUDA-graph scope. Options:
     # - 'none': inference runs in eager mode (no CUDA graphs).
     # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
@@ -47,6 +50,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     materialize_only_last_token_logits: bool
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
+    # Generation log-probs: "processed_logprobs" (sampling-filtered, default)
+    # or "raw_logprobs" (F.log_softmax of model logits). Zero-KL forces raw.
+    logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
 
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
     num_speculative_tokens: int

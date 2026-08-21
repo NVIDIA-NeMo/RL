@@ -401,6 +401,8 @@ def validate_and_set_config(
             f"policy.hf_config_overrides.rope_scaling."
         )
 
+    _apply_zero_train_gen_mismatch(config)
+
     megatron_cfg, model_cfg = setup_model_config(
         config,
         rank,
@@ -1018,6 +1020,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
+    if "use_mamba_mem_eff_path" in config["megatron_cfg"]:
+        model_cfg.use_mamba_mem_eff_path = config["megatron_cfg"][
+            "use_mamba_mem_eff_path"
+        ]
+
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
     model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
@@ -1139,6 +1146,10 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
 
+    flash_attention_version = config["megatron_cfg"].get("flash_attention_version")
+    if flash_attention_version is not None:
+        model_cfg.flash_attention_version = flash_attention_version
+
     # These overrides need to be applied before the workers spawn.
     if "transformer_impl" in config["megatron_cfg"]:
         model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
@@ -1166,6 +1177,9 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             and generation_cfg["mcore_generation_config"]["cuda_graph_impl"] != "none"
         ):
             model_cfg.use_te_rng_tracker = True
+
+    if config["megatron_cfg"].get("batch_invariant_mode"):
+        model_cfg.batch_invariant_mode = True
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -1510,6 +1524,82 @@ def _create_draft_pre_wrap_hook(
     return draft_pre_wrap_hook
 
 
+def _enable_batch_invariant_kernels_if_requested(config: PolicyConfig) -> None:
+    """Enable global batch-invariant kernel patches (cuBLAS workspace shrink, FA num_splits=1, TE GEMM pin).
+
+    Bridge's initialize_megatron() does not call megatron.training.initialize, so we
+    mirror the legacy ``if args.batch_invariant_mode: enable_batch_invariant_mode()``
+    hook here, calling it before initialize_megatron so the patches are active from the
+    start of the worker lifetime.
+
+    ``zero_train_gen_mismatch`` applies TE cuBLAS workspace shrink via
+    ``zero_train_gen_kl_patches.core_patches.apply_te_gemm_cublas_pinned_patch``
+    instead of Megatron BIK.
+    """
+    if config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
+        return
+    if not config["megatron_cfg"].get("batch_invariant_mode"):
+        return
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        enable_batch_invariant_mode,
+    )
+
+    print("Enabling batch invariant mode globally", flush=True)
+    enable_batch_invariant_mode()
+
+
+def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
+    """Propagate zero_train_gen_mismatch flag to its constituent sub-knobs.
+
+    When True, forces batch_invariant_mode=True, use_mamba_mem_eff_path=False (Mamba
+    models only), attention_backend=flash (FA4 via TE), and the Transformer Engine
+    generation layer spec so generation and scoring share aligned MoE/Mamba paths.
+    MoE batch_invariant_mode requires DeepGEMM in the mcore worker venv (see
+    pyproject.toml mcore extra). Also applies TE cuBLAS workspace shrink and TP=1
+    log-softmax via zero_train_gen_kl_patches.core_patches, deterministic MoE
+    fixed-order combine (train + generation) via moe_zero_kl_patches.py.
+    Generation uses ``logprobs_mode=raw_logprobs`` so gen uses ``F.log_softmax``
+    (not FlashInfer processed log-probs). moe_grouped_gemm must be configured explicitly.
+    """
+    if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
+        return
+    import os
+
+    from nemo_rl.models.generation.megatron.zero_train_gen_kl_patches import (
+        apply_log_softmax_determinism_patch,
+        apply_mamba_alignment_patch,
+        apply_moe_determinism_patches,
+        apply_te_bik_attention_assert_skip_patch,
+        apply_te_gemm_cublas_pinned_patch,
+        policy_uses_mamba_layers,
+    )
+
+    mc = config["megatron_cfg"]
+    mc["batch_invariant_mode"] = True
+    if policy_uses_mamba_layers(config):
+        mc.setdefault(
+            "use_mamba_mem_eff_path", False
+        )  # Disable Mamba's memory-efficient path
+    mc.setdefault("attention_backend", "flash")
+    mc.setdefault("flash_attention_version", 4)
+    generation = config.get("generation")
+    if generation is not None and "mcore_generation_config" in generation:
+        generation["mcore_generation_config"]["transformer_impl"] = "transformer_engine"
+        # Match the TP=1 train log-softmax patch: Megatron processed_logprobs
+        # routes through FlashInfer log(renorm(softmax)), not F.log_softmax.
+        generation["mcore_generation_config"]["logprobs_mode"] = "raw_logprobs"
+    apply_te_gemm_cublas_pinned_patch()
+    apply_log_softmax_determinism_patch()
+    apply_moe_determinism_patches()
+    apply_mamba_alignment_patch(required=policy_uses_mamba_layers(config))
+    apply_te_bik_attention_assert_skip_patch()
+    # Starve PyTorch's own cuBLAS workspace so non-TE aten::mm/addmm paths also
+    # pick workspace-free (splitK=1, reduction=NONE) algorithms.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
+    os.environ.setdefault("CUBLASLT_WORKSPACE_SIZE", "0")
+    os.environ.setdefault("MAMBA_DETERMINISTIC", "1")
+
+
 _BRIDGE_SIGNAL_HANDLER_PATCHED = False
 
 
@@ -1635,6 +1725,8 @@ def setup_model_and_optimizer(
 ):
     state = GlobalState()
     _patch_bridge_signal_handler_for_worker_threads()
+    _apply_zero_train_gen_mismatch(policy_cfg)
+    _enable_batch_invariant_kernels_if_requested(policy_cfg)
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 

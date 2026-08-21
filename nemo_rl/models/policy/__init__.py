@@ -378,6 +378,8 @@ class MegatronConfig(TypedDict):
     # Attention backend available values:
     # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/enums.py#L60
     attention_backend: NotRequired[str]
+    # FlashAttention major version (3 or 4). Required when batch_invariant_mode=True.
+    flash_attention_version: NotRequired[int]
     moe_per_layer_logging: bool
     # Set to true to enable DeepEP for expert parallel communication
     # Must set moe_token_dispatcher_type to 'flex'
@@ -481,6 +483,16 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # Use batch-invariant kernels (cuBLAS workspace shrink, FA num_splits=1, TE GEMM pin)
+    # for deterministic execution regardless of batch size. Required for zero-KL.
+    batch_invariant_mode: NotRequired[bool]
+    # Disable the memory-efficient Mamba SSM path so training and generation kernels match.
+    # Required for zero-KL on hybrid Mamba models.
+    use_mamba_mem_eff_path: NotRequired[bool]
+    # Master switch: when True, forces batch_invariant_mode=True and
+    # use_mamba_mem_eff_path=False to eliminate train/gen KL mismatch sources.
+    # Router replay and moe_grouped_gemm must be configured explicitly.
+    zero_train_gen_mismatch: NotRequired[bool]
 
 
 class DraftConfigDisabled(TypedDict):

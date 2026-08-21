@@ -1,0 +1,72 @@
+# Qwen3-30B-A3B DAPO 8K — colocated Megatron inference with zero train/gen KL
+defaults: ../../grpo_math_qwen30ba3b_megatron.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  val_at_start: false
+  val_at_end: false
+  val_period: 10
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+
+policy:
+  router_replay:
+    enabled: false
+  train_global_batch_size: 256
+  max_total_sequence_length: 10240
+  logprob_chunk_size: 2048 # requires defer_fp32_logits
+  megatron_cfg:
+    zero_train_gen_mismatch: true
+    activation_checkpointing: true
+    defer_fp32_logits: true
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    moe_token_dispatcher_type: alltoall
+    moe_router_dtype: fp32
+    moe_pad_experts_for_cuda_graph_inference: false
+    moe_permute_fusion: false
+    cuda_graph_impl: none
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.0
+      adam_beta2: 0.98
+    scheduler:
+      lr_decay_style: constant
+      lr_warmup_iters: 0
+      lr_warmup_init: 1.0e-06
+  generation:
+    backend: megatron
+    colocated:
+      enabled: true
+    max_new_tokens: 8192
+    mcore_generation_config:
+      use_cuda_graphs_for_non_decode_steps: false
+      cuda_graph_impl: none
+      num_cuda_graphs: 0
+      inference_cuda_graph_scope: none
+      enable_chunked_prefill: false
+      enable_prefix_caching: false
+      kv_cache_management_mode: recompute
+      static_kv_memory_pointers: false
+      buffer_size_gb: 16
+
+data:
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: examples/prompts/cot.txt
+
+env:
+  math:
+    math_verify_impl: dapo_math_verify
+    dapo_long_cot: true

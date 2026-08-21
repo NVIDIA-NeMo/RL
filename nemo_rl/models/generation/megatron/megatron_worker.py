@@ -98,6 +98,78 @@ class MegatronGenerationMixin:
         self._inference_loop = None
         self._inference_thread = None
 
+    def _prepare_fp8_inference_linears(self) -> None:
+        """Pad TE linears so FP8/MXFP8 decode (seq_len=1) uses the same GEMM as train.
+
+        Megatron's ``prepare_model_for_fp8_inference`` wraps TE Linear.forward to
+        pad/unpad the sequence dim to the recipe alignment (32 for MXFP8). Without
+        it, decode falls off the TE MXFP8 cuBLAS path the workspace pin targets.
+        Deferred import: only needed when FP8 is enabled.
+        """
+        fp8_cfg = self.cfg.get("megatron_cfg", {}).get("fp8_cfg")
+        if not fp8_cfg or not fp8_cfg.get("enabled", False):
+            return
+        from megatron.core.fp8_utils import prepare_model_for_fp8_inference
+
+        prepare_model_for_fp8_inference(unwrap_model(self.model))
+        print(
+            f"[Rank {self.rank}] wrapped TE linears for FP8 inference padding "
+            f"(recipe={fp8_cfg.get('fp8_recipe')})."
+        )
+
+    def _refresh_te_quantized_weight_cache(self) -> None:
+        """Force TE to recache FP8/MXFP8 packed weights from the live parameters.
+
+        After the first forward, TE Linear sets ``is_first_microbatch=False``.
+        CUDA-graph replay then skips the weight-cache update, so generation keeps
+        the pre-optimizer quantized weights (KL=0 at step 0, nonzero after).
+        The training schedule resets this flag; generation must too, including
+        colocated m-inf where there is no train→gen weight swap.
+        """
+        models = self.model if isinstance(self.model, (list, tuple)) else [self.model]
+        for model in models:
+            unwrapped = unwrap_model(model)
+            # GPTModel.set_is_first_microbatch() is a no-op unless fp8/fp4 is set,
+            # but TE Linear still caches the BF16 weight transpose behind this flag.
+            if hasattr(unwrapped, "set_is_first_microbatch"):
+                unwrapped.set_is_first_microbatch()
+            for module in unwrapped.modules():
+                if hasattr(module, "is_first_microbatch"):
+                    module.is_first_microbatch = True
+
+    def _sync_te_extra_state_after_reshard(self, is_source: bool) -> None:
+        """Copy TE quantizer ``._extra_state`` train→gen after a reshard refit.
+
+        Megatron reshard copies parameters and persistent buffers only. TE FP8
+        amax/scale lives in ``._extra_state`` and otherwise stays stale on the
+        gen replica after the first optimizer step.
+        """
+        if not (
+            hasattr(self, "refit_pg")
+            and hasattr(self, "_get_model_extra_state_dict")
+            and hasattr(self, "_apply_state_dict_to_model")
+        ):
+            return
+
+        payload: dict = {}
+        if is_source:
+            raw = self._get_model_extra_state_dict()
+            for key, value in raw.items():
+                if isinstance(value, torch.Tensor):
+                    payload[key] = value.detach().to("cpu").contiguous()
+                else:
+                    payload[key] = value
+        world = self.refit_pg.size()
+        gathered: list = [None] * world
+        torch.distributed.all_gather_object(gathered, payload, group=self.refit_pg)
+        if is_source:
+            return
+        src_rank = self.refit_pg.rank() - self.refit_dst_rank_offset
+        extra = gathered[src_rank] or {}
+        if not extra:
+            return
+        self._apply_state_dict_to_model(extra, raise_if_key_missing=False)
+
     def _initialize_inference_engine(self, mcore_generation_config: dict) -> None:
         """Initialize the persistent inference engine and client."""
         # TODO: Switch to standardized Megatron API.
@@ -133,7 +205,9 @@ class MegatronGenerationMixin:
 
         # The value may be overwritten by `recompute_kv_cache_after_weight_updates`.
         kv_cache_management_mode = mcore_generation_config["kv_cache_management_mode"]
-        needs_static_kv_pointers = kv_cache_management_mode != "persist"
+        needs_static_kv_pointers = mcore_generation_config.get(
+            "static_kv_memory_pointers", kv_cache_management_mode != "persist"
+        )
 
         materialize_only_last_token_logits = mcore_generation_config[
             "materialize_only_last_token_logits"
@@ -143,6 +217,14 @@ class MegatronGenerationMixin:
 
         mamba_inference_state_config = MambaInferenceStateConfig.from_model(gen_model)
         is_hybrid_model = mamba_inference_state_config is not None
+        if is_hybrid_model and self.cfg.get("megatron_cfg", {}).get(
+            "zero_train_gen_mismatch"
+        ):
+            # Match the train scan's fp32 boundary-state precision so gen SSM cache
+            # doesn't diverge from train (gen defaults to bf16 otherwise).
+            mcore_generation_config.setdefault(
+                "mamba_inference_ssm_states_dtype", "float32"
+            )
         if is_hybrid_model:
             if (
                 mcore_generation_config.get("mamba_inference_ssm_states_dtype")
@@ -197,7 +279,9 @@ class MegatronGenerationMixin:
             ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
-            logprobs_mode="processed_logprobs",
+            logprobs_mode=mcore_generation_config.get(
+                "logprobs_mode", "processed_logprobs"
+            ),
             max_requests=max_requests,
         )
 
@@ -209,6 +293,7 @@ class MegatronGenerationMixin:
         self.inference_context = DynamicInferenceContext(
             gen_model.config, inference_config
         )
+        self._prepare_fp8_inference_linears()
         self.inference_wrapped_model = GPTInferenceWrapper(
             gen_model, self.inference_context
         )
@@ -464,6 +549,7 @@ class MegatronGenerationMixin:
 
         lang_module = unwrap_model(gen_model)
         lang_module.eval()
+        self._refresh_te_quantized_weight_cache()
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
         if rotary_module is not None and hasattr(
@@ -893,6 +979,10 @@ class MegatronGenerationRefitMixin:
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
         )
+
+        self._sync_te_extra_state_after_reshard(is_source)
+        if not is_source:
+            self._refresh_te_quantized_weight_cache()
 
         return True
 
