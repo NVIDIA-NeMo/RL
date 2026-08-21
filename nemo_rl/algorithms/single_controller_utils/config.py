@@ -1020,6 +1020,21 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "loss_fn.reference_policy_kl_penalty=0."
         )
 
+    if (
+        master_config.loss_fn.use_kl_in_reward
+        and reference_policy_kl_penalty > 0
+        and master_config.loss_fn.force_on_policy_ratio
+        and algo_cfg.seq_logprob_error_threshold is None
+    ):
+        raise ValueError(
+            "loss_fn.use_kl_in_reward=true with a nonzero "
+            "loss_fn.reference_policy_kl_penalty requires policy logprobs, but "
+            "loss_fn.force_on_policy_ratio=true without "
+            "seq_logprob_error_threshold skips them. Set "
+            "loss_fn.force_on_policy_ratio=false or configure "
+            "seq_logprob_error_threshold."
+        )
+
     # ``env`` is required in production configs, but model_construct-based unit
     # configs can omit it. Only apply rollout-path validation when it is present.
     env_config = getattr(master_config, "env", None)

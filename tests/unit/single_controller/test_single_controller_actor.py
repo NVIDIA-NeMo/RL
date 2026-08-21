@@ -223,11 +223,18 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
 
 
 @pytest.mark.parametrize(
-    ("reference_policy_kl_penalty", "skip_reference_logprobs", "expected_required"),
+    (
+        "reference_policy_kl_penalty",
+        "skip_reference_logprobs",
+        "force_on_policy_ratio",
+        "expected_policy_required",
+        "expected_reference_required",
+    ),
     [
-        (0.0, False, False),
-        (0.0, True, False),
-        (0.01, False, True),
+        (0.0, False, False, True, False),
+        (0.0, True, False, True, False),
+        (0.01, False, False, True, True),
+        (0.01, False, True, False, True),
     ],
 )
 def test_reference_logprobs_required_only_when_kl_enabled(
@@ -235,7 +242,9 @@ def test_reference_logprobs_required_only_when_kl_enabled(
     tmp_path,
     reference_policy_kl_penalty: float,
     skip_reference_logprobs: bool,
-    expected_required: bool,
+    force_on_policy_ratio: bool,
+    expected_policy_required: bool,
+    expected_reference_required: bool,
 ) -> None:
     """KL-disabled SingleController runs do not request reference logprobs."""
     monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
@@ -250,7 +259,7 @@ def test_reference_logprobs_required_only_when_kl_enabled(
             skip_reference_policy_logprobs_calculation=skip_reference_logprobs,
         ),
         loss_fn=ClippedPGLossConfig(
-            force_on_policy_ratio=False,
+            force_on_policy_ratio=force_on_policy_ratio,
             reference_policy_kl_penalty=reference_policy_kl_penalty,
         ),
         async_rl=AsyncRLConfig(
@@ -264,7 +273,12 @@ def test_reference_logprobs_required_only_when_kl_enabled(
 
     controller = _init_controller(master_config, _actor_args_for_init())
 
-    assert controller._reference_logprobs_required is expected_required
+    assert controller._policy_logprobs_required is expected_policy_required
+    assert controller._reference_logprobs_required is expected_reference_required
+    assert ("prev_logprobs" in controller._train_fields) is expected_policy_required
+    assert (
+        "reference_policy_logprobs" in controller._train_fields
+    ) is expected_reference_required
 
 
 @pytest.mark.parametrize("with_critic", [True, False], ids=["ppo", "grpo"])
@@ -928,6 +942,12 @@ class _EvictingSampler(_OneThenEmptySampler):
         return meta, 2 if num_groups else 0
 
 
+class _FullStepSampler(_OneThenEmptySampler):
+    async def select(self, **kwargs):
+        meta, num_groups = await super().select(**kwargs)
+        return meta, 2 if num_groups else 0
+
+
 class _ChunkedSampler(_EmptySampler):
     """Assembles one step out of several single-group chunks, then goes empty.
 
@@ -977,8 +997,10 @@ class _NoOpTrainer:
     def begin_train_step(self, loss_fn) -> None:
         del loss_fn
 
-    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
-        del meta
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        del meta, train_fields
 
     def finish_train_step(self) -> dict:
         return {}
@@ -998,6 +1020,27 @@ class _LpRecordingTrainer(_NoOpTrainer):
 
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
         del meta
+
+
+class _LogprobRecordingTrainer(_NoOpTrainer):
+    def __init__(self) -> None:
+        self.policy_logprob_calls = 0
+        self.reference_logprob_calls = 0
+        self.train_fields_calls: list[tuple[str, ...]] = []
+
+    def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
+        del meta
+        self.policy_logprob_calls += 1
+
+    def get_reference_policy_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
+        del meta
+        self.reference_logprob_calls += 1
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        del meta
+        self.train_fields_calls.append(train_fields)
 
 
 class _OrderRecordingTrainer(_NoOpTrainer):
@@ -1031,8 +1074,10 @@ class _EpochRecordingTrainer(_OrderRecordingTrainer):
         del loss_fn
         self.calls.append("policy.begin_train_step")
 
-    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
-        del meta
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        del meta, train_fields
         self.calls.append("policy.train_microbatches_from_meta")
 
     def finish_train_step(self) -> dict:
@@ -1074,6 +1119,10 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
+    ctrl._train_fields = single_controller._train_fields_for_step(
+        policy_logprobs_required=False,
+        reference_logprobs_required=False,
+    )
     ctrl._advantage_estimator = None
     ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler
@@ -1263,6 +1312,59 @@ def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
     assert ctrl._batch_shortfall == {5: 1}
 
 
+@pytest.mark.parametrize(
+    (
+        "policy_logprobs_required",
+        "reference_logprobs_required",
+        "expected_policy_calls",
+        "expected_reference_calls",
+    ),
+    [
+        (False, False, 0, 0),
+        (True, False, 1, 0),
+        (False, True, 0, 1),
+        (True, True, 1, 1),
+    ],
+)
+def test_train_pump_requests_and_fetches_only_required_logprobs(
+    monkeypatch,
+    policy_logprobs_required: bool,
+    reference_logprobs_required: bool,
+    expected_policy_calls: int,
+    expected_reference_calls: int,
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0", "sample-1"],
+        fields=[],
+        sequence_lengths=[1, 1],
+        tags=[{"weight_version": 0}, {"weight_version": 0}],
+    )
+    ctrl = _train_pump_controller(sampler=_FullStepSampler(meta))
+    ctrl._policy_logprobs_required = policy_logprobs_required
+    ctrl._reference_logprobs_required = reference_logprobs_required
+    ctrl._train_fields = single_controller._train_fields_for_step(
+        policy_logprobs_required=policy_logprobs_required,
+        reference_logprobs_required=reference_logprobs_required,
+    )
+    trainer = _LogprobRecordingTrainer()
+    ctrl._trainer = trainer
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert trainer.policy_logprob_calls == expected_policy_calls
+    assert trainer.reference_logprob_calls == expected_reference_calls
+    assert trainer.train_fields_calls == [ctrl._train_fields]
+    assert ("prev_logprobs" in ctrl._train_fields) is policy_logprobs_required
+    assert (
+        "reference_policy_logprobs" in ctrl._train_fields
+    ) is reference_logprobs_required
+
+
 def test_train_pump_rejects_step_with_no_valid_training_chunks() -> None:
     meta = KVBatchMeta(
         partition_id="rollout_data",
@@ -1327,7 +1429,9 @@ def test_train_pump_skips_empty_chunk_and_trains_later_valid_chunk(
 
     assert trainer.prepare_for_training.call_count == 2
     trainer.begin_train_step.assert_called_once_with(None)
-    trainer.train_microbatches_from_meta.assert_called_once_with(valid_meta)
+    trainer.train_microbatches_from_meta.assert_called_once_with(
+        valid_meta, train_fields=ctrl._train_fields
+    )
     trainer.finish_train_step.assert_called_once_with()
     assert ctrl._train_steps == 1
 
