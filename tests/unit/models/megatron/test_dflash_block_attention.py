@@ -339,6 +339,95 @@ def _random_attention_inputs(
     )
 
 
+def test_cp1_process_group_without_layout_is_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_type, attention = _load_block_only_attention_contract()
+    attention_module = _load_module(_ATTENTION_MODULE)
+    plan = _make_plan(
+        plan_type,
+        token_valid_mask=torch.ones((1, 4), dtype=torch.bool),
+        sample_rows=[0],
+        anchor_positions=[1],
+        slot_valid=torch.ones((1, 2), dtype=torch.bool),
+    )
+    inputs = _random_attention_inputs(
+        batch_size=1,
+        sequence_length=4,
+        num_blocks=1,
+        block_size=2,
+        num_query_heads=2,
+        num_kv_heads=2,
+        head_dim=4,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        seed=17,
+    )
+    cp_group = object()
+    monkeypatch.setattr(attention_module.dist, "get_world_size", lambda _: 1)
+
+    expected = attention(
+        plan=plan,
+        trunk_k=inputs[0],
+        trunk_v=inputs[1],
+        block_q=inputs[2],
+        block_k=inputs[3],
+        block_v=inputs[4],
+    )
+    actual = attention(
+        plan=plan,
+        trunk_k=inputs[0],
+        trunk_v=inputs[1],
+        block_q=inputs[2],
+        block_k=inputs[3],
+        block_v=inputs[4],
+        context_parallel_group=cp_group,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_cp_group_larger_than_one_requires_sequence_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_type, attention = _load_block_only_attention_contract()
+    attention_module = _load_module(_ATTENTION_MODULE)
+    plan = _make_plan(
+        plan_type,
+        token_valid_mask=torch.ones((1, 4), dtype=torch.bool),
+        sample_rows=[0],
+        anchor_positions=[1],
+        slot_valid=torch.ones((1, 2), dtype=torch.bool),
+    )
+    inputs = _random_attention_inputs(
+        batch_size=1,
+        sequence_length=4,
+        num_blocks=1,
+        block_size=2,
+        num_query_heads=2,
+        num_kv_heads=2,
+        head_dim=4,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        seed=23,
+    )
+    monkeypatch.setattr(attention_module.dist, "get_world_size", lambda _: 2)
+
+    with pytest.raises(
+        ValueError,
+        match="context_parallel_group requires a draft sequence layout",
+    ):
+        attention(
+            plan=plan,
+            trunk_k=inputs[0],
+            trunk_v=inputs[1],
+            block_q=inputs[2],
+            block_k=inputs[3],
+            block_v=inputs[4],
+            context_parallel_group=object(),
+        )
+
+
 @pytest.mark.parametrize(
     "num_query_heads,num_kv_heads",
     [

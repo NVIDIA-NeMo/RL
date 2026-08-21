@@ -346,7 +346,7 @@ def _run_cuda_cp_zero_owner_attention(
         _load_module(_CP_MODULE, _CP_PATH)
         attention_module = _load_module(_ATTENTION_MODULE, _ATTENTION_PATH)
         device = torch.device("cuda", rank)
-        sample_ids = torch.tensor([101], dtype=torch.int64, device=device)
+        sample_ids = torch.tensor([5], dtype=torch.int64, device=device)
         layout = layout_module.build_draft_sequence_layout(
             logical_sample_ids=sample_ids,
             cu_seqlens_q=torch.tensor([0, 16], dtype=torch.int64, device=device),
@@ -377,6 +377,12 @@ def _run_cuda_cp_zero_owner_attention(
         expected_owners = 0 if all_zero else 1
         assert sum(int(count.item()) for count in owner_counts) == expected_owners
         assert any(int(count.item()) == 0 for count in owner_counts)
+        local_anchor = torch.full((), -1, dtype=torch.int64, device=device)
+        if plan.global_anchor_positions.numel() > 0:
+            local_anchor = plan.global_anchor_positions[0]
+        owner_anchors = [torch.zeros_like(local_anchor) for _ in range(world_size)]
+        dist.all_gather(owner_anchors, local_anchor)
+        selected_cp_anchor = max(int(anchor.item()) for anchor in owner_anchors)
 
         full_shape = (1, 16, 1, 16)
         full_k_value = torch.arange(
@@ -438,6 +444,8 @@ def _run_cuda_cp_zero_owner_attention(
             seed=0,
             sequence_layout=oracle_layout,
         )
+        if expected_owners:
+            assert oracle_plan.global_anchor_positions.tolist() == [selected_cp_anchor]
         oracle_k = full_k_value.detach().clone().requires_grad_(True)
         oracle_v = full_v_value.detach().clone().requires_grad_(True)
         oracle_q = full_block_value.detach().clone().requires_grad_(True)
