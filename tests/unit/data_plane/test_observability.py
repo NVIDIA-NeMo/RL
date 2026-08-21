@@ -23,10 +23,14 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tensordict import TensorDict
+from tensordict import NonTensorData, NonTensorStack, TensorDict
 
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
-from nemo_rl.data_plane.observability import MetricsDataPlaneClient
+from nemo_rl.data_plane.observability import (
+    MetricsDataPlaneClient,
+    _estimate_encoded_bytes,
+    _td_bytes,
+)
 
 from ._rollout_shapes import make_rollout_batch
 
@@ -232,4 +236,294 @@ def test_observability_records_realistic_rollout_put() -> None:
     # not a fixed-dtype assumption. Lower bound: at least one full int64 batch.
     min_expected = n * 64 * 8  # input_ids alone
     assert put_events[0]["n_bytes"] >= min_expected
+    client.close()
+
+
+# ── byte accounting ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "name,td,expected",
+    [
+        ("flat", TensorDict({"x": torch.zeros(8, 16)}, batch_size=[8]), 8 * 16 * 4),
+        (
+            "sliced-view",
+            TensorDict({"x": torch.zeros(8, 32)[:, :8]}, batch_size=[8]),
+            8 * 8 * 4,
+        ),
+        (
+            "transposed",
+            TensorDict({"x": torch.zeros(4, 8).t()}, batch_size=[8]),
+            8 * 4 * 4,
+        ),
+        (
+            "stride-0-expand",
+            TensorDict({"x": torch.zeros(8, 1).expand(8, 9)}, batch_size=[8]),
+            8 * 9 * 4,
+        ),
+        (
+            "mixed-dtype",
+            TensorDict(
+                {
+                    "i": torch.zeros(8, 4, dtype=torch.int64),
+                    "b": torch.zeros(8, 4, dtype=torch.bool),
+                    "f": torch.zeros(8, 4, dtype=torch.bfloat16),
+                },
+                batch_size=[8],
+            ),
+            8 * 4 * 8 + 8 * 4 * 1 + 8 * 4 * 2,
+        ),
+        (
+            "nested-container",
+            TensorDict(
+                {
+                    "a": torch.zeros(8, 2),
+                    "sub": TensorDict({"b": torch.zeros(8, 3)}, batch_size=[8]),
+                },
+                batch_size=[8],
+            ),
+            8 * 2 * 4 + 8 * 3 * 4,
+        ),
+        ("empty", TensorDict({}, batch_size=[8]), 0),
+        ("none", None, 0),
+    ],
+)
+def test_td_bytes_counts_wire_payload(name, td, expected):
+    """Tensor leaves count as ``contiguous().nbytes``, containers count once."""
+    assert _td_bytes(td) == expected
+
+
+def test_td_bytes_nontensordata_is_not_broadcast():
+    """``NonTensorData`` holds ONE object; counting it per batch row would
+    inflate a 64-row put by 64x. Its bytes must not scale with batch size."""
+    payload = {"tool": "bash", "text": "x" * 100}
+    small = TensorDict({"m": NonTensorData(payload, batch_size=[2])}, batch_size=[2])
+    large = TensorDict({"m": NonTensorData(payload, batch_size=[64])}, batch_size=[64])
+    assert _td_bytes(small) == _td_bytes(large)
+    assert _td_bytes(small) >= 100  # the string itself is still counted
+
+
+def test_td_bytes_nontensorstack_scales_with_rows():
+    """``NonTensorStack`` genuinely holds one object per row, so its estimate
+    must scale — and stay close to the exact walk it extrapolates from."""
+    row = {"turns": ["hello"] * 4, "n": 3}
+    stack_8 = NonTensorStack(*[NonTensorData(dict(row)) for _ in range(8)])
+    stack_64 = NonTensorStack(*[NonTensorData(dict(row)) for _ in range(64)])
+    bytes_8 = _td_bytes(TensorDict({"s": stack_8}, batch_size=[8]))
+    bytes_64 = _td_bytes(TensorDict({"s": stack_64}, batch_size=[64]))
+    assert bytes_8 > 0
+    assert bytes_64 == pytest.approx(8 * bytes_8, rel=0.05)
+    # And it agrees with summing every row explicitly.
+    exact = sum(_estimate_encoded_bytes(dict(row), [10_000]) for _ in range(64))
+    assert bytes_64 == pytest.approx(exact, rel=0.05)
+
+
+def test_estimate_encoded_bytes_walk_is_bounded():
+    """The node budget caps the walk so one pathological payload cannot make
+    a put O(payload size)."""
+    huge = {"k": list(range(100_000))}
+    bounded = _estimate_encoded_bytes(huge, [64])
+    unbounded = _estimate_encoded_bytes(huge, [10_000_000])
+    assert bounded < unbounded
+    assert bounded <= 4 * 64  # ≤2 leaves per budget unit, ≤2 bytes each here
+
+
+def test_outstanding_bytes_reconcile_exactly():
+    """Put then clear must return ``bytes_outstanding`` to zero: the per-key
+    split drops its division remainder on one key rather than spreading it,
+    so the total has to be preserved for the accounting to close."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    ids = [f"u{i}" for i in range(7)]  # 7 keys => non-zero remainder
+    fields = TensorDict({"x": torch.zeros(7, 5)}, batch_size=[7])
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=7, consumer_tasks=["t"]
+    )
+    client.put_samples(sample_ids=ids, partition_id="p", fields=fields)
+    assert client.snapshot()["bytes_outstanding"] == 7 * 5 * 4
+    client.clear_samples(sample_ids=ids, partition_id="p")
+    assert client.snapshot()["bytes_outstanding"] == 0
+    client.close()
+
+
+def test_no_callback_still_accumulates_stats():
+    """``on_event=None`` skips building the event dict; the counters that
+    ``snapshot()`` reports must not depend on a sink being registered."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=2, consumer_tasks=["t"]
+    )
+    client.put_samples(
+        sample_ids=["a", "b"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.zeros(2, 3)}, batch_size=[2]),
+    )
+    snap = client.snapshot()
+    assert snap["total_bytes"] == 2 * 3 * 4
+    assert snap["by_op"]["put"]["calls"] == 1
+    assert snap["total_wall_ms"] > 0
+    client.close()
+
+
+# ── wire-in / wire-out hash verification ───────────────────────────────
+
+
+class _CorruptingClient(NoOpDataPlaneClient):
+    """Flips one element of one field on read — a stand-in for a wire bug."""
+
+    def __init__(self, field: str, row: int) -> None:
+        super().__init__()
+        self._corrupt_field = field
+        self._corrupt_row = row
+
+    def get_samples(self, sample_ids, partition_id, select_fields):
+        out = super().get_samples(sample_ids, partition_id, select_fields)
+        if self._corrupt_field in out.keys():
+            out[self._corrupt_field][self._corrupt_row] += 1
+        return out
+
+
+def _hash_client(inner=None):
+    client = MetricsDataPlaneClient(
+        inner or NoOpDataPlaneClient(), verify_tensor_hash=True
+    )
+    client.register_partition(
+        partition_id="p", fields=["ids", "lp"], num_samples=4, consumer_tasks=["t"]
+    )
+    return client
+
+
+def _hash_fields(n=4):
+    return TensorDict(
+        {
+            "ids": torch.arange(n * 6, dtype=torch.int64).reshape(n, 6),
+            "lp": torch.linspace(0, 1, n * 6, dtype=torch.bfloat16).reshape(n, 6),
+        },
+        batch_size=[n],
+    )
+
+
+def test_hash_verification_clean_roundtrip():
+    client = _hash_client()
+    ids = [f"u{i}" for i in range(4)]
+    client.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
+    client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids", "lp"])
+
+    hv = client.snapshot()["hash_verify"]
+    assert hv["rows_recorded"] == 4
+    assert hv["rows_checked"] == 4
+    assert hv["rows_unverified"] == 0
+    assert hv["mismatches"] == 0
+    client.close()
+
+
+def test_hash_verification_detects_corruption():
+    client = _hash_client(_CorruptingClient(field="ids", row=2))
+    ids = [f"u{i}" for i in range(4)]
+    client.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
+    client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids", "lp"])
+
+    hv = client.snapshot()["hash_verify"]
+    assert hv["mismatches"] == 1
+    assert client.get_step_metrics(1.0)["hash/mismatches"] == 1
+    client.close()
+
+
+def test_hash_verification_survives_shard_readback():
+    """A 4-row put read back two rows at a time must still line up: the
+    fingerprint is per row, not per batch."""
+    client = _hash_client()
+    ids = [f"u{i}" for i in range(4)]
+    client.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
+    for shard in (ids[:2], ids[2:]):
+        client.get_samples(sample_ids=shard, partition_id="p", select_fields=["ids"])
+
+    hv = client.snapshot()["hash_verify"]
+    assert hv["rows_checked"] == 4
+    assert hv["mismatches"] == 0
+    client.close()
+
+
+def test_hash_verification_reports_rows_it_never_wrote():
+    """A consumer-side client sees only wire-out. Those rows must land in
+    ``rows_unverified`` — reporting 0 mismatches would read as 'clean'."""
+    inner = NoOpDataPlaneClient()
+    writer = _hash_client(inner)
+    ids = [f"u{i}" for i in range(4)]
+    writer.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
+
+    reader = MetricsDataPlaneClient(inner, verify_tensor_hash=True)
+    reader.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
+
+    hv = reader.snapshot()["hash_verify"]
+    assert hv["rows_unverified"] == 4
+    assert hv["rows_checked"] == 0
+    assert hv["mismatches"] == 0
+    writer.close()
+
+
+def test_hash_fingerprints_released_on_clear():
+    """Fingerprints must be bounded by the live key population, not by
+    cumulative traffic."""
+    client = _hash_client()
+    ids = [f"u{i}" for i in range(4)]
+    client.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
+    assert client._hash_by_partition["p"]
+    client.clear_samples(sample_ids=ids, partition_id="p")
+    assert client._hash_by_partition == {}
+    client.close()
+
+
+def test_hash_fingerprint_sees_rearrangement():
+    """A plain XOR reduction is commutative and would report a mis-sharded
+    read (two rows swapped) as clean. The second, strided reduction is what
+    makes these visible — regress it and shard misalignment goes silent."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
+    ids = ["a", "b", "c"]
+    # arange is the adversarial case: its 64-bit words cancel under XOR.
+    td = TensorDict(
+        {"x": torch.arange(12, dtype=torch.float32).reshape(3, 4)}, batch_size=[3]
+    )
+    base = client._row_fingerprints(td, ids)["x"]
+
+    swapped = TensorDict({"x": td["x"][[0, 2, 1]]}, batch_size=[3])
+    assert client._row_fingerprints(swapped, ids)["x"] != base
+
+    reversed_row = td["x"].clone()
+    reversed_row[0] = reversed_row[0].flip(0)
+    within = TensorDict({"x": reversed_row}, batch_size=[3])
+    assert client._row_fingerprints(within, ids)["x"] != base
+
+
+def test_hash_fingerprint_separates_dtype_and_shape():
+    """The salt must make a reinterpreted payload look different even when
+    the underlying words are identical."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient(), verify_tensor_hash=True)
+    ids = ["a", "b"]
+    values = torch.arange(8, dtype=torch.int64).reshape(2, 4)
+    as_2x4 = client._row_fingerprints(TensorDict({"x": values}, batch_size=[2]), ids)[
+        "x"
+    ]
+    as_2x2x2 = client._row_fingerprints(
+        TensorDict({"x": values.reshape(2, 2, 2)}, batch_size=[2]), ids
+    )["x"]
+    as_int32 = client._row_fingerprints(
+        TensorDict({"x": values.to(torch.int32)}, batch_size=[2]), ids
+    )["x"]
+    assert as_2x4 != as_2x2x2
+    assert as_2x4 != as_int32
+
+
+def test_hash_verification_off_by_default():
+    """Default construction must do no hashing work at all."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client.register_partition(
+        partition_id="p", fields=["ids", "lp"], num_samples=4, consumer_tasks=["t"]
+    )
+    ids = [f"u{i}" for i in range(4)]
+    client.put_samples(sample_ids=ids, partition_id="p", fields=_hash_fields())
+    client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
+
+    assert client.snapshot()["hash_verify"]["rows_recorded"] == 0
+    assert client._hash_by_partition == {}
+    assert "hash/mismatches" not in client.get_step_metrics(1.0)
     client.close()
