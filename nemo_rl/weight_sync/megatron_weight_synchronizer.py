@@ -18,9 +18,6 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.collective_weight_synchronizer import (
-    CollectiveWeightSynchronizer,
-)
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 
@@ -34,10 +31,8 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
     transfer, but one the worker performs internally on wake. Sync therefore
     reduces to dropping training-only buffers and re-entering inference mode.
 
-    Non-colocated adds the cross-group collective, with the engine suspended
-    around the transfer. Native refit uses MCore's reshard-capable weight swap;
-    Bridge refit delegates transport and conversion to the same packed
-    collective synchronizer used by vLLM.
+    Non-colocated generation keeps the Megatron engine lifecycle here and
+    delegates the transfer to native MCore refit, packed collective, or M2N.
     """
 
     def __init__(
@@ -60,14 +55,30 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
         self._refit_backend: Optional[str] = None
-        self._collective: Optional[CollectiveWeightSynchronizer] = None
+        self._transport: Optional[WeightSynchronizer] = None
         if not colocated and not generation.uses_native_refit:
-            self._collective = CollectiveWeightSynchronizer(
-                policy=policy,
-                generation=generation,
-                train_cluster=train_cluster,
-                inference_cluster=inference_cluster,
-            )
+            if generation.cfg.get("refit_transport") == "nccl_reshard":
+                from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+                    NcclReshardWeightSynchronizer,
+                )
+
+                self._transport = NcclReshardWeightSynchronizer(
+                    policy=policy,
+                    generation=generation,
+                    train_cluster=train_cluster,
+                    inference_cluster=inference_cluster,
+                )
+            else:
+                from nemo_rl.weight_sync.collective_weight_synchronizer import (
+                    CollectiveWeightSynchronizer,
+                )
+
+                self._transport = CollectiveWeightSynchronizer(
+                    policy=policy,
+                    generation=generation,
+                    train_cluster=train_cluster,
+                    inference_cluster=inference_cluster,
+                )
         self._stale = True
 
     def init_communicator(self) -> None:
@@ -78,8 +89,8 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         """
         if self._colocated:
             return
-        if self._collective is not None:
-            self._collective.init_communicator()
+        if self._transport is not None:
+            self._transport.init_communicator()
             return
         ip, port = self._train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -136,8 +147,8 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             else nullcontext()
         )
         with timer_context:
-            if self._collective is not None:
-                self._collective.sync_weights(kv_scales=kv_scales)
+            if self._transport is not None:
+                self._transport.sync_weights(kv_scales=kv_scales)
             else:
                 futures_train = self._policy.swap_weights_via_reshard(is_source=True)
                 futures_inference = self._generation.update_weights_from_collective()
@@ -161,6 +172,6 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         return self._stale
 
     def shutdown(self) -> None:
-        """Release any resources owned by the delegated collective."""
-        if self._collective is not None:
-            self._collective.shutdown()
+        """Release any resources owned by the delegated transport."""
+        if self._transport is not None:
+            self._transport.shutdown()

@@ -576,8 +576,8 @@ class MegatronGenerationMixin:
 
         # tags=["weights"] means we are inside refit_policy_generation between
         # suspend_for_refit and the weight transfer — the engine was intentionally
-        # paused and waking it now would race the weight transfer against CUDA-graph
-        # replay. The subsequent
+        # paused and waking it now would race NVSHMEM init / weight transfer against
+        # CUDA-graph replay, corrupting TE FP8 state. The subsequent
         # prepare_for_generation(tags=["kv_cache"]) is what actually wakes it.
         if tags is None or "weights" not in tags:
             if not self._inference_engine_initialized:
@@ -834,8 +834,8 @@ class MegatronGenerationMixin:
         return results
 
 
-class MegatronNativeRefitMixin:
-    """Megatron Core's native cross-world reshard/refit implementation."""
+class MegatronGenerationRefitMixin:
+    """Refit collective, weight transfer, and engine suspend/resume around refits."""
 
     def init_collective_mcore_generation(
         self,
@@ -843,7 +843,7 @@ class MegatronNativeRefitMixin:
         port: int,
         world_size: int,
         rank_offset: int,
-        refit_backend: str,
+        refit_backend: str = "gloo",
     ) -> None:
         """Initialize the refit collective for non-colocated weight transfer.
 
@@ -861,6 +861,7 @@ class MegatronNativeRefitMixin:
                 '"gloo". See https://github.com/NVIDIA-NeMo/RL/issues/3646',
                 stacklevel=2,
             )
+
         from torch.distributed.distributed_c10d import (
             PrefixStore,
             ProcessGroup,
@@ -870,6 +871,8 @@ class MegatronNativeRefitMixin:
 
         local_rank = torch.distributed.get_rank()
         global_rank = local_rank + rank_offset
+
+        # port+1 to avoid collision with the caller's rendezvous on `port`.
         store = torch.distributed.TCPStore(
             host_name=ip,
             port=port + 1,
@@ -879,6 +882,12 @@ class MegatronNativeRefitMixin:
 
         group_name = "refit"
         pg_prefix_store = PrefixStore(f"{group_name}/", store)
+
+        # Training and inference workers run in separate torch.distributed worlds.
+        # The public APIs (new_group, init_process_group) assume all ranks belong to one world;
+        # new_group validates ranks against the default PG, and init_process_group can only
+        # be called once. We construct the PG manually using the same internal pattern as
+        # _new_process_group_helper, skipping the single-world assumptions.
         pg = ProcessGroup(pg_prefix_store, global_rank, world_size)
         gloo_store = PrefixStore("cpu/", pg_prefix_store)
         gloo_backend = ProcessGroupGloo(gloo_store, global_rank, world_size)
@@ -890,16 +899,20 @@ class MegatronNativeRefitMixin:
         )
         pg._set_default_backend(ProcessGroup.BackendType.GLOO)
 
+        # The NCCL copy service moves the actual weight bytes with CUDA-tensor P2P
+        # (`torch.distributed.batch_isend_irecv`), which needs an NCCL backend
+        # registered for the cuda device on this cross-world PG. GLOO stays the
+        # default backend so the object collectives in `prepare_swap_model_weights`
+        # (all_gather_object / broadcast_object_list) keep using CPU tensors.
         if refit_backend == "nccl":
             from torch.distributed.distributed_c10d import ProcessGroupNCCL
 
+            # Ensure the NCCL communicator binds to this rank's own GPU.
             torch.cuda.set_device(torch.cuda.current_device())
             nccl_store = PrefixStore("cuda/", pg_prefix_store)
+            nccl_options = ProcessGroupNCCL.Options()
             nccl_backend = ProcessGroupNCCL(
-                nccl_store,
-                global_rank,
-                world_size,
-                ProcessGroupNCCL.Options(),
+                nccl_store, global_rank, world_size, nccl_options
             )
             nccl_backend._set_sequence_number_for_group()
             pg._register_backend(
@@ -909,11 +922,12 @@ class MegatronNativeRefitMixin:
             )
 
         pg._set_group_name(group_name)
+
         self.refit_pg = pg
 
-        # High-level object collectives need this manually-created cross-world
-        # process group registered in torch.distributed's global state.
-        _world.pg_group_ranks[pg] = {rank: rank for rank in range(world_size)}
+        # Register in torch.distributed's global state so that high-level ops
+        # (all_gather_object, broadcast_object_list) work with this PG.
+        _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
         _world.pg_map[pg] = ("gloo", pg_prefix_store)
         _world.pg_names[pg] = group_name
 
@@ -923,33 +937,40 @@ class MegatronNativeRefitMixin:
                 NVSHMEMCopyService,
             )
 
-            self.refit_copy_service = NVSHMEMCopyService(group=pg)
+            self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
         elif refit_backend == "nccl":
             self.refit_copy_service = NCCLCopyService(group=self.refit_pg)
-        elif refit_backend == "gloo":
-            self.refit_copy_service = GlooCopyService(group=self.refit_pg)
         else:
-            raise ValueError(
-                f"Unsupported native MCore refit backend: {refit_backend!r}."
-            )
+            self.refit_copy_service = GlooCopyService(group=self.refit_pg)
 
         is_source = rank_offset == 0
+        # Cache for later refit calls (swap_weights_via_reshard).
         self.refit_dst_rank_offset = (
             torch.distributed.get_world_size() if is_source else rank_offset
         )
+
+        # Build and cache the reshard plan (and any MXFP8 transforms) collectively.
+        # All participating ranks (training + generation) call this simultaneously.
         prepare_swap_model_weights(
             src_model=self.model if is_source else None,
             target_model=None if is_source else self.model,
-            group=pg,
+            group=self.refit_pg,
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
         )
 
     def preinit_nvshmem_collective(self) -> None:
-        """Initialize an NVSHMEM copy service outside CUDA graph capture."""
-        copy_service = getattr(self, "refit_copy_service", None)
-        if copy_service is not None and hasattr(copy_service, "_ensure_initialized"):
-            copy_service._ensure_initialized()
+        """Initialize NVShmem collectively before any weight transfer.
+
+        Must be called on ALL participating ranks (training + inference) simultaneously,
+        after `prepare_for_generation()` has completed and the CG has been recorded.
+        The `NVSHMEMCopyService` lazy init can corrupt CUDA graph state.
+        """
+        if not hasattr(self, "refit_copy_service"):
+            return
+        if not hasattr(self.refit_copy_service, "_ensure_initialized"):
+            return
+        self.refit_copy_service._ensure_initialized()
 
     def swap_weights_via_reshard(self, is_source: bool) -> bool:
         """Transfer weights using Megatron's `swap_model_weights` API.
@@ -971,11 +992,8 @@ class MegatronNativeRefitMixin:
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
         )
+
         return True
-
-
-class MegatronGenerationRefitMixin(MegatronNativeRefitMixin):
-    """Bridge/native refit implementations and inference-engine lifecycle."""
 
     @staticmethod
     def _hf_dependencies(mapping: Any) -> tuple[str, ...]:

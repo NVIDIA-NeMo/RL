@@ -89,10 +89,11 @@ nccl-reshard-refit implementation:
   `model_update_group` and are loaded on the generation side through the backend's
   regular `load_weights` machinery.
 
-The feature is integrated into the `nemo_rl/weight_sync/` framework:
-`create_weight_synchronizer(...)` with `refit_transport=nccl_reshard` returns a
-`NcclReshardWeightSynchronizer` whose `init_communicator()` performs the one-time setup
-and whose `sync_weights()` runs one refit.
+The feature is integrated into the `nemo_rl/weight_sync/` framework. For vLLM,
+`create_weight_synchronizer(...)` returns an `NcclReshardWeightSynchronizer` directly.
+For Megatron generation, the existing `MegatronWeightSynchronizer` retains ownership of
+the inference-engine lifecycle and delegates only the transfer to an
+`NcclReshardWeightSynchronizer`.
 
 ### Execution Flow: Setup Time
 

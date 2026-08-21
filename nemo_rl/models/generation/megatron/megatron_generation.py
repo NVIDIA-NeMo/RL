@@ -132,7 +132,7 @@ class MegatronGeneration(GenerationInterface):
         # `self._policy_config` keeps a reference to the full PolicyConfig.
         self._policy_config = config
         self.cfg: MCoreGenerationConfig = config["generation"]
-        self.refit_impl = self.cfg["mcore_generation_config"]["refit_impl"]
+        self.refit_impl = self.cfg["mcore_generation_config"].get("refit_impl", "mcore")
         if self.refit_impl not in ("bridge", "mcore"):
             raise ValueError(
                 "policy.generation.mcore_generation_config.refit_impl must be "
@@ -346,7 +346,10 @@ class MegatronGeneration(GenerationInterface):
         return True
 
     def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
-        """Initialize native NVSHMEM outside CUDA graph capture."""
+        """Pre-initialize NVShmem collectively after CUDA graph capture.
+
+        Must be called simultaneously on both training and inference workers.
+        """
         if not self.uses_native_refit:
             raise RuntimeError(
                 "NVSHMEM pre-initialization is only valid with refit_impl='mcore'."

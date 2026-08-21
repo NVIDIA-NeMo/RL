@@ -2390,7 +2390,7 @@ def refit_policy_generation(
                 results = ray.get(futures_inference)
                 update_success = all(result for result in results if result is not None)
         else:
-            # Update through the shared packed collective.
+            # update weights through nccl (vLLM) or megatron reshard
             # SGLang haven't implemented non-colocated inference mode.
             if isinstance(policy_generation, SGLangGeneration):
                 raise NotImplementedError(

@@ -2427,7 +2427,7 @@ class MegatronPolicyWorkerImpl(
             show_progress=False,
             conversion_tasks=self._iter_logical_refit_conversion_tasks(
                 conversion_tasks
-            ),
+            ),  # used for metadata caching
         )
 
         # Yield the original parameters first.

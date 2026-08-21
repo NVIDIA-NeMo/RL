@@ -102,27 +102,6 @@ def create_weight_synchronizer(
         raise ValueError("refit_buffer_size_gb must be > 0")
 
     if generation_backend == MEGATRON_BACKEND:
-        if generation.cfg.get("refit_transport") == "nccl_reshard":
-            if colocated:
-                raise ValueError(
-                    "nccl_reshard refit requires non-colocated Megatron generation."
-                )
-            if train_cluster is None or inference_cluster is None:
-                raise ValueError(
-                    "train_cluster and inference_cluster are required for "
-                    "non-colocated weight synchronization."
-                )
-            from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
-                NcclReshardWeightSynchronizer,
-            )
-
-            return NcclReshardWeightSynchronizer(
-                policy=policy,
-                generation=generation,
-                train_cluster=train_cluster,
-                inference_cluster=inference_cluster,
-            )
-
         from nemo_rl.weight_sync.megatron_weight_synchronizer import (
             MegatronWeightSynchronizer,
         )

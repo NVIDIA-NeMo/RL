@@ -31,8 +31,8 @@ Lifecycle:
   sync_weights():
     policy.nccl_reshard_refit(kv_scales) + generation.nccl_reshard_refit(); verify.
 
-For Megatron generation, the synchronizer also owns the inference-engine phase
-transitions around the transfer. Other backends remain pure data movers.
+Like the collective transport, this is a pure data mover. Backend-specific
+phase transitions are owned by the caller.
 """
 
 from contextlib import nullcontext
@@ -81,7 +81,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
-        self._is_megatron_generation = generation.cfg["backend"] == "megatron"
         self._stale = True
 
     def _train_parallelism(self) -> dict[str, int]:
@@ -126,11 +125,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
-        if self._is_megatron_generation:
-            self._generation.suspend_for_refit()
-            self._policy.offload_before_refit()
-            self._generation.prepare_for_generation(tags=["weights"])
-
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
@@ -153,10 +147,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                     "This often indicates an issue with the NCCL process group "
                     "or the generation backend worker."
                 )
-
-        if self._is_megatron_generation:
-            self._generation.prepare_for_generation(tags=["kv_cache"])
-            self._generation.resume_after_refit()
 
         self._stale = False
 

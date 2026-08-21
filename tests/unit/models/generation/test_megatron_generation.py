@@ -33,6 +33,26 @@ from nemo_rl.weight_sync.megatron_weight_synchronizer import (
 model_name = "Qwen/Qwen3-0.6B"
 
 
+def test_megatron_generation_defaults_to_native_refit():
+    config = {
+        "generation": {
+            "mcore_generation_config": {
+                "refit_backend": "gloo",
+                "expose_http_server": False,
+            }
+        }
+    }
+
+    generation = MegatronGeneration(
+        config=config,
+        tokenizer=MagicMock(),
+        policy=MagicMock(),
+    )
+
+    assert generation.refit_impl == "mcore"
+    assert generation.uses_native_refit
+
+
 @pytest.mark.parametrize("refit_impl", ["bridge", "mcore"])
 def test_megatron_generation_dispatches_refit_implementation(refit_impl):
     generation = object.__new__(MegatronGeneration)
