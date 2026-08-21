@@ -703,8 +703,10 @@ class TestFinish:
         aggregated = _aggregate_train_results(filtered)
 
         assert len(mock_module_symbols["all_reduce"].call_args_list) == 3
-        assert aggregated["all_mb_metrics"]["draft_loss"] == pytest.approx(
-            [global_numerator / global_count]
+        aggregated_draft_loss = aggregated["all_mb_metrics"]["draft_loss"]
+        assert len(aggregated_draft_loss) == 1
+        assert aggregated_draft_loss[0].item() == pytest.approx(
+            global_numerator / global_count
         )
 
     def test_accumulates_draft_counts_across_streamed_chunks(self, mock_module_symbols):
