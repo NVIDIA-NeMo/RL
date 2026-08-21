@@ -19,7 +19,12 @@ import time
 
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
+from nemo_rl.algorithms.grpo import (
+    MasterConfig,
+    grpo_train,
+    setup,
+    shutdown_environments,
+)
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -104,83 +109,84 @@ def main() -> None:
         )
 
     # Initialise telemetry on the driver BEFORE init_ray() so the resolved
-    # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited
-    # by every worker. No-op unless nemo-lens is installed and telemetry is on.
+    # NEMO_RL_OTEL_* settings are snapshotted into the Ray runtime_env and
+    # inherited by every worker. No-op unless nemo-lens is installed and
+    # telemetry is on.
     init_telemetry_driver(config, algorithm="grpo")
 
+    with rl_init_timer.time("ray_connect"):
+        init_ray()
+
+    # setup tokenizer
+    with rl_init_timer.time("tokenizer"):
+        tokenizer = get_tokenizer(config.policy["tokenizer"])
+        assert config.policy["generation"] is not None, (
+            "A generation config is required for GRPO"
+        )
+        has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
+        megatron_cfg = config.policy.get("megatron_cfg") or {}
+        trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
+        config.policy["generation"] = configure_generation_config(
+            config.policy["generation"],
+            tokenizer,
+            has_refit_draft_weights=has_refit_draft_weights,
+            trains_mtp=trains_mtp,
+        )
+
+    # setup data
+    with rl_init_timer.time("data"):
+        dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
+            tokenizer, config.data, config.env
+        )
+
+    # Pick the policy factory at the launcher level so the legacy trainer
+    # stays data-plane-agnostic (architectural invariant — see
+    # tests/data_plane/unit/test_architecture_invariants.py).
+    _dp_cfg = config.data_plane or {}
+    if _dp_cfg.get("enabled", False):
+        from nemo_rl.models.policy.tq_policy import TQPolicy
+
+        def _make_policy(**kwargs):
+            return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
+
+        _policy_factory = _make_policy
+    else:
+        _policy_factory = None  # setup() defaults to plain Policy
+
+    with rl_init_timer.time("setup"):
+        (
+            policy,
+            policy_generation,
+            _nemo_gym,
+            cluster,
+            dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+            teacher_worker_groups,
+            alias_to_group_alias,
+        ) = setup(
+            config,
+            tokenizer,
+            dataset,
+            val_dataset,
+            policy_factory=_policy_factory,
+        )
+
+    rl_init_timer.record("total", time.perf_counter() - main_start)
+
+    rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
+    print("\n" + "=" * 60)
+    print(" " * 14 + "RL INIT TIMING BREAKDOWN")
+    for label, value in sorted(rl_init_metrics.items()):
+        if isinstance(value, (int, float)):
+            print(f"  {label}: {value:.1f}s")
+    print("=" * 60 + "\n", flush=True)
+
     try:
-        with rl_init_timer.time("ray_connect"):
-            init_ray()
-
-        # setup tokenizer
-        with rl_init_timer.time("tokenizer"):
-            tokenizer = get_tokenizer(config.policy["tokenizer"])
-            assert config.policy["generation"] is not None, (
-                "A generation config is required for GRPO"
-            )
-            has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
-            megatron_cfg = config.policy.get("megatron_cfg") or {}
-            trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
-            config.policy["generation"] = configure_generation_config(
-                config.policy["generation"],
-                tokenizer,
-                has_refit_draft_weights=has_refit_draft_weights,
-                trains_mtp=trains_mtp,
-            )
-
-        # setup data
-        with rl_init_timer.time("data"):
-            dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
-                tokenizer, config.data, config.env
-            )
-
-        # Pick the policy factory at the launcher level so the legacy trainer
-        # stays data-plane-agnostic (architectural invariant — see
-        # tests/data_plane/unit/test_architecture_invariants.py).
-        _dp_cfg = config.data_plane or {}
-        if _dp_cfg.get("enabled", False):
-            from nemo_rl.models.policy.tq_policy import TQPolicy
-
-            def _make_policy(**kwargs):
-                return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
-
-            _policy_factory = _make_policy
-        else:
-            _policy_factory = None  # setup() defaults to plain Policy
-
-        with rl_init_timer.time("setup"):
-            (
-                policy,
-                policy_generation,
-                _nemo_gym,
-                cluster,
-                dataloader,
-                val_dataloader,
-                loss_fn,
-                logger,
-                checkpointer,
-                grpo_state,
-                master_config,
-                teacher_worker_groups,
-                alias_to_group_alias,
-            ) = setup(
-                config,
-                tokenizer,
-                dataset,
-                val_dataset,
-                policy_factory=_policy_factory,
-            )
-
-        rl_init_timer.record("total", time.perf_counter() - main_start)
-
-        rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
-        print("\n" + "=" * 60)
-        print(" " * 14 + "RL INIT TIMING BREAKDOWN")
-        for label, value in sorted(rl_init_metrics.items()):
-            if isinstance(value, (int, float)):
-                print(f"  {label}: {value:.1f}s")
-        print("=" * 60 + "\n", flush=True)
-
         # Check if async mode is enabled
         if config.grpo.async_grpo.enabled:
             # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
@@ -248,9 +254,15 @@ def main() -> None:
                     master_config,
                 )
     finally:
-        # Flush on the failure paths too, and before cluster teardown: the OTel
-        # SDK's own atexit hook is registered ahead of Ray's and so runs after
-        # it. No-op when telemetry is inactive.
+        shutdown_environments(task_to_env, val_task_to_env)
+        try:
+            policy_generation.shutdown()
+        except Exception as error:
+            print(f"Error shutting down generation: {error}", flush=True)
+        # After the generation shutdown above, which is where the vLLM workers
+        # flush their own spans, and before Ray is torn down: the OTel SDK's
+        # atexit hook is registered ahead of Ray's, so it would otherwise run
+        # after it. No-op when telemetry is inactive.
         shutdown_telemetry()
 
 
