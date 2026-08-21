@@ -51,6 +51,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import reduce
+from queue import SimpleQueue
 from time import perf_counter
 from typing import Any, Callable, cast
 
@@ -139,14 +140,41 @@ class _PinTable:
 
     def unpin(self, base: int) -> None:
         """Drop one reference to ``base``; unregister and release it at zero."""
+        for dead in self.unpin_many([base]):
+            self._deregister([dead])
+
+    def unpin_many(self, bases: list[int]) -> list[tuple[int, Any]]:
+        """Drop one reference each; return the ``(base, storage)`` that hit zero.
+
+        Deliberately does *not* call the engine: ``ibv_dereg_mr`` is a syscall,
+        and doing it per base under this lock put it on ``clear``'s critical
+        path. The caller decides when to deregister — the storage rides along
+        because the allocation must stay alive until it does, or the allocator
+        could hand the address out while the NIC still maps it.
+        """
         with self._lock:
-            pin = self._pins.get(base)
-            if pin is None:
-                return
-            pin.refcount -= 1
-            if pin.refcount == 0:
-                del self._pins[base]
-                self._engine.unregister_memory(base)
+            dead: list[tuple[int, Any]] = []
+            for base in bases:
+                pin = self._pins.get(base)
+                if pin is None:
+                    continue
+                pin.refcount -= 1
+                if pin.refcount == 0:
+                    del self._pins[base]
+                    dead.append((base, pin.storage))
+            return dead
+
+    def _deregister(self, dead: list[tuple[int, Any]]) -> None:
+        """One batched ``ibv_dereg_mr`` for everything in ``dead``."""
+        if not dead:
+            return
+        status = self._engine.batch_unregister_memory([base for base, _ in dead])
+        if status is not None and status != 0:
+            logger.error(
+                "batch_unregister_memory of %d regions failed with status %s",
+                len(dead),
+                status,
+            )
 
     def unpin_all(self) -> None:
         """Unregister every region regardless of refcount; used on shutdown."""
@@ -160,6 +188,47 @@ class _PinTable:
         with self._lock:
             pin = self._pins.get(base)
             return pin.storage if pin is not None else None
+
+
+class _Deregistrar:
+    """Runs ``ibv_dereg_mr`` off the caller's thread, in batches.
+
+    Nothing waits on a deregistration — the data is already dead by the time
+    ``clear`` names it — so paying the syscall inline only lengthened the step
+    boundary. Correctness still needs the ordering: each allocation's strong
+    reference is held here until its region is actually unregistered, so the
+    caching allocator cannot reissue an address the NIC still maps.
+    """
+
+    def __init__(self, deregister: Callable[[list[tuple[int, Any]]], None]) -> None:
+        self._deregister = deregister
+        self._pending: SimpleQueue[list[tuple[int, Any]] | None] = SimpleQueue()
+        self._thread = threading.Thread(
+            target=self._drain, name="tq-register-dereg", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, dead: list[tuple[int, Any]]) -> None:
+        """Hand over regions to unregister; returns immediately."""
+        if dead:
+            self._pending.put(dead)
+
+    def _drain(self) -> None:
+        while True:
+            batch = self._pending.get()
+            if batch is None:
+                return
+            try:
+                self._deregister(batch)
+            except Exception:
+                logger.exception(
+                    "deferred deregistration of %d regions failed", len(batch)
+                )
+
+    def close(self) -> None:
+        """Finish every outstanding deregistration, then stop."""
+        self._pending.put(None)
+        self._thread.join(timeout=10)
 
 
 class _ReleaseChannel:
@@ -220,8 +289,12 @@ class _ReleaseChannel:
                     "register-mode release of %d keys failed", len(payload)
                 )
 
-    def send(self, ip: str, port: int, keys: list[tuple[str, int]]) -> None:
-        """Ask the client at ``ip:port`` to release ``keys``. Never blocks."""
+    def connect(self, ip: str, port: int) -> zmq.Socket:
+        """Get (or open) the socket to a peer. Idempotent, so callers can warm it.
+
+        ``get`` already knows every peer it read from, and connecting there
+        keeps TCP setup out of ``clear``, which is on the step boundary.
+        """
         address = format_zmq_address(ip, port)
         with self._senders_lock:
             sender = self._senders.get(address)
@@ -232,11 +305,16 @@ class _ReleaseChannel:
                 sender.setsockopt(zmq.LINGER, 0)
                 sender.connect(address)
                 self._senders[address] = sender
+            return sender
+
+    def send(self, ip: str, port: int, keys: list[tuple[str, int]]) -> None:
+        """Ask the client at ``ip:port`` to release ``keys``. Never blocks."""
+        sender = self.connect(ip, port)
         try:
             sender.send(json.dumps(keys).encode())
         except zmq.ZMQError as e:
             # The producer is gone, so its registrations died with it.
-            logger.debug("release to %s dropped (%s); owner is gone", address, e)
+            logger.debug("release to %s dropped (%s); owner is gone", ip, e)
 
     def close(self) -> None:
         """Stop serving and drop every socket."""
@@ -368,6 +446,7 @@ class TransferEngineClient(StorageKVClient):
         self._published_seq = 0
         self._published_lock = threading.Lock()
         self._release = _ReleaseChannel(self.local_hostname, self._release_keys)
+        self._dereg = _Deregistrar(self._pins._deregister)
         # The one line that says which path this process actually took: without
         # it a GDR client that silently fell back to host receive buffers looks
         # identical in the logs to one that did not.
@@ -578,6 +657,7 @@ class TransferEngineClient(StorageKVClient):
                 "registrations to release."
             )
 
+        started = perf_counter()
         mine: list[tuple[str, int]] = []
         remote: dict[tuple[str, int], list[tuple[str, int]]] = defaultdict(list)
         for key, meta in zip(keys, custom_backend_meta, strict=True):
@@ -589,14 +669,32 @@ class TransferEngineClient(StorageKVClient):
                 host = meta["endpoint"].rsplit(":", 1)[0]
                 remote[(host, meta["release_port"])].append((key, meta["seq"]))
 
+        local_started = perf_counter()
         self._release_keys(mine)
+        sent_started = perf_counter()
         for (host, port), owned in remote.items():
             self._release.send(host, port, owned)
+        finished = perf_counter()
+        logger.info(
+            "register_mode clear: total=%dus local=%dus send=%dus "
+            "keys=%d (mine=%d forwarded=%d) owners=%d pinned_keys=%d",
+            (finished - started) * 1e6,
+            (sent_started - local_started) * 1e6,
+            (finished - sent_started) * 1e6,
+            len(keys),
+            len(mine),
+            len(keys) - len(mine),
+            len(remote),
+            self.pinned_keys,
+        )
 
     def close(self) -> None:
         """Stop serving releases, unregister every published region, drop the engine."""
         if self._engine is not None:
             self._release.close()
+            # Drains first: unpin_all deregisters everything still held, and a
+            # queued batch naming the same regions must not race it.
+            self._dereg.close()
             self._pins.unpin_all()
             with self._published_lock:
                 self._published.clear()
@@ -630,8 +728,12 @@ class TransferEngineClient(StorageKVClient):
         if superseded is not None:
             # Re-publishing a key TQ never cleared: the old value is dead the
             # moment the new one lands, and dropping its reference here is what
-            # keeps an upsert from leaking a registration.
-            self._pins.unpin(superseded[0])
+            # keeps an upsert from leaking a registration. Deferred like every
+            # other release, so an upsert does not pay ibv_dereg_mr inline on
+            # the put path. (When both publications share a base — the common
+            # case, since the allocator reuses blocks — the refcount simply
+            # goes 2 -> 1 and nothing is deregistered.)
+            self._dereg.submit(self._pins.unpin_many([superseded[0]]))
         return {
             "endpoint": self._endpoint,
             "base": base,
@@ -644,7 +746,12 @@ class TransferEngineClient(StorageKVClient):
         }
 
     def _release_keys(self, versioned_keys: list[tuple[str, int]]) -> None:
-        """Unpin the named publications. A replay or a duplicate is a no-op."""
+        """Unpin the named publications. A replay or a duplicate is a no-op.
+
+        Accounting is synchronous, so ``pinned_keys`` is exact the moment this
+        returns; the ``ibv_dereg_mr`` it implies is handed to a background
+        thread, since nothing waits on it.
+        """
         bases: list[int] = []
         with self._published_lock:
             for key, seq in versioned_keys:
@@ -652,8 +759,7 @@ class TransferEngineClient(StorageKVClient):
                 if published is not None and published[1] == seq:
                     bases.append(published[0])
                     del self._published[key]
-        for base in bases:
-            self._pins.unpin(base)
+        self._dereg.submit(self._pins.unpin_many(bases))
 
     def _fetch_group(
         self,
@@ -686,6 +792,12 @@ class TransferEngineClient(StorageKVClient):
 
         local = groups.pop(self._endpoint, [])
         remote = bool(groups)
+
+        # Open the release socket to every peer we are about to read from, so
+        # the eventual clear does not pay TCP setup on the step boundary.
+        for endpoint, indices in groups.items():
+            meta = metas[indices[0]]
+            self._release.connect(endpoint.rsplit(":", 1)[0], meta["release_port"])
 
         if remote:
             # The engine can only write into registered memory, so the receive

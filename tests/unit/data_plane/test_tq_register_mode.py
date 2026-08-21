@@ -146,6 +146,16 @@ def _get_args(rows: list[torch.Tensor], meta: list[dict]) -> dict[str, Any]:
     }
 
 
+def _wait_until(predicate, timeout: float = 5.0) -> bool:
+    """Poll ``predicate`` — releases cross a socket, so they are not synchronous."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
 def test_put_publishes_row_addresses_without_copying():
     client = _make_client()
     batch, rows = _batch_rows()
@@ -214,19 +224,13 @@ def test_clear_releases_the_registration_once_every_key_is_gone():
     client.clear(keys[:-1], custom_backend_meta=meta[:-1])
     # Rows share one registration; it survives until the last key is cleared.
     assert len(client._engine.registered) == 1
+    assert client.pinned_keys == 1
 
     client.clear(keys[-1:], custom_backend_meta=meta[-1:])
-    assert client._engine.registered == {}
-
-
-def _wait_until(predicate, timeout: float = 5.0) -> bool:
-    """Poll ``predicate`` — releases cross a socket, so they are not synchronous."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.02)
-    return predicate()
+    # Accounting is synchronous; the ibv_dereg_mr it implies is not — it runs
+    # off the step boundary, so the registration clears a moment later.
+    assert client.pinned_keys == 0
+    assert _wait_until(lambda: client._engine.registered == {})
 
 
 def test_clear_by_a_consumer_releases_the_producers_registration():
@@ -294,10 +298,14 @@ def test_republishing_a_key_releases_the_value_it_replaced():
     assert len(producer._engine.registered) == 1
     producer.put(keys, [second])
 
-    # One live publication, so one registration — not two.
+    # One live publication, so one registration — not two. The superseded
+    # region's ibv_dereg_mr is deferred like every other release, so the old
+    # entry disappears a moment after the put returns.
     assert producer.pinned_keys == 1
-    assert len(producer._engine.registered) == 1
-    assert list(producer._engine.registered) == [second.untyped_storage().data_ptr()]
+    assert _wait_until(
+        lambda: list(producer._engine.registered)
+        == [second.untyped_storage().data_ptr()]
+    )
 
 
 def test_release_to_a_departed_owner_does_not_block():
