@@ -73,60 +73,63 @@ def main() -> None:
     # by every worker. No-op unless nemo-lens is installed and telemetry is on.
     init_telemetry_driver(config, algorithm="distillation")
 
-    init_ray()
+    try:
+        init_ray()
 
-    tokenizer = get_tokenizer(config.policy["tokenizer"])
+        tokenizer = get_tokenizer(config.policy["tokenizer"])
 
-    if config.policy["generation"] is not None:
-        config.policy["generation"] = configure_generation_config(
-            config.policy["generation"], tokenizer
-        )
-    else:
-        print("  ⚠️ No generation config found, this may cause issues")
+        if config.policy["generation"] is not None:
+            config.policy["generation"] = configure_generation_config(
+                config.policy["generation"], tokenizer
+            )
+        else:
+            print("  ⚠️ No generation config found, this may cause issues")
 
-    # setup data
-    (
-        dataset,
-        val_dataset,
-        task_to_env,
-        val_task_to_env,
-    ) = setup_response_data(tokenizer, config.data, config.env)
+        # setup data
+        (
+            dataset,
+            val_dataset,
+            task_to_env,
+            val_task_to_env,
+        ) = setup_response_data(tokenizer, config.data, config.env)
 
-    (
-        student_policy,
-        teacher_policy,
-        student_generation,
-        _nemo_gym,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        distillation_state,
-        master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
-
-    # The checkpointer owns background async-checkpoint finalization threads;
-    # the context manager guarantees they are flushed (rename + delete) on exit.
-    with checkpointer:
-        distillation_train(
+        (
             student_policy,
             teacher_policy,
             student_generation,
+            _nemo_gym,
             dataloader,
             val_dataloader,
-            tokenizer,  # pass tokenizer parameter
             loss_fn,
-            task_to_env,
-            val_task_to_env,
             logger,
             checkpointer,
             distillation_state,
             master_config,
-        )
+        ) = setup(config, tokenizer, dataset, val_dataset)
 
-    # Flush and shut down telemetry (no-op when telemetry is inactive).
-    shutdown_telemetry()
+        # The checkpointer owns background async-checkpoint finalization threads;
+        # the context manager guarantees they are flushed (rename + delete) on exit.
+        with checkpointer:
+            distillation_train(
+                student_policy,
+                teacher_policy,
+                student_generation,
+                dataloader,
+                val_dataloader,
+                tokenizer,  # pass tokenizer parameter
+                loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                distillation_state,
+                master_config,
+            )
+    finally:
+        # Flush on the failure paths too, and before cluster teardown: the OTel
+        # SDK's own atexit hook is registered ahead of Ray's and so runs after
+        # it. No-op when telemetry is inactive.
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":

@@ -84,65 +84,68 @@ def main() -> None:
     # by every worker. No-op unless nemo-lens is installed and telemetry is on.
     init_telemetry_driver(config, algorithm="ppo")
 
-    init_ray()
+    try:
+        init_ray()
 
-    # setup tokenizer
-    tokenizer = get_tokenizer(config.policy["tokenizer"])
-    assert config.policy["generation"] is not None, (
-        "A generation config is required for PPO"
-    )
-    config.policy["generation"] = configure_generation_config(
-        config.policy["generation"], tokenizer
-    )
+        # setup tokenizer
+        tokenizer = get_tokenizer(config.policy["tokenizer"])
+        assert config.policy["generation"] is not None, (
+            "A generation config is required for PPO"
+        )
+        config.policy["generation"] = configure_generation_config(
+            config.policy["generation"], tokenizer
+        )
 
-    # setup data
-    (
-        dataset,
-        val_dataset,
-        task_to_env,
-        val_task_to_env,
-    ) = setup_response_data(tokenizer, config.data, config.env)
+        # setup data
+        (
+            dataset,
+            val_dataset,
+            task_to_env,
+            val_task_to_env,
+        ) = setup_response_data(tokenizer, config.data, config.env)
 
-    (
-        policy,
-        policy_generation,
-        value_model,
-        cluster,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        value_loss_fn,
-        logger,
-        checkpointer,
-        ppo_state,
-        master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
-
-    print("🚀 Running synchronous PPO training")
-
-    # Run standard PPO training. The checkpointer owns background
-    # async-checkpoint finalization threads; the context manager guarantees they
-    # are flushed (rename + delete) on exit.
-    with checkpointer:
-        ppo_train(
+        (
             policy,
             policy_generation,
             value_model,
+            cluster,
             dataloader,
             val_dataloader,
-            tokenizer,
             loss_fn,
             value_loss_fn,
-            task_to_env,
-            val_task_to_env,
             logger,
             checkpointer,
             ppo_state,
             master_config,
-        )
+        ) = setup(config, tokenizer, dataset, val_dataset)
 
-    # Flush and shut down telemetry (no-op when telemetry is inactive).
-    shutdown_telemetry()
+        print("🚀 Running synchronous PPO training")
+
+        # Run standard PPO training. The checkpointer owns background
+        # async-checkpoint finalization threads; the context manager guarantees they
+        # are flushed (rename + delete) on exit.
+        with checkpointer:
+            ppo_train(
+                policy,
+                policy_generation,
+                value_model,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                value_loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                ppo_state,
+                master_config,
+            )
+    finally:
+        # Flush on the failure paths too, and before cluster teardown: the OTel
+        # SDK's own atexit hook is registered ahead of Ray's and so runs after
+        # it. No-op when telemetry is inactive.
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":

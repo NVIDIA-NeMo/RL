@@ -56,6 +56,19 @@ class TelemetryConfig(BaseModel, extra="allow"):
     export_rank: int = -1
     """For ``single_rank``: which rank exports (``-1`` = last rank)."""
 
+    export_sample_rate: float = 1.0
+    """For ``sampled``: fraction of worker ranks that export, in ``[0.0, 1.0]``.
+    Also the sampling rate used by the span sampler when ``sampler_enabled`` is
+    true. ``1.0`` means every rank considered by the strategy exports."""
+
+    sampler_enabled: bool = False
+    """Enable lens's rank-aware span sampler on the TracerProvider. It drops
+    spans at the SDK level — cheaper than exporting and filtering downstream —
+    and decides all-or-nothing per rank, from a hash of the rank against
+    ``export_sample_rate``. This is a *second*, independent filter: a rank has
+    to pass both it and ``export_strategy`` to emit anything. The driver and
+    singleton actors are exempt from both, having no real rank."""
+
     traces_enabled: bool = True
     """Emit trace spans."""
 

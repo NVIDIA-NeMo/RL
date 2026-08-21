@@ -2,10 +2,6 @@
 
 To add new spans or metrics to NeMo-RL code, use the instrumentation primitives from nemo-lens (`managed_span`, `trace_fn`, `span_cm`). The primitives themselves are documented in [lens: instrumentation](https://github.com/NVIDIA-NeMo/Lens); this page covers NeMo-RL conventions.
 
-```{tip}
-If you work in this repo with Claude Code, the `add-span-group` skill (new span group), the `new-instrument` lens skill (new `rl.*` metric), and the `instrumentation-site-helper` agent (new span/metric site) automate the steps below and keep the cross-repo fallback contract in sync. They are optional — everything here can be done by hand.
-```
-
 ## The import / fallback pattern
 
 Every algorithm instrumentation import should go through
@@ -14,7 +10,7 @@ Every algorithm instrumentation import should go through
 fallbacks in `_fallbacks.py` (which re-exports nemo-lens when installed):
 
 ```python
-from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import Bucket, bucket_scope, managed_span, trace_fn
 from nemo_rl.telemetry.setup import get_telemetry
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 ```
@@ -41,8 +37,43 @@ with managed_span(
     ...
 ```
 
+To reclassify spans opened *below* you — where the callee cannot tell why it was
+called — wrap the region in `bucket_scope` instead. Validation uses this so its
+generation counts as `overhead` rather than goodput:
+
+```python
+from nemo_rl.telemetry.instrumentation import Bucket, bucket_scope
+
+with bucket_scope(Bucket.OVERHEAD):
+    ...  # every leaf span in here is tagged overhead
+```
+
+Umbrellas stay unbucketed inside a scope, and an explicit `rl.bucket=` still
+wins, so a scope cannot make a parent double-count its children. See
+[span groups](span-groups.md).
+
 When adding a **new** span group, update `_DEFAULT_GROUP_BUCKET` /
 `UMBRELLA_GROUPS` in `instrumentation.py` and extend `test_instrumentation.py`.
+
+## Instrumenting inside a Ray actor
+
+Two things that are easy to get wrong, because both fail silently as no-ops
+rather than as errors.
+
+The actor needs its own providers: call `init_telemetry_worker()` in its
+`__init__` (not `post_init`, which some fan-outs run on one rank per group), and
+flush before it dies. An actor reaped with `ray.kill` runs no `atexit` handler,
+so expose a method that calls `shutdown_telemetry()` and have the driver call it
+first — `AsyncTrajectoryCollector.flush_telemetry` is the worked example.
+
+Ray does not propagate OTel context, so the actor's spans form their own trace
+unless you carry the parent across. On the driver, inside the span that should
+be the root, capture `current_trace_carrier()` and pass it to the actor; in the
+actor, wrap the work in `remote_trace_context(carrier)`. Reattach in **every
+thread** the actor spawns — OTel context is a `ContextVar` and threads inherit
+none — and note the carrier is empty (a harmless no-op) whenever the driver's
+enclosing group is disabled. See
+[span groups](span-groups.md#getting-the-collector-into-one-waterfall).
 
 ## Adding a span
 
@@ -108,17 +139,20 @@ Pick from `RLSpanGroup` before inventing a new one:
 If nothing fits, add a group to `RLSpanGroup` in `nemo_rl/telemetry/span_groups.py`:
 
 1. Add the constant, add it to `ALL_GROUPS`, and slot it into the right preset(s) in `_PRESETS`. Decide per preset: `default` is coarse (rarely add here); `per_step` for per-step spans; `all` always includes it.
-2. **Update the fallback stub** in the same file — the stub `SpanGroup` used when nemo-lens is absent must keep the same constants and presets in lockstep.
-3. Document the new group in [Span Groups](span-groups.md).
+2. **Leave the fallback stub alone.** The stub `SpanGroup` in that file mirrors only lens's *base* groups and presets, for when nemo-lens is absent; `RLSpanGroup` overrides both `ALL_GROUPS` and `_PRESETS`, so an RL group belongs there and nowhere else. Touch the stub only when lens's own base contract changes.
+3. Document the new group in [Span Groups](span-groups.md), and add it to `EMITTED_GROUPS` in `tests/unit/telemetry/test_span_groups.py` so the preset-reachability test covers it.
 
-The `add-span-group` skill walks these steps and keeps the base-class contract (shared with lens and the other consumers) consistent.
+Keep the base-class contract — shared with lens and its other consumers — consistent when you do this.
 
 ## Adding a metric
 
 The `rl.*` gauges are populated by teeing `Logger.log_metrics` (see [Metrics](metrics.md)) — not by scattering `record_rl_metrics()` calls. So there are two cases:
 
-- **The scalar already flows through `Logger.log_metrics`** under a `train` prefix but isn't teed. Add a candidate key (or a new field) to `_RL_OTEL_METRIC_MAP` in `nemo_rl/telemetry/metrics.py`, and add the matching field to `record_rl_metrics` in lens's `nemo.lens.instruments.rl`.
+- **The scalar already flows through `Logger.log_metrics`** but isn't teed. Add a candidate key (or a new field) to the map for the prefix that dict is logged under — `_RL_OTEL_METRIC_MAP` for `train`/`""`, `_PERFORMANCE_OTEL_METRIC_MAP` for `performance` — in `nemo_rl/telemetry/metrics.py`, and add the matching field to `record_rl_metrics` in lens's `nemo.lens.instruments.rl`. Check where the dict is actually logged: a candidate under the wrong prefix compiles, passes review, and never fires. If the metric arrives under a third prefix, add that prefix to the dispatch in `tee_rl_metrics_to_otel` with its own map.
 - **You need a brand-new instrument** (a new counter/gauge/histogram, or a value that doesn't go through the Logger). Add it to `nemo.lens.instruments.rl` following the per-Meter `WeakKeyDictionary` caching pattern, then record it from the driver via `telemetry.meter`. The `new-instrument` lens skill covers this.
+- **The series is keyed by a NeMo-RL-specific label set** rather than a fixed field — e.g. one value per efficiency category. `record_rl_metrics` takes fixed keyword fields, so a growing label set doesn't fit it. Define the instrument in `nemo_rl/telemetry/metrics.py` instead (same per-Meter caching pattern) and emit **one dimensioned instrument** with the label as an attribute, not one instrument per label. `rl.efficiency.seconds` is the worked example. This also avoids gating the feature on a lens release.
+
+Prefer an attribute over a name whenever the label set can grow: `rl.efficiency.seconds{rl.efficiency.category="idle/refit_bubble"}` stays stable as categories come and go, while `rl.efficiency.idle_refit_bubble_seconds` forces an instrument change per category. Keep attribute cardinality bounded — a per-step or per-request value belongs on a span, not a metric label.
 
 Keep `rl.<subsystem>.<metric>` naming and record only non-`None` values. See [lens: metrics](https://github.com/NVIDIA-NeMo/Lens).
 

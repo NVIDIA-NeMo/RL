@@ -18,41 +18,32 @@ Tries to import the real ``SpanGroup`` from ``nemo.lens``; falls back to a
 minimal stub so that NeMo-RL works without nemo-lens installed.
 """
 
-from typing import ClassVar, Final
+from typing import TYPE_CHECKING, ClassVar, Final
 
-try:
+# The real and stub SpanGroup are kept in mutually exclusive branches: declaring
+# both unconditionally makes the name a union, which pyrefly rejects as a base
+# class for RLSpanGroup below (invalid-inheritance).
+if TYPE_CHECKING:
     from nemo.lens.groups import SpanGroup
-except ImportError:
-    # TODO(ahmadki): SpanGroups will move from nemo-lens to downstream,
-    # so this stub will be removed in the future.
-    class SpanGroup:  # type: ignore[no-redef]
-        """Minimal stub used when nemo-lens is not installed."""
+else:
+    try:
+        from nemo.lens.groups import SpanGroup
+    except ImportError:
+        # TODO(ahmadki): SpanGroups will move from nemo-lens to downstream,
+        # so this stub will be removed in the future.
+        class SpanGroup:
+            """Minimal stub used when nemo-lens is not installed."""
 
-        JOB = "job"
-        CHECKPOINT = "checkpoint"
-        EVALUATE = "evaluate"
-        MODEL_INIT = "model_init"
-        LOAD_CHECKPOINT = "load_checkpoint"
-        STEP = "step"
-        FORWARD_BACKWARD = "forward_backward"
-        OPTIMIZER = "optimizer"
+            JOB = "job"
+            CHECKPOINT = "checkpoint"
+            EVALUATE = "evaluate"
+            MODEL_INIT = "model_init"
+            LOAD_CHECKPOINT = "load_checkpoint"
+            STEP = "step"
+            FORWARD_BACKWARD = "forward_backward"
+            OPTIMIZER = "optimizer"
 
-        ALL_GROUPS: Final[frozenset] = frozenset(
-            [
-                JOB,
-                CHECKPOINT,
-                EVALUATE,
-                MODEL_INIT,
-                LOAD_CHECKPOINT,
-                STEP,
-                FORWARD_BACKWARD,
-                OPTIMIZER,
-            ]
-        )
-
-        _PRESETS: ClassVar[dict] = {
-            "default": frozenset([JOB, CHECKPOINT, EVALUATE]),
-            "per_step": frozenset(
+            ALL_GROUPS: Final[frozenset] = frozenset(
                 [
                     JOB,
                     CHECKPOINT,
@@ -63,16 +54,31 @@ except ImportError:
                     FORWARD_BACKWARD,
                     OPTIMIZER,
                 ]
-            ),
-            "all": ALL_GROUPS,
-        }
-
-        @classmethod
-        def resolve(cls, spec: str) -> frozenset:
-            raise RuntimeError(
-                "SpanGroup.resolve() requires nemo-lens. "
-                "Install it with: uv sync --extra telemetry"
             )
+
+            _PRESETS: ClassVar[dict] = {
+                "default": frozenset([JOB, CHECKPOINT, EVALUATE]),
+                "per_step": frozenset(
+                    [
+                        JOB,
+                        CHECKPOINT,
+                        EVALUATE,
+                        MODEL_INIT,
+                        LOAD_CHECKPOINT,
+                        STEP,
+                        FORWARD_BACKWARD,
+                        OPTIMIZER,
+                    ]
+                ),
+                "all": ALL_GROUPS,
+            }
+
+            @classmethod
+            def resolve(cls, spec: str) -> frozenset:
+                raise RuntimeError(
+                    "SpanGroup.resolve() requires nemo-lens. "
+                    "Install it with: uv sync --extra telemetry"
+                )
 
 
 class RLSpanGroup(SpanGroup):
@@ -106,6 +112,14 @@ class RLSpanGroup(SpanGroup):
     DATA_PROCESSING = "data_processing"
     """Data processing / batching spans."""
 
+    EFFICIENCY = "efficiency"
+    """Async efficiency phases (idle / wasted accounting).
+
+    Unlike the other leaf groups these do not have one fixed bucket — the
+    ``rl.bucket`` comes from the category, so emit them via
+    ``instrumentation.efficiency_span``.
+    """
+
     # ------------------------------------------------------------------ #
     # All groups and presets
     # ------------------------------------------------------------------ #
@@ -120,6 +134,7 @@ class RLSpanGroup(SpanGroup):
             POLICY_UPDATE,
             REFERENCE_POLICY,
             DATA_PROCESSING,
+            EFFICIENCY,
         ]
     )
 
@@ -139,6 +154,11 @@ class RLSpanGroup(SpanGroup):
             [
                 SpanGroup.CHECKPOINT,
                 SpanGroup.EVALUATE,
+                # rl.vllm.load_model is the only span in this group, and it was
+                # otherwise reachable from "all" alone -- so the one phase that
+                # explains a slow start was invisible in both presets a user is
+                # likely to pick.
+                SpanGroup.MODEL_INIT,
                 SpanGroup.STEP,
                 ROLLOUT,
                 GENERATION,
@@ -148,6 +168,9 @@ class RLSpanGroup(SpanGroup):
                 POLICY_UPDATE,
                 REFERENCE_POLICY,
                 DATA_PROCESSING,
+                # Included here because idle time is what makes a per-step
+                # goodput breakdown add up to the step duration.
+                EFFICIENCY,
             ]
         ),
         "all": ALL_GROUPS,

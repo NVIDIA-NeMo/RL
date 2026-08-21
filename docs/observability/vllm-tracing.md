@@ -16,6 +16,8 @@ Generation is where most of an RL step's wall-clock goes, so NeMo-RL instruments
 
 Because these are ordinary lens spans, they travel the same OTLP transport as everything else — including a direct-to-backend `http/protobuf` export path. **Nothing extra is required**: enable the `generation` group (it is in the `per_step` and `all` presets) and they appear.
 
+This covers the synchronous rollout path only. Async runs drive generation through `generate_async`, which carries no span today, so Layer 1 shows no generate spans there — and the `rl.grpo.collect_rollouts` span they would nest under comes from the collector actor rather than the driver. See [span groups — coverage gaps](span-groups.md#coverage-gaps).
+
 ## Layer 2 — vLLM native OTLP tracing (opt-in)
 
 vLLM can emit its own OpenTelemetry spans for the engine internals. Enable it with:

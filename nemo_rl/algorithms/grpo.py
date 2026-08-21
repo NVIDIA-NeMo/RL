@@ -57,6 +57,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
+    WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
     log_generation_metrics_to_wandb,
@@ -144,7 +145,14 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
-from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import (
+    Bucket,
+    bucket_scope,
+    current_trace_carrier,
+    efficiency_span,
+    managed_span,
+    trace_fn,
+)
 
 from nemo_rl.telemetry.setup import get_telemetry
 from nemo_rl.telemetry.span_groups import RLSpanGroup
@@ -3933,6 +3941,15 @@ def validate(
             tracer=_tracer,
             **{"rl.step": step},
         ),
+        # Validation generates through the same path as training rollouts, but
+        # its tokens are scored and thrown away — no weights advance. Without
+        # this the generate spans below land in productive and a validation
+        # pass reads as goodput. Effective on the sync rollout path, which is
+        # where those spans exist; async validation goes through
+        # generate_async, which carries no span yet (see the coverage gaps in
+        # nemo_rl/telemetry/README.md). The scope is set regardless so it
+        # applies as soon as that path is instrumented.
+        bucket_scope(Bucket.OVERHEAD),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
         # >= 1 is validated in setup().
@@ -4380,8 +4397,15 @@ def async_grpo_train(
             **os.environ,
             "VIRTUAL_ENV": _tc_py_venv,
             "UV_PROJECT_ENVIRONMENT": _tc_py_venv,
+            # Names this actor's spans the way RayWorkerGroup names its groups'.
+            "NRL_WORKER_GROUP": "trajectory_collector",
         },
     }
+
+    # Captured inside rl.grpo.job, so the collector's spans join this run's
+    # trace instead of starting their own roots. Empty unless the job group is
+    # enabled (per_step omits it) — see docs/observability/span-groups.md.
+    _tc_trace_carrier = current_trace_carrier()
 
     # Initialize trajectory collector with synchronized collection
     trajectory_collector = AsyncTrajectoryCollector.options(
@@ -4398,6 +4422,7 @@ def async_grpo_train(
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
         next_nemo_gym_task_index=next_nemo_gym_task_index,
         processor=processor,
+        trace_carrier=_tc_trace_carrier,
     )
 
     # Start trajectory collection in background
@@ -4407,6 +4432,25 @@ def async_grpo_train(
     trajectory_collector.set_weight_version.remote(weight_version)
 
     print("📦 Started continuous background trajectory collection")
+
+    def _flush_collector_telemetry() -> None:
+        """Export the collector's buffered spans before the actor is reaped.
+
+        ``ray.kill`` runs no atexit handler, so whatever the span processor has
+        not sent yet goes with the actor -- including the last rollout batches
+        of the run. Every path that reaps the collector needs this, not only the
+        normal one, and collection is already running by the time this is
+        defined. The timeout covers the callee's quiesce budget *plus* its 5s
+        export; too short and it gives up mid-export, dropping the very spans
+        it exists to save.
+        """
+        try:
+            ray.get(
+                trajectory_collector.flush_telemetry.remote(quiesce_timeout_s=3.0),
+                timeout=15,
+            )
+        except Exception as e:
+            print(f"Error flushing trajectory collector telemetry: {e}")
 
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, "
@@ -4430,6 +4474,7 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
+            _flush_collector_telemetry()
             return
     else:
         print("🔄 Preparing policy generation for inference...")
@@ -4441,6 +4486,7 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
+            _flush_collector_telemetry()
             return
 
     print("✅ Policy generation setup complete, proceeding to validation...")
@@ -4502,6 +4548,7 @@ def async_grpo_train(
             # generation; the remaining actors are reaped when the driver
             # exits right after this return.
             checkpointer.shutdown()
+            _flush_collector_telemetry()
             try:
                 ray.kill(trajectory_collector)
             except Exception as e:
@@ -4594,7 +4641,9 @@ def async_grpo_train(
         wait_iterations += 1
         time.sleep(1.0)
 
-    timer.stop("init/total")
+    # Retained because the per-step timer.reset() below discards it; the
+    # efficiency snapshot re-supplies it every step.
+    init_total_s = timer.stop("init/total")
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
@@ -4715,7 +4764,10 @@ def async_grpo_train(
                                 f"Increase data.train.max_num_epochs or use a larger dataset."
                             )
 
-                        with timer.time("idle/buffer_starvation"):
+                        with (
+                            timer.time("idle/buffer_starvation"),
+                            efficiency_span("idle/buffer_starvation", tracer=_tracer),
+                        ):
                             time.sleep(0.5)
                         continue
 
@@ -5024,36 +5076,42 @@ def async_grpo_train(
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
                 if NEED_REFIT:
-                    timer.start("idle/refit_bubble")
-
-                    # Measure pending-generation wait as exposed_generation time
-                    print("🔄 Coordinating with trajectory collector before refit...")
-                    with timer.time("exposed_generation"):
-                        ray.get(trajectory_collector.prepare_for_refit.remote())
-
-                    # Collect generation logger metrics for performance reporting
-                    # inflight batch sizes and num pending samples are collected from each worker
-                    if policy_generation is not None:
-                        generation_logger_metrics = (
-                            policy_generation.get_logger_metrics()
+                    # A context manager rather than start/stop, so the timer is
+                    # stopped and the span closed even if the refit raises.
+                    with (
+                        timer.time("idle/refit_bubble"),
+                        efficiency_span("idle/refit_bubble", tracer=_tracer),
+                    ):
+                        # Measure pending-generation wait as exposed_generation time
+                        print(
+                            "🔄 Coordinating with trajectory collector before refit..."
                         )
+                        with timer.time("exposed_generation"):
+                            ray.get(trajectory_collector.prepare_for_refit.remote())
 
-                    # Only the actual refit/weight transfer should be counted as weight_sync
-                    print("🔄 Performing policy generation refit...")
-                    with timer.time("weight_sync"):
-                        refit_metrics = refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
-                        )
-                        POLICY_GENERATION_STALE = False
+                        # Collect generation logger metrics for performance reporting
+                        # inflight batch sizes and num pending samples are collected from each worker
+                        if policy_generation is not None:
+                            generation_logger_metrics = (
+                                policy_generation.get_logger_metrics()
+                            )
 
-                        # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
-                        weight_version += 1
-                        trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
+                        # Only the actual refit/weight transfer should be counted as weight_sync
+                        print("🔄 Performing policy generation refit...")
+                        with timer.time("weight_sync"):
+                            refit_metrics = refit_policy_generation(
+                                policy,
+                                policy_generation,
+                                colocated_inference,
+                            )
+                            POLICY_GENERATION_STALE = False
 
-                    timer.stop("idle/refit_bubble")
+                            # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
+                            weight_version += 1
+                            trajectory_collector.set_weight_version.remote(
+                                weight_version
+                            )
+                            trajectory_collector.resume_after_refit.remote()
 
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:
@@ -5085,6 +5143,13 @@ def async_grpo_train(
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if should_run_validation:
+                    # Timer only, no efficiency_span: validate() accounts this
+                    # window as overhead (see the bucket_scope in validate), so
+                    # an idle-bucketed span over the same interval would both
+                    # contradict that label and, on the sync rollout path where
+                    # the generate spans below carry it, be double-counted by a
+                    # rollup that sums durations by rl.bucket. The metric has no
+                    # such hierarchy and stays correct.
                     with timer.time("idle/validation"):
                         if NEED_REFIT and POLICY_GENERATION_STALE:
                             refit_metrics = refit_policy_generation(
@@ -5438,21 +5503,28 @@ def async_grpo_train(
             )
             driver_efficiency = {
                 cat: timer.reduce(cat, "sum")
-                for cat in [
-                    "init/total",
-                    "idle/buffer_starvation",
-                    "idle/refit_bubble",
-                    "idle/validation",
-                ]
+                for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES
                 if cat in timer._timers
             }
+            # init/total is measured once, before the loop, and the timer.reset()
+            # at the end of every step drops it -- so re-supply the captured
+            # value, or the series reports the real startup cost at step 1 and
+            # zero for the rest of the run.
+            driver_efficiency["init/total"] = init_total_s
             merged_efficiency = {**driver_efficiency}
             for cat, dur in collector_efficiency.items():
                 merged_efficiency[cat] = merged_efficiency.get(cat, 0.0) + dur
 
             total_wall_time = time.perf_counter() - training_wall_start
             efficiency_loggable = print_efficiency_summary(
-                merged_efficiency, total_wall_time, step + 1
+                merged_efficiency,
+                total_wall_time,
+                step + 1,
+                # The driver's idle categories are per-step (timer.reset()
+                # below), so the efficiency ratio needs a per-step denominator;
+                # against the run's elapsed time it would climb toward 100%
+                # whatever the idle time did.
+                step_wall_time_s=total_time,
             )
 
             if master_config.grpo.debug_payload_metrics and not should_run_validation:
@@ -5511,6 +5583,7 @@ def async_grpo_train(
 
         # Clean up
         print("🛑 Stopping trajectory collection...")
+        _flush_collector_telemetry()
         try:
             ray.kill(trajectory_collector)
         except Exception as e:
