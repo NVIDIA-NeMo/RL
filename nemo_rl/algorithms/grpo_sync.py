@@ -1266,7 +1266,10 @@ def grpo_train_sync(
                 del log_data
 
             timing_metrics: dict = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
-            if metrics["token_mult_prob_error"] > 1.05:
+            if (
+                "token_mult_prob_error" in metrics
+                and metrics["token_mult_prob_error"] > 1.05
+            ):
                 logger.log_plot_token_mult_prob_error(
                     {
                         "prompt_lengths": length,
@@ -1310,7 +1313,8 @@ def grpo_train_sync(
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
-            print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
+            if "gen_kl_error" in metrics:
+                print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
             if master_config.grpo.use_dynamic_sampling:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
