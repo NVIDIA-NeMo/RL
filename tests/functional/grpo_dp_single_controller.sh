@@ -27,6 +27,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.model_name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
+    grpo.seq_logprob_error_threshold=1000 \
     policy.train_global_batch_size=8 \
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
@@ -50,6 +51,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
+    'max(data["train/num_masked_seqs_by_logprob_error"]) == 0' \
+    'max(data["train/max_seq_mult_prob_error"]) < 1000' \
     'max(data["train/gen_kl_error"]) < 0.002' \
     'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
     'max(data["train/probs_ratio_clamped_min"]) < 1.21' \

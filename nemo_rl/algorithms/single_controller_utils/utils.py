@@ -94,9 +94,10 @@ def reduce_advantage_pump_metrics(
     rewards: list[torch.Tensor],
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
-    num_invalid_tool_calls: list[torch.Tensor],
-    num_malformed_thinking: list[torch.Tensor],
-    num_assistant_messages: list[torch.Tensor],
+    num_invalid_tool_calls: list[torch.Tensor] | None = None,
+    num_malformed_thinking: list[torch.Tensor] | None = None,
+    num_assistant_messages: list[torch.Tensor] | None = None,
+    seq_logprob_error_metrics: list[dict[str, float]] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -107,9 +108,12 @@ def reduce_advantage_pump_metrics(
         num_invalid_tool_calls: Per-row invalid-tool-call message counts.
         num_malformed_thinking: Per-row malformed-thinking message counts.
         num_assistant_messages: Per-row generated assistant-message counts.
+        seq_logprob_error_metrics: Sequence-error metrics and their aggregation
+            counts, one record per streaming chunk.
 
     Returns:
-        Reward/advantage/token metrics plus message violation counts and rates.
+        Step-level reward, advantage, token-count, message-violation, and
+        optional sequence log-probability error metrics.
     """
     out: dict[str, float] = {}
     if rewards:
@@ -131,10 +135,10 @@ def reduce_advantage_pump_metrics(
             int(counts.sum().item()) for counts in num_assistant_messages
         )
         invalid_count = sum(
-            int(counts.sum().item()) for counts in num_invalid_tool_calls
+            int(counts.sum().item()) for counts in (num_invalid_tool_calls or [])
         )
         malformed_count = sum(
-            int(counts.sum().item()) for counts in num_malformed_thinking
+            int(counts.sum().item()) for counts in (num_malformed_thinking or [])
         )
         denominator = max(assistant_count, 1)
         out["num_invalid_tool_calls"] = float(invalid_count)
@@ -142,7 +146,61 @@ def reduce_advantage_pump_metrics(
         out["num_assistant_messages"] = float(assistant_count)
         out["invalid_tool_call_rate"] = invalid_count / denominator
         out["malformed_thinking_rate"] = malformed_count / denominator
+    if seq_logprob_error_metrics:
+        out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     return out
+
+
+def _reduce_seq_logprob_error_metrics(
+    records: list[dict[str, float]],
+) -> dict[str, float]:
+    """Reduce sequence-error metrics across streaming chunks."""
+
+    def reduce_range(
+        *,
+        count_key: str,
+        max_key: str,
+        mean_key: str,
+        min_key: str,
+    ) -> dict[str, float]:
+        populated = [record for record in records if record[count_key] > 0]
+        count = sum(record[count_key] for record in populated)
+        if not count:
+            return {max_key: 0.0, mean_key: 0.0, min_key: 0.0}
+        return {
+            max_key: max(record[max_key] for record in populated),
+            mean_key: sum(record[mean_key] * record[count_key] for record in populated)
+            / count,
+            min_key: min(record[min_key] for record in populated),
+        }
+
+    reduced = reduce_range(
+        count_key="_num_valid_seqs_before",
+        max_key="max_seq_mult_prob_error",
+        mean_key="mean_seq_mult_prob_error",
+        min_key="min_seq_mult_prob_error",
+    )
+    reduced.update(
+        reduce_range(
+            count_key="_num_valid_seqs_after",
+            max_key="max_seq_mult_prob_error_after_mask",
+            mean_key="mean_seq_mult_prob_error_after_mask",
+            min_key="min_seq_mult_prob_error_after_mask",
+        )
+    )
+
+    masked_count = sum(record["num_masked_seqs_by_logprob_error"] for record in records)
+    reduced["num_masked_seqs_by_logprob_error"] = int(masked_count)
+    reduced["masked_correct_pct"] = (
+        sum(
+            record["masked_correct_pct"] * record["num_masked_seqs_by_logprob_error"]
+            for record in records
+        )
+        / masked_count
+        if masked_count
+        else 0.0
+    )
+    return reduced
 
 
 def apply_message_level_advantage_penalties(

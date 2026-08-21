@@ -24,7 +24,7 @@ loss_fn:
   use_importance_sampling_correction: true
 ```
 
-3. **Disable colocated inference** (required for async mode):
+3. **Disable colocated inference** (required for async mode with the vLLM backend; the Megatron backend supports colocated async — see `examples/configs/recipes/llm/grpo-nanov3-30BA3B-4n4g-megatron_async_colocated.yaml`):
 ```yaml
 policy:
   generation:
@@ -189,7 +189,7 @@ If no `replay_buffer.pt` file is found in the latest checkpoint directory, train
 
 3. **Resource Allocation**: Ensure sufficient GPU memory for both the training and generation clusters
 
-4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` when using `async_engine: true` for updating the weights of vLLM engine during generation. This prevents stalling training pipeline until longest generation finishes and provides significant performance benefits.
+4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` to update engine weights during generation; with vLLM this requires `async_engine: true`, while the Megatron backend is always async-engine. This prevents stalling the training pipeline until the longest generation finishes and provides significant performance benefits.
 
 5. **Recompute KV Cache After Weight Updates**: A user can choose whether to invalidate and recompute KV caches after weight updates by setting the `recompute_kv_cache_after_weight_updates` configuration. This is applicable to async GRPO and independent of in-flight updates.
 

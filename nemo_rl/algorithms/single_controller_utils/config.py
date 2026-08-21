@@ -831,4 +831,5 @@ class AdvantageConfig:
     num_assistant_messages_field: str = NUM_ASSISTANT_MESSAGES
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: str = "prev_logprobs"
+    generation_logprobs_field: str = "generation_logprobs"
     reference_logprobs_field: str = "reference_policy_logprobs"

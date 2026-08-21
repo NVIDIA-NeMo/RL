@@ -245,9 +245,7 @@ class TestApplyMessageLevelAdvantagePenalties:
             invalid_tool_call_advantage=-5.0,
             malformed_thinking_advantage=None,
         )
-        torch.testing.assert_close(
-            result, torch.tensor([[1.0, -5.0, 3.0, 4.0]])
-        )
+        torch.testing.assert_close(result, torch.tensor([[1.0, -5.0, 3.0, 4.0]]))
 
     def test_only_malformed_thinking_penalty_leaves_invalid_untouched(
         self,
@@ -259,9 +257,7 @@ class TestApplyMessageLevelAdvantagePenalties:
             invalid_tool_call_advantage=None,
             malformed_thinking_advantage=-7.0,
         )
-        torch.testing.assert_close(
-            result, torch.tensor([[1.0, 2.0, -7.0, 4.0]])
-        )
+        torch.testing.assert_close(result, torch.tensor([[1.0, 2.0, -7.0, 4.0]]))
 
     def test_rejects_misaligned_mask(self) -> None:
         with pytest.raises(ValueError, match="invalid_tool_call_mask shape"):
@@ -272,6 +268,50 @@ class TestApplyMessageLevelAdvantagePenalties:
                 invalid_tool_call_advantage=-5.0,
                 malformed_thinking_advantage=None,
             )
+
+    def test_seq_logprob_error_metrics_are_reduced_across_streaming_chunks(
+        self,
+    ) -> None:
+        out = reduce_advantage_pump_metrics(
+            rewards=[],
+            masked_advantages=[],
+            sequence_lengths=[],
+            seq_logprob_error_metrics=[
+                {
+                    "max_seq_mult_prob_error": 10.0,
+                    "mean_seq_mult_prob_error": 3.0,
+                    "min_seq_mult_prob_error": 1.1,
+                    "max_seq_mult_prob_error_after_mask": 1.5,
+                    "mean_seq_mult_prob_error_after_mask": 1.2,
+                    "min_seq_mult_prob_error_after_mask": 1.0,
+                    "num_masked_seqs_by_logprob_error": 1,
+                    "masked_correct_pct": 1.0,
+                    "_num_valid_seqs_before": 4,
+                    "_num_valid_seqs_after": 3,
+                },
+                {
+                    "max_seq_mult_prob_error": 5.0,
+                    "mean_seq_mult_prob_error": 2.0,
+                    "min_seq_mult_prob_error": 1.05,
+                    "max_seq_mult_prob_error_after_mask": 1.8,
+                    "mean_seq_mult_prob_error_after_mask": 1.4,
+                    "min_seq_mult_prob_error_after_mask": 1.02,
+                    "num_masked_seqs_by_logprob_error": 2,
+                    "masked_correct_pct": 0.0,
+                    "_num_valid_seqs_before": 6,
+                    "_num_valid_seqs_after": 4,
+                },
+            ],
+        )
+
+        assert out["max_seq_mult_prob_error"] == pytest.approx(10.0)
+        assert out["mean_seq_mult_prob_error"] == pytest.approx(2.4)
+        assert out["min_seq_mult_prob_error"] == pytest.approx(1.05)
+        assert out["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.8)
+        assert out["mean_seq_mult_prob_error_after_mask"] == pytest.approx(9.2 / 7)
+        assert out["min_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
+        assert out["num_masked_seqs_by_logprob_error"] == 3
+        assert out["masked_correct_pct"] == pytest.approx(1.0 / 3)
 
 
 class TestFieldsForPut:

@@ -50,7 +50,6 @@ def _add_message_violation_fields(
     columns even for all-clean groups, since the advantage stage always fetches
     them when configured.
     """
-
     invalid_counts: list[int] = []
     malformed_counts: list[int] = []
     assistant_counts: list[int] = []
