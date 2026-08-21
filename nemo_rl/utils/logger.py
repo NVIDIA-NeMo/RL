@@ -101,7 +101,11 @@ def should_log_nemo_gym_full_result_tables(
 
 
 def should_log_nemo_gym_responses(env_config: Mapping[str, Any]) -> bool:
-    """Return whether NeMo Gym owns full response logging."""
+    """Return whether NeMo Gym owns full response logging.
+
+    When true, NeMo RL skips its local training response JSONL. W&B full-result
+    tables are controlled independently by ``log_nemo_gym_full_result_tables``.
+    """
     return bool(env_config.get("should_log_nemo_gym_responses"))
 
 

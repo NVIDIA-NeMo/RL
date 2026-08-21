@@ -493,6 +493,16 @@ def setup(
         raise NotImplementedError(
             "PPO NeMo Gym currently requires the vLLM generation backend"
         )
+    if enable_nemo_gym:
+        unsupported_features = {
+            "PPO reward scaling": ppo_config.reward_scaling.enabled,
+            "PPO reward shaping": ppo_config.reward_shaping.enabled,
+            "PPO training top-k sampling": generation_config["top_k"] is not None,
+            "PPO validation top-k sampling": generation_config["val_top_k"] is not None,
+        }
+        for feature, enabled in unsupported_features.items():
+            if enabled:
+                raise NotImplementedError(f"{feature} is not supported with NeMo Gym")
 
     # Set seed for all random number generators
     set_seed(ppo_config.seed)
@@ -549,6 +559,9 @@ def setup(
         )
         assert ppo_config.val_batch_size is not None, (
             "ppo.val_batch_size must be set when validation is enabled"
+        )
+        assert ppo_config.max_val_samples is not None, (
+            "ppo.max_val_samples must be set when validation is enabled"
         )
         val_dataloader = StatefulDataLoader(
             val_dataset,
@@ -897,10 +910,17 @@ def setup(
     def init_policy_and_value():
         """Initialize policy and value workers serially on the training GPUs."""
         policy, policy_time = init_policy()
+        # Block until the policy worker's __init__ completes and offload to
+        # CPU, freeing GPU for value model initialization. Policy will be
+        # reloaded before the vLLM refit step below.
         policy.offload_to_cpu()
 
         print("  ⚙️  Initializing value model for GAE...", flush=True)
         value_model, value_time = init_value()
+        # Block until the value worker's __init__ completes and offload
+        # model + optimizer to CPU. Without this, __init__ runs asynchronously
+        # in the Ray actor and may overlap with vLLM generation, causing
+        # GPU OOM.
         value_model.finish_training()
         print(f"  ✓ Value model initialized in {value_time:.2f}s", flush=True)
         return policy, policy_time, value_model, value_time

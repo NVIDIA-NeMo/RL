@@ -238,7 +238,21 @@ def apply_message_level_advantage_penalties(
 ) -> dict[str, float | int]:
     """Overwrite actor advantages for Gym-flagged assistant-message token spans.
 
-    The value-model returns are intentionally unchanged.
+    For each assistant message flagged by the NeMo-Gym detector as an invalid
+    tool call or malformed thinking, overwrite that message's advantage span in
+    ``train_data["advantages"]`` with the configured value. No-op when both
+    override values are ``None``. The value-model ``returns`` are intentionally
+    left unchanged.
+
+    Args:
+        train_data: Training batch; ``advantages`` is modified in place.
+        message_logs: Batch of message logs with per-message Gym flags.
+        invalid_tool_call_advantage: Advantage assigned to invalid tool calls.
+        malformed_thinking_advantage: Advantage assigned to malformed thinking.
+        log_config: If True, print the configured penalty values once.
+
+    Returns:
+        Penalty rate/count metrics, or an empty dict when no override is configured.
     """
     penalty_metrics: dict[str, float | int] = {}
     if invalid_tool_call_advantage is None and malformed_thinking_advantage is None:

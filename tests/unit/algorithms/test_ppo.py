@@ -703,8 +703,9 @@ def test_create_advantage_estimator_uses_ppo_config_default():
 
 def _make_ppo_loop_batch(
     truncated_samples: tuple[bool, bool] = (False, False),
+    mask_sample: tuple[bool, bool] | None = None,
 ) -> BatchedDataDict:
-    return BatchedDataDict(
+    batch = BatchedDataDict(
         {
             "message_log": [
                 [
@@ -742,6 +743,9 @@ def _make_ppo_loop_batch(
             "length": torch.ones(2, dtype=torch.int32),
         }
     )
+    if mask_sample is not None:
+        batch["mask_sample"] = torch.tensor(mask_sample, dtype=torch.bool)
+    return batch
 
 
 def _run_mock_ppo_train(
@@ -756,6 +760,7 @@ def _run_mock_ppo_train(
     warmup_generation_lead_steps: int | None = None,
     overlong_filtering: bool = False,
     truncated_samples: tuple[bool, bool] = (False, False),
+    mask_sample: tuple[bool, bool] | None = None,
     use_nemo_gym: bool = False,
     should_log_nemo_gym_responses: bool = False,
     reward_penalties: RewardPenaltyConfig | None = None,
@@ -996,7 +1001,13 @@ def _run_mock_ppo_train(
     checkpointer.get_latest_checkpoint_path.return_value = checkpoint_path
     checkpointer.init_tmp_checkpoint.return_value = checkpoint_path
     dataloader = DummyLoader(
-        [_make_ppo_loop_batch(truncated_samples) for _ in range(max_num_steps)]
+        [
+            _make_ppo_loop_batch(
+                truncated_samples=truncated_samples,
+                mask_sample=mask_sample,
+            )
+            for _ in range(max_num_steps)
+        ]
     )
     tokenizer = SimpleNamespace(pad_token_id=0)
     replay_actor = None
@@ -1013,7 +1024,10 @@ def _run_mock_ppo_train(
         replay_actor.sample.remote.return_value = {
             "trajectories": [
                 {
-                    "batch": _make_ppo_loop_batch(truncated_samples).slice(i, i + 1),
+                    "batch": _make_ppo_loop_batch(
+                        truncated_samples=truncated_samples,
+                        mask_sample=mask_sample,
+                    ).slice(i, i + 1),
                     "rollout_metrics": {},
                 }
                 for i in range(2)
@@ -1326,6 +1340,22 @@ def test_ppo_train_excludes_overlong_samples_from_advantage(monkeypatch, async_m
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
+def test_ppo_train_masks_gym_flagged_samples_out_of_the_loss(monkeypatch, async_mode):
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        async_mode=async_mode,
+        max_num_steps=1,
+        ppo_epochs=1,
+        seq_logprob_error_threshold=None,
+        use_nemo_gym=True,
+        mask_sample=(False, True),
+    )
+
+    train_data = harness.policy.train.call_args.args[0]
+    torch.testing.assert_close(train_data["sample_mask"], torch.tensor([1.0, 0.0]))
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
 def test_ppo_train_rejects_all_masked_batch(monkeypatch, async_mode):
     with pytest.raises(
         RuntimeError,
@@ -1486,6 +1516,8 @@ def _make_noncolocated_setup_config(
             "megatron_cfg": {"enabled": False},
             "generation": {
                 "backend": backend,
+                "top_k": None,
+                "val_top_k": None,
                 "colocated": {
                     "enabled": False,
                     "resources": {
@@ -2162,6 +2194,78 @@ def test_setup_rejects_message_advantage_overrides_without_nemo_gym(
         _run_noncolocated_setup(monkeypatch, config)
 
 
+@pytest.mark.parametrize("feature", ["reward_scaling", "reward_shaping"])
+def test_setup_rejects_ppo_reward_processing_with_nemo_gym(monkeypatch, feature):
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.env.update(should_use_nemo_gym=True, nemo_gym={})
+    config.policy["generation"]["vllm_cfg"].update(
+        async_engine=True,
+        expose_http_server=True,
+    )
+    getattr(config.ppo, feature).enabled = True
+
+    with pytest.raises(
+        NotImplementedError,
+        match=f"PPO {feature.replace('_', ' ')} is not supported with NeMo Gym",
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+@pytest.mark.parametrize("config_field", ["top_k", "val_top_k"])
+def test_setup_rejects_top_k_sampling_with_nemo_gym(monkeypatch, config_field):
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.env.update(should_use_nemo_gym=True, nemo_gym={})
+    config.policy["generation"]["vllm_cfg"].update(
+        async_engine=True,
+        expose_http_server=True,
+    )
+    config.policy["generation"][config_field] = 10
+
+    with pytest.raises(
+        NotImplementedError,
+        match="PPO .*top-k sampling is not supported with NeMo Gym",
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_setup_requires_max_val_samples_when_validation_is_enabled(monkeypatch):
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.ppo.val_period = 1
+    config.ppo.max_val_samples = None
+
+    with pytest.raises(
+        AssertionError,
+        match="ppo.max_val_samples must be set when validation is enabled",
+    ):
+        ppo_mod.setup(
+            config,
+            MagicMock(),
+            _setup_dataset(),
+            _setup_dataset(),
+        )
+
+    cluster_cls.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("async_enabled", "expected_train_iters"),
     [(False, 3), (True, 30)],
@@ -2679,8 +2783,20 @@ def test_async_ppo_completed_resume_exits_before_actor_start(monkeypatch):
     value_model.shutdown.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("rollouts_task_index", "replay_task_index", "expected_task_index"),
+    [
+        (7, 5, 7),
+        (None, 5, 5),
+        (3, 5, 5),
+    ],
+)
 def test_async_ppo_restores_gym_cursor_and_cleans_up_on_initial_refit_failure(
-    monkeypatch, tmp_path
+    monkeypatch,
+    tmp_path,
+    rollouts_task_index,
+    replay_task_index,
+    expected_task_index,
 ):
     from unittest.mock import call
 
@@ -2707,7 +2823,9 @@ def test_async_ppo_restores_gym_cursor_and_cleans_up_on_initial_refit_failure(
     }
 
     replay_actor = MagicMock()
-    replay_actor.load_from_path.remote.return_value = {NEXT_NEMO_GYM_TASK_INDEX_KEY: 5}
+    replay_actor.load_from_path.remote.return_value = {
+        NEXT_NEMO_GYM_TASK_INDEX_KEY: replay_task_index
+    }
     collector_actor = MagicMock()
     replay_type = MagicMock()
     replay_type.options.return_value.remote.return_value = replay_actor
@@ -2737,10 +2855,11 @@ def test_async_ppo_restores_gym_cursor_and_cleans_up_on_initial_refit_failure(
     checkpoint_path = tmp_path / "step_0"
     checkpoint_path.mkdir()
     torch.save({}, checkpoint_path / "replay_buffer.pt")
-    torch.save(
-        {NEXT_NEMO_GYM_TASK_INDEX_KEY: 7},
-        checkpoint_path / "rollouts.pt",
-    )
+    if rollouts_task_index is not None:
+        torch.save(
+            {NEXT_NEMO_GYM_TASK_INDEX_KEY: rollouts_task_index},
+            checkpoint_path / "rollouts.pt",
+        )
     checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
 
     with pytest.raises(RuntimeError, match="initial refit failed"):
@@ -2780,7 +2899,7 @@ def test_async_ppo_restores_gym_cursor_and_cleans_up_on_initial_refit_failure(
         collector_type.options.return_value.remote.call_args.kwargs[
             "next_nemo_gym_task_index"
         ]
-        == 7
+        == expected_task_index
     )
     checkpointer.shutdown.assert_called_once()
     generation.shutdown.assert_called_once()
