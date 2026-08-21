@@ -92,6 +92,32 @@ def _build_cp_layout(*, cp_rank: int, cp_size: int) -> Any:
     )
 
 
+def _build_tp_cp_layout(
+    *,
+    tp_rank: int,
+    tp_size: int,
+    cp_rank: int,
+    cp_size: int,
+) -> Any:
+    module = _load_module(_LAYOUT_MODULE, _LAYOUT_PATH)
+    padding_multiple = 2 * cp_size
+    first_padded = ((5 + padding_multiple - 1) // padding_multiple) * padding_multiple
+    second_padded = ((3 + padding_multiple - 1) // padding_multiple) * padding_multiple
+    return module.build_draft_sequence_layout(
+        logical_sample_ids=torch.tensor([101, 303], dtype=torch.int64),
+        cu_seqlens_q=torch.tensor([0, 5, 8], dtype=torch.int64),
+        cu_seqlens_q_padded=torch.tensor(
+            [0, first_padded, first_padded + second_padded],
+            dtype=torch.int64,
+        ),
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        device=torch.device("cpu"),
+    )
+
+
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -215,6 +241,92 @@ def test_projected_kv_cp1_is_identity() -> None:
     )
 
     assert gathered is local
+
+
+def _run_tp_cp_reconstruction_and_gather(
+    rank: int,
+    tp_size: int,
+    cp_size: int,
+    port: int,
+) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    interface_names = {name for _, name in socket.if_nameindex()}
+    for loopback_name in ("lo", "lo0"):
+        if loopback_name in interface_names:
+            os.environ["GLOO_SOCKET_IFNAME"] = loopback_name
+            break
+    world_size = tp_size * cp_size
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        tp_groups = [
+            dist.new_group(
+                ranks=list(range(cp_rank * tp_size, (cp_rank + 1) * tp_size))
+            )
+            for cp_rank in range(cp_size)
+        ]
+        cp_groups = [
+            dist.new_group(
+                ranks=[cp_rank * tp_size + tp_rank for cp_rank in range(cp_size)]
+            )
+            for tp_rank in range(tp_size)
+        ]
+        tp_rank = rank % tp_size
+        cp_rank = rank // tp_size
+        layout = _build_tp_cp_layout(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+        )
+        sequence_parallel_module = _load_module(_SP_MODULE, _SP_PATH)
+        context_parallel_module = _load_module(_CP_MODULE, _CP_PATH)
+        total_length = int(layout.cu_seqlens_q_padded[-1])
+        full = torch.arange(total_length * 2, dtype=torch.float64).reshape(
+            total_length,
+            1,
+            1,
+            2,
+        )
+        cp_local = full[layout.cp_global_positions]
+        sp_local = cp_local[layout.sp_local_positions].clone().requires_grad_(True)
+
+        reconstructed = sequence_parallel_module.reconstruct_tp_sequence(
+            sp_local,
+            sequence_layout=layout,
+            tp_group=tp_groups[cp_rank],
+            sequence_dim=0,
+        )
+        assert torch.equal(reconstructed, cp_local)
+        lane_offset = tp_rank * 1_000
+        projected = reconstructed + lane_offset
+
+        gathered = context_parallel_module.gather_projected_kv(
+            projected,
+            sequence_layout=layout,
+            cp_group=cp_groups[tp_rank],
+            sequence_dim=0,
+        )
+        assert torch.equal(gathered, full + lane_offset)
+        (((gathered - lane_offset).square().sum()) / world_size).backward()
+        assert sp_local.grad is not None
+        assert torch.equal(sp_local.grad, 2 * sp_local.detach())
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_tp2_cp_reconstruction_and_projected_gather_are_group_isolated(
+    cp_size: int,
+) -> None:
+    """Target-SP and CP gathers must compose on orthogonal process groups."""
+    tp_size = 2
+    mp.spawn(
+        _run_tp_cp_reconstruction_and_gather,
+        args=(tp_size, cp_size, _find_free_port()),
+        nprocs=tp_size * cp_size,
+        join=True,
+    )
 
 
 def _run_cuda_cp_zero_owner_attention(rank: int, world_size: int, port: int) -> None:
