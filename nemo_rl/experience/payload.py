@@ -21,11 +21,37 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
+
+VIOLATION_TAG_KEYS = (
+    "num_invalid_tool_calls",
+    "num_malformed_thinking",
+    "num_assistant_messages",
+)
+# Per-row violation counts ride ``tags`` rather than the tensor fields, so this
+# key is carried on the train batch and consumed by pack_payload.
+_VIOLATION_COUNTS_KEY = "violation_counts"
+
+
+def _violation_counts(
+    message_log: LLMMessageLogType | VLMMessageLogType,
+) -> dict[str, int]:
+    """Count invalid tool calls / malformed thinking over flagged assistant turns."""
+    counts = dict.fromkeys(VIOLATION_TAG_KEYS, 0)
+    for message in message_log:
+        if message["role"] != "assistant" or "generation_logprobs" not in message:
+            continue
+        counts["num_assistant_messages"] += 1
+        if message.get("is_invalid_tool_call", False):
+            counts["num_invalid_tool_calls"] += 1
+        if message.get("has_malformed_thinking", False):
+            counts["num_malformed_thinking"] += 1
+    return counts
 
 
 def record_to_train_batch(
@@ -41,7 +67,8 @@ def record_to_train_batch(
 
     Returns:
         BatchedDataDict with input_ids, input_lengths, generation_logprobs, token_mask,
-        sample_mask, prompt_ids_for_adv, total_reward, and optional routed_experts.
+        sample_mask, prompt_ids_for_adv, total_reward, violation counts, and optional
+        routed_experts.
     """
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
@@ -90,6 +117,7 @@ def record_to_train_batch(
         "sample_mask": sample_mask,
         "prompt_ids_for_adv": prompt_flat["token_ids"],
         "total_reward": total_reward,
+        _VIOLATION_COUNTS_KEY: [_violation_counts(ml) for ml in message_logs],
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
@@ -110,7 +138,8 @@ def pack_payload(
         group_id: Per-group identifier used as the sample_id prefix; the caller owns uniqueness.
 
     Returns:
-        sample_ids of the form {group_id}_g{i}, a jagged-packed TensorDict, and per-row tags.
+        sample_ids of the form {group_id}_g{i}, a jagged-packed TensorDict, and per-row
+        tags carrying weight_version plus any per-row violation counts.
     """
     lengths = train_batch["input_lengths"]
     n = int(lengths.shape[0])
@@ -124,5 +153,6 @@ def pack_payload(
         tensor_fields, lengths=lengths, token_aligned_fields=TOKEN_ALIGNED_FIELDS
     )
     sample_ids = [f"{group_id}_g{i}" for i in range(n)]
-    tags = [{"weight_version": weight_version} for _ in range(n)]
+    violations = train_batch.get(_VIOLATION_COUNTS_KEY, [{}] * n)
+    tags = [{"weight_version": weight_version, **violations[i]} for i in range(n)]
     return sample_ids, fields_td, tags
