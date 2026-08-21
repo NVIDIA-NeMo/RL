@@ -890,7 +890,7 @@ def grpo_train_sync(
                     )
                     for k in get_gdpo_reward_component_keys(driver_carry):
                         adv_inputs[k] = driver_carry[k]
-                    advantages = adv_estimator.compute_advantage(
+                    adv_result = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
                         mask=mask,
@@ -898,6 +898,7 @@ def grpo_train_sync(
                         logprobs_policy=prev_logprobs,
                         logprobs_reference=reference_policy_logprobs,
                     )
+                    advantages = adv_result.advantages
                     del prompt_ids_for_adv
 
                     _log_mixed_rewards_and_advantages_information(
