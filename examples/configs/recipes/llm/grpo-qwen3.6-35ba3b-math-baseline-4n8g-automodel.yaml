@@ -1,0 +1,72 @@
+defaults: grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml
+# Qwen3.6-35B-A3B GRPO math baseline (NO speculative decoding), automodel
+# (DTensor v2) backend, 4 nodes x 8 GPUs. MoE sibling of the Qwen3-8B
+# baseline: identical data / GRPO knobs / lengths / optimizer; only the
+# model and its parallelism differ.
+#
+# Parallelism (mirrors grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml):
+# - Training: EP=32 shards the experts (the bulk of the 35B weights) across
+#   all GPUs via deepep dispatch + grouped-GEMM experts; dtensor TP drops to
+#   1 (A3B active params are small -- FSDP handles the non-expert weights).
+# - Generation: vLLM TP=8, one engine per node (4 DP replicas); 35B bf16
+#   weights are ~9 GiB per GPU at TP=8, leaving KV room for 20480 ctx.
+grpo:
+  val_period: 10
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.6-35ba3b-math-baseline-4n8g-automodel
+  save_period: 15
+  keep_top_k: 5
+policy:
+  model_name: Qwen/Qwen3.6-35B-A3B
+  hf_config_overrides:
+    text_config:
+      # Disable the MoE load-balancing aux loss for RL: Automodel otherwise
+      # injects router gradients that conflict with the policy objective and
+      # degrade accuracy. Keep as 0.0, not 0: Hugging Face strict config
+      # validation declares router_aux_loss_coef as float and rejects YAML's
+      # integer 0.
+      router_aux_loss_coef: 0.0
+  # 35B weights + optimizer state squeeze the logprob pass at 20480 tokens.
+  logprob_chunk_size: 4096
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    tensor_parallel_size: 1
+    # CP=2 keeps the full 20480 context (2048 prompt + 18432 response) within
+    # memory: the training loss materializes full fp32 logits, and with this
+    # model's 248320-token vocab a whole 20480-token microbatch is an
+    # 18.2 GiB allocation that OOMed on 80 GiB twice; CP shards the sequence
+    # so each rank holds ~9.5 GiB. EP borrows from the dp*cp*tp ranks in the
+    # Automodel mesh, so ep=32 still spans all 32 GPUs (dp=16, ep_shard=1).
+    context_parallel_size: 2
+    expert_parallel_size: 32
+    # The 248320-token vocab materializes ~10 GiB bf16 training logits per
+    # 20480-token microbatch; Triton autotune benchmarks then OOM on a
+    # fragmented allocator. Clearing the cache each microbatch restores
+    # contiguous headroom.
+    clear_cache_every_n_steps: 1
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        # te (not sdpa): Automodel's capability validation hard-requires the
+        # TE attention backend for context parallelism with Qwen3_5Moe.
+        attn: te
+        linear: torch
+        rms_norm: torch
+        experts: gmm
+        dispatcher: deepep
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 8
+      # 0.5 (not the 8B baseline's 0.6): vLLM sleep leaves ~7 GiB resident
+      # per GPU; the lower budget keeps that residue out of training headroom.
+      gpu_memory_utilization: 0.5
+logger:
+  wandb:
+    name: grpo-qwen3.6-35ba3b-math-baseline-4n8g-automodel

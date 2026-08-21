@@ -47,7 +47,10 @@ from nemo_rl.environments.nemo_gym import (
     should_use_nemo_gym,
 )
 from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
-from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation import (
+    configure_generation_config,
+    draft_full_refit_enabled,
+)
 from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.utils.config import (
     load_config,
@@ -182,6 +185,7 @@ def main() -> None:
             tokenizer,
             has_refit_draft_weights=has_refit_draft_weights,
             trains_mtp=trains_mtp,
+            draft_full_refit=draft_full_refit_enabled(config.policy),
         )
         if is_vlm and "vllm_cfg" in config.policy["generation"]:
             assert not config.policy["generation"]["vllm_cfg"]["skip_tokenizer_init"], (

@@ -14,6 +14,8 @@
 
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
+from pydantic import BaseModel
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
@@ -494,14 +496,90 @@ class DraftConfigDisabled(TypedDict):
     enabled: Literal[False]
 
 
+class DSparkDraftOptions(BaseModel, extra="allow"):
+    """Training options for DSpark/DFlash draft co-training (DTensor-v2 backend only).
+
+    Architecture fields (block_size, target_layer_ids, mask_token_id, markov and
+    confidence head layout) are read from the draft checkpoint's config.json and
+    are intentionally not configurable here.
+    """
+
+    # Anchor blocks sampled per sequence each training forward (capped by the
+    # number of valid response positions).
+    num_anchors: int = 512
+    # Learning rate for the draft's optimizer param group. The draft needs a
+    # much higher rate than the policy's RL lr to track the policy's
+    # distribution drift (dspark pretraining used 6e-4; the policy trains at
+    # ~1e-6).
+    learning_rate: float = 1.0e-4
+    # Cross-entropy weight against the rollout tokens.
+    ce_loss_alpha: float = 0.1
+    # Total-variation distillation weight against the policy's raw logits.
+    l1_loss_alpha: float = 0.9
+    # Confidence-head BCE weight; requires the checkpoint's confidence head
+    # (dflash checkpoints have none, so dflash requires 0.0).
+    confidence_loss_alpha: float = 1.0
+    # Exponential per-block-position decay exp(-k / gamma) on the loss mask.
+    loss_decay_gamma: float = 4.0
+    # Train the draft's embed_tokens/lm_head (streamed on every refit) instead
+    # of keeping the checkpoint copies frozen.
+    train_embed_and_head: bool = True
+
+
+# Default drafter family when policy.draft.enabled is set without an explicit
+# algo (the original megatron co-training path predates the algo field).
+# Every reader of policy.draft["algo"] must use this same default.
+DEFAULT_DRAFT_ALGO = "eagle3"
+# Block drafters propose a whole anchored block per step and exist only on
+# the DTensor-v2 co-training path; eagle3 additionally runs on Megatron.
+BLOCK_DRAFT_ALGOS = ("dspark", "dflash")
+DRAFT_ALGOS = ("eagle3", *BLOCK_DRAFT_ALGOS)
+
+
+class Eagle3DraftOptions(BaseModel, extra="allow"):
+    """Training options for EAGLE3 draft co-training (DTensor-v2 backend only).
+
+    Architecture fields (hidden sizes, draft vocab, d2t/t2d maps) are read
+    from the draft checkpoint's config.json; the auxiliary capture layers are
+    derived from the target model with the same selection vLLM uses and are
+    intentionally not configurable here.
+    """
+
+    # Learning rate for the draft's optimizer param group; like dspark, the
+    # draft needs a much higher rate than the policy's RL lr to track the
+    # policy's distribution drift.
+    learning_rate: float = 1.0e-4
+    # Test-time-training unroll depth: the draft re-consumes its own context
+    # for this many steps per training forward (speculators default).
+    ttt_steps: int = 3
+    # Per-unroll-step loss decay factor (1.0 keeps all steps equally
+    # weighted, matching the speculators default).
+    ttt_step_loss_decay: float = 1.0
+    # Train the draft's embed_tokens/lm_head (streamed on every refit)
+    # instead of keeping the checkpoint copies frozen.
+    train_embed_and_head: bool = True
+
+
 class DraftConfig(TypedDict):
-    """Configuration for Eagle draft-model training alongside the policy model."""
+    """Configuration for draft-model co-training alongside the policy model.
+
+    algo selects the drafter family: "eagle3" (Megatron backend, or DTensor-v2
+    with TTT training), "dspark", or "dflash" (both DTensor-v2).
+    num_layers/aux_layer_indices apply to the Megatron eagle3 path only;
+    dspark and dflash carry their options in the dspark sub-block (dflash is
+    the markov-free/confidence-free subset, so confidence_loss_alpha must be
+    0), and the DTensor-v2 eagle3 path carries its options in the eagle3
+    sub-block.
+    """
 
     enabled: Literal[True]
     model_name: NotRequired[str | None]
     loss_weight: NotRequired[float]
+    algo: NotRequired[Literal["eagle3", "dspark", "dflash"]]
     num_layers: NotRequired[int | None]
     aux_layer_indices: NotRequired[list[int] | None]
+    dspark: NotRequired[DSparkDraftOptions]
+    eagle3: NotRequired[Eagle3DraftOptions]
 
 
 class TokenizerConfig(TypedDict):

@@ -1,0 +1,40 @@
+defaults: grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml
+# Qwen3-8B GRPO math baseline with DSpark draft co-training (DTensor v2
+# backend), 4 nodes x 8 GPUs. Experimental arm for
+# grpo-qwen3-8b-math-baseline-4n8g-automodel.yaml: policy-side settings are
+# inherited unchanged (including tp=2 and activation checkpointing); the
+# deepseek-ai/dspark_qwen3_8b_block7 block drafter trains alongside the
+# policy on rollout data and is refit into vLLM (draft.* weight stream) for
+# speculative-decoding generation. Draft architecture fields (block_size,
+# target_layer_ids, mask_token_id, markov/confidence heads) come from the
+# draft checkpoint's config.json; only training options are set here.
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-8b-math-baseline-4n8g-automodel-dspark
+policy:
+  draft:
+    enabled: true
+    model_name: deepseek-ai/dspark_qwen3_8b_block7
+    algo: "dspark"
+    loss_weight: 1.0
+    dspark:
+      num_anchors: 32
+      # Draft-group lr: the policy's 1e-6 RL lr is ~600x below dspark's native
+      # training lr, leaving the draft unable to track policy drift (observed
+      # as monotonic tau decay). 1e-4 sits between the two.
+      learning_rate: 1.0e-04
+      ce_loss_alpha: 0.1
+      l1_loss_alpha: 0.9
+      confidence_loss_alpha: 1.0
+      loss_decay_gamma: 4.0
+      train_embed_and_head: true
+  generation:
+    vllm_kwargs:
+      speculative_config:
+        method: "dspark"
+        model: ${policy.draft.model_name}
+        num_speculative_tokens: 7
+        attention_backend: "FLASH_ATTN"
+        draft_sample_method: "probabilistic"
+logger:
+  wandb:
+    name: grpo-qwen3-8b-math-baseline-4n8g-automodel-dspark

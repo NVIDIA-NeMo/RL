@@ -41,7 +41,10 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
-from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation import (
+    configure_generation_config,
+    draft_full_refit_enabled,
+)
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -138,6 +141,7 @@ def main() -> None:
         tokenizer,
         has_refit_draft_weights=has_refit_draft_weights,
         trains_mtp=trains_mtp,
+        draft_full_refit=draft_full_refit_enabled(config.policy),
     )
 
     # NeMo-Gym specific config setup.

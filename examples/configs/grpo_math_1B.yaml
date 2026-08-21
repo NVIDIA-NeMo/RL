@@ -326,8 +326,39 @@ policy:
     enabled: false
     model_name: null
     loss_weight: 0.1
+    # Drafter family: "eagle3" (Megatron backend, or DTensor v2 with the
+    # speculators-style TTT trainer), "dspark" / "dflash" (DTensor v2 backend;
+    # dflash is the markov-free, confidence-free, bonus-anchor variant).
+    algo: "eagle3"
     num_layers: null
     aux_layer_indices: null
+    # DSpark/DFlash co-training options (read when algo is dspark or dflash).
+    # Architecture fields (block_size, target_layer_ids, mask_token_id,
+    # sample_from_anchor, markov/confidence head layout) come from the draft
+    # checkpoint's config.json. dflash requires confidence_loss_alpha: 0.0.
+    dspark:
+      num_anchors: 512
+      # Draft param-group lr; must far exceed the policy RL lr so the draft
+      # tracks policy drift (pretraining used 6e-4).
+      learning_rate: 1.0e-04
+      ce_loss_alpha: 0.1
+      l1_loss_alpha: 0.9
+      confidence_loss_alpha: 1.0
+      loss_decay_gamma: 4.0
+      train_embed_and_head: true
+    # EAGLE3 TTT co-training options for the DTensor v2 backend (read only
+    # when algo=eagle3 there; the Megatron eagle3 path ignores this block).
+    # Architecture fields (aux layer ids, draft_vocab_size, d2t/t2d maps,
+    # norm_before_residual, layer family) come from the speculators-format
+    # draft checkpoint's config.json.
+    # eagle3:
+    #   # Draft param-group lr (same rationale as dspark.learning_rate).
+    #   learning_rate: 1.0e-04
+    #   # TTT unroll depth; align generation's num_speculative_tokens with it.
+    #   ttt_steps: 3
+    #   # Per-step loss decay gamma (loss_k *= gamma^k).
+    #   ttt_step_loss_decay: 1.0
+    #   train_embed_and_head: true
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.

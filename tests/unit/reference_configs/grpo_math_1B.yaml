@@ -311,8 +311,23 @@ policy:
     enabled: false
     model_name: null
     loss_weight: 0.1
+    # Drafter family: "eagle3" (Megatron backend) or "dspark" (DTensor v2 backend).
+    algo: "eagle3"
     num_layers: null
     aux_layer_indices: null
+    # DSpark co-training options (read only when algo=dspark). Architecture
+    # fields (block_size, target_layer_ids, mask_token_id, markov/confidence
+    # head layout) come from the draft checkpoint's config.json.
+    dspark:
+      num_anchors: 512
+      # Draft param-group lr; must far exceed the policy RL lr so the draft
+      # tracks policy drift (pretraining used 6e-4).
+      learning_rate: 1.0e-04
+      ce_loss_alpha: 0.1
+      l1_loss_alpha: 0.9
+      confidence_loss_alpha: 1.0
+      loss_decay_gamma: 4.0
+      train_embed_and_head: true
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.

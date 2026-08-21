@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import itertools
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
@@ -55,7 +56,7 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import DEFAULT_DRAFT_ALGO, PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -85,7 +86,15 @@ from nemo_rl.utils.timer import Timer
 def _refit_tensor_dtype(
     fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
 ) -> torch.dtype:
-    """Preserve the FP32 dtype used by inference-critical MoE router state."""
+    """Preserve the dtype of non-floating-point buffers and FP32 MoE router state.
+
+    Integer/bool buffers (e.g. the reduced-vocab draft's d2t index map) must
+    keep their dtype — token ids are not representable in bf16. FP32
+    ``e_score_correction_bias`` tensors are inference-critical MoE router
+    state and must also stay FP32.
+    """
+    if not tensor.is_floating_point():
+        return tensor.dtype
     is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] == (
         "e_score_correction_bias"
     )
@@ -332,19 +341,96 @@ class DTensorPolicyWorkerV2Impl(
             optimizer_path=None if defer_checkpoint_load else optimizer_path,
         )
 
-        # Set instance attributes from model and optimizer state (tuple unpacking)
-        (
-            self.model,
-            self.optimizer,
-            self.scheduler,
-            self.is_hf_model,
-            self.is_moe_model,
-            self._is_reward_model,  # Note: using underscore prefix for internal naming
-            self.model_class,
-            self.model_config,
-            self.peft_config,
-            self.autocast_enabled,
-        ) = model_and_optimizer_state
+        # Set instance attributes from model and optimizer state. Access by
+        # field name (not positional unpacking) so optional fields appended to
+        # ModelAndOptimizerState stay backward compatible across workers.
+        self.model = model_and_optimizer_state.model
+        self.optimizer = model_and_optimizer_state.optimizer
+        self.scheduler = model_and_optimizer_state.scheduler
+        self.is_hf_model = model_and_optimizer_state.is_hf_model
+        self.is_moe_model = model_and_optimizer_state.is_moe_model
+
+        self._is_reward_model = model_and_optimizer_state.is_reward_model
+        self.model_class = model_and_optimizer_state.model_class
+        self.model_config = model_and_optimizer_state.model_config
+        self.peft_config = model_and_optimizer_state.peft_config
+        self.autocast_enabled = model_and_optimizer_state.autocast_enabled
+        self.draft_model = model_and_optimizer_state.draft_model
+        self.composite_model = model_and_optimizer_state.composite_model
+
+        # Draft co-training runtime (draft loss, hidden capture, grad-norm
+        # reporting). Present when policy.draft is enabled on this backend:
+        # dspark/dflash share DSparkRuntime (dflash is the markov-free,
+        # confidence-free subset), eagle3 uses the TTT Eagle3Runtime.
+        self.draft_runtime = None
+        self.draft_algo = None
+        if self.draft_model is not None:
+            from nemo_rl.models.automodel.draft.integration import (
+                DSparkRuntime,
+                Eagle3Runtime,
+            )
+            from nemo_rl.models.policy import Eagle3DraftOptions
+
+            draft_cfg = config.get("draft", {})
+            self.draft_algo = draft_cfg.get("algo", DEFAULT_DRAFT_ALGO)
+            # loss_weight has no call-site default: its default lives in the
+            # exemplar YAML (grpo_math_1B.yaml) like every other draft knob.
+            loss_weight = float(draft_cfg["loss_weight"])
+            common_groups = dict(
+                dp_group=self.dp_mesh.get_group(),
+                tp_group=self.tp_mesh.get_group(),
+                cp_group=self.cp_mesh.get_group() if self.cp_size > 1 else None,
+            )
+            if self.draft_algo == "eagle3":
+                self.draft_runtime = Eagle3Runtime(
+                    draft_model=self.draft_model,
+                    eagle3_options=Eagle3DraftOptions.model_validate(
+                        draft_cfg.get("eagle3", {}) or {}
+                    ),
+                    loss_weight=loss_weight,
+                    **common_groups,
+                )
+            else:
+                from nemo_rl.models.policy import DSparkDraftOptions
+
+                self.draft_runtime = DSparkRuntime(
+                    draft_model=self.draft_model,
+                    dspark_options=DSparkDraftOptions.model_validate(
+                        draft_cfg.get("dspark", {}) or {}
+                    ).model_dump(),
+                    loss_weight=loss_weight,
+                    **common_groups,
+                )
+            self.draft_runtime.attach_capture(self.model)
+
+            spec_cfg = (
+                config.get("generation", {})
+                .get("vllm_kwargs", {})
+                .get("speculative_config", {})
+            ) or {}
+            num_spec_tokens = spec_cfg.get("num_speculative_tokens")
+            if self.draft_algo == "eagle3":
+                expected_spec = int(self.draft_runtime.options.ttt_steps)
+                expected_desc = f"the eagle3 ttt_steps={expected_spec}"
+            else:
+                # dspark blocks predict at every slot; dflash's anchor slot is
+                # an unsupervised bonus token, so it proposes one fewer.
+                block_size = int(self.draft_model.config.block_size)
+                sample_from_anchor = bool(
+                    getattr(self.draft_model.config, "sample_from_anchor", True)
+                )
+                expected_spec = block_size if sample_from_anchor else block_size - 1
+                expected_desc = (
+                    f"the draft's proposal count {expected_spec} "
+                    f"(block_size={block_size}, "
+                    f"sample_from_anchor={sample_from_anchor})"
+                )
+            if num_spec_tokens is not None and int(num_spec_tokens) != expected_spec:
+                warnings.warn(
+                    f"speculative_config.num_speculative_tokens={num_spec_tokens} "
+                    f"does not match {expected_desc}; the drafter proposes "
+                    f"{expected_spec} tokens per step."
+                )
 
         # Initialize reference model if requested. With deferred loading the
         # model still holds the base (model_name) weights here, so the KL
@@ -425,6 +511,10 @@ class DTensorPolicyWorkerV2Impl(
             # Ensure model is in training mode
             self.model.train()
 
+        # Draft co-training is active only for real training steps; eval and
+        # logprob forwards never run capture hooks or the draft loss.
+        draft_runtime = self.draft_runtime if not eval_mode else None
+
         # Create loss post-processor
         loss_post_processor = LossPostProcessor(
             loss_fn=loss_fn,
@@ -434,7 +524,16 @@ class DTensorPolicyWorkerV2Impl(
             dp_size=self.dp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
+            draft_runtime=draft_runtime,
         )
+        if draft_runtime is not None:
+            from nemo_rl.models.automodel.draft.integration import draft_capture_ctx
+
+            self.draft_model.train()
+            # Replaces the training nullcontext: capture hooks are active for
+            # exactly the duration of this train call and removed on any exit.
+            ctx = draft_capture_ctx(draft_runtime)
+        draft_grad_norm = 0.0
 
         # Setup cache clearing callback if configured
         empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
@@ -479,6 +578,26 @@ class DTensorPolicyWorkerV2Impl(
                     tokenizer=self.tokenizer,
                 )
 
+                if draft_runtime is not None:
+                    # Slot count = DP-max of valid microbatch counts, i.e. the
+                    # padded (dummy-including) count every rank actually runs.
+                    # Used to average the per-slot draft losses so the summed
+                    # backward keeps a global-mean gradient scale. Counts can
+                    # differ across ranks only under dynamic batching (packing
+                    # is rejected for draft co-training); otherwise skip the
+                    # collective.
+                    if self.cfg["dynamic_batching"]["enabled"]:
+                        mb_slots_t = torch.tensor(iterator_len, device="cuda")
+                        torch.distributed.all_reduce(
+                            mb_slots_t,
+                            op=torch.distributed.ReduceOp.MAX,
+                            group=self.dp_mesh.get_group(),
+                        )
+                        mb_slots = int(mb_slots_t.item())
+                    else:
+                        mb_slots = iterator_len
+                    draft_runtime.begin_global_batch(mb_slots)
+
                 # Use automodel_forward_backward for the training loop
                 mb_results = automodel_forward_backward(
                     model=self.model,
@@ -517,6 +636,10 @@ class DTensorPolicyWorkerV2Impl(
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
+                    # The policy is clipped on its own (Megatron-path parity):
+                    # a shared global clip let the draft's larger gradients
+                    # scale down the policy's updates on every step. The draft
+                    # is clipped separately below.
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
                         [self.model],
@@ -537,6 +660,25 @@ class DTensorPolicyWorkerV2Impl(
                         grad_norm, device="cpu", dtype=torch.float32
                     )
                     warn_if_inf_grad_norm(grad_norm)
+
+                    # Independent draft clip with the same max norm; the
+                    # returned pre-clip norm doubles as the reported metric.
+                    if draft_runtime is not None:
+                        draft_grad_norm = float(
+                            scale_grads_and_clip_grad_norm(
+                                self.max_grad_norm,
+                                [self.draft_model],
+                                norm_type=2.0,
+                                pp_enabled=False,
+                                device_mesh=self.device_mesh,
+                                moe_mesh=None,
+                                ep_axis_name=None,
+                                pp_axis_name=None,
+                                foreach=True,
+                                num_label_tokens=1,
+                                dp_group_size=self.dp_size * self.cp_size,
+                            )
+                        )
 
                     # Update parameters and the non-gradient MoE routing bias.
                     self.optimizer.step()
@@ -561,6 +703,13 @@ class DTensorPolicyWorkerV2Impl(
                 dp_group=self.dp_mesh.get_group(),
                 dtype=self.dtype,
             )
+            if draft_runtime is not None and not eval_mode:
+                # Like grad_norm, this reflects the last global batch. Returned
+                # as a CPU tensor to match the Megatron worker's return type
+                # (the trainer calls .numpy() on it).
+                metrics["draft_grad_norm"] = torch.tensor(
+                    draft_grad_norm, device="cpu", dtype=torch.float32
+                )
 
             self.timer.stop("train")
             return metrics
@@ -1059,7 +1208,31 @@ class DTensorPolicyWorkerV2Impl(
                 )
                 state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
 
+        if self.draft_model is not None:
+            # The draft is a native HF module: no adapter, no LoRA. DTensor
+            # .shape is already the global shape, so no gather is needed here.
+            # Integer/bool buffers (e.g. d2t/t2d vocab maps) keep their dtype;
+            # the stream generator only casts floating-point tensors.
+            for name, tensor in self.draft_model.state_dict().items():
+                dtype = self.dtype if tensor.is_floating_point() else tensor.dtype
+                state_dict_info[f"draft.{name}"] = (tensor.shape, dtype)
+
         return state_dict_info
+
+    def _refit_params_generator(
+        self,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Policy weights followed by draft.<name> weights (when co-training)."""
+        gen = dtensor_params_generator(self.model, self.dtype)
+        if self.draft_model is None:
+            return gen
+        # The draft is a plain HF module (no LoRA, no state-dict adapter), so
+        # the shared generator's merge/adapt steps are no-ops for it.
+        draft_gen = (
+            (f"draft.{name}", tensor)
+            for name, tensor in dtensor_params_generator(self.draft_model, self.dtype)
+        )
+        return itertools.chain(gen, draft_gen)
 
     @torch.no_grad()
     def calibrate_qkv_fp8_scales(
@@ -1097,11 +1270,52 @@ class DTensorPolicyWorkerV2Impl(
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(self.model, self.dtype),
+            params_generator=self._refit_params_generator(),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
+    def stream_weights_via_http(
+        self,
+        rollout_engine_urls: list[str],
+        buffer_size_bytes: int,
+    ) -> None:
+        """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
+
+        Args:
+            rollout_engine_urls: ``http://host:port`` base URLs of each
+                engine's ``node_rank=0`` SGLang HTTP server. The driver
+                resolves these once via ``engine.get_base_url`` and passes
+                them down so every FSDP rank doesn't redo the Ray RPC.
+            buffer_size_bytes: Max bucket size in bytes before flushing.
+
+        ``num_gpus_per_engine`` is recorded once via
+        ``set_rollout_num_gpus_per_engine`` after the SGLang generation handle
+        is created, so the caller doesn't have to pass it on every refit.
+        """
+        assert self._rollout_num_gpus_per_engine is not None, (
+            "stream_weights_via_http called before set_rollout_num_gpus_per_engine; "
+            "wire the rollout TP size on the policy after SGLangGeneration is built."
+        )
+
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
+        from nemo_rl.models.policy.utils import stream_weights_via_http_impl
+
+        stream_weights_via_http_impl(
+            params_generator=self._refit_params_generator(),
+            rollout_engine_urls=rollout_engine_urls,
+            num_gpus_per_engine=self._rollout_num_gpus_per_engine,
+            rank=self.rank,
+            world_size=torch.distributed.get_world_size(),
+            worker_name=str(self),
+            buffer_size_bytes=buffer_size_bytes,
         )
 
     @torch.no_grad()
@@ -1150,7 +1364,7 @@ class DTensorPolicyWorkerV2Impl(
     def _checkpoint_engine_params(
         self,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        return dtensor_params_generator(self.model, self.dtype)
+        return self._refit_params_generator()
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
@@ -1210,7 +1424,7 @@ class DTensorPolicyWorkerV2Impl(
         dtensor_post_iter_func = lambda x: x[1]
 
         packed_broadcast_producer(
-            iterator=dtensor_params_generator(self.model, self.dtype),
+            iterator=self._refit_params_generator(),
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,
@@ -1350,18 +1564,58 @@ class DTensorPolicyWorkerV2Impl(
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
+        # With a draft, the optimizer state is saved separately below, paired
+        # with the composite module whose param groups span policy + draft
+        # (same pairing used at load); policy weights save identically either way.
+        has_draft = self.draft_model is not None
         self.checkpoint_manager.save_checkpoint(
             model=self.model,
             weights_path=weights_path,
-            optimizer=self.optimizer,
-            optimizer_path=optimizer_path,
-            scheduler=self.scheduler,
+            optimizer=None if has_draft else self.optimizer,
+            optimizer_path=None if has_draft else optimizer_path,
+            scheduler=None if has_draft else self.scheduler,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
             checkpointing_cfg=checkpointing_cfg,
             lora_enabled=self.lora_enabled,
             peft_config=self.peft_config,
         )
+        if has_draft:
+            from nemo_rl.models.automodel.draft.integration import (
+                draft_meta_record,
+                save_draft_checkpoint,
+            )
+
+            if optimizer_path and self.optimizer is not None:
+                self.checkpoint_manager.checkpointer.save_optimizer(
+                    optimizer=self.optimizer,
+                    model=self.composite_model,
+                    weights_path=optimizer_path,
+                    scheduler=self.scheduler,
+                )
+            # The runtime holds the validated per-algo options resolved at
+            # worker init; re-parsing the raw config here could drift.
+            ttt_steps = None
+            if self.draft_algo == "eagle3":
+                options = self.draft_runtime.options
+                train_embed_and_head = bool(options.train_embed_and_head)
+                ttt_steps = int(options.ttt_steps)
+            else:
+                train_embed_and_head = bool(
+                    self.draft_runtime.options["train_embed_and_head"]
+                )
+            save_draft_checkpoint(
+                self.draft_model,
+                weights_path,
+                meta=draft_meta_record(
+                    self.draft_model,
+                    self.cfg["draft"]["model_name"],
+                    self.optimizer,
+                    algo=self.draft_algo,
+                    train_embed_and_head=train_embed_and_head,
+                    ttt_steps=ttt_steps,
+                ),
+            )
 
     def finalize_async_save(self) -> None:
         """Block until this worker's in-flight async checkpoint writes complete.
@@ -1380,13 +1634,37 @@ class DTensorPolicyWorkerV2Impl(
         optimizer_path: Optional[str] = None,
     ) -> None:
         """Load a checkpoint into the model using Automodel Checkpointer."""
-        self.checkpoint_manager.load_checkpoint(
-            model=self.model,
-            weights_path=weights_path,
-            optimizer=self.optimizer,
-            optimizer_path=optimizer_path,
-            scheduler=self.scheduler,
-        )
+        if self.draft_model is not None:
+            from nemo_rl.models.automodel.draft.integration import (
+                load_dspark_checkpoint,
+            )
+
+            ttt_steps = (
+                int(self.draft_runtime.options.ttt_steps)
+                if self.draft_algo == "eagle3"
+                else None
+            )
+            load_dspark_checkpoint(
+                self.checkpoint_manager,
+                model=self.model,
+                draft_model=self.draft_model,
+                composite_model=self.composite_model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                model_name=self.cfg["draft"]["model_name"],
+                algo=self.draft_algo,
+                ttt_steps=ttt_steps,
+            )
+        else:
+            self.checkpoint_manager.load_checkpoint(
+                model=self.model,
+                weights_path=weights_path,
+                optimizer=self.optimizer,
+                optimizer_path=optimizer_path,
+                scheduler=self.scheduler,
+            )
 
     def _init_checkpoint_manager(
         self,

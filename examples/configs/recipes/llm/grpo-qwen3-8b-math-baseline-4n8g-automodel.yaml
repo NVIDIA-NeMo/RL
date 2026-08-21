@@ -1,0 +1,129 @@
+defaults: ../../grpo_math_1B.yaml
+# GRPO Math baseline (NO speculative decoding): Qwen3-8B (thinking ON),
+# automodel (DTensor v2) backend, 4 nodes x 8 GPUs.
+#
+# Purpose:    Automodel-backend control arm for the DSpark block-draft
+#             co-training experiments (grpo-qwen3-8b-1n8g-automodel-dspark.yaml),
+#             mirroring the megatron-backend baseline
+#             (nemo-rl-async-swe/grpo_qwen3_8b_math_baseline.yaml) so that
+#             backend choice is the only axis being compared. Same data,
+#             GRPO/DAPO knobs, batch/seq sizes, and optimizer as that
+#             megatron baseline; the only difference is the DTensor v2
+#             (automodel) training/generation backend instead of Megatron,
+#             and no draft is trained (vanilla vLLM decoding).
+# Model:      Qwen/Qwen3-8B (thinking via chat_template_kwargs.enable_thinking)
+# Train data: DAPOMath17K; Eval: DAPOMathAIME2024 (dapo_math_verify)
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_steps: 10000
+  use_leave_one_out_baseline: false
+  val_period: 5
+  val_at_start: true
+  max_val_samples: 960
+  val_batch_size: 960
+  reward_scaling:
+    enabled: true
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.generation.max_new_tokens}
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-qwen3-8b-math-baseline-4n8g-automodel
+  keep_top_k: 3
+  save_period: 5
+
+policy:
+  model_name: Qwen/Qwen3-8B
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: true
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # 2048 prompt + 18432 thinking response.
+  max_total_sequence_length: 20480
+  make_sequence_length_divisible_by: 8
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 5
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 5
+
+  dtensor_cfg:
+    tensor_parallel_size: 2
+    context_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+  dynamic_batching:
+    enabled: true
+
+  sequence_packing:
+    enabled: false
+
+  generation:
+    max_new_tokens: 18432
+    vllm_cfg:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-dspark
+    name: grpo-qwen3-8b-math-baseline-4n8g-automodel
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

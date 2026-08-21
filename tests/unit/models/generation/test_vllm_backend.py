@@ -1124,6 +1124,9 @@ def test_load_mtp_weights_from_disk_without_drafter(
     ext.device = torch.device("cpu")
     ext.model_runner = MagicMock()
     ext.model_runner.drafter = None
+    # The drafter lookup also probes the newer gpu-worker ``speculator``
+    # layout; a bare MagicMock would auto-create it as a fake drafter.
+    ext.model_runner.speculator = None
     ext._load_draft_weights = MagicMock()
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_backend.get_pp_group",
@@ -1267,3 +1270,499 @@ def test_maybe_process_mtp_drafter_after_loading_noop_when_disk_loaded(monkeypat
     ext._maybe_process_mtp_drafter_after_loading()
 
     process_weights.assert_not_called()
+
+
+def _make_dspark_refit_extension(
+    vllm_backend, *, has_speculator=True, drafter_param_names=None, method="dspark"
+):
+    """Extension wired for co-trained-draft refit-manifest tests.
+
+    The default fake drafter mimics the pinned vLLM Qwen3DSparkForCausalLM
+    layout: fused qkv/gate_up parameters, a mask_embedding placeholder, and an
+    owned lm_head. Ownership is controlled via vllm_backend.get_pp_group in
+    tests.
+    """
+    if drafter_param_names is None:
+        drafter_param_names = [
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            "model.layers.0.mlp.gate_up_proj.weight",
+            "model.fc.weight",
+            "model.hidden_norm.weight",
+            "model.norm.weight",
+            "model.markov_head.markov_w1.weight",
+            "model.markov_head.markov_w2.weight",
+            "model.mask_embedding",
+            "lm_head.weight",
+        ]
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    drafter_model = None
+    if has_speculator:
+        drafter_model = SimpleNamespace(
+            named_parameters=lambda: [(n, None) for n in drafter_param_names],
+            load_weights=MagicMock(),
+        )
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(speculative_config=SimpleNamespace(method=method)),
+        speculator=SimpleNamespace(model=drafter_model) if has_speculator else None,
+    )
+    return ext, drafter_model
+
+
+# The pinned vLLM Eagle3Qwen3ForCausalLM layout: single fused decoder layer,
+# aux-feature fc, d2t exposed as the draft_id_to_target_id parameter.
+_EAGLE3_DRAFTER_PARAM_NAMES = [
+    "model.embed_tokens.weight",
+    "model.layers.0.self_attn.qkv_proj.weight",
+    "model.layers.0.self_attn.o_proj.weight",
+    "model.layers.0.self_attn.q_norm.weight",
+    "model.layers.0.self_attn.k_norm.weight",
+    "model.layers.0.hidden_norm.weight",
+    "model.layers.0.input_layernorm.weight",
+    "model.layers.0.post_attention_layernorm.weight",
+    "model.layers.0.mlp.gate_up_proj.weight",
+    "model.layers.0.mlp.down_proj.weight",
+    "model.fc.weight",
+    "model.norm.weight",
+    "lm_head.weight",
+    "draft_id_to_target_id",
+]
+
+
+def _complete_eagle3_draft_info():
+    keys = [
+        "draft.embed_tokens.weight",
+        "draft.layers.0.self_attn.q_proj.weight",
+        "draft.layers.0.self_attn.k_proj.weight",
+        "draft.layers.0.self_attn.v_proj.weight",
+        "draft.layers.0.self_attn.o_proj.weight",
+        "draft.layers.0.self_attn.q_norm.weight",
+        "draft.layers.0.self_attn.k_norm.weight",
+        "draft.layers.0.hidden_norm.weight",
+        "draft.layers.0.input_layernorm.weight",
+        "draft.layers.0.post_attention_layernorm.weight",
+        "draft.layers.0.mlp.gate_proj.weight",
+        "draft.layers.0.mlp.up_proj.weight",
+        "draft.layers.0.mlp.down_proj.weight",
+        "draft.fc.weight",
+        "draft.norm.weight",
+        "draft.lm_head.weight",
+        "draft.d2t",
+    ]
+    info = {key: ((4, 4), torch.bfloat16) for key in keys}
+    info["model.weight"] = ((4, 4), torch.bfloat16)
+    return info
+
+
+def _complete_dspark_draft_info():
+    keys = [
+        "draft.embed_tokens.weight",
+        "draft.layers.0.self_attn.q_proj.weight",
+        "draft.layers.0.self_attn.k_proj.weight",
+        "draft.layers.0.self_attn.v_proj.weight",
+        "draft.layers.0.self_attn.q_norm.weight",
+        "draft.layers.0.mlp.gate_proj.weight",
+        "draft.layers.0.mlp.up_proj.weight",
+        "draft.fc.weight",
+        "draft.hidden_norm.weight",
+        "draft.norm.weight",
+        "draft.markov_head.markov_w1.weight",
+        "draft.markov_head.markov_w2.weight",
+        "draft.lm_head.weight",
+    ]
+    info = {key: ((4, 4), torch.bfloat16) for key in keys}
+    info["model.weight"] = ((4, 4), torch.bfloat16)
+    return info
+
+
+@pytest.mark.vllm
+def test_dspark_owner_accepts_complete_draft_manifest(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(vllm_backend)
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    info = _complete_dspark_draft_info()
+    # Keys the drafter's loader intentionally skips are tolerated as extras.
+    info["draft.confidence_head.proj.weight"] = ((4,), torch.bfloat16)
+    ext.prepare_refit_info(info)
+    assert ext.state_dict_info is info
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "dropped_key",
+    ["draft.embed_tokens.weight", "draft.lm_head.weight"],
+)
+def test_dspark_owner_rejects_missing_draft_keys(monkeypatch, dropped_key):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(vllm_backend)
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    info = _complete_dspark_draft_info()
+    del info[dropped_key]
+    with pytest.raises(RuntimeError, match="missing draft keys"):
+        ext.prepare_refit_info(info)
+
+
+@pytest.mark.vllm
+def test_dspark_owner_rejects_unexpected_draft_keys(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(vllm_backend)
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    info = _complete_dspark_draft_info()
+    info["draft.renamed_bogus.weight"] = ((4, 4), torch.bfloat16)
+    with pytest.raises(RuntimeError, match="unexpected draft keys"):
+        ext.prepare_refit_info(info)
+
+
+@pytest.mark.vllm
+def test_dspark_non_owner_skips_draft_payloads(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(vllm_backend, has_speculator=False)
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
+    )
+    # Non-owning ranks neither validate the draft manifest nor require a
+    # drafter for draft payloads.
+    ext.prepare_refit_info(_complete_dspark_draft_info())
+    ext._load_draft_weights([("embed_tokens.weight", torch.zeros(1))])
+
+
+@pytest.mark.vllm
+def test_dspark_owner_without_speculator_raises(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(vllm_backend, has_speculator=False)
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    with pytest.raises(RuntimeError, match="no drafter"):
+        ext._load_draft_weights([("embed_tokens.weight", torch.zeros(1))])
+
+
+@pytest.mark.vllm
+def test_dspark_static_drafter_manifest_without_draft_keys_passes(monkeypatch):
+    """policy.draft.enabled=false: drafter loads from disk, refits carry only
+    policy weights, and the manifest legitimately has zero draft.* keys."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(vllm_backend)
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    info = {"model.weight": ((4, 4), torch.bfloat16)}
+    ext.prepare_refit_info(info)
+    assert ext.state_dict_info is info
+
+
+@pytest.mark.vllm
+def test_dspark_alias_guard_rejects_target_shared_modules():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    shared_embed = SimpleNamespace(weight=torch.zeros(4, 2))
+    shared_head = SimpleNamespace(weight=torch.zeros(4, 2))
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=shared_embed), lm_head=shared_head
+        )
+    )
+    draft_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=shared_embed), lm_head=shared_head
+    )
+    weights = [
+        ("model.embed_tokens.weight", torch.zeros(4, 2)),
+        ("lm_head.weight", torch.zeros(4, 2)),
+    ]
+    with pytest.raises(RuntimeError, match="share storage"):
+        ext._assert_drafter_owns_modules(draft_model, weights)
+
+
+@pytest.mark.vllm
+def test_dspark_alias_guard_accepts_drafter_owned_modules():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            model=SimpleNamespace(
+                embed_tokens=SimpleNamespace(weight=torch.zeros(4, 2))
+            ),
+            lm_head=SimpleNamespace(weight=torch.zeros(4, 2)),
+        )
+    )
+    draft_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=SimpleNamespace(weight=torch.zeros(4, 2))),
+        lm_head=SimpleNamespace(weight=torch.zeros(4, 2)),
+    )
+    weights = [
+        ("model.embed_tokens.weight", torch.zeros(4, 2)),
+        ("lm_head.weight", torch.zeros(4, 2)),
+    ]
+    ext._assert_drafter_owns_modules(draft_model, weights)
+
+
+@pytest.mark.vllm
+def test_dspark_alias_guard_ignores_shared_modules_not_in_refit():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    shared_embed = SimpleNamespace(weight=torch.zeros(4, 2))
+    shared_head = SimpleNamespace(weight=torch.zeros(4, 2))
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=shared_embed), lm_head=shared_head
+        )
+    )
+    draft_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=shared_embed), lm_head=shared_head
+    )
+    # A static-drafter-style refit without embed/lm_head keys may keep sharing.
+    weights = [("model.fc.weight", torch.zeros(4, 2))]
+    ext._assert_drafter_owns_modules(draft_model, weights)
+
+
+@pytest.mark.vllm
+def test_dflash_owner_accepts_dspark_shaped_manifest_without_markov(monkeypatch):
+    """The dflash drafter layout is the dspark layout minus the markov head."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    param_names = [
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.qkv_proj.weight",
+        "model.layers.0.self_attn.q_norm.weight",
+        "model.layers.0.mlp.gate_up_proj.weight",
+        "model.fc.weight",
+        "model.hidden_norm.weight",
+        "model.norm.weight",
+        "model.mask_embedding",
+        "lm_head.weight",
+    ]
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend, drafter_param_names=param_names, method="dflash"
+    )
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    info = _complete_dspark_draft_info()
+    del info["draft.markov_head.markov_w1.weight"]
+    del info["draft.markov_head.markov_w2.weight"]
+    ext.prepare_refit_info(info)
+    assert ext.state_dict_info is info
+
+
+@pytest.mark.vllm
+def test_dflash_owner_rejects_markov_keys(monkeypatch):
+    """dflash drafts must not stream markov-head weights."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend,
+        drafter_param_names=[
+            "model.embed_tokens.weight",
+            "model.fc.weight",
+            "lm_head.weight",
+        ],
+        method="dflash",
+    )
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    info = {
+        "draft.embed_tokens.weight": ((4, 4), torch.bfloat16),
+        "draft.fc.weight": ((4, 4), torch.bfloat16),
+        "draft.lm_head.weight": ((4, 4), torch.bfloat16),
+        "draft.markov_head.markov_w1.weight": ((4, 4), torch.bfloat16),
+    }
+    with pytest.raises(RuntimeError, match="unexpected draft keys"):
+        ext.prepare_refit_info(info)
+
+
+@pytest.mark.vllm
+def test_eagle3_owner_accepts_complete_draft_manifest(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend,
+        drafter_param_names=_EAGLE3_DRAFTER_PARAM_NAMES,
+        method="eagle3",
+    )
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    info = _complete_eagle3_draft_info()
+    # t2d is training-only and tolerated as an extra.
+    info["draft.t2d"] = ((4,), torch.bool)
+    ext.prepare_refit_info(info)
+    assert ext.state_dict_info is info
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "dropped_key",
+    ["draft.fc.weight", "draft.d2t", "draft.lm_head.weight"],
+)
+def test_eagle3_owner_rejects_missing_draft_keys(monkeypatch, dropped_key):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend,
+        drafter_param_names=_EAGLE3_DRAFTER_PARAM_NAMES,
+        method="eagle3",
+    )
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    info = _complete_eagle3_draft_info()
+    del info[dropped_key]
+    with pytest.raises(RuntimeError, match="missing draft keys"):
+        ext.prepare_refit_info(info)
+
+
+@pytest.mark.vllm
+def test_eagle3_owner_rejects_dspark_only_extras(monkeypatch):
+    """mask_embedding/confidence_head are tolerated for dspark, not eagle3."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend,
+        drafter_param_names=_EAGLE3_DRAFTER_PARAM_NAMES,
+        method="eagle3",
+    )
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    info = _complete_eagle3_draft_info()
+    info["draft.mask_embedding"] = ((4,), torch.bfloat16)
+    with pytest.raises(RuntimeError, match="unexpected draft keys"):
+        ext.prepare_refit_info(info)
+
+
+@pytest.mark.vllm
+def test_eagle3_megatron_partial_manifest_accepted(monkeypatch):
+    """The megatron eagle3 exporter streams a PARTIAL drafter (midlayer.*
+    alias, no embed_tokens) and relies on drafter module sharing; exact-key
+    validation must only apply to the DTensor-v2 full stream."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend,
+        drafter_param_names=_EAGLE3_DRAFTER_PARAM_NAMES,
+        method="eagle3",
+    )
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    info = {
+        "model.weight": ((4, 4), torch.bfloat16),
+        "draft.fc.weight": ((4, 4), torch.bfloat16),
+        "draft.midlayer.self_attn.q_proj.weight": ((4, 4), torch.bfloat16),
+        "draft.norm.weight": ((4,), torch.bfloat16),
+        "draft.lm_head.weight": ((4, 4), torch.bfloat16),
+        "draft.d2t": ((4,), torch.int64),
+    }
+    ext.prepare_refit_info(info)
+    assert ext.state_dict_info is info
+
+
+@pytest.mark.vllm
+def test_eagle3_megatron_partial_stream_skips_alias_guard():
+    """Loading the megatron partial stream through target-shared modules is
+    the pre-existing behavior and must not trip the full-stream alias guard."""
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    shared_head = SimpleNamespace(weight=torch.zeros(4, 2))
+    drafter = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=None),
+        lm_head=shared_head,
+        named_parameters=lambda: [],
+        named_modules=lambda: [],
+        load_weights=MagicMock(),
+    )
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method="eagle3")
+        ),
+        speculator=SimpleNamespace(model=drafter),
+        model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=None), lm_head=shared_head
+        ),
+    )
+    weights = [("lm_head.weight", torch.zeros(4, 2))]
+    ext._load_draft_weights(weights)
+    drafter.load_weights.assert_called_once()
+
+
+@pytest.mark.vllm
+def test_eagle3_full_stream_alias_guard_still_fires():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    shared_embed = SimpleNamespace(weight=torch.zeros(4, 2))
+    drafter = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=shared_embed),
+        lm_head=SimpleNamespace(weight=torch.zeros(4, 2)),
+        named_parameters=lambda: [],
+        load_weights=MagicMock(),
+    )
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method="eagle3")
+        ),
+        speculator=SimpleNamespace(model=drafter),
+        model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=shared_embed),
+            lm_head=SimpleNamespace(weight=torch.zeros(4, 2)),
+        ),
+    )
+    weights = [("embed_tokens.weight", torch.zeros(4, 2))]
+    with pytest.raises(RuntimeError, match="share storage"):
+        ext._load_draft_weights(weights)
+
+
+@pytest.mark.vllm
+def test_disable_draft_module_sharing_forces_ownership():
+    from vllm.v1.worker.gpu.spec_decode.dflash import utils as dflash_utils
+    from vllm.v1.worker.gpu.spec_decode.dspark import utils as dspark_utils
+    from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
+
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        disable_draft_module_sharing,
+    )
+
+    originals = [
+        (eagle_utils, eagle_utils._should_share),
+        (dspark_utils, dspark_utils._should_share),
+        (dflash_utils, dflash_utils._should_share),
+    ]
+    try:
+        disable_draft_module_sharing()
+        for module, _ in originals:
+            assert (
+                module._should_share(None, "has_own_embed_tokens", None, None) is False
+            )
+    finally:
+        for module, original in originals:
+            module._should_share = original

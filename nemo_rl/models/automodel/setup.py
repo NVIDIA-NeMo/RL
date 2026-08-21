@@ -52,7 +52,12 @@ from nemo_rl.models.automodel.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
-from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
+from nemo_rl.models.policy import (
+    DEFAULT_DRAFT_ALGO,
+    DRAFT_ALGOS,
+    PolicyConfig,
+    TokenizerConfig,
+)
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
 
 STRING_TO_DTYPE = {
@@ -753,6 +758,67 @@ def setup_model_and_optimizer(
             v.data = v.data.to("cpu")
         model = model.to("cpu")
 
+    # Build the DSpark draft model before optimizer construction so its params
+    # join the optimizer (and any optimizer-state resume) from the start.
+    draft_cfg = config.get("draft", {}) or {}
+    draft_algo = draft_cfg.get("algo", DEFAULT_DRAFT_ALGO)
+    draft_enabled = bool(draft_cfg.get("enabled", False)) and draft_algo in DRAFT_ALGOS
+    draft_model = None
+    composite_model = None
+    if draft_enabled:
+        from nemo_rl.models.automodel.draft.integration import (
+            PolicyWithDraft,
+            build_dspark_draft_model,
+            build_eagle3_draft_model,
+        )
+
+        # Use the configured training precision, NOT model_config.torch_dtype:
+        # validate_and_prepare_config pins the policy config to float32 for
+        # master weights, and a float32 draft would double its parameter and
+        # transient memory in the already memory-tight co-training recipe.
+        # The shared optimizer's master weights preserve update precision.
+        draft_dtype = runtime_config.dtype
+        if draft_algo == "eagle3":
+            from nemo_rl.models.policy import Eagle3DraftOptions
+
+            # The BaseModel centralizes the option defaults (v2 config
+            # convention); the loaded dict is validated against it once here.
+            eagle3_options = Eagle3DraftOptions.model_validate(
+                draft_cfg.get("eagle3", {}) or {}
+            )
+            target_text_config = (
+                getattr(model_config, "text_config", None) or model_config
+            )
+            draft_model = build_eagle3_draft_model(
+                model_name=draft_cfg["model_name"],
+                eagle3_options=eagle3_options,
+                torch_dtype=draft_dtype,
+                mesh=device_mesh["dp_cp"],
+                target_num_hidden_layers=target_text_config.num_hidden_layers,
+            )
+            draft_learning_rate = float(eagle3_options.learning_rate)
+            draft_ttt_steps = int(eagle3_options.ttt_steps)
+        else:
+            from nemo_rl.models.policy import DSparkDraftOptions
+
+            # The BaseModel centralizes the option defaults (v2 config
+            # convention); the loaded dict is validated against it once here
+            # and passed on fully populated so downstream consumers never
+            # fall back to call-site defaults.
+            dspark_options = DSparkDraftOptions.model_validate(
+                draft_cfg.get("dspark", {}) or {}
+            )
+            draft_model = build_dspark_draft_model(
+                model_name=draft_cfg["model_name"],
+                dspark_options=dspark_options.model_dump(),
+                torch_dtype=draft_dtype,
+                mesh=device_mesh["dp_cp"],
+                algo=draft_algo,
+            )
+            draft_learning_rate = float(dspark_options.learning_rate)
+            draft_ttt_steps = None
+        composite_model = PolicyWithDraft(policy=model, draft=draft_model)
+
     # Initialize optimizer
     optimizer = None
     if init_optimizer:
@@ -767,10 +833,34 @@ def setup_model_and_optimizer(
         # p.grad-is-None check, so passing frozen params (e.g. the visual
         # encoder in text-only training) causes DCP to save unused state that
         # later fails to reshard on resume.
-        optimizer = optimizer_cls(
-            (p for p in model.parameters() if p.requires_grad),
-            **optimizer_kwargs,
-        )
+        if draft_model is not None:
+            # Named [policy, draft] param groups in stable order; the layout
+            # record saved with the checkpoint validates names, order, and
+            # per-group param counts on resume (hard error on mismatch). The
+            # draft group carries its own learning rate: the policy's RL lr is
+            # orders of magnitude below the draft's native training lr, and a
+            # shared lr leaves the draft unable to track policy drift.
+            optimizer = optimizer_cls(
+                [
+                    {
+                        "name": "policy",
+                        "params": [p for p in model.parameters() if p.requires_grad],
+                    },
+                    {
+                        "name": "draft",
+                        "params": [
+                            p for p in draft_model.parameters() if p.requires_grad
+                        ],
+                        "lr": draft_learning_rate,
+                    },
+                ],
+                **optimizer_kwargs,
+            )
+        else:
+            optimizer = optimizer_cls(
+                (p for p in model.parameters() if p.requires_grad),
+                **optimizer_kwargs,
+            )
 
     # Initialize scheduler
     scheduler = None
@@ -805,13 +895,32 @@ def setup_model_and_optimizer(
 
     # Load NeMo RL checkpoint if provided
     if weights_path:
-        checkpoint_manager.load_checkpoint(
-            model=model,
-            weights_path=weights_path,
-            optimizer=optimizer,
-            optimizer_path=optimizer_path,
-            scheduler=scheduler,
-        )
+        if draft_model is not None:
+            from nemo_rl.models.automodel.draft.integration import (
+                load_dspark_checkpoint,
+            )
+
+            load_dspark_checkpoint(
+                checkpoint_manager,
+                model=model,
+                draft_model=draft_model,
+                composite_model=composite_model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                model_name=draft_cfg["model_name"],
+                algo=draft_algo,
+                ttt_steps=draft_ttt_steps,
+            )
+        else:
+            checkpoint_manager.load_checkpoint(
+                model=model,
+                weights_path=weights_path,
+                optimizer=optimizer,
+                optimizer_path=optimizer_path,
+                scheduler=scheduler,
+            )
     else:
         print(
             "No weights path provided. Loaded base HF weights via from_pretrained (default policy init)"
@@ -828,4 +937,6 @@ def setup_model_and_optimizer(
         model_config=model.config,
         peft_config=peft_config,
         autocast_enabled=autocast_enabled,
+        draft_model=draft_model,
+        composite_model=composite_model,
     )
