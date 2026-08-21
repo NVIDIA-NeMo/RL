@@ -403,6 +403,10 @@ class GenerationInterface(ABC):
         """Whether this engine must stand down before a training step."""
         return False
 
+    def wake_carries_weight_updates(self) -> bool:
+        """Whether waking this engine alone serves weights updated while asleep."""
+        return False
+
     def clear_logger_metrics(self) -> None:
         """Clear logger metrics for performance reporting.
 

@@ -2275,7 +2275,8 @@ class SingleControllerActor:
                     # blocking engines (min == max), so nothing below waits on
                     # rollouts the sleeping engine could not deliver.
                     # In-flight requests freeze, then continue on fresh weights.
-                    # The post-step `_sync_weights` wake reopens the gate.
+                    # The post-step `_sync_weights` wake reopens the gate,
+                    # except on save-bound steps, where the wake is deferred until after the save.
                     if not generation_released and self._gen.blocks_training():
                         self._rollout_permitted.clear()
                         await asyncio.to_thread(self._gen.finish_generation)
@@ -2388,23 +2389,6 @@ class SingleControllerActor:
                 self._trainer_version += 1
                 self._train_steps += 1
                 self._optimizer_commit_in_progress = False
-                with self._timer.time("weight_sync"):
-                    calibration_data = (
-                        BatchedDataDict.from_batches(calibration_batches)
-                        if calibration_batches
-                        else None
-                    )
-                    aborted_stale_inflight_groups = await self._sync_weights(
-                        calibration_data=calibration_data
-                    )
-                    step_metrics.update(
-                        {
-                            "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
-                            "aborted_stale_inflight_groups": aborted_stale_inflight_groups,
-                        }
-                    )
-
-                # Checkpointing (mirrors async_grpo_train's save block).
                 self._consumed_samples += grpo_cfg.num_prompts_per_step
                 self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
                 self._timeout.mark_iteration()
@@ -2427,13 +2411,60 @@ class SingleControllerActor:
                         and self._train_steps % ft_save_period == 0
                     )
                 )
+                # Latched (timer.last_saved): call once per step and reuse the bool.
+                # A second call would consume the latch, returning False and silently
+                # dropping both the save and the early-stop break below.
                 should_save_by_timeout = self._timeout.check_save()
+                will_save_checkpoint = self._master_config.checkpointing[
+                    "enabled"
+                ] and (should_save_by_step or should_save_by_timeout)
+                # A save-bound colocated step defers the wake until after the save.
+                defer_wake_for_save = (
+                    will_save_checkpoint
+                    and self._gen.blocks_training()
+                    and self._gen.wake_carries_weight_updates()
+                )
 
-                if self._master_config.checkpointing["enabled"] and (
-                    should_save_by_step or should_save_by_timeout
-                ):
+                with self._timer.time("weight_sync"):
+                    calibration_data = (
+                        BatchedDataDict.from_batches(calibration_batches)
+                        if calibration_batches
+                        else None
+                    )
+                    aborted_stale_inflight_groups = await self._sync_weights(
+                        calibration_data=calibration_data,
+                        defer_engine_wake=defer_wake_for_save,
+                    )
+                    step_metrics.update(
+                        {
+                            "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
+                            "aborted_stale_inflight_groups": aborted_stale_inflight_groups,
+                        }
+                    )
+
+                if will_save_checkpoint:
                     with self._timer.time("checkpointing"):
                         await self._save_checkpoint(step_metrics)
+                    if defer_wake_for_save:
+                        # The save is done; wake the engine unless the loop is about to exit.
+                        loop_will_exit = (
+                            self._train_steps >= grpo_cfg.max_num_steps
+                            or should_save_by_timeout
+                            or (
+                                self._rollout_exhausted.is_set()
+                                and len(self._buffer) == 0
+                            )
+                        )
+                        if not loop_will_exit:
+                            with self._timer.time("weight_sync"):
+                                # The save onloaded model+optimizer; generation needs offload.
+                                await asyncio.to_thread(
+                                    self._trainer.offload_after_refit
+                                )
+                                await asyncio.to_thread(
+                                    self._gen.prepare_for_generation
+                                )
+                                self._rollout_permitted.set()
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
@@ -2638,8 +2669,9 @@ class SingleControllerActor:
     async def _save_checkpoint_locked(self, step_metrics: dict[str, Any]) -> None:
         """Write a full checkpoint for the just-finished train step.
 
-        Everything except the (possibly async) policy weight write must be
-        on disk before begin_finalization; rollouts keep running throughout.
+        Everything except the (possibly async) policy weight write must be on disk
+        before begin_finalization. Non-colocated engines keep serving rollouts throughout;
+        colocated engine is held stood-down through the save.
         """
         save_state = self._save_state
         save_state.current_step = self._train_steps
@@ -2781,12 +2813,12 @@ class SingleControllerActor:
         self,
         *,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
+        defer_engine_wake: bool = False,
     ) -> int:
         """Pause new rollout dispatches, synchronize weights, resume.
 
-        SC owns the pause gate; in-flight generations continue through the
-        refit — vLLM V1 async engine supports weight updates during pending
-        requests.
+        SC owns the pause gate. vLLM serves through the refit;
+        its async engine supports weight updates during pending requests.
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
@@ -2794,9 +2826,13 @@ class SingleControllerActor:
           3. weight_synchronizer.sync_weights(kv_scales=...)
           4. _rollout_permitted.set()   — resume
 
+        `defer_engine_wake` is used to skip refit and wake on save-bound steps for colocated cases.
+
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
                 scales before synchronizing weights.
+            defer_engine_wake: Keep the engine asleep: offload the trainer's
+                refit buffers, stamp the version, leave the gate closed.
 
         Returns:
             The number of stale in-flight rollout groups aborted before the
@@ -2832,12 +2868,15 @@ class SingleControllerActor:
             )
             kv_scales = calibration_result["layers"]
 
-        await asyncio.to_thread(
-            self._weight_synchronizer.sync_weights,
-            kv_scales=kv_scales,
-        )
+        if defer_engine_wake:
+            await asyncio.to_thread(self._trainer.offload_before_refit)
+        else:
+            await asyncio.to_thread(
+                self._weight_synchronizer.sync_weights,
+                kv_scales=kv_scales,
+            )
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
-            self._gen.invalidate_kv_cache()
+            await asyncio.to_thread(self._gen.invalidate_kv_cache)
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
@@ -2848,7 +2887,8 @@ class SingleControllerActor:
             await asyncio.to_thread(
                 self._gen.set_rollout_weight_version, self._trainer_version
             )
-        self._rollout_permitted.set()
+        if not defer_engine_wake:
+            self._rollout_permitted.set()
         return aborted_stale_inflight_groups
 
     async def _log_rollout_throughput_metrics(self, *, emit: bool = True) -> None:

@@ -333,6 +333,10 @@ class MegatronGeneration(GenerationInterface):
         """Whether colocated generation must stand down before training."""
         return bool(self.cfg["colocated"]["enabled"])
 
+    def wake_carries_weight_updates(self) -> bool:
+        """Colocated wake reshards or shares the updated training tensors."""
+        return bool(self.cfg["colocated"]["enabled"])
+
     def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
         """Pre-initialize NVShmem collectively after CUDA graph capture.
 
