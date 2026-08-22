@@ -383,35 +383,27 @@ def _compute_seq_logprob_error_metrics(
     return masking_data["sample_mask"], seq_logprob_error_metrics
 
 
-# Previous cluster-wide reading, for per-step deltas. A single client owns
-# its own previous snapshot; a cluster has no such owner, so the trainer
-# holds it.
-_PREV_CLUSTER_SNAPSHOT: dict[str, Any] = {}
-
-
 def _log_data_plane_metrics(
     policy: Any, logger: Logger, step: int, total_step_time: float
 ) -> None:
     """Log this step's data-plane cost. No-op unless observability is enabled.
 
-    Delta arithmetic, unit conversion and the per-op namespace live on
-    ``MetricsDataPlaneClient.get_step_metrics`` -- the same split as
-    ``VllmGeneration.get_step_metrics`` -- so the async trainer can log the
-    same metrics with one call against its own client.
+    Prefers the cluster view -- the driver's counters plus every policy
+    worker's, summed -- and falls back to the driver's alone when the
+    fan-out reaches only one process. Reported one way or the other, never
+    both, so there is a single answer to "what did the data plane cost"
+    rather than two that disagree by roughly the DP degree.
 
-    Scoped to the driver, and the prefix says so. Every process builds its
-    own client -- ``tq_policy`` here, plus one per policy worker
-    (``worker_mixin``), one in the rollout actor, one on the
-    single-controller path -- and each keeps independent counters. The
-    driver issues roughly one op of each kind per step; the bulk traffic is
-    elsewhere (``kv_first_write`` in the rollout actor writes the rollout,
-    per-DP-rank ``get_samples`` in the workers read it), and none of it
-    appears here. A ``data_plane/`` prefix would read as cluster-wide
-    totals, which these are not.
+    The prefix names the scope because the two differ by a lot: the driver
+    issues about one op of each kind per step while the bulk traffic is the
+    workers' per-DP-rank ``get_samples``. Note that even the cluster view
+    omits the rollout actor, which builds its own client and is not on the
+    worker group -- so ``kv_first_write`` is not in these totals.
 
-    ``OpStats`` is additive on purpose -- histograms and regression sums
-    from every rank sum into one cluster-wide view -- but nothing collects
-    them yet, so that remains a design affordance rather than a feature.
+    The previous reading lives on the policy, alongside the client whose
+    counters it differences, rather than in module state: two trainers in
+    one process would otherwise interleave one ``prev`` and produce
+    negative deltas.
     """
     client = getattr(policy, "dp_client", None)
     if not isinstance(client, MetricsDataPlaneClient):
@@ -421,14 +413,15 @@ def _log_data_plane_metrics(
     collect_started = time.perf_counter()
     snapshots = collect() if callable(collect) else []
     if len(snapshots) > 1:
-        # Cluster view: every rank's counters summed. Prefixed and reported
-        # instead of the driver's, not alongside, so there is one answer to
-        # "what did the data plane cost" rather than two that disagree by
-        # roughly the DP degree.
         merged = merge_snapshots(snapshots)
-        metrics = cluster_step_metrics(merged, _PREV_CLUSTER_SNAPSHOT, total_step_time)
-        _PREV_CLUSTER_SNAPSHOT.clear()
-        _PREV_CLUSTER_SNAPSHOT.update(merged)
+        # The fan-out is part of what observability costs, and the larger
+        # part: omitting it reported a twentieth of the real bill.
+        collect_ms = (time.perf_counter() - collect_started) * 1e3
+        prev = getattr(policy, "_prev_cluster_snapshot", {})
+        metrics = cluster_step_metrics(
+            merged, prev, total_step_time, collect_ms=collect_ms
+        )
+        policy._prev_cluster_snapshot = merged
         logger.log_metrics(metrics, step, prefix="data_plane/cluster")
     else:
         # Single process, or the fan-out could not reach the workers.

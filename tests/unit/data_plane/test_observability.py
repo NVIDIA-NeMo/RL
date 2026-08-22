@@ -726,11 +726,18 @@ def test_hash_verification_off_by_default():
 # ── cross-process aggregation ──────────────────────────────────────────
 
 
-def _client_with(n_puts, n_bytes_each, wall_ms):
+def _rank_client(latencies_ms):
+    """A client that has seen one put per entry, at that latency."""
     client = MetricsDataPlaneClient(NoOpDataPlaneClient())
-    for _ in range(n_puts):
-        client._emit("put", "p", 1, n_bytes_each, monotonic() - wall_ms / 1e3, "ok")
+    now = monotonic()
+    for ms in latencies_ms:
+        client._emit("put", "p", 1, 1_000, now - ms / 1e3, "ok")
     return client
+
+
+def _rank_with(latencies_ms):
+    """Its snapshot, for the merge tests."""
+    return _rank_client(latencies_ms).snapshot()
 
 
 def test_merge_sums_counters_and_rederives_percentiles():
@@ -738,7 +745,7 @@ def test_merge_sums_counters_and_rederives_percentiles():
     from every rank combine into the true cluster distribution. Averaging
     per-rank percentiles could not do this, which is the whole reason the
     latency lives in fixed buckets rather than retained samples."""
-    ranks = [_client_with(4, 1_000, 5.0) for _ in range(3)]
+    ranks = [_rank_client([5.0] * 4) for _ in range(3)]
     merged = merge_snapshots([c.snapshot() for c in ranks])
 
     assert merged["n_processes"] == 3
@@ -754,8 +761,8 @@ def test_merge_sums_counters_and_rederives_percentiles():
 
 def test_merge_takes_max_for_max_fields():
     """A cluster's worst call is the worst any rank saw, not their sum."""
-    slow = _client_with(1, 1_000, 40.0)
-    fast = _client_with(1, 1_000, 1.0)
+    slow = _rank_client([40.0])
+    fast = _rank_client([1.0])
     merged = merge_snapshots([slow.snapshot(), fast.snapshot()])
     assert merged["by_op"]["put"]["max_ms"] >= 40.0
     assert merged["by_op"]["put"]["max_ms"] < 41.0, "max, not sum"
@@ -831,14 +838,6 @@ def test_cluster_overhead_includes_the_collection_fan_out():
     )
     assert delta == pytest.approx(2.31, rel=1e-6)
     client.close()
-
-
-def _rank_with(latencies_ms):
-    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
-    now = monotonic()
-    for ms in latencies_ms:
-        client._emit("put", "p", 1, 1_000, now - ms / 1e3, "ok")
-    return client.snapshot()
 
 
 def test_cluster_percentiles_never_exceed_the_measured_max():
