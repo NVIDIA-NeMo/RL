@@ -1467,6 +1467,42 @@ class TestAsyncTrajectoryCollector:
         assert collector._max_trajectory_age_steps == 5
         assert collector._calculate_target_weights(2) == [3, 4, 5]
 
+    def test_collector_reads_ppo_payload_and_failure_settings(self):
+        """The PPO branch must read these, not hard-code them.
+
+        The GRPO branch ten lines above reads all three from config. The PPO
+        branch used to pin them to False/False/0, so no recipe could reach
+        them -- and ``max_generation_failures=0`` makes the very first
+        generation-worker exception fatal, with no way to opt into tolerating
+        transient failures.
+        """
+        from nemo_rl.algorithms.ppo import AsyncPPOConfig, PPOConfig
+        from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+
+        master_config = PPOMasterConfig.model_construct(
+            policy={"make_sequence_length_divisible_by": 1},
+            ppo=PPOConfig.model_construct(
+                num_prompts_per_step=2,
+                num_generations_per_prompt=4,
+                max_rollout_turns=1,
+                deduplicate_multimodal_data=True,
+                debug_payload_metrics=True,
+                async_ppo=AsyncPPOConfig(max_generation_failures=3),
+            ),
+        )
+        collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
+        collector = collector_cls(
+            policy_generation=MockGenerationInterface(),
+            tokenizer=mock.MagicMock(),
+            task_to_env={},
+            master_config=master_config,
+            replay_buffer=mock.MagicMock(),
+        )
+
+        assert collector._deduplicate_multimodal_data is True
+        assert collector._debug_payload_metrics is True
+        assert collector._max_generation_failures == 3
+
     def test_collector_grpo_window_remains_fixed(self):
         collector = self.create_local_collector()
 

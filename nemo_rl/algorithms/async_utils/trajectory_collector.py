@@ -109,9 +109,11 @@ class AsyncTrajectoryCollector:
         elif isinstance(master_config, PPOMasterConfig):
             algorithm_config = master_config.ppo
             async_config = algorithm_config.async_ppo
-            self._deduplicate_multimodal_data = False
-            self._debug_payload_metrics = False
-            self._max_generation_failures = 0
+            self._deduplicate_multimodal_data = (
+                algorithm_config.deduplicate_multimodal_data
+            )
+            self._debug_payload_metrics = algorithm_config.debug_payload_metrics
+            self._max_generation_failures = async_config.max_generation_failures
         else:
             raise TypeError(
                 "master_config must be a GRPO or PPO MasterConfig, got "

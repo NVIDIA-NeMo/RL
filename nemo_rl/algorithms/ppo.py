@@ -123,6 +123,10 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     # Number of future target steps generation may fill during critic warmup.
     # None uses max_trajectory_age_steps as the generation lead.
     warmup_generation_lead_steps: int | None = Field(default=None, ge=1)
+    # Generation-worker failures tolerated before the AsyncTrajectoryCollector
+    # aborts the run. A successful batch worker resets the count.
+    # 0 makes the very first worker exception fatal.
+    max_generation_failures: int = Field(default=0, ge=0)
     # Allows weight updates while rollout requests are still in flight.
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
@@ -191,6 +195,11 @@ class PPOConfig(BaseModel, extra="allow"):
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
     ppo_epochs: int = 4
+    # Share and compact immutable image/video/audio payload segments across
+    # logical PPO rows. Prompt identity is never used as proof of equality.
+    deduplicate_multimodal_data: bool = False
+    # Emit exact-boundary and logical-vs-physical payload metrics.
+    debug_payload_metrics: bool = False
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     # Advantage estimator configuration (gae or raw_reward)
