@@ -24,6 +24,7 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
+    apply_message_level_advantage_penalties,
     fields_for_put,
     reduce_advantage_pump_metrics,
     squeeze_trailing_unit_dim,
@@ -138,6 +139,9 @@ class TestReduceAdvantagePumpMetrics:
             rewards=[torch.tensor([1.0, 3.0])],
             masked_advantages=[torch.tensor([-1.0, 0.0, 2.0])],
             sequence_lengths=[4, 6],
+            num_invalid_tool_calls=[],
+            num_malformed_thinking=[],
+            num_assistant_messages=[],
         )
         assert out["reward"] == pytest.approx(2.0)
         assert out["advantages/mean"] == pytest.approx(1.0 / 3.0)
@@ -150,6 +154,9 @@ class TestReduceAdvantagePumpMetrics:
             rewards=[],
             masked_advantages=[torch.empty(0)],
             sequence_lengths=[],
+            num_invalid_tool_calls=[],
+            num_malformed_thinking=[],
+            num_assistant_messages=[],
         )
         assert out["advantages/mean"] == 0.0
         assert out["advantages/max"] == 0.0
@@ -157,8 +164,110 @@ class TestReduceAdvantagePumpMetrics:
         assert "reward" not in out
         assert "total_num_tokens" not in out
 
+    def test_violation_rates_use_global_message_counts(self) -> None:
+        out = reduce_advantage_pump_metrics(
+            rewards=[],
+            masked_advantages=[],
+            sequence_lengths=[],
+            num_invalid_tool_calls=[torch.tensor([1, 0]), torch.tensor([2])],
+            num_malformed_thinking=[torch.tensor([0, 1]), torch.tensor([1])],
+            num_assistant_messages=[torch.tensor([2, 1]), torch.tensor([5])],
+        )
+        assert out["num_invalid_tool_calls"] == 3.0
+        assert out["num_malformed_thinking"] == 2.0
+        assert out["num_assistant_messages"] == 8.0
+        assert out["invalid_tool_call_rate"] == pytest.approx(3.0 / 8.0)
+        assert out["malformed_thinking_rate"] == pytest.approx(2.0 / 8.0)
+
+    def test_zero_assistant_messages_produce_zero_rates(self) -> None:
+        out = reduce_advantage_pump_metrics(
+            rewards=[],
+            masked_advantages=[],
+            sequence_lengths=[],
+            num_invalid_tool_calls=[torch.tensor([0])],
+            num_malformed_thinking=[torch.tensor([0])],
+            num_assistant_messages=[torch.tensor([0])],
+        )
+        assert out["invalid_tool_call_rate"] == 0.0
+        assert out["malformed_thinking_rate"] == 0.0
+
     def test_all_empty_inputs_returns_empty_dict(self) -> None:
-        assert reduce_advantage_pump_metrics([], [], []) == {}
+        assert reduce_advantage_pump_metrics([], [], [], [], [], []) == {}
+
+
+class TestApplyMessageLevelAdvantagePenalties:
+    def test_overwrites_only_flagged_tokens(self) -> None:
+        advantages = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        result = apply_message_level_advantage_penalties(
+            advantages,
+            invalid_tool_call_mask=torch.tensor([[False, True, False, False]]),
+            malformed_thinking_mask=torch.tensor([[False, False, True, False]]),
+            invalid_tool_call_advantage=-5.0,
+            malformed_thinking_advantage=-7.0,
+        )
+        torch.testing.assert_close(
+            result,
+            torch.tensor([[1.0, -5.0, -7.0, 4.0]]),
+        )
+        torch.testing.assert_close(
+            advantages,
+            torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+        )
+
+    def test_invalid_tool_call_takes_precedence_on_overlap(self) -> None:
+        result = apply_message_level_advantage_penalties(
+            torch.zeros(1, 2),
+            invalid_tool_call_mask=torch.tensor([[False, True]]),
+            malformed_thinking_mask=torch.tensor([[False, True]]),
+            invalid_tool_call_advantage=-5.0,
+            malformed_thinking_advantage=-7.0,
+        )
+        torch.testing.assert_close(result, torch.tensor([[0.0, -5.0]]))
+
+    def test_disabled_penalties_leave_advantages_unchanged(self) -> None:
+        advantages = torch.tensor([[1.0, 2.0]])
+        result = apply_message_level_advantage_penalties(
+            advantages,
+            invalid_tool_call_mask=torch.tensor([[True, False]]),
+            malformed_thinking_mask=torch.tensor([[False, True]]),
+            invalid_tool_call_advantage=None,
+            malformed_thinking_advantage=None,
+        )
+        assert result is advantages
+
+    def test_only_invalid_tool_call_penalty_leaves_malformed_untouched(
+        self,
+    ) -> None:
+        result = apply_message_level_advantage_penalties(
+            torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+            invalid_tool_call_mask=torch.tensor([[False, True, False, False]]),
+            malformed_thinking_mask=torch.tensor([[False, False, True, False]]),
+            invalid_tool_call_advantage=-5.0,
+            malformed_thinking_advantage=None,
+        )
+        torch.testing.assert_close(result, torch.tensor([[1.0, -5.0, 3.0, 4.0]]))
+
+    def test_only_malformed_thinking_penalty_leaves_invalid_untouched(
+        self,
+    ) -> None:
+        result = apply_message_level_advantage_penalties(
+            torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+            invalid_tool_call_mask=torch.tensor([[False, True, False, False]]),
+            malformed_thinking_mask=torch.tensor([[False, False, True, False]]),
+            invalid_tool_call_advantage=None,
+            malformed_thinking_advantage=-7.0,
+        )
+        torch.testing.assert_close(result, torch.tensor([[1.0, 2.0, -7.0, 4.0]]))
+
+    def test_rejects_misaligned_mask(self) -> None:
+        with pytest.raises(ValueError, match="invalid_tool_call_mask shape"):
+            apply_message_level_advantage_penalties(
+                torch.zeros(1, 2),
+                invalid_tool_call_mask=torch.zeros(1, 3, dtype=torch.bool),
+                malformed_thinking_mask=torch.zeros(1, 2, dtype=torch.bool),
+                invalid_tool_call_advantage=-5.0,
+                malformed_thinking_advantage=None,
+            )
 
     def test_seq_logprob_error_metrics_are_reduced_across_streaming_chunks(
         self,

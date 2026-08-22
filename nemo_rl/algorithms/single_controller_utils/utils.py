@@ -94,6 +94,9 @@ def reduce_advantage_pump_metrics(
     rewards: list[torch.Tensor],
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
+    num_invalid_tool_calls: list[torch.Tensor] | None = None,
+    num_malformed_thinking: list[torch.Tensor] | None = None,
+    num_assistant_messages: list[torch.Tensor] | None = None,
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
@@ -102,12 +105,15 @@ def reduce_advantage_pump_metrics(
         rewards: One tensor per advantage_stage call; each row a sample reward.
         masked_advantages: Token-masked advantages, one tensor per call.
         sequence_lengths: All input_lengths trained on this step.
+        num_invalid_tool_calls: Per-row invalid-tool-call message counts.
+        num_malformed_thinking: Per-row malformed-thinking message counts.
+        num_assistant_messages: Per-row generated assistant-message counts.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
 
     Returns:
-        Step-level reward, advantage, token-count, and optional sequence
-        log-probability error metrics.
+        Step-level reward, advantage, token-count, message-violation, and
+        optional sequence log-probability error metrics.
     """
     out: dict[str, float] = {}
     if rewards:
@@ -124,6 +130,22 @@ def reduce_advantage_pump_metrics(
             out["advantages/min"] = 0.0
     if sequence_lengths:
         out["total_num_tokens"] = float(sum(sequence_lengths))
+    if num_assistant_messages:
+        assistant_count = sum(
+            int(counts.sum().item()) for counts in num_assistant_messages
+        )
+        invalid_count = sum(
+            int(counts.sum().item()) for counts in (num_invalid_tool_calls or [])
+        )
+        malformed_count = sum(
+            int(counts.sum().item()) for counts in (num_malformed_thinking or [])
+        )
+        denominator = max(assistant_count, 1)
+        out["num_invalid_tool_calls"] = float(invalid_count)
+        out["num_malformed_thinking"] = float(malformed_count)
+        out["num_assistant_messages"] = float(assistant_count)
+        out["invalid_tool_call_rate"] = invalid_count / denominator
+        out["malformed_thinking_rate"] = malformed_count / denominator
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     return out
@@ -179,6 +201,74 @@ def _reduce_seq_logprob_error_metrics(
         else 0.0
     )
     return reduced
+
+
+def apply_message_level_advantage_penalties(
+    advantages: torch.Tensor,
+    *,
+    invalid_tool_call_mask: torch.Tensor,
+    malformed_thinking_mask: torch.Tensor,
+    invalid_tool_call_advantage: float | None,
+    malformed_thinking_advantage: float | None,
+) -> torch.Tensor:
+    """Overwrite flagged token advantages while leaving valid tokens unchanged.
+
+    Invalid-tool-call penalties take precedence when both masks select the same
+    token, matching the legacy GRPO message-level implementation.
+
+    Args:
+        advantages: Per-token advantages of shape (batch, seq).
+        invalid_tool_call_mask: Bool mask of the same shape as ``advantages``;
+            True at tokens produced by an invalid tool call.
+        malformed_thinking_mask: Bool mask of the same shape as ``advantages``;
+            True at tokens produced by malformed thinking.
+        invalid_tool_call_advantage: Value to overwrite flagged tokens with, or
+            ``None`` to leave the invalid-tool-call branch disabled.
+        malformed_thinking_advantage: Value to overwrite flagged tokens with, or
+            ``None`` to leave the malformed-thinking branch disabled.
+
+    Returns:
+        New tensor with penalties applied. The original ``advantages`` object is
+        returned unchanged when both advantages are ``None``.
+
+    Raises:
+        ValueError: If either mask shape does not match ``advantages``.
+    """
+    if invalid_tool_call_mask.shape != advantages.shape:
+        raise ValueError(
+            "invalid_tool_call_mask shape "
+            f"{tuple(invalid_tool_call_mask.shape)} does not match advantages "
+            f"{tuple(advantages.shape)}"
+        )
+    if malformed_thinking_mask.shape != advantages.shape:
+        raise ValueError(
+            "malformed_thinking_mask shape "
+            f"{tuple(malformed_thinking_mask.shape)} does not match advantages "
+            f"{tuple(advantages.shape)}"
+        )
+
+    result = advantages
+    if malformed_thinking_advantage is not None:
+        result = torch.where(
+            malformed_thinking_mask.bool(),
+            torch.as_tensor(
+                malformed_thinking_advantage,
+                dtype=advantages.dtype,
+                device=advantages.device,
+            ),
+            result,
+        )
+    if invalid_tool_call_advantage is not None:
+        result = torch.where(
+            invalid_tool_call_mask.bool(),
+            torch.as_tensor(
+                invalid_tool_call_advantage,
+                dtype=advantages.dtype,
+                device=advantages.device,
+            ),
+            result,
+        )
+    return result
 
 
 def tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:

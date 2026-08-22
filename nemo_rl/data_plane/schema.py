@@ -30,6 +30,15 @@ INPUT_LENGTHS = "input_lengths"
 SAMPLE_MASK = "sample_mask"
 META_IDX = "meta_idx"
 
+# Message-derived violation fields written by NeMo-Gym rollouts and consumed by
+# the SingleController advantage stage. The masks are token-aligned; the counts
+# are per-sample scalars used for exact step-level rate aggregation.
+INVALID_TOOL_CALL_MASK = "invalid_tool_call_mask"
+MALFORMED_THINKING_MASK = "malformed_thinking_mask"
+NUM_INVALID_TOOL_CALLS = "num_invalid_tool_calls"
+NUM_MALFORMED_THINKING = "num_malformed_thinking"
+NUM_ASSISTANT_MESSAGES = "num_assistant_messages"
+
 # Tensor fields in the train partition. Rollout writes the input
 # subset on first put; later stages add prev_logprobs /
 # reference_policy_logprobs (workers) and advantages (driver).
@@ -77,6 +86,9 @@ ROUTED_EXPERTS_FIELD = "routed_experts"
 PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
     {
         INPUT_LENGTHS,
+        NUM_ASSISTANT_MESSAGES,
+        NUM_INVALID_TOOL_CALLS,
+        NUM_MALFORMED_THINKING,
         "total_reward",
         SAMPLE_MASK,
     }

@@ -62,6 +62,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
+    apply_message_level_advantage_penalties,
     fields_for_put,
     reduce_advantage_pump_metrics,
     squeeze_trailing_unit_dim,
@@ -127,6 +128,10 @@ class SingleControllerActor:
 
         self._master_config = master_config
         self._async_cfg = master_config.async_rl
+        self._message_level_advantage_penalties_enabled = (
+            master_config.grpo.invalid_tool_call_advantage is not None
+            or master_config.grpo.malformed_thinking_advantage is not None
+        )
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
             and master_config.grpo.seq_logprob_error_threshold is None
@@ -260,6 +265,9 @@ class SingleControllerActor:
             "rewards": [],
             "masked_advantages": [],
             "sequence_lengths": [],
+            "num_invalid_tool_calls": [],
+            "num_malformed_thinking": [],
+            "num_assistant_messages": [],
             "seq_logprob_error_metrics": [],
         }
 
@@ -1784,6 +1792,33 @@ class SingleControllerActor:
             )
         else:
             advantages = torch.zeros_like(mask)
+
+        if self._message_level_advantage_penalties_enabled:
+            advantages = apply_message_level_advantage_penalties(
+                advantages,
+                invalid_tool_call_mask=tensor_field(
+                    data, adv_cfg.invalid_tool_call_mask_field
+                ),
+                malformed_thinking_mask=tensor_field(
+                    data, adv_cfg.malformed_thinking_mask_field
+                ),
+                invalid_tool_call_advantage=(
+                    self._master_config.grpo.invalid_tool_call_advantage
+                ),
+                malformed_thinking_advantage=(
+                    self._master_config.grpo.malformed_thinking_advantage
+                ),
+            )
+            for metric_name, field_name in (
+                ("num_invalid_tool_calls", adv_cfg.num_invalid_tool_calls_field),
+                ("num_malformed_thinking", adv_cfg.num_malformed_thinking_field),
+                ("num_assistant_messages", adv_cfg.num_assistant_messages_field),
+            ):
+                self._step_log_dict[metric_name].append(
+                    squeeze_trailing_unit_dim(tensor_field(data, field_name))
+                    .detach()
+                    .cpu()
+                )
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["masked_advantages"].append(
@@ -1816,6 +1851,16 @@ class SingleControllerActor:
             adv_cfg.sample_mask_field,
             *adv_cfg.repeated_batch_fields,
         ]
+        if self._message_level_advantage_penalties_enabled:
+            fields.extend(
+                [
+                    adv_cfg.invalid_tool_call_mask_field,
+                    adv_cfg.malformed_thinking_mask_field,
+                    adv_cfg.num_invalid_tool_calls_field,
+                    adv_cfg.num_malformed_thinking_field,
+                    adv_cfg.num_assistant_messages_field,
+                ]
+            )
         if self._policy_logprobs_required:
             fields.append(adv_cfg.policy_logprobs_field)
         if self._policy_logprobs_required:

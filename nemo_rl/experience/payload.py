@@ -23,25 +23,90 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import (
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+    NUM_ASSISTANT_MESSAGES,
+    NUM_INVALID_TOOL_CALLS,
+    NUM_MALFORMED_THINKING,
+    ROUTED_EXPERTS_FIELD,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
+
+
+def _add_message_violation_fields(
+    message_logs: list[Any],
+) -> dict[str, torch.Tensor]:
+    """Add token-aligned violation masks and return per-row message counts.
+
+    NeMo-Gym attaches boolean violation decisions to generated assistant
+    messages. Convert them before the generic GRPO message normalizer fills
+    missing generation_logprobs on prompt/environment messages, since field
+    presence is what distinguishes generated assistant turns.
+
+    The caller invokes this only when message-level advantage penalties are
+    enabled. This keeps disabled runs lean while ensuring enabled runs emit the
+    columns even for all-clean groups, since the advantage stage always fetches
+    them when configured.
+    """
+    invalid_counts: list[int] = []
+    malformed_counts: list[int] = []
+    assistant_counts: list[int] = []
+    for message_log in message_logs:
+        invalid_count = 0
+        malformed_count = 0
+        assistant_count = 0
+        for message in message_log:
+            token_ids = message["token_ids"]
+            is_generated_assistant = (
+                message["role"] == "assistant" and "generation_logprobs" in message
+            )
+            is_invalid = is_generated_assistant and bool(
+                message.get("is_invalid_tool_call", False)
+            )
+            is_malformed = is_generated_assistant and bool(
+                message.get("has_malformed_thinking", False)
+            )
+            message[INVALID_TOOL_CALL_MASK] = torch.full_like(
+                token_ids, is_invalid, dtype=torch.bool
+            )
+            message[MALFORMED_THINKING_MASK] = torch.full_like(
+                token_ids, is_malformed, dtype=torch.bool
+            )
+            assistant_count += int(is_generated_assistant)
+            invalid_count += int(is_invalid)
+            malformed_count += int(is_malformed)
+
+        invalid_counts.append(invalid_count)
+        malformed_counts.append(malformed_count)
+        assistant_counts.append(assistant_count)
+
+    return {
+        NUM_INVALID_TOOL_CALLS: torch.tensor(invalid_counts, dtype=torch.int64),
+        NUM_MALFORMED_THINKING: torch.tensor(malformed_counts, dtype=torch.int64),
+        NUM_ASSISTANT_MESSAGES: torch.tensor(assistant_counts, dtype=torch.int64),
+    }
 
 
 def record_to_train_batch(
     record: PromptGroupRecord,
     *,
     pad_value_dict: Mapping[str, int],
+    include_message_violation_fields: bool,
 ) -> BatchedDataDict[Any]:
     """Convert one prompt group's record into a packed BatchedDataDict of N rows.
 
     Args:
         record: Rollout's PromptGroupRecord with N completions to flatten into rows.
         pad_value_dict: Field-name → pad value used by batched_message_log_to_flat_message.
+        include_message_violation_fields: Whether to tensorize NeMo-Gym message
+            violation flags for configured advantage penalties.
 
     Returns:
         BatchedDataDict with input_ids, input_lengths, generation_logprobs, token_mask,
-        sample_mask, prompt_ids_for_adv, total_reward, and optional routed_experts.
+        sample_mask, prompt_ids_for_adv, total_reward, and optional routed_experts
+        and message-violation masks/counts.
     """
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
@@ -57,6 +122,11 @@ def record_to_train_batch(
     assert n > 0, "PromptGroupRecord has no completions"
 
     message_logs = [c.message_log for c in completions]
+    violation_counts = (
+        _add_message_violation_fields(message_logs)
+        if include_message_violation_fields
+        else {}
+    )
     prompt_token_count = sum(len(m["token_ids"]) for m in record.prompt)
     prompt_lengths = torch.full((n,), prompt_token_count, dtype=torch.long)
 
@@ -90,7 +160,11 @@ def record_to_train_batch(
         "sample_mask": sample_mask,
         "prompt_ids_for_adv": prompt_flat["token_ids"],
         "total_reward": total_reward,
+        **violation_counts,
     }
+    if violation_counts:
+        train_data[INVALID_TOOL_CALL_MASK] = flat[INVALID_TOOL_CALL_MASK]
+        train_data[MALFORMED_THINKING_MASK] = flat[MALFORMED_THINKING_MASK]
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
     return BatchedDataDict[Any](train_data)

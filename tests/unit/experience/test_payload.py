@@ -16,6 +16,13 @@ from __future__ import annotations
 
 import torch
 
+from nemo_rl.data_plane.schema import (
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+    NUM_ASSISTANT_MESSAGES,
+    NUM_INVALID_TOOL_CALLS,
+    NUM_MALFORMED_THINKING,
+)
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
@@ -103,6 +110,7 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
     )
 
     expected_routes = [
@@ -135,14 +143,103 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
     assert tags == [{"weight_version": 3}, {"weight_version": 3}]
 
 
-def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
-    record = _record([_completion(route_start=10, reward=1.0, with_routes=False)])
+def test_record_to_train_batch_preserves_message_violation_fields() -> None:
+    invalid = _completion(route_start=10, reward=1.0)
+    invalid.message_log[1]["is_invalid_tool_call"] = True
+    invalid.message_log[1]["has_malformed_thinking"] = False
+
+    malformed = _completion(
+        route_start=30,
+        reward=2.0,
+        env_token_ids=(30, 31),
+    )
+    malformed.message_log[1]["is_invalid_tool_call"] = False
+    malformed.message_log[1]["has_malformed_thinking"] = True
+
+    train_batch = record_to_train_batch(
+        _record([invalid, malformed]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=True,
+    )
+
+    assert train_batch[INVALID_TOOL_CALL_MASK].dtype == torch.bool
+    assert train_batch[MALFORMED_THINKING_MASK].dtype == torch.bool
+    assert train_batch[INVALID_TOOL_CALL_MASK][0, :5].tolist() == [
+        False,
+        False,
+        True,
+        True,
+        False,
+    ]
+    assert train_batch[MALFORMED_THINKING_MASK][0, :5].tolist() == [False] * 5
+    assert train_batch[INVALID_TOOL_CALL_MASK][1, :6].tolist() == [False] * 6
+    assert train_batch[MALFORMED_THINKING_MASK][1, :6].tolist() == [
+        False,
+        False,
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert train_batch[NUM_INVALID_TOOL_CALLS].tolist() == [1, 0]
+    assert train_batch[NUM_MALFORMED_THINKING].tolist() == [0, 1]
+    assert train_batch[NUM_ASSISTANT_MESSAGES].tolist() == [1, 1]
+
+    _, fields, _ = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+    )
+    invalid_rows = list(fields[INVALID_TOOL_CALL_MASK].unbind())
+    malformed_rows = list(fields[MALFORMED_THINKING_MASK].unbind())
+    assert invalid_rows[0].tolist() == [False, False, True, True, False]
+    assert invalid_rows[1].tolist() == [False] * 6
+    assert malformed_rows[0].tolist() == [False] * 5
+    assert malformed_rows[1].tolist() == [
+        False,
+        False,
+        True,
+        True,
+        False,
+        False,
+    ]
+
+
+def test_record_to_train_batch_preserves_clean_violation_fields_when_enabled() -> None:
+    clean = _completion(route_start=10, reward=1.0)
+    clean.message_log[1]["is_invalid_tool_call"] = False
+    clean.message_log[1]["has_malformed_thinking"] = False
+
+    train_batch = record_to_train_batch(
+        _record([clean]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=True,
+    )
+
+    assert not train_batch[INVALID_TOOL_CALL_MASK].any()
+    assert not train_batch[MALFORMED_THINKING_MASK].any()
+    assert train_batch[NUM_INVALID_TOOL_CALLS].tolist() == [0]
+    assert train_batch[NUM_MALFORMED_THINKING].tolist() == [0]
+    assert train_batch[NUM_ASSISTANT_MESSAGES].tolist() == [1]
+
+
+def test_record_to_train_batch_omits_optional_fields_when_disabled() -> None:
+    completion = _completion(route_start=10, reward=1.0, with_routes=False)
+    completion.message_log[1]["is_invalid_tool_call"] = True
+    completion.message_log[1]["has_malformed_thinking"] = True
+    record = _record([completion])
 
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
     )
     assert "routed_experts" not in train_batch
+    assert INVALID_TOOL_CALL_MASK not in train_batch
+    assert MALFORMED_THINKING_MASK not in train_batch
+    assert NUM_INVALID_TOOL_CALLS not in train_batch
+    assert NUM_MALFORMED_THINKING not in train_batch
+    assert NUM_ASSISTANT_MESSAGES not in train_batch
 
     _, fields, _ = pack_payload(
         train_batch,
@@ -175,6 +272,7 @@ def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:
     train_batch = record_to_train_batch(
         record,
         pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
     )
 
     assert train_batch["input_lengths"].tolist() == [5, 2]

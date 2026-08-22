@@ -38,7 +38,15 @@ from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
+from nemo_rl.data_plane.schema import (
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+    NUM_ASSISTANT_MESSAGES,
+    NUM_INVALID_TOOL_CALLS,
+    NUM_MALFORMED_THINKING,
+)
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
@@ -758,6 +766,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "loss_fn.reference_policy_kl_penalty=0."
         )
 
+    penalties_enabled = (
+        master_config.grpo.invalid_tool_call_advantage is not None
+        or master_config.grpo.malformed_thinking_advantage is not None
+    )
+    if penalties_enabled and not should_use_nemo_gym(master_config):
+        raise ValueError(
+            "grpo.invalid_tool_call_advantage and "
+            "grpo.malformed_thinking_advantage require the NeMo-Gym rollout "
+            "path (env.should_use_nemo_gym=true) on SingleController."
+        )
+
     _validate_failure_settings(async_config, num_prompts_per_step)
 
     # Nesting says which knob applies to which path, but nothing stops an operator
@@ -805,6 +824,11 @@ class AdvantageConfig:
     reward_field: str = "total_reward"
     token_mask_field: str = "token_mask"
     sample_mask_field: str = "sample_mask"
+    invalid_tool_call_mask_field: str = INVALID_TOOL_CALL_MASK
+    malformed_thinking_mask_field: str = MALFORMED_THINKING_MASK
+    num_invalid_tool_calls_field: str = NUM_INVALID_TOOL_CALLS
+    num_malformed_thinking_field: str = NUM_MALFORMED_THINKING
+    num_assistant_messages_field: str = NUM_ASSISTANT_MESSAGES
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: str = "prev_logprobs"
     generation_logprobs_field: str = "generation_logprobs"

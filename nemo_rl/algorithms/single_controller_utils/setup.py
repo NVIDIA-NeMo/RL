@@ -791,6 +791,10 @@ def setup_single_controller(
         dp_client,
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
+        include_message_violation_fields=(
+            grpo_config.invalid_tool_call_advantage is not None
+            or grpo_config.malformed_thinking_advantage is not None
+        ),
         require_routed_experts=router_replay_enabled(policy_config),
     )
     rollout_manager = RolloutManager(
