@@ -220,7 +220,15 @@ class _StagingPool:
         try:
             if buf is None or buf.nbytes < nbytes:
                 if buf is not None:
-                    self._store.unregister_buffer(buf.data_ptr())
+                    status = self._store.unregister_buffer(buf.data_ptr())
+                    if status is not None and status != 0:
+                        # Dropping it now would hand memory the NIC may still
+                        # map back to the allocator — see _register_checked.
+                        raise RuntimeError(
+                            f"mooncake unregister_buffer(0x{buf.data_ptr():x}) "
+                            f"failed with status {status}; refusing to free a "
+                            "buffer that may still be registered."
+                        )
                     # Empty the slot before allocating: if the registration
                     # below fails, the slot must come back empty rather than
                     # holding a buffer the NIC no longer maps.
