@@ -31,6 +31,10 @@ from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
+from nemo_rl.algorithms.reward_functions import (
+    GRPORewardShapingConfig,
+    apply_length_aware_reward,
+)
 from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -2270,6 +2274,7 @@ async def run_async_nemo_gym_rollout(
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
     effort_config: Optional[EffortLevelsConfig] = None,
+    reward_shaping_config: GRPORewardShapingConfig | None = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
@@ -2301,6 +2306,8 @@ async def run_async_nemo_gym_rollout(
         max_rollout_turns: Must be ``None`` because NeMo-Gym owns turn limits.
         greedy: Must be ``False`` because this path does not support greedy mode.
         effort_config: Optional configuration for effort-based reward shaping.
+        reward_shaping_config: Optional GRPO reward-shaping configuration. The
+            reasoning-length mode is applied to each completed Gym rollout.
         reward_penalty_config: Optional reward-penalty configuration.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
         mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
@@ -2476,6 +2483,7 @@ async def run_async_nemo_gym_rollout(
                         tokenizer=tokenizer,
                         log_full_result_tables=log_full_result_tables,
                         effort_config=effort_config,
+                        reward_shaping_config=reward_shaping_config,
                         reward_penalty_config=reward_penalty_config,
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
@@ -2513,6 +2521,7 @@ def run_nemo_gym_rollout_sync(
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
     effort_config: Optional[EffortLevelsConfig] = None,
+    reward_shaping_config: GRPORewardShapingConfig | None = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     sampling_params: Optional[GenerationSamplingParams] = None,
@@ -2540,6 +2549,8 @@ def run_nemo_gym_rollout_sync(
         max_rollout_turns: Must be ``None`` because NeMo-Gym owns turn limits.
         greedy: Must be ``False`` because this path does not support greedy mode.
         effort_config: Optional configuration for effort-based reward shaping.
+        reward_shaping_config: Optional GRPO reward-shaping configuration. The
+            reasoning-length mode is applied to each completed Gym rollout.
         reward_penalty_config: Optional reward-penalty configuration.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
         sampling_params: Sampling profile stamped onto every NeMo-Gym row.
@@ -2577,6 +2588,7 @@ def run_nemo_gym_rollout_sync(
             max_rollout_turns=max_rollout_turns,
             greedy=greedy,
             effort_config=effort_config,
+            reward_shaping_config=reward_shaping_config,
             reward_penalty_config=reward_penalty_config,
             thinking_tags=thinking_tags,
             mask_env_flagged_samples=mask_env_flagged_samples,
@@ -2603,6 +2615,7 @@ def _postprocess_single_nemo_gym_group(
     tokenizer: TokenizerType,
     log_full_result_tables: bool,
     effort_config: Optional[EffortLevelsConfig] = None,
+    reward_shaping_config: GRPORewardShapingConfig | None = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
@@ -2615,6 +2628,13 @@ def _postprocess_single_nemo_gym_group(
     low_lengths = shaping.low_lengths
     high_lengths = shaping.high_lengths
 
+    reasoning_length_config = (
+        reward_shaping_config.reasoning_length
+        if reward_shaping_config is not None
+        and reward_shaping_config.reasoning_length_enabled
+        else None
+    )
+    length_aware_metrics = apply_length_aware_reward(results, reasoning_length_config)
     resolved_reward_penalty_config = resolve_reward_penalty_config(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
     )
@@ -2753,6 +2773,21 @@ def _postprocess_single_nemo_gym_group(
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
         "gen_tokens_per_sample/mean"
     ]
+    if length_aware_metrics.component_rewards:
+        rollout_metrics.update(
+            calculate_single_metric(
+                length_aware_metrics.component_rewards,
+                len(length_aware_metrics.component_rewards),
+                "length_aware_reward",
+            )
+        )
+        rollout_metrics.update(
+            calculate_single_metric(
+                length_aware_metrics.reasoning_chain_lengths,
+                len(length_aware_metrics.reasoning_chain_lengths),
+                "reasoning_chain_tokens",
+            )
+        )
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
