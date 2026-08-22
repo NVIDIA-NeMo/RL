@@ -431,11 +431,17 @@ def fit_latency_bandwidth(s: dict[str, Any]) -> dict[str, Any]:
 
 
 def _step_deltas(snap: dict[str, Any], prev: dict[str, Any]) -> dict[str, float]:
-    """The five series both step-metric paths report, identically.
+    """The three series both step-metric paths report, identically.
 
     Shared so the single-process and cluster views cannot drift on series
     names -- which is the whole point of the ``step/``/``now/`` convention
     they publish under.
+
+    Write and read volume are deliberately not here. They were computed and
+    then dropped by :func:`headline_series`, charted by nobody, while the
+    breakdown table already carries per-op ``mb`` -- put's is the write
+    volume and get's is the read volume, split finer than a global pair
+    would be.
     """
     return {
         "step/wall_ms": snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0),
@@ -443,9 +449,6 @@ def _step_deltas(snap: dict[str, Any], prev: dict[str, Any]) -> dict[str, float]
             snap["comm_volume_bytes"] - prev.get("comm_volume_bytes", 0)
         )
         / 1e6,
-        "step/bytes_written_mb": (snap["bytes_written"] - prev.get("bytes_written", 0))
-        / 1e6,
-        "step/bytes_read_mb": (snap["bytes_read"] - prev.get("bytes_read", 0)) / 1e6,
         "now/bytes_outstanding_mb": snap["bytes_outstanding"] / 1e6,
     }
 
@@ -495,6 +498,40 @@ def _op_step_stats(
             row["overhead_ms"], row["transfer_ms"] = split
         out[op] = row
     return out
+
+
+def _hash_deltas(hv: dict[str, int], prev_hv: dict[str, int]) -> dict[str, float]:
+    """This step's hash-verification counters, or nothing if the guard is off.
+
+    Shared by both step-metric paths. It was emitted only on the driver
+    path, but ``_log_data_plane_metrics`` prefers the cluster path whenever
+    the fan-out reaches more than one process -- which is every real run --
+    so with ``verify_tensor_hash`` on, ``mismatches`` never reached the
+    logger. A guard whose findings are not reported is not a guard.
+
+    ``fields_skipped`` is here for the same reason it exists at all: a guard
+    that quietly stops covering a field still reports zero mismatches, so
+    the abstention count has to be visible beside the finding count.
+
+    Args:
+        hv: This step's cumulative ``hash_verify`` block.
+        prev_hv: The previous step's, for differencing.
+
+    Returns:
+        ``step/hash/{counter}`` deltas, or ``{}`` when the guard never ran.
+    """
+    if not hv or not hv.get("rows_recorded"):
+        return {}
+    return {
+        f"step/hash/{name}": hv[name] - prev_hv.get(name, 0)
+        for name in (
+            "rows_checked",
+            "rows_recorded",
+            "rows_unverified",
+            "mismatches",
+            "fields_skipped",
+        )
+    }
 
 
 def _percent_of_dataplane(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
@@ -778,6 +815,9 @@ def cluster_step_metrics(
             "step/self/overhead_ms": overhead_ms,
             "step/self/frac": overhead_ms / wall_ms if wall_ms > 0 else 0.0,
         }
+    )
+    metrics.update(
+        _hash_deltas(merged.get("hash_verify") or {}, prev.get("hash_verify") or {})
     )
     per_op = _op_step_stats(merged["by_op"], prev.get("by_op", {}))
     metrics.update(_percent_of_dataplane(per_op))
@@ -1103,20 +1143,16 @@ class MetricsDataPlaneClient(DataPlaneClient):
         metrics["step/frac_of_step"] = (
             (wall_ms / 1e3 / step_time_s) if step_time_s > 0 else 0.0
         )
-        if self._verify_tensor_hash:
-            hv, prev_hv = snap["hash_verify"], prev.get("hash_verify", {})
-            for name in ("rows_checked", "rows_recorded", "rows_unverified"):
-                metrics[f"step/hash/{name}"] = hv[name] - prev_hv.get(name, 0)
-            metrics["step/hash/mismatches"] = hv["mismatches"] - prev_hv.get(
-                "mismatches", 0
-            )
-            # Logged because a guard that quietly stops covering a field is
-            # worse than no guard: it reports 0 mismatches and reads as
-            # clean. A step where this climbs is a step where something
-            # stopped being checked.
-            metrics["step/hash/fields_skipped"] = hv["fields_skipped"] - prev_hv.get(
-                "fields_skipped", 0
-            )
+        metrics.update(
+            _hash_deltas(snap.get("hash_verify") or {}, prev.get("hash_verify") or {})
+        )
+        # The same bill the cluster path reports, under the same name: this
+        # process's wrapper time, minus what the inner client was doing.
+        # There is no fan-out to add here -- a single process gathers
+        # nothing -- so this is the whole of it.
+        self_ms = snap["self_ms"] - prev.get("self_ms", 0.0)
+        metrics["step/self/overhead_ms"] = self_ms
+        metrics["step/self/frac"] = self_ms / wall_ms if wall_ms > 0 else 0.0
         per_op = _op_step_stats(snap["by_op"], prev.get("by_op", {}))
         metrics.update(_percent_of_dataplane(per_op))
         for op, row in per_op.items():
