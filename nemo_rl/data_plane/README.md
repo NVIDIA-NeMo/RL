@@ -466,6 +466,23 @@ a rectangle first. On a realistically ragged batch that rectangle is 3.5×
 the real payload and cost 13× more, to answer a question the buffer digest
 already answers.
 
+**Detection is not attribution, and the difference is the whole point of
+the split.** The same corruption, injected into an 8-row batch:
+
+| corruption | jagged leaf | rectangular leaf |
+|---|---|---|
+| 1 element changed in `u3` | caught, flags **all 8 rows** | caught, names **`u3`** |
+| `u5` zeroed | caught, flags all 8 rows | caught, names `u5` |
+| `u3`↔`u4` swapped | caught only if their lengths differ | caught, names `u3`,`u4` |
+| nothing | clean | clean |
+
+A jagged digest covers the whole values buffer, so any change moves every
+row's value: it says *this batch is wrong*, never *this sample is wrong*.
+Since `pack_jagged_fields` leaves ~94% of the payload jagged (only
+`rewards` and `input_lengths` stay rectangular), that is the normal
+resolution — you learn a step's transfer diverged and have to bisect for
+the row yourself.
+
 Verified by injecting corruption into the round trip. Caught: a
 single-element change in every dtype, a truncated row, a zeroed row, a
 bf16→fp32 precision change, and a row served from the wrong sample — with
@@ -478,9 +495,12 @@ limits, measured rather than assumed:
   uniform-length batch. Rectangular fields catch it unconditionally.
 - It reads every tensor byte again on both sides — ~2.4 ms for a 12 MB
   jagged batch, on put and again on get. Keep it to debugging runs.
+- A rectangular field that comes back **jagged** (one row truncated makes
+  the batch ragged) has no comparable digest and is dropped — counted in
+  `hash/fields_skipped`, not reported as a mismatch.
 - Only rows this process wrote can be checked. A consumer-side client
   reports them under `hash/rows_unverified` rather than counting them
-  clean, and `hash/fields_skipped` reports any leaf it could not fingerprint
+  clean, and `hash/fields_skipped` reports any leaf it could not compare
   — watch that one, since a guard that quietly stops covering a field still
   reports zero mismatches.
 
