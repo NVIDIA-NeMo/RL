@@ -456,6 +456,24 @@ affine fit, throughput — is recomputed from the merged totals, never
 averaged across ranks (averaging per-rank percentiles does not give a
 cluster percentile).
 
+**A per-op breakdown table** is logged alongside the series, under
+`data_plane/{cluster,driver}/breakdown` — one row per op, ordered by wall
+time so the expensive one reads first:
+
+| op | calls | wall_ms | max_ms | p50_ms | p99_ms |
+|---|---:|---:|---:|---:|---:|
+| put | 64 | 3998 | 114.9 | 58.93 | 114.9 |
+| get | 240 | 2916 | 20.0 | 12.76 | 20.0 |
+| clear | 32 | 43.42 | 2.03 | — | — |
+| register | 16 | 11.95 | 1.08 | — | — |
+
+A stack of line charts answers "how did put's wall time trend"; this
+answers "where did the step go", which is a table. Cells are empty rather
+than zero where a series was withheld (a percentile below the sample gate,
+a fit that is not trustworthy) — a zero would read as a measurement. It is
+built from the same metrics dict that is logged, so the table and the
+series cannot disagree. Only wandb renders it; other backends skip it.
+
 **Every series says what kind of number it is.** A per-step delta and an
 instantaneous level shared the `_mb` suffix and a chart, with nothing to
 tell them apart:
