@@ -81,6 +81,7 @@ from nemo_rl.data_plane.observability import (
     MetricsDataPlaneClient,
     breakdown_table,
     cluster_step_metrics,
+    headline_series,
     merge_snapshots,
 )
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
@@ -442,12 +443,12 @@ def _log_data_plane_metrics(
             merged, prev, total_step_time, collect_ms=collect_ms
         )
         policy._prev_cluster_snapshot = merged
-        logger.log_metrics(metrics, step, prefix="data_plane/cluster")
+        logger.log_metrics(headline_series(metrics), step, prefix="data_plane/cluster")
         _log_breakdown(logger, metrics, step, "data_plane/cluster/breakdown")
     else:
         # Single process, or the fan-out could not reach the workers.
         metrics = client.get_step_metrics(total_step_time)
-        logger.log_metrics(metrics, step, prefix="data_plane/driver")
+        logger.log_metrics(headline_series(metrics), step, prefix="data_plane/driver")
         _log_breakdown(logger, metrics, step, "data_plane/driver/breakdown")
     print(
         f"  • data plane: {metrics['step/wall_ms']:.0f}ms, "

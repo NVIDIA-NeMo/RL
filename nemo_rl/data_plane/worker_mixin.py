@@ -188,10 +188,15 @@ class TQWorkerMixin:
         Returns ``None`` when observability is off or no client exists, so
         the driver can filter rather than special-case. The payload is
         counters only (about 1 kB), not tensors.
+
+        Closes this rank's step window (``step_max_ms``) as it reads, since
+        the driver calls this once per step. A maximum cannot be differenced
+        out of a cumulative counter, so without the reset the cluster's
+        per-step max would latch at the worst call ever seen.
         """
         client = getattr(self, "_dp_client", None)
         snapshot = getattr(client, "snapshot", None)
-        return snapshot() if callable(snapshot) else None
+        return snapshot(reset_step_window=True) if callable(snapshot) else None
 
     def _fetch(
         self,
