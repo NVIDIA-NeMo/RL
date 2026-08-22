@@ -442,9 +442,11 @@ def test_latency_breakdown_stacks_to_wall_ms():
     assert fit["fixed_ms"] == pytest.approx(fixed_ms, rel=0.05)
     assert fit["bandwidth_mb_s"] == pytest.approx(mb_per_s, rel=0.05)
 
-    # the two components are the split, in ms, and they add up
+    # the two components are the split of ONE call, and they add to the mean
     total = metrics["step/put/overhead_ms"] + metrics["step/put/transfer_ms"]
-    assert total == pytest.approx(metrics["step/put/wall_ms"], rel=0.05)
+    assert total == pytest.approx(metrics["step/put/mean_ms"], rel=0.05)
+    # per call, the overhead term IS the fitted constant
+    assert metrics["step/put/overhead_ms"] == pytest.approx(fixed_ms, rel=0.05)
     assert "step/put/overhead_frac" not in metrics, "a ratio is derivable from these"
     client.close()
 
@@ -1032,7 +1034,8 @@ def test_cluster_view_carries_the_latency_split():
     assert "step/get/overhead_ms" in metrics, "cluster view must carry the split"
 
     total = metrics["step/get/overhead_ms"] + metrics["step/get/transfer_ms"]
-    assert total == pytest.approx(metrics["step/get/wall_ms"], rel=0.05)
+    assert total == pytest.approx(metrics["step/get/mean_ms"], rel=0.05)
+    assert metrics["step/get/overhead_ms"] == pytest.approx(fixed_ms, rel=0.05)
 
     columns, rows = breakdown_table(metrics)
     row = rows[0]
