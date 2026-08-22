@@ -82,6 +82,7 @@ def _checkpoint_engine_cfg(
 
 def _nixl_refit_cfg(*, release_after_refit=False):
     return {
+        "backend": "vllm",
         "refit_transport": "nixl",
         "refit_cfg": {
             "nixl": {
@@ -146,13 +147,44 @@ def _checkpoint_sync(
     checkpoint_engine_config = checkpoint_engine_config or _checkpoint_engine_cfg(
         release_after_refit=release_after_refit
     )
-    gen = _mock_generation(cfg={"vllm_cfg": {"async_engine": async_engine}})
+    gen = _mock_generation(
+        cfg={
+            "backend": VLLM_BACKEND,
+            "vllm_cfg": {"async_engine": async_engine},
+        }
+    )
     gen.dp_size = 2
     gen.worker_group = _CheckpointWorkerGroup()
     return CheckpointEngineWeightSynchronizer(policy, gen, checkpoint_engine_config)
 
 
 class TestCheckpointEngineWeightSynchronizer:
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_sglang_dispatches_directly_to_generation_actors(self, mock_ray):
+        policy = _mock_policy()
+        policy.worker_group = _CheckpointWorkerGroup()
+        generation = _mock_generation(cfg={"backend": SGLANG_BACKEND})
+        generation.run_checkpoint_engine_method.return_value = ["generation-update"]
+        generation.prepare_for_generation.return_value = None
+        sync = CheckpointEngineWeightSynchronizer(
+            policy, generation, _checkpoint_engine_cfg()
+        )
+        sync._checkpoint_engine_ready = True
+        mock_ray.get.return_value = ["policy-send", True]
+
+        sync.sync_weights()
+
+        generation.run_checkpoint_engine_method.assert_called_once_with(
+            "update_weights_from_checkpoint_engine", ()
+        )
+        assert [
+            item.kwargs for item in generation.prepare_for_generation.call_args_list
+        ] == [
+            {"tags": ["weights"]},
+            {"tags": ["kv_cache"]},
+        ]
+        assert not sync.is_stale
+
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
     def test_bucket_uses_minimum_total_memory_and_is_cached(self, mock_ray, capsys):
         config = _checkpoint_engine_cfg(bucket_memory_ratio=0.125)
@@ -322,7 +354,7 @@ class TestCheckpointEngineFactory:
         [
             (VLLM_BACKEND, False, CheckpointEngineWeightSynchronizer),
             (VLLM_BACKEND, True, ValueError),
-            (SGLANG_BACKEND, False, NotImplementedError),
+            (SGLANG_BACKEND, False, CheckpointEngineWeightSynchronizer),
             (MEGATRON_BACKEND, False, NotImplementedError),
         ],
     )
@@ -360,3 +392,44 @@ class TestCheckpointEngineFactory:
             ),
             CheckpointEngineWeightSynchronizer,
         )
+
+    def test_checkpoint_engine_rejects_sglang_sharded_experts(self):
+        gen = _mock_generation(cfg=_nixl_refit_cfg())
+        gen.cfg["backend"] = SGLANG_BACKEND
+        gen.cfg["refit_cfg"]["nixl"]["shard_expert_weights"] = True
+
+        with pytest.raises(NotImplementedError, match="shard_expert_weights"):
+            create_weight_synchronizer(
+                policy=_mock_policy(cfg={}),
+                generation=gen,
+                generation_backend=SGLANG_BACKEND,
+                colocated=False,
+            )
+
+    def test_checkpoint_engine_rejects_sglang_data_parallelism(self):
+        gen = _mock_generation(cfg=_nixl_refit_cfg())
+        gen.cfg["backend"] = SGLANG_BACKEND
+        gen.cfg["sglang_cfg"] = {"dp_size": 2}
+
+        with pytest.raises(NotImplementedError, match="dp_size=1"):
+            create_weight_synchronizer(
+                policy=_mock_policy(cfg={}),
+                generation=gen,
+                generation_backend=SGLANG_BACKEND,
+                colocated=False,
+            )
+
+    def test_checkpoint_engine_rejects_sglang_pipeline_parallelism(self):
+        """One receiver is created per engine GPU, but SGLang indexes the
+        payload list by TP rank, and pp_size>1 makes those counts differ."""
+        gen = _mock_generation(cfg=_nixl_refit_cfg())
+        gen.cfg["backend"] = SGLANG_BACKEND
+        gen.cfg["sglang_cfg"] = {"pp_size": 2}
+
+        with pytest.raises(NotImplementedError, match="pp_size=1"):
+            create_weight_synchronizer(
+                policy=_mock_policy(cfg={}),
+                generation=gen,
+                generation_backend=SGLANG_BACKEND,
+                colocated=False,
+            )

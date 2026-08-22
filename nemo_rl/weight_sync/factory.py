@@ -82,13 +82,38 @@ def create_weight_synchronizer(
                 "generation. Set policy.generation.colocated.enabled=false or "
                 "set policy.generation.refit_transport=null."
             )
-        if generation_backend != VLLM_BACKEND:
+        if generation_backend not in {VLLM_BACKEND, SGLANG_BACKEND}:
             raise NotImplementedError(
                 "checkpoint-engine non-colocated refit is only supported for "
-                f"the vLLM generation backend, got {generation_backend!r}. "
-                "Support for other generation backends is tracked in "
+                "the vLLM and SGLang generation backends, got "
+                f"{generation_backend!r}. Support for other generation backends "
+                "is tracked in "
                 "https://github.com/NVIDIA-NeMo/RL/issues/3288."
             )
+        engine_kwargs = checkpoint_engine_config["engine_kwargs"][
+            checkpoint_engine_config["backend"]
+        ]
+        if generation_backend == SGLANG_BACKEND:
+            sglang_cfg = generation.cfg.get("sglang_cfg", {})
+            if sglang_cfg.get("dp_size", 1) != 1:
+                raise NotImplementedError(
+                    "SGLang checkpoint-engine refit currently requires "
+                    "sglang_cfg.dp_size=1."
+                )
+            if sglang_cfg.get("pp_size", 1) != 1:
+                # One receiver is created per engine GPU, but SGLang indexes
+                # ``serialized_named_tensors`` by TP rank, and with pp_size>1
+                # the engine has tp_size = num_gpus_per_engine // pp_size TP
+                # ranks. The payload list would be pp_size times too long.
+                raise NotImplementedError(
+                    "SGLang checkpoint-engine refit currently requires "
+                    "sglang_cfg.pp_size=1."
+                )
+            if engine_kwargs.get("shard_expert_weights", False):
+                raise NotImplementedError(
+                    "SGLang checkpoint-engine refit does not support "
+                    "shard_expert_weights=true; use full-weight MoE refit instead."
+                )
 
         from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
             CheckpointEngineWeightSynchronizer,

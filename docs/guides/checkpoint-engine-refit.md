@@ -2,13 +2,24 @@
 
 Checkpoint-engine refit updates non-colocated generation workers directly from
 policy workers. The built-in backend is NIXL, which can use UCX/RDMA for large
-policy-to-vLLM refits.
+policy-to-generation refits.
 
-Use it only for non-colocated vLLM generation:
+Use it only for non-colocated generation:
 
-- `policy.generation.backend=vllm`
+- `policy.generation.backend=vllm` or `policy.generation.backend=sglang`
 - `policy.generation.colocated.enabled=false`
 - `policy.generation.refit_transport=nixl`
+
+| Generation backend | Supported | Notes |
+| --- | --- | --- |
+| vLLM | yes | Includes sharded EP refit (`shard_expert_weights`). |
+| SGLang | yes | One node per logical engine, `dp_size=1`, `pp_size=1`; `shard_expert_weights` not supported. |
+| Megatron | no | Tracked by [issue #3288](https://github.com/NVIDIA-NeMo/RL/issues/3288). |
+
+For SGLang, NIXL terminates in the generation worker actor and the weights are
+handed to the SGLang server subprocess over same-node CUDA IPC, reusing the same
+`flattened_bucket` / `update_weights_from_tensor` contract as colocated refit.
+The per-refit timing line is logged as `[SGLang refit]`.
 
 Colocated generation still uses IPC/HTTP refit. Non-colocated generation without
 checkpoint-engine refit still uses the NCCL collective update path.

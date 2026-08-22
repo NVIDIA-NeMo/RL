@@ -204,3 +204,7 @@ class SGLangConfig(GenerationConfig):
 
     sglang_cfg: SglangSpecificArgs
     sglang_kwargs: NotRequired[dict[str, Any]]
+    # Null uses the colocated CUDA-IPC path. ``nixl`` and custom checkpoint
+    # engines are supported for non-colocated generation.
+    refit_transport: NotRequired[str | None]
+    refit_cfg: NotRequired[Any]

@@ -651,6 +651,36 @@ class TestFactory:
         )
         assert isinstance(sync, HTTPWeightSynchronizer)
 
+    def test_colocated_sglang_accepts_real_generation_object(self):
+        """A real SGLangGeneration must expose ``cfg`` like the other backends.
+
+        ``create_weight_synchronizer`` reads ``generation.cfg`` before any
+        backend dispatch. The MagicMock double used above answers ``cfg``
+        automatically, so only the real class can catch a missing attribute.
+        """
+        from nemo_rl.models.generation.sglang.sglang_generation import (
+            SGLangGeneration,
+        )
+
+        # ``__new__`` skips ``__init__``, which would need Ray, a router and
+        # live engines; ``cfg`` only depends on ``sglang_cfg``.
+        gen = SGLangGeneration.__new__(SGLangGeneration)
+        gen.sglang_cfg = {"backend": "sglang", "model_name": "dummy"}
+        # ``__del__`` calls ``shutdown()``, which reads these four attributes.
+        gen.all_engines = []
+        gen._router_actor = None
+        gen._http_client = None
+        gen._async_loop = None
+        assert gen.cfg is gen.sglang_cfg
+
+        sync = create_weight_synchronizer(
+            policy=_mock_policy(),
+            generation=gen,
+            generation_backend=SGLANG_BACKEND,
+            colocated=True,
+        )
+        assert isinstance(sync, HTTPWeightSynchronizer)
+
     def test_colocated_megatron_returns_megatron_synchronizer(self):
         policy = _mock_policy()
         gen = _mock_generation()
