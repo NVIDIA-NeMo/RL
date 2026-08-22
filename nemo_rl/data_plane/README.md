@@ -456,21 +456,49 @@ affine fit, throughput — is recomputed from the merged totals, never
 averaged across ranks (averaging per-rank percentiles does not give a
 cluster percentile).
 
-**A per-op breakdown table** is logged alongside the series, under
-`data_plane/{cluster,driver}/breakdown` — one row per op, ordered by wall
-time so the expensive one reads first:
+**What gets charted is the bottleneck, not the detail.** Four ops times
+eight fields is 32 series saying one thing, and a dashboard of 32 lines
+does not answer "where is my time going". So the emitted series are the
+totals and two *shares*, and the per-op detail goes in a table beside them:
 
-| op | calls | mean_ms | max_ms | wall_ms | overhead_ms | transfer_ms | p50_ms | p90_ms |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| get | 200 | 11.17 | 16.0 | 2232 | 6.03 | 5.15 | 12.9 | 15.2 |
-| put | 48 | 23.66 | 31.9 | 1135 | 12.06 | 11.60 | 22.4 | 30.1 |
+| series | what it answers |
+|---|---|
+| `step/frac_of_step` | is the data plane worth optimising at all? |
+| `step/share/by_op/{put,get,clear,register}` | which call is expensive? (sums to 1) |
+| `step/share/by_cause/{overhead,transfer}` | fixed per-request cost, or bandwidth? |
+| `step/wall_ms`, `step/comm_volume_mb` | how much time and traffic |
+| `now/bytes_outstanding_mb`, `now/n_processes` | occupancy, fan-out width |
+| `step/self/{overhead_ms,frac}` | what measuring cost |
 
-Everything in ms on that row is **per call**, and the two split terms add
-to `mean_ms`: that `get` row reads "each call cost 11.17 ms, of which 6.03
-was fixed per-request overhead and 5.15 was bandwidth at this step's mean
-request size". Per call the overhead term *is* the fitted constant, so it
-is comparable against a hardware number. `calls` and `wall_ms` are the only
-extensive columns.
+Two independent decompositions of one total is what makes a bottleneck
+legible. From a real TransferQueue run: `by_op` says put 43%, get 31%,
+register 17%, clear 9%; `by_cause` says 53% fixed per-request overhead
+against 18% bandwidth. That second line is the actionable one — this
+workload is overhead-dominated, so fewer, larger requests buy more than
+faster transport.
+
+The by-op shares sum to 1. The by-cause shares cover only the ops whose
+affine fit is identifiable, so they sum to at most 1; the gap is time that
+could not be attributed, not time that did not happen. `register` and
+`clear` move no bytes and never get a split.
+
+**A per-op breakdown table** carries the detail, under
+`data_plane/{cluster,driver}/breakdown` — one row per op, ordered by share
+so the bottleneck is the first line read:
+
+| op | share_pct | calls | wall_ms | mean_ms | max_ms | p50_ms | p90_ms | overhead_ms | transfer_ms | mb |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| put | 43.0 | 2 | 53.9 | 26.9 | 29.4 | — | — | 19.4 | 6.39 | 1.32 |
+| get | 30.9 | 2 | 38.7 | 19.4 | 21.5 | — | — | 13.8 | 4.63 | 1.03 |
+| register | 17.1 | 1 | 21.4 | 21.4 | 21.4 | — | — | — | — | 0 |
+| clear | 8.93 | 1 | 11.2 | 11.2 | 11.2 | — | — | — | — | 0 |
+
+Everything in ms on that row is **per call** except `wall_ms`, and the two
+split terms add to `mean_ms`: that `put` row reads "each call cost 26.9 ms,
+of which 19.4 was fixed per-request overhead and 6.39 was bandwidth at this
+step's mean request size". Per call the overhead term *is* the fitted
+constant, so it is comparable against a hardware number. `calls`,
+`wall_ms` and `mb` are the only extensive columns.
 
 **Per-call figures describe the wire; sums describe the run.** `wall_ms` on the cluster
 path is summed over processes that ran concurrently, so it is process-time
@@ -479,11 +507,7 @@ while the wall clock was 279. Dividing by the process count only trades one
 arbitrary denominator for another. Per call is invariant to both DP degree
 and batch size: the same workload at 8 and at 32 ranks reports 11.16 and
 11.06 ms while `wall_ms` quadruples. Use `mean_ms` to compare runs and
-cluster sizes, `wall_ms` to attribute cost across ops within one step.
-
-`overhead_ms` and `transfer_ms` stack to the measured `wall_ms` — that row
-reads "2233 ms of get was 1207 ms of fixed per-call cost and 1026 ms of
-bandwidth", which is a decision you can act on.
+cluster sizes, `share_pct` to attribute cost across ops within one step.
 
 A stack of line charts answers "how did put's wall time trend"; this
 answers "where did the step go", which is a table. Cells are empty rather
@@ -506,17 +530,18 @@ leak signal the metric exists for: bytes put and never cleared.
 
 Two more read differently in the cluster view and are named to say so:
 
-- **`step/wall_ms_per_process`**, not a bare fraction. `wall_ms` sums
-  processes that ran concurrently, so dividing it by one step's wall clock
-  exceeded 1 whenever they overlapped (measured 1.054 across ten
-  processes). Per process it is a duration in ms, like everything else.
-- **Percentiles are per step and clamped to the exact `max_ms`**, and are
-  withheld entirely below 50 calls in the window. Bucket interpolation
-  spreads a bucket's samples uniformly across it, so calls clustered low in
-  a wide bucket read high — 160 calls of 120 ms all land in `(100, 250]`
-  and interpolate to a p50 of 175, above every call observed and above the
-  max reported beside it. The max is measured exactly, so it is the tighter
-  bound.
+- **`step/frac_of_step` is per process.** `wall_ms` sums processes that ran
+  concurrently, so dividing it by one step's wall clock exceeded 1 whenever
+  they overlapped (measured 1.054 across ten processes) and read as "105%
+  of the step". Divided per process it is the mean share of the step a
+  process spent in the data plane, which is what the name claims.
+- **`step/{op}/max_ms` is scoped to the step by being reset**, not by being
+  differenced. A maximum cannot be recovered from two cumulative readings
+  the way `calls` and `wall_ms` can, so the reader that consumes it zeroes
+  it — `snapshot(reset_step_window=True)`, which the once-per-step
+  collector passes and an inspection snapshot does not. Without that the
+  cluster path reported the lifetime max: after one 50 ms call every later
+  step still read 50 ms.
 
 `grpo_train_sync` fans out to the driver and every policy worker, and logs
 the combined result under `data_plane/cluster/` instead of the driver's
@@ -528,7 +553,7 @@ processes, against a 6x wider view of the traffic. The fan-out is
 best-effort — a rank that cannot answer is dropped rather than failing the
 step.
 
-`observability_overhead_ms` reports what the measurement itself cost — the
+`step/self/overhead_ms` reports what the measurement itself cost — the
 whole bill, both halves:
 
 - every process's wrapper time (its wall time minus the time its inner
