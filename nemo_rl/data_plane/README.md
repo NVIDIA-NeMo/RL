@@ -477,20 +477,29 @@ put". Whether that time mattered against compute is the *other* metric:
 `frac_of_step` divides by the step's own wall clock. Read them together —
 a workload can be 43% put and still not be worth touching.
 
+Each `by_cause` term names what it measures. `fixed_overhead` is the fitted
+per-request constant — the cost of making a request at all, independent of
+its size. `transfer` **is** the bandwidth term: bytes divided by the fitted
+bandwidth. Reading a real TransferQueue step:
+
 ```
-step/frac_of_step               0.87    the data plane is 87% of the step, so it matters
-step/percent_of_dataplane/by_op/put        43.0     and within it, put is the largest piece
-step/percent_of_dataplane/by_cause/...
-    fixed_overhead             53.1     that time is mostly per-request cost,
-    transfer                   17.6     not bandwidth -- batch, don't tune the wire
+step/frac_of_step                                  0.074   the data plane is 7% of the step
+step/percent_of_dataplane/by_op/put                 42.1   within it, put is the largest op
+step/percent_of_dataplane/by_cause/fixed_overhead   52.3   half the time is per-request cost
+step/percent_of_dataplane/by_cause/transfer         20.7   a fifth is bandwidth
 ```
+
+Overhead beats bandwidth roughly 2:1 here, so this workload is
+overhead-dominated: batching into fewer, larger requests buys more than a
+faster wire. Had `transfer` been the larger of the two, the conclusion
+would invert.
 
 Two decompositions of one total, because either alone leaves the next
 question unanswered. `by_op` sums to 100 by construction. `by_cause` sums
 to *at most* 100: only ops with an identifiable affine fit can be split, so
-the remainder (here 29%, the `register` and `clear` calls that move no
-bytes) is time that could not be attributed rather than time that did not
-happen.
+the remainder (27% above — the `register` and `clear` calls, which move
+no bytes and so have no bandwidth term to fit) is time that could not be
+attributed rather than time that did not happen.
 
 On the cluster path `wall_ms` is summed over processes that ran
 concurrently, so these are percentages of aggregate **process-time**, not of
