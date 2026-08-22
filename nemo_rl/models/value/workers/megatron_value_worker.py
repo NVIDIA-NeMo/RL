@@ -85,14 +85,26 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-def _install_value_head_load_skip(chunk: GPTModel) -> None:
-    """Give the chunk a ``hide_loss_modules`` context manager that drops ``output_layer.*``.
+def _install_value_head_load_skip(chunk: Any) -> None:
+    """Give the chunk a context manager that hides its value-head checkpoint keys.
 
     The freshly-initialized value head is never in a base checkpoint, so Megatron-Bridge
     enters this context during finetune loads (and HF->Megatron conversion) to skip it.
     Resume loads run with ``finetune=False``, so the trained head is restored normally.
+
+    Some Megatron-Bridge model wrappers expose ``output_layer`` on the outer model while
+    storing it below a nested module (for example Qwen3.5 uses
+    ``language_model.output_layer``).  Record the actual ``LinearForLastLayer`` module
+    paths instead of assuming that the checkpoint key starts with ``output_layer``.
     """
     chunk._skip_value_head_in_sharded_sd = False
+    value_head_prefixes = tuple(
+        f"{name}." if name else ""
+        for name, module in chunk.named_modules(remove_duplicate=False)
+        if isinstance(module, LinearForLastLayer)
+    )
+    if not value_head_prefixes:
+        raise RuntimeError("Value head hook did not install a LinearForLastLayer")
     original_sharded_state_dict = chunk.sharded_state_dict
 
     def sharded_state_dict(
@@ -103,7 +115,8 @@ def _install_value_head_load_skip(chunk: GPTModel) -> None:
         )
         if chunk._skip_value_head_in_sharded_sd:
             for key in list(sharded_sd.keys()):
-                if key.startswith(f"{prefix}output_layer."):
+                relative_key = key[len(prefix) :] if key.startswith(prefix) else key
+                if relative_key.startswith(value_head_prefixes):
                     del sharded_sd[key]
         return sharded_sd
 
@@ -122,7 +135,14 @@ def _install_value_head_load_skip(chunk: GPTModel) -> None:
 
 
 def make_value_head_hook(hidden_size: int, sequence_parallel: bool):
-    """Build the pre-wrap hook that installs the value head and lets it skip base loads."""
+    """Build the pre-wrap hook that installs the value head and skips base loads.
+
+    Megatron-Bridge's generic hook assigns ``chunk.output_layer``.  Qwen3.5 is
+    represented by a multimodal wrapper whose forward path instead calls
+    ``chunk.language_model.output_layer``.  Move the freshly-created head to the
+    module that actually owns the language-model output layer before wrapping or
+    loading checkpoints.  Plain GPT models keep the generic behavior.
+    """
     base_hook = create_value_head_hook(
         hidden_size=hidden_size, sequence_parallel=sequence_parallel
     )
@@ -130,8 +150,16 @@ def make_value_head_hook(hidden_size: int, sequence_parallel: bool):
     def hook(model):
         model = base_hook(model)
         for chunk in model if isinstance(model, list) else [model]:
-            if isinstance(getattr(chunk, "output_layer", None), LinearForLastLayer):
-                _install_value_head_load_skip(chunk)
+            value_head = getattr(chunk, "output_layer", None)
+            if not isinstance(value_head, LinearForLastLayer):
+                continue
+
+            language_model = getattr(chunk, "language_model", None)
+            if language_model is not None and hasattr(language_model, "output_layer"):
+                language_model.output_layer = value_head
+                delattr(chunk, "output_layer")
+
+            _install_value_head_load_skip(chunk)
         return model
 
     return hook

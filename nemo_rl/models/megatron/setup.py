@@ -1894,6 +1894,9 @@ def make_policy_like_config(config: ValueConfig) -> dict:
         "megatron_cfg": megatron_cfg,
         "dynamic_batching": config["dynamic_batching"],
         "sequence_packing": config.get("sequence_packing", {"enabled": False}),
+        "materialize_causal_attention_mask": config.get(
+            "materialize_causal_attention_mask", True
+        ),
         "make_sequence_length_divisible_by": config[
             "make_sequence_length_divisible_by"
         ],

@@ -110,6 +110,9 @@ def make_processed_microbatch_iterator(
         ProcessedMicrobatch objects containing processed tensors ready for model forward
     """
     pack_sequences = cfg["sequence_packing"]["enabled"]
+    materialize_causal_attention_mask = cfg.get(
+        "materialize_causal_attention_mask", True
+    )
 
     for data_dict in raw_iterator:
         # Move to GPU
@@ -123,6 +126,7 @@ def make_processed_microbatch_iterator(
             pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
             pad_full_seq_to=pad_full_seq_to,
             pack_sequences=pack_sequences,
+            materialize_causal_attention_mask=materialize_causal_attention_mask,
             delegate_pack_to_model=delegate_pack_to_model,
             straggler_timer=straggler_timer,
         )
@@ -245,6 +249,7 @@ def process_microbatch(
     pad_packed_seq_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
     pack_sequences: bool = False,
+    materialize_causal_attention_mask: bool = True,
     delegate_pack_to_model: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
 ) -> ProcessedInputs:
@@ -443,15 +448,26 @@ def process_microbatch(
                 cp_rank=get_context_parallel_rank(),
                 cp_size=get_context_parallel_world_size(),
             )
-            attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                data=input_ids,
-                eod_token=0,  # used for loss_mask, which we don't use
-                pad_token=0,  # used for loss_mask, which we don't use
-                reset_position_ids=False,
-                reset_attention_mask=False,
-                eod_mask_loss=False,
-                pad_mask_loss=False,
-            )
+            if materialize_causal_attention_mask:
+                attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
+                    data=input_ids,
+                    eod_token=0,  # used for loss_mask, which we don't use
+                    pad_token=0,  # used for loss_mask, which we don't use
+                    reset_position_ids=False,
+                    reset_attention_mask=False,
+                    eod_mask_loss=False,
+                    pad_mask_loss=False,
+                )
+            else:
+                # Megatron's helper constructs a dense [1, 1, S, S] fp32 causal
+                # mask. At S=65536 that tensor alone is 16 GiB. Causality is
+                # already supplied by the transformer attention implementation,
+                # and right padding contains no valid tokens after a sequence's
+                # end, so the value model only needs ordinary position IDs here.
+                attention_mask = None
+                position_ids = torch.arange(
+                    input_ids.size(1), dtype=torch.long, device=input_ids.device
+                ).unsqueeze(0).expand_as(input_ids)
             if "mtp_loss_mask" in data_dict:
                 mtp_loss_mask = data_dict["mtp_loss_mask"]
     return ProcessedInputs(

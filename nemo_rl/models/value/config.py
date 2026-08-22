@@ -63,6 +63,7 @@ class ValueConfig(TypedDict):
     # Batching strategies
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
+    materialize_causal_attention_mask: NotRequired[bool]
 
     # Sequence length settings
     make_sequence_length_divisible_by: int
