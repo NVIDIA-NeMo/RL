@@ -19,7 +19,6 @@ import os
 import threading
 import time
 import warnings
-from dataclasses import replace
 from typing import Any, AsyncGenerator, Optional
 
 import requests
@@ -30,7 +29,6 @@ from megatron.core.inference.config import (
     KVCacheManagementMode,
     MambaInferenceStateConfig,
     PrefixCachingCoordinatorPolicy,
-    VideoProcessingConfig,
 )
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
@@ -57,6 +55,7 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.utils import unwrap_model
 
+from nemo_rl.data.multimodal_utils import CACHED_VIDEO_FRAME_MANIFEST_MAGIC
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -65,11 +64,9 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.megatron.utils import (
     build_image_preprocessing_config,
+    build_video_preprocessing_config,
     log_gpu_memory,
     resolve_torch_dtype,
-)
-from nemo_rl.models.generation.vllm.video_utils import (
-    _CACHED_VIDEO_FRAME_MANIFEST_MAGIC,
 )
 from nemo_rl.models.megatron.memory_saver import (
     HAVE_TORCH_MEMORY_SAVER,
@@ -346,22 +343,11 @@ class MegatronGenerationMixin:
         image_preprocessing_config = self._build_image_preprocessing_config(
             mcore_generation_config
         )
-        video_preprocessing_config = None
-        temporal_patch_size = mcore_generation_config.get("video_temporal_patch_size")
-        if image_preprocessing_config is not None and temporal_patch_size is not None:
-            video_image_config = image_preprocessing_config
-            target_num_patches = mcore_generation_config.get("video_target_num_patches")
-            if target_num_patches is not None:
-                video_image_config = replace(
-                    video_image_config,
-                    dynamic_resolution_max_patches=int(target_num_patches),
-                )
-            video_preprocessing_config = VideoProcessingConfig(
-                image_config=video_image_config,
-                num_frames=int(mcore_generation_config["video_num_frames"]),
-                temporal_patch_size=int(temporal_patch_size),
-                frame_manifest_magic=_CACHED_VIDEO_FRAME_MANIFEST_MAGIC,
-            )
+        video_preprocessing_config = build_video_preprocessing_config(
+            image_preprocessing_config,
+            mcore_generation_config,
+            frame_manifest_magic=CACHED_VIDEO_FRAME_MANIFEST_MAGIC,
+        )
 
         inference_config = InferenceConfig(
             block_size_tokens=block_size_tokens,

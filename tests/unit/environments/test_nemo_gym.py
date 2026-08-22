@@ -32,6 +32,7 @@ from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
     PackedTensor,
     image_to_data_url,
+    normalize_media_in_examples,
 )
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -50,7 +51,6 @@ from nemo_rl.environments.nemo_gym_video import (
     _inject_vllm_mm_processor_kwargs,
     _metadata_extra_body,
     nemo_gym_example_to_video_datum_spec,
-    normalize_video_urls_in_examples,
 )
 from nemo_rl.environments.nemotron_utils import (
     _expand_nemotron_video_placeholders,
@@ -184,7 +184,7 @@ def test_extract_static_video_message_ignores_still_image_only_row():
     assert _extract_static_video_messages(example) is None
 
 
-def test_gym_local_video_path_is_normalized_to_file_url(tmp_path):
+def test_gym_local_video_path_is_inlined_as_data_url(tmp_path):
     video_path = tmp_path / "clip with spaces.mp4"
     video_path.write_bytes(b"test")
     examples = [
@@ -205,14 +205,12 @@ def test_gym_local_video_path_is_normalized_to_file_url(tmp_path):
         }
     ]
 
-    normalize_video_urls_in_examples(examples)
+    normalize_media_in_examples(examples)
 
-    assert (
-        examples[0]["responses_create_params"]["input"][0]["content"][0]["video_url"][
-            "url"
-        ]
-        == video_path.resolve().as_uri()
-    )
+    video_url = examples[0]["responses_create_params"]["input"][0]["content"][0][
+        "video_url"
+    ]
+    assert video_url.startswith("data:video/mp4;base64,")
 
 
 def test_extract_static_video_message_rejects_multiple_videos(tmp_path):

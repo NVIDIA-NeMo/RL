@@ -96,41 +96,6 @@ def _resolve_local_video_path(source: str) -> str:
     return str(path.resolve())
 
 
-def normalize_video_urls_in_examples(examples: list[dict[str, Any]]) -> None:
-    """Convert bare local video paths to file URLs before Gym dispatch."""
-    for example in examples:
-        input_items = example.get("responses_create_params", {}).get("input", [])
-        if not isinstance(input_items, list):
-            continue
-        for item in input_items:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if (
-                    not isinstance(part, dict)
-                    or part.get("type") not in VIDEO_CONTENT_TYPES
-                ):
-                    continue
-                media_key = next(
-                    (key for key in ("video_url", "video", "url") if key in part),
-                    None,
-                )
-                if media_key is None:
-                    continue
-                source = _get_content_part_url(part, media_key)
-                if not source or urlparse(source).scheme:
-                    continue
-                normalized = Path(_resolve_local_video_path(source)).as_uri()
-                original = part[media_key]
-                if isinstance(original, dict):
-                    original["url"] = normalized
-                else:
-                    part[media_key] = normalized
-
-
 def _extract_static_video_messages(
     nemo_gym_example: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], str | None] | None:

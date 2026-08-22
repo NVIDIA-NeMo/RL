@@ -355,6 +355,7 @@ async def _run_env_eval_impl(
                     prompt_dict = {"prompt": vllm_content}
                     prompt_display = vllm_content
                 else:
+                    # Placeholder-style processors pass prompt_token_ids with media.
                     prompt_token_ids = []
                     for message in message_log:
                         token_ids = message["token_ids"]
