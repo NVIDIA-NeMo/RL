@@ -44,7 +44,7 @@ import ray
 
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
-from nemo_rl.weight_sync.membership import RefitMembership, plan_refit_membership
+from nemo_rl.weight_sync.membership import RefitMembership, desired_membership
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     make_nccl_reshard_refit_info_wire_safe,
 )
@@ -87,6 +87,8 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         self._inference_cluster = inference_cluster
         self._refit_timeout_s = refit_timeout_s
         self._stale = True
+        # What the communicators were last built over. None until init_communicator.
+        self._built_membership: Optional[RefitMembership] = None
 
     def _train_parallelism(self) -> dict[str, int]:
         megatron_cfg = self._policy.cfg["megatron_cfg"]
@@ -145,11 +147,10 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
     def init_communicator(self) -> None:
         """Build both communicator families and the refit plan, over the whole fleet."""
-        dp_size = self._generation.worker_group.dp_size
         self._build(
-            plan_refit_membership(
-                surviving_shards=list(range(dp_size)),
-                dp_size=dp_size,
+            desired_membership(
+                absent_shards=[],
+                dp_size=self._generation.worker_group.dp_size,
                 total_gen_workers=len(self._generation.worker_group.workers),
                 train_world_size=self._train_cluster.world_size(),
             )
@@ -255,6 +256,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             nccl_reshard_refit_info
         )
         self._generation.prepare_nccl_reshard_refit_info(wire_refit_info)
+        self._built_membership = membership
 
     def reconcile_communicator(self, absent_shards: Sequence[int]) -> bool:
         """Rebuild both communicator families and regenerate the refit plan.
@@ -273,21 +275,32 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         communicators without regenerating the plan would corrupt the refit silently,
         which is why the plan is regenerated rather than reused.
         """
-        if not absent_shards:
-            return False
-
-        dp_size = self._generation.worker_group.dp_size
-        surviving = [idx for idx in range(dp_size) if idx not in set(absent_shards)]
-        membership = plan_refit_membership(
-            surviving_shards=surviving,
-            dp_size=dp_size,
+        membership = desired_membership(
+            absent_shards=absent_shards,
+            dp_size=self._generation.worker_group.dp_size,
             total_gen_workers=len(self._generation.worker_group.workers),
             train_world_size=self._train_cluster.world_size(),
         )
+        # Compared against what was built, not against "is anything absent". Keyed off
+        # the absent set alone this would return False the moment a restarted shard came
+        # back, leaving it permanently excluded from a communicator it should rejoin.
+        #
+        # An unrecorded membership means the full fleet: init_communicator builds over
+        # everything, so "not recorded" is not "unknown", and treating it as a difference
+        # would rebuild pointlessly on the very first refit of every run.
+        if self._built_membership is None:
+            self._built_membership = desired_membership(
+                absent_shards=[],
+                dp_size=self._generation.worker_group.dp_size,
+                total_gen_workers=len(self._generation.worker_group.workers),
+                train_world_size=membership.train_world_size,
+            )
+        if membership.shard_prefixes == self._built_membership.shard_prefixes:
+            return False
         print(
-            f"  refit: rebuilding nccl_reshard communicators without shards "
-            f"{sorted(absent_shards)}; gen world "
-            f"{len(surviving) * membership.workers_per_shard}",
+            f"  refit: rebuilding nccl_reshard communicators over shards "
+            f"{membership.surviving_shards}; gen world "
+            f"{membership.world_size - membership.train_world_size}",
             flush=True,
         )
         self._build(membership)

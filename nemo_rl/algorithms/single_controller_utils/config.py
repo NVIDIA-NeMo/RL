@@ -300,6 +300,11 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # GB200 -- because the cost of firing early is aborting a run that was merely slow,
     # while the cost of firing late is only that a wedge lasts longer before it is broken.
     refit_timeout_s: Optional[PositiveFloat] = None
+    # Restart dead shards and re-admit them at the next refit. Off by default: without
+    # it the fleet only ever shrinks, which is safe but means a long run ends smaller
+    # than it started. Recreating a vLLM worker mid-run is the most invasive thing this
+    # feature does, so it is opt-in rather than implied by fleet_health.enabled.
+    restart_dead_shards: bool = False
 
     @model_validator(mode="after")
     def _check_consistent(self) -> "FleetHealthConfig":

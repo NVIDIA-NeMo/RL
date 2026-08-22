@@ -19,6 +19,7 @@
 #   bash tests/functional/grpo_sc_generation_shard_recovery.sh
 #   NUM_GPUS=8 bash tests/functional/grpo_sc_generation_shard_recovery.sh
 #   REFIT_TRANSPORT=nccl_reshard bash tests/functional/grpo_sc_generation_shard_recovery.sh
+#   RESTART_DEAD_SHARDS=true bash tests/functional/grpo_sc_generation_shard_recovery.sh
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR"/../..)
@@ -239,6 +240,11 @@ fi
 
 HOLD_FILE="$EXP_DIR/hold_refit"
 rm -f "$HOLD_FILE"
+# With restarts on, the assertion changes from "the run survived a smaller fleet" to
+# "the shard came back": the engine is recreated, re-admitted at the next refit, and
+# serves again. That is a strictly stronger claim and exercises code -- worker
+# recreation -- that no unit test can reach.
+RESTART_DEAD_SHARDS=${RESTART_DEAD_SHARDS:-false}
 
 echo "[recovery] $NUM_GPUS GPUs on host -> using $USED_GPUS: $TRAIN_GPUS train, $GEN_GPUS generation (dp_size=$GEN_GPUS), refit_transport=$REFIT_TRANSPORT"
 
@@ -272,6 +278,7 @@ uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     logger.tensorboard_enabled=true \
     logger.monitor_gpus=false \
     ++async_rl.generation_fleet_health.enabled=true \
+    ++async_rl.generation_fleet_health.restart_dead_shards="$RESTART_DEAD_SHARDS" \
     ++async_rl.generation_fleet_health.probe_interval_s=$PROBE_INTERVAL_S \
     ++async_rl.generation_fleet_health.unhealthy_threshold=$UNHEALTHY_THRESHOLD \
     ++async_rl.generation_fleet_health.refit_timeout_s="$REFIT_TIMEOUT_S" \
@@ -548,7 +555,7 @@ fi
 
 # Completion alone is not enough: a run that never noticed the death would also exit 0.
 # These pin that the death was seen AND that the communicator was actually rebuilt.
-REBUILD_RE="rebuilding (nccl_reshard )?communicators? without shards"
+REBUILD_RE="rebuilding (nccl_reshard )?communicators? over shards"
 if ! grep -Eq "$REBUILD_RE" "$RUN_LOG"; then
     echo "[recovery] FAIL: job completed but never rebuilt the refit communicator."
     echo "[recovery] Either the death went unnoticed, or a refit was never needed after it."
@@ -589,8 +596,36 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
     "len(data[\"train/reward\"]) == $MAX_STEPS" \
     'max(data["train/reward"]) > 0'
 
+if [[ "$RESTART_DEAD_SHARDS" == "true" ]]; then
+    # Completion plus one rebuild only proves the fleet shrank and carried on. Coming
+    # back is a different claim and needs its own evidence.
+    if ! grep -q "supervisor: restarting generation shard" "$RUN_LOG"; then
+        echo "[recovery] FAIL: restarts enabled but no restart was ever attempted"
+        grep -E "supervisor|fleet:" "$RUN_LOG" | tail -20; exit 1
+    fi
+    if ! grep -q "supervisor: shard .* back up at" "$RUN_LOG"; then
+        echo "[recovery] FAIL: the restart never produced a working engine"
+        grep -E "supervisor|fleet:" "$RUN_LOG" | tail -20; exit 1
+    fi
+    # Two rebuilds: one dropping the dead shard, one taking the replacement back.
+    REBUILDS=$(grep -Ec "$REBUILD_RE" "$RUN_LOG")
+    if (( REBUILDS < 2 )); then
+        echo "[recovery] FAIL: $REBUILDS rebuild(s); re-admission needs a second one."
+        echo "[recovery] The shard restarted but was never let back into the refit."
+        grep -E "$REBUILD_RE|supervisor|fleet:" "$RUN_LOG" | tail -20; exit 1
+    fi
+    # STALE -> HEALTHY only happens via a completed refit, so this is the end of the
+    # handover rather than just the engine being up.
+    if ! grep -q "stale -> healthy" "$RUN_LOG"; then
+        echo "[recovery] FAIL: the replacement never returned to the serving set"
+        grep -E "fleet: shard" "$RUN_LOG" | tail -20; exit 1
+    fi
+    echo "[recovery] restart + re-admission observed:"
+    grep -E "supervisor:|stale -> healthy" "$RUN_LOG" | head -6
+fi
+
 if [[ "$FREEZE_VICTIM" == "true" ]]; then
-    echo "[recovery] PASS: the refit deadline broke a stalled collective and the run finished all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT)"
+    echo "[recovery] PASS: the refit deadline broke a stalled collective and the run finished all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT, restart=$RESTART_DEAD_SHARDS)"
 else
-    echo "[recovery] PASS: survived a shard loss and completed all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT)"
+    echo "[recovery] PASS: survived a shard loss and completed all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT, restart=$RESTART_DEAD_SHARDS)"
 fi

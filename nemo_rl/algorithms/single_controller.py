@@ -78,6 +78,7 @@ from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
+from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -169,6 +170,14 @@ class SingleControllerActor:
         # therefore degrades to the documented off state rather than to a broken one.
         self._gen_fleet = getattr(actor_args, "fleet_monitor", None)
         self._generation_router = getattr(actor_args, "generation_router", None)
+        # Only with fleet health: without a ledger nothing ever reaches DEAD, so there
+        # is nothing for a supervisor to restart.
+        self._engine_supervisor = (
+            EngineSupervisor(generation=self._gen, monitor=self._gen_fleet)
+            if self._gen_fleet is not None
+            and master_config.async_rl.generation_fleet_health.restart_dead_shards
+            else None
+        )
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -1274,6 +1283,8 @@ class SingleControllerActor:
             metrics["rollout/train_steps"] = float(self._train_steps)
             if self._gen_fleet is not None:
                 metrics.update(self._gen_fleet.as_metrics())
+            if self._engine_supervisor is not None:
+                metrics.update(self._engine_supervisor.metrics())
             if self._generation_router is not None:
                 # router/* counters are exactly what you want when a backend starts
                 # failing; computed since P2 landed but never published until now.
@@ -1345,6 +1356,12 @@ class SingleControllerActor:
         while True:
             await asyncio.sleep(interval_s)
             await self._probe_generation_fleet()
+            # Between probing and publishing: a shard condemned by the probe above starts
+            # restarting on this tick rather than the next, and moving to RESTARTING
+            # before the router push keeps a shard that is coming back out of the
+            # serving set.
+            if self._engine_supervisor is not None:
+                self._engine_supervisor.tick()
             # Both of these are best-effort: they talk to a max_restarts=-1 actor that
             # may be mid-recreation, and run() awaits this task and re-raises, so an
             # unguarded RayActorError here would end the training job over a push that

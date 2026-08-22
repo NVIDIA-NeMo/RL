@@ -74,12 +74,11 @@ def _mock_generation(**overrides):
     gen.update_weights_from_collective.return_value = [MagicMock()]
     gen.get_rollout_engine_urls.return_value = ["http://localhost:30000"]
     gen.init_collective.return_value = [MagicMock()]
-    # A real worker group, because the reshard transport now derives its refit
-    # membership from dp_size and the worker count. Left as bare MagicMocks these
-    # reach the rank arithmetic and fail there, on a comparison, several frames from
-    # the cause.
-    gen.worker_group.dp_size = 1
-    gen.worker_group.workers = [MagicMock()]
+    # Real numbers, not MagicMocks: both NCCL transports derive their refit membership
+    # from dp_size and the worker count, so bare MagicMocks reach the rank arithmetic and
+    # fail there, on a comparison, several frames from the cause.
+    gen.worker_group.dp_size = 2
+    gen.worker_group.workers = [MagicMock(), MagicMock()]
     gen.get_collective_sender_spec.return_value = CollectiveSenderSpec()
     gen.get_inference_world_size.return_value = None
     for k, v in overrides.items():

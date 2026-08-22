@@ -136,6 +136,78 @@ class TestStaleIsTheOnlyWayBack:
         assert monitor.snapshot()[0].weight_version == 42
 
 
+class TestFailedRestart:
+    """A restart that does not bring the engine up.
+
+    Its own transition because record_probe deliberately ignores non-serving states -- a
+    probe must never resurrect a shard. Reporting a failed restart that way would strand
+    the shard in RESTARTING: never retried, because it is no longer DEAD, and never
+    retired, because retirement is driven by restart attempts.
+    """
+
+    def test_a_failed_restart_goes_back_to_dead(self):
+        monitor = _monitor(unhealthy_threshold=1)
+        _fail(monitor, 0, times=1)
+        monitor.mark_restarting(0)
+
+        monitor.mark_restart_failed(0)
+
+        assert monitor.state_of(0) is ShardState.DEAD
+
+    def test_the_shard_is_retryable_again(self):
+        """DEAD is what makes it eligible for another attempt; RESTARTING is a dead end."""
+        monitor = _monitor(unhealthy_threshold=1, max_restart_attempts_per_shard=3)
+        _fail(monitor, 0, times=1)
+        monitor.mark_restarting(0)
+        monitor.mark_restart_failed(0)
+
+        assert 0 in monitor.absent_shards()
+        monitor.mark_restarting(0)
+        assert monitor.state_of(0) is ShardState.RESTARTING
+
+    def test_failed_restarts_consume_the_budget(self):
+        """A DEAD -> RESTARTING -> DEAD cycle must still cost an attempt, or a shard that
+        fails to come up retries forever.
+
+        Retirement is lazy: mark_restarting increments *then* checks, so the budget is
+        enforced when the next attempt is requested, not when the last one is spent. The
+        supervisor is built for that -- it picks up DEAD shards, calls mark_restarting,
+        then checks for RETIRED -- so this costs one extra tick and leaks nothing.
+        """
+        monitor = _monitor(unhealthy_threshold=1, max_restart_attempts_per_shard=2)
+        _fail(monitor, 0, times=1)
+        for _ in range(2):
+            monitor.mark_restarting(0)
+            monitor.mark_restart_failed(0)
+        assert monitor.state_of(0) is ShardState.DEAD, "budget spent, not yet retired"
+
+        monitor.mark_restarting(0)
+
+        assert monitor.state_of(0) is ShardState.RETIRED
+
+    def test_it_never_serves_after_a_failed_restart(self):
+        monitor = _monitor(unhealthy_threshold=1, healthy_threshold=1)
+        _fail(monitor, 0, times=1)
+        monitor.mark_restarting(0)
+        monitor.mark_restart_failed(0)
+        for _ in range(10):
+            monitor.record_probe(0, ok=True)
+
+        assert 0 not in monitor.serving_shards()
+
+    def test_a_retired_shard_is_not_dragged_back_to_dead(self):
+        monitor = _monitor(unhealthy_threshold=1, max_restart_attempts_per_shard=1)
+        _fail(monitor, 0, times=1)
+        monitor.mark_restarting(0)
+        monitor.mark_restart_failed(0)
+        monitor.mark_restarting(0)  # one past the budget
+        assert monitor.state_of(0) is ShardState.RETIRED
+
+        monitor.mark_restart_failed(0)
+
+        assert monitor.state_of(0) is ShardState.RETIRED, "retirement is terminal"
+
+
 class TestRetirement:
     def test_restarts_are_bounded_then_the_shard_retires(self):
         monitor = _monitor(unhealthy_threshold=1, max_restart_attempts_per_shard=2)
