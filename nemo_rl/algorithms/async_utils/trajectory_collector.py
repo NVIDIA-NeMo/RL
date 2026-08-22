@@ -1057,9 +1057,17 @@ class AsyncTrajectoryCollector:
                     group_index = rollout_result.group_index
                     if group_index not in expected_group_indices:
                         raise ValueError(f"Unexpected prompt group index {group_index}")
-                    cross_trajectory = use_nemo_gym and self.algorithm_config[
-                        "adv_estimator"
-                    ].get("cross_trajectory")
+                    # PPO carries an ``adv_estimator`` section, while legacy GRPO
+                    # does not.  Refine-style Gym agents can still expand one row
+                    # into multiple trainable trajectories on the GRPO path, so
+                    # default to the existing non-cross-trajectory handling when
+                    # the algorithm has no such section.
+                    adv_estimator_config = self.algorithm_config.get(
+                        "adv_estimator", {}
+                    )
+                    cross_trajectory = use_nemo_gym and adv_estimator_config.get(
+                        "cross_trajectory", False
+                    )
                     if cross_trajectory:
                         trajectory_ids = rollout_result.final_batch.get("trajectory_id")
                         logical_trajectory_count = (
@@ -1073,11 +1081,21 @@ class AsyncTrajectoryCollector:
                                 f"{logical_trajectory_count} logical trajectories; "
                                 f"expected {num_generations}"
                             )
-                    elif rollout_result.final_batch.size != num_generations:
+                    else:
+                        # NeMo-Gym agents may expand one generation into multiple
+                        # trainable trajectories (for example, one trajectory per
+                        # refine round). Native rollouts remain one-to-one with the
+                        # configured generation count.
+                        invalid_group_size = (
+                            rollout_result.final_batch.size < num_generations
+                            if use_nemo_gym
+                            else rollout_result.final_batch.size != num_generations
+                        )
+                    if not cross_trajectory and invalid_group_size:
                         raise ValueError(
                             f"Prompt group {group_index} contains "
                             f"{rollout_result.final_batch.size} rollouts; expected "
-                            f"{num_generations}"
+                            f"{'at least ' if use_nemo_gym else ''}{num_generations}"
                         )
                     if group_index in buffered_group_indices:
                         continue

@@ -687,11 +687,12 @@ class VllmAsyncGenerationWorkerImpl(
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
                 )
-            except VLLMValidationError as e:
-                # vLLM 0.20 raises VLLMValidationError for prompts exceeding
-                # max_model_len during tokenization, instead of returning an
-                # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
-                # detect context-length overflow and handle it gracefully.
+            except (ValueError, VLLMValidationError) as e:
+                # Depending on the vLLM version and validation path, prompts
+                # exceeding max_model_len raise either ValueError or
+                # VLLMValidationError instead of returning an ErrorResponse.
+                # Convert both to HTTP 400 so clients can detect context-length
+                # overflow and trigger compaction instead of retrying a 500.
                 return JSONResponse(
                     content={
                         "error": {

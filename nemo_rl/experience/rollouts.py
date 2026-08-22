@@ -18,6 +18,7 @@
 import asyncio
 import copy
 import json
+import math
 import statistics
 import warnings
 from collections import defaultdict
@@ -1988,6 +1989,52 @@ def _tensorize_nemo_gym_result(result: dict) -> None:
     )
 
 
+def _truncate_nemo_gym_result_to_policy_limit(
+    result: dict, max_seq_len: Optional[int]
+) -> None:
+    """Bound a Gym trajectory to the sequence length accepted by training.
+
+    CompactionRL intentionally gives the generation server extra hard-limit
+    headroom. A tool result at a compaction boundary can therefore make the
+    returned segment longer than the policy/value budget even though the next
+    generation starts from a compacted prompt. Keep the on-policy prefix and
+    trim the untrainable tail before replay/PPO sees the segment.
+    """
+    if max_seq_len is None:
+        return
+    if max_seq_len <= 0:
+        raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
+
+    message_log = result["message_log"]
+    original_tokens = sum(len(message["token_ids"]) for message in message_log)
+    result["policy_original_tokens"] = original_tokens
+    result["policy_sequence_truncated"] = original_tokens > max_seq_len
+    if original_tokens <= max_seq_len:
+        return
+
+    remaining = max_seq_len
+    truncated_log = []
+    for message in message_log:
+        if remaining == 0:
+            break
+        token_count = len(message["token_ids"])
+        keep = min(token_count, remaining)
+        truncated_message = dict(message)
+        if keep < token_count:
+            # Keep every per-token tensor aligned with token_ids. Other fields
+            # are diagnostic metadata and are not used to build PPO tensors.
+            for key, value in message.items():
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.ndim > 0
+                    and value.shape[0] == token_count
+                ):
+                    truncated_message[key] = value[:keep]
+        truncated_log.append(truncated_message)
+        remaining -= keep
+    result["message_log"] = truncated_log
+
+
 def _tool_call_metrics(results: list[dict[str, Any]], prefix: str) -> dict[str, Any]:
     """Summarize tool-call shape and empty-call concentration.
 
@@ -2413,6 +2460,7 @@ async def run_async_nemo_gym_rollout(
                         effort_config=effort_config,
                         reward_penalty_config=reward_penalty_config,
                         thinking_tags=thinking_tags,
+                        max_seq_len=max_seq_len,
                     )
                     if accumulator.is_complete:
                         final_rollout_result = rollout_result
@@ -2522,19 +2570,40 @@ def _postprocess_single_nemo_gym_group(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    max_seq_len: Optional[int] = None,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
     flat_results: list[dict] = []
     source_row_indices: list[int] = []
-    for source_row_index, row_result in enumerate(results):
+    for fallback_source_row_index, row_result in enumerate(results):
         row_results = row_result if isinstance(row_result, list) else [row_result]
-        flat_results.extend(row_results)
-        source_row_indices.extend([source_row_index] * len(row_results))
+        for result in row_results:
+            source_row_index = result.get(
+                "source_rowidx", fallback_source_row_index
+            )
+            if type(source_row_index) is not int:
+                raise TypeError(
+                    "NeMo-Gym source_rowidx must be an int, got "
+                    f"{type(source_row_index).__name__}"
+                )
+            if source_row_index < 0 or source_row_index >= len(nemo_gym_rows):
+                raise ValueError(
+                    f"NeMo-Gym source_rowidx {source_row_index} outside the "
+                    f"prompt-group range [0, {len(nemo_gym_rows)})"
+                )
+            flat_results.append(result)
+            source_row_indices.append(source_row_index)
     results = flat_results
     expanded_nemo_gym_rows = [
         nemo_gym_rows[source_row_index]
         for source_row_index in source_row_indices
     ]
+
+    # The Gym server can use a larger hard context limit than policy/value
+    # training. Enforce the training contract independently for every expanded
+    # result (including every CompactionRL segment).
+    for result in results:
+        _truncate_nemo_gym_result_to_policy_limit(result, max_seq_len)
 
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(
@@ -2579,8 +2648,11 @@ def _postprocess_single_nemo_gym_group(
                 ),
                 "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-                == max_total_tokens_per_sample,
+                "hit_max_tokens": (
+                    bool(r.get("policy_sequence_truncated", False))
+                    or sum(len(m["token_ids"]) for m in r["message_log"])
+                    == max_total_tokens_per_sample
+                ),
                 # max_gen_tokens_per_turn: Diagnostic for long single generations
                 "max_gen_tokens_per_turn": max(
                     (
@@ -2636,6 +2708,17 @@ def _postprocess_single_nemo_gym_group(
             / batch_size,
             "truncation_rate": sum(m["hit_max_tokens"] for m in all_sample_metrics)
             / batch_size,
+            "policy_sequence_truncation_rate": sum(
+                bool(r.get("policy_sequence_truncated", False)) for r in results
+            )
+            / batch_size,
+            "policy_sequence_truncated_count": sum(
+                bool(r.get("policy_sequence_truncated", False)) for r in results
+            ),
+            "policy_sequence_max_original_tokens": max(
+                (int(r.get("policy_original_tokens", 0)) for r in results),
+                default=0,
+            ),
             # TODO enable this metric. We don't have a clear handle on which tokens are user or tool role.
             # We would probably need to re-tokenize the messages post-hoc to kind of figure this out.
             # "mean_env_tokens_per_sample": sum(
@@ -2816,6 +2899,21 @@ def _postprocess_single_nemo_gym_group(
             for index, segment_type in enumerate(segment_types)
             if segment_type == "execution"
         ]
+        # The generic total_reward metric is segment-weighted after a
+        # compaction rollout expands one SWE task into multiple trainable
+        # traces. Report the task-level outcome separately by selecting the
+        # single final segment from each logical trajectory. This is
+        # observability only; reward/advantage assignment is unchanged.
+        task_rewards = []
+        for indices in trajectory_to_segments.values():
+            final_indices = [index for index in indices if final_segment_flags[index]]
+            if len(final_indices) != 1:
+                raise ValueError(
+                    "Every compaction trajectory must provide exactly one final segment"
+                )
+            task_rewards.append(
+                float(results[final_indices[0]]["full_result"]["reward"])
+            )
         rollout_metrics.update(
             {
                 "compaction/count_mean": sum(compaction_counts)
@@ -2828,6 +2926,13 @@ def _postprocess_single_nemo_gym_group(
                 / max(len(summary_token_counts), 1),
                 "compaction/execution_tokens_mean": sum(execution_token_counts)
                 / max(len(execution_token_counts), 1),
+                "compaction/task_reward_mean": sum(task_rewards)
+                / len(task_rewards),
+                # SWE reward is binary, so the task-level mean is the pass rate.
+                # Keep the explicit name to avoid comparing against the
+                # segment-weighted generic total_reward/mean metric.
+                "compaction/pass_rate": sum(task_rewards) / len(task_rewards),
+                "compaction/task_count": len(task_rewards),
             }
         )
 
