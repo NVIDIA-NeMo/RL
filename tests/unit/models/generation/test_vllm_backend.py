@@ -235,6 +235,40 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_nccl_reshard_preflight_failure_is_fail_closed_and_nonfatal(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=object(), vllm_config=SimpleNamespace(speculative_config=None)
+    )
+    ext.model_config = object()
+    ext.device = object()
+    ext.nccl_reshard_refit_info = {"layer_names": []}
+    ext.hf_to_local_param_map = {}
+    ext.model_update_group = object()
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+
+    def failing_preflight(_group, _src):
+        raise RuntimeError("train-signaled preflight failure")
+
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_preflight_consumer", failing_preflight
+    )
+
+    # A preflight failure must follow the same contract as every other
+    # transport failure: swallowed to False (nonfatal) and worker poisoned.
+    assert ext.nccl_reshard_refit() is False
+    assert ext._refit_unusable_reason is not None
+    assert "preflight failure" in ext._refit_unusable_reason
+    assert ext.nccl_reshard_refit() is False
+
+
+@pytest.mark.vllm
 def test_fp8_kv_postprocess_failure_makes_worker_fail_closed(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
