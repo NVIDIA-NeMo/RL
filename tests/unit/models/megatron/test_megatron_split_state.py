@@ -12,9 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     draft_local_update_outcome,
 )
+
+
+pytestmark = pytest.mark.mcore
 
 
 def test_zero_anchor_model_is_structural_owner_without_draft_payload() -> None:

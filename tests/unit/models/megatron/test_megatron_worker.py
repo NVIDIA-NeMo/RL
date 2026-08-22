@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from nemo_rl.algorithms.draft_update_schedule import DraftUpdateDecision
 from nemo_rl.models.policy.workers.megatron_policy_worker import draft_execution_inputs
+
+
+pytestmark = pytest.mark.mcore
 
 
 def _decision(*, update_requested: bool) -> DraftUpdateDecision:
