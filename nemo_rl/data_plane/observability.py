@@ -156,6 +156,32 @@ def _pop_partition_keys(
     return removed
 
 
+def _tensor_bytes(v: torch.Tensor) -> int:
+    """Wire bytes of one tensor leaf, rectangular or nested.
+
+    A nested tensor's own ``nbytes`` (and ``numel``/``element_size``) route
+    through ``__torch_function__`` and measure ~16 us per leaf; its packed
+    values buffer answers the same question in ~0.1 us. Every per-token
+    field on this wire is nested, so that difference is paid four or five
+    times per transfer.
+
+    Guarded twice, because a wrong byte count is worse than a slow one. If
+    ``_values`` is ever absent the public attribute still answers. And a
+    buffer holding more elements than the offsets describe means the tensor
+    views a larger allocation (``torch.nested.narrow``), where the buffer
+    would overcount — nothing in ``nemo_rl`` builds one, since all four
+    construction sites use the compacting ``as_nested_tensor``, but this is
+    handed whatever a caller passes.
+    """
+    buf = getattr(v, "_values", None)
+    if type(buf) is not torch.Tensor:
+        return v.nbytes
+    offsets = getattr(v, "_offsets", None)
+    if offsets is not None and buf.shape[0] != int(offsets[-1]):
+        return v.nbytes
+    return buf.nbytes
+
+
 def _dtype_salt(dtype: torch.dtype) -> int:
     """Salt distinguishing dtypes whose values reduce to the same words.
 
@@ -311,10 +337,7 @@ def _td_bytes(td: TensorDict | None, max_nodes: int = 10_000) -> int:
     total = 0
     for _, v in td.items(include_nested=True, leaves_only=False):
         if isinstance(v, torch.Tensor):
-            # No jagged special case: numel() already reports a nested
-            # tensor's total element count, and costs half of reaching
-            # through .values().
-            total += v.numel() * v.element_size()
+            total += _tensor_bytes(v)
         elif isinstance(v, NonTensorData):
             total += _estimate_encoded_bytes(v.data, budget)
         elif isinstance(v, NonTensorStack):
