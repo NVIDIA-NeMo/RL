@@ -150,6 +150,12 @@ def _select_by_rank(
     Equivalent to a per-row ``topk`` with a row-dependent ``k``, but without a
     Python loop over the batch.
 
+    Uses the same sort/rank/scatter shape as
+    ``nemo_automodel.components.datasets.dllm.corruption._batched_gumbel_topk``.
+    That helper is not reused because it always adds Gumbel noise to the
+    scores: remasking has to pick the genuinely most confident positions, and
+    perturbing them would change which tokens get committed.
+
     Args:
         confidence: ``[B, L]`` scores, ``-inf`` where a position is ineligible.
         num_transfer: ``[B]`` per-row counts of positions to select.
