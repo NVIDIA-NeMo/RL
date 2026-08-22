@@ -115,6 +115,25 @@ def test_core_preserves_mcore_tp_group_from_process_group_collection() -> None:
     assert core.tp_group is tp_group
 
 
+def test_core_rejects_activation_recompute_config() -> None:
+    # Recompute re-enters the armed forward during backward, which the
+    # one-shot pass lifecycle cannot tolerate; construction must fail fast.
+    module = _load_module()
+    for granularity in ("full", "selective"):
+        with pytest.raises(ValueError, match="recompute"):
+            module.EagleTTTCoreAttention(
+                config=SimpleNamespace(
+                    context_parallel_size=1, recompute_granularity=granularity
+                ),
+                layer_number=1,
+                attn_mask_type=None,
+                attention_type="self",
+                cp_comm_type=None,
+                softmax_scale=None,
+                pg_collection=None,
+            )
+
+
 def test_layer_spec_adapter_is_construction_time_and_does_not_mutate_default() -> None:
     module = _load_module()
     original_core = object()
