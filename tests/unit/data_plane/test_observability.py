@@ -32,6 +32,7 @@ from nemo_rl.data_plane.observability import (
     MetricsDataPlaneClient,
     breakdown_table,
     cluster_step_metrics,
+    headline_series,
     merge_snapshots,
     _estimate_encoded_bytes,
     _QUANTILES,
@@ -809,7 +810,7 @@ def test_merge_of_nothing_is_empty():
 
 
 def test_cluster_step_metrics_report_their_own_cost():
-    """``observability_overhead_ms`` is the wrapper's own wall time minus
+    """``step/self/overhead_ms`` is the wrapper's own wall time minus
     the inner client's, summed over processes — the bill for measuring,
     sitting beside what it bought."""
     client = MetricsDataPlaneClient(NoOpDataPlaneClient())
@@ -826,26 +827,27 @@ def test_cluster_step_metrics_report_their_own_cost():
     metrics = cluster_step_metrics(merged, {}, 1.0)
 
     assert metrics["now/n_processes"] == 1
-    assert metrics["step/observability_overhead_ms"] > 0, "measuring is never free"
+    assert metrics["step/self/overhead_ms"] > 0, "measuring is never free"
     # Deliberately not clamped to 1. Against this no-op inner client the RPC
     # is instant, so measuring costs more than the thing measured and the
     # ratio exceeds 100% -- which is exactly the signal worth surfacing.
     # Against a real backend it lands near 0.01.
-    assert metrics["step/observability_overhead_frac"] > 0
+    assert metrics["step/self/frac"] > 0
     assert "step/wall_ms" in metrics and "step/comm_volume_mb" in metrics
     client.close()
 
 
-def test_cluster_time_is_per_process_not_a_bare_fraction():
+def test_cluster_frac_of_step_is_per_process_and_bounded():
     """``wall_ms`` sums processes that ran concurrently, so dividing it by
     one step's wall clock exceeded 1 whenever they overlapped and read as
-    "105% of the step". Reported per process it is a duration in ms, like
-    everything else, and needs no gloss."""
+    "105% of the step". Divided per process it is the mean share of the
+    step a process spent in the data plane, which is what the name claims:
+    10 ranks x 5 calls x 100 ms over a 5 s step is 500 ms each, or 10%."""
     ranks = [_rank_with([100.0] * 5) for _ in range(10)]
-    metrics = cluster_step_metrics(merge_snapshots(ranks), {}, 1.0)
+    metrics = cluster_step_metrics(merge_snapshots(ranks), {}, 5.0)
 
-    assert "busy_frac_mean" not in metrics and "frac_of_step" not in metrics
-    assert metrics["step/wall_ms_per_process"] == pytest.approx(500.0, rel=0.1)
+    assert "busy_frac_mean" not in metrics
+    assert metrics["step/frac_of_step"] == pytest.approx(0.10, rel=0.1)
     assert metrics["now/n_processes"] == 10
 
 
@@ -866,10 +868,7 @@ def test_cluster_overhead_includes_the_collection_fan_out():
     without = cluster_step_metrics(merged, {}, 1.0)
     with_gather = cluster_step_metrics(merged, {}, 1.0, collect_ms=2.31)
 
-    delta = (
-        with_gather["step/observability_overhead_ms"]
-        - without["step/observability_overhead_ms"]
-    )
+    delta = with_gather["step/self/overhead_ms"] - without["step/self/overhead_ms"]
     assert delta == pytest.approx(2.31, rel=1e-6)
     client.close()
 
@@ -1006,9 +1005,13 @@ def test_snapshot_percentiles_never_exceed_the_measured_max():
 
 def test_breakdown_table_rows_by_op_worst_first():
     """One row per op, ordered by wall time, so the expensive op is the
-    first line read rather than the alphabetically luckiest."""
+    first line read rather than the alphabetically luckiest. Share of
+    data-plane time is the second column for the same reason: the answer
+    to "what is my bottleneck" should be the top-left of the table."""
     metrics = {
         "step/wall_ms": 100.0,
+        "step/share/by_op/get": 0.10,
+        "step/share/by_op/put": 0.90,
         "step/get/calls": 8,
         "step/get/wall_ms": 10.0,
         "step/get/max_ms": 2.0,
@@ -1024,6 +1027,8 @@ def test_breakdown_table_rows_by_op_worst_first():
     assert [r[0] for r in rows] == ["put", "get"], "worst first"
     assert len(rows) == 2, "only per-op series become rows"
     assert rows[0][columns.index("wall_ms")] == 90.0
+    assert rows[0][columns.index("share_pct")] == pytest.approx(90.0)
+    assert columns[1] == "share_pct", "the bottleneck reads first"
 
 
 def test_breakdown_table_leaves_withheld_series_empty():
@@ -1096,7 +1101,7 @@ def test_cluster_per_op_time_is_reported_per_call():
     ), "the sum does move with cluster size"
 
     columns, rows = breakdown_table(small)
-    assert "mean_ms" in columns and "wall_ms_per_process" not in columns
+    assert "mean_ms" in columns and "share_pct" in columns
 
 
 def test_each_quantile_waits_for_the_samples_it_needs():
@@ -1246,3 +1251,101 @@ def test_delta_put_does_not_restate_the_scheme_of_untouched_fields():
     client.get_samples(sample_ids=ids, partition_id="p", select_fields=["ids"])
     assert client.snapshot()["hash_verify"]["mismatches"] == 0
     client.close()
+
+
+def _busy_client(op_calls):
+    """A client that ran ``n`` calls of each named op this step."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    now = monotonic()
+    for op, (n, ms) in op_calls.items():
+        for i in range(n):
+            client._emit(op, "p", 1, 1_000_000 * (1 + i % 5), now - ms / 1e3, "ok")
+    return client
+
+
+def test_time_shares_name_the_bottleneck():
+    """The question a dashboard has to answer is "which op is expensive",
+    and 32 per-op line charts do not answer it. The by-op shares are one
+    decomposition of data-plane time and sum to 1, so the largest is the
+    bottleneck by construction."""
+    client = _busy_client({"get": (100, 9.0), "put": (10, 1.0), "clear": (10, 0.1)})
+    metrics = cluster_step_metrics(
+        merge_snapshots([client.snapshot(reset_step_window=True)]), {}, 1.0
+    )
+
+    shares = {k: v for k, v in metrics.items() if k.startswith("step/share/by_op/")}
+    assert sum(shares.values()) == pytest.approx(1.0)
+    assert max(shares, key=shares.__getitem__) == "step/share/by_op/get"
+    assert shares["step/share/by_op/get"] == pytest.approx(900 / 911, rel=0.05)
+    client.close()
+
+
+def test_headline_drops_per_op_detail_but_keeps_the_shares():
+    """Four ops times eight fields is 32 series saying one thing. The detail
+    is still computed -- the breakdown table is built from the same dict, so
+    the two cannot disagree -- but only the totals and shares are charted."""
+    client = _busy_client({"get": (100, 9.0), "put": (10, 1.0), "clear": (10, 0.1)})
+    metrics = cluster_step_metrics(
+        merge_snapshots([client.snapshot(reset_step_window=True)]), {}, 1.0
+    )
+    head = headline_series(metrics)
+
+    assert len(head) < len(metrics) / 2, f"{len(head)} of {len(metrics)}"
+    assert not [k for k in head if k.split("/")[1:2] in (["get"], ["put"], ["clear"])]
+    assert "step/share/by_op/get" in head
+    assert "step/wall_ms" in head and "step/frac_of_step" in head
+    # and the detail the table needs survives in the full dict
+    assert breakdown_table(metrics)[1], "table still has rows"
+    client.close()
+
+
+def test_cluster_step_max_reopens_each_step():
+    """A maximum cannot be differenced out of a cumulative counter, so the
+    cluster path reported the lifetime max: after one 50 ms call every later
+    step still read 50 ms, which is the same defect as a cumulative
+    percentile. The reader resets the window as it reads."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    prev, seen = {}, []
+    for slowest_ms in (5.0, 50.0, 5.0, 5.0):
+        now = monotonic()
+        for i in range(4):
+            client._emit(
+                "put", "p", 1, 1_000, now - (slowest_ms if i == 0 else 5.0) / 1e3, "ok"
+            )
+        merged = merge_snapshots([client.snapshot(reset_step_window=True)])
+        seen.append(cluster_step_metrics(merged, prev, 1.0)["step/put/max_ms"])
+        prev = merged
+
+    assert seen[1] == pytest.approx(50.0, abs=1.0), "the spike shows"
+    assert seen[2] == pytest.approx(5.0, abs=1.0), "and does not latch"
+    client.close()
+
+
+def test_snapshot_leaves_the_step_window_alone_unless_asked():
+    """``snapshot()`` is also how a human inspects a live client. Resetting
+    the step window on every call would let an inspection silently blank the
+    next step's max."""
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client._emit("put", "p", 1, 1_000, monotonic() - 0.030, "ok")
+
+    assert client.snapshot()["by_op"]["put"]["step_max_ms"] >= 30.0
+    assert client.snapshot()["by_op"]["put"]["step_max_ms"] >= 30.0, "still there"
+    assert client.snapshot(reset_step_window=True)["by_op"]["put"]["step_max_ms"] >= 30
+    assert client.snapshot()["by_op"]["put"]["step_max_ms"] == 0.0, "window reopened"
+    client.close()
+
+
+def test_breakdown_table_ignores_reserved_namespaces():
+    """``step/self/overhead_ms`` has the same three-part shape as a per-op
+    series and was becoming a "self" row in the table beside put and get."""
+    columns, rows = breakdown_table(
+        {
+            "step/put/calls": 2,
+            "step/put/wall_ms": 9.0,
+            "step/self/overhead_ms": 6.2,
+            "step/hash/mismatches": 0,
+            "step/share/by_cause/transfer": 0.4,
+        }
+    )
+    assert [r[0] for r in rows] == ["put"], rows
+    assert columns[0] == "op"
