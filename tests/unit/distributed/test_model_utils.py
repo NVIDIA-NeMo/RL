@@ -32,6 +32,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
+    get_distillation_topk_logprobs_from_logits,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -1583,3 +1584,97 @@ def test_distributed_vocab_topk_ops(
         worker_group.shutdown(force=True)
     finally:
         cluster.shutdown()
+
+
+def test_distillation_topk_non_tp_defers_fp32_upcast():
+    """The non-TP top-k gather must not need a full-vocab fp32 copy.
+
+    Only K columns are read on this path, and ``gather`` then ``to(float32)``
+    is equivalent to ``to(float32)`` then ``gather``. Pin that the returned
+    log-probs and the gradient w.r.t. the student logits stay bitwise identical
+    to the previous full-vocab-upcast formulation, and that the result is still
+    fp32.
+    """
+    torch.manual_seed(0)
+    batch, seq, vocab, k = 1, 8, 512, 4
+    logits = torch.randn(batch, seq, vocab, dtype=torch.bfloat16)
+    teacher_topk_logits = torch.randn(batch, seq, k)
+    # distinct per position, as torch.topk returns: with duplicate indices the
+    # gather backward would accumulate into the (now bf16) input rather than an
+    # fp32 copy, which is a different computation
+    teacher_topk_indices = torch.stack(
+        [
+            torch.stack([torch.randperm(vocab)[:k] for _ in range(seq)])
+            for _ in range(batch)
+        ]
+    )
+
+    student = logits.clone().requires_grad_(True)
+    topk_logprobs, _, h_all = get_distillation_topk_logprobs_from_logits(
+        student_logits=student,
+        teacher_topk_logits=teacher_topk_logits,
+        teacher_topk_indices=teacher_topk_indices,
+        zero_outside_topk=False,
+        calculate_entropy=False,
+    )
+    topk_logprobs.sum().backward()
+
+    reference = logits.clone().requires_grad_(True)
+    expected = torch.nn.functional.log_softmax(
+        reference.to(torch.float32).gather(dim=-1, index=teacher_topk_indices),
+        dim=-1,
+    )[:, :-1, :]
+    expected.sum().backward()
+
+    assert h_all is None
+    assert topk_logprobs.dtype == torch.float32
+    assert torch.equal(topk_logprobs, expected)
+    assert torch.equal(student.grad, reference.grad)
+
+
+def test_distillation_topk_gathers_before_upcasting(monkeypatch):
+    """The full-vocab tensor must still be bf16 when ``gather`` runs.
+
+    The equivalence test above cannot catch a revert: its reference is the
+    old ``to(float32).gather(...)`` formulation, so it holds whether or not
+    the upcast was deferred. This one observes the deferral itself.
+
+    It spies on ``Tensor.gather``, so it is coupled to that specific call. An
+    equivalent rewrite to ``torch.gather(...)`` or ``index_select`` would keep
+    the deferral but stop tripping the spy, failing here as a false alarm --
+    update the spy in that case rather than reading it as a regression.
+    """
+    torch.manual_seed(0)
+    batch, seq, vocab, k = 1, 8, 512, 4
+    logits = torch.randn(batch, seq, vocab, dtype=torch.bfloat16)
+    teacher_topk_logits = torch.randn(batch, seq, k)
+    teacher_topk_indices = torch.stack(
+        [
+            torch.stack([torch.randperm(vocab)[:k] for _ in range(seq)])
+            for _ in range(batch)
+        ]
+    )
+
+    seen_dtypes = []
+    real_gather = torch.Tensor.gather
+
+    def spy(self, dim, index):
+        # only the full-vocab gather is interesting; K-wide ones are downstream
+        if self.shape[-1] == vocab:
+            seen_dtypes.append(self.dtype)
+        return real_gather(self, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "gather", spy, raising=True)
+
+    get_distillation_topk_logprobs_from_logits(
+        student_logits=logits,
+        teacher_topk_logits=teacher_topk_logits,
+        teacher_topk_indices=teacher_topk_indices,
+        zero_outside_topk=False,
+        calculate_entropy=False,
+    )
+
+    assert seen_dtypes, "expected a gather over the vocab axis"
+    assert all(d == torch.bfloat16 for d in seen_dtypes), (
+        f"the vocab-wide tensor was upcast before the gather: {seen_dtypes}"
+    )
