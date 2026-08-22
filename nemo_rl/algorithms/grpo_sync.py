@@ -388,15 +388,25 @@ def _log_data_plane_metrics(
     ``VllmGeneration.get_step_metrics`` -- so the async trainer can log the
     same metrics with one call against its own client.
 
-    Only the driver's client is visible here: clients are built per process
-    (``tq_policy`` bootstraps one; rollout actors and policy workers build
-    their own), so this covers the trainer's reads, not cluster-wide traffic.
+    Scoped to the driver, and the prefix says so. Every process builds its
+    own client -- ``tq_policy`` here, plus one per policy worker
+    (``worker_mixin``), one in the rollout actor, one on the
+    single-controller path -- and each keeps independent counters. The
+    driver issues roughly one op of each kind per step; the bulk traffic is
+    elsewhere (``kv_first_write`` in the rollout actor writes the rollout,
+    per-DP-rank ``get_samples`` in the workers read it), and none of it
+    appears here. A ``data_plane/`` prefix would read as cluster-wide
+    totals, which these are not.
+
+    ``OpStats`` is additive on purpose -- histograms and regression sums
+    from every rank sum into one cluster-wide view -- but nothing collects
+    them yet, so that remains a design affordance rather than a feature.
     """
     client = getattr(policy, "dp_client", None)
     if not isinstance(client, MetricsDataPlaneClient):
         return  # observability disabled -> plain adapter
     metrics = client.get_step_metrics(total_step_time)
-    logger.log_metrics(metrics, step, prefix="data_plane")
+    logger.log_metrics(metrics, step, prefix="data_plane/driver")
     print(
         f"  • data plane: {metrics['wall_ms']:.0f}ms "
         f"({100 * metrics['frac_of_step']:.1f}% of step), "
