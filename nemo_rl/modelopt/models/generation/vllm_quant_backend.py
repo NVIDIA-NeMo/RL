@@ -482,7 +482,14 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         model = self.model_runner.model
         reload_roots = self._get_modelopt_reload_roots()
 
-        def finalize() -> None:
+        def finalize(finalize_draft: bool) -> None:
+            # Match the base lifecycle's finalize(finalize_draft) signature.
+            # Real-quant refits do not support co-trained draft finalization;
+            # fail loudly rather than silently skipping it.
+            if finalize_draft:
+                raise RuntimeError(
+                    "ModelOpt real-quant refit does not support draft finalization"
+                )
             try:
                 with torch.device(self.device):
                     _require_complete_modelopt_layerwise_reload(model)
