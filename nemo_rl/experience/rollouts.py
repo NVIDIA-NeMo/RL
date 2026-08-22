@@ -29,7 +29,6 @@ import ray
 import torch
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
-from wandb import Table
 
 from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
 from nemo_rl.data.interfaces import (
@@ -2608,6 +2607,10 @@ def _postprocess_single_nemo_gym_group(
     mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
+    # Deferred: wandb is optional, and importing it at module scope would
+    # pull it in for every importer of nemo_rl.algorithms.grpo.
+    from wandb import Table
+
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
     length_rewards_low = shaping.length_rewards_low

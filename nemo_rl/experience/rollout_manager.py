@@ -22,7 +22,6 @@ from typing import Any, Optional
 import ray.exceptions
 import torch
 from transformers import PreTrainedTokenizerBase
-from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
@@ -1036,6 +1035,10 @@ class AsyncNemoGymRolloutImpl:
         agent_name: str,
     ) -> dict[str, Any]:
         """Aggregate per-sample and per-agent metrics."""
+        # Deferred: wandb is optional, and importing it at module scope would
+        # pull it in for every importer of nemo_rl.algorithms.grpo.
+        from wandb import Table
+
         # Prepare lists of values for each metric.
         total_reward = [c.reward for c in completions]
         turn_count = [
