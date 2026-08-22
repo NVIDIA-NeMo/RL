@@ -1478,7 +1478,7 @@ class RolloutManager:
         *,
         target_step: Optional[int] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
-    ) -> "FinalizationRequest":
+    ) -> Optional["FinalizationRequest"]:
         """Run capture generation and return a metadata-only actor request.
 
         The replay-buffer slot remains reserved and unready. Logical sibling
