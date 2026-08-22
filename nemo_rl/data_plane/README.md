@@ -484,7 +484,9 @@ Two more read differently in the cluster view and are named to say so:
 
 `grpo_train_sync` fans out to the driver and every policy worker, and logs
 the combined result under `data_plane/cluster/` instead of the driver's
-own. It falls back to `data_plane/driver/` when the fan-out finds only one
+own. **It does not reach the rollout actor**, which builds its own client
+and is not on the worker group — so `kv_first_write`, the write of the
+whole rollout, is not in these totals. It falls back to `data_plane/driver/` when the fan-out finds only one
 process. Measured: **~2.4 ms and ~1 kB per process per step** for 10
 processes, against a 6x wider view of the traffic. The fan-out is
 best-effort — a rank that cannot answer is dropped rather than failing the
@@ -533,8 +535,11 @@ carries — 256 ragged rows, 12 MB, jagged per-token fields as
 0.1% of a 59 ms operation. What is left is dominated by the per-key
 attribution `clear_samples` needs to undo.
 
-This is **on by default**, and only engages when `data_plane.enabled` is
-true, so it costs nothing for runs that don't use the data plane. There is
+This is **on in the exemplar config**, which is where a v1 `TypedDict`
+default lives — so recipes inheriting `grpo_math_1B.yaml` get it, and a
+config with no `observability:` block still falls back to `False` at the
+factory. It only engages when `data_plane.enabled` is true either way, so
+it costs nothing for runs that don't use the data plane. There is
 no default per-op sink: `get_step_metrics()` is the surface, and
 `grpo_train_sync` logs it once a step under the `data_plane/` prefix — so
 the series reach whatever backends the run has enabled (wandb, TensorBoard,
