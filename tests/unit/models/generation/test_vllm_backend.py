@@ -204,6 +204,7 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
     )
     ext.model_config = object()
     ext.device = object()
+    ext.model_update_group = object()
 
     class _ExplodingInfo:
         def __getitem__(self, key):
@@ -216,6 +217,11 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
     ext.hf_to_local_param_map = {}
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "packed_broadcast_preflight_consumer",
+        lambda _group, _src: None,
     )
 
     # A failure inside the bulk receive must not propagate (nonfatal contract,
