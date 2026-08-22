@@ -35,11 +35,14 @@ traversal happens twice, no allocation happens for a payload nobody reads,
 and no estimate walks a structure whose size it can extrapolate.
 
 ``verify_tensor_hash=True`` adds an opt-in correctness check on top:
-per-row ``torch.hash_tensor`` fingerprints recorded at put and re-checked
-at get, so a tensor that changes between wire-in and wire-out is reported
-rather than trained on. It reads every tensor byte again on both sides
-(~8 ms for that same 12 MB payload), so it is a debugging tool, not a
-metric.
+``torch.hash_tensor`` fingerprints recorded at put and re-checked at get,
+so a tensor that changes between wire-in and wire-out is reported rather
+than trained on. Rectangular leaves get a digest per row; jagged leaves get
+one over their values buffer, because torch has no ragged hash kernel and
+padding a ragged batch out to a rectangle costs more than the payload is
+worth (see :meth:`MetricsDataPlaneClient._row_fingerprints`). It reads
+every tensor byte again on both sides (~2.4 ms for that same 12 MB
+payload), so it is a debugging tool, not a metric.
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ import zlib
 from bisect import bisect_left
 from dataclasses import asdict, dataclass, field
 from time import monotonic
-from typing import Any, Callable, Literal, TypedDict
+from typing import Any, Callable, Collection, Literal, NamedTuple, TypedDict
 
 EventStatus = Literal["ok", "error", "timeout"]
 
@@ -101,6 +104,35 @@ _READ_OPS = frozenset({"get", "get_data"})
 # capped: the counter in ``HashStats`` carries the magnitude, and the first
 # few lines carry the identity of what broke.
 _MAX_HASH_MISMATCH_LOGS = 20
+
+
+class _FieldDigest(NamedTuple):
+    """One fingerprint per row, plus how far it can be trusted.
+
+    ``batch_scoped`` means the values were derived from the whole batch's
+    buffer, so they only reconcile against a read of that same batch. A
+    shard of it computes a different buffer digest and must be reported
+    unverified rather than as a mismatch.
+    """
+
+    per_row: list[int]
+    batch_scoped: bool
+
+
+# Same-width signed integer for each tensor element size, used to bitcast a
+# leaf before hashing.
+_INT_VIEW_BY_WIDTH = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _as_int_view(t: torch.Tensor) -> torch.Tensor:
+    """Bitcast a tensor to a same-width integer type, or pass it through.
+
+    ``hash_tensor`` has no float8 kernel and raises ``NotImplementedError``
+    there; viewing the bytes as integers sidesteps every dtype-specific
+    kernel for free, since ``view`` on a same-width dtype is metadata only.
+    """
+    int_dtype = _INT_VIEW_BY_WIDTH.get(t.element_size())
+    return t.view(int_dtype) if int_dtype is not None else t
 
 
 def _dtype_salt(dtype: torch.dtype) -> int:
@@ -502,7 +534,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 no sink, nothing is paid for a payload nobody reads.
             verify_tensor_hash: Record a per-row ``torch.hash_tensor``
                 fingerprint on put and re-check it on get. Debug aid, not a
-                metric: it reads every tensor byte again (~8 ms for a
+                metric: it reads every tensor byte again (~2.4 ms for a
                 12 MB jagged batch), so it is off unless the config asks.
         """
         self._inner = inner
@@ -517,6 +549,10 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # lifetime as ``_bytes_by_partition``: cleared by ``clear_samples``,
         # so it is bounded by the live key population.
         self._hash_by_partition: dict[str, dict[str, dict[str, int]]] = {}
+        # partition -> field -> row count, for the jagged fields whose digest
+        # covers a whole buffer and so only reconciles against a read of that
+        # same batch. One int per field, not per row.
+        self._batch_scoped_rows: dict[str, dict[str, int]] = {}
         self._hash_mismatches_logged = 0
         # Previous snapshot, for per-step deltas. Owned here rather than by a
         # caller: it is this client's prior reading, and keeping it here lets
@@ -691,39 +727,48 @@ class MetricsDataPlaneClient(DataPlaneClient):
     # ── wire-in / wire-out fingerprinting (opt-in) ─────────────────────
 
     def _row_fingerprints(
-        self, td: TensorDict | None, sample_ids: list[str]
-    ) -> dict[str, list[int]]:
-        """Per-row ``torch.hash_tensor`` fingerprints, keyed by field name.
+        self,
+        td: TensorDict | None,
+        sample_ids: list[str],
+        batch_scoped_fields: Collection[str] = (),
+    ) -> dict[str, _FieldDigest]:
+        """``torch.hash_tensor`` fingerprints for each tensor leaf.
 
-        Each tensor leaf is flattened to ``[n_rows, -1]`` and reduced along
-        the trailing dims, giving one ``uint64`` per sample id — the
-        granularity the wire actually needs, since a batch put of 256 rows
-        is routinely read back as eight shards of 32 and a whole-tensor hash
-        would be incomparable.
+        Two granularities, because the wire has two layouts and only one of
+        them can be reduced per row cheaply:
 
-        ``hash_tensor`` reduces by XOR, which is commutative, so a row's
-        digest is blind to a rearrangement of that row's own elements. Rows
-        are compared per sample id, so a swap *between* rows is still caught
-        — it is only a permutation *within* one row that hides, and nothing
-        on this wire reorders within a row. Measured against ten corruption
-        modes (single-element change per dtype, truncation, zeroed row,
-        precision change, wrong sample, swapped rows) it caught all ten.
+        * **Rectangular leaf** — ``hash_tensor(..., dim=1)`` gives one
+          ``uint64`` per sample id directly, for the cost of a single pass.
+          That is the granularity worth having: it names *which* sample
+          diverged, and it survives a batch being read back in shards.
+        * **Jagged leaf** — ``hash_tensor`` has no ragged kernel, so a
+          per-row digest would mean padding each field out to a rectangle
+          first. On a realistically ragged batch that rectangle is 3.5x the
+          real payload and measured 13x the cost of hashing the values
+          buffer, for a field this only has to answer "did anything change".
+          So a jagged leaf gets one digest over its whole values buffer,
+          XORed per row with that row's length, and is marked
+          ``batch_scoped``.
 
-        Row *i* is attributed to ``sample_ids[i]``, which is the ordering
-        :meth:`DataPlaneClient.get_samples` already promises ("batched along
-        ``sample_ids``"). An adapter that reordered rows would show up here
-        as a mismatch — which is the correct verdict, since a reordered read
-        is exactly the bug this check exists to catch.
+        Both are still ``torch.hash_tensor``; the jagged one just reduces
+        the flat buffer instead of a rectangle it had to build first.
 
-        Jagged leaves are fingerprinted too, and have to be: ``column_io``
-        packs every per-token field (``input_ids``, ``generation_logprobs``,
-        ``token_mask``, ``advantages``) through
-        :func:`codec.pack_jagged_fields` before it reaches ``put_samples``,
-        so skipping nested tensors would leave the entire bulk payload
-        unguarded while still reporting a clean bill of health. They round
-        trip asymmetrically — ``_from_wire`` densifies a nested field whose
-        rows happen to be uniform — so the fingerprint is defined on the
-        *row*, identically for both layouts.
+        Leaves are bitcast to a same-width integer type before hashing.
+        ``hash_tensor`` has no float8 kernel — it raises
+        ``NotImplementedError`` on ``float8_e4m3fn``, which would propagate
+        straight out of ``put_samples`` and take the transfer down with it.
+        The bitcast is free (a view), makes every dtype hashable, and the
+        dtype still enters through the salt.
+
+        The scheme has to follow the *field*, not the layout in hand: a
+        field packed jagged on put comes back **dense** whenever its rows
+        happen to be uniform, because ``_from_wire`` densifies those. Left
+        to pick per layout, the two sides compute different things and every
+        row of a uniform batch reports a mismatch. ``batch_scoped_fields``
+        carries the scheme chosen at put so the read reproduces it — the
+        values buffer of a uniform jagged field and the flattened dense
+        tensor it densifies into are the same elements in the same order, so
+        the digests agree by construction.
 
         Leaves that cannot be attributed per row (a leading dim that isn't
         ``len(sample_ids)``, or a nested layout other than ``jagged``) are
@@ -733,30 +778,40 @@ class MetricsDataPlaneClient(DataPlaneClient):
             return {}
         n_rows = len(sample_ids)
         stats = self._stats.hash_verify
-        out: dict[str, list[int]] = {}
+        out: dict[str, _FieldDigest] = {}
         for key, v in td.items(include_nested=True, leaves_only=True):
             if not isinstance(v, torch.Tensor) or v.ndim < 1:
                 stats.fields_skipped += 1
                 continue
             salt = _dtype_salt(v.dtype)
+            name = key if isinstance(key, str) else ".".join(key)
             if v.is_nested:
                 if v.layout != torch.jagged:
                     stats.fields_skipped += 1
                     continue
-                # Padding with zero is free here rather than approximate:
-                # XOR is its own identity on zero and a zero pad bitcasts to
-                # a zero 64-bit word for every dtype on this wire (verified
-                # for int64/int32/bf16/fp32/bool), so the pad contributes
-                # nothing. That is what lets a jagged put reconcile against
-                # the dense read `_from_wire` hands back when the rows
-                # happen to be uniform.
-                v = torch.nested.to_padded_tensor(v, padding=0)
-            if v.shape[0] != n_rows:
+                offsets = v.offsets()
+                if offsets.numel() - 1 != n_rows:
+                    stats.fields_skipped += 1
+                    continue
+                buffer, lengths = v.values(), (offsets[1:] - offsets[:-1]).tolist()
+            elif v.shape[0] != n_rows:
                 stats.fields_skipped += 1
                 continue
-            digest = torch.hash_tensor(v.reshape(n_rows, -1), dim=1) ^ salt
-            name = key if isinstance(key, str) else ".".join(key)
-            out[name] = digest.tolist()
+            elif name in batch_scoped_fields:
+                buffer = v
+                lengths = [v.shape[1] if v.ndim >= 2 else 1] * n_rows
+            else:
+                flat = _as_int_view(v.reshape(n_rows, -1))
+                out[name] = _FieldDigest(
+                    (torch.hash_tensor(flat, dim=1) ^ salt).tolist(),
+                    batch_scoped=False,
+                )
+                continue
+            flat_buffer = _as_int_view(buffer.reshape(1, -1))
+            buffer_digest = torch.hash_tensor(flat_buffer, dim=1).tolist()[0] ^ salt
+            out[name] = _FieldDigest(
+                [buffer_digest ^ length for length in lengths], batch_scoped=True
+            )
         return out
 
     def _record_hashes(
@@ -769,18 +824,32 @@ class MetricsDataPlaneClient(DataPlaneClient):
         partition_hashes = self._hash_by_partition.setdefault(partition_id, {})
         for row, sample_id in enumerate(sample_ids):
             per_field = partition_hashes.setdefault(sample_id, {})
-            for name, column in digests.items():
-                per_field[name] = column[row]
+            for name, digest in digests.items():
+                per_field[name] = digest.per_row[row]
+        batch_rows = self._batch_scoped_rows.setdefault(partition_id, {})
+        for name, digest in digests.items():
+            if digest.batch_scoped:
+                batch_rows[name] = len(sample_ids)
         self._stats.hash_verify.rows_recorded += len(sample_ids)
 
     def _check_hashes(self, partition_id: str, sample_ids: list[str], out: Any) -> None:
         """Compare wire-out fingerprints against what was written."""
         if not isinstance(out, TensorDict):
             return
-        digests = self._row_fingerprints(out, sample_ids)
+        batch_rows = self._batch_scoped_rows.get(partition_id, {})
+        digests = self._row_fingerprints(out, sample_ids, batch_rows.keys())
         if not digests:
             return
         partition_hashes = self._hash_by_partition.get(partition_id, {})
+        # A batch-scoped digest covers the whole buffer it was reduced from,
+        # so it only means anything against a read of that same batch. Drop
+        # those fields on a shard read rather than reporting every row of it
+        # as a mismatch.
+        comparable = {
+            name: digest
+            for name, digest in digests.items()
+            if not digest.batch_scoped or batch_rows.get(name) == len(sample_ids)
+        }
         stats = self._stats.hash_verify
         for row, sample_id in enumerate(sample_ids):
             per_field = partition_hashes.get(sample_id)
@@ -790,9 +859,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 stats.rows_unverified += 1
                 continue
             stats.rows_checked += 1
-            for name, column in digests.items():
+            for name, digest in comparable.items():
                 expected = per_field.get(name)
-                if expected is None or expected == column[row]:
+                if expected is None or expected == digest.per_row[row]:
                     continue
                 stats.mismatches += 1
                 if self._hash_mismatches_logged < _MAX_HASH_MISMATCH_LOGS:
@@ -804,13 +873,14 @@ class MetricsDataPlaneClient(DataPlaneClient):
                         sample_id,
                         name,
                         expected,
-                        column[row],
+                        digest.per_row[row],
                     )
 
     def _drop_hashes(self, partition_id: str, keys: list[str] | None) -> None:
         """Release fingerprints alongside the bytes accounting."""
         if keys is None:
             self._hash_by_partition.pop(partition_id, None)
+            self._batch_scoped_rows.pop(partition_id, None)
             return
         partition_hashes = self._hash_by_partition.get(partition_id)
         if partition_hashes is None:
@@ -819,6 +889,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             partition_hashes.pop(key, None)
         if not partition_hashes:
             del self._hash_by_partition[partition_id]
+            self._batch_scoped_rows.pop(partition_id, None)
 
     def _run(
         self,
