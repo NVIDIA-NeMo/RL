@@ -137,6 +137,10 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
             checkpoint_engine.finalize()
 
     async def _update_weights_from_checkpoint_engine_async(self) -> bool:
+        # Checkpoint-engine refits load weights outside the native layerwise
+        # reload lifecycle, which the unquantized FlashInfer TRTLLM MoE backend
+        # requires; reject the combination instead of corrupting silently.
+        self._reject_unsupported_native_trtllm_transport("Checkpoint-engine")
         loaded_tensors = 0
         loaded_bytes = 0
         loaded_batches = 0

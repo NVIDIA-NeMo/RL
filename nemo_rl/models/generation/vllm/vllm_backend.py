@@ -265,6 +265,11 @@ class VllmInternalWorkerExtension:
             raise
         finally:
             try:
+                # Deferred layerwise reload keeps each weight_loader's arguments
+                # (including the incoming tensor) buffered until finalize replays
+                # them. Those tensors are views into NCCL/IPC transport buffers
+                # that NeMo-RL reuses for the next transfer, so clone any buffered
+                # tensor that still aliases this batch's transport storage.
                 _detach_pending_layerwise_weights(
                     self.model_runner.model, source_storage_ptrs
                 )
@@ -397,14 +402,30 @@ class VllmInternalWorkerExtension:
         Args:
             state_dict_info (dict): A dictionary containing the info for refit.
                 e.g. {tensor_name: (shape, dtype)}
+
+        Raises:
+            RuntimeError: If the model realizes the unquantized FlashInfer TRTLLM
+                MoE backend while a co-trained MTP drafter is enabled (unsupported
+                by the native layerwise refit lifecycle).
         """
         self._validate_weight_update_compatibility()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+
+    def _reject_unsupported_native_trtllm_transport(self, transport: str) -> None:
+        """Fail loudly for transports that bypass the native reload lifecycle."""
+        if self._uses_unquantized_flashinfer_trtllm():
+            raise RuntimeError(
+                f"{transport} refit does not support the unquantized FlashInfer "
+                "TRTLLM MoE backend yet: it bypasses vLLM's native layerwise "
+                "reload lifecycle, and canonical-layout writes silently corrupt "
+                "the repacked runtime weights"
+            )
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
     ) -> list[str]:
         """Reserve scratch space and report weights that require overwrite."""
+        self._reject_unsupported_native_trtllm_transport("Sparse-delta")
         applier = self._get_sparse_delta_applier()
         return sorted(applier.discover_native_skips(state_dict_info))
 
@@ -759,9 +780,16 @@ class VllmInternalWorkerExtension:
             def finalize() -> None:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
+                    # vLLM's finalize_layerwise_reload re-runs quant methods and
+                    # attention finalization but omits the HpcModule refresh that
+                    # the normal load path (model_loader/utils.
+                    # process_weights_after_loading) performs, so HPC modules
+                    # would keep derived state computed from pre-refit weights.
+                    # The non-layerwise branch below calls
+                    # process_weights_after_loading directly and needs no fixup.
                     _process_hpc_modules_after_loading(model)
                     self._maybe_process_mtp_drafter_after_loading()
-                torch.accelerator.synchronize()
+                torch.cuda.synchronize()
 
             try:
                 with set_current_vllm_config(self.model_runner.vllm_config):
@@ -927,6 +955,16 @@ class VllmInternalWorkerExtension:
                     group=self.model_update_group,
                     src=0,
                     post_unpack_func=self._load_weights,
+                    # The native layerwise reload replays buffered weight_loaders
+                    # eagerly when a layer's last shard arrives, which can read a
+                    # previous chunk's clones from another CUDA stream with no
+                    # event edge. A single buffer/stream removes the cross-stream
+                    # read-after-write hazard on this path.
+                    num_buffers=(
+                        1
+                        if getattr(self, "_nrl_layerwise_reload_active", False)
+                        else None
+                    ),
                 )
                 finalize()
 
@@ -946,6 +984,7 @@ class VllmInternalWorkerExtension:
     def update_weights_from_decoded_sparse_payload(
         self, *payloads: bytes | str
     ) -> dict[str, Any]:
+        self._reject_unsupported_native_trtllm_transport("Sparse-delta")
         applier = self._get_sparse_delta_applier()
         return applier.update_weights_from_decoded_sparse_payload(*payloads)
 

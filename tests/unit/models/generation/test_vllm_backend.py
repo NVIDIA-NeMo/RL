@@ -148,9 +148,7 @@ def test_process_hpc_modules_after_loading(monkeypatch):
     model = SimpleNamespace(
         named_modules=lambda: [("", other_module), ("rope_norm", hpc_module)]
     )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.hpc.HpcModule", FakeHpcModule
-    )
+    monkeypatch.setattr("vllm.model_executor.layers.hpc.HpcModule", FakeHpcModule)
 
     vllm_backend._process_hpc_modules_after_loading(model)
 
@@ -583,6 +581,65 @@ def test_failed_unquantized_reload_marks_worker_unusable(monkeypatch):
     with pytest.raises(RuntimeError, match="worker is unusable"):
         with ext._weight_update_lifecycle("collective"):
             pass
+
+
+@pytest.mark.vllm
+def test_update_weights_from_collective_reraises_on_fatal_native_refit(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM"),
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+            quant_config=None,
+        ),
+    )
+    ext.model_config = object()
+    ext.device = torch.device("cpu")
+    ext.state_dict_info = {"model.weight": ((1,), torch.float32)}
+    ext.model_update_group = object()
+    ext._mtp_drafter_refit_enabled = lambda: False
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda _: None,
+    )
+
+    def failing_consumer(**_kwargs):
+        raise RuntimeError("transport load failed")
+
+    monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", failing_consumer)
+
+    # The fatal-native path must re-raise instead of swallowing into False.
+    with pytest.raises(RuntimeError, match="transport load failed"):
+        ext.update_weights_from_collective()
+
+    assert ext._nrl_layerwise_reload_failure is not None
+    with pytest.raises(RuntimeError, match="worker is unusable"):
+        ext.update_weights_from_collective()
+
+
+@pytest.mark.vllm
+def test_sparse_delta_refit_rejected_for_native_trtllm_backend():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM"),
+        vllm_config=SimpleNamespace(quant_config=None),
+    )
+
+    with pytest.raises(RuntimeError, match="Sparse-delta refit does not support"):
+        ext.prepare_sparse_delta_refit_info({})
+    with pytest.raises(RuntimeError, match="Sparse-delta refit does not support"):
+        ext.update_weights_from_decoded_sparse_payload(b"")
 
 
 @pytest.mark.vllm
