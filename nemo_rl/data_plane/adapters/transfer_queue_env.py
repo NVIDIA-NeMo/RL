@@ -95,7 +95,9 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
 
     No-op unless the backend is ``mooncake_cpu``; ``simple`` has no engine.
     Values already present in the environment are left alone, so a launcher can
-    override any of them.
+    override any of them — except ``MC_ENABLE_DEST_DEVICE_AFFINITY``, which
+    mooncake reads presence-only, so a launcher trying to override it to
+    ``"0"`` enables it instead; unsetting it is the only way to disable it.
 
     Call this before anything imports ``transfer_queue`` or ``mooncake``.
     :func:`nemo_rl.data_plane.factory.maybe_configure_data_plane_env` does, on

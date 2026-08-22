@@ -99,11 +99,13 @@ class DataPlaneConfig(TypedDict):
 
     Backend-specific knobs live under a block named for the backend that reads
     them — ``simple:`` and ``mooncake_cpu:`` — mirroring TransferQueue's own
-    ``config.yaml`` and the per-backend overlay :func:`_init_tq` builds. Both
-    blocks are optional: an absent block means "use this backend's defaults",
-    which is why a config selecting ``simple`` never has to mention mooncake's
-    RDMA sizing at all. Defaults live on :class:`SimpleStorageConfig` /
-    :class:`MooncakeCpuConfig`, not at any call site.
+    ``config.yaml`` and the per-backend overlay :func:`_init_tq` builds. Only
+    the block named by ``backend`` is consulted, so a config selecting
+    ``simple`` never has to mention mooncake's RDMA sizing at all. An absent
+    ``mooncake_cpu:`` block means "use :class:`MooncakeCpuConfig`'s
+    defaults" — but ``simple:`` is **not** optional: ``num_storage_units``
+    has no static default, since no single value is right across cluster
+    sizes, so a ``simple`` run without the block fails validation.
 
     Required keys (always set in the exemplar YAML): ``enabled``, ``impl``,
     ``backend``, ``claim_meta_poll_interval_s``.
