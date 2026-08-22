@@ -126,6 +126,17 @@ class LoggerInterface(ABC):
         """Log histogram metrics."""
         pass
 
+    def log_table(
+        self, columns: list[str], rows: list[list[Any]], step: int, name: str
+    ) -> None:
+        """Log a table of rows. Backends that have no table type skip it.
+
+        Concrete rather than abstract: only wandb renders tables natively,
+        and making this abstract would force every other backend -- and any
+        out-of-tree one -- to write a stub.
+        """
+        return None
+
     @abstractmethod
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a matplotlib figure."""
@@ -398,6 +409,19 @@ class WandbLogger(LoggerInterface):
             params: Dict of hyperparameters to log
         """
         self.run.config.update(params, allow_val_change=True)
+
+    def log_table(
+        self, columns: list[str], rows: list[list[Any]], step: int, name: str
+    ) -> None:
+        """Log a table to wandb.
+
+        Args:
+            columns: Column headers
+            rows: One list of values per row
+            step: Global step value
+            name: Panel name
+        """
+        self.run.log({name: wandb.Table(columns=columns, data=rows)}, step=step)
 
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a plot to wandb.
@@ -1235,6 +1259,20 @@ class Logger(LoggerInterface):
         """
         for logger in self.loggers:
             logger.log_histogram(histogram, step, name)
+
+    def log_table(
+        self, columns: list[str], rows: list[list[Any]], step: int, name: str
+    ) -> None:
+        """Log a table to every backend that supports one.
+
+        Args:
+            columns: Column headers
+            rows: One list of values per row
+            step: Global step value
+            name: Panel name
+        """
+        for logger in self.loggers:
+            logger.log_table(columns, rows, step, name)
 
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a matplotlib figure to all backends.
