@@ -236,6 +236,17 @@ on_policy_distillation:
         freeze_vision_projection: __unset__
         freeze_sound_encoder: __unset__
         freeze_sound_projection: __unset__
+        # The VLM student's mtp_num_layers: 0 must not leak either: this
+        # teacher checkpoint HAS MTP layers (HF mtp_layers_block_type), and a
+        # 0-layer config over an MTP model hits `assert mtp_num_layers > 0` in
+        # hybrid_model.forward on every get_logprobs (job 6444954, 2.5k-error
+        # storm). Unset all four so the bridge derives them from the teacher's
+        # own HF config (the text runs worked only because their student also
+        # used mtp 5, so the leak happened to match).
+        mtp_num_layers: __unset__
+        mtp_use_repeated_layer: __unset__
+        mtp_loss_scaling_factor: __unset__
+        mtp_detach_heads: __unset__
 logger:
   log_dir: logs/mopd-super-omni-joint-opd-hsg
   wandb:
