@@ -455,7 +455,7 @@ def _op_step_stats(
     """This step's per-op detail, keyed by op, from two snapshots.
 
     Shared by the single-process and cluster paths so the two cannot drift,
-    and used for both the emitted shares and the breakdown table -- one
+    and used for both the emitted percentages and the breakdown table -- one
     computation, so a chart and the table beside it can never disagree.
 
     ``max_ms`` comes from ``step_max_ms``, which the reader resets, rather
@@ -496,30 +496,58 @@ def _op_step_stats(
     return out
 
 
-def _time_shares(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
-    """Where this step's data-plane time went, as fractions of the total.
+def _time_pct(per_op: dict[str, dict[str, float]]) -> dict[str, float]:
+    """Where this step's data-plane time went, in percent.
 
-    Two independent decompositions of one total, which is what makes a
-    bottleneck legible: **by op** (which call is expensive) and **by cause**
-    (fixed per-request overhead vs bandwidth). The by-op shares sum to 1.
-    The by-cause shares cover only the ops whose affine fit is identifiable
-    -- an op whose requests were all the same size cannot be split -- so
-    they sum to at most 1, and the gap is time that could not be attributed
-    rather than time that did not happen.
+    **The denominator is data-plane time, not the step.** Every value here
+    is a percentage of ``sum(wall_ms)`` over the ops that ran this step, so
+    ``by_op/put = 43`` reads "43% of the time spent inside the data plane
+    went to put". Whether that time mattered at all against compute is a
+    different question, answered by ``step/frac_of_step``, which divides by
+    the step's own wall clock. A workload can be 43% put and still not be
+    worth touching.
+
+    Two decompositions of that one total, because either alone leaves the
+    next question unanswered:
+
+    - ``by_op`` -- which call is expensive. Sums to 100 by construction.
+    - ``by_cause`` -- whether that time is fixed per-request cost or moving
+      bytes. ``overhead_ms``/``transfer_ms`` are per call, so they are
+      multiplied back by the call count to compare against the same total.
+      Only ops with an identifiable affine fit can be split (an op whose
+      requests were all one size cannot be), so this sums to *at most* 100
+      and the remainder is time that could not be attributed -- not time
+      that did not happen.
+
+    On the cluster path ``wall_ms`` is summed over processes that ran
+    concurrently, so these are percentages of aggregate process-time rather
+    than of elapsed time. That is the right denominator for "what should I
+    optimise" and the wrong one for "what blocked the step".
+
+    Args:
+        per_op: Per-op step detail from :func:`_op_step_stats`.
+
+    Returns:
+        ``step/time_pct/by_op/{op}`` and ``step/time_pct/by_cause/{cause}``,
+        each in percent. Empty when no op ran.
     """
     total = sum(r["wall_ms"] for r in per_op.values())
     if total <= 0:
         return {}
-    shares = {
-        f"step/share/by_op/{op}": r["wall_ms"] / total for op, r in per_op.items()
+    pct = {
+        f"step/time_pct/by_op/{op}": 100.0 * r["wall_ms"] / total
+        for op, r in per_op.items()
     }
-    for cause in ("overhead", "transfer"):
+    for cause, field_name in (
+        ("fixed_overhead", "overhead_ms"),
+        ("transfer", "transfer_ms"),
+    ):
         attributed = sum(
-            r[f"{cause}_ms"] * r["calls"] for r in per_op.values() if f"{cause}_ms" in r
+            r[field_name] * r["calls"] for r in per_op.values() if field_name in r
         )
         if attributed > 0:
-            shares[f"step/share/by_cause/{cause}"] = attributed / total
-    return shares
+            pct[f"step/time_pct/by_cause/{cause}"] = 100.0 * attributed / total
+    return pct
 
 
 def _latency_split(
@@ -733,7 +761,7 @@ def cluster_step_metrics(
     metrics.update(
         {
             # The one metric that says whether optimising the data plane is
-            # worth anything: per-op shares say where its time went, never
+            # worth anything: per-op percentages say where its time went, never
             # whether it mattered against compute. ``wall_ms`` sums
             # processes that ran concurrently, so dividing it by one step's
             # wall clock exceeds 1 whenever they overlapped (measured 1.054
@@ -749,7 +777,7 @@ def cluster_step_metrics(
         }
     )
     per_op = _op_step_stats(merged["by_op"], prev.get("by_op", {}))
-    metrics.update(_time_shares(per_op))
+    metrics.update(_time_pct(per_op))
     for op, row in per_op.items():
         for field_name, value in row.items():
             metrics[f"step/{op}/{field_name}"] = value
@@ -759,7 +787,7 @@ def cluster_step_metrics(
 # What goes on a chart. Everything else this module computes is per-op
 # detail, which belongs in the breakdown table beside it: four ops times
 # eight fields is 32 series saying one thing, and a dashboard of 32 lines
-# does not answer "what is my bottleneck" -- a table sorted by share does.
+# does not answer "what is my bottleneck" -- a table sorted by time does.
 # The full dict is still returned, so the table and the series are derived
 # from one computation and cannot disagree.
 _HEADLINE = (
@@ -771,11 +799,11 @@ _HEADLINE = (
     "step/self/overhead_ms",
     "step/self/frac",
 )
-_HEADLINE_PREFIXES = ("step/share/", "step/hash/", "step/self/")
+_HEADLINE_PREFIXES = ("step/time_pct/", "step/hash/", "step/self/")
 # ``step/<x>/<field>`` is the per-op shape, so these reserved middles must
 # not be mistaken for op tags -- ``step/self/overhead_ms`` was becoming a
 # "self" row in the breakdown table beside put and get.
-_RESERVED_NAMESPACES = frozenset({"share", "hash", "self"})
+_RESERVED_NAMESPACES = frozenset({"time_pct", "hash", "self"})
 
 
 def headline_series(metrics: dict[str, float]) -> dict[str, float]:
@@ -786,7 +814,7 @@ def headline_series(metrics: dict[str, float]) -> dict[str, float]:
             :meth:`MetricsDataPlaneClient.get_step_metrics`.
 
     Returns:
-        Totals, time shares, and hash counters -- the per-op detail is
+        Totals, time percentages, and hash counters -- the per-op detail is
         dropped, since :func:`breakdown_table` presents it better.
     """
     return {
@@ -802,7 +830,7 @@ def headline_series(metrics: dict[str, float]) -> dict[str, float]:
 # row carries None where a series was withheld rather than a zero that
 # would read as a measurement.
 _BREAKDOWN_COLUMNS = (
-    "share_pct",
+    "time_pct",
     "calls",
     "wall_ms",
     "mean_ms",
@@ -823,7 +851,8 @@ def breakdown_table(
     A stack of line charts answers "how did put's wall time trend"; the
     question this feeds is "where did this step's time go, across ops, at a
     glance" -- which is a table, and reading it off eight separate charts is
-    the wrong tool. Rows are ordered by share of data-plane time, so the
+    the wrong tool. Rows are ordered by their share of data-plane time, so
+    the
     bottleneck is the first line read.
 
     Built from the metrics dict that is logged rather than from the snapshot
@@ -842,8 +871,8 @@ def breakdown_table(
     per_op: dict[str, dict[str, float]] = {}
     for key, value in metrics.items():
         parts = key.split("/")
-        if len(parts) == 4 and parts[:3] == ["step", "share", "by_op"]:
-            per_op.setdefault(parts[3], {})["share_pct"] = 100.0 * value
+        if len(parts) == 4 and parts[:3] == ["step", "time_pct", "by_op"]:
+            per_op.setdefault(parts[3], {})["time_pct"] = value
         elif (
             len(parts) == 3
             and parts[0] == "step"
@@ -853,10 +882,10 @@ def breakdown_table(
             per_op.setdefault(parts[1], {})[parts[2]] = value
     rows = [
         [op, *(stats.get(col) for col in _BREAKDOWN_COLUMNS)]
-        # By wall time, which orders identically to share (share is wall
-        # time over the same total) and is present even when the shares
-        # are not -- a table built from a partial metrics dict still reads
-        # worst-first.
+        # By wall time, which orders identically to ``time_pct`` (that is
+        # wall time over a common total) and is present even when the
+        # percentages are not -- a table built from a partial metrics dict
+        # still reads worst-first.
         for op, stats in sorted(
             per_op.items(), key=lambda kv: -kv[1].get("wall_ms", 0.0)
         )
@@ -1052,8 +1081,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
         ``VllmGeneration.get_step_metrics`` so trainers stay one line.
 
         ``frac_of_step`` is the metric that decides whether optimising the
-        data plane is worth anything: per-op shares only say where data-plane
-        time went, never whether it mattered against compute.
+        data plane is worth anything: ``time_pct`` only says where
+        data-plane time went, never whether it mattered against compute.
         """
         # Reading the step maxima is what closes the window: the values
         # just read are this step's, and anything after belongs to the next.
@@ -1086,7 +1115,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 "fields_skipped", 0
             )
         per_op = _op_step_stats(snap["by_op"], prev.get("by_op", {}))
-        metrics.update(_time_shares(per_op))
+        metrics.update(_time_pct(per_op))
         for op, row in per_op.items():
             for field_name, value in row.items():
                 metrics[f"step/{op}/{field_name}"] = value

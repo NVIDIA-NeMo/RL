@@ -459,34 +459,49 @@ cluster percentile).
 **What gets charted is the bottleneck, not the detail.** Four ops times
 eight fields is 32 series saying one thing, and a dashboard of 32 lines
 does not answer "where is my time going". So the emitted series are the
-totals and two *shares*, and the per-op detail goes in a table beside them:
+totals and `time_pct`, with the per-op detail in a table beside them:
 
 | series | what it answers |
 |---|---|
 | `step/frac_of_step` | is the data plane worth optimising at all? |
-| `step/share/by_op/{put,get,clear,register}` | which call is expensive? (sums to 1) |
-| `step/share/by_cause/{overhead,transfer}` | fixed per-request cost, or bandwidth? |
+| `step/time_pct/by_op/{put,get,clear,register}` | which call is expensive? |
+| `step/time_pct/by_cause/{fixed_overhead,transfer}` | is that fixed per-request cost, or moving bytes? |
 | `step/wall_ms`, `step/comm_volume_mb` | how much time and traffic |
 | `now/bytes_outstanding_mb`, `now/n_processes` | occupancy, fan-out width |
 | `step/self/{overhead_ms,frac}` | what measuring cost |
 
-Two independent decompositions of one total is what makes a bottleneck
-legible. From a real TransferQueue run: `by_op` says put 43%, get 31%,
-register 17%, clear 9%; `by_cause` says 53% fixed per-request overhead
-against 18% bandwidth. That second line is the actionable one — this
-workload is overhead-dominated, so fewer, larger requests buy more than
-faster transport.
+**`time_pct` is a percentage of data-plane time, not of the step.** The
+denominator is `sum(wall_ms)` over the ops that ran, so
+`by_op/put = 43` reads "43% of the time spent inside the data plane went to
+put". Whether that time mattered against compute is the *other* metric:
+`frac_of_step` divides by the step's own wall clock. Read them together —
+a workload can be 43% put and still not be worth touching.
 
-The by-op shares sum to 1. The by-cause shares cover only the ops whose
-affine fit is identifiable, so they sum to at most 1; the gap is time that
-could not be attributed, not time that did not happen. `register` and
-`clear` move no bytes and never get a split.
+```
+step/frac_of_step               0.87    the data plane is 87% of the step, so it matters
+step/time_pct/by_op/put        43.0     and within it, put is the largest piece
+step/time_pct/by_cause/...
+    fixed_overhead             53.1     that time is mostly per-request cost,
+    transfer                   17.6     not bandwidth -- batch, don't tune the wire
+```
+
+Two decompositions of one total, because either alone leaves the next
+question unanswered. `by_op` sums to 100 by construction. `by_cause` sums
+to *at most* 100: only ops with an identifiable affine fit can be split, so
+the remainder (here 29%, the `register` and `clear` calls that move no
+bytes) is time that could not be attributed rather than time that did not
+happen.
+
+On the cluster path `wall_ms` is summed over processes that ran
+concurrently, so these are percentages of aggregate **process-time**, not of
+elapsed time. That is the right denominator for "what should I optimise"
+and the wrong one for "what blocked the step".
 
 **A per-op breakdown table** carries the detail, under
-`data_plane/{cluster,driver}/breakdown` — one row per op, ordered by share
-so the bottleneck is the first line read:
+`data_plane/{cluster,driver}/breakdown` — one row per op, ordered by
+`time_pct` so the bottleneck is the first line read:
 
-| op | share_pct | calls | wall_ms | mean_ms | max_ms | p50_ms | p90_ms | overhead_ms | transfer_ms | mb |
+| op | time_pct | calls | wall_ms | mean_ms | max_ms | p50_ms | p90_ms | overhead_ms | transfer_ms | mb |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | put | 43.0 | 2 | 53.9 | 26.9 | 29.4 | — | — | 19.4 | 6.39 | 1.32 |
 | get | 30.9 | 2 | 38.7 | 19.4 | 21.5 | — | — | 13.8 | 4.63 | 1.03 |
@@ -507,7 +522,7 @@ while the wall clock was 279. Dividing by the process count only trades one
 arbitrary denominator for another. Per call is invariant to both DP degree
 and batch size: the same workload at 8 and at 32 ranks reports 11.16 and
 11.06 ms while `wall_ms` quadruples. Use `mean_ms` to compare runs and
-cluster sizes, `share_pct` to attribute cost across ops within one step.
+cluster sizes, `time_pct` to attribute cost across ops within one step.
 
 A stack of line charts answers "how did put's wall time trend"; this
 answers "where did the step go", which is a table. Cells are empty rather
