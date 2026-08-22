@@ -217,12 +217,16 @@ on_policy_distillation:
       micro_batch_size: 1
       moe_shared_expert_overlap: false
     teacher_overrides:
-      # text teacher: proven text-MOPD shape (TP8/EP16/CP2, 4n4g)
+      # text teacher: TP8/EP16/CP1 over 4n4g (DP=2). CP was 2 (the text-run
+      # shape), but on this stack the teacher's FIRST CP2 forward hung
+      # silently in lazy 2-rank P2P NCCL init (job 6448223: first-forward
+      # markers then 55min of nothing, zero enqueues, zero errors). CP1 is
+      # the shape every proven teacher here runs (002-refmatch, vlm teacher).
       general:
         tensor_model_parallel_size: 8
         pipeline_model_parallel_size: 1
         expert_model_parallel_size: 16
-        context_parallel_size: 2
+        context_parallel_size: 1
         num_nodes: 4
         gpus_per_node: 4
         precision: bf16
