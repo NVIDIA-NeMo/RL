@@ -106,6 +106,62 @@ def test_draft_loss_wrapper_reports_draft_loss_when_weight_is_zero(
     assert metrics["draft_loss"] == draft_loss.item()
 
 
+@pytest.mark.parametrize("output_key", ["dflash_output", "dspark_output"])
+def test_draft_loss_wrapper_hides_transient_provider_output_from_policy_loss(
+    output_key: str,
+) -> None:
+    """Packed policy slicing must not index provider-owned transient outputs."""
+    from nemo_rl.algorithms.loss.draft import DraftLossStats
+    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+
+    provider_output = object()
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            output_key: provider_output,
+        }
+    )
+
+    def policy_loss(
+        next_token_logits,
+        policy_data,
+        global_valid_seqs,
+        global_valid_toks,
+        **kwargs,
+    ):
+        del next_token_logits, global_valid_seqs, global_valid_toks, kwargs
+        assert output_key not in policy_data
+        policy_data.slice(0, 1)
+        return torch.tensor(3.0), {}
+
+    provider = MagicMock()
+    provider.config.speculator_type = output_key.removesuffix("_output")
+    provider.loss_stats.return_value = DraftLossStats(
+        numerators=torch.tensor([2.0]),
+        counts=torch.tensor([1.0]),
+        weights=torch.ones(1),
+    )
+    wrapper = DraftLossWrapper(
+        loss_fn=policy_loss,
+        prepare_fn=MagicMock(),
+        data_dict=data,
+        loss_weight=0.5,
+        draft_provider=provider,
+        draft_normalization_counts=torch.tensor([1.0]),
+    )
+
+    combined_loss, _ = wrapper(
+        next_token_logits=torch.randn(1, 2, 3),
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(1.0),
+    )
+
+    assert combined_loss.item() == pytest.approx(4.0)
+    assert data[output_key] is provider_output
+    assert provider.loss_stats.call_args.kwargs["data"] is data
+
+
 @patch("nemo_rl.algorithms.loss.loss_functions.streaming_vocab_parallel_soft_ce")
 def test_draft_cross_entropy_loss_uses_streaming_path(
     mock_streaming_ce,

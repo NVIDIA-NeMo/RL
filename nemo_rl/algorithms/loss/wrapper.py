@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from copy import copy
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -268,9 +269,19 @@ class DraftLossWrapper:
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if global_valid_toks is None:
             raise ValueError("global_valid_toks is required for DraftLossWrapper.")
+        policy_data = data
+        if self.draft_provider is not None:
+            transient_output_keys = {"dflash_output", "dspark_output"} & data.keys()
+            if transient_output_keys:
+                policy_data = copy(data)
+                policy_data.data = {
+                    key: value
+                    for key, value in data.items()
+                    if key not in transient_output_keys
+                }
         policy_loss, metrics = self.loss_fn(
             next_token_logits,
-            data,
+            policy_data,
             global_valid_seqs,
             global_valid_toks,
             **kwargs,
