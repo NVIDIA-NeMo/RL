@@ -58,7 +58,11 @@ from nemo_rl.algorithms.grpo import (
     shutdown_environments,
     validate,
 )
-from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
+from nemo_rl.algorithms.grpo_sync import (
+    _train_fields_for_step,
+    grpo_train_sync,
+    validate_sync,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -4678,6 +4682,69 @@ class TestValidateFunction:
                 master_config=mock_config,
             )
 
+        # accuracy stays the plain mean over all 8 rollouts; pass@4 counts
+        # prompts with at least one passing rollout (1 of 2).
+        assert val_metrics["accuracy"] == pytest.approx(0.125)
+        assert val_metrics["pass_k"] == pytest.approx(0.5)
+
+    def test_sync_grouped_validation_reports_pass_k(self, mock_grpo_components):
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [{"role": "user", "content": "a", "token_ids": torch.tensor([1])}],
+                    [{"role": "user", "content": "b", "token_ids": torch.tensor([2])}],
+                ],
+                "task_name": ["math", "math"],
+                "extra_env_info": [{}, {}],
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "idx": torch.tensor([0, 1]),
+                "length": torch.tensor([1, 1]),
+                "total_reward": torch.tensor([0.0, 0.0]),
+            }
+        )
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.max_val_samples = 2
+        mock_config.grpo.val_batch_size = 2
+        mock_config.grpo.val_num_generations_per_prompt = 4
+
+        def rollout_to_tq_remote(repeated_batch, **_kwargs):
+            # Each prompt is repeated k=4 times, contiguously.
+            assert repeated_batch["idx"].tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
+            driver_carry = {
+                # Prompt 0 passes once out of 4; prompt 1 never passes.
+                "total_reward": torch.tensor(
+                    [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                ),
+                "turn_roles": [["user"]] * 8,
+                "turn_contents": [["x"]] * 8,
+            }
+            return (MagicMock(), driver_carry, {"mean_gen_tokens_per_sample": 1.0}, {})
+
+        rollout_actor = MagicMock()
+        rollout_actor.rollout_to_tq.remote.side_effect = rollout_to_tq_remote
+        policy = MagicMock()
+
+        with (
+            patch("nemo_rl.algorithms.grpo_sync.ray.get", side_effect=lambda x: x),
+            patch(
+                "nemo_rl.algorithms.grpo_sync._should_use_nemo_gym",
+                return_value=False,
+            ),
+            patch("nemo_rl.algorithms.grpo_sync.print_message_log_samples"),
+        ):
+            val_metrics, _ = validate_sync(
+                rollout_actor=rollout_actor,
+                policy=policy,
+                val_dataloader=mock_dataloader,
+                val_task_to_env={"math": MagicMock(spec=EnvironmentInterface)},
+                step=0,
+                master_config=mock_config,
+            )
+
+        # The val partition is sized for the expanded batch (2 prompts x k=4).
+        policy.prepare_val_partition.assert_called_once_with(8, partition_id="val")
         # accuracy stays the plain mean over all 8 rollouts; pass@4 counts
         # prompts with at least one passing rollout (1 of 2).
         assert val_metrics["accuracy"] == pytest.approx(0.125)
